@@ -2351,6 +2351,14 @@ impl<'a> KernelRestoreTarget<'a> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| BackupError::Target(error.to_string()))?;
+            // The one place this operation writes into the destination tree,
+            // so containment is re-derived HERE rather than only once at
+            // admission: `contained_member_path` proved the member is spelled
+            // with plain segments under the root, and `create_dir_all`
+            // followed whatever already answered at that name. Re-resolving
+            // the parent here is what turns a directory the operation merely
+            // NAMED into one it has proved it may write into.
+            Self::refuse_member_directory_outside_root(&self.root, parent)?;
         }
         let tmp = path.with_extension("tmp-restore");
         std::fs::write(&tmp, bytes).map_err(|error| BackupError::Target(error.to_string()))?;
@@ -2420,6 +2428,72 @@ impl<'a> KernelRestoreTarget<'a> {
             ));
         }
         Ok(self.root.join(relative))
+    }
+
+    /// Re-derives, at the moment of use, that the directory a member is about
+    /// to be written into still resolves inside this destination's resolved
+    /// root.
+    ///
+    /// [`Self::contained_member_path`] proves the member is SPELLED with plain
+    /// relative segments under the root, and
+    /// [`KernelBackupRestore::refuse_destination_outside_isolated_area`]
+    /// proves the ROOT resolves inside the isolated restore area. Neither
+    /// proves the intermediate directories: on Windows a directory already
+    /// answering at `<root>/events`, `<root>/blobs`, `<root>/receipts`,
+    /// `<root>/projections` or `<root>/phase-receipts` can be a reparse
+    /// point, `std::fs::create_dir_all` accepts one without complaint, and
+    /// every later `std::fs::write` then publishes through it. The bytes would
+    /// land outside the admitted isolated destination while `finalize` attests
+    /// a root that is not one — the same outcome the root-level refusal
+    /// exists to prevent, one level down.
+    ///
+    /// So the rule the owner already applies to the root is applied to the
+    /// directory that actually receives the write, with the SAME mechanism:
+    /// both sides are resolved with `std::fs::canonicalize`, and the resolved
+    /// directory must be at or below the resolved root. A name is not
+    /// containment; the resolved topology is. A member written directly at the
+    /// root (`evidence.json`, the pinned admission, the phase documents)
+    /// resolves to the root itself, so equality is the admitted case and only
+    /// a directory that resolves elsewhere refuses.
+    ///
+    /// This is not a second scheme: it is `refuse_destination_outside_isolated_area`
+    /// and [`cleanup_staged_output`](Self::cleanup_staged_output) — which
+    /// canonicalize the same two sides for the same reason — narrowed from the
+    /// root to the directory actually used.
+    ///
+    /// An unresolvable directory is a typed refusal, never a silent pass: the
+    /// directory was created or opened by this operation moments earlier, so a
+    /// path that cannot be resolved is a broken contour, not permission to
+    /// write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackupError::Target`] when the root or the member directory
+    /// cannot be resolved at all — the same class as the `create_dir_all`
+    /// immediately above it — and
+    /// [`BackupError::InvalidField`] on the `restore member directory` field
+    /// when the member directory resolves to another tree.
+    fn refuse_member_directory_outside_root(
+        root: &Path,
+        member_directory: &Path,
+    ) -> Result<(), BackupError> {
+        let resolved_root = std::fs::canonicalize(root).map_err(|error| {
+            BackupError::Target(format!(
+                "isolated restore root could not be resolved: {error}"
+            ))
+        })?;
+        let resolved_directory = std::fs::canonicalize(member_directory).map_err(|error| {
+            BackupError::Target(format!(
+                "restore member directory could not be resolved: {error}"
+            ))
+        })?;
+        if !resolved_directory.starts_with(&resolved_root) {
+            return Err(BackupError::InvalidField {
+                field: "restore member directory",
+                reason: "must resolve inside the isolated restore root",
+            });
+        }
+        Ok(())
     }
 
     fn phase_receipt_path(&self, phase: &RestorePhase) -> Result<PathBuf, BackupError> {
