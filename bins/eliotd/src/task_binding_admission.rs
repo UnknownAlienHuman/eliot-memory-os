@@ -39,6 +39,13 @@
 //!   supplies it. No source is synthesized from an unrelated profile or
 //!   receipt handle. I5.6 step 4 verbatim — "resolve `TaskSelectionEvidence`
 //!   and `TaskContract` compatibility when the command is task-relative".
+//! - [`admit_canonical_write_with_governor_selection`] — the Governor-joined
+//!   canonical-write variant (issue #1746, W4). Its selection leg is
+//!   [`bind_current_task_selection`] over the Governor-supplied activation
+//!   snapshot, owner-compiled receipt, and live fence; it takes no
+//!   request-supplied evidence, so caller-presented structure can never admit
+//!   here. Same split predicate, same non-current meaning, same sealed
+//!   task-relative checks as [`admit_canonical_write`].
 //! - [`admit_named_mutation_capture`] — the transport edge
 //!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
 //!   a task-free `CaptureObservation` is admitted here as a cold unbound
@@ -83,6 +90,9 @@
 //!   is the composition-root canonical-commit entry and nothing in production
 //!   calls it yet, so the typed evidence leg this module owns is reached from
 //!   no live daemon path.
+//! - [`admit_canonical_write_with_governor_selection`] has **zero** production
+//!   call sites: the dispatch gate that must thread the Governor pair lives in
+//!   `super::DaemonComposition`, outside this module's path scope (STITCH).
 //! - [`admit_named_mutation_capture`] **is** live, through the neutral
 //!   transport port: `PreparedKernelExchange::exchange` calls
 //!   `KernelTransitionPort::apply_prepared`, implemented by
@@ -2107,10 +2117,15 @@ fn compatibility_for(
 /// dispatch effect gate revalidates it against the live owners through
 /// [`revalidate_dispatched_binding`] (and [`revalidate_task_bound_for_effect`]
 /// for the fence leg) (issue #1746, W6/A5).
-#[expect(
-    clippy::too_many_lines,
-    reason = "single dispatch edge sealing identity, scope, fence, and bootstrap revisions; splitting would scatter the conflict/rebind ordering"
-)]
+///
+/// The selection leg here resolves the caller-presented receipt through
+/// [`selection_response_for_receipt`]. The Governor-joined variant
+/// ([`admit_canonical_write_with_governor_selection`]) resolves the
+/// Governor-supplied activation/receipt pair through
+/// [`bind_current_task_selection`] instead and takes no request-supplied
+/// evidence. Both share the split predicate
+/// ([`envelope_is_task_relative`]) and the admission body
+/// ([`admit_canonical_write_resolved`]).
 pub fn admit_canonical_write(
     candidate_id: String,
     context: &RequestMetadata,
@@ -2118,19 +2133,10 @@ pub fn admit_canonical_write(
     receipt: &OnboardingReadinessReceipt,
     write_fence: &StateFence,
 ) -> Result<TaskBindingAdmission, TaskBindingError> {
-    let compatibility = compatibility_for(receipt, envelope, write_fence);
     // Issue #1746, W1: the capture/task-relative split is derived from the
     // frozen requirement table, so gating cannot drift from the mapped
     // operation classes.
-    let carries_requirement = |requirement: CanonicalOperationRequirement| {
-        envelope
-            .semantic_commands
-            .iter()
-            .any(|command| requirement_for_named_mutation(command.operation) == requirement)
-    };
-    let captures = carries_requirement(CanonicalOperationRequirement::SafeRawCapture);
-    let task_relative = envelope.task_id.is_some()
-        || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful);
+    let task_relative = envelope_is_task_relative(envelope);
     // Issue #1746, W4: Absent stays absent and Ambiguous keeps its bounded
     // eligible handles through the single typed response constructor.
     // A task-free capture remains cold and unrelated non-task writes need
@@ -2146,6 +2152,69 @@ pub fn admit_canonical_write(
         Err(_) if !task_relative => (None, 0_usize),
         Err(error) => return Err(error),
     };
+    admit_canonical_write_resolved(
+        candidate_id,
+        context,
+        envelope,
+        receipt,
+        write_fence,
+        selection,
+        candidate_count,
+    )
+}
+
+/// Whether one canonical write envelope is task-relative (issue #1746, W1).
+///
+/// Single definition of the capture/task-relative split predicate behind both
+/// canonical-write entries: a write that names a task, or that carries a
+/// task-relative/effectful named mutation
+/// ([`requirement_for_named_mutation`]), needs the live selection recheck;
+/// anything else stays on the receipt-only cold/non-task-relative legs.
+/// Shared by [`admit_canonical_write`] and
+/// [`admit_canonical_write_with_governor_selection`] so the two entries
+/// cannot drift from the frozen requirement table or from each other.
+fn envelope_is_task_relative(envelope: &CanonicalWriteEnvelope) -> bool {
+    envelope.task_id.is_some()
+        || envelope.semantic_commands.iter().any(|command| {
+            requirement_for_named_mutation(command.operation)
+                == CanonicalOperationRequirement::TaskRelativeEffectful
+        })
+}
+
+/// Runs the shared canonical-write admission body after the selection leg
+/// (issue #1929, I5.5 capture/promotion split; issue #1746, W4/W6).
+///
+/// Both [`admit_canonical_write`] (caller-presented receipt leg) and
+/// [`admit_canonical_write_with_governor_selection`] (Governor-resolved leg)
+/// end here with the exact selection that leg produced — `None` with a
+/// candidate count of 0 for absent/exploratory/stale, `None` with the bounded
+/// handle count for ambiguous, or the rechecked evidence with a count of 1.
+/// The split, the cold-capture retention, the typed task-relative rejections,
+/// and the sealed [`DispatchedBinding`] are therefore identical whichever
+/// resolution supplied the selection; only the provenance of the selection
+/// differs.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single dispatch edge sealing identity, scope, fence, and bootstrap revisions; splitting would scatter the conflict/rebind ordering"
+)]
+fn admit_canonical_write_resolved(
+    candidate_id: String,
+    context: &RequestMetadata,
+    envelope: &CanonicalWriteEnvelope,
+    receipt: &OnboardingReadinessReceipt,
+    write_fence: &StateFence,
+    selection: Option<TaskSelectionEvidence>,
+    candidate_count: usize,
+) -> Result<TaskBindingAdmission, TaskBindingError> {
+    let compatibility = compatibility_for(receipt, envelope, write_fence);
+    // Issue #1746, W1: the capture/task-relative split is derived from the
+    // frozen requirement table, so gating cannot drift from the mapped
+    // operation classes.
+    let captures = envelope.semantic_commands.iter().any(|command| {
+        requirement_for_named_mutation(command.operation)
+            == CanonicalOperationRequirement::SafeRawCapture
+    });
+    let task_relative = envelope_is_task_relative(envelope);
 
     if captures && !task_relative {
         // `admit_capture` consumes the candidate identity on each of its cold
@@ -2266,6 +2335,78 @@ pub fn admit_canonical_write(
     }
 
     Ok(TaskBindingAdmission::NotTaskRelative)
+}
+
+/// Admits one daemon named-mutation write against the Governor-resolved
+/// current task selection (issue #1746, W4).
+///
+/// Governor-joined variant of [`admit_canonical_write`]: the selection leg is
+/// the live Governor resolution — [`bind_current_task_selection`] over the
+/// Governor-supplied activation snapshot, the owner-compiled readiness
+/// receipt, and the live fence — rechecked for current applicability before
+/// admission. This entry takes no `TaskSelectionEvidence` parameter, so
+/// structural validation of evidence a request supplied can never admit here;
+/// only the Governor-rechecked `Current` evidence reaches the task-relative
+/// checks. Non-current dispositions keep the exact meaning
+/// [`admit_canonical_write`] gives them: `Absent`, `Exploratory`, and `Stale`
+/// select nothing, `Ambiguous` keeps its bounded eligible handles verbatim
+/// and selects nothing, a task-free capture stays cold through
+/// [`admit_capture`], and a task-relative write without a current selection
+/// rejects typed (`TASK_SELECTION_REQUIRED`, or the bind's own
+/// `TASK_SCOPE_INCOMPATIBLE`). No task is created to remove an absence or an
+/// ambiguity, and no cold capture is retroactively attached: a later binding
+/// remains a separate admitted transition.
+///
+/// The `Current` arm stays refused until the receipt owner carries
+/// owner-proven selection source/evidence (see [`resolve_task_selection`]):
+/// until then this entry resolves no write to a task. A `Current` receipt
+/// that contradicts the activation (or vice versa) fails closed inside
+/// [`bind_current_task_selection`] and admits nothing.
+///
+/// Designated caller (STITCH): the dispatch gate in
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
+/// which today admits the caller-presented receipt through
+/// [`admit_canonical_write`] and cannot supply the Governor pair without
+/// changing its own ingress (outside this module's path scope). Until that
+/// threading lands this entry has no caller; it selects nothing on its own.
+pub fn admit_canonical_write_with_governor_selection(
+    candidate_id: String,
+    context: &RequestMetadata,
+    envelope: &CanonicalWriteEnvelope,
+    activation: Option<&eliot_governor::GovernorActivationSnapshot>,
+    owner_receipt: &OnboardingReadinessReceipt,
+    live_fence: &StateFence,
+    write_fence: &StateFence,
+) -> Result<TaskBindingAdmission, TaskBindingError> {
+    // Issue #1746, W1: the same split the frozen table defines, so a
+    // Governor-resolution failure on a non-task-relative write keeps the
+    // receipt-only legs instead of rejecting what needs no selection.
+    let task_relative = envelope_is_task_relative(envelope);
+    // Issue #1746, W4: Absent stays absent and Ambiguous keeps its bounded
+    // eligible handles. No request-supplied evidence is read on any arm.
+    let bound = bind_current_task_selection(activation, owner_receipt, live_fence);
+    let (selection, candidate_count) = match bound {
+        Ok(
+            TaskSelectionDisposition::Absent
+            | TaskSelectionDisposition::Exploratory { .. }
+            | TaskSelectionDisposition::Stale { .. },
+        ) => (None, 0_usize),
+        Ok(TaskSelectionDisposition::Ambiguous(candidate_handles)) => {
+            (None, candidate_handles.len())
+        }
+        Ok(TaskSelectionDisposition::Current(evidence)) => (Some(evidence), 1_usize),
+        Err(_) if !task_relative => (None, 0_usize),
+        Err(error) => return Err(error),
+    };
+    admit_canonical_write_resolved(
+        candidate_id,
+        context,
+        envelope,
+        owner_receipt,
+        write_fence,
+        selection,
+        candidate_count,
+    )
 }
 
 /// Admitted operation/payload identity carried through dispatch
