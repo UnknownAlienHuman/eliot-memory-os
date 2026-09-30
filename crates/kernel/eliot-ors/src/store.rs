@@ -16634,13 +16634,14 @@ impl RedbRecoveryStore {
     ) -> String {
         let predecessor_len = predecessor_commitment.len();
         let mut canonical = String::new();
-        canonical.push_str(&format!("{predecessor_len}:{predecessor_commitment};"));
+        let _ = std::fmt::Write::write!(canonical, "{predecessor_len}:{predecessor_commitment};");
         for (sequence, event_id, envelope_sha256, reconcile_key) in leaves {
             let event_len = event_id.len();
             let reconcile_len = reconcile_key.len();
-            canonical.push_str(&format!(
+            let _ = std::fmt::Write::write!(
+                canonical,
                 "{sequence:020}:{event_len}:{event_id}:{envelope_sha256}:{reconcile_len}:{reconcile_key};"
-            ));
+            );
         }
         crate::model::sha256_hex(canonical.as_bytes())
     }
@@ -16678,6 +16679,30 @@ impl RedbRecoveryStore {
             intervals.push((gap.start_sequence, gap.end_sequence));
         }
         Ok(intervals)
+    }
+
+    /// Validates compacted-range leaves as contiguous from their start,
+    /// returning the covered end sequence (issue #2885, item 5).
+    fn validate_compacted_leaves_contiguous(
+        start_sequence: u64,
+        leaves: &[(u64, String, String, String)],
+    ) -> Result<u64, OrsError> {
+        let mut expected = start_sequence;
+        for (sequence, event_id, envelope_sha256, reconcile_key) in leaves {
+            if *sequence != expected {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_compacted_range",
+                    reason: "compacted range leaves must be contiguous from their start".to_owned(),
+                });
+            }
+            bridge_identity_text(event_id, "event_id")?;
+            crate::model::validate_digest(envelope_sha256, "envelope_sha256")?;
+            if !reconcile_key.is_empty() {
+                crate::model::validate_digest(reconcile_key, "reconcile_key")?;
+            }
+            expected += 1;
+        }
+        Ok(expected - 1)
     }
 
     /// Certifies one cumulative compacted range over a contiguous eligible
@@ -16721,22 +16746,7 @@ impl RedbRecoveryStore {
                 reason: "compacted range certification needs its admitted stream owner".to_owned(),
             });
         }
-        let mut expected = start_sequence;
-        for (sequence, event_id, envelope_sha256, reconcile_key) in leaves {
-            if *sequence != expected {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "bridge_event_compacted_range",
-                    reason: "compacted range leaves must be contiguous from their start".to_owned(),
-                });
-            }
-            bridge_identity_text(event_id, "event_id")?;
-            crate::model::validate_digest(envelope_sha256, "envelope_sha256")?;
-            if !reconcile_key.is_empty() {
-                crate::model::validate_digest(reconcile_key, "reconcile_key")?;
-            }
-            expected += 1;
-        }
-        let end_sequence = expected - 1;
+        let end_sequence = Self::validate_compacted_leaves_contiguous(start_sequence, leaves)?;
         let mut ranges = write
             .open_table(BRIDGE_EVENT_COMPACTED_RANGES)
             .map_err(storage)?;
@@ -16786,18 +16796,14 @@ impl RedbRecoveryStore {
                 reason: "compacted range frontier must never move backward".to_owned(),
             });
         }
-        let segment_commitment = Self::bridge_compacted_segment_commitment(
-            &stored.segment_commitment,
-            leaves,
-        );
+        let segment_commitment =
+            Self::bridge_compacted_segment_commitment(&stored.segment_commitment, leaves);
         if stored.end_sequence == end_sequence {
             // The frontier is already certified: re-presenting its last
             // extension identically is idempotent, while changed content
             // under the same range conflicts instead of overwriting.
-            let recomputed = Self::bridge_compacted_segment_commitment(
-                &stored.predecessor_commitment,
-                leaves,
-            );
+            let recomputed =
+                Self::bridge_compacted_segment_commitment(&stored.predecessor_commitment, leaves);
             if stored.segment_commitment != recomputed {
                 return Err(OrsError::DuplicateConflict);
             }
@@ -19660,7 +19666,7 @@ impl RedbRecoveryStore {
             }));
         };
         let BridgeRetirementPage {
-            eligible: mut eligible,
+            mut eligible,
             continuation: page_continuation,
             after_sequence: page_last,
         } = Self::bridge_retire_eligible_in(write, &access, &owner, &cursor, &scan, budget)?;
