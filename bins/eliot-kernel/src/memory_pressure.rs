@@ -2084,6 +2084,18 @@ impl MemoryPressureCoordinator {
     /// Returns [`PressureError::InvalidField`] for an unbounded reference, a
     /// zero byte count, a temporary bound above the profile ceiling or a zero
     /// time.
+    ///
+    /// Live status: no production caller. Measured on this tree, no code
+    /// outside this module names this method (the defining line is its only
+    /// reference), and this module is not yet declared in
+    /// `bins/eliot-kernel/src/lib.rs` at all — see the module-level STITCH note
+    /// — so the entry is not even compiled into the binary. Its product
+    /// [`PayloadConversionRequest`] is likewise unreachable: this constructor is
+    /// its only producer, and its only consumer, `release_after_capture`, is
+    /// itself uncalled, so `PayloadConversionRequest::validate` runs only from
+    /// that uncalled consumer. Nothing in the repository builds a payload
+    /// conversion request; whether a runtime owner wires this request to the
+    /// Blob/artifact capture owner or retires it is an owner decision.
     #[allow(
         clippy::too_many_arguments,
         reason = "the conversion binds one explicit field per payload/scope/privacy/budget/identity dimension and must stay explicit"

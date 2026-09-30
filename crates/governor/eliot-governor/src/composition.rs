@@ -7950,7 +7950,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the lease inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery or onboarding lease).
+    /// discovery or onboarding lease). Measured on this tree, that means zero
+    /// call sites: the defining line is this entry's only reference in any
+    /// crate. Two helpers are dead transitively with it and are named here
+    /// because a name-level scan cannot see that:
+    /// [`Self::build_cold_start_readiness_claim`] and the private
+    /// `Self::readiness_join_from_record` are called only from this entry and
+    /// from `Self::compile_cold_start_at_trigger`, which itself has zero call
+    /// sites (`Caller: STITCH`), so neither helper runs. The nearest live cold-
+    /// start trigger evaluation is `bins/eliotd/src/daemon_runtime.rs`'s
+    /// `trigger_cold_start_controller`, which calls
+    /// `ColdStartController::check_discovery_with_scan` directly and cannot
+    /// build these lease inputs. Whether an attach ingress builds them or this
+    /// entry is retired is an owner decision; no caller was added to close the
+    /// gap.
     #[allow(
         clippy::too_many_arguments,
         reason = "evidence-bound join carries trigger, leases, candidate, sources, and scan evidence in one fail-closed entry"

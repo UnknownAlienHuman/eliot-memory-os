@@ -2575,6 +2575,20 @@ impl DaemonComposition {
     /// Same seam discipline as [`Self::skill_install_package`]: only an
     /// applied ack for the exact receipt reaches the catalogue boundary.
     /// Receipt and ack travel by value, mirroring the owned display boundary.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Measured on this tree, no code in any crate names
+    /// this method other than its defining line. The live receiver-ack display
+    /// path is [`Self::skill_carry_receipt_to_display`], called from
+    /// `bins/eliotd/src/skill_dispatch.rs`, which reaches the *shared adapter's*
+    /// versioned entry (`skill_lifecycle_adapters.rs`) rather than this
+    /// composition wrapper. So the receipt/ack seam itself is exercised; this
+    /// unversioned composition-level accessor over it is not, and the two are
+    /// not interchangeable: the versioned leg also enforces the display-time
+    /// tool-owner drift gate. Whether a caller needs the unversioned leg or this
+    /// accessor is retired is an owner decision; no caller was added to close
+    /// the gap.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "receipt/ack cross by value like the owned display boundary"
@@ -2599,6 +2613,20 @@ impl DaemonComposition {
     /// handle refuses the display when the live source drifted past the
     /// admitted definition version. Receipt and ack travel by value,
     /// mirroring the owned display boundary.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Measured on this tree, no code in any crate names
+    /// this method other than its defining line. The live equivalent is
+    /// [`Self::skill_carry_receipt_to_display`], called from
+    /// `bins/eliotd/src/skill_dispatch.rs`: it performs the same versioned
+    /// acknowledge against a freshly Governor-built canonical tool source and
+    /// calls the shared adapter's `acknowledge_and_display_versioned` directly,
+    /// bypassing this composition wrapper. So the versioned drift gate is
+    /// enforced on the live path — this entry is a second, unwired route to the
+    /// same adapter method, not a missing owner. Whether a caller needs this
+    /// route or the wrapper is retired is an owner decision; no caller was added
+    /// to close the gap.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "receipt/ack cross by value like the owned display boundary"

@@ -649,6 +649,26 @@ impl KernelSupervisionLeaseAuthority {
         )
     }
 
+    /// Reads the live eliotd supervision evidence for one exact lease id,
+    /// generation and authority epoch.
+    ///
+    /// This is the evidence-only view of `current_eliotd_live_projection`: it
+    /// drops the issue timestamp and keeps the validated
+    /// [`EliotdLiveSupervisionEvidence`]. Every binding check — active lease
+    /// state and projection, exact lease identity, resource generation, and
+    /// authority epoch — belongs to that projection, which this method does not
+    /// reimplement or relax.
+    ///
+    /// Live status: no production caller. Measured on this tree, no code in any
+    /// crate names this method other than its defining line. The live Kernel
+    /// live-receipt path (`bins/eliot-kernel/src/daemon_live_receipt.rs`) calls
+    /// `current_eliotd_live_projection` directly, twice — before and after the
+    /// launch recheck — because it needs the issued-at timestamp as well as the
+    /// evidence to prove neither moved across the launch. So this evidence-only
+    /// accessor is the unused projection of that live call, not a second live
+    /// route. Whether a consumer needs the evidence without the timestamp or the
+    /// accessor is retired is an owner decision; no caller was added to close
+    /// the gap.
     pub fn current_eliotd_live_evidence(
         &self,
         expected_supervision_lease_id: &str,

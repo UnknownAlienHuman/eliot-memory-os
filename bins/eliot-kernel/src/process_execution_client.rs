@@ -175,6 +175,24 @@ pub fn process_execution_client(
 /// projections (`eliot_kernel_service::protocol::native_worker_claim`,
 /// unreachable from this crate at this base; the integrator rebinds these
 /// parameters to `NativeWorkerClaimRequest`/`NativeWorkerClaimReceipt`).
+///
+/// # Live status
+///
+/// No production caller. Measured on this tree, no code in any crate names this
+/// function other than its defining line. The live process-start path is
+/// different and does not go through here: `frame_dispatch.rs` /
+/// `process_execution.rs` dispatch the generic `ProcessExecutionRequest::Start`
+/// arm, and the front-door client built by `process_execution_client` (called
+/// from `front_door_driver.rs`) wraps the same gateway in
+/// `GatewayProcessStarter`, whose `start` retains the path proof and starts.
+/// Neither route builds or checks a native-worker claim/receipt pair, because
+/// the projections this entry takes are unreachable from this crate at this
+/// base; the integrator rebinds them to
+/// `NativeWorkerClaimRequest`/`NativeWorkerClaimReceipt`. The
+/// `#[allow(dead_code)]` above is the compiler-side record of the same fact,
+/// not evidence of a caller. Whether the post-Ready starter binds this
+/// conversion or the entry is retired is an owner decision; no caller was added
+/// to close the gap.
 #[allow(clippy::too_many_lines)]
 #[allow(
     dead_code,
