@@ -52,7 +52,10 @@ use redb::{Database, TableDefinition};
 
 #[cfg(test)]
 use crate::InstallationTransactionStore;
-use crate::approved_generation_registry::PendingActivationTerminalDisposition;
+use crate::approved_generation_registry::{
+    PendingActivationTerminalDisposition, UserModeTaskRunHostAck,
+    UserModeTaskRunIntentProjection, UserModeTaskRunRecord,
+};
 #[cfg(any(test, feature = "test-support"))]
 use crate::approved_generation_registry::{
     TestSupportRegistryFixtureContour, test_support_activation_fixture,
@@ -784,6 +787,199 @@ impl RedbInstallationRegistry {
     ) -> Result<ActivationCommitReceipt, InstallationError> {
         self.load()?
             .read_committed_activation_receipt(transaction_id, plan_digest, generation)
+    }
+
+    /// Stages the exact UserMode task registration and `RunEx` intent before
+    /// the caller invokes Task Scheduler. The record remains explicitly
+    /// unresolved until Host commits readiness evidence; staging never implies
+    /// that `RunEx` was accepted.
+    ///
+    /// The caller supplies the revision from its current loaded projection.
+    /// Repeating the exact intent is idempotent even if the revision has since
+    /// advanced. A different intent cannot replace an unresolved record; an
+    /// acknowledged record may be superseded by the next active generation's
+    /// operation.
+    pub fn stage_user_mode_task_run_intent(
+        &self,
+        expected_revision: u64,
+        intent: UserModeTaskRunIntentProjection,
+    ) -> Result<UserModeTaskRunRecord, InstallationError> {
+        let current = self.load()?;
+        if let Some(record) = current.user_mode_task_run_record()
+            && record.intent() == &intent
+        {
+            return Ok(record.clone());
+        }
+        if current.user_mode_task_run_record().is_some_and(|record| {
+            record.intent().transaction_id() == intent.transaction_id()
+                && record.intent().effect_id() == intent.effect_id()
+        }) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if current
+            .user_mode_task_run_record()
+            .is_some_and(|record| record.host_ack().is_none())
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        current.validate_active_user_mode_task_run_intent(&intent)?;
+        if current.revision() != expected_revision {
+            return Err(InstallationError::CompareAndSaveConflict {
+                expected: expected_revision,
+                actual: current.revision(),
+            });
+        }
+        let staged_intent = intent.clone();
+        match self.mutate_atomic(expected_revision, |registry| {
+            registry.validate_active_user_mode_task_run_intent(&staged_intent)?;
+            if let Some(existing) = registry.user_mode_task_run_record()
+                && existing.intent() == &staged_intent
+            {
+                return Ok(existing.clone());
+            }
+            if registry.user_mode_task_run_record().is_some_and(|record| {
+                record.intent().transaction_id() == staged_intent.transaction_id()
+                    && record.intent().effect_id() == staged_intent.effect_id()
+            }) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if registry
+                .user_mode_task_run_record()
+                .is_some_and(|record| record.host_ack().is_none())
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let record = UserModeTaskRunRecord::staged(staged_intent.clone());
+            record.validate()?;
+            registry.user_mode_task_run_record = Some(record.clone());
+            Ok(record)
+        }) {
+            Ok(record) => Ok(record),
+            Err(conflict @ InstallationError::CompareAndSaveConflict { .. }) => {
+                let latest = self.load()?;
+                match latest.user_mode_task_run_record() {
+                    Some(record) if record.intent() == &intent => Ok(record.clone()),
+                    _ => Err(conflict),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reads one exact transaction/effect task-run projection from an already
+    /// opened registry. This method does not create a registry or mutate it.
+    pub fn inspect_user_mode_task_run(
+        &self,
+        transaction_id: &PlatformHandle,
+        effect_id: &PlatformHandle,
+    ) -> Result<Option<UserModeTaskRunRecord>, InstallationError> {
+        let registry = self.load()?;
+        Ok(registry
+            .user_mode_task_run_record()
+            .filter(|record| {
+                record.intent().transaction_id() == transaction_id.as_str()
+                    && record.intent().effect_id() == effect_id.as_str()
+            })
+            .cloned())
+    }
+
+    /// Commits authenticated Host readiness for one exact staged UserMode
+    /// task-run intent. The Host launch markers must equal the original
+    /// transaction/effect IDs, and the current active generation, original
+    /// root receipt and Host-owner capability must still agree.
+    ///
+    /// This acknowledgement is Host readiness evidence only. It does not
+    /// stand in for Task Scheduler's `RunEx` receipt or an engine process ID.
+    pub fn acknowledge_user_mode_task_run(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        ack: UserModeTaskRunHostAck,
+    ) -> Result<UserModeTaskRunRecord, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let current = self.load()?;
+        let existing = current.user_mode_task_run_record().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "no staged UserMode task-run intent exists".to_owned(),
+            )
+        })?;
+        if existing.intent() != &ack.intent {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if existing.host_ack() == Some(&ack) {
+            return Ok(existing.clone());
+        }
+        let active = current.validate_active_user_mode_task_run_intent(&ack.intent)?;
+        if ack.evidence.host_process_id != std::process::id()
+            || !eliot_platform_windows::windows_paths_equal(
+                Path::new(&ack.evidence.host_process_image_path),
+                Path::new(active.manifest.host_executable_path.as_str()),
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.validate_host_owner_binding_for_identity(
+            host,
+            &active.manifest.runtime_launch.installation_epoch.installation,
+            &active
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root,
+        )?;
+        if current.revision() != expected_revision {
+            return Err(InstallationError::CompareAndSaveConflict {
+                expected: expected_revision,
+                actual: current.revision(),
+            });
+        }
+        let staged_ack = ack.clone();
+        match self.mutate_atomic(expected_revision, |registry| {
+            let active = registry.validate_active_user_mode_task_run_intent(&staged_ack.intent)?;
+            if staged_ack.evidence.host_process_id != std::process::id()
+                || !eliot_platform_windows::windows_paths_equal(
+                    Path::new(&staged_ack.evidence.host_process_image_path),
+                    Path::new(active.manifest.host_executable_path.as_str()),
+                )
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            self.validate_host_owner_binding_for_identity(
+                host,
+                &active.manifest.runtime_launch.installation_epoch.installation,
+                &active
+                    .manifest
+                    .runtime_launch
+                    .runtime_state_roots
+                    .host_state_root,
+            )?;
+            let record = registry
+                .user_mode_task_run_record()
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "no staged UserMode task-run intent exists".to_owned(),
+                    )
+                })?;
+            if record.intent() != &staged_ack.intent {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let mut record = record.clone();
+            record.acknowledge(staged_ack.clone())?;
+            registry.user_mode_task_run_record = Some(record.clone());
+            Ok(record)
+        }) {
+            Ok(record) => Ok(record),
+            Err(conflict @ InstallationError::CompareAndSaveConflict { .. }) => {
+                let latest = self.load()?;
+                match latest.user_mode_task_run_record() {
+                    Some(record) if record.host_ack() == Some(&ack) => Ok(record.clone()),
+                    _ => Err(conflict),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Loads the sealed transaction and atomically stages its exact pending

@@ -8,7 +8,7 @@ use super::{
     PendingActivationTerminalDisposition, PlatformHandle, ResourceGeneration, RuntimeStateRoots,
     StateFence,
 };
-use current_models::RegistryWireV11;
+use current_models::RegistryWireV12;
 
 #[allow(
     dead_code,
@@ -694,6 +694,7 @@ fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
         "last_terminal_activation",
         "system_service_host_root_receipt",
         "active_phase_b_rebind",
+        "user_mode_task_run_record",
     ]
     .iter()
     .any(|field| !object.contains_key(*field));
@@ -757,17 +758,20 @@ pub(super) fn decode_registry_bytes(
         .get("registry_wire_version")
         .and_then(|version| version.get("major"))
         .and_then(serde_json::Value::as_u64);
-    let legacy_identity_source = (declared_major == Some(17)).then(|| value.clone());
+    let legacy_identity_source = matches!(declared_major, Some(17 | 18)).then(|| value.clone());
     if declared_major == Some(10) {
         return Err(InstallationError::MigrationRequired {
-            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v18; nested authority is never synthesized or adopted"
+            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v19; nested authority is never synthesized or adopted"
                 .to_owned(),
         });
     }
     let legacy_identity_version = if declared_major == Some(17) {
         if value
             .as_object()
-            .is_some_and(|object| object.contains_key("system_service_host_root_receipt"))
+            .is_some_and(|object| {
+                object.contains_key("system_service_host_root_receipt")
+                    || object.contains_key("user_mode_task_run_record")
+            })
         {
             return Err(InstallationError::CorruptRegistry {
                 reason: "v17 registry contains a field outside its declared wire shape".to_owned(),
@@ -797,7 +801,48 @@ pub(super) fn decode_registry_bytes(
             "system_service_host_root_receipt".to_owned(),
             serde_json::Value::Null,
         );
+        object.insert(
+            "user_mode_task_run_record".to_owned(),
+            serde_json::Value::Null,
+        );
         source_revision.map(|revision| (ContractVersion::new(17, 0, 0), revision))
+    } else if declared_major == Some(18) {
+        let source_version = value
+            .get("registry_wire_version")
+            .cloned()
+            .and_then(|version| serde_json::from_value::<ContractVersion>(version).ok());
+        if source_version != Some(ContractVersion::new(18, 0, 0)) {
+            return Err(InstallationError::MigrationRequired {
+                reason: "only the exact v18.0.0 installation registry shape has a v19 migration"
+                    .to_owned(),
+            });
+        }
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| InstallationError::CorruptRegistry {
+                reason: "registry wire is not an object".to_owned(),
+            })?;
+        if object.contains_key("user_mode_task_run_record") {
+            return Err(InstallationError::CorruptRegistry {
+                reason: "v18 registry contains the v19 UserMode task-run member".to_owned(),
+            });
+        }
+        let source_revision = object
+            .get("revision")
+            .and_then(serde_json::Value::as_u64);
+        object.insert(
+            "registry_wire_version".to_owned(),
+            serde_json::to_value(INSTALLATION_REGISTRY_WIRE_VERSION).map_err(|error| {
+                InstallationError::CorruptRegistry {
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        object.insert(
+            "user_mode_task_run_record".to_owned(),
+            serde_json::Value::Null,
+        );
+        source_revision.map(|revision| (ContractVersion::new(18, 0, 0), revision))
     } else {
         None
     };
@@ -826,7 +871,7 @@ pub(super) fn decode_registry_bytes(
         });
     }
 
-    if let Ok(wire) = serde_json::from_value::<RegistryWireV11>(value.clone()) {
+    if let Ok(wire) = serde_json::from_value::<RegistryWireV12>(value.clone()) {
         if wire.registry_wire_version != INSTALLATION_REGISTRY_WIRE_VERSION {
             return Err(InstallationError::MigrationRequired {
                 reason: format!(
@@ -851,10 +896,10 @@ pub(super) fn decode_registry_bytes(
             });
         }
         if let Some(source) = legacy_identity_source.as_ref()
-            && !registry.matches_legacy_v17_identity_shape(source)?
+            && !registry.matches_legacy_registry_identity_shape(source)?
         {
             return Err(InstallationError::MigrationRequired {
-                reason: "v17 registry does not reproduce its canonical activation identity shape; explicit recovery is required"
+                reason: "legacy v17/v18 registry does not reproduce its canonical activation identity shape; explicit recovery is required"
                     .to_owned(),
             });
         }
