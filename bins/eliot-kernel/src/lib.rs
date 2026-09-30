@@ -77,6 +77,9 @@ mod kernel_config;
 /// once here and imported by the binary; later leaves extend through their
 /// own serialized turns, never a second copy.
 pub mod kernel_diagnostics;
+/// Bounded asynchronous producer for the fixed Kernel Event Log profile.
+/// The platform FFI is reached only from this module's single worker.
+pub mod windows_event_log;
 mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
