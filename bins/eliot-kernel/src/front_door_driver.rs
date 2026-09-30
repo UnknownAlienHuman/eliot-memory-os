@@ -41,16 +41,18 @@ const MAX_SESSIONS: usize = 32;
 ///
 /// The mapping is a property of the response shape, not a judgement about the
 /// work: a started child, a status projection, a cancellation receipt, a
-/// reconciliation and a bounded rejection are all port outcomes, and only a
-/// genuine rejection is reported as one. Collapsing them would make a refused
-/// admission indistinguishable from a failed execution in the scrape.
+/// reconciliation, a bounded original-stream chunk and a bounded rejection
+/// are all port outcomes, and only a genuine rejection is reported as one.
+/// Collapsing them would make a refused admission indistinguishable from a
+/// failed execution in the scrape.
 #[cfg(windows)]
 fn local_port_outcome(response: &ProcessExecutionResponse) -> LocalPortOutcome {
     match response {
         ProcessExecutionResponse::Started(_)
         | ProcessExecutionResponse::Status(_)
         | ProcessExecutionResponse::Cancelled(_)
-        | ProcessExecutionResponse::Reconciled(_) => LocalPortOutcome::Succeeded,
+        | ProcessExecutionResponse::Reconciled(_)
+        | ProcessExecutionResponse::StreamChunk(_) => LocalPortOutcome::Succeeded,
         ProcessExecutionResponse::Rejected(_) => LocalPortOutcome::Rejected,
     }
 }

@@ -26,7 +26,9 @@ use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
     AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CausalBinding,
+    CausalWriteReceipt,
+    CommitId,
     DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
     ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF, ERASURE_PARAM_OPERATION_ID,
     ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
@@ -39,15 +41,18 @@ use eliot_store_api::{
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    audit_heads_digest, bind_issue18_receipt, bind_policy_config_schema_versions,
+    TransactionSequence, audit_heads_digest, bind_issue18_receipt,
+    bind_policy_config_schema_versions, committed_receipt_sequence,
     canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
     decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
     decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
-    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    is_genesis_fence, issue_genesis_receipt_envelope,
     named_mutation_operation_name, sha256_hex, validate_automation_read_params,
     validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
     validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    issue_store_receipt_envelope_with_causal, validate_store_receipt_envelope_with_causal,
+    verify_canonical_request_hash,
+    verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -3774,7 +3779,13 @@ fn existing_receipt(
         if receipt.idempotency_key == idempotency_key
             && receipt.canonical_request_hash == canonical_hash
         {
-            validate_store_receipt_envelope(ctx, transition, receipt)?;
+            let causal = memory_causal_binding(
+                state,
+                &transition.state_fence,
+                committed_receipt_sequence(receipt)?,
+                Some(operation_key),
+            )?;
+            validate_store_receipt_envelope_with_causal(ctx, transition, receipt, &causal)?;
             return Ok(Some(receipt.clone()));
         }
         return Err(StoreError::IdentityConflict);
@@ -3786,12 +3797,101 @@ fn existing_receipt(
             && existing_operation == operation_key
             && let Some(receipt) = state.receipts_by_operation.get(existing_operation)
         {
-            validate_store_receipt_envelope(ctx, transition, receipt)?;
+            let causal = memory_causal_binding(
+                state,
+                &transition.state_fence,
+                committed_receipt_sequence(receipt)?,
+                Some(existing_operation),
+            )?;
+            validate_store_receipt_envelope_with_causal(ctx, transition, receipt, &causal)?;
             return Ok(Some(receipt.clone()));
         }
         return Err(StoreError::IdentityConflict);
     }
     Ok(None)
+}
+
+/// Reconstructs the expected receipt-chain binding from the MemoryStore's
+/// canonical receipt rows. The envelope being validated is excluded from the
+/// predecessor scan; its own causal projection is never used as evidence.
+fn memory_causal_binding(
+    state: &MemoryState,
+    state_fence: &StateFence,
+    sequence: u64,
+    excluded_operation: Option<&str>,
+) -> Result<CausalBinding, StoreError> {
+    if sequence == 0 {
+        return Err(StoreError::InvalidReceipt);
+    }
+    if match excluded_operation {
+        Some(_) => state.next_commit_sequence <= sequence,
+        None => state.next_commit_sequence != sequence,
+    } {
+        return Err(StoreError::InvalidReceipt);
+    }
+
+    let mut prior = BTreeMap::<u64, &WriteReceipt>::new();
+    for (operation_key, receipt) in &state.receipts_by_operation {
+        if excluded_operation == Some(operation_key.as_str()) {
+            continue;
+        }
+        let prior_sequence = committed_receipt_sequence(receipt)?;
+        if prior_sequence == sequence {
+            return Err(StoreError::InvalidReceipt);
+        }
+        if prior_sequence > sequence {
+            if excluded_operation.is_none() {
+                return Err(StoreError::InvalidReceipt);
+            }
+            continue;
+        }
+        if receipt.operation_id.as_str() != operation_key.as_str()
+            || receipt.status != WriteReceiptStatus::Committed
+        {
+            return Err(StoreError::InvalidReceipt);
+        }
+        receipt.validate()?;
+        if prior.insert(prior_sequence, receipt).is_some() {
+            return Err(StoreError::InvalidReceipt);
+        }
+    }
+
+    let mut predecessor_receipt_id = None;
+    for expected_sequence in 1..sequence {
+        let receipt = prior
+            .remove(&expected_sequence)
+            .ok_or(StoreError::InvalidReceipt)?;
+        let envelope = receipt.require_reconciliation_envelope()?;
+        let expected_causal = CausalBinding {
+            state_fence: receipt.state_fence.clone(),
+            transaction_sequence: if expected_sequence == 1 {
+                TransactionSequence::genesis()
+            } else {
+                TransactionSequence::new(expected_sequence).map_err(StoreError::Foundation)?
+            },
+            parent_receipt_id: predecessor_receipt_id.clone(),
+            predecessor_receipt_ids: predecessor_receipt_id.iter().cloned().collect(),
+        };
+        if envelope.core.causal != expected_causal {
+            return Err(StoreError::InvalidReceipt);
+        }
+        predecessor_receipt_id = Some(envelope.identity.receipt_id.clone());
+    }
+
+    if !prior.is_empty() {
+        return Err(StoreError::InvalidReceipt);
+    }
+
+    Ok(CausalBinding {
+        state_fence: state_fence.clone(),
+        transaction_sequence: if sequence == 1 {
+            TransactionSequence::genesis()
+        } else {
+            TransactionSequence::new(sequence).map_err(StoreError::Foundation)?
+        },
+        parent_receipt_id: predecessor_receipt_id.clone(),
+        predecessor_receipt_ids: predecessor_receipt_id.into_iter().collect(),
+    })
 }
 
 fn validate_transaction_state(
@@ -3853,6 +3953,7 @@ fn validate_transaction_state(
 
 struct TransactionPlan {
     commit_sequence: u64,
+    causal: CausalBinding,
     revision_before_after: Vec<RevisionDelta>,
     next_revision_heads: Vec<RevisionHead>,
     next_ordering_heads: Vec<OrderingHead>,
@@ -3871,6 +3972,7 @@ fn transaction_plan(
     operation_key: &str,
 ) -> Result<TransactionPlan, StoreError> {
     let commit_sequence = state.next_commit_sequence;
+    let causal = memory_causal_binding(state, &transition.state_fence, commit_sequence, None)?;
     let next_commit_sequence =
         checked_increment(commit_sequence, "commit.sequence", "sequence overflow")?;
     let revision_keys = revision_keys(transition)?;
@@ -3931,6 +4033,7 @@ fn transaction_plan(
     )?;
     Ok(TransactionPlan {
         commit_sequence,
+        causal,
         revision_before_after,
         next_revision_heads,
         next_ordering_heads,
@@ -3988,11 +4091,12 @@ fn transaction_receipt(
         committed_at: Some(format!("commit-sequence-{:016}", plan.commit_sequence)),
         envelope: None,
     };
-    receipt.envelope = Some(issue_store_receipt_envelope(
+    receipt.envelope = Some(issue_store_receipt_envelope_with_causal(
         ctx,
         transition,
         &receipt,
         plan.commit_sequence,
+        &plan.causal,
     )?);
     receipt.validate()?;
     Ok(receipt)
@@ -4041,6 +4145,10 @@ fn commit_transaction(
                 .into_iter()
                 .map(|operation| ScopedNamedOperation {
                     scope_id: transition.scope_id.clone(),
+                    task_binding: receipt
+                        .envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.core.task.clone()),
                     operation,
                 }),
         );
@@ -4518,7 +4626,7 @@ impl MemoryStore {
         let suppressed = state
             .erased_subjects
             .contains(&(scope_id.to_string(), subject.to_owned()));
-        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = if suppressed {
+        let matched: Vec<(usize, &ScopedNamedOperation)> = if suppressed {
             Vec::new()
         } else {
             state
@@ -4535,18 +4643,19 @@ impl MemoryStore {
                             .and_then(Value::as_str)
                             == Some(subject)
                 })
-                .map(|(index, record)| (index, &record.operation))
+                .map(|(index, record)| (index, record))
                 .collect()
         };
         let matched_total = matched.len();
         let records: Vec<Value> = matched
             .into_iter()
             .take(limit)
-            .map(|(capture_index, operation)| {
+            .map(|(capture_index, record)| {
                 json!({
                     "capture_index": capture_index,
-                    "operation": named_mutation_operation_name(operation.operation),
-                    "parameters": operation.parameters,
+                    "operation": named_mutation_operation_name(record.operation.operation),
+                    "parameters": record.operation.parameters,
+                    "task_binding": record.task_binding,
                 })
             })
             .collect();
@@ -5120,6 +5229,22 @@ impl CanonicalStoreClient for MemoryStore {
         )
     }
 
+    async fn apply_prepared_with_causal(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<CausalWriteReceipt, StoreError> {
+        let receipt = self.apply_transaction(
+            ctx,
+            transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )?;
+        self.causal_write_receipt(receipt)
+    }
+
     async fn recovery(
         &self,
         request: StoreRecoveryRequest,
@@ -5137,6 +5262,16 @@ impl CanonicalStoreClient for MemoryStore {
 
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
         self.receipt_sync(&operation_id)
+    }
+
+    async fn receipt_with_causal(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<CausalWriteReceipt>, StoreError> {
+        let Some(receipt) = self.receipt_sync(&operation_id)? else {
+            return Ok(None);
+        };
+        self.causal_write_receipt(receipt).map(Some)
     }
 
     async fn revision_heads(
@@ -5173,6 +5308,26 @@ impl CanonicalStoreClient for MemoryStore {
 
     async fn health(&self) -> Result<StoreHealth, StoreError> {
         self.health_sync()
+    }
+}
+
+impl MemoryStore {
+    /// Projects the canonical receipt history while holding the MemoryStore
+    /// owner lock, excluding the receipt under validation from its own
+    /// predecessor scan.
+    fn causal_write_receipt(
+        &self,
+        receipt: WriteReceipt,
+    ) -> Result<CausalWriteReceipt, StoreError> {
+        let sequence = committed_receipt_sequence(&receipt)?;
+        let state = self.lock_state()?;
+        let causal = memory_causal_binding(
+            &state,
+            &receipt.state_fence,
+            sequence,
+            Some(receipt.operation_id.as_str()),
+        )?;
+        CausalWriteReceipt::new(receipt, causal)
     }
 }
 
@@ -5255,6 +5410,10 @@ fn genesis_receipt(
 #[derive(Clone, Debug, PartialEq)]
 struct ScopedNamedOperation {
     scope_id: ScopeId,
+    /// Original canonical receipt task binding retained beside the command.
+    /// This is copied from the validated receipt, not reconstructed from the
+    /// capture subject or payload parameters.
+    task_binding: Option<eliot_store_api::TaskBinding>,
     operation: eliot_store_api::NamedMutationRequest,
 }
 

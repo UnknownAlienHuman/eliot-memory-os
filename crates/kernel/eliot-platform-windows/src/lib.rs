@@ -91,6 +91,7 @@ thread_local! {
     };
 }
 
+pub mod blob_file_store;
 mod directory_publication;
 mod event_log;
 mod installer_authority_key;

@@ -9,6 +9,7 @@ description = "Store-neutral ELIOT canonical storage contracts"
 [dependencies]
 base64.workspace = true
 eliot-contracts = { workspace = true }
+eliot-blob-api = { workspace = true }
 eliot-evidence = { workspace = true }
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
 eliot-learning-contracts.workspace = true
