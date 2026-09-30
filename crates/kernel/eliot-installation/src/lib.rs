@@ -191,8 +191,9 @@ pub use integration_discovery::{
 pub use isolated_destination::{
     IsolatedDestinationAdmissionInput, IsolatedDestinationAllocation, IsolatedDestinationError,
     IsolatedDestinationRefusal, IsolationEvidence, PREPARED_DESTINATION_ADMISSION_WIRE,
-    PreparedDestinationAdmission, PreparedDestinationFacts, ProposedRestorationRequirements,
-    admit_prepared_isolated_destination,
+    PREPARED_DESTINATION_MATERIALISATION_WIRE, PreparedDestinationAdmission,
+    PreparedDestinationFacts, PreparedDestinationMaterialisation, ProposedRestorationRequirements,
+    admit_prepared_isolated_destination, materialise_prepared_isolated_destination,
 };
 
 pub use managed_change_plan::{
