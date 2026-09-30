@@ -1111,6 +1111,248 @@ struct CodeCortexCompileBatch {
     pending_persistence: Option<CodeCortexReport>,
 }
 
+const LSP_OBSERVATION_BLOB_SCHEMA_VERSION: &str = "eliot.lsp_observation_blob.v1";
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct LspObservationBlobReceiptV1 {
+    schema_version: String,
+    blob: eliot_types::BlobRef,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LspToolObservationInputV1 {
+    receipt_kind: String,
+    receipt_body: eliot_lsp_bridge::RetainedLspObservationV1,
+}
+
+struct LoadedLspObservation {
+    adopted: eliot_code_cortex::ValidatedLspObservation,
+    blob: eliot_types::BlobRef,
+    workspace_root: String,
+    path: Option<String>,
+    symbol: Option<String>,
+}
+
+struct LspObservationLoad {
+    observations: Vec<LoadedLspObservation>,
+    gaps: Vec<String>,
+}
+
+fn retain_lsp_observation_payload(state: &McpState, payload: Value) -> Result<Value> {
+    let input: LspToolObservationInputV1 = serde_json::from_value(payload)
+        .context("decode retained LSP observation before immutable blob storage")?;
+    anyhow::ensure!(
+        input.receipt_kind == eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND,
+        "LSP observation receipt kind does not match the bridge contract"
+    );
+    let bytes = serde_json::to_vec(&input.receipt_body)
+        .context("serialize the typed retained LSP observation")?;
+    let blob = BlobStore::open(&state.blob_store)?.put_bytes(&bytes)?;
+    let receipt_body = LspObservationBlobReceiptV1 {
+        schema_version: LSP_OBSERVATION_BLOB_SCHEMA_VERSION.to_owned(),
+        blob,
+    };
+    Ok(json!({
+        "receipt_kind": eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND,
+        "receipt_body": receipt_body,
+    }))
+}
+
+async fn read_retained_lsp_observations(
+    state: &McpState,
+    project_id: ProjectId,
+    task_id: &str,
+) -> Result<LspObservationLoad> {
+    let task_id = TaskId::from_str(task_id).context("parse task id for LSP observation lookup")?;
+    let records = state
+        .store
+        .tool_observations_by_kind(
+            project_id,
+            task_id,
+            eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND,
+        )
+        .await?;
+    let blob_store = BlobStore::open(&state.blob_store)?;
+    let mut load = LspObservationLoad {
+        observations: Vec::new(),
+        gaps: Vec::new(),
+    };
+    if records.is_empty() {
+        load.gaps
+            .push("no canonical retained LSP observation exists for this project/task".to_owned());
+        return Ok(load);
+    }
+    if records.len() == 256 {
+        load.gaps.push(
+            "canonical LSP observation query reached its 256-record bound; retained coverage may be incomplete"
+                .to_owned(),
+        );
+    }
+
+    for record in records {
+        let source = format!("canonical observation {}", record.observation_id);
+        let receipt_kind = record
+            .payload
+            .get("receipt_kind")
+            .and_then(Value::as_str);
+        if receipt_kind != Some(eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND) {
+            load.gaps.push(format!(
+                "{source} was returned by the LSP receipt query with a mismatched receipt kind"
+            ));
+            continue;
+        }
+        let Some(receipt_body) = record.payload.get("receipt_body").cloned() else {
+            load.gaps
+                .push(format!("{source} has no immutable observation blob reference"));
+            continue;
+        };
+        let blob_receipt = match serde_json::from_value::<LspObservationBlobReceiptV1>(receipt_body)
+        {
+            Ok(receipt) if receipt.schema_version == LSP_OBSERVATION_BLOB_SCHEMA_VERSION => receipt,
+            Ok(_) => {
+                load.gaps.push(format!(
+                    "{source} has an unsupported observation blob receipt schema"
+                ));
+                continue;
+            }
+            Err(error) => {
+                load.gaps.push(format!(
+                    "{source} has an invalid observation blob reference: {error}"
+                ));
+                continue;
+            }
+        };
+        let blob = blob_receipt.blob;
+        let bytes = match blob_store.read_verified(&blob) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                load.gaps.push(format!(
+                    "{source} blob blake3:{} failed verified read: {error}",
+                    blob.digest_hex
+                ));
+                continue;
+            }
+        };
+        let retained = match serde_json::from_slice::<
+            eliot_lsp_bridge::RetainedLspObservationV1,
+        >(&bytes)
+        {
+            Ok(retained) => retained,
+            Err(error) => {
+                load.gaps.push(format!(
+                    "{source} blob blake3:{} is not a retained LSP observation: {error}",
+                    blob.digest_hex
+                ));
+                continue;
+            }
+        };
+        if retained.receipt_kind != eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND {
+            load.gaps.push(format!(
+                "{source} blob blake3:{} carries a foreign bridge receipt kind",
+                blob.digest_hex
+            ));
+            continue;
+        }
+        let workspace_root = retained.source_candidate.workspace_root.clone();
+        let path = retained.source_candidate.path.clone();
+        let symbol = retained.source_candidate.symbol.clone();
+        let adopted = match eliot_code_cortex::ValidatedLspObservation::adopt(
+            record.observation_id.clone(),
+            retained,
+        ) {
+            Ok(adopted) => adopted,
+            Err(error) => {
+                load.gaps.push(format!(
+                    "{source} blob blake3:{} was rejected by bridge historical adoption: {error}",
+                    blob.digest_hex
+                ));
+                continue;
+            }
+        };
+        load.observations.push(LoadedLspObservation {
+            adopted,
+            blob,
+            workspace_root,
+            path,
+            symbol,
+        });
+    }
+    Ok(load)
+}
+
+async fn resolve_authenticated_packet_git_scope(
+    request: &CompilePacketL3Request,
+    task: Option<&TaskContract>,
+) -> Result<Option<(PathBuf, eliot_types::memory::GovernedGitScope)>> {
+    let Some(task) = task.filter(|task| {
+        task.project_id == request.project_id
+            && task.task_id.to_string() == request.task_id
+            && matches!(task.status, TaskContractStatus::Active | TaskContractStatus::DoneVerified)
+    }) else {
+        return Ok(None);
+    };
+    let Some(provenance) = task.action_provenance.as_ref() else {
+        return Ok(None);
+    };
+    if provenance.task_id != task.task_id {
+        anyhow::bail!("task action provenance names a different task");
+    }
+    let mut material = provenance.clone();
+    let expected_hash = material.hash.clone();
+    material.hash.clear();
+    anyhow::ensure!(
+        canonical_struct_hash(&material)? == expected_hash,
+        "task action provenance hash does not validate"
+    );
+    if provenance.source_scope.kind != "git_worktree" {
+        return Ok(None);
+    }
+    let worktree = provenance
+        .source_scope
+        .worktree_ref
+        .as_deref()
+        .context("authenticated Git task provenance has no worktree reference")?;
+    let root = tokio::fs::canonicalize(worktree)
+        .await
+        .context("canonicalize authenticated packet worktree")?;
+    let scope = resolve_packet_git_scope(&root, request.project_id).await?;
+    Ok(Some((root, scope)))
+}
+
+fn same_packet_workspace(left: &str, right: &str) -> bool {
+    let normalize = |path: &str| {
+        path.replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    normalize(left) == normalize(right)
+}
+
+fn selector_matches_lsp_candidate(
+    path: Option<&str>,
+    symbol: Option<&str>,
+    selectors: &[String],
+) -> bool {
+    let matches_path = path.is_none_or(|candidate| {
+        selectors.iter().any(|selector| {
+            selector
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_ascii_lowercase()
+                == candidate
+                    .replace('\\', "/")
+                    .trim_end_matches('/')
+                    .to_ascii_lowercase()
+        })
+    });
+    let matches_symbol = symbol.is_none_or(|candidate| {
+        selectors.iter().any(|selector| selector == candidate)
+    });
+    matches_path && matches_symbol
+}
+
 async fn fresh_codecortex_reports(
     state: &McpState,
     request: &CompilePacketL3Request,
@@ -1124,13 +1366,14 @@ async fn fresh_codecortex_reports(
             pending_persistence: None,
         });
     }
-    let mut exact_patterns = request.candidate_handles.clone();
+    let mut selectors = request.candidate_handles.clone();
     if let Some(frame) = frame {
-        exact_patterns.extend(frame.predicted_changed_paths.iter().cloned());
-        exact_patterns.extend(frame.exact_load_bearing_atoms.iter().cloned());
+        selectors.extend(frame.predicted_changed_paths.iter().cloned());
+        selectors.extend(frame.exact_load_bearing_atoms.iter().cloned());
     }
-    exact_patterns.sort();
-    exact_patterns.dedup();
+    selectors.sort();
+    selectors.dedup();
+    let mut exact_patterns = selectors.clone();
     exact_patterns.truncate(32);
     let codecortex_request = CodeCortexRequest {
         project: request.project_id.to_string(),
@@ -1139,11 +1382,50 @@ async fn fresh_codecortex_reports(
         exact_patterns,
         max_files: 160,
         max_matches_per_pattern: 24,
-        include_diagnostics: false,
+        include_diagnostics: true,
     };
+
+    let mut lsp_gaps = Vec::new();
+    let current_git_scope = match resolve_authenticated_packet_git_scope(request, task).await {
+        Ok(scope) => scope,
+        Err(error) => {
+            lsp_gaps.push(format!(
+                "authenticated task source scope could not be resolved: {error}"
+            ));
+            None
+        }
+    };
+    if current_git_scope.is_none() && lsp_gaps.is_empty() {
+        lsp_gaps.push(
+            "no independently authenticated current Git worktree is available for LSP scope matching"
+                .to_owned(),
+        );
+    }
+    if current_git_scope
+        .as_ref()
+        .is_some_and(|(_, scope)| !scope.clean)
+    {
+        lsp_gaps.push(
+            "authenticated task worktree has uncommitted changes; retained LSP observations remain historical and stale"
+                .to_owned(),
+        );
+    }
+    let loaded = match read_retained_lsp_observations(state, request.project_id, &request.task_id)
+        .await
+    {
+        Ok(loaded) => loaded,
+        Err(error) => LspObservationLoad {
+            observations: Vec::new(),
+            gaps: vec![format!(
+                "canonical retained LSP observations could not be loaded: {error}"
+            )],
+        },
+    };
+    lsp_gaps.extend(loaded.gaps);
+
     let runtime_root = state.root.clone();
     let task = task.cloned();
-    tokio::task::spawn_blocking(move || {
+    let mut batch = tokio::task::spawn_blocking(move || {
         let project_root = resolve_codecortex_repo_root(&runtime_root, task.as_ref())?;
         let service = CodeCortexService::new(project_root);
         if let Some(report) = latest_codecortex_report(&runtime_root)?
@@ -1161,7 +1443,119 @@ async fn fresh_codecortex_reports(
         })
     })
     .await
-    .context("join packet CodeCortex grounding worker")?
+    .context("join packet CodeCortex grounding worker")??;
+
+    let mut accepted = Vec::new();
+    if let Some((current_root, _)) = current_git_scope.as_ref() {
+        let current_root = current_root.display().to_string();
+        for observation in loaded.observations {
+            let source = observation.adopted.source_handle().to_owned();
+            if !same_packet_workspace(&observation.workspace_root, &current_root) {
+                lsp_gaps.push(format!(
+                    "canonical observation {source} workspace does not match the authenticated task worktree"
+                ));
+                continue;
+            }
+            if !selector_matches_lsp_candidate(
+                observation.path.as_deref(),
+                observation.symbol.as_deref(),
+                &selectors,
+            ) {
+                lsp_gaps.push(format!(
+                    "canonical observation {source} path/symbol candidate does not match the current task selectors"
+                ));
+                continue;
+            }
+            accepted.push(observation);
+        }
+    } else {
+        for observation in loaded.observations {
+            lsp_gaps.push(format!(
+                "canonical observation {} was bridge-adopted but not attached because current authenticated source scope is unavailable",
+                observation.adopted.source_handle()
+            ));
+        }
+    }
+
+    let mut projected_lsp_observations = Vec::new();
+    if let Some((current_root, _)) = current_git_scope
+        .as_ref()
+        .filter(|_| !accepted.is_empty())
+    {
+        let composed = eliot_code_cortex::CodeCortexService::with_lsp_observations(
+            accepted
+                .iter()
+                .map(|observation| observation.adopted.clone())
+                .collect(),
+        )
+        .and_then(|service| {
+            service.compose(&eliot_code_cortex::CompositionRequest {
+                task_id: request.task_id.clone(),
+                goal: request.goal.clone(),
+                scope: current_root.display().to_string(),
+                max_relations: 1,
+                max_nodes: 1,
+            })
+        });
+        match composed {
+            Ok(composition) => {
+                for gap in composition.coverage_gaps {
+                    lsp_gaps.push(format!("LSP compositor gap: {}", gap.reason));
+                }
+                for observation in &accepted {
+                    let handle = observation.adopted.source_handle();
+                    if !composition
+                        .evidence_handles
+                        .iter()
+                        .any(|item| item.as_str() == handle)
+                    {
+                        lsp_gaps.push(format!(
+                            "canonical observation {handle} was not retained as a CodeCortex evidence handle"
+                        ));
+                        continue;
+                    }
+                    let (has_diagnostics, diagnostics) = match observation.adopted.result() {
+                        eliot_lsp_bridge::NormalizedResult::Diagnostics {
+                            observations, ..
+                        } => (
+                            true,
+                            observations
+                                .iter()
+                                .map(|diagnostic| eliot_types::DiagnosticEvidence {
+                                    source: eliot_types::CodeEvidenceSource::Diagnostics,
+                                    status: "historical_observation".to_owned(),
+                                    path: Some(diagnostic.file.clone()),
+                                    line: Some(diagnostic.line),
+                                    severity: format!("{:?}", diagnostic.severity)
+                                        .to_ascii_lowercase(),
+                                    message: diagnostic.message.clone(),
+                                })
+                                .collect(),
+                        ),
+                        _ => (false, Vec::new()),
+                    };
+                    projected_lsp_observations.push((
+                        handle.to_owned(),
+                        observation.blob.digest_hex.clone(),
+                        has_diagnostics,
+                        diagnostics,
+                    ));
+                }
+            }
+            Err(error) => lsp_gaps.push(format!(
+                "bridge-adopted observations could not be composed by CodeCortex: {error}"
+            )),
+        }
+    }
+
+    eliot_engine::codecortex::append_historical_lsp_evidence(
+        &mut batch.reports[0],
+        projected_lsp_observations,
+        &lsp_gaps,
+    );
+    batch.reports[0].generated_at = time::OffsetDateTime::now_utc();
+    batch.pending_persistence = Some(batch.reports[0].clone());
+    Ok(batch)
 }
 
 fn persist_pending_codecortex_projection(
@@ -3434,7 +3828,17 @@ async fn dispatch_write_cognitive_observation(
     }
     let project_id = parse_project_id(&input.project_id)?;
     let task_id = TaskId::from_str(&input.task_id).context("parse task id")?;
-    let payload_hash = blake3::hash(&serde_json::to_vec(&input.payload)?)
+    let is_lsp_observation = input
+        .payload
+        .get("receipt_kind")
+        .and_then(Value::as_str)
+        == Some(eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND);
+    let payload = if is_lsp_observation {
+        retain_lsp_observation_payload(state, input.payload)?
+    } else {
+        input.payload
+    };
+    let payload_hash = blake3::hash(&serde_json::to_vec(&payload)?)
         .to_hex()
         .to_string();
     let write_id = input.write_id.as_deref().map_or_else(
@@ -3448,22 +3852,39 @@ async fn dispatch_write_cognitive_observation(
         },
         |value| WriteId::from_str(value).context("parse write id"),
     )?;
-    let tool_name = input
-        .payload
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .unwrap_or("eliot-worker")
-        .to_owned();
-    let observation = input
-        .payload
-        .get("error")
-        .or_else(|| input.payload.get("diagnostic"))
-        .or_else(|| input.payload.get("message"))
-        .and_then(Value::as_str)
-        .map_or_else(
-            || format!("cognitive observation {}", &payload_hash[..16]),
-            str::to_owned,
-        );
+    let tool_name = if is_lsp_observation {
+        "eliot-lsp-bridge".to_owned()
+    } else {
+        payload
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or("eliot-worker")
+            .to_owned()
+    };
+    let observation = if is_lsp_observation {
+        "retained LSP observation; bridge adoption is required".to_owned()
+    } else {
+        payload
+            .get("error")
+            .or_else(|| payload.get("diagnostic"))
+            .or_else(|| payload.get("message"))
+            .and_then(Value::as_str)
+            .map_or_else(
+                || format!("cognitive observation {}", &payload_hash[..16]),
+                str::to_owned,
+            )
+    };
+    let (authority, taint) = if is_lsp_observation {
+        (
+            "received bridge observation; adoption is required",
+            TaintClass::ExternalAgent,
+        )
+    } else {
+        (
+            "model-owned Part-E cognitive observation",
+            TaintClass::LocalVerified,
+        )
+    };
     let command = SemanticCommand::ToolObservationRecord(ToolObservationRecordCommand {
         context: CommandContext {
             write_id,
@@ -3472,14 +3893,14 @@ async fn dispatch_write_cognitive_observation(
             project_id,
             task_id: Some(task_id),
             scope: format!("eliot/task/{task_id}/cognitive-observation"),
-            authority: "model-owned Part-E cognitive observation".to_owned(),
+            authority: authority.to_owned(),
             visibility: Visibility::Internal,
-            taint: TaintClass::LocalVerified,
+            taint,
             lifecycle_status: LifecycleStatus::Active,
         },
         tool_name,
         observation,
-        payload: input.payload,
+        payload,
     });
     let envelope = WriteAdmissionService.admit(&command)?;
     let receipt = state.writer.submit(envelope).await?;

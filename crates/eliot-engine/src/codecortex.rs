@@ -203,6 +203,83 @@ fn diagnostic_availability(include_diagnostics: bool) -> VerifierEvidence {
     }
 }
 
+/// Adds LSP evidence that the bridge has validated from its retained raw
+/// observation. This projection is historical and read-only: it never turns
+/// diagnostics into a successful verifier result or upgrades the report's
+/// operation status.
+pub fn append_historical_lsp_evidence(
+    report: &mut CodeCortexReport,
+    observations: Vec<(String, String, bool, Vec<DiagnosticEvidence>)>,
+    gaps: &[String],
+) {
+    let has_observations = !observations.is_empty();
+    let has_diagnostic_result = observations.iter().any(|(_, _, has_diagnostics, _)| *has_diagnostics);
+    report
+        .diagnostic_evidence
+        .retain(|item| item.status != "historical_observation");
+    report
+        .verifier_evidence
+        .retain(|item| !matches!(item.name.as_str(), "lsp_observation" | "lsp_observation_gap"));
+    report.adapter_notes.retain(|item| {
+        !item.starts_with("read-only historical LSP evidence:")
+            && !item.starts_with("LSP observation gap:")
+    });
+    if let Some(adapter) = report
+        .verifier_evidence
+        .iter_mut()
+        .find(|item| item.name == "diagnostics_adapter")
+    {
+        if !has_diagnostic_result {
+            adapter.status = "unavailable".to_owned();
+            if !gaps.is_empty() {
+                adapter.summary = format!(
+                    "no bridge-adopted diagnostics result was attached; {}",
+                    gaps.join("; ")
+                );
+            } else if has_observations {
+                adapter.summary = "retained LSP observations contain no diagnostics result; CodeCortex does not execute diagnostics".to_owned();
+            }
+        } else {
+            adapter.status = "historical_observation".to_owned();
+            adapter.summary = "bridge-adopted LSP observations are historical and stale because independent current source and executable/profile verification is unavailable; no verifier pass is implied".to_owned();
+        }
+    }
+
+    for (observation_handle, blob_digest, _, diagnostics) in observations {
+        let provenance = format!(
+            "canonical observation {observation_handle}; verified blob blake3:{blob_digest}"
+        );
+        report.adapter_notes.push(format!(
+            "read-only historical LSP evidence: {provenance}; freshness remains stale"
+        ));
+        report.verifier_evidence.push(VerifierEvidence {
+            name: "lsp_observation".to_owned(),
+            command: "retained bridge observation adoption".to_owned(),
+            status: "historical_observation".to_owned(),
+            summary: format!(
+                "{provenance}; original raw bytes and bridge bindings were validated; current source/executable/profile authority is unavailable"
+            ),
+            source: CodeEvidenceSource::Diagnostics,
+        });
+        report.diagnostic_evidence.extend(diagnostics);
+    }
+
+    for gap in gaps {
+        report.verifier_evidence.push(VerifierEvidence {
+            name: "lsp_observation_gap".to_owned(),
+            command: "load and adopt retained bridge observation".to_owned(),
+            status: "unavailable".to_owned(),
+            summary: gap.clone(),
+            source: CodeEvidenceSource::Diagnostics,
+        });
+        report.adapter_notes.push(format!("LSP observation gap: {gap}"));
+    }
+
+    if has_observations || !gaps.is_empty() {
+        report.operation_status = OperationStatus::Blocked;
+    }
+}
+
 fn resolve_repo_root(root: &Path) -> Result<PathBuf, EngineError> {
     let git_root = run_process(root, "git", &["rev-parse", "--show-toplevel"])?;
     Ok(if git_root.status {

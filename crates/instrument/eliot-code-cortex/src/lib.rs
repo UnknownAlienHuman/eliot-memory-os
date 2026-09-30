@@ -12,6 +12,10 @@ use eliot_graph_api::{
     GraphCoverage, GraphEdge, GraphFreshness, GraphNode, GraphQueryResult, GraphRevision,
 };
 use eliot_instrument_api::{EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
+use eliot_lsp_bridge::{
+    Coverage as LspCoverage, FailureDisposition as LspFailureDisposition, Freshness as LspFreshness,
+    NormalizedResult, RetainedLspObservationV1, adopt_retained_observation,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,6 +142,48 @@ pub struct IndexSnapshot {
     pub revision: GraphRevision,
     pub graph_results: Vec<GraphQueryResult>,
     pub instrument_evidence: Vec<NormalizedEvidence>,
+    pub lsp_observations: Vec<ValidatedLspObservation>,
+}
+
+/// One LSP observation whose original retained bytes, process evidence,
+/// invocation bindings, and normalized result passed the bridge's
+/// historical adoption boundary. Historical adoption deliberately carries
+/// stale freshness until independent current source and executable/profile
+/// owners are available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedLspObservation {
+    source_handle: String,
+    result: NormalizedResult,
+}
+
+impl ValidatedLspObservation {
+    pub fn adopt(
+        source_handle: impl Into<String>,
+        record: RetainedLspObservationV1,
+    ) -> Result<Self, CodeCortexError> {
+        let source_handle = source_handle.into();
+        if source_handle.trim().is_empty() {
+            return Err(CodeCortexError::InvalidEvidence(
+                "LSP source handle is blank".to_owned(),
+            ));
+        }
+        let result = adopt_retained_observation(record)
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        Ok(Self {
+            source_handle,
+            result,
+        })
+    }
+
+    #[must_use]
+    pub fn source_handle(&self) -> &str {
+        &self.source_handle
+    }
+
+    #[must_use]
+    pub fn result(&self) -> &NormalizedResult {
+        &self.result
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -145,6 +191,7 @@ pub struct SemanticIndex {
     revision: u64,
     graphs: BTreeMap<String, GraphQueryResult>,
     evidence: BTreeMap<String, NormalizedEvidence>,
+    lsp_observations: BTreeMap<String, ValidatedLspObservation>,
 }
 
 impl SemanticIndex {
@@ -203,6 +250,23 @@ impl SemanticIndex {
         Ok(revision)
     }
 
+    /// Admits bridge-adopted LSP observations under their original canonical
+    /// store handles. The bridge validates the retained invocation, process
+    /// evidence, raw outputs, and normalized result before this method can
+    /// receive the private-field wrapper.
+    pub fn admit_lsp_observation_batch(
+        &mut self,
+        observations: Vec<ValidatedLspObservation>,
+    ) -> Result<GraphRevision, CodeCortexError> {
+        let mut revision = self.revision()?;
+        for observation in observations {
+            let key = observation.source_handle.clone();
+            self.lsp_observations.insert(key, observation);
+            revision = self.bump()?;
+        }
+        Ok(revision)
+    }
+
     pub fn snapshot(&self) -> IndexSnapshot {
         let revision = self
             .revision()
@@ -211,6 +275,7 @@ impl SemanticIndex {
             revision,
             graph_results: self.graphs.values().cloned().collect(),
             instrument_evidence: self.evidence.values().cloned().collect(),
+            lsp_observations: self.lsp_observations.values().cloned().collect(),
         }
     }
 
@@ -242,6 +307,20 @@ impl CodeCortexService {
     pub fn with_evidence(evidence: Vec<NormalizedEvidence>) -> Result<Self, CodeCortexError> {
         let mut index = SemanticIndex::new();
         index.admit_evidence_batch(evidence)?;
+        Ok(Self { index })
+    }
+
+    /// Builds a compositor from LSP receipts that have passed historical
+    /// bridge adoption. Their original process/raw-result bindings remain
+    /// attached to the receipt in the canonical store; because this caller
+    /// has no independent current LSP profile owner, the historical bridge
+    /// receipt is represented as stale/unknown and cannot establish a clean
+    /// current result.
+    pub fn with_lsp_observations(
+        observations: Vec<ValidatedLspObservation>,
+    ) -> Result<Self, CodeCortexError> {
+        let mut index = SemanticIndex::new();
+        index.admit_lsp_observation_batch(observations)?;
         Ok(Self { index })
     }
 
@@ -340,6 +419,53 @@ pub fn compose_snapshot(
         }
     }
 
+    for observation in &snapshot.lsp_observations {
+        handles.insert(observation.source_handle.clone());
+        let receipt = observation.result.receipt();
+        if !matches!(receipt.freshness, LspFreshness::Current) {
+            gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: "historical LSP observation is stale; current source and executable/profile binding are unavailable".to_owned(),
+                cheapest_probe: Some(
+                    "obtain independent current source and admitted LSP executable/profile context".to_owned(),
+                ),
+            });
+        }
+        if !matches!(receipt.disposition, LspFailureDisposition::Success) {
+            gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: "LSP observation records an unsuccessful or incomplete tool disposition".to_owned(),
+                cheapest_probe: Some(
+                    "capture a complete observation with the admitted LSP profile".to_owned(),
+                ),
+            });
+        }
+        match &receipt.coverage {
+            LspCoverage::Workspace { root } if same_workspace(root, &request.scope) => {}
+            LspCoverage::Workspace { .. } => gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: "LSP workspace coverage does not match the current compositor scope".to_owned(),
+                cheapest_probe: Some(
+                    "capture diagnostics for the exact authenticated worktree".to_owned(),
+                ),
+            }),
+            LspCoverage::SymbolSubset { .. } | LspCoverage::SingleSymbol { .. } => {
+                gaps.push(CoverageGap {
+                    scope: request.scope.clone(),
+                    reason: "LSP observation covers only a selected symbol or path subset".to_owned(),
+                    cheapest_probe: Some(
+                        "capture the declared workspace scope before making broader claims".to_owned(),
+                    ),
+                });
+            }
+            LspCoverage::ProbeOnly => gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: "LSP observation is a version probe and covers no source".to_owned(),
+                cheapest_probe: Some("request a source-scoped LSP operation".to_owned()),
+            }),
+        }
+    }
+
     let entrypoints = nodes
         .values()
         .take(request.max_nodes)
@@ -372,6 +498,11 @@ pub fn compose_snapshot(
         coverage_gaps: gaps,
         expansion_handles,
     })
+}
+
+fn same_workspace(left: &str, right: &str) -> bool {
+    let normalize = |path: &str| path.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    normalize(left) == normalize(right)
 }
 
 fn add_edge(
