@@ -2428,15 +2428,15 @@ impl KernelStoreGateway {
         // that already reached `Routed` proves the possible effect durably, and
         // this contour never moves a row backward out of it.
         let missing = match existing.state {
-            HostRequestState::Requested => vec![
-                HostRequestState::Admitted,
-                HostRequestState::Routed,
-            ],
+            HostRequestState::Requested => {
+                vec![HostRequestState::Admitted, HostRequestState::Routed]
+            }
             HostRequestState::Admitted => vec![HostRequestState::Routed],
             _ => Vec::new(),
         };
         for target in missing {
-            match ors.advance_host_request(&operation_id, &obligation.request_digest, target, None) {
+            match ors.advance_host_request(&operation_id, &obligation.request_digest, target, None)
+            {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     return Err(unretained_obligation_reason(
