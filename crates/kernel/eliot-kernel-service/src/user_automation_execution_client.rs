@@ -26,8 +26,8 @@ use super::{
     UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationReadback, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
-    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
-    UserAutomationWakeReadback,
+    UserAutomationWakeOccurrencePublication, UserAutomationWakePort,
+    UserAutomationWakePublication, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 
 /// Persisted observer for the authenticated cancellation transport boundary.
@@ -531,6 +531,19 @@ pub enum UserAutomationHostExecutionOperation {
         /// Original Human RunNow identity and owner-issued invocation.
         request: Box<UserAutomationWakeReadRequest>,
     },
+    /// Publish the pending wake of one committed manual (run-now) occurrence.
+    ///
+    /// This is an additive variant of the externally tagged, `deny_unknown_fields`
+    /// operation enum, by the same rule `OutcomeSettled` states: no existing
+    /// variant, member name, or digest input changed, and an older peer that
+    /// cannot decode it fails closed rather than answering another owner effect.
+    /// It travels no calendar occurrence key and does not extend any
+    /// occurrence denominator; it names one already-committed manual occurrence
+    /// under its own parent `RunNow` identity.
+    PublishOccurrenceWake {
+        /// Committed occurrence, manual nonce, and parent RunNow identity.
+        request: Box<UserAutomationWakeOccurrencePublication>,
+    },
     /// Enumerate the complete committed denominator from one Host snapshot.
     EnumeratePendingWakes {
         /// Immutable revision, full occurrence denominator, and digest.
@@ -605,6 +618,19 @@ impl UserAutomationHostExecutionRequest {
         Self::new(
             channel,
             UserAutomationHostExecutionOperation::ReadPendingWake {
+                request: request.into(),
+            },
+        )
+    }
+
+    /// Builds and hashes one typed manual-occurrence wake publication carrier.
+    pub fn publish_occurrence_wake(
+        channel: UserAutomationHostChannelBinding,
+        request: impl Into<Box<UserAutomationWakeOccurrencePublication>>,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        Self::new(
+            channel,
+            UserAutomationHostExecutionOperation::PublishOccurrenceWake {
                 request: request.into(),
             },
         )
@@ -757,6 +783,18 @@ impl UserAutomationHostExecutionRequest {
                     .map_err(|error| rejected(format!("wake read: {error}")))?;
                 if request.context.state_fence != self.channel.state_fence {
                     return Err(rejected("wake read channel fence mismatch"));
+                }
+            }
+            UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
+                request
+                    .validate()
+                    .map_err(|error| rejected(format!("occurrence wake publication: {error}")))?;
+                if request.context.state_fence != self.channel.state_fence
+                    || request.state_fence != self.channel.state_fence
+                {
+                    return Err(rejected(
+                        "occurrence wake publication channel fence mismatch",
+                    ));
                 }
             }
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
@@ -985,6 +1023,18 @@ impl UserAutomationHostExecutionResponse {
             ) => readback
                 .validate_for(request)
                 .map_err(|_| UserAutomationRuntimeError::IdentityConflict),
+            // The owner's retained readback is the only thing that makes a
+            // manual wake published, so it is checked here against the exact
+            // publication: this occurrence, this State Fence, exactly the
+            // published intent, and the committed parent RunNow operation
+            // identity. A response that does not account for the request is a
+            // foreign answer, never a partial success.
+            (
+                UserAutomationHostExecutionOperation::PublishOccurrenceWake { request },
+                Self::WakeRead { readback, .. },
+            ) => readback
+                .validate_for_occurrence_publication(request)
+                .map_err(|_| UserAutomationRuntimeError::IdentityConflict),
             (
                 UserAutomationHostExecutionOperation::EnumeratePendingWakes {
                     request: enumeration_request,
@@ -1061,6 +1111,14 @@ impl UserAutomationHostExecutionResponse {
             | (
                 UserAutomationHostExecutionOperation::ReadPendingWake { .. },
                 Self::Cancelled { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::PublishOccurrenceWake { .. },
+                Self::Admitted { .. }
+                | Self::Cancelled { .. }
+                | Self::WakeEnumeration { .. }
+                | Self::WakeCancellationBatchReadback { .. }
+                | Self::WakeHorizonPublication { .. },
             )
             | (
                 UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
@@ -1151,7 +1209,10 @@ fn request_context(request: &UserAutomationHostExecutionRequest) -> &RequestMeta
         | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
             &request.context
         }
-        UserAutomationHostExecutionOperation::ReadPendingWake { request } => &request.context,
+        UserAutomationHostExecutionOperation::ReadPendingWake { request }
+        | UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
+            &request.context
+        }
         UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => &request.context,
         UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
         | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
@@ -1794,6 +1855,37 @@ where
         }
     }
 
+    /// Publishes the pending wake of one committed manual (run-now) occurrence
+    /// through the authenticated Host execution transport.
+    ///
+    /// Only the wake owner's own retained readback is returned. The `WakeIntent`
+    /// this schedules grants no task, route, tool, effect, or delivery authority,
+    /// and a published occurrence wake is never permission to pre-admit a
+    /// Durable Job: the deterministic preflight still runs afterwards over the
+    /// same readback.
+    pub async fn publish_occurrence_wake(
+        &self,
+        request: impl Into<Box<UserAutomationWakeOccurrencePublication>>,
+    ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        let carrier = UserAutomationHostExecutionRequest::publish_occurrence_wake(
+            self.transport.channel_binding().clone(),
+            request,
+        )?;
+        match self.execute(carrier).await? {
+            UserAutomationHostExecutionResponse::WakeRead { readback, .. } => Ok(readback),
+            UserAutomationHostExecutionResponse::Admitted { .. }
+            | UserAutomationHostExecutionResponse::Cancelled { .. }
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. }
+            | UserAutomationHostExecutionResponse::WakeHorizonPublication { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
+            }
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
+            }
+        }
+    }
+
     /// Enumerates every committed occurrence from one authenticated Host
     /// snapshot and validates its receipt against this exact channel.
     pub async fn enumerate_pending_wakes(
@@ -1946,6 +2038,18 @@ impl<T> UserAutomationWakePort for UserAutomationHostExecutionClient<T>
 where
     T: UserAutomationHostExecutionTransport,
 {
+    /// Publishes one committed manual occurrence's pending wake over the
+    /// authenticated Host execution transport. Without this override the
+    /// operator route would resolve the trait default and answer `Unavailable`
+    /// for every run-now occurrence, so it is the durable owner effect that
+    /// makes a run-now wake provable.
+    async fn publish_occurrence_wake(
+        &self,
+        request: impl Into<Box<UserAutomationWakeOccurrencePublication>>,
+    ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        UserAutomationHostExecutionClient::publish_occurrence_wake(self, request).await
+    }
+
     /// Publishes one bounded recurring horizon over the authenticated Host
     /// execution transport. This is the durable owner effect the operator route
     /// reaches: only the owner's acknowledgement, checked against the exact

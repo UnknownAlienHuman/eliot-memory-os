@@ -103,6 +103,7 @@ where
             UserAutomationHostExecutionOperation::CancelPendingWakes { .. }
             | UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. }
             | UserAutomationHostExecutionOperation::ReadCancellationBatch { .. }
+            | UserAutomationHostExecutionOperation::PublishOccurrenceWake { .. }
             | UserAutomationHostExecutionOperation::PublishWakeHorizon { .. }
             | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
@@ -157,6 +158,19 @@ where
             }
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 let readback = self.wake.read_pending_wake(request).await?;
+                Ok(UserAutomationHostExecutionResponse::WakeRead {
+                    request_sha256,
+                    state_fence,
+                    readback,
+                })
+            }
+            // Publication answers with the owner's own retained readback, the
+            // same shape a lookup returns, because the retained record IS the
+            // publication's proof. The `WakeRead` variant is reused rather than
+            // duplicated: a second response variant carrying the same owner
+            // answer would add a wire member that no distinct fact requires.
+            UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
+                let readback = self.wake.publish_occurrence_wake(request).await?;
                 Ok(UserAutomationHostExecutionResponse::WakeRead {
                     request_sha256,
                     state_fence,

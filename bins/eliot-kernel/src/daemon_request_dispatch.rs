@@ -4843,6 +4843,14 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
+            UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 if let Err(error) = request.validate() {
                     return Ok(Self::user_automation_runtime_error_response(
@@ -4890,6 +4898,12 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_wake_read(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_occurrence_wake(session, request)
                         .await,
                 )
             }
@@ -4957,6 +4971,12 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_wake_read(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_occurrence_wake(session, request)
                         .await,
                 )
             }
@@ -5033,6 +5053,19 @@ impl KernelComposition {
                         "status": "known",
                         "value": {
                             "outcome": "wake_readback",
+                            "readback": readback,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+            UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
+                match Box::pin(client.publish_occurrence_wake(request)).await {
+                    Ok(readback) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "occurrence_wake_published",
                             "readback": readback,
                         },
                         "recovery": null,
@@ -6996,6 +7029,111 @@ impl KernelComposition {
             &lookup.state_fence,
             &request.identity,
             &request.invocation,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates one manual (run-now) occurrence wake publication against the
+    /// committed owner occurrence and the exact parent `RunNow` receipt.
+    ///
+    /// A publication writes to the Host wake journal, so it is an owner effect
+    /// and gets the same pre-effect revalidation a lookup gets, on the same
+    /// evidence: the occurrence must be the one the canonical owner persisted
+    /// under this automation, revision and principal; the published intent must
+    /// be that persisted occurrence's own committed wake projection; and the
+    /// parent `RunNow` operation must be committed under this exact identity.
+    /// A request that names another occurrence, another fence, or a
+    /// self-asserted intent is refused before the journal is touched.
+    async fn revalidate_user_automation_occurrence_wake(
+        &self,
+        session: &Session,
+        request: &eliot_kernel_service::UserAutomationWakeOccurrencePublication,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal
+            || request.context.state_fence != session.module_generation.state_fence
+            || request.state_fence != session.module_generation.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.automation_id.clone(),
+            requested_revision: request.automation_revision.clone(),
+            authenticated_principal: authenticated_principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        if owner.current_configuration_state
+            != eliot_kernel_core::user_automation::UserAutomationConfigurationState::Active
+            || owner.revision.owner_principal != authenticated_principal
+            || owner.revision.revision != request.automation_revision
+            || owner.revision.digest().map_err(|error| {
+                UserAutomationRuntimeError::Rejected(error.to_string())
+            })? != request.revision_digest
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let persisted = gateway
+            .read_user_automation_invocation(
+                &lookup.state_fence,
+                &lookup.automation_id,
+                &request.occurrence_id,
+            )
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        let occurrence_id = persisted
+            .occurrence_identity()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        if occurrence_id != request.occurrence_id {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        // The occurrence is a manual one: a publication that names a calendar
+        // occurrence is a schedule mutation arriving on the manual seam, which
+        // I11.12 forbids ("run-now uses an explicit manual nonce and does not
+        // mutate the schedule").
+        if !matches!(
+            &persisted.trigger,
+            eliot_kernel_core::user_automation::UserAutomationTrigger::Manual { nonce }
+                if *nonce == request.manual_nonce
+        ) {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        // The published intent must be exactly the one the canonical owner
+        // compiles for this occurrence from the retained immutable revision, by
+        // the same `compile_wake_intent` derivation the committed `RunNow`
+        // mutation used. Recomputing it here means a self-asserted intent cannot
+        // reach the Host journal, and it needs no second read: the revision is
+        // already in the owner snapshot this revalidation proved.
+        let committed = owner
+            .revision
+            .compile_wake_intent(&request.occurrence_id, lookup.state_fence.clone())
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        if committed != request.wake_intent {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        ensure_user_automation_run_now_receipt(
+            &gateway,
+            &lookup.state_fence,
+            &request.identity,
+            &persisted,
         )
         .await?;
         Ok(())

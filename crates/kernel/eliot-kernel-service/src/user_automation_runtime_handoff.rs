@@ -26,11 +26,13 @@ use eliot_kernel_core::user_automation::{
     ScheduleKind, UserAutomationConfigurationState, UserAutomationDeferReason,
     UserAutomationTrigger,
 };
+use eliot_runtime_contracts::WakeIntent;
 use eliot_store_api::{OperationIdentity, WriteReceipt, WriteReceiptStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+use super::UserAutomationOwnerSnapshot;
 use super::user_automation::{
     UserAutomationMutationResult, UserAutomationReadResult, UserAutomationServiceRequest,
     UserAutomationStoreOutcome,
@@ -41,8 +43,9 @@ use super::user_automation_execution::{
     UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
     UserAutomationRuntimePort, UserAutomationWakeCancellation,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationWakeHorizonPublication, UserAutomationWakeOccurrencePublication,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback,
 };
 use super::user_automation_execution_client::{
     UserAutomationHostExecutionClient, UserAutomationHostExecutionObserver,
@@ -1685,6 +1688,23 @@ where
         UserAutomationWakePort::read_wake_horizon_publication(self.client, request).await
     }
 
+    /// Publishes one committed manual occurrence's pending wake through the
+    /// same authenticated Host transport every other owner call on this
+    /// adapter uses.
+    ///
+    /// This override is load-bearing: the `RunNow` handoff reaches
+    /// `publish_occurrence_wake` through the `UserAutomationWakePort` trait on
+    /// this concrete type, so without it the run-now wake would resolve to the
+    /// trait default and answer `Unavailable` no matter what the client
+    /// publishes. It forwards to the client's own trait implementation, so this
+    /// adapter adds no second transport path and no second wake owner.
+    async fn publish_occurrence_wake(
+        &self,
+        request: impl Into<Box<UserAutomationWakeOccurrencePublication>>,
+    ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        UserAutomationWakePort::publish_occurrence_wake(self.client, request).await
+    }
+
     async fn read_pending_wake(
         &self,
         request: impl Into<Box<UserAutomationWakeReadRequest>>,
@@ -1834,6 +1854,62 @@ pub fn run_now_wake_read_request(
         identity,
         invocation,
     }
+}
+
+/// Builds the manual occurrence wake publication for one committed `RunNow`
+/// occurrence.
+///
+/// Every member is read from a value the handoff already proved: the parent
+/// `RunNow` identity is the admitted operation identity, the occurrence and
+/// nonce are the committed invocation's own, the revision digest is the current
+/// owner's committed revision, and the intent is the inert `WakeIntent` the
+/// canonical Store minted for this occurrence. Nothing is asserted on the wake
+/// owner's behalf — the owner still writes the journal record and answers from
+/// what it retains.
+///
+/// This is a publisher, not a schedule: it names exactly one already-committed
+/// manual occurrence and extends no occurrence denominator, which is what I11.12
+/// requires of a `run-now` ("uses an explicit manual nonce and does not mutate
+/// the schedule").
+pub fn run_now_occurrence_wake_publication(
+    context: RequestMetadata,
+    authenticated_principal: String,
+    identity: OperationIdentity,
+    owner: &UserAutomationOwnerSnapshot,
+    invocation: &eliot_kernel_core::user_automation::UserAutomationInvocation,
+    wake_intent: &WakeIntent,
+) -> Result<UserAutomationWakeOccurrencePublication, String> {
+    let UserAutomationTrigger::Manual { nonce } = &invocation.trigger else {
+        return Err(
+            "a run-now occurrence must name an explicit manual nonce to publish its wake".to_owned(),
+        );
+    };
+    let occurrence_id = invocation
+        .occurrence_identity()
+        .map_err(|error| error.to_string())?;
+    let publication = UserAutomationWakeOccurrencePublication {
+        context,
+        authenticated_principal,
+        identity,
+        automation_id: invocation.automation_id.clone(),
+        automation_revision: invocation.automation_revision.clone(),
+        revision_digest: owner
+            .revision
+            .digest()
+            .map_err(|error| error.to_string())?,
+        // The publication is same-fence by construction, so it takes the fence
+        // from the owner readback this handoff already proved rather than
+        // restating one: a caller cannot pair an occurrence with a fence no
+        // owner read was bound to.
+        state_fence: owner.state_fence.clone(),
+        occurrence_id,
+        manual_nonce: nonce.clone(),
+        wake_intent: wake_intent.clone(),
+    };
+    publication
+        .validate()
+        .map_err(|error| error.to_string())?;
+    Ok(publication)
 }
 
 /// Returns the exact configuration state a committed mutation produced.

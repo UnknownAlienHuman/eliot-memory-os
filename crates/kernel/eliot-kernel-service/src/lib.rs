@@ -286,8 +286,9 @@ pub use user_automation_execution::{
     UserAutomationWakeEnumerationCoverage, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonEntry,
     UserAutomationWakeHorizonPublication, UserAutomationWakeOccurrenceDisposition,
-    UserAutomationWakeOwnerEvidence, UserAutomationWakePort, UserAutomationWakePublication,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
+    UserAutomationWakeOccurrencePublication, UserAutomationWakeOwnerEvidence,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback, advance_wake_horizon,
     compile_wake_horizon, horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
     wake_occurrence_denominator_digest,
 };
@@ -326,7 +327,8 @@ pub use user_automation_runtime_handoff::{
     UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
     UserAutomationHorizonPhase, UserAutomationOperatorResultEnvelope,
     UserAutomationOperatorRuntime, UserAutomationOperatorTransition, UserAutomationRecoveryPhase,
-    UserAutomationWakePhase, committed_configuration_state, run_now_wake_read_request,
+    UserAutomationWakePhase, committed_configuration_state,
+    run_now_occurrence_wake_publication, run_now_wake_read_request,
 };
 pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,

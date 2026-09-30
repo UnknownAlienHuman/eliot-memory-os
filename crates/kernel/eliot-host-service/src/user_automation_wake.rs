@@ -31,9 +31,9 @@ use eliot_kernel_service::{
     UserAutomationWakeCancellationReadback, UserAutomationWakeEnumerationCoverage,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
     UserAutomationWakeHorizonEntry, UserAutomationWakeHorizonPublication,
-    UserAutomationWakeOccurrenceDisposition, UserAutomationWakeOwnerEvidence,
-    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
-    UserAutomationWakeReadback,
+    UserAutomationWakeOccurrenceDisposition, UserAutomationWakeOccurrencePublication,
+    UserAutomationWakeOwnerEvidence, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::WakeIntentState;
@@ -160,6 +160,46 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
         horizon_acknowledgement(&request, acknowledged, remaining)
     }
 
+    async fn publish_occurrence_wake(
+        &self,
+        request: impl Into<Box<UserAutomationWakeOccurrencePublication>>,
+    ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationWakeOccurrencePublication> = request.into();
+        request
+            .validate()
+            .map_err(|error| rejected(format!("Occurrence wake publication: {error}")))?;
+        let fence = live_activation_fence(&self.journal.snapshot().map_err(map_journal_error)?)?;
+        let record = occurrence_wake_record(&request, fence)?;
+        match self
+            .journal
+            .append(HostStateRecord::Wake(record))
+            .map_err(map_journal_error)?
+            .disposition()
+        {
+            // Both dispositions are the same retained wake. `Replayed` is the
+            // journal's own answer for an identity it already applied, and it
+            // writes no second frame, which is what makes a re-presented
+            // publication of one parent RunNow identity idempotent.
+            AppendDisposition::Applied | AppendDisposition::Replayed => {}
+        }
+        // The readback is read back from the journal rather than assembled from
+        // the request. An append disposition alone does not prove the record is
+        // still retained — an activation cutover clears the whole wake
+        // projection — so the answer is exactly what this owner holds under its
+        // own live generation, and the parent-identity binding is rechecked here
+        // rather than assumed from the append.
+        let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
+        let readback = retained_occurrence_wake_readback(
+            &snapshot,
+            &request.occurrence_id,
+            &request.wake_intent,
+        )?;
+        readback
+            .validate_for_occurrence_publication(&request)
+            .map_err(|error| rejected(format!("Occurrence wake readback: {error}")))?;
+        Ok(readback)
+    }
+
     async fn read_pending_wake(
         &self,
         request: impl Into<Box<UserAutomationWakeReadRequest>>,
@@ -169,39 +209,11 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
             .validate()
             .map_err(|error| rejected(format!("Wake read: {error}")))?;
         let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
-        let mut found = None;
-        for wake in snapshot
-            .wakes
-            .iter()
-            .filter(|wake| wake.wake_id.as_str() == occurrence_id)
-        {
-            if found.is_some() {
-                return Err(UserAutomationRuntimeError::IdentityConflict);
-            }
-            let checksum =
-                record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
-            let readback = UserAutomationWakeReadback {
-                intent: wake.intent.clone(),
-                operation_id: wake.operation.operation_id.as_str().to_owned(),
-                idempotency_key: wake.operation.idempotency_key.as_str().to_owned(),
-                record_checksum: checksum,
-            };
-            readback
-                .validate_for(&request)
-                .map_err(|error| rejected(format!("Wake owner readback: {error}")))?;
-            found = Some(readback);
-        }
-        found.ok_or_else(|| {
-            // The snapshot above was read successfully, so this is a complete
-            // negative answer from the sole owner of this journal: it retains no
-            // such record. It is deliberately not `Unavailable`, which is what
-            // the journal read failure above maps to. A caller must be able to
-            // tell "there is nothing here to cancel" from "I could not read what
-            // is here", because only the first is a proof.
-            UserAutomationRuntimeError::NotRetained(
-                "exact UserAutomation wake is not retained by the Host journal".to_owned(),
-            )
-        })
+        let readback = retained_wake_readback(&snapshot, &occurrence_id)?;
+        readback
+            .validate_for(&request)
+            .map_err(|error| rejected(format!("Wake owner readback: {error}")))?;
+        Ok(readback)
     }
 
     async fn cancel_pending_wakes(
@@ -682,6 +694,184 @@ fn horizon_acknowledgement(
         .validate_for(request)
         .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
     Ok(acknowledgement)
+}
+
+/// Returns the one record this journal retains for one occurrence.
+///
+/// This is the single accounting used by both the manual publication and the
+/// ordinary read path, so the two can never disagree about what the owner
+/// holds. Two records for one occurrence are a contradiction this owner can
+/// neither answer for nor replace, and a snapshot read successfully that holds
+/// no such record is [`UserAutomationRuntimeError::NotRetained`] — a complete
+/// negative from the sole writer, deliberately not `Unavailable`.
+fn single_retained_wake<'a>(
+    snapshot: &'a HostState,
+    occurrence_id: &str,
+) -> Result<&'a WakeRecord, UserAutomationRuntimeError> {
+    let mut matches = snapshot
+        .wakes
+        .iter()
+        .filter(|wake| wake.wake_id.as_str() == occurrence_id);
+    let Some(wake) = matches.next() else {
+        return Err(UserAutomationRuntimeError::NotRetained(
+            "exact UserAutomation wake is not retained by the Host journal".to_owned(),
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    Ok(wake)
+}
+
+/// Projects one retained record into the owner's exact readback.
+///
+/// The checksum is this owner's own `record_checksum`, which re-runs
+/// `WakeRecord::validate` on the ORIGINAL value read back from the journal. No
+/// digest is recomputed and no value is rebuilt here.
+fn wake_readback_for(
+    wake: &WakeRecord,
+) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+    let checksum =
+        record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
+    Ok(UserAutomationWakeReadback {
+        intent: wake.intent.clone(),
+        operation_id: wake.operation.operation_id.as_str().to_owned(),
+        idempotency_key: wake.operation.idempotency_key.as_str().to_owned(),
+        record_checksum: checksum,
+    })
+}
+
+/// Reads back the one record this journal retains for one occurrence.
+fn retained_wake_readback(
+    snapshot: &HostState,
+    occurrence_id: &str,
+) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+    wake_readback_for(single_retained_wake(snapshot, occurrence_id)?)
+}
+
+/// Reads back one occurrence's record and proves it is the one this
+/// publication wrote.
+///
+/// The intent is compared against the request, not against the append that was
+/// just issued: a record the journal already retained under a different intent
+/// is a contradiction this publication can neither answer for nor replace, and
+/// is reported as [`UserAutomationRuntimeError::IdentityConflict`] rather than
+/// as a successful publication.
+fn retained_occurrence_wake_readback(
+    snapshot: &HostState,
+    occurrence_id: &str,
+    expected_intent: &eliot_runtime_contracts::WakeIntent,
+) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+    let wake = single_retained_wake(snapshot, occurrence_id)?;
+    if wake.intent != *expected_intent {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    wake_readback_for(wake)
+}
+
+/// Builds the one journal record that retains one committed manual occurrence.
+///
+/// The record grants nothing. `intent` is the Store's own inert owner-contract
+/// wake projection for this occurrence, which I1.5 makes inert: it schedules
+/// work and carries no task, route, tool, effect, or delivery authority, and
+/// every target, capability, policy, budget, and State Fence is revalidated on
+/// wake.
+///
+/// `operation` is the PARENT `RunNow` identity, not a digest derived here. The
+/// existing readback binding requires the retained record's operation identity
+/// to equal the committed parent RunNow operation, and the parent is the only
+/// writer of that operation: deriving a fresh identity would mint a wake under
+/// an operation no committed transition owns.
+///
+/// The remaining fields follow the same discipline as
+/// [`horizon_wake_record`], with the manual nonce in place of the calendar
+/// occurrence key:
+///
+/// - `reason_evidence_refs` names the manual nonce, the immutable revision
+///   digest and the exact occurrence identity, so the retained record cites the
+///   trigger basis it was published for;
+/// - `earliest_start`, `deadline`, and `expiry` name that same manual nonce. A
+///   manual occurrence has no normalized calendar instant to read, and the
+///   contract being published declares none: the nonce is the complete
+///   owner-supplied time basis this record has. Deriving a `catch-up` or
+///   `deadline` policy here would put a time in the journal that no owner ever
+///   normalized, which is the same argument
+///   [`horizon_wake_record`] makes for the calendar key;
+/// - `required_capabilities` names the existing `UserAutomation` kernel
+///   capability the due-wake consumer must hold, reusing the constant this
+///   operation family already spells;
+/// - `maintenance_family` and `budget_ref` are bound to the immutable
+///   automation and revision this occurrence belongs to;
+/// - `state_fence_revalidation_ref` is the canonical digest of the exact
+///   publishing State Fence, and the intent carries that same fence.
+fn occurrence_wake_record(
+    request: &UserAutomationWakeOccurrencePublication,
+    fence: RecordFence,
+) -> Result<WakeRecord, UserAutomationRuntimeError> {
+    let fence_digest = sha256_hex(
+        &canonical_json_bytes(&request.state_fence)
+            .map_err(|error| rejected(format!("Wake State Fence encoding: {error}")))?,
+    );
+    Ok(WakeRecord {
+        fence,
+        operation: IdempotencyIdentity {
+            operation_id: PlatformHandle::new(request.identity.operation_id.as_str().to_owned())
+                .map_err(|_| rejected("occurrence wake operation identity is invalid"))?,
+            idempotency_key: PlatformHandle::new(request.identity.idempotency_key.clone())
+                .map_err(|_| rejected("occurrence wake idempotency identity is invalid"))?,
+        },
+        // `UserAutomationWakeOccurrencePublication::validate` has already proved
+        // that the intent's wake id is this occurrence, which is the identity
+        // `WakeRecord::validate` requires the record to carry.
+        wake_id: wake_handle(request.occurrence_id.clone(), "wake_id")?,
+        intent: request.wake_intent.clone(),
+        reason_evidence_refs: vec![
+            wake_handle(
+                format!("ua-wake-manual:{}", request.manual_nonce),
+                "reason_evidence_ref",
+            )?,
+            wake_handle(
+                format!("ua-wake-revision:{}", request.revision_digest),
+                "reason_evidence_ref",
+            )?,
+            wake_handle(
+                format!("ua-wake-occurrence:{}", request.occurrence_id),
+                "reason_evidence_ref",
+            )?,
+        ],
+        earliest_start: wake_handle(
+            format!("ua-wake-manual-earliest:{}", request.manual_nonce),
+            "earliest_start",
+        )?,
+        deadline: wake_handle(
+            format!("ua-wake-manual-deadline:{}", request.manual_nonce),
+            "deadline",
+        )?,
+        expiry: wake_handle(
+            format!("ua-wake-manual-expiry:{}", request.manual_nonce),
+            "expiry",
+        )?,
+        required_capabilities: vec![wake_handle(
+            USER_AUTOMATION_KERNEL_CAPABILITY.to_owned(),
+            "required_capability",
+        )?],
+        maintenance_family: wake_handle(
+            format!("ua-wake-family:{}", request.automation_id),
+            "maintenance_family",
+        )?,
+        safety_class: ServiceSafetyClass::ServiceSafe,
+        state_fence_revalidation_ref: wake_handle(
+            format!("ua-wake-revalidation:{fence_digest}"),
+            "state_fence_revalidation_ref",
+        )?,
+        budget_ref: wake_handle(
+            format!(
+                "ua-wake-budget:{}:{}",
+                request.revision_digest, request.occurrence_id
+            ),
+            "budget_ref",
+        )?,
+    })
 }
 
 fn wake_handle(

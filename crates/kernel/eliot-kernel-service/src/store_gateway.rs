@@ -116,7 +116,8 @@ use crate::{
     handle_maintenance_trigger_pending_page, handle_maintenance_trigger_release_expired,
     handle_maintenance_trigger_replacement_pending_set, handle_maintenance_trigger_revocation,
     handle_maintenance_trigger_supersession, recover_maintenance_trigger_commit,
-    replay_maintenance_trigger_after_crash, run_now_wake_read_request,
+    replay_maintenance_trigger_after_crash, run_now_occurrence_wake_publication,
+    run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
@@ -5838,8 +5839,10 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
-        let Some(UserAutomationMutationResult::RunNow { invocation, .. }) =
-            configuration.mutation_result()
+        let Some(UserAutomationMutationResult::RunNow {
+            invocation,
+            wake_intent: published_wake_intent,
+        }) = configuration.mutation_result()
         else {
             return Err("run-now did not return a run-now projection".to_owned());
         };
@@ -5876,6 +5879,42 @@ impl KernelStoreGateway {
                 },
             ));
         };
+        // The Store mints this occurrence's inert `WakeIntent` and the owner
+        // journal is the only writer of a `WakeRecord`, so the wake must be
+        // PUBLISHED to the owner before it can be read back. Without this the
+        // lookup below answers `NotRetained` for every manual occurrence and the
+        // handoff can never reach the preflight. The publication is a publisher,
+        // not a schedule: it names this one committed occurrence under its own
+        // parent `RunNow` identity, extends no occurrence denominator, and
+        // mints no authority (I11.12: "run-now uses an explicit manual nonce and
+        // does not mutate the schedule").
+        //
+        // A refused publication is the occurrence's `UnknownOutcome` wake
+        // disposition, exactly like a refused readback: it is never treated as
+        // "nothing was sent" and never as a published wake, so the refusal
+        // below still decides whether the preflight is reached.
+        if defer_reason.is_none() {
+            let publication = run_now_occurrence_wake_publication(
+                sealed.context.clone(),
+                sealed.authenticated_principal.clone(),
+                sealed.identity.clone(),
+                &owner,
+                &invocation,
+                published_wake_intent,
+            )?;
+            if let Err(error) =
+                UserAutomationWakePort::publish_occurrence_wake(runtime, publication).await
+            {
+                return Ok((
+                    UserAutomationWakePhase::UnknownOutcome {
+                        reason: error.to_string(),
+                    },
+                    UserAutomationExecutionPhase::Unavailable {
+                        reason: unproven_run_now_wake_reason(&occurrence_id),
+                    },
+                ));
+            }
+        }
         let wake_request = run_now_wake_read_request(
             sealed.context.clone(),
             sealed.authenticated_principal.clone(),

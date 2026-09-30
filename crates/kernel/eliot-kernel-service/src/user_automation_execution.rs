@@ -1297,6 +1297,104 @@ impl UserAutomationWakeReadRequest {
     }
 }
 
+/// Exact request that publishes the pending wake of one manual occurrence.
+///
+/// A `run-now` occurrence has no calendar occurrence key, so it cannot travel
+/// through [`UserAutomationWakeHorizonPublication`]. That type's entries are a
+/// contiguous run of the revision's normalized denominator, and its owner
+/// revalidates the published slice against `revision.compile_occurrence_identities()`,
+/// which requires exact equality; a manual nonce is deliberately not a member of
+/// that set, because I11.12: "run-now uses an explicit manual nonce and does not
+/// mutate the schedule". Widening that denominator to admit a manual member would
+/// break a stated guarantee rather than satisfy it, so this is a separate
+/// publisher over the SAME Host journal, not a second schedule and not a second
+/// wake owner. It names exactly one already-committed occurrence and grants
+/// nothing: the Host still appends the record and answers from its own retained
+/// state.
+///
+/// The parent `RunNow` identity is this publication's operation identity because
+/// the readback that proves the wake is bound to the committed parent RunNow
+/// operation. A derived identity here would produce a readback no committed
+/// parent can claim.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeOccurrencePublication {
+    /// Live authenticated request metadata and State Fence.
+    pub context: RequestMetadata,
+    /// Principal authenticated by Kernel/Host.
+    pub authenticated_principal: String,
+    /// Exact parent `RunNow` operation identity that owns this publication.
+    pub identity: OperationIdentity,
+    /// Stable automation identity.
+    pub automation_id: String,
+    /// Immutable revision identity whose committed occurrence is published.
+    pub automation_revision: String,
+    /// Canonical digest of that committed immutable revision.
+    pub revision_digest: String,
+    /// Fence under which the publication is issued.
+    pub state_fence: StateFence,
+    /// Stable occurrence identity the manual nonce compiled.
+    pub occurrence_id: String,
+    /// Exact Human-issued manual nonce that compiled the occurrence.
+    pub manual_nonce: String,
+    /// The Store's own inert wake projection for this occurrence.
+    ///
+    /// This is a publication INPUT, never a readback. Nothing here asserts that
+    /// a wake is retained: the owner writes the journal record and answers from
+    /// what it holds, so a fabricated record here could never survive the
+    /// owner's own readback and is refused there instead.
+    pub wake_intent: WakeIntent,
+}
+
+impl UserAutomationWakeOccurrencePublication {
+    /// Validates the publication request shape and its parent bindings.
+    pub fn validate(&self) -> Result<(), UserAutomationExecutionError> {
+        self.context
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        self.identity
+            .validate()
+            .map_err(UserAutomationServiceError::Store)
+            .map_err(UserAutomationExecutionError::Service)?;
+        for (value, field) in [
+            (
+                &self.authenticated_principal,
+                "occurrence_wake.authenticated_principal",
+            ),
+            (&self.automation_id, "occurrence_wake.automation_id"),
+            (
+                &self.automation_revision,
+                "occurrence_wake.automation_revision",
+            ),
+            (&self.occurrence_id, "occurrence_wake.occurrence_id"),
+            (&self.manual_nonce, "occurrence_wake.manual_nonce"),
+        ] {
+            validate_text(value, field)?;
+        }
+        validate_digest(&self.revision_digest, "occurrence_wake.revision_digest")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        if self.state_fence != self.context.state_fence {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "occurrence wake publication fence",
+            ));
+        }
+        self.wake_intent
+            .validate()
+            .map_err(|_| UserAutomationError::Invalid("occurrence_wake.wake_intent"))?;
+        if self.wake_intent.wake_id != self.occurrence_id
+            || self.wake_intent.state_fence != self.state_fence
+            || self.wake_intent.state != WakeIntentState::Pending
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "occurrence wake publication occurrence/fence/state",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Exact readback from the existing Host wake journal.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1804,6 +1902,56 @@ fn validate_wake_occurrence_denominator(
 }
 
 impl UserAutomationWakeReadback {
+    /// Validates a wake readback against the exact manual publication that
+    /// asked for it.
+    ///
+    /// This is the same fence-bound, parent-identity-bound proof as
+    /// [`Self::validate_for`], read against a publication rather than a read
+    /// request: the record must be this publication's occurrence, under this
+    /// publication's State Fence, still `Pending`, carrying exactly the intent
+    /// that was published, and written under the committed parent `RunNow`
+    /// operation identity. A wake retained under any other operation is a
+    /// foreign record and is refused here rather than becoming an owner
+    /// acknowledgement.
+    pub fn validate_for_occurrence_publication(
+        &self,
+        publication: &UserAutomationWakeOccurrencePublication,
+    ) -> Result<(), UserAutomationExecutionError> {
+        publication.validate()?;
+        validate_text(&self.operation_id, "occurrence_wake_readback.operation_id")?;
+        validate_text(
+            &self.idempotency_key,
+            "occurrence_wake_readback.idempotency_key",
+        )?;
+        if !is_sha256_digest(&self.record_checksum) {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "occurrence wake readback record checksum",
+            ));
+        }
+        self.intent.validate().map_err(|_| {
+            UserAutomationExecutionError::RuntimeResponseMismatch(
+                "occurrence wake readback intent shape",
+            )
+        })?;
+        if self.intent != publication.wake_intent
+            || self.intent.wake_id != publication.occurrence_id
+            || self.intent.state_fence != publication.state_fence
+            || self.intent.state != WakeIntentState::Pending
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "occurrence wake readback occurrence/fence/state",
+            ));
+        }
+        if self.operation_id != publication.identity.operation_id.as_str()
+            || self.idempotency_key != publication.identity.idempotency_key
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "occurrence wake readback parent identity",
+            ));
+        }
+        Ok(())
+    }
+
     /// Validates the persisted record against the exact Human occurrence.
     pub fn validate_for(
         &self,
@@ -3370,6 +3518,34 @@ pub trait UserAutomationWakePort: Send + Sync {
     ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
         Err(UserAutomationRuntimeError::Unavailable(
             "exact owner wake-horizon publication readback is unavailable".to_owned(),
+        ))
+    }
+
+    /// Publishes the pending wake of one committed manual (run-now) occurrence
+    /// to the existing WakeIntent/Task Scheduler owner.
+    ///
+    /// This is a publisher, not a member of the recurring horizon: the owner
+    /// writes exactly one journal record for exactly one already-committed
+    /// occurrence, and the returned [`UserAutomationWakeReadback`] is that
+    /// owner's own retained readback rather than an acknowledgement derived from
+    /// the request. An implementation must therefore issue no effect for an
+    /// occurrence it cannot bind to the parent `RunNow` identity, and must
+    /// answer with the record it retains — never with the intent the request
+    /// carried.
+    ///
+    /// The default refuses with a named unavailability. A contour with no wake
+    /// owner cannot manufacture a journal record, and a fabricated
+    /// `operation_id`/checksum pair is exactly the owner acknowledgement this
+    /// seam exists to prevent.
+    async fn publish_occurrence_wake(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeOccurrencePublication>>,
+    ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "UserAutomation manual occurrence wake publication is unavailable at this boundary: the \
+             existing WakeIntent/Task Scheduler owner publishes no manual occurrence wake over the \
+             admitted channel, so nothing was sent and no wake was retained"
+                .to_owned(),
         ))
     }
 
