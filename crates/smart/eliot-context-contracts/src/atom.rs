@@ -359,7 +359,16 @@ pub enum RepresentationKind {
 
 impl LossPolicy {
     /// Whether a representation is exact or no more lossy than this policy.
-    const fn allows(self, representation: RepresentationKind) -> bool {
+    ///
+    /// The one representation rule of this crate, and public so every owner of a
+    /// loss policy decides representation compatibility with it instead of
+    /// restating it: `ContextCandidate::validate`, `RoleLossRule::validate` and
+    /// `ContextSectionBudget::validate_admitted_section` all read it, so a
+    /// `NON_DROPPABLE` policy has exactly one answer everywhere — `WHOLE` only,
+    /// which is what keeps a handle from silently standing in for a complete
+    /// required unit.
+    #[must_use]
+    pub const fn allows(self, representation: RepresentationKind) -> bool {
         match self {
             Self::NonDroppable => matches!(representation, RepresentationKind::Whole),
             Self::HandleOnly => matches!(representation, RepresentationKind::Handle),
