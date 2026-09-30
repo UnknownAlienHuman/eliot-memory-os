@@ -26,6 +26,7 @@ use eliot_kernel_core::user_automation::{
     ScheduleKind, UserAutomationConfigurationState, UserAutomationDeferReason,
     UserAutomationTrigger,
 };
+use eliot_runtime_contracts::WakeIntentState;
 use eliot_store_api::{OperationIdentity, WriteReceipt, WriteReceiptStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1452,12 +1453,41 @@ impl UserAutomationOperatorTransition {
                             return Err("RunNow phases are not bound to the committed occurrence"
                                 .to_owned());
                         }
+                        let occurrence_id = invocation
+                            .occurrence_identity()
+                            .map_err(|error| error.to_string())?;
+                        // The committed `WakeIntent` is the owner record the
+                        // Durable Job admission binds this occurrence through, so
+                        // it must name the occurrence it was committed beside.
+                        // That check is what lets a proven-absence wake phase
+                        // stand beside an execution join: the absence is about
+                        // the Host journal's published calendar wakes, and the
+                        // committed intent is the separate owner record that
+                        // does bind this manual occurrence.
+                        if wake_intent.wake_id != occurrence_id
+                            || wake_intent.state != WakeIntentState::Pending
+                        {
+                            return Err(
+                                "RunNow committed wake intent does not name its committed occurrence"
+                                    .to_owned(),
+                            );
+                        }
                         match &self.wake {
                             UserAutomationWakePhase::Published { readback }
                                 if readback.intent == *wake_intent
                                     && !readback.operation_id.trim().is_empty()
                                     && !readback.idempotency_key.trim().is_empty()
                                     && !readback.record_checksum.trim().is_empty() => {}
+                            // The wake owner is the sole writer of the Host
+                            // journal, and it publishes only the calendar
+                            // occurrences the immutable revision compiles. An
+                            // explicit manual `run-now` nonce is deliberately
+                            // outside that set (I11.12:33), so its proven
+                            // absence is the correct answer beside a committed
+                            // occurrence whose own owner record binds it. A
+                            // retained readback still has to equal that
+                            // committed intent in full above.
+                            UserAutomationWakePhase::NotApplicable { .. } => {}
                             UserAutomationWakePhase::UnknownOutcome { .. }
                             | UserAutomationWakePhase::Unavailable { .. } => {}
                             _ => {
@@ -1467,35 +1497,33 @@ impl UserAutomationOperatorTransition {
                                 );
                             }
                         }
-                        let occurrence_id = invocation
-                            .occurrence_identity()
-                            .map_err(|error| error.to_string())?;
+                        // A wake phase that names this occurrence — the owner's
+                        // retained record or its complete negative — is what an
+                        // admitted, blocked, or unresolved execution may sit
+                        // beside. An unresolved wake proves neither and never
+                        // admits an occurrence.
+                        let wake_proven = matches!(
+                            &self.wake,
+                            UserAutomationWakePhase::Published { .. }
+                                | UserAutomationWakePhase::NotApplicable { .. }
+                        );
                         match &self.execution {
                             UserAutomationExecutionPhase::Admitted { execution }
-                                if execution.occurrence_id == occurrence_id
-                                    && matches!(
-                                        &self.wake,
-                                        UserAutomationWakePhase::Published { .. }
-                                    ) => {}
+                                if execution.occurrence_id == occurrence_id && wake_proven => {}
                             UserAutomationExecutionPhase::Deferred { reason }
-                                if matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::Published { .. }
-                                ) || (matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::UnknownOutcome { .. }
-                                        | UserAutomationWakePhase::Unavailable { .. }
-                                ) && matches!(
-                                    reason,
-                                    UserAutomationDeferReason::Paused
-                                        | UserAutomationDeferReason::Retired
-                                )) => {}
+                                if wake_proven
+                                    || (matches!(
+                                        &self.wake,
+                                        UserAutomationWakePhase::UnknownOutcome { .. }
+                                            | UserAutomationWakePhase::Unavailable { .. }
+                                    ) && matches!(
+                                        reason,
+                                        UserAutomationDeferReason::Paused
+                                            | UserAutomationDeferReason::Retired
+                                    )) => {}
                             UserAutomationExecutionPhase::BlockedConfig { .. }
                             | UserAutomationExecutionPhase::UnknownOutcome { .. }
-                                if matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::Published { .. }
-                                ) => {}
+                                if wake_proven => {}
                             UserAutomationExecutionPhase::Unavailable { .. } => {}
                             _ => {
                                 return Err(
