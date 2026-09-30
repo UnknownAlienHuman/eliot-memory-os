@@ -3264,8 +3264,7 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)
                 .map(|health| Self::daemon_health_response(&health)),
             "store_recovery" => {
-                self.store_recovery_operation(session, payload.clone())
-                    .await
+                Box::pin(self.store_recovery_operation(session, payload.clone())).await
             }
             "store_initialize_genesis" => {
                 self.store_initialize_genesis_operation(session, payload.clone())
@@ -9262,14 +9261,14 @@ impl KernelComposition {
                     return Ok::<(), TaskFailure>(());
                 }
                 let _ = staged_sender.send(Ok(submission));
-                let receipt = Self::execute_or_resume_reserved_observe_write(
+                let receipt = Box::pin(Self::execute_or_resume_reserved_observe_write(
                     &gateway,
                     accepted,
                     operation,
                     token,
                     &expected_operation_id,
                     cancellation,
-                )
+                ))
                 .await;
                 let _ = receipt_sender.send(receipt);
                 Ok::<(), TaskFailure>(())
@@ -9378,7 +9377,7 @@ impl KernelComposition {
                 });
             }
             tokio::select! {
-                _ = cancellation.cancelled() => {
+                () = cancellation.cancelled() => {
                     return Err(StagedReservedWriteError::OutcomeUnknown {
                         operation_id: expected_operation_id.to_owned(),
                         detail: "runtime shutdown interrupted the retained predecessor wait"
@@ -11808,8 +11807,9 @@ fn authenticated_user_automation_principal(session: &Session) -> Result<String, 
         {
             Ok(user_identity.clone())
         }
-        PeerIdentity::Authenticated { .. } => Err(TransportError::PeerIdentityUnavailable),
-        PeerIdentity::Unavailable { .. } => Err(TransportError::PeerIdentityUnavailable),
+        PeerIdentity::Authenticated { .. } | PeerIdentity::Unavailable { .. } => {
+            Err(TransportError::PeerIdentityUnavailable)
+        }
     }
 }
 
