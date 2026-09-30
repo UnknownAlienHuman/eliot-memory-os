@@ -92,8 +92,10 @@ pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evide
 /// head so the producer converges after renewals on any path.
 pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
 /// Authenticated current-source process execution/readback route. The payload
-/// is the existing closed P-03 request and every leg remains bound to the
-/// daemon frame's original request identity and authenticated session.
+/// wraps the existing closed P-03 request under `request` so its tagged
+/// `operation` discriminator does not collide with the daemon routing key.
+/// Every leg remains bound to the daemon frame's original request identity
+/// and authenticated session.
 pub(crate) const EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION: &str =
     "execute_current_source_process";
 /// Authenticated Governor publish operation carrying one live-derivation
@@ -686,6 +688,15 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
 #[serde(deny_unknown_fields)]
 struct StoreNamedOperation {
     request: NamedReadRequest,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentSourceProcessOperation {
+    /// The exact closed P-03 operation. It is nested because the daemon's
+    /// routing envelope also uses the top-level `operation` JSON key.
+    request: ProcessExecutionRequest,
 }
 
 /// Strips the daemon transport's routing key from one application body.
@@ -4542,9 +4553,10 @@ impl KernelComposition {
         payload: serde_json::Value,
         request_identity: Option<&RequestIdentity>,
     ) -> Result<serde_json::Value, TransportError> {
-        let request: ProcessExecutionRequest =
+        let operation: CurrentSourceProcessOperation =
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
+        let request = operation.request;
         request
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -4579,7 +4591,7 @@ impl KernelComposition {
         }
         let (_, session_binding) = super::caller_binding(session)?;
         let response = self
-            .execute_process_request(session, session_binding, request)
+            .execute_current_source_process_request(session, session_binding, request, identity)
             .await;
         let response = serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?;
         Ok(serde_json::json!({

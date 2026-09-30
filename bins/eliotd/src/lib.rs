@@ -136,6 +136,9 @@ mod reactive_feed;
 mod route_execution_identity;
 mod route_receipts;
 pub mod semantic_revision_store;
+/// I5.2 D1 same-stack source-artifact Blob owner. It consumes the live
+/// Governor source-effect admission and retains S-04 receipt lineage here.
+pub mod source_artifact_owner;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -180,6 +183,7 @@ pub use authority_revocation_ingress::{
 };
 
 use controlboard_adapters::SharedOperatorReplay;
+pub use source_artifact_owner::{SourceArtifactOwner, SourceArtifactOwnerError};
 
 pub use canonical_config_precedence::{
     ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PrecedenceError, ResolvedChain,
@@ -586,6 +590,7 @@ pub struct VersionedToolView<'a> {
 /// physical process execution and canonical persistence remain outside it.
 pub struct DaemonComposition {
     governor: GovernorComposition<dyn KernelGenerationPort>,
+    source_artifact_owner: SourceArtifactOwner,
     config_lease: ProtectedRuntimePathLease,
     state_lease: ProtectedRuntimePathLease,
     config_path: PathBuf,
@@ -1030,9 +1035,15 @@ impl DaemonComposition {
             &config.launch().kernel,
             QueueLimits::default(),
         )?;
+        let source_artifact_owner = SourceArtifactOwner::new(
+            &config.state_root,
+            governor.kernel_snapshot().state_fence(),
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         let cached_revision_fence = Some(Box::new(governor.kernel_snapshot().state_fence()));
         Ok(Self {
             governor,
+            source_artifact_owner,
             config_lease,
             state_lease,
             config_path: config.config_path,
@@ -1932,6 +1943,13 @@ impl DaemonComposition {
     #[must_use]
     pub fn state_root(&self) -> &Path {
         &self.state_root
+    }
+
+    /// Returns the one daemon-owned D1 source-artifact provider. Callers must
+    /// pass the original Governor source-effect admission on the same stack.
+    #[must_use]
+    pub const fn source_artifact_owner(&self) -> &SourceArtifactOwner {
+        &self.source_artifact_owner
     }
 
     /// Computes the digest of the provider-owned recovery snapshot admitted at

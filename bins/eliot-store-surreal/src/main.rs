@@ -556,12 +556,7 @@ async fn serve_handshake_loop(
     };
     let handshake_identity = StoreHandshakeIdentity::new(
         composition.operation_manifest_digest().to_owned(),
-        serde_json::json!({
-            "root_id": composition.blob_owner().root_id(),
-            "owner_id": composition.blob_owner().owner_id().as_str(),
-            "process_id": composition.blob_owner().process_id(),
-            "claim_id": composition.blob_owner().claim_id(),
-        }),
+        serde_json::Value::Null,
     );
     let authenticated_peer = server.peer_identity().clone();
     let (mut session, server_hello) = match admit_authenticated_handshake(

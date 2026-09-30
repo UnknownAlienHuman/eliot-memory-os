@@ -1,5 +1,6 @@
-//! C3 S-04 blob implementation over injected platform, codec, key, AEAD and
-//! canonical-live-set ports.
+//! C3 S-04 blob implementation over injected platform, codec, key and AEAD
+//! ports. Reachability, recovery and collection additionally require a
+//! canonical-live-set port; source staging and verified reads do not.
 //!
 //! Filesystem and cryptographic effects are provided through typed ports. The
 //! production Windows physical adapter lives in `physical_ports` and delegates
@@ -2473,7 +2474,7 @@ where
     C: BlobCompressionPort,
     K: BlobKeyPort,
     A: BlobAeadPort,
-    L: BlobLiveSetPort,
+    L: Send + Sync,
 {
     fn claim(
         lease: BlobRootLease,
@@ -2881,7 +2882,10 @@ where
     fn live_sets_revalidate(
         &self,
         proof: &BlobLiveSetProof,
-    ) -> Result<LiveSetRevalidation, BlobError> {
+    ) -> Result<LiveSetRevalidation, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
@@ -2895,7 +2899,10 @@ where
         locator: &BlobLocator,
         intent_revision: u64,
         residency_sha256: &str,
-    ) -> Result<BlobDeletionReconciliation, BlobError> {
+    ) -> Result<BlobDeletionReconciliation, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
@@ -2916,7 +2923,10 @@ where
         intent_revision: u64,
         residency_sha256: &str,
         delete: &mut dyn FnMut() -> Result<(), BlobError>,
-    ) -> Result<BlobDeletionReconciliation, BlobError> {
+    ) -> Result<BlobDeletionReconciliation, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
@@ -3696,7 +3706,10 @@ where
     fn reconcile_tombstone_path(
         &self,
         path: &WorkScopePath,
-    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+    ) -> Result<ConditionalDeleteOutcome, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.contained(path)?;
         let bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
         let mut tombstone = decode_tombstone(&bytes)?;
@@ -4463,7 +4476,10 @@ where
     fn reachability(
         &self,
         request: BlobReachabilityRequest,
-    ) -> Result<BlobReachabilityView, BlobError> {
+    ) -> Result<BlobReachabilityView, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
         // Coherent reachability (T3-B): the view is bound to a freshly
@@ -4551,7 +4567,10 @@ where
         request: &BlobGcRequest,
         locator: &BlobLocator,
         tombstone_path: &WorkScopePath,
-    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+    ) -> Result<ConditionalDeleteOutcome, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.contained(tombstone_path)?;
         let bytes = self.read_bounded_file(tombstone_path, MAX_JOURNAL_BYTES)?;
         let tombstone = decode_tombstone(&bytes)?;
@@ -4600,7 +4619,10 @@ where
         locator: &BlobLocator,
         scoped: &ScopedObject,
         now: u64,
-    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+    ) -> Result<ConditionalDeleteOutcome, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         let operation_id = request.context.operation.operation_id.to_string();
         let tombstone_path = tombstone_scope_path(&operation_id, locator, &scoped.scope)?;
         self.contained(&tombstone_path)?;
@@ -4675,7 +4697,10 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    fn gc(&self, request: BlobGcRequest) -> Result<BlobGcReceipt, BlobError> {
+    fn gc(&self, request: BlobGcRequest) -> Result<BlobGcReceipt, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
         let observed = self.live_sets_revalidate(&request.live_set)?;
@@ -4771,7 +4796,10 @@ where
         )
     }
 
-    fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+    fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.ensure_lease(lease)?;
         let transactions = WorkScopePath::new("transactions")
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
@@ -5069,7 +5097,7 @@ where
     C: BlobCompressionPort,
     K: BlobKeyPort,
     A: BlobAeadPort,
-    L: BlobLiveSetPort,
+    L: Send + Sync,
 {
     pub fn new(
         lease: BlobRootLease,
@@ -5139,8 +5167,32 @@ where
         self.core.reference(request)
     }
 
+    /// Stages exact source bytes through the canonical BlobStoreCore path.
+    /// This owner-only entry point is available to a source-only composition
+    /// whose `L` has no live-set implementation; it cannot perform GC or
+    /// reachability operations.
+    pub fn stage_source(
+        &self,
+        request: BlobStageRequest,
+    ) -> Result<BlobReadyReceipt, BlobError> {
+        self.core.stage_sync(request)
+    }
+
+    /// Reads and verifies exact plaintext bytes through the canonical
+    /// BlobStoreCore path. The returned chunk carries the original
+    /// independently verifiable Blob read receipt.
+    pub fn read_source(
+        &self,
+        request: BlobReadRequest,
+    ) -> Result<BlobReadChunk, BlobError> {
+        self.core.read_sync(&request)
+    }
+
     /// Startup recovery helper; it is not part of the public `BlobStoreClient` contract.
-    pub fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+    pub fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.core.reconcile(lease)
     }
 }

@@ -1255,7 +1255,7 @@ impl KernelStoreGateway {
             )
             .await?;
         let pair = self
-            .receipt_with_causal(&receipt.state_fence, expected.operation_id)
+            .receipt_with_causal(&receipt.state_fence, expected.operation_id.clone())
             .await
             .map_err(StoreApplyRefusal::GatewayRefusal)?
             .ok_or_else(|| {

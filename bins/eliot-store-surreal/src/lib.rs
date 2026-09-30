@@ -5,13 +5,12 @@
 //! This process exposes only the store-neutral EBP contract.  `SurrealDB`
 //! credentials, provider transport and query text stay inside
 //! `eliot-store-surreal-adapter`; this root only assembles the adapter and
-//! serializes bounded contract receipts. Blob contributes one process/root
-//! claim identity; it is not a second store or semantic write path.
+//! serializes bounded contract receipts. Source Blob ownership is co-located
+//! in `eliotd` per I5.2; this process never claims a Blob data root.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use eliot_blob::BlobRootOwner;
 use eliot_contracts::StateFence;
 use eliot_installation::{
     InstallationProfile, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
@@ -298,12 +297,10 @@ fn admit_prepared_for_execution(
     Ok(())
 }
 
-/// Canonical store composition. All provider authority is held by the one
-/// adapter and one process/root Blob claim; Blob does not become a semantic
-/// store or alternate transition path.
+/// Canonical store composition. Provider authority is held by the one
+/// canonical adapter; the source-artifact Blob root is owned by the daemon.
 pub struct StoreComposition {
     store: SurrealStoreAdapter,
-    blob: BlobRootOwner,
     state_fence: StateFence,
     schema_bootstrap_binding: StoreSchemaBootstrapBinding,
     schema_bootstrap_cache: tokio::sync::Mutex<Option<StoreSchemaBootstrapCache>>,
@@ -322,7 +319,6 @@ impl std::fmt::Debug for StoreComposition {
         formatter
             .debug_struct("StoreComposition")
             .field("store", &self.store)
-            .field("blob_owner", &self.blob)
             .field("state_fence", &self.state_fence)
             .field("connections", &self.connections)
             .field("health_admission", &self.health_admission)
@@ -339,13 +335,6 @@ impl StoreComposition {
     pub fn new(config: &StoreLaunchConfig) -> Result<Self, String> {
         config.validate()?;
         let schema_bootstrap_binding = StoreSchemaBootstrapBinding::from_config(config);
-        let blob = BlobRootOwner::claim_with_lifecycle_fence(
-            config.blob_root.clone(),
-            format!("store-composition:{}", config.instance_id),
-            std::process::id(),
-            config.runtime_launch.authority_state_fence.clone(),
-        )
-        .map_err(|error| format!("claim Blob root owner: {error}"))?;
         let platform = WindowsPlatform::new(config.blob_root.clone())
             .map_err(|error| format!("validate Blob root for credential access: {error}"))?;
         let password = resolve_credential(&platform, &config.credential_ref)?;
@@ -407,7 +396,6 @@ impl StoreComposition {
         .map_err(|error| format!("compose bounded bridge client sets: {error}"))?;
         Ok(Self {
             store,
-            blob,
             state_fence,
             schema_bootstrap_binding,
             schema_bootstrap_cache: tokio::sync::Mutex::new(None),
@@ -455,18 +443,6 @@ impl StoreComposition {
             adapter.expected_schema_generation.as_str(),
         )
         .map(|_report| ())
-    }
-
-    /// Rejects attempts to add a second process/root owner after composition.
-    pub fn with_blob_owner(self, _owner: BlobRootOwner) -> Result<Self, String> {
-        Err("exactly one Blob root owner is composed by StoreComposition::new".to_owned())
-    }
-
-    /// Returns the sole process/root claim identity. It carries no semantic
-    /// write authority and does not mint Blob receipts.
-    #[must_use]
-    pub fn blob_owner(&self) -> &BlobRootOwner {
-        &self.blob
     }
 
     /// Returns the one composed canonical provider adapter.
@@ -1803,6 +1779,7 @@ pub fn validate_request_frame_with_context(
         session.state_fence.clone(),
         session.session_principal_binding.clone(),
         authenticated_peer_principal_binding,
+        session.capabilities.clone(),
     )?;
     let context = source_artifact_request_context::AdmittedStoreRequestContext::from_validated_parts(
         frame,
