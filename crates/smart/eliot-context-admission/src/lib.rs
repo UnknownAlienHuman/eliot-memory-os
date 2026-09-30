@@ -34,9 +34,11 @@ pub mod decision;
 pub mod learning_gate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod material_floor;
+pub mod unit_group;
 
 pub use campaign_view::check_campaign_view_for_admission;
 pub use closure::{ClosureParts, assemble_closure};
+pub use unit_group::UnitGroupContext;
 
 pub use decision::{
     ClassificationEvidence, ClassifiedAdmission, MaterialRankTrace, RetrievalAdmissionDecision,
@@ -72,6 +74,8 @@ use eliot_context_contracts::{
 };
 use eliot_receipts::ProofCeiling;
 
+use crate::unit_group::{UnitGroupBinding, UnitGroupContext};
+
 const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
     "candidate availability is unknown; admission deferred until availability is known";
 
@@ -105,7 +109,7 @@ fn refuse_ungoverned_learning(input: &AdmissionInput) -> Result<(), ContextError
 }
 
 pub(crate) fn admit_context_inner(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
-    admit_context_inner_with_headroom(input, None)
+    admit_context_inner_with_boundaries(input, None, None)
 }
 
 /// The validated owner evidence the pure compiler receives before optional
@@ -297,6 +301,21 @@ pub fn admit_context_traced_with_headroom(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
 ) -> Result<HeadroomAdmissionOutcome, ContextError> {
+    run_with_headroom(input, headroom, None)
+}
+
+/// The one bounded headroom orchestration both headroom entries share.
+///
+/// The refusal constructor, the headroom check, the refused-dimension arm and
+/// the single selection call are defined once here so the
+/// indivisible-unit entry cannot grow a second reservation scheme or a second
+/// selection pass. `units` is `None` when the caller presented no owner
+/// unit/member metadata; it is never synthesised here.
+fn run_with_headroom(
+    input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
+    units: Option<&UnitGroupBinding>,
+) -> Result<HeadroomAdmissionOutcome, ContextError> {
     // The refusal names an existing owner record, never a minted placeholder:
     // the recipe's own invalidation identity when it declared one, otherwise
     // the admission rule evidence that produced the failure.
@@ -351,7 +370,7 @@ pub fn admit_context_traced_with_headroom(
             },
         )));
     }
-    match admit_context_inner_with_headroom(input, Some(headroom)) {
+    match admit_context_inner_with_boundaries(input, Some(headroom), units) {
         Ok(result) => {
             let traces = trace_material(input, &result)?;
             Ok(HeadroomAdmissionOutcome::Admitted {
@@ -364,9 +383,38 @@ pub fn admit_context_traced_with_headroom(
     }
 }
 
-fn admit_context_inner_with_headroom(
+/// Admit one candidate set under one granted downstream reservation and the
+/// owner-issued indivisible-unit metadata.
+///
+/// I12.13 "Bind indivisible groups": a tool call/result pair or an evidence edge
+/// may span several records, so the closure this decision selects is expanded to
+/// every member the owner declared for each indivisible unit, and a group whose
+/// closure cannot be admitted whole receives the whole group's disposition
+/// instead of a partial one. Group membership and each member's unit kind come
+/// from the owner's own [`UnitGroupContext`] metadata; nothing here reads a unit
+/// kind off a content string, and a candidate the metadata does not describe is
+/// never admitted as a whole unit.
+///
+/// The same decision also runs the I12.13 headroom rule before optional filling.
+/// This entry receives validated owner evidence only, performs no I/O, and
+/// contacts no owner.
+///
+/// A withheld reservation returns [`HeadroomAdmissionOutcome::Refused`] with the
+/// attempted recipe and binding and no admitted set, so a dependent operation
+/// can never observe a nominally complete view built without its headroom.
+pub fn admit_context_traced_with_boundaries(
+    input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
+    units: &UnitGroupContext<'_>,
+) -> Result<HeadroomAdmissionOutcome, ContextError> {
+    let units = UnitGroupBinding::bind(input, units)?;
+    run_with_headroom(input, headroom, Some(&units))
+}
+
+fn admit_context_inner_with_boundaries(
     input: &AdmissionInput,
     headroom: Option<&HeadroomContext<'_>>,
+    units: Option<&UnitGroupBinding>,
 ) -> Result<AdmissionResult, ContextError> {
     // I12.26 stale-projection fence arm, enforced before exact cue firing: a
     // candidate closure compiled under another fence must refresh the packet
@@ -404,7 +452,7 @@ fn admit_context_inner_with_headroom(
 
     // Capacity validation is deliberately before any candidate selection.
     input.recipe.capacity.validate()?;
-    let floor_ids = match prepare_floor(input, &candidates, &supplied)? {
+    let floor_ids = match prepare_floor(input, &candidates, &supplied, units)? {
         Ok(floor_ids) => floor_ids,
         Err(incomplete) => {
             return incomplete_result(input, input_digest, profile_digest, &incomplete);
@@ -435,6 +483,7 @@ fn admit_context_inner_with_headroom(
         admitted: &mut admitted,
         fixed,
         required_cost,
+        units,
     })?;
     let omissions = build_omissions(
         input,
@@ -1086,6 +1135,7 @@ struct OptionalSelectionInput<'a> {
     admitted: &'a mut BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
     fixed: u64,
     required_cost: u64,
+    units: Option<&'a UnitGroupBinding>,
 }
 
 enum OptionalDecision {
@@ -1115,6 +1165,7 @@ fn select_optional(
         admitted,
         fixed,
         required_cost,
+        units,
     } = selection;
     let mut failure_causes = BTreeMap::new();
     let mut optional_ids: Vec<_> = candidates
@@ -1146,6 +1197,7 @@ fn select_optional(
         admitted,
         available,
         optional_cost: 0,
+        units,
     };
     for atom_id in optional_ids {
         if selection.admitted.contains_key(&atom_id) {
@@ -1178,6 +1230,7 @@ struct OptionalSelection<'a> {
     admitted: &'a mut BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
     available: u64,
     optional_cost: u64,
+    units: Option<&'a UnitGroupBinding>,
 }
 
 impl OptionalSelection<'_> {
@@ -1189,7 +1242,14 @@ impl OptionalSelection<'_> {
             .candidates
             .get(atom_id)
             .ok_or(ContextError::DenominatorMismatch)?;
-        let closure = optional_closure(atom_id, self.floor_ids, self.candidates)?;
+        let mut closure = optional_closure(atom_id, self.floor_ids, self.candidates)?;
+        // I12.13 "Bind indivisible groups": an optional member of an indivisible
+        // unit is selected with every member the owner declared for that unit, so
+        // the existing all-or-nothing `fits` decision below already covers the
+        // whole group. A group that cannot fit is omitted whole, never partially.
+        if let Some(units) = self.units {
+            closure = units.group_closure(&closure)?;
+        }
         let closure_candidates = closure
             .iter()
             .filter_map(|id| self.candidates.get(id).copied())
@@ -1211,8 +1271,18 @@ impl OptionalSelection<'_> {
         let closure_current = closure_candidates
             .iter()
             .all(|item| item.availability == AtomAvailability::PresentCurrent);
+        // A candidate the owner metadata does not describe, or whose degraded
+        // envelope names no exact handle of its own, is not an established whole
+        // unit. Folding this into `fits` gives the whole group its allowed
+        // disposition instead of admitting part of one.
+        let closure_established = self.units.is_none_or(|units| {
+            closure_candidates
+                .iter()
+                .all(|item| units.admits_representation(item))
+        });
         let fits = !closure_missing
             && closure_current
+            && closure_established
             && candidate.availability == AtomAvailability::PresentCurrent
             && cost.is_some()
             && closure_cost.as_ref().is_ok_and(|value| {
@@ -1240,14 +1310,32 @@ impl OptionalSelection<'_> {
             }
             Ok(OptionalDecision::Include(value))
         } else {
-            let failure = optional_failure_cause(
+            // An unestablished whole unit is reported under its own reason
+            // rather than falling through to the capacity default, so a truthful
+            // optional omission never claims a group was crowded out when it was
+            // actually rejected for lacking owner-issued unit evidence.
+            let unestablished = self.units.and_then(|units| {
+                closure_candidates
+                    .iter()
+                    .find(|item| !units.admits_representation(item))
+                    .map(|item| {
+                        (
+                            OmissionReason::Policy,
+                            format!(
+                                "candidate {} has no owner-issued complete unit metadata or owner-named exact handle",
+                                item.atom_id
+                            ),
+                        )
+                    })
+            });
+            let failure = unestablished.or(optional_failure_cause(
                 self.input,
                 atom_id,
                 &closure,
                 self.candidates,
                 &closure_candidates,
                 closure_missing,
-            )?;
+            )?);
             Ok(OptionalDecision::Omit(failure.unwrap_or((
                 OmissionReason::Capacity,
                 "optional allocation exceeds remaining capacity".to_owned(),
@@ -1263,9 +1351,18 @@ fn prepare_floor(
         eliot_contracts::ArtifactId,
         &eliot_context_contracts::SuppliedOmissionBinding,
     >,
+    units: Option<&UnitGroupBinding>,
 ) -> Result<Result<BTreeSet<eliot_contracts::ArtifactId>, DecisionContextIncomplete>, ContextError>
 {
-    let floor_ids = floor_closure(input, candidates)?;
+    let mut floor_ids = floor_closure(input, candidates)?;
+    // I12.13 "Bind indivisible groups": a required member of an indivisible unit
+    // makes every member the owner declared for that unit required too. The
+    // group is therefore admitted as its required closure or it is not admitted
+    // at all; a member absent from this candidate set is reported by the
+    // unchanged `floor_gap` below as an explicit gap, never dropped quietly.
+    if let Some(units) = units {
+        floor_ids = units.group_closure(&floor_ids)?;
+    }
     for candidate in candidates.values() {
         if !floor_ids.contains(&candidate.atom_id)
             && (candidate.protected
@@ -1279,6 +1376,14 @@ fn prepare_floor(
             supplied,
             floor_ids.contains(&candidate.atom_id),
         )?;
+        // A candidate the owner metadata does not describe is not an established
+        // whole unit, and a degraded unit may only stand as the exact handle its
+        // own envelope names. `WHOLE` on a content string establishes neither.
+        if let Some(units) = units
+            && !units.admits_representation(candidate)
+        {
+            return Err(ContextError::WholeUnitRequired);
+        }
     }
     if let Some(incomplete) = floor_gap(input, candidates, &floor_ids)? {
         return Ok(Err(incomplete));
