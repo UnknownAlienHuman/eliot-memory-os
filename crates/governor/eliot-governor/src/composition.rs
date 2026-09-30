@@ -3708,8 +3708,17 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         }
         let skill = SkillRegistry::from_snapshot(skill_views)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let module_registry_read = recovery.owner_read(RecoveryOwner::ModuleRegistry)?;
         let module_snapshot: ModuleCatalogSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::ModuleRegistry)?;
+        if module_snapshot.catalog_revision != module_registry_read.revision
+            || module_snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "module catalog snapshot revision or fence does not match its Kernel named-read owner"
+                    .to_owned(),
+            ));
+        }
         let module_registry = ModuleCatalog::from_snapshot(module_snapshot)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let change_snapshot: eliot_change_monitor::ChangeMonitorSnapshot =
