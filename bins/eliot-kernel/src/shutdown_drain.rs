@@ -1651,9 +1651,7 @@ pub(crate) const KERNEL_QUIESCENCE_EDGES: [QuiescenceEdge; 1] = [QuiescenceEdge 
 /// named by no declared edge (its position is unprovable, so it is refused
 /// rather than ordered by assumption), or when the declared edges are cyclic
 /// among the live branches and no quiescence order exists.
-pub(crate) fn reverse_quiescence_order(
-    live_branches: &[String],
-) -> Result<Vec<String>, String> {
+pub(crate) fn reverse_quiescence_order(live_branches: &[String]) -> Result<Vec<String>, String> {
     let live: BTreeSet<&str> = live_branches.iter().map(String::as_str).collect();
     if live.len() != live_branches.len() {
         return Err("quiescent contour contains duplicates".to_owned());
