@@ -100,6 +100,37 @@ pub struct OperatorIntentExecutionLink {
     pub effects: Vec<OperatorIntentEffectDisposition>,
 }
 
+/// The parts of an [`OperatorIntentExecutionLink`] that arrive from their own
+/// retained owners rather than from the observed queue answer.
+///
+/// Grouping them is not cosmetic: these five are exactly the values the
+/// execution site cannot derive for itself. `plan` is the current admitted
+/// plan re-read at execute time and `plan_revision` is the exact revision the
+/// confirmation authorized, so they are kept as a PAIR on purpose — deriving
+/// one from the other would let a delayed confirmation of a predecessor
+/// revision execute its replacement, which is the whole point of
+/// [`OperatorIntentExecutionLink::validate_against_plan`]. `record` is the
+/// durable-job owner's own record and is never a locally rebuilt facsimile
+/// from response projections, and `epistemic`/`effects` are the answer
+/// assessor's dispositions.
+///
+/// A composition site that cannot source one of these has a missing owner, and
+/// the honest response is to have no value to pass — not to substitute a
+/// placeholder. Naming them as one carrier makes that boundary visible in the
+/// signature instead of hiding it in a nine-argument call.
+pub struct OperatorIntentExecutionOwners<'a> {
+    /// The current admitted plan, re-read at execute time.
+    pub plan: &'a OperatorIntentPlan,
+    /// The exact plan revision the confirmation authorized.
+    pub plan_revision: OperatorIntentPlanRevisionRef,
+    /// The durable-job owner's own record for the executed job.
+    pub record: DurableJobRecord,
+    /// The answer assessor's epistemic status; never a completion claim.
+    pub epistemic: OperatorIntentEpistemic,
+    /// The answer assessor's disposition of the proposed effects.
+    pub effects: Vec<OperatorIntentEffectDisposition>,
+}
+
 impl OperatorIntentExecutionLink {
     /// Binds one authorized plan revision to the retained durable execution
     /// that answers it, refusing an inconsistent join instead of publishing it.
@@ -119,27 +150,23 @@ impl OperatorIntentExecutionLink {
     /// job identity taken from a foreign record is returned as a typed refusal
     /// and never as a published link.
     pub fn join(
-        plan: &OperatorIntentPlan,
-        plan_revision: OperatorIntentPlanRevisionRef,
+        owners: OperatorIntentExecutionOwners<'_>,
         request_id: RequestId,
         job_id: TaskId,
         attempt_id: ArtifactId,
-        record: DurableJobRecord,
         receipt_id: Option<ReceiptId>,
-        epistemic: OperatorIntentEpistemic,
-        effects: Vec<OperatorIntentEffectDisposition>,
     ) -> Result<Self, OperatorIntentExecutionError> {
         let link = Self {
-            plan_revision,
+            plan_revision: owners.plan_revision,
             request_id,
             job_id,
             attempt_id,
-            record,
+            record: owners.record,
             receipt_id,
-            epistemic,
-            effects,
+            epistemic: owners.epistemic,
+            effects: owners.effects,
         };
-        link.validate_against_plan(plan)?;
+        link.validate_against_plan(owners.plan)?;
         Ok(link)
     }
 

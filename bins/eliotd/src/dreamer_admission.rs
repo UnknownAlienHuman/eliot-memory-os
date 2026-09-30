@@ -23,13 +23,11 @@ use std::sync::Arc;
 
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, KernelPortError, OperatorIntentEffectDisposition,
-    OperatorIntentEpistemic, OperatorIntentExecutionLink, OperatorIntentPlan,
-    OperatorIntentPlanRevisionRef,
+    CompositionError, CompositionReadiness, KernelPortError, OperatorIntentExecutionLink,
+    OperatorIntentExecutionOwners,
 };
 use eliot_protocol::dreamer_job::{
-    DurableJobRecord, DurableJobRequest, DurableJobResponse, JobOperation, JobRole, JobState,
-    JobSubmission,
+    DurableJobRequest, DurableJobResponse, JobOperation, JobRole, JobState, JobSubmission,
 };
 use eliot_read::{LocalReadPort, ReadService};
 use eliot_store_api::ScopeId;
@@ -191,11 +189,7 @@ impl<'a> GovernorDreamerAdapter<'a> {
         &self,
         input: &OrientationSubmitInput,
         queue: &impl DreamerJobQueue,
-        plan: &OperatorIntentPlan,
-        plan_revision: OperatorIntentPlanRevisionRef,
-        record: DurableJobRecord,
-        epistemic: OperatorIntentEpistemic,
-        effects: Vec<OperatorIntentEffectDisposition>,
+        owners: OperatorIntentExecutionOwners<'_>,
     ) -> Result<(DurableJobResponse, OperatorIntentExecutionLink), CompositionError> {
         let admitted = self.composition.kernel_snapshot().state_fence();
         let readiness = self.composition.readiness();
@@ -206,20 +200,8 @@ impl<'a> GovernorDreamerAdapter<'a> {
             ));
         }
         let service = ReadService::new(KernelContextReadClient::new(Arc::clone(self.kernel)));
-        submit_admitted_orientation(
-            readiness,
-            &admitted,
-            &service,
-            &ctx,
-            input,
-            queue,
-            plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
-        )
-        .await
+        submit_admitted_orientation(readiness, &admitted, &service, &ctx, input, queue, owners)
+            .await
     }
 }
 
@@ -265,11 +247,7 @@ pub(crate) async fn submit_admitted_orientation<'a>(
     ctx: &RequestMetadata,
     input: &OrientationSubmitInput,
     queue: &'a impl DreamerJobQueue,
-    plan: &OperatorIntentPlan,
-    plan_revision: OperatorIntentPlanRevisionRef,
-    record: DurableJobRecord,
-    epistemic: OperatorIntentEpistemic,
-    effects: Vec<OperatorIntentEffectDisposition>,
+    owners: OperatorIntentExecutionOwners<'_>,
 ) -> Result<(DurableJobResponse, OperatorIntentExecutionLink), CompositionError> {
     if readiness != CompositionReadiness::Ready {
         return Err(CompositionError::NotReady);
@@ -302,16 +280,7 @@ pub(crate) async fn submit_admitted_orientation<'a>(
     }
     let response = queue.submit(ctx.clone(), input.request.clone()).await?;
     let response = bind_queued_response(&input.request, response)?;
-    let link = join_queued_execution(
-        plan,
-        plan_revision,
-        submission,
-        &input.request,
-        &response,
-        record,
-        epistemic,
-        effects,
-    )?;
+    let link = join_queued_execution(owners, submission, &input.request, &response)?;
     Ok((response, link))
 }
 
@@ -372,18 +341,13 @@ pub(crate) fn bind_queued_response(
 /// ([`OperatorIntentExecutionLink::validate_against_plan`]) before anything is returned or
 /// published.
 pub(crate) fn join_queued_execution(
-    plan: &OperatorIntentPlan,
-    plan_revision: OperatorIntentPlanRevisionRef,
+    owners: OperatorIntentExecutionOwners<'_>,
     submission: &JobSubmission,
     request: &DurableJobRequest,
     response: &DurableJobResponse,
-    record: DurableJobRecord,
-    epistemic: OperatorIntentEpistemic,
-    effects: Vec<OperatorIntentEffectDisposition>,
 ) -> Result<OperatorIntentExecutionLink, CompositionError> {
     OperatorIntentExecutionLink::join(
-        plan,
-        plan_revision,
+        owners,
         request
             .request_identity
             .request
@@ -393,10 +357,7 @@ pub(crate) fn join_queued_execution(
             .clone(),
         submission.job_id.clone(),
         submission.attempt_id.clone(),
-        record,
         response.receipt_id.clone(),
-        epistemic,
-        effects,
     )
     .map_err(|error| owner_error(format!("dreamer execution link: {error}")))
 }
@@ -813,26 +774,9 @@ mod tests {
         ctx: &RequestMetadata,
         input: &OrientationSubmitInput,
         queue: &RecordingQueue,
-        plan: &OperatorIntentPlan,
-        plan_revision: OperatorIntentPlanRevisionRef,
-        record: DurableJobRecord,
-        epistemic: OperatorIntentEpistemic,
-        effects: Vec<OperatorIntentEffectDisposition>,
+        owners: OperatorIntentExecutionOwners<'_>,
     ) -> Result<(DurableJobResponse, OperatorIntentExecutionLink), CompositionError> {
-        submit_admitted_orientation(
-            readiness,
-            admitted,
-            reads,
-            ctx,
-            input,
-            queue,
-            plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
-        )
-        .await
+        submit_admitted_orientation(readiness, admitted, reads, ctx, input, queue, owners).await
     }
 
     /// Test-only operator-intent fixtures matching an admitted intake. The plan carries the
@@ -932,11 +876,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
-            &plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await
         .map(|_| ())
@@ -965,11 +911,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
-            &plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -998,11 +946,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
-            &plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -1039,11 +989,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
-            &plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -1084,11 +1036,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
-            &plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -1114,11 +1068,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
-            &plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -1153,11 +1109,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
-            &plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -1182,11 +1140,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
-            &plan,
-            plan_revision,
-            record,
-            epistemic,
-            effects,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
