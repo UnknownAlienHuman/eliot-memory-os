@@ -130,12 +130,14 @@ impl ColdStartAuthorityInputJoin {
         state_fence
             .validate()
             .map_err(|error| fail(&format!("cold-start state fence is invalid: {error}")))?;
-        discovery.key.validate().map_err(|error| {
-            fail(&format!("Host discovery lease key is invalid: {error}"))
-        })?;
-        discovery.lease.validate().map_err(|error| {
-            fail(&format!("Host discovery lease is invalid: {error}"))
-        })?;
+        discovery
+            .key
+            .validate()
+            .map_err(|error| fail(&format!("Host discovery lease key is invalid: {error}")))?;
+        discovery
+            .lease
+            .validate()
+            .map_err(|error| fail(&format!("Host discovery lease is invalid: {error}")))?;
         if !discovery.lease.key_matches(
             &discovery.key.proposer_ref,
             &discovery.key.session_ref,
@@ -149,19 +151,19 @@ impl ColdStartAuthorityInputJoin {
         {
             return Err(fail("Host discovery lease and key do not match exactly"));
         }
-        host.observed.validate().map_err(|error| {
-            fail(&format!("Host discovery observation is invalid: {error}"))
-        })?;
-        evidence.validate().map_err(|error| {
-            fail(&format!("Host scan evidence is invalid: {error}"))
-        })?;
+        host.observed
+            .validate()
+            .map_err(|error| fail(&format!("Host discovery observation is invalid: {error}")))?;
+        evidence
+            .validate()
+            .map_err(|error| fail(&format!("Host scan evidence is invalid: {error}")))?;
         let policy = host
             .policy
             .as_ref()
             .ok_or_else(|| fail("scanner policy is not present in the Host discovery"))?;
-        policy.validate().map_err(|error| {
-            fail(&format!("Host scanner policy is invalid: {error}"))
-        })?;
+        policy
+            .validate()
+            .map_err(|error| fail(&format!("Host scanner policy is invalid: {error}")))?;
         if host.scan_ref.trim().is_empty()
             || host.identity_fingerprint != candidate.instance.instance_ref
             || evidence.canonical_root_ref != candidate.scope.root_identity
@@ -190,22 +192,25 @@ impl ColdStartAuthorityInputJoin {
                 "candidate and onboarding lease do not match the retained Host identity",
             ));
         }
-        candidate.scope.validate().map_err(|error| {
-            fail(&format!("cold-start candidate scope is invalid: {error}"))
-        })?;
+        candidate
+            .scope
+            .validate()
+            .map_err(|error| fail(&format!("cold-start candidate scope is invalid: {error}")))?;
         candidate.instance.validate().map_err(|error| {
-            fail(&format!("cold-start candidate instance is invalid: {error}"))
+            fail(&format!(
+                "cold-start candidate instance is invalid: {error}"
+            ))
         })?;
-        proposed.validate().map_err(|error| {
-            fail(&format!("cold-start onboarding lease is invalid: {error}"))
-        })?;
+        proposed
+            .validate()
+            .map_err(|error| fail(&format!("cold-start onboarding lease is invalid: {error}")))?;
 
-        boundary.validate().map_err(|error| {
-            fail(&format!("cold-start privacy boundary is invalid: {error}"))
-        })?;
-        privacy.validate().map_err(|error| {
-            fail(&format!("cold-start privacy profile is invalid: {error}"))
-        })?;
+        boundary
+            .validate()
+            .map_err(|error| fail(&format!("cold-start privacy boundary is invalid: {error}")))?;
+        privacy
+            .validate()
+            .map_err(|error| fail(&format!("cold-start privacy profile is invalid: {error}")))?;
         if host.candidate_privacy != Some(candidate.privacy_class)
             || host.privacy_boundary.as_ref() != Some(boundary)
             || !boundary.admits(candidate.privacy_class)
@@ -223,7 +228,9 @@ impl ColdStartAuthorityInputJoin {
         sources
             .validate_for(&candidate.scope, privacy)
             .map_err(|error| {
-                fail(&format!("governing-source set is not admitted for this scope: {error}"))
+                fail(&format!(
+                    "governing-source set is not admitted for this scope: {error}"
+                ))
             })?;
         if sources.generation != proposed.governing_source_generation {
             return Err(fail(
@@ -235,8 +242,10 @@ impl ColdStartAuthorityInputJoin {
             .as_deref()
             .ok_or_else(|| fail("Host discovery did not attest source candidates"))?;
         let mut requested_refs = host.governing_source_refs.clone();
-        let mut observed_refs: Vec<String> =
-            host_candidates.iter().map(|item| item.source_ref.clone()).collect();
+        let mut observed_refs: Vec<String> = host_candidates
+            .iter()
+            .map(|item| item.source_ref.clone())
+            .collect();
         requested_refs.sort();
         requested_refs.dedup();
         observed_refs.sort();
@@ -261,14 +270,17 @@ impl ColdStartAuthorityInputJoin {
             }
         }
 
-        scan_binding.admit().map_err(|error| {
-            fail(&format!("Kernel scan binding is invalid: {error}"))
+        scan_binding
+            .admit()
+            .map_err(|error| fail(&format!("Kernel scan binding is invalid: {error}")))?;
+        scan_receipt
+            .validate()
+            .map_err(|error| fail(&format!("scan receipt handle is invalid: {error}")))?;
+        let fence_bytes = canonical_json_bytes(state_fence).map_err(|error| {
+            fail(&format!(
+                "state fence cannot be canonically encoded: {error}"
+            ))
         })?;
-        scan_receipt.validate().map_err(|error| {
-            fail(&format!("scan receipt handle is invalid: {error}"))
-        })?;
-        let fence_bytes = canonical_json_bytes(state_fence)
-            .map_err(|error| fail(&format!("state fence cannot be canonically encoded: {error}")))?;
         let state_fence_ref = sha256_hex(&fence_bytes);
         if scan_binding.lease_ref != discovery.lease.lease_ref
             || scan_binding.candidate_root_ref != candidate.scope.root_identity
@@ -282,12 +294,16 @@ impl ColdStartAuthorityInputJoin {
             ));
         }
 
-        let readback =
-            ScanDisclosureStore::readback(scan_store, scan_receipt, scan_binding).map_err(|error| {
-                fail(&format!("authenticated scanner receipt readback failed: {error}"))
+        let readback = ScanDisclosureStore::readback(scan_store, scan_receipt, scan_binding)
+            .map_err(|error| {
+                fail(&format!(
+                    "authenticated scanner receipt readback failed: {error}"
+                ))
             })?;
         readback.validate().map_err(|error| {
-            fail(&format!("authenticated scanner receipt is invalid: {error}"))
+            fail(&format!(
+                "authenticated scanner receipt is invalid: {error}"
+            ))
         })?;
         if readback.scan_ref != host.scan_ref
             || readback.scan_ref != scan_receipt.receipt_ref
