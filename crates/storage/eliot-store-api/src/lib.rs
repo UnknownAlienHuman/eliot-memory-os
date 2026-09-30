@@ -140,8 +140,8 @@ pub use problem_owner_state::{
     PROBLEM_TRANSITION_ESCALATE, PROBLEM_TRANSITION_QUARANTINE, PROBLEM_TRANSITION_REOPEN,
     PROBLEM_TRANSITION_RESOLVE, PROBLEM_TRANSITION_SUPERSEDE, PROBLEM_TRANSITION_UNASSIGN,
     PROBLEM_TRANSITION_UPDATE, PROBLEM_TRANSITION_WAIVE, ProblemOwnerTransition,
-    decode_problem_owner_state_mutation, problem_owner_state_mutation_request, problem_revision_key,
-    validate_problem_owner_state_params,
+    decode_problem_owner_state_mutation, problem_owner_state_mutation_request,
+    problem_revision_key, validate_problem_owner_state_params,
 };
 
 pub use reactive_state::{

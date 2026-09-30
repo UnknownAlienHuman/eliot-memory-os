@@ -236,7 +236,10 @@ fn assessed_source_shape(source: &AssessedSourceRevision) -> Result<(), ProblemE
     text(&source.revision, "assessed_source.revision")?;
     digest_text(&source.digest, "assessed_source.digest")?;
     text(&source.scope.scope_ref, "assessed_source.scope.scope_ref")?;
-    nonempty(&source.scope.included_refs, "assessed_source.scope.included_refs")?;
+    nonempty(
+        &source.scope.included_refs,
+        "assessed_source.scope.included_refs",
+    )?;
     unique_text(
         &source.scope.included_refs,
         "assessed_source.scope.included_refs",

@@ -253,10 +253,6 @@ pub use problem_owner_transitions::{
     PreparedProblemOwnerTransition, ProblemOwnerClosure, ProblemOwnerTransitionBody,
     ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
-pub use source_quarantine_admission::{
-    PreparedSourceQuarantineAdmission, SourceQuarantineAdmissionRequest,
-    SourceQuarantineDecision, SourceQuarantineOutcome, prepare_source_quarantine_admission,
-};
 pub use quality_applicability::{
     ACTIVE_DIRECTIVE_OWNER, GOVERNANCE_PROFILE_OWNER, GovernedDecision, IMPACT_OWNER,
     PROTECTED_FLOOR_OWNER, QualityApplicabilityError, QualityApplicabilityOwnerInputs, ROUTE_OWNER,
@@ -296,6 +292,10 @@ pub use selection_chain::{
     selection_chain_security_context, selection_claim_ceiling,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
+pub use source_quarantine_admission::{
+    PreparedSourceQuarantineAdmission, SourceQuarantineAdmissionRequest, SourceQuarantineDecision,
+    SourceQuarantineOutcome, prepare_source_quarantine_admission,
+};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
 pub use swarm_plan_attachment_ownership::{
     AttachmentOwnershipDomain, AttachmentOwnershipScope, OwnershipOutcome,

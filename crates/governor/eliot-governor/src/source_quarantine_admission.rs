@@ -89,7 +89,9 @@ fn refused(detail: impl Into<String>) -> CompositionError {
 }
 
 fn problem_refused(error: &ProblemError) -> CompositionError {
-    refused(format!("problem state machine refused the quarantine: {error}"))
+    refused(format!(
+        "problem state machine refused the quarantine: {error}"
+    ))
 }
 
 fn influence_refused(error: &eliot_influence::InfluenceError) -> CompositionError {
@@ -153,9 +155,8 @@ impl SourceQuarantineDecision {
             .permitted_effects
             .iter()
             .map(|effect| {
-                serde_json::to_value(effect).map_err(|error| {
-                    refused(format!("cannot render a permitted effect: {error}"))
-                })
+                serde_json::to_value(effect)
+                    .map_err(|error| refused(format!("cannot render a permitted effect: {error}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let strings = |values: &[String]| {
@@ -180,7 +181,10 @@ impl SourceQuarantineDecision {
                 "retained_frontier",
                 Value::Array(strings(&self.retained_frontier)),
             ),
-            ("impacted_scopes", Value::Array(strings(&self.impacted_scopes))),
+            (
+                "impacted_scopes",
+                Value::Array(strings(&self.impacted_scopes)),
+            ),
             ("permitted_effects", Value::Array(effects)),
             ("owner", owner),
             ("authority", authority),
@@ -265,8 +269,8 @@ impl SourceQuarantineAdmissionRequest<'_> {
     /// A per-transition idempotency key derived from the caller's, the Problem,
     /// the verb and the expected revision, so an identical retry reconciles
     /// rather than quarantining twice.
-    fn admission_identity(&self) -> Result<eliot_protocol::RequestIdentity, CompositionError> {
-        Ok(eliot_protocol::RequestIdentity {
+    fn admission_identity(&self) -> eliot_protocol::RequestIdentity {
+        eliot_protocol::RequestIdentity {
             request: self.identity.request.clone(),
             idempotency_key: format!(
                 "{}:source-quarantine:{problem_id}:{revision}",
@@ -276,7 +280,7 @@ impl SourceQuarantineAdmissionRequest<'_> {
             ),
             deadline_unix_ms: self.identity.deadline_unix_ms,
             cancellation_id: self.identity.cancellation_id.clone(),
-        })
+        }
     }
 }
 
@@ -331,7 +335,11 @@ fn quarantine_authorization(
         &restriction.rule_revision,
         digest_input,
     ))
-    .map_err(|error| refused(format!("cannot canonicalize the quarantine authorization: {error}")))?;
+    .map_err(|error| {
+        refused(format!(
+            "cannot canonicalize the quarantine authorization: {error}"
+        ))
+    })?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -355,7 +363,7 @@ pub fn prepare_source_quarantine_admission(
     request: &SourceQuarantineAdmissionRequest<'_>,
 ) -> Result<PreparedSourceQuarantineAdmission, CompositionError> {
     let operation_id = request.operation_id()?;
-    let identity = request.admission_identity()?;
+    let identity = request.admission_identity();
     let fence: &StateFence = &identity.request.metadata.state_fence;
 
     let current = request.current;
@@ -370,7 +378,12 @@ pub fn prepare_source_quarantine_admission(
     // restated: a record whose owner was fenced has no accountable party to
     // release a restriction, so the obligation stays outstanding on the record
     // until it is reassigned.
-    if &current.ownership.assigned().map_err(|error| problem_refused(&error))?.holder != request.owner
+    if &current
+        .ownership
+        .assigned()
+        .map_err(|error| problem_refused(&error))?
+        .holder
+        != request.owner
     {
         return Err(refused(
             "the accountable owner is not the quarantined record's live owner".to_owned(),

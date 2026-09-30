@@ -456,7 +456,8 @@ fn is_lowercase_digest(value: &str) -> bool {
 /// name a model recommendation — refuses here instead of being stored as an
 /// admitted restriction.
 fn validate_quarantine_authority(value: Option<&Value>) -> Result<(), StoreError> {
-    const REASON: &str = "retained source restriction must name a deterministic rule or an authorized decision";
+    const REASON: &str =
+        "retained source restriction must name a deterministic rule or an authorized decision";
     let Some(Value::Object(object)) = value else {
         return Err(StoreError::InvalidField {
             field: PROBLEM_PARAM_CLOSURE_JSON,
@@ -484,17 +485,18 @@ fn validate_quarantine_authority(value: Option<&Value>) -> Result<(), StoreError
             });
         }
     };
-    let inner = object.get(name).and_then(Value::as_object).ok_or(
-        StoreError::InvalidField {
+    let inner = object
+        .get(name)
+        .and_then(Value::as_object)
+        .ok_or(StoreError::InvalidField {
             field: PROBLEM_PARAM_CLOSURE_JSON,
             reason: REASON,
-        },
-    )?;
+        })?;
     if inner.len() != 1
-        || !inner
+        || inner
             .get(reference)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
     {
         return Err(StoreError::InvalidField {
             field: PROBLEM_PARAM_CLOSURE_JSON,
@@ -521,7 +523,7 @@ fn validate_source_quarantine_identities(
         if !source
             .get(name)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
         {
             return Err(members());
         }
@@ -541,7 +543,7 @@ fn validate_source_quarantine_identities(
         if !owner
             .get(name)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
         {
             return Err(members());
         }
@@ -570,7 +572,11 @@ fn validate_source_quarantine_json(
             reason: "retained source restriction does not name the presented Problem",
         });
     }
-    if object.get("expected_problem_revision").and_then(Value::as_str) != Some(expected_revision) {
+    if object
+        .get("expected_problem_revision")
+        .and_then(Value::as_str)
+        != Some(expected_revision)
+    {
         return Err(StoreError::InvalidField {
             field: PROBLEM_PARAM_CLOSURE_JSON,
             reason: "retained source restriction does not name the presented expected revision",
@@ -580,7 +586,7 @@ fn validate_source_quarantine_json(
         if !object
             .get(name)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
         {
             return Err(StoreError::InvalidField {
                 field: PROBLEM_PARAM_CLOSURE_JSON,
