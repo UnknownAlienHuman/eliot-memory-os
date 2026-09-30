@@ -13,8 +13,9 @@
 use std::collections::BTreeSet;
 
 use eliot_context::campaign_publication::{
-    ContextCampaignRecipeBody, ContextPublicationError, ContextSourcePublication,
-    context_delivery_publication, context_recipe_publication,
+    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV1, ContextPublicationError,
+    ContextSourcePublication, ContextToolPolicyProjectionV1, context_delivery_publication,
+    context_recipe_publication_with_compiler_suppliers,
 };
 use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{ArtifactId, StateFence};
@@ -130,8 +131,15 @@ fn build_context_tool_policy_record(
                 field: "context_tool_policy.owner_id",
             },
         )?);
-    let projection = serde_json::to_value(&recipe_body.recipe)
-        .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?;
+    let projection = match &recipe_body.compiler_suppliers {
+        Some(compiler_suppliers) => serde_json::to_value(ContextToolPolicyProjectionV1 {
+            schema_version: 1,
+            recipe: recipe_body.recipe.clone(),
+            compiler_suppliers: compiler_suppliers.clone(),
+        }),
+        None => serde_json::to_value(&recipe_body.recipe),
+    }
+    .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?;
     let projection_digest = eliot_contracts::sha256_hex(
         &eliot_contracts::canonical_json_bytes(&projection)
             .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?,
@@ -173,8 +181,12 @@ fn build_context_tool_policy_record(
 pub(crate) fn derive_context_recipe_record(
     recipe_body: &ContextCampaignRecipeBody,
 ) -> Result<CampaignSourceRecord, String> {
-    let recipe_owner = context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)
-        .map_err(|error| error.to_string())?;
+    let recipe_owner = context_recipe_publication_with_compiler_suppliers(
+        &recipe_body.recipe,
+        &recipe_body.compiler_input,
+        recipe_body.compiler_suppliers.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
     build_context_recipe_record(&recipe_owner, context_required_references(recipe_body))
         .map_err(|error| error.to_string())
 }
@@ -209,8 +221,11 @@ pub fn build_context_owner_publications(
     expected_delivery_head: Option<CampaignSourceHead>,
     read_state_fence: &StateFence,
 ) -> Result<Vec<CampaignSourcePublication>, ContextPublicationError> {
-    let recipe_owner =
-        context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)?;
+    let recipe_owner = context_recipe_publication_with_compiler_suppliers(
+        &recipe_body.recipe,
+        &recipe_body.compiler_input,
+        recipe_body.compiler_suppliers.as_ref(),
+    )?;
     let delivery_owner = context_delivery_publication(&recipe_body.recipe, prior_delivery)?;
     let required_references = context_required_references(recipe_body);
     let recipe_record = build_context_recipe_record(&recipe_owner, required_references.clone())?;
@@ -262,8 +277,12 @@ pub(crate) fn validate_context_owner_bodies(
     if recipe_body.recipe.binding.state_fence != *state_fence {
         return Err("Context recipe does not share the packet State Fence".to_owned());
     }
-    let recipe_owner = context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)
-        .map_err(|error| error.to_string())?;
+    let recipe_owner = context_recipe_publication_with_compiler_suppliers(
+        &recipe_body.recipe,
+        &recipe_body.compiler_input,
+        recipe_body.compiler_suppliers.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
     let required_references = context_required_references(recipe_body);
     let recipe_record = build_context_recipe_record(&recipe_owner, required_references.clone())
         .map_err(|error| error.to_string())?;
@@ -308,6 +327,30 @@ pub(crate) fn validate_context_owner_bodies(
         }
     }
     Ok(publications)
+}
+
+/// Validate the original ContextToolPolicy row against the same typed recipe
+/// and supplier profile used to derive its owner publication.
+pub(crate) fn validate_context_tool_policy_source_record(
+    recipe_body: &ContextCampaignRecipeBody,
+    source: &CampaignSourceRecord,
+) -> Result<Option<ContextCompilerSupplierProfileV1>, String> {
+    let recipe_owner = context_recipe_publication_with_compiler_suppliers(
+        &recipe_body.recipe,
+        &recipe_body.compiler_input,
+        recipe_body.compiler_suppliers.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let expected = build_context_tool_policy_record(
+        recipe_body,
+        &recipe_owner,
+        context_required_references(recipe_body),
+    )
+    .map_err(|error| error.to_string())?;
+    if *source != expected {
+        return Err("ContextToolPolicy row does not match its original typed recipe source".to_owned());
+    }
+    Ok(recipe_body.compiler_suppliers.clone())
 }
 
 fn source_record_matches_head(record: &CampaignSourceRecord, head: &CampaignSourceHead) -> bool {

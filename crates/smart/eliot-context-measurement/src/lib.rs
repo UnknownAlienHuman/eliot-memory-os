@@ -63,6 +63,8 @@ use eliot_context_contracts::{
     SerializedContextMeasurement, StuEstimate, TokenizerObservation,
 };
 use eliot_contracts::{ArtifactId, ContractVersion, sha256_hex};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use capacity::unit_as_str;
 use envelope::{validate_digest, validate_identity_text};
@@ -84,7 +86,8 @@ pub const MAX_IDENTITY_TEXT_BYTES: usize = 1_048_576;
 /// Supply `None` unless the value was empirically observed for this payload;
 /// this crate never derives an STU estimate from the byte count and never
 /// synthesizes a tokenizer observation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MeasurementParams {
     /// Stable identity for the produced measurement record.
     pub measurement_id: ArtifactId,
@@ -114,6 +117,29 @@ pub struct MeasurementParams {
     pub valid_until: Option<ArtifactId>,
     /// Maximum canonical payload bytes accepted by this route.
     pub max_serialized_bytes: u64,
+}
+
+impl MeasurementParams {
+    /// Validate the caller-owned parameters without manufacturing a
+    /// measurement for a payload that has not yet been assembled.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        if self.max_serialized_bytes == 0 {
+            return Err(ContextError::Bounds {
+                field: "measurement.max_serialized_bytes",
+            });
+        }
+        self.context.validate()?;
+        self.capacity.validate()?;
+        preflight_text(&self.serializer_id, "measurement.serializer_id")?;
+        preflight_text(&self.serializer_version, "measurement.serializer_version")?;
+        preflight_text(&self.route_id, "measurement.route_id")?;
+        preflight_text(&self.model_id, "measurement.model_id")?;
+        validate_digest(
+            &self.serializer_options_digest,
+            "measurement.serializer_options_digest",
+        )?;
+        Ok(())
+    }
 }
 
 fn preflight_text(value: &str, field: &'static str) -> Result<(), ContextError> {

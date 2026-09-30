@@ -51,7 +51,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use eliot_context::campaign_publication::ContextCampaignRecipeBody;
+use eliot_context::campaign_publication::{
+    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV1,
+};
 use eliot_context_contracts::ContextBinding;
 use eliot_contracts::{
     ClockReading, ProductId, RequestId, RequestMetadata, SessionId, SourceId, StateFence, TaskId,
@@ -60,16 +62,19 @@ use eliot_contracts::{
 use eliot_governor::{ContextReconstructionRequest, SevenRoleInputs};
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceBinding, CampaignSourceRole,
-    LearningStateViewRecipe, OwnerId, SlotRequirement, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    CampaignSourceRevisionRef, LearningStateViewRecipe, OwnerId, SlotRequirement,
+    TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
 };
 use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody,
     HostRequestResultLineage, LocalReadAttempt, host_request_operation_id,
 };
 use eliot_store_api::{
-    CampaignSourceDocumentSchema, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRead, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
+    CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
+    CampaignLearningStateViewReadStatus, CampaignSourceDocumentSchema,
+    CampaignSourceReadStatus, CampaignSourceRevisionLookup, CampaignSourceRevisionRead,
+    EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    ReadConsistency, RevisionHead, RevisionKey, ScopeId,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -148,6 +153,10 @@ pub enum ReconstructionPrerequisite {
     /// or did not validate against its current owner read.
     #[error("authenticated Context recipe source is unavailable or unbound")]
     ContextRecipeUnavailable,
+    /// The immutable campaign view named by the original compiler supplier
+    /// profile is missing, stale or not bound to the current TaskPlan/fence.
+    #[error("authenticated campaign learning-state view is unavailable or unbound")]
+    CampaignLearningViewUnavailable,
     /// The observed revision heads do not carry this scope's head.
     #[error("observed revision heads do not carry this scope's dependency head")]
     DependencyHeadUnavailable,
@@ -214,7 +223,17 @@ pub async fn serve_context_reconstruction(
     attempt: &LocalReadAttempt,
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
     let owner = reconstruct_context_owner_inputs(kernel, envelope, tool, attempt).await?;
-    context_reconstruction_result_body(&owner)
+    let compilation = if owner.context_recipe.body.compiler_suppliers.is_some() {
+        Some(
+            crate::dreamer_orientation_context::compile_dreamer_orientation_context(&owner)
+                .map_err(|error| {
+                    ReconstructionPrerequisite::ReconstructionRefused(error.to_string())
+                })?,
+        )
+    } else {
+        None
+    };
+    context_reconstruction_result_body(&owner, compilation.as_ref())
 }
 
 /// Reconstructs one authenticated input closure while retaining every owner
@@ -269,6 +288,14 @@ pub(crate) async fn reconstruct_context_owner_inputs<'a>(
     let context_recipe =
         read_authenticated_context_recipe(kernel, &envelope.state_fence, &scope, task_id, &recipe)
             .await?;
+    let context_tool_policy = read_authenticated_context_tool_policy(
+        kernel,
+        &envelope.state_fence,
+        &scope,
+        &recipe,
+        &context_recipe,
+    )
+    .await?;
     let dependency_revisions =
         observed_scope_head(&recipe.response.revision_heads, &scope, &envelope.state_fence)?;
     let request = context_reconstruction_request(
@@ -284,6 +311,20 @@ pub(crate) async fn reconstruct_context_owner_inputs<'a>(
         .reconstruct_context_inputs(&ctx, &request)
         .await
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
+    let campaign_learning_view = match context_recipe.body.compiler_suppliers.as_ref() {
+        Some(suppliers) => Some(
+            read_authenticated_campaign_learning_view(
+                kernel,
+                &envelope.state_fence,
+                &scope,
+                task_id,
+                &recipe,
+                &suppliers.campaign_learning_state_view_id,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     Ok(ContextReconstructionOwnerReadback {
         source_envelope: envelope,
         source_attempt: attempt,
@@ -291,6 +332,8 @@ pub(crate) async fn reconstruct_context_owner_inputs<'a>(
         task_id: task_id.to_owned(),
         task_recipe: recipe,
         context_recipe,
+        context_tool_policy,
+        campaign_learning_view,
         request,
         seven_role_inputs: seven,
     })
@@ -315,6 +358,12 @@ pub(crate) struct ContextReconstructionOwnerReadback<'a> {
     /// Exact Context owner source declared by that TaskPlan and its retained
     /// named read/receipt.
     pub(crate) context_recipe: AuthenticatedContextRecipe,
+    /// Original ContextToolPolicy owner source, including its independent
+    /// named read/receipt when the TaskPlan declares one.
+    pub(crate) context_tool_policy: Option<AuthenticatedContextToolPolicy>,
+    /// Exact current immutable campaign view named by the typed Context
+    /// compiler profile, with the original selector/readback retained.
+    pub(crate) campaign_learning_view: Option<AuthenticatedCampaignLearningView>,
     pub(crate) request: ContextReconstructionRequest,
     pub(crate) seven_role_inputs: SevenRoleInputs,
 }
@@ -346,6 +395,31 @@ pub(crate) struct AuthenticatedContextRecipe {
     /// Typed current source row and its original owner read receipt.
     pub(crate) read: CampaignSourceRevisionRead,
     /// Original named response, including its source revision heads.
+    pub(crate) response: NamedReadResponse,
+}
+
+/// Exact ContextToolPolicy owner row and original readback, when the
+/// authenticated TaskPlan declared that source role.
+#[derive(Serialize)]
+pub(crate) struct AuthenticatedContextToolPolicy {
+    /// Typed suppliers decoded only after the exact current source row passed
+    /// its original ContextToolPolicy receipt and recipe-derived projection
+    /// comparison. Absence remains `None`.
+    pub(crate) compiler_suppliers: Option<ContextCompilerSupplierProfileV1>,
+    /// Original typed current source row and owner receipt.
+    pub(crate) read: CampaignSourceRevisionRead,
+    /// Original named response, including payload and observed revision heads.
+    pub(crate) response: NamedReadResponse,
+}
+
+/// Exact original named read of the immutable campaign learning-state view.
+#[derive(Serialize)]
+pub(crate) struct AuthenticatedCampaignLearningView {
+    /// Original lookup, including view, task and scope selectors.
+    pub(crate) lookup: CampaignLearningStateViewLookup,
+    /// Typed named-read result with its original read fence.
+    pub(crate) read: CampaignLearningStateViewRead,
+    /// Original authenticated response, including identity and observed heads.
     pub(crate) response: NamedReadResponse,
 }
 
@@ -700,6 +774,206 @@ async fn read_authenticated_context_recipe(
     })
 }
 
+/// Reads the exact ContextToolPolicy reference declared by the authenticated
+/// TaskPlan. A supplier profile is usable only when this independent owner row
+/// mirrors the exact typed value retained by the ContextRecipe source.
+async fn read_authenticated_context_tool_policy(
+    kernel: &DaemonKernelClient,
+    fence: &StateFence,
+    scope: &ScopeId,
+    task_recipe: &AuthenticatedTaskRecipe,
+    context_recipe: &AuthenticatedContextRecipe,
+) -> Result<Option<AuthenticatedContextToolPolicy>, ReconstructionPrerequisite> {
+    let Some(expected) = context_tool_policy_reference(task_recipe, context_recipe)? else {
+        return Ok(None);
+    };
+    let lookup = CampaignSourceRevisionLookup {
+        role: CampaignSourceRole::ContextToolPolicy,
+        owner_id: expected.owner.clone(),
+        record_id: expected.record_id.clone(),
+        expected_revision: Some(expected.revision.clone()),
+        expected_content_digest: Some(expected.content_digest.clone()),
+    };
+    let request = NamedReadRequest {
+        operation: NamedReadOperation::GetCampaignSourceRevision,
+        scope_id: Some(scope.clone()),
+        consistency: ReadConsistency::ExactFence,
+        state_fence: fence.clone(),
+        parameters: lookup
+            .named_parameters()
+            .map_err(|_| ReconstructionPrerequisite::ContextRecipeUnavailable)?,
+    };
+    let response = KernelContextReadClient::execute_campaign_read(kernel, request)
+        .await
+        .map_err(|_| ReconstructionPrerequisite::ContextRecipeUnavailable)?;
+    let read = CampaignSourceRevisionRead::from_named_read_response(&response)
+        .map_err(|_| ReconstructionPrerequisite::ContextRecipeUnavailable)?;
+    let source = validate_context_tool_policy_read(&read, expected, fence)?;
+    let compiler_suppliers =
+        crate::campaign_context_owner::validate_context_tool_policy_source_record(
+            &context_recipe.body,
+            source,
+        )
+        .map_err(|_| ReconstructionPrerequisite::ContextRecipeUnavailable)?;
+    Ok(Some(AuthenticatedContextToolPolicy {
+        compiler_suppliers,
+        read,
+        response,
+    }))
+}
+
+/// Reads the exact view named by the original typed Context compiler profile.
+/// The immutable view must belong to the authenticated TaskPlan recipe and the
+/// current admitted task, scope and full State Fence before compilation.
+async fn read_authenticated_campaign_learning_view(
+    kernel: &DaemonKernelClient,
+    fence: &StateFence,
+    scope: &ScopeId,
+    task_id: &str,
+    task_recipe: &AuthenticatedTaskRecipe,
+    view_id: &eliot_contracts::ArtifactId,
+) -> Result<AuthenticatedCampaignLearningView, ReconstructionPrerequisite> {
+    let task_id = TaskId::new(task_id.to_owned())
+        .map_err(|_| ReconstructionPrerequisite::CampaignLearningViewUnavailable)?;
+    let lookup = CampaignLearningStateViewLookup {
+        view_id: view_id.clone(),
+        task_id,
+        scope_id: scope.clone(),
+    };
+    let request = NamedReadRequest {
+        operation: NamedReadOperation::GetCampaignLearningStateView,
+        scope_id: Some(scope.clone()),
+        consistency: ReadConsistency::ExactFence,
+        state_fence: fence.clone(),
+        parameters: lookup
+            .named_parameters()
+            .map_err(|_| ReconstructionPrerequisite::CampaignLearningViewUnavailable)?,
+    };
+    let response = KernelContextReadClient::execute_campaign_read(kernel, request)
+        .await
+        .map_err(|_| ReconstructionPrerequisite::CampaignLearningViewUnavailable)?;
+    let read = CampaignLearningStateViewRead::from_named_read_response(&response)
+        .map_err(|_| ReconstructionPrerequisite::CampaignLearningViewUnavailable)?;
+    if read.status != CampaignLearningStateViewReadStatus::Current
+        || read.read_state_fence != *fence
+        || response.state_fence != *fence
+    {
+        return Err(ReconstructionPrerequisite::CampaignLearningViewUnavailable);
+    }
+    let publication = read
+        .publication
+        .as_ref()
+        .ok_or(ReconstructionPrerequisite::CampaignLearningViewUnavailable)?;
+    if publication.view_id != lookup.view_id
+        || publication.task_id != lookup.task_id
+        || publication.scope_id != lookup.scope_id
+        || publication.state_fence != *fence
+        || publication.view.validate_against(&task_recipe.recipe).is_err()
+        || publication.view.binding.state_fence != *fence
+        || publication.view.provenance.source_resolutions.iter().any(|resolution| {
+            resolution.read_state_fence != *fence
+        })
+    {
+        return Err(ReconstructionPrerequisite::CampaignLearningViewUnavailable);
+    }
+    Ok(AuthenticatedCampaignLearningView {
+        lookup,
+        read,
+        response,
+    })
+}
+
+fn context_tool_policy_reference<'a>(
+    task_recipe: &'a AuthenticatedTaskRecipe,
+    context_recipe: &AuthenticatedContextRecipe,
+) -> Result<Option<&'a CampaignSourceRevisionRef>, ReconstructionPrerequisite> {
+    let mut requirements = task_recipe
+        .recipe
+        .source_requirements
+        .iter()
+        .filter(|requirement| requirement.role == CampaignSourceRole::ContextToolPolicy);
+    let Some(requirement) = requirements.next() else {
+        return if context_recipe.body.compiler_suppliers.is_none() {
+            Ok(None)
+        } else {
+            Err(ReconstructionPrerequisite::ContextRecipeUnavailable)
+        };
+    };
+    if requirements.next().is_some() {
+        return Err(ReconstructionPrerequisite::ContextRecipeUnavailable);
+    }
+    let reference = match requirement.source_binding {
+        CampaignSourceBinding::ExactReference => requirement
+            .expected_reference
+            .as_ref()
+            .ok_or(ReconstructionPrerequisite::ContextRecipeUnavailable)?,
+        CampaignSourceBinding::ExplicitlyAbsent => {
+            if requirement.expected_reference.is_some()
+                || context_recipe.body.compiler_suppliers.is_some()
+            {
+                return Err(ReconstructionPrerequisite::ContextRecipeUnavailable);
+            }
+            return Ok(None);
+        }
+        CampaignSourceBinding::AuthenticatedTaskAnchor => {
+            return Err(ReconstructionPrerequisite::ContextRecipeUnavailable);
+        }
+    };
+    if reference.role != CampaignSourceRole::ContextToolPolicy
+        || reference.owner != requirement.owner
+    {
+        return Err(ReconstructionPrerequisite::ContextRecipeUnavailable);
+    }
+    Ok(Some(reference))
+}
+
+fn validate_context_tool_policy_read<'a>(
+    read: &'a CampaignSourceRevisionRead,
+    expected: &CampaignSourceRevisionRef,
+    fence: &StateFence,
+) -> Result<&'a eliot_store_api::CampaignSourceRecord, ReconstructionPrerequisite> {
+    if read.validate().is_err()
+        || read.status != CampaignSourceReadStatus::Current
+        || read.read_state_fence != *fence
+    {
+        return Err(ReconstructionPrerequisite::ContextRecipeUnavailable);
+    }
+    let source = read
+        .source
+        .as_ref()
+        .ok_or(ReconstructionPrerequisite::ContextRecipeUnavailable)?;
+    let head = read
+        .current_head
+        .as_ref()
+        .ok_or(ReconstructionPrerequisite::ContextRecipeUnavailable)?;
+    let receipt = read
+        .read_receipt
+        .as_ref()
+        .ok_or(ReconstructionPrerequisite::ContextRecipeUnavailable)?;
+    if source.role != expected.role
+        || source.owner_id != expected.owner
+        || source.record_id != expected.record_id
+        || source.revision != expected.revision
+        || source.content_digest != expected.content_digest
+        || source.slot_projection_digests != expected.slot_projection_digests
+        || source.recorded_state_fence != expected.recorded_state_fence
+        || head.role != expected.role
+        || head.owner_id != expected.owner
+        || head.record_id != expected.record_id
+        || head.revision != expected.revision
+        || head.content_digest != expected.content_digest
+        || head.slot_projection_digests != expected.slot_projection_digests
+        || head.recorded_state_fence != expected.recorded_state_fence
+        || receipt.validate().is_err()
+        || receipt.read_state_fence != *fence
+        || !receipt.binds_record(source)
+        || source.document.schema != CampaignSourceDocumentSchema::ContextToolPolicy
+    {
+        return Err(ReconstructionPrerequisite::ContextRecipeUnavailable);
+    }
+    Ok(source)
+}
+
 /// Turns the revision heads this daemon OBSERVED on its authenticated owner
 /// read into the exact-fence dependency minimums for the reconstruction.
 ///
@@ -981,15 +1255,26 @@ fn reconstruction_context(
 /// action authority.
 fn context_reconstruction_result_body(
     owner: &ContextReconstructionOwnerReadback<'_>,
+    compilation: Option<&crate::kernel_context_read_client::ContextCompilationOwnerReadback<'_>>,
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
     let closure = serde_json::to_value(&owner.seven_role_inputs)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
+    let compilation_publication = match compilation {
+        Some(compilation) => Some(
+            crate::dreamer_orientation_context::compilation_owner_publication(compilation)
+                .map_err(ReconstructionPrerequisite::ReconstructionRefused)?,
+        ),
+        None => None,
+    };
     let owner_publication = json!({
         "source_envelope": owner.source_envelope,
         "source_attempt": owner.source_attempt,
         "request": &owner.request,
         "task_plan": &owner.task_recipe,
         "context_recipe": &owner.context_recipe,
+        "context_tool_policy": &owner.context_tool_policy,
+        "campaign_learning_view": &owner.campaign_learning_view,
+        "context_compilation": compilation_publication,
     });
     let response = json!({
         "operation": CONTEXT_RECONSTRUCTION_MODE,
