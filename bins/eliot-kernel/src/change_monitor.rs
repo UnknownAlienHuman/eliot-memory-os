@@ -1344,7 +1344,10 @@ pub(crate) fn persist_ledger_sidecar() -> Result<(), ChangeMonitorError> {
 /// acceptance instead of trusting a half-read projection.
 ///
 /// Caller: `host_request_route::daemon_claim_queue::submit_finish_result`,
-/// before consulting the acceptance gate.
+/// before consulting the acceptance gate; and
+/// `crate::process_execution::KernelGovernedProcessEffectPort::new`, which
+/// rebuilds ledger state (and therefore ledger-retained tips) when this
+/// process started fresh.
 pub(crate) fn hydrate_ledger_sidecar_if_empty() -> Result<bool, ChangeMonitorError> {
     let Some(path) = ledger_sidecar_path() else {
         return Ok(false);
