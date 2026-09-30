@@ -452,9 +452,9 @@ pub struct ContextSectionBudget {
     ///
     /// Required and non-empty: a section that names no exact required identity
     /// could only ever be checked by count, which is exactly the gap #1725
-    /// closes. These are unit identities — an EvidenceAtom, ClaimCard,
-    /// ToolDefinition, source-catalog entry, WorkItem, completed causal stage or
-    /// normative anchor — and a JSON object, URL, source identity, call/result
+    /// closes. These are unit identities — an `EvidenceAtom`, `ClaimCard`,
+    /// `ToolDefinition`, source-catalog entry, `WorkItem`, completed causal stage
+    /// or normative anchor — and a JSON object, URL, source identity, call/result
     /// pair or evidence edge is never a member of this set, because none of
     /// them is one whole unit. A genuine set: order carries no meaning and it
     /// is sorted for the policy digest.
@@ -491,11 +491,14 @@ impl ContextSectionBudget {
                 "section_budget.minimum_required_whole_units",
             ));
         }
-        Self::validate_required_references()?;
+        self.validate_required_references()?;
         if self.planning_maximum_whole_units < self.minimum_required_whole_units {
             return Err(ContextError::CapacityExceeded);
         }
-        validate_text(&self.planning_route_profile, "section_budget.planning_route_profile")?;
+        validate_text(
+            &self.planning_route_profile,
+            "section_budget.planning_route_profile",
+        )?;
         if self.protected_floor_refs.len() > 64 {
             return Err(ContextError::Bounds {
                 field: "section_budget.protected_floor_refs",
@@ -531,7 +534,10 @@ impl ContextSectionBudget {
         }
         let mut seen = BTreeSet::new();
         for reference in &self.required_exact_references {
-            validate_text(reference.as_str(), "section_budget.required_exact_references")?;
+            validate_text(
+                reference.as_str(),
+                "section_budget.required_exact_references",
+            )?;
             if !seen.insert(reference.clone()) {
                 return Err(ContextError::Duplicate(
                     "section_budget.required_exact_references",
@@ -593,8 +599,8 @@ impl ContextSectionBudget {
                 return Err(ContextError::WholeUnitRequired);
             }
         }
-        let admitted_whole_units = u64::try_from(admitted_units.len())
-            .map_err(|_| ContextError::Overflow)?;
+        let admitted_whole_units =
+            u64::try_from(admitted_units.len()).map_err(|_| ContextError::Overflow)?;
         if admitted_whole_units < self.minimum_required_whole_units {
             return Err(ContextError::MissingFloor);
         }
@@ -1404,10 +1410,7 @@ impl ContextRecipePolicy {
     }
 
     /// Refuse two role policies for one semantic role that disagree.
-    fn require_consistent_role_policies(
-        &self,
-        recipe: &ContextRecipe,
-    ) -> Result<(), ContextError> {
+    fn require_consistent_role_policies(&self, recipe: &ContextRecipe) -> Result<(), ContextError> {
         for budget in &self.section_budgets {
             let Some(rule) = recipe
                 .role_policies
