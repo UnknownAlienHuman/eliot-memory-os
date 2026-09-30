@@ -249,11 +249,14 @@ struct ActivatedTaskBinding {
 /// Disposition of the one retained consumed-frontier offer (issue #2800).
 ///
 /// `Prepared`, `HandedToTransport`, and `OutcomeUnknown` are unresolved:
-/// the exact frontier stays retryable under the same identity. A validated
-/// Kernel acknowledgement receipt or the joint core/cache import moves an
-/// offer to `OwnerConfirmed`, after proving the exact owner tuple, offered
-/// frontier, and acknowledged cursor. A proved successor marks its
-/// predecessor `Replaced`; that offer is never replayed under the successor.
+/// the exact frontier stays retryable under the same identity. Only the
+/// joint core/cache import moves an offer to `OwnerConfirmed`, after proving
+/// the exact owner tuple, offered frontier, acknowledged cursor, and this
+/// binding's live window. A validated Kernel acknowledgement receipt is
+/// retained as evidence for that import but never confirms on its own: a
+/// receipt proves Kernel committed the acknowledgement, not that this
+/// bridge imported the answer. A proved successor marks its predecessor
+/// `Replaced`; that offer is never replayed under the successor.
 /// Transport custody (`Delivered`) never confirms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConsumedOfferDisposition {
@@ -265,7 +268,8 @@ enum ConsumedOfferDisposition {
     /// Send failure, missing reply, or rejected answer; retryable under the
     /// same identity. Unconfirmed.
     OutcomeUnknown,
-    /// Terminal: exact Kernel ack receipt or joint import confirmed the offer.
+    /// Terminal: the joint core/cache import confirmed this offer against
+    /// exact owner proof. No other writer exists.
     OwnerConfirmed,
     /// Terminal: an exact successor owner proof replaced at least one
     /// stream identity in this offer; its bytes must never be replayed under
@@ -507,11 +511,13 @@ fn acknowledgement_receipts_share_request(
 
 /// Validates a Kernel acknowledgement receipt against the exact frontier and
 /// owner tuple held by the unresolved offer. The receipt proves ack progress
-/// only; its independent read has not completed.
+/// only; its independent read has not completed. Returns no acknowledged
+/// cursors: the confirmed bases are advanced solely by the guarded joint
+/// import, from the owner-confirmed cursors that import proves itself.
 fn validate_acknowledgement_receipt(
     receipt: &serde_json::Value,
     offer: &ConsumedFrontierOffer,
-) -> Result<BTreeMap<String, u64>, ProviderFailure> {
+) -> Result<(), ProviderFailure> {
     let invalid = || {
         event_shape_failure(
             "reconciliation refused: acknowledgement receipt does not bind the retained offer",
@@ -582,22 +588,22 @@ fn validate_acknowledgement_receipt(
         return Err(invalid());
     }
     let mut seen_outcome_namespaces = BTreeSet::new();
-    let mut acknowledged = BTreeMap::new();
     for stream in outcome_streams {
         let namespace = recovery_digest(stream, "namespace")?;
-        let (stream_id, expected_sequence) =
-            requested_namespaces.get(&namespace).ok_or_else(invalid)?;
+        let expected_sequence = requested_namespaces.get(&namespace).ok_or_else(invalid)?.1;
         let durable_cursor = recovery_cursor(stream, "durable_cursor")?;
         let acked_cursor = recovery_cursor(stream, "acked_cursor")?;
         if !seen_outcome_namespaces.insert(namespace)
-            || acked_cursor < *expected_sequence
+            || acked_cursor < expected_sequence
             || durable_cursor < acked_cursor
         {
             return Err(invalid());
         }
-        acknowledged.insert(stream_id.clone(), acked_cursor);
+        // The per-leg owner-confirmed cursor is proved here and not returned:
+        // only the joint import may advance an acknowledgement base, and it
+        // proves the cursor again from this result's own owner facts.
     }
-    Ok(acknowledged)
+    Ok(())
 }
 
 fn verify_acknowledgement_receipt_digests(
@@ -3824,9 +3830,19 @@ impl KernelMcpForwardingPort {
         Ok(())
     }
 
-    /// Promotes a previously validated acknowledgement receipt into local
-    /// acknowledgement bases after the complete response has been validated.
-    /// A saved receipt is usable when the final retry omits it.
+    /// Retains the committed acknowledgement receipt of the final answer on
+    /// the still-unresolved offer so the guarded joint import can confirm
+    /// from it. A saved receipt is usable when the final retry omits it.
+    ///
+    /// This is RETENTION ONLY. It advances no acknowledgement base, prunes
+    /// no held receipt, and never writes a terminal disposition: a receipt
+    /// that passed its own digest and shape checks proves only that Kernel
+    /// committed the acknowledgement, not that this bridge reconciled the
+    /// answer into its recovery state. `ConsumedOfferDisposition::OwnerConfirmed`
+    /// and the `owner_acked` / `delivered_sequences` advances have exactly one
+    /// writer, `reconciliation_imported`'s guarded branch, so a failure
+    /// anywhere between here and that joint commit leaves the offer unresolved
+    /// and its receipts held.
     fn retain_acknowledgement_receipt(
         &mut self,
         value: &serde_json::Value,
@@ -3863,15 +3879,26 @@ impl KernelMcpForwardingPort {
                 "reconciliation refused: acknowledgement receipt has no retained consumed offer",
             )
         })?;
+        // Retention applies to an unresolved offer only. A terminal offer is
+        // left exactly as the joint import left it.
+        if matches!(
+            offer.disposition,
+            ConsumedOfferDisposition::OwnerConfirmed | ConsumedOfferDisposition::Replaced
+        ) {
+            return Ok(());
+        }
+        // No terminal write is gated on this disposition: the reply itself is
+        // the custody fact, and the joint import re-evaluates the live
+        // disposition before it confirms.
         if !matches!(
             offer.disposition,
-            ConsumedOfferDisposition::HandedToTransport
+            ConsumedOfferDisposition::HandedToTransport | ConsumedOfferDisposition::OutcomeUnknown
         ) {
             return Err(event_shape_failure(
                 "reconciliation refused: acknowledgement receipt does not match transport custody",
             ));
         }
-        let acknowledged = validate_acknowledgement_receipt(&receipt, offer)?;
+        validate_acknowledgement_receipt(&receipt, offer)?;
         if let Some(previous) = &offer.acknowledgement_receipt {
             validate_acknowledgement_receipt(previous, offer)?;
             if !acknowledgement_receipts_share_request(previous, &receipt) {
@@ -3889,40 +3916,16 @@ impl KernelMcpForwardingPort {
                 "reconciliation refused: acknowledgement receipt is exact for a predecessor owner identity that is no longer adopted",
             ));
         }
-        // Build both replacement caches before touching shared state. If an
-        // allocation or validation fails, the offer and caches stay intact.
-        let stream_identities = offer.stream_identities.clone();
-        let mut owner_acked = owner.owner_acked.clone();
-        let mut delivered_sequences = owner.delivered_sequences.clone();
-        let acknowledgement_receipt = receipt;
-        for (stream_id, acked_cursor) in acknowledged {
-            let confirmed_cursor = owner_acked
-                .get(&stream_id)
-                .copied()
-                .unwrap_or(0)
-                .max(acked_cursor);
-            owner_acked.insert(stream_id.clone(), confirmed_cursor);
-            if let Some(held) = delivered_sequences.get_mut(&stream_id) {
-                let identity = &stream_identities[&stream_id];
-                held.retain(|sequence, delivered| {
-                    *sequence > confirmed_cursor
-                        || delivered.owner_identity.as_ref() != Some(identity)
-                });
-                if held.is_empty() {
-                    delivered_sequences.remove(&stream_id);
-                }
-            }
-        }
         let offer = owner.consumed_offer.as_mut().ok_or_else(|| {
             event_shape_failure(
                 "reconciliation refused: retained consumed offer disappeared during receipt validation",
             )
         })?;
-        // Infallible swap after all parsing, validation, and allocation.
-        owner.owner_acked = owner_acked;
-        owner.delivered_sequences = delivered_sequences;
-        offer.acknowledgement_receipt = Some(acknowledgement_receipt);
-        offer.disposition = ConsumedOfferDisposition::OwnerConfirmed;
+        // The one field write this function may make: evidence bound to the
+        // offer that produced it, never an acknowledgement base.
+        if offer.acknowledgement_receipt.is_none() {
+            offer.acknowledgement_receipt = Some(receipt);
+        }
         Ok(())
     }
 
@@ -4389,6 +4392,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         } else {
             first
         };
+        // Retention only. This call is deliberately NOT a confirmation
+        // point: the offer's terminal disposition and the ack bases are
+        // written solely by the joint import below, after this answer
+        // survives core's authority recheck and candidate-window staging.
+        // Confirming here would commit half the import while those
+        // fallible steps still stand between it and the joint cut.
         if final_attempt.window_status == RecoveryWindowStatus::Active
             && let Err(error) = self.retain_acknowledgement_receipt(&final_attempt.value, false)
         {
@@ -4494,6 +4503,15 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     /// typed refusal naming the preserved state and the retry/recovery
     /// directive. Text-keyed caches remain paired with their adopted owner
     /// tuple and reset only when exact successor facts arrive.
+    ///
+    /// This is the ONLY writer of the terminal
+    /// [`ConsumedOfferDisposition::OwnerConfirmed`] and of the ack-base /
+    /// held-receipt advance. The transport half of `reconcile_external`
+    /// retains the same reply's acknowledgement receipt as evidence but
+    /// confirms nothing, so a failure between that retention and this call
+    /// leaves the offer unresolved and every held receipt retained, and
+    /// this call is the point where core, ack cache, held receipts, and the
+    /// matching offer commit together or not at all.
     fn reconciliation_imported(
         &mut self,
         binding: &AttachBinding,
@@ -4586,10 +4604,11 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         if offer_was_replaced && let Some(offer) = owner.consumed_offer.as_mut() {
             offer.disposition = ConsumedOfferDisposition::Replaced;
         }
-        // A positive pre-borrow proof confirms the retained offer here, in
-        // the same swap: core, ack cache, held receipts, and matching
-        // offer commit together. The live disposition is rechecked so only
-        // an unresolved offer can confirm; a replaced offer never does.
+        // The ONE terminal confirmation write for a retained offer. Nothing
+        // else in this file sets `OwnerConfirmed`: the transport
+        // reconcile path only retains the receipt as evidence. The live
+        // disposition is rechecked so only an unresolved offer can
+        // confirm; a replaced offer never does.
         if offer_proven
             && let Some(offer) = owner.consumed_offer.as_mut()
             && !matches!(
