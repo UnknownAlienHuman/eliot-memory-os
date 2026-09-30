@@ -186,6 +186,11 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
                 "current WorkScope owner is unbound",
             ))?;
     let current_scope = work_scope_owner.read_current(fence)?;
+    super::ensure_snapshot_fresh(
+        &current_scope,
+        "source-artifact read WorkScope is not fresh",
+    )
+    .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
     let current_scope_identity = &current_scope.binding.scope;
     if current_scope.state_fence != *fence
         || current_scope_identity.scope_ref != original.work_scope_ref
