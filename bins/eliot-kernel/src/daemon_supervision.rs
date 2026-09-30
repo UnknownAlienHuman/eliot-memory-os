@@ -291,7 +291,7 @@ impl AdmittedDaemonRestartPolicy {
         admitted_generation: ResourceGeneration,
         state_fence: StateFence,
     ) -> Result<Self, RestartPolicyError> {
-        let binding = policy.bind(admitted_generation.clone(), state_fence.clone())?;
+        let binding = policy.bind(admitted_generation, state_fence.clone())?;
         binding.validate_for(&policy, &admitted_generation, &state_fence)?;
         Ok(Self { policy, binding })
     }
