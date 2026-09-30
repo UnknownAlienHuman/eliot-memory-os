@@ -7012,10 +7012,13 @@ impl KernelComposition {
     /// Advances the recurring horizon after an owner-acknowledged admission and
     /// reports the occurrence as admitted (issue #2806 item 6).
     ///
-    /// The `status`/`recovery` pair is derived from the horizon alone, exactly as
+    /// The `status`/`recovery` pair is derived from the advance alone, exactly as
     /// before: only a fully acknowledged published horizon reports a settled
     /// answer, and every partial, unknown or unavailable remainder keeps its
-    /// exact remaining occurrence set and replay handle.
+    /// exact remaining occurrence set and replay handle. A consumed denominator
+    /// also reports a settled answer, because the resolved revision owns no wake
+    /// horizon after the admitted occurrence rather than because an owner was
+    /// missing.
     #[cfg(windows)]
     async fn user_automation_due_wake_admitted_value(
         session: &Session,
@@ -7028,7 +7031,7 @@ impl KernelComposition {
         >,
         execution: eliot_kernel_core::user_automation::AutomationExecutionReference,
     ) -> serde_json::Value {
-        let horizon = Self::user_automation_due_wake_horizon(
+        let advance = Self::user_automation_due_wake_horizon(
             session,
             resolution,
             occurrence_id,
@@ -7036,7 +7039,7 @@ impl KernelComposition {
             client,
         )
         .await;
-        let recovery = Self::user_automation_horizon_recovery(&horizon);
+        let recovery = Self::user_automation_horizon_recovery(&advance);
         serde_json::json!({
             "status": if recovery.is_none() { "known" } else { "unknown" },
             "value": {
@@ -7044,7 +7047,7 @@ impl KernelComposition {
                 "execution": execution,
                 "resolution": resolution,
                 "wake_readback": readback,
-                "horizon": horizon,
+                "horizon": Self::user_automation_horizon_value(&advance),
             },
             "recovery": recovery,
         })
@@ -7114,9 +7117,9 @@ impl KernelComposition {
     /// `outcome` and the owner's own reason. It is not published, not admitted,
     /// and it carries no Durable Job reference, so nothing here can be read as a
     /// success, and one disposition is never re-labelled as another. The
-    /// route-level `recovery` stays derived from the horizon alone and is never
-    /// fabricated: a decided disposition with a fully acknowledged horizon owes
-    /// the caller nothing, which is the same convention
+    /// route-level `recovery` stays derived from the horizon advance alone and is
+    /// never fabricated: a decided disposition with a fully acknowledged or
+    /// consumed horizon owes the caller nothing, which is the same convention
     /// `user_automation_runtime_error_response` already uses for
     /// `UserAutomationRuntimeError::Rejected`.
     #[cfg(windows)]
@@ -7131,7 +7134,7 @@ impl KernelComposition {
         >,
         disposition: DecidedDisposition<'_>,
     ) -> Result<serde_json::Value, TransportError> {
-        let horizon = Self::user_automation_due_wake_horizon(
+        let advance = Self::user_automation_due_wake_horizon(
             session,
             resolution,
             occurrence_id,
@@ -7139,7 +7142,7 @@ impl KernelComposition {
             client,
         )
         .await;
-        let recovery = Self::user_automation_horizon_recovery(&horizon);
+        let recovery = Self::user_automation_horizon_recovery(&advance);
         Ok(serde_json::json!({
             "status": if recovery.is_none() { "known" } else { "unknown" },
             "value": {
@@ -7149,7 +7152,7 @@ impl KernelComposition {
                 "occurrence_id": occurrence_id,
                 "resolution": resolution,
                 "wake_readback": readback,
-                "horizon": horizon,
+                "horizon": Self::user_automation_horizon_value(&advance),
             },
             "recovery": recovery,
         }))
@@ -7247,6 +7250,26 @@ impl KernelComposition {
     /// immutable revision's own normalized denominator. A request that was never
     /// sent, or whose answer was lost, keeps the exact remaining occurrence set
     /// and the replay handle instead of reporting a published horizon.
+    ///
+    /// **A consumed denominator is finished, not unavailable.** The cursor rule
+    /// is the same one the horizon compiler uses: the slice starts immediately
+    /// after the consumed occurrence's own place in the revision's recompiled
+    /// denominator. When that occurrence is the LAST member, the revision's
+    /// complete normalized set is consumed and there is no next slice to
+    /// compile. That is a settled fact about the revision, and it is reported as
+    /// [`UserAutomationHorizonAdvance::Exhausted`] with no owner call at all,
+    /// because the honest owner was available the whole time and there was simply
+    /// nothing to ask it about. The digest and owner-principal bindings the
+    /// compiler itself proves are proved here first, so a resolution that does
+    /// not name this exact immutable revision under its own owner can never be
+    /// reported as a complete horizon.
+    ///
+    /// The denominator is therefore compiled once, before anything is issued, and
+    /// a revision that cannot compile it yields
+    /// [`UserAutomationHorizonAdvance::Unresolved`] naming that refusal. The
+    /// failure projection below can consequently always be handed a non-empty
+    /// remainder; an empty set there would claim that nothing is outstanding,
+    /// which is the one answer this contour cannot prove.
     #[cfg(windows)]
     async fn user_automation_due_wake_horizon(
         session: &Session,
@@ -7256,17 +7279,32 @@ impl KernelComposition {
         client: &UserAutomationHostExecutionClient<
             AuthenticatedUserAutomationHostExecutionTransport,
         >,
-    ) -> UserAutomationHorizonPhase {
-        let denominator_occurrence_ids = resolution
-            .revision
-            .compile_occurrence_identities()
-            .map(|identities| {
-                identities
-                    .iter()
-                    .map(|identity| identity.occurrence_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+    ) -> UserAutomationHorizonAdvance {
+        let identities = match resolution.revision.compile_occurrence_identities() {
+            Ok(identities) => identities,
+            Err(error) => {
+                return UserAutomationHorizonAdvance::Unresolved {
+                    reason: format!(
+                        "revision {} of automation {} does not compile its own normalized \
+                         occurrence denominator, so the exact remaining occurrence set this \
+                         advance owns cannot be named and no schedule owner is asked: {error}",
+                        resolution.revision.revision, resolution.revision.automation_id,
+                    ),
+                };
+            }
+        };
+        let denominator_occurrence_ids = identities
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        if Self::user_automation_horizon_cursor_is_consumed(
+            resolution,
+            &identities,
+            occurrence_id,
+            &request.authenticated_principal,
+        ) {
+            return UserAutomationHorizonAdvance::Exhausted;
+        }
         let publication = match advance_wake_horizon(
             resolution,
             occurrence_id,
@@ -7277,48 +7315,78 @@ impl KernelComposition {
         ) {
             Ok(publication) => publication,
             Err(error) => {
-                return Self::user_automation_unacknowledged_horizon(
-                    resolution,
-                    &denominator_occurrence_ids,
-                    &request.identity,
-                    &format!(
-                        "the next bounded horizon slice for the resolved revision could not be \
-                         compiled from its own normalized contract: {error}"
+                return UserAutomationHorizonAdvance::Answered(
+                    Self::user_automation_unacknowledged_horizon(
+                        resolution,
+                        &denominator_occurrence_ids,
+                        &request.identity,
+                        &format!(
+                            "the next bounded horizon slice for the resolved revision could not be \
+                             compiled from its own normalized contract: {error}"
+                        ),
+                        false,
                     ),
-                    false,
                 );
             }
         };
         let requested_occurrence_ids = publication.requested_occurrence_ids();
-        if requested_occurrence_ids.is_empty() {
-            return Self::user_automation_unacknowledged_horizon(
-                resolution,
-                &denominator_occurrence_ids,
-                &request.identity,
-                "the resolved revision has no remaining occurrence after the admitted one, so there \
-                 is no next horizon slice to request",
-                false,
-            );
-        }
+        // No empty-slice guard is needed and none is kept: the compiler refuses
+        // an exhausted cursor before it builds entries, and a consumed occurrence
+        // that is not a member of the denominator is refused as a binding
+        // mismatch, so a publication reaching this point always carries at least
+        // one occurrence. An empty requested set here would be a claim that the
+        // revision is finished, which this contour does not decide.
         match UserAutomationWakePort::publish_wake_horizon(client, publication.clone()).await {
-            Ok(acknowledgement) => Self::user_automation_acknowledged_horizon(
-                resolution,
-                &publication,
-                &requested_occurrence_ids,
-                &acknowledgement,
+            Ok(acknowledgement) => UserAutomationHorizonAdvance::Answered(
+                Self::user_automation_acknowledged_horizon(
+                    resolution,
+                    &publication,
+                    &requested_occurrence_ids,
+                    &acknowledgement,
+                ),
             ),
             Err(error) => {
                 let reason = error.to_string();
                 let unknown = !matches!(error, UserAutomationRuntimeError::Unavailable(_));
-                Self::user_automation_unacknowledged_horizon(
-                    resolution,
-                    &denominator_occurrence_ids,
-                    &request.identity,
-                    &reason,
-                    unknown,
+                UserAutomationHorizonAdvance::Answered(
+                    Self::user_automation_unacknowledged_horizon(
+                        resolution,
+                        &denominator_occurrence_ids,
+                        &request.identity,
+                        &reason,
+                        unknown,
+                    ),
                 )
             }
         }
+    }
+
+    /// Reports whether the consumed occurrence is the last member of the
+    /// resolved revision's own normalized denominator, which is the same cursor
+    /// rule the horizon compiler applies when it refuses a slice that would start
+    /// past the end of that denominator.
+    ///
+    /// The revision digest and the owner principal are proved first because they
+    /// are the two bindings `advance_wake_horizon` proves before it will slice at
+    /// all. A resolution that fails either of them is not this revision under
+    /// this owner, so it can be neither advanced past its end nor reported as a
+    /// complete horizon; it falls through to the compiler, which returns the
+    /// typed refusal.
+    #[cfg(windows)]
+    fn user_automation_horizon_cursor_is_consumed(
+        resolution: &UserAutomationDueWakeResolution,
+        identities: &[eliot_kernel_core::user_automation::AutomationOccurrenceIdentity],
+        occurrence_id: &str,
+        authenticated_principal: &str,
+    ) -> bool {
+        resolution.revision.owner_principal == authenticated_principal
+            && resolution
+                .revision
+                .digest()
+                .is_ok_and(|digest| digest == resolution.revision_digest)
+            && identities
+                .last()
+                .is_some_and(|last| last.occurrence_id == occurrence_id)
     }
 
     /// Projects one horizon the schedule owner did not acknowledge.
@@ -7475,12 +7543,37 @@ impl KernelComposition {
         }
     }
 
-    /// Projects the recovery directive of one bounded horizon, including the
-    /// exact remaining occurrence set and the replay handle the caller must use.
+    /// Projects the recovery directive of one post-disposition horizon advance,
+    /// including the exact remaining occurrence set and the replay handle the
+    /// caller must use.
+    ///
+    /// The three arms of [`UserAutomationHorizonAdvance`] produce three different
+    /// answers, and the second is the one that must not borrow the first's: an
+    /// owner-acknowledged phase keeps its own derived directive over the exact
+    /// remainder, an exhausted denominator owes the caller nothing and gets no
+    /// directive, and a horizon that could not be composed at all is unresolved
+    /// with the revision's own compile refusal beside it instead of a directive
+    /// over a remainder that cannot be named. The last arm deliberately carries
+    /// neither a `remaining_occurrence_ids` nor a `retry_handle`, because a
+    /// recovery directive naming a set nobody can compute is not a recovery.
     #[cfg(windows)]
     fn user_automation_horizon_recovery(
-        horizon: &UserAutomationHorizonPhase,
+        advance: &UserAutomationHorizonAdvance,
     ) -> Option<serde_json::Value> {
+        let horizon = match advance {
+            UserAutomationHorizonAdvance::Answered(horizon) => horizon,
+            // The resolved revision's complete normalized denominator is
+            // consumed at this occurrence, so this advance owns no wake-horizon
+            // obligation and there is no owner effect to reconcile. A recovery
+            // directive here would invent recovery work that does not exist.
+            UserAutomationHorizonAdvance::Exhausted => return None,
+            UserAutomationHorizonAdvance::Unresolved { reason } => {
+                return Some(serde_json::json!({
+                    "kind": "unknown_outcome",
+                    "reason": reason,
+                }));
+            }
+        };
         let (kind, reason) = match &horizon.outcome {
             UserAutomationHorizonOutcome::Published { .. } => return None,
             UserAutomationHorizonOutcome::Partial { reason, .. }
@@ -7497,6 +7590,26 @@ impl KernelComposition {
             "remaining_occurrence_ids": horizon.remaining_occurrence_ids,
             "retry_handle": horizon.retry_handle,
         }))
+    }
+
+    /// Projects the horizon value one due-wake answer reports beside its own
+    /// recovery directive.
+    ///
+    /// An absent horizon and a settled answer are the same thing on this route:
+    /// [`UserAutomationHorizonAdvance::Exhausted`] is the only arm that produces
+    /// it, because the next-slice request is attempted on every decided
+    /// disposition, so an absent horizon here says the resolved revision's
+    /// normalized denominator is consumed and no wake-horizon obligation remains
+    /// to be asked, published, or reconciled.
+    #[cfg(windows)]
+    fn user_automation_horizon_value(
+        advance: &UserAutomationHorizonAdvance,
+    ) -> Option<&UserAutomationHorizonPhase> {
+        match advance {
+            UserAutomationHorizonAdvance::Answered(horizon) => Some(horizon),
+            UserAutomationHorizonAdvance::Exhausted
+            | UserAutomationHorizonAdvance::Unresolved { .. } => None,
+        }
     }
 
     /// Projects one refused due wake.
@@ -11268,6 +11381,39 @@ enum UserAutomationDueWakeRead {
     /// The wake is refused or the owner could not be read; this is the answer
     /// to return instead of admitting the occurrence.
     Answer(serde_json::Value),
+}
+
+/// Closed outcome of the post-disposition horizon advance one due-wake
+/// occurrence owns (issue #2806 item 6).
+///
+/// The arms are three different facts, and the wire keeps them apart. `Answered`
+/// is one real owner round-trip and carries that owner's own
+/// [`UserAutomationHorizonPhase`]. `Exhausted` is a complete answer about the
+/// revision itself: the consumed occurrence is the last member of the immutable
+/// revision's normalized denominator, so no next slice exists and no owner is
+/// asked. `Unresolved` is the refusal to compose either, because a resolution
+/// whose own revision does not compile its denominator cannot name the exact
+/// remainder at all.
+///
+/// Folding the last two into `UserAutomationHorizonOutcome::Unavailable` would
+/// make a finished horizon a claim that the schedule owner was not reachable,
+/// which is a false claim about the owner rather than a disposition, and it is
+/// why the two non-answer arms exist here instead of inside that closed
+/// vocabulary. `Exhausted` is a settled answer and therefore owes the caller no
+/// recovery; `Unresolved` owes one and says so.
+#[cfg(windows)]
+enum UserAutomationHorizonAdvance {
+    /// The schedule owner answered one bounded slice request.
+    Answered(UserAutomationHorizonPhase),
+    /// The resolved revision's complete normalized denominator is consumed at
+    /// this occurrence, so this advance owns no wake-horizon obligation.
+    Exhausted,
+    /// Neither a slice nor its completeness could be established, and the exact
+    /// remaining occurrence set could not be named.
+    Unresolved {
+        /// Closed reason the horizon could not be composed at all.
+        reason: String,
+    },
 }
 
 /// The decided disposition one terminal due-wake occurrence reports.
