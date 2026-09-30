@@ -1562,10 +1562,7 @@ impl DiagnosticBrief {
             }
         }
         if let Some(changes) = &self.recent_config_changes {
-            let changes = changes
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
+            let changes = changes.iter().map(ToString::to_string).collect::<Vec<_>>();
             unique_text(&changes, "brief.recent_config_changes")?;
         }
         Ok(())
@@ -1586,7 +1583,7 @@ impl DiagnosticBrief {
     /// composition step owned by the read-path holder: no production
     /// read/projection site of a canonical `Problem` exists yet (the Governor
     /// preparation path takes `&Problem` only to prepare mutations, and the
-    /// `GetAttentionAndProblems` named read plus the ControlBoard surface live
+    /// `GetAttentionAndProblems` named read plus the `ControlBoard` surface live
     /// outside this crate), so this entry compiles the model and leaves the
     /// serving composition to that holder.
     pub fn compile(problem: &Problem) -> Result<Self, ProblemError> {
