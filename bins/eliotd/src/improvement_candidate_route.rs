@@ -193,10 +193,11 @@ pub fn check_improvement_handoff_identity(
     Ok(())
 }
 
-/// Returns the owning identity for each of the eight distinct pipeline operations.
+/// Returns the owning identity for each of the nine distinct pipeline operations.
 ///
-/// Production caller of [`ImprovementOperation::owner`]: Propose/Admit/Promote
-/// resolve to Governor maintenance, Execute/Measure to Testd, Evaluate to the
+/// Production caller of [`ImprovementOperation::owner`]:
+/// Propose/IngestCandidate/Admit/Promote resolve to Governor maintenance,
+/// Execute/Measure to Testd, Evaluate to the
 /// independent Instrument verifier, `CanaryActivate` to Kernel (handoff only),
 /// and Rollback to the bound rollback-contract owner.
 ///
@@ -223,20 +224,26 @@ pub fn check_improvement_handoff_identity(
 /// request already carries, so the owner the map names and the owner the
 /// pipeline compares against are one value read once, never a literal.
 ///
-/// The map projects all eight operations and the daemon reads three of them
+/// The map projects all nine operations and the daemon reads three of them
 /// (`ExecuteExperiment`, `Evaluate`, `Rollback`), because those are the three
-/// whose owner the daemon has to state in a record it builds. The remaining five
+/// whose owner the daemon has to state in a record it builds. The remaining six
 /// are stamped or decided inside the Governor crate this route calls — including
 /// the `CanaryActivate` owner the pipeline writes into the handoff's
 /// `activation_owner_id` and the daemon only reads — so there is no daemon-side
 /// field for them to appear in, and the map is left complete rather than trimmed
 /// to what one caller happens to read.
 #[must_use]
-pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 8] {
+pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 9] {
     [
         (
             ImprovementOperation::Propose.as_str(),
             ImprovementOperation::Propose
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::IngestCandidate.as_str(),
+            ImprovementOperation::IngestCandidate
                 .owner(rollback_owner_id)
                 .to_string(),
         ),
