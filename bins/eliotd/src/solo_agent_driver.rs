@@ -1059,6 +1059,42 @@ fn guard_solo_plan(plan: &StaffingPlanRequest) -> Result<(), FabricError> {
     Ok(())
 }
 
+/// Refuses a drive that would overlap the single live slot (issue #1108).
+///
+/// A second drive for another operation while the slot holds an unsettled
+/// attempt refuses typed instead of overlapping effect authority; a settled
+/// slot clears so the next admitted operation may proceed. The check runs
+/// before any owner IO or fabric effect, so overlapping work never reaches
+/// admission, activation, dispatch, or emission.
+///
+/// # Errors
+///
+/// Returns the state-lock recovery error or the typed live-attempt refusal
+/// unchanged.
+fn refuse_unsettled_live_slot(
+    composition: &DaemonComposition,
+    operation_id: &str,
+) -> Result<(), DaemonError> {
+    let mut state = composition.solo_state.lock().map_err(|_| {
+        DaemonError::Composition(CompositionError::Recovery(
+            "solo driver state lock poisoned".to_owned(),
+        ))
+    })?;
+    if let Some(live) = state.live_operation.clone()
+        && live != operation_id
+    {
+        let settled =
+            load_projection(composition.state_root(), &live).is_ok_and(projection_settled);
+        if !settled {
+            return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                format!("solo slice holds live attempt {live}; settle or cancel it first"),
+            )));
+        }
+        state.live_operation = None;
+    }
+    Ok(())
+}
+
 /// Drives one admitted solo delegate intake to a retained dispatch.
 ///
 /// Test-only record of the previous synchronous fabric flow. Production is
@@ -1087,25 +1123,7 @@ pub fn drive_solo_delegate(
     // Single live slot: a second drive while the slot holds an unsettled
     // attempt refuses instead of overlapping ownership. A settled slot
     // clears so the next admitted operation may proceed.
-    {
-        let mut state = composition.solo_state.lock().map_err(|_| {
-            DaemonError::Composition(CompositionError::Recovery(
-                "solo driver state lock poisoned".to_owned(),
-            ))
-        })?;
-        if let Some(live) = state.live_operation.clone()
-            && live != operation_id
-        {
-            let settled = load_projection(composition.state_root(), &live)
-                .is_ok_and(|projection| projection_settled(&projection));
-            if !settled {
-                return Err(DaemonError::ProviderAdmission(FabricError::Contract(
-                    format!("solo slice holds live attempt {live}; settle or cancel it first"),
-                )));
-            }
-            state.live_operation = None;
-        }
-    }
+    refuse_unsettled_live_slot(composition, &operation_id)?;
     let capability = composition.agent_fabric_verified_capability(kernel, material)?;
     let config = daemon_coordinator_config()?;
     let receipt = plan_coordinator_staffing(&config, &intake.plan).map_err(|error| {
@@ -1237,7 +1255,9 @@ pub fn drive_solo_delegate(
 /// session and binds the live fence), gated on the daemon-held capability
 /// admission view, and dispatched through the shared verified dispatch. Every
 /// owner refusal propagates typed and fail-closed; the queue path is
-/// untouched, so a direct drive never double-drives queued work.
+/// untouched, so a direct drive never double-drives queued work. The single
+/// live slot is honored first: a direct drive for another operation while
+/// the slot holds an unsettled attempt refuses typed before any owner IO.
 pub async fn drive_solo_delegate_async(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -1248,6 +1268,7 @@ pub async fn drive_solo_delegate_async(
         .validate(now_unix_ms)
         .map_err(DaemonError::ProviderAdmission)?;
     guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+    refuse_unsettled_live_slot(composition, &intake.claimed.operation_id)?;
 
     // Preserve the useful plan-only staffing validation while the authenticated
     // owner check runs; it does not construct a coordinator capability or
@@ -1551,7 +1572,6 @@ pub fn drive_solo_delegate(
 }
 
 /// Returns true when the persisted projection needs no further drive.
-#[cfg(test)]
 fn projection_settled(projection: &SoloPersistedAttempt) -> bool {
     if projection.result_digest.is_some() || projection.cancellation_evidence.is_some() {
         return true;
@@ -1645,16 +1665,55 @@ fn restore_solo_fabric(
     Ok(fabric)
 }
 
+/// Restores the durable projection through the verified restore seam.
+///
+/// Re-resolves live owner evidence through
+/// [`DaemonComposition::agent_fabric_restore_verified`] over the closed
+/// production ports: readiness, the live fence, the validated session
+/// binding, and the current expectation epoch are all re-checked, and the
+/// coordinator owner re-verifies every restored event against the fresh
+/// capability. A snapshot that carries no definition binding the persisted
+/// frozen plan digest refuses before any restore, and an emitted dispatch
+/// with no ingested result reconciles to unknown instead of relaunching or
+/// releasing. Missing, stale, or revoked evidence propagates typed and stays
+/// blocked: the restore never downgrades silently to plan-only and never
+/// resumes effecting operations without current owner evidence.
 #[cfg(not(test))]
 fn restore_solo_fabric(
-    _composition: &DaemonComposition,
-    _kernel: &Arc<DaemonKernelClient>,
-    _projection: &SoloPersistedAttempt,
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    projection: &SoloPersistedAttempt,
 ) -> Result<AgentFabric, DaemonError> {
-    Err(DaemonError::Kernel(
-        "solo restore is blocked until Kernel retains an independently owner-verified executable-binding digest"
-            .to_owned(),
-    ))
+    let plan_bound = projection
+        .snapshot
+        .definitions
+        .values()
+        .any(|definition| definition.definition_digest == projection.plan_digest);
+    if !plan_bound {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::BrokenOwnershipLink(
+                "solo restore finds no definition binding the frozen plan digest".to_owned(),
+            ),
+        ));
+    }
+    let ports = composition.production_fabric_ports()?;
+    let mut fabric = composition.agent_fabric_restore_verified(
+        kernel,
+        projection.snapshot.clone(),
+        ports,
+        projection.claimed.material(),
+    )?;
+    // Reconcile the unknown: an emitted dispatch with no ingested result
+    // cannot relaunch and cannot release; its outcome stays unknown until
+    // the worker observation arrives through the ingest leg.
+    if projection.emitted && projection.result_digest.is_none() {
+        let attempt = AttemptId::new(projection.attempt_id.clone())
+            .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+        if fabric.attempt_of(&attempt) == Some(crate::agent_fabric::AttemptLifecycle::Dispatched) {
+            fabric.mark_unknown_outcome(&attempt)?;
+        }
+    }
+    Ok(fabric)
 }
 
 /// Re-persists the projection after a control operation.
