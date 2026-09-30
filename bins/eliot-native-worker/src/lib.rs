@@ -6,8 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
+use eliot_ipc::{TransportLimits, decode_frame, encode_frame};
 use eliot_native_worker_core::{
     ActionEnvelopeCarrier, CapabilityAdmissionFacts, CapabilityAdmissionPort,
     ClaimAdmissionRequest, DurableCheckpointPort, DurableReplayPort, NativeWorkerClaim,
@@ -15,6 +17,9 @@ use eliot_native_worker_core::{
     WorkerEventEnvelope, WorkerFrame, WorkerHello, WorkerLifecycle, WorkerReady,
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
+use eliot_protocol::{
+    EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -68,6 +73,22 @@ pub struct WorkerResponse {
     pub events: Vec<WorkerEventEnvelope>,
 }
 
+struct WorkerResponseContext {
+    connection_id: String,
+    request_id: eliot_contracts::RequestId,
+    trace_context: BTreeMap<String, String>,
+}
+
+impl From<&WorkerFrame> for WorkerResponseContext {
+    fn from(request: &WorkerFrame) -> Self {
+        Self {
+            connection_id: request.connection_id.clone(),
+            request_id: request.request_id.clone(),
+            trace_context: request.trace_context.clone(),
+        }
+    }
+}
+
 /// Errors at the process composition boundary.
 #[derive(Debug, Error)]
 pub enum NativeWorkerError {
@@ -79,10 +100,14 @@ pub enum NativeWorkerError {
     Io(#[from] io::Error),
     #[error("worker transport JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("worker EBP transport failed: {0}")]
+    Transport(#[from] eliot_ipc::TransportError),
     #[error("native-worker frame is {actual} bytes; maximum is {maximum}")]
     FrameTooLarge { actual: u32, maximum: u32 },
     #[error("native-worker frame length cannot be zero")]
     EmptyFrame,
+    #[error("native-worker frame ended before its four-byte length prefix completed")]
+    TruncatedFramePrefix,
 }
 
 /// Composed native-worker generation with all governing dependencies explicit.
@@ -229,11 +254,14 @@ where
     /// Handles one frame and writes its response, returning true on shutdown.
     async fn serve_frame(&mut self, frame: WorkerFrame) -> Result<bool, NativeWorkerError> {
         let shutdown = matches!(
-            frame.body,
+            &frame.body,
             eliot_native_worker_core::WorkerFrameBody::Shutdown
         );
+        let response_context = WorkerResponseContext::from(&frame);
         let events = self.handle(frame).await?;
-        write_frame(&WorkerResponse { events })?;
+        let response_wire =
+            encode_worker_response_frame(response_context, &WorkerResponse { events })?;
+        write_frame(&response_wire)?;
         Ok(shutdown)
     }
 
@@ -253,11 +281,14 @@ where
             return Ok(true);
         };
         let shutdown = matches!(
-            frame.body,
+            &frame.body,
             eliot_native_worker_core::WorkerFrameBody::Shutdown
         );
+        let response_context = WorkerResponseContext::from(&frame);
         let events = self.handle(frame).await?;
-        write_frame_to(&WorkerResponse { events }, writer)?;
+        let response_wire =
+            encode_worker_response_frame(response_context, &WorkerResponse { events })?;
+        write_frame_to(&response_wire, writer)?;
         Ok(shutdown)
     }
 
@@ -2387,39 +2418,49 @@ pub mod admitted_material {
     }
 }
 
-fn write_frame(response: &WorkerResponse) -> Result<(), NativeWorkerError> {
+fn encode_worker_response_frame(
+    request: WorkerResponseContext,
+    response: &WorkerResponse,
+) -> Result<Vec<u8>, NativeWorkerError> {
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: request.connection_id,
+        request_id: Some(request.request_id),
+        kind: FrameKind::Response,
+        message_type: MessageType::Result,
+        request_identity: None,
+        payload: ProtocolPayload::Json(serde_json::to_value(response)?),
+        trace_context: request.trace_context,
+    };
+    Ok(encode_frame(&frame, TransportLimits::default())?)
+}
+
+fn write_frame(wire: &[u8]) -> Result<(), NativeWorkerError> {
     let mut output = io::stdout().lock();
-    write_frame_to(response, &mut output)
+    write_frame_to(wire, &mut output)
 }
 
 fn read_frame() -> Result<Option<WorkerFrame>, NativeWorkerError> {
-    let mut prefix = [0_u8; 4];
     let mut input = io::stdin().lock();
-    match input.read_exact(&mut prefix) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(NativeWorkerError::Io(error)),
-    }
-    let length = u32::from_le_bytes(prefix);
-    if length == 0 {
-        return Err(NativeWorkerError::EmptyFrame);
-    }
-    if length > MAX_FRAME_BYTES {
-        return Err(NativeWorkerError::FrameTooLarge {
-            actual: length,
-            maximum: MAX_FRAME_BYTES,
-        });
-    }
-    let mut body = vec![0_u8; length as usize];
-    input.read_exact(&mut body)?;
-    Ok(Some(serde_json::from_slice(&body)?))
+    read_frame_from(&mut input)
 }
 
 fn read_frame_from<R: Read>(reader: &mut R) -> Result<Option<WorkerFrame>, NativeWorkerError> {
     let mut prefix = [0_u8; 4];
-    match reader.read_exact(&mut prefix) {
+    loop {
+        match reader.read(&mut prefix[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(NativeWorkerError::Io(error)),
+        }
+    }
+    match reader.read_exact(&mut prefix[1..]) {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(NativeWorkerError::TruncatedFramePrefix);
+        }
         Err(error) => return Err(NativeWorkerError::Io(error)),
     }
     let length = u32::from_le_bytes(prefix);
@@ -2432,28 +2473,20 @@ fn read_frame_from<R: Read>(reader: &mut R) -> Result<Option<WorkerFrame>, Nativ
             maximum: MAX_FRAME_BYTES,
         });
     }
-    let mut body = vec![0_u8; length as usize];
-    reader.read_exact(&mut body)?;
-    Ok(Some(serde_json::from_slice(&body)?))
-}
-
-fn write_frame_to<W: Write>(
-    response: &WorkerResponse,
-    writer: &mut W,
-) -> Result<(), NativeWorkerError> {
-    let body = serde_json::to_vec(response)?;
-    let length = u32::try_from(body.len()).map_err(|_| NativeWorkerError::FrameTooLarge {
-        actual: u32::MAX,
+    let body_len = usize::try_from(length).map_err(|_| NativeWorkerError::FrameTooLarge {
+        actual: length,
         maximum: MAX_FRAME_BYTES,
     })?;
-    if length > MAX_FRAME_BYTES {
-        return Err(NativeWorkerError::FrameTooLarge {
-            actual: length,
-            maximum: MAX_FRAME_BYTES,
-        });
-    }
-    writer.write_all(&length.to_le_bytes())?;
-    writer.write_all(&body)?;
+    let mut wire = Vec::with_capacity(4 + body_len);
+    wire.extend_from_slice(&prefix);
+    wire.resize(4 + body_len, 0);
+    reader.read_exact(&mut wire[4..])?;
+    let frame = decode_frame(&wire, TransportLimits::default())?;
+    Ok(Some(WorkerFrame::from_ebp_frame(frame)?))
+}
+
+fn write_frame_to<W: Write>(wire: &[u8], writer: &mut W) -> Result<(), NativeWorkerError> {
+    writer.write_all(wire)?;
     writer.flush()?;
     Ok(())
 }

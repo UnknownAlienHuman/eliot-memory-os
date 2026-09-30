@@ -14,7 +14,7 @@ use crate::activation_resolution::AgentActivationResolutionDisposition;
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
     ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, RequestId,
-    ResourceGeneration, StateFence, canonical_json_bytes, contract_identity,
+    ResourceGeneration, StateFence, WorkLeaseId, canonical_json_bytes, contract_identity,
 };
 use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
@@ -101,11 +101,17 @@ pub use reactive_restore::{
 /// Stable identity of this protocol surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.protocol";
 /// Current EBP semantic contract revision.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 /// EBP wire protocol major version.
 pub const EBP_MAJOR: u16 = 1;
 /// EBP wire protocol minor version.
-pub const EBP_MINOR: u16 = 0;
+pub const EBP_MINOR: u16 = 1;
+/// Minimum EBP minor version carrying the native-worker frame payload.
+pub const NATIVE_WORKER_FRAME_EBP_MINOR: u16 = 1;
+/// Stable native-worker frame payload wire version.
+pub const NATIVE_WORKER_FRAME_V1_WIRE_VERSION: u16 = 1;
+/// Native-worker protocol revision carried inside its EBP frame payload.
+pub const NATIVE_WORKER_PROTOCOL_VERSION: &str = "eliot-native-worker/v2";
 /// Default maximum encoded body size, four mebibytes.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FRAME_BYTES_U32: u32 = 4 * 1024 * 1024;
@@ -501,6 +507,179 @@ pub enum MessageType {
     Shutdown,
     /// Report a fatal module failure.
     Fatal,
+    /// Native-worker heartbeat operation, distinct from health observation.
+    NativeWorkerHeartbeat,
+    /// Native-worker reconnect operation.
+    NativeWorkerReconnect,
+    /// Native-worker reconciliation operation.
+    NativeWorkerReconcile,
+    /// Native-worker acknowledgement operation with its own receipt contract.
+    NativeWorkerAcknowledge,
+}
+
+/// Exact operation discriminator in the native-worker EBP/1.1 payload.
+///
+/// The operation names mirror `WorkerFrameBody` and map one-to-one to a
+/// canonical EBP frame kind/message type pair. This does not reinterpret the
+/// generic EBP `RequestIdentity`; native-worker authority and admission fields
+/// remain in this separately versioned contract.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NativeWorkerOperationV1 {
+    /// Execute the generated facet call.
+    Execute,
+    /// Cancel an admitted operation.
+    Cancel,
+    /// Observe native-worker liveness.
+    Heartbeat,
+    /// Observe native-worker health.
+    Health,
+    /// Save a native-worker checkpoint.
+    Checkpoint,
+    /// Quiesce a native worker.
+    Quiesce,
+    /// Reconnect a native worker.
+    Reconnect,
+    /// Reconcile an unknown native-worker outcome.
+    Reconcile,
+    /// Acknowledge a native-worker event receipt.
+    Acknowledge,
+    /// Shut down a native worker.
+    Shutdown,
+}
+
+impl NativeWorkerOperationV1 {
+    /// Canonical EBP frame kind for this native-worker operation.
+    #[must_use]
+    pub const fn frame_kind(self) -> FrameKind {
+        match self {
+            Self::Execute
+            | Self::Checkpoint
+            | Self::Quiesce
+            | Self::Reconnect
+            | Self::Reconcile
+            | Self::Shutdown => FrameKind::Request,
+            Self::Cancel => FrameKind::Cancel,
+            Self::Heartbeat | Self::Health => FrameKind::Heartbeat,
+            Self::Acknowledge => FrameKind::Control,
+        }
+    }
+
+    /// Canonical EBP message type for this native-worker operation.
+    #[must_use]
+    pub const fn message_type(self) -> MessageType {
+        match self {
+            Self::Execute => MessageType::Execute,
+            Self::Cancel => MessageType::Cancel,
+            Self::Heartbeat => MessageType::NativeWorkerHeartbeat,
+            Self::Health => MessageType::Health,
+            Self::Checkpoint => MessageType::Checkpoint,
+            Self::Quiesce => MessageType::Quiesce,
+            Self::Reconnect => MessageType::NativeWorkerReconnect,
+            Self::Reconcile => MessageType::NativeWorkerReconcile,
+            Self::Acknowledge => MessageType::NativeWorkerAcknowledge,
+            Self::Shutdown => MessageType::Shutdown,
+        }
+    }
+
+    /// Stable tagged-body discriminator shared with `WorkerFrameBody`.
+    #[must_use]
+    pub const fn body_kind(self) -> &'static str {
+        match self {
+            Self::Execute => "EXECUTE",
+            Self::Cancel => "CANCEL",
+            Self::Heartbeat => "HEARTBEAT",
+            Self::Health => "HEALTH",
+            Self::Checkpoint => "CHECKPOINT",
+            Self::Quiesce => "QUIESCE",
+            Self::Reconnect => "RECONNECT",
+            Self::Reconcile => "RECONCILE",
+            Self::Acknowledge => "ACKNOWLEDGE",
+            Self::Shutdown => "SHUTDOWN",
+        }
+    }
+}
+
+/// Versioned native-worker payload carried inside the shared EBP frame.
+///
+/// `body` is the exact tagged `WorkerFrameBody` value. Its tagged operation
+/// is checked here; the native-worker owner deserializes and validates the
+/// full operation-specific contract, including the generated facet Execute
+/// stub. `request_id`, connection identity, encoding, and trace context stay
+/// in the enclosing EBP frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerFramePayloadV1 {
+    /// Payload schema revision.
+    pub wire_version: u16,
+    /// Native-worker protocol revision.
+    pub native_protocol_version: String,
+    /// Exact native-worker operation.
+    pub operation: NativeWorkerOperationV1,
+    /// Absolute deadline in Unix milliseconds.
+    pub deadline_unix_ms: u64,
+    /// Lineage-aware authority epoch.
+    pub authority_epoch: EpochId,
+    /// Exact authority fence.
+    pub state_fence: StateFence,
+    /// Versioned owner-neutral lease identity.
+    pub lease_id: WorkLeaseId,
+    /// Admission revision bound by the native-worker claim.
+    pub admission_revision: String,
+    /// Producer generation bound by the native-worker claim.
+    pub producer_generation: u64,
+    /// Tagged operation body owned by the native-worker core.
+    pub body: Value,
+}
+
+impl NativeWorkerFramePayloadV1 {
+    /// Validates the versioned native-worker payload without projecting
+    /// native authority into the generic EBP request-identity contract.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_version != NATIVE_WORKER_FRAME_V1_WIRE_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "payload.wire_version",
+                reason: "unsupported native-worker frame payload version",
+            });
+        }
+        if self.native_protocol_version != NATIVE_WORKER_PROTOCOL_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "payload.native_protocol_version",
+                reason: "unsupported native-worker protocol version",
+            });
+        }
+        if self.deadline_unix_ms == 0 || self.producer_generation == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "payload.native_worker_identity",
+                reason: "deadline and producer generation must be greater than zero",
+            });
+        }
+        text(&self.admission_revision, "payload.admission_revision")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| provider_error("eliot-contracts", error))?;
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "payload.authority_epoch",
+                reason: "must match payload.state_fence.authority_epoch",
+            });
+        }
+        let body_kind = self
+            .body
+            .as_object()
+            .and_then(|body| body.get("kind"))
+            .and_then(Value::as_str);
+        if body_kind != Some(self.operation.body_kind()) {
+            return Err(ProtocolError::InvalidField {
+                field: "payload.body.kind",
+                reason: "must match the native-worker operation discriminator",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Request identity carried by request and cancellation boundaries.
@@ -564,6 +743,8 @@ pub enum ProtocolPayload {
     Event(Box<EventEnvelope>),
     /// Explicit receiver receipt for a lifecycle event.
     EventAck(Box<EventAckReceipt>),
+    /// Versioned native-worker operation carried by the shared EBP envelope.
+    NativeWorkerFrameV1(NativeWorkerFramePayloadV1),
 }
 
 impl ProtocolPayload {
@@ -588,6 +769,7 @@ impl ProtocolPayload {
                 .map_err(|error| provider_error("eliot-agent-contracts", error)),
             Self::Event(event) => event.validate(),
             Self::EventAck(receipt) => receipt.validate(),
+            Self::NativeWorkerFrameV1(frame) => frame.validate(),
         }
     }
 }
@@ -664,6 +846,55 @@ fn validate_event_message(
     }
 }
 
+fn validate_native_worker_frame(frame: &Frame) -> Result<bool, ProtocolError> {
+    let native_worker = match &frame.payload {
+        ProtocolPayload::NativeWorkerFrameV1(payload) => Some(payload),
+        _ => None,
+    };
+    if matches!(
+        frame.message_type,
+        MessageType::NativeWorkerHeartbeat
+            | MessageType::NativeWorkerReconnect
+            | MessageType::NativeWorkerReconcile
+            | MessageType::NativeWorkerAcknowledge
+    ) && native_worker.is_none()
+    {
+        return Err(ProtocolError::InvalidField {
+            field: "payload",
+            reason: "native-worker message types require NativeWorkerFrameV1",
+        });
+    }
+    if let Some(native_worker) = native_worker {
+        if frame.protocol_version.minor < NATIVE_WORKER_FRAME_EBP_MINOR {
+            return Err(ProtocolError::InvalidField {
+                field: "protocol_version.minor",
+                reason: "native-worker frames require EBP/1.1 or newer",
+            });
+        }
+        if frame.request_id.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "request_id",
+                reason: "required for every native-worker frame",
+            });
+        }
+        if frame.request_identity.is_some() {
+            return Err(ProtocolError::InvalidField {
+                field: "request_identity",
+                reason: "native-worker authority uses its versioned payload contract",
+            });
+        }
+        if frame.kind != native_worker.operation.frame_kind()
+            || frame.message_type != native_worker.operation.message_type()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "must match the native-worker operation mapping",
+            });
+        }
+    }
+    Ok(native_worker.is_some())
+}
+
 impl Frame {
     /// Validates identity, version and the request correlation boundary.
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -674,14 +905,17 @@ impl Frame {
             | MessageType::Ready
             | MessageType::Challenge
             | MessageType::Fatal
-            | MessageType::EventAck => FrameKind::Control,
-            MessageType::Health => FrameKind::Heartbeat,
+            | MessageType::EventAck
+            | MessageType::NativeWorkerAcknowledge => FrameKind::Control,
+            MessageType::Health | MessageType::NativeWorkerHeartbeat => FrameKind::Heartbeat,
             MessageType::Execute
             | MessageType::Quiesce
             | MessageType::Checkpoint
             | MessageType::RestoreCheckpoint
             | MessageType::DrainStatus
-            | MessageType::Shutdown => FrameKind::Request,
+            | MessageType::Shutdown
+            | MessageType::NativeWorkerReconnect
+            | MessageType::NativeWorkerReconcile => FrameKind::Request,
             MessageType::Result => FrameKind::Response,
             MessageType::Event => FrameKind::Event,
             MessageType::Cancel => FrameKind::Cancel,
@@ -703,8 +937,10 @@ impl Frame {
                 reason: "required for request and cancel frames",
             });
         }
+        let native_worker = validate_native_worker_frame(self)?;
         if matches!(self.kind, FrameKind::Request | FrameKind::Cancel)
             && self.request_identity.is_none()
+            && !native_worker
         {
             return Err(ProtocolError::InvalidField {
                 field: "request_identity",
