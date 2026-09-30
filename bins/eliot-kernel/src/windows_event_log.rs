@@ -51,8 +51,7 @@ impl EventLogAdmission {
     }
 }
 
-/// Starts the single worker and admits the startup event after the entrypoint
-/// has validated both the `SystemService` binding and `ProgramData` contour.
+/// Starts the single worker for the entrypoint's parsed `SystemService` profile.
 ///
 /// The event means that the Kernel entered startup. It does not mean the
 /// service is ready or that the OS accepted the record.
@@ -168,6 +167,21 @@ fn report_admission(
     event: AdmittedKernelEventLogEvent,
     admission: EventLogAdmission,
 ) -> EventLogAdmission {
+    if matches!(
+        admission,
+        EventLogAdmission::QueueFull
+            | EventLogAdmission::WorkerUnavailable
+            | EventLogAdmission::Rejected
+    ) {
+        tracing::warn!(
+            target: KERNEL_DIAGNOSTICS_TARGET,
+            event = "kernel.event_log_admission",
+            event_kind = event.as_str(),
+            admission = admission.as_str(),
+            "Kernel Event Log queue did not admit the event"
+        );
+        return admission;
+    }
     tracing::info!(
         target: KERNEL_DIAGNOSTICS_TARGET,
         event = "kernel.event_log_admission",
