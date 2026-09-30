@@ -28,6 +28,10 @@ use eliot_host_state::{ActivationState, ServiceSafetyClass, WakeDisposition};
 #[cfg(windows)]
 use eliot_installation::InstallationProfile;
 #[cfg(windows)]
+use eliot_kernel_core::user_automation::{UserAutomationTrigger, UserAutomationTriggerOrigin};
+#[cfg(windows)]
+use eliot_kernel_service::{UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest};
+#[cfg(windows)]
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::profile_supervision::USER_MODE_SUPERVISOR_SWITCH;
@@ -766,7 +770,7 @@ fn run_profile_supervisor(
         // before its own trigger is recorded and no failed admission is
         // answered with success.
         process_runtime_control_requests(&mut host, &runtime_queue, &mut idle_drain);
-        process_user_automation_owner_requests(&host);
+        process_user_automation_owner_requests(&mut host, &mut idle_drain);
         if !durable_fence {
             let drain_tick = idle_drain.evaluate(&mut host, std::time::Instant::now());
             report_activation_diagnostics(&host, &idle_drain.last_census);
@@ -1625,7 +1629,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         // One bounded sweep of the authenticated `UserAutomation` owner queue.
         // The dedicated execution pipe blocks until this drain answers, so it
         // must run from the service loop rather than from the pipe server.
-        process_user_automation_owner_requests(&host);
+        process_user_automation_owner_requests(&mut host, &mut idle_drain);
         // One bounded sweep of the backup dispatch handoff. The backup owner
         // registered on the runtime-control pipe hands each admitted operation
         // to this live composition and waits for the answer, so, exactly like
@@ -1910,10 +1914,77 @@ fn process_user_automation_request(
 /// place that runs the composed endpoint. It is a bounded, non-blocking sweep
 /// of an already-authenticated queue: it never starts work, never discovers
 /// occurrences, and never invents authority.
+///
+/// I1.5 admissions-first order holds on this pipe exactly as on the
+/// runtime-control transfer plane: every queued carrier is classified from
+/// its own validated bytes and admitted through the observable-use loop
+/// BEFORE the owner effect runs. A carrier that proves a scheduler wake is a
+/// `ScheduledWake` trigger; every other automation-plane carrier stays the
+/// attempt it serves (`AgentAttempt`, the same class the transfer plane
+/// assigns it). A refused admission, an unusable trigger digest, or a
+/// post-admission state that admits no governed work skips the drain: the
+/// envelopes stay queued for the next tick instead of running under a
+/// generation that refused them.
+///
+/// The runtime-control and execution-pipe planes carry no authenticated
+/// caller/principal field and no Watchdog-origin discriminator, so this loop
+/// cannot attribute a carrier to `CliRequest`, `UiRequest`, or
+/// `WatchdogRegisteredActivity`. Those producers belong to the endpoint and
+/// contract owners: the endpoint must propagate the authenticated peer
+/// identity onto the envelope, and the Watchdog carrier owner must attest
+/// the watchdog origin (or demand-start Host through a real caller).
 #[cfg(windows)]
-fn process_user_automation_owner_requests(host: &HostComposition) {
+fn process_user_automation_owner_requests(
+    host: &mut HostComposition,
+    idle_drain: &mut HostIdleDrainSupervisor,
+) {
     let queue = host.user_automation_execution_queue();
     if queue.lock().map_or(true, |queue| queue.is_empty()) {
+        return;
+    }
+    // Snapshot the trigger of every queued carrier under the queue lock, then
+    // release the lock before admission: the owner drain below locks the same
+    // queue, and the admission path must never hold it across the drain.
+    let triggers: Vec<(ActivationTriggerClass, PlatformHandle)> = {
+        let Ok(queued) = queue.lock() else {
+            return;
+        };
+        let mut triggers = Vec::with_capacity(queued.len());
+        for index in 0..queued.len() {
+            let Some(envelope) = queued.get(index) else {
+                return;
+            };
+            let execution = envelope.request();
+            let trigger = if execution_proves_scheduled_wake(execution) {
+                ActivationTriggerClass::ScheduledWake
+            } else {
+                ActivationTriggerClass::AgentAttempt
+            };
+            // The carrier digest is the durable trigger evidence. It was
+            // validated as a SHA-256 by the authenticated endpoint before
+            // queueing; a value that is not even a handle fails closed here
+            // instead of admitting a trigger without evidence.
+            let Ok(evidence) = PlatformHandle::new(execution.request_sha256.clone()) else {
+                return;
+            };
+            triggers.push((trigger, evidence));
+        }
+        triggers
+    };
+    for (trigger, evidence) in &triggers {
+        if idle_drain.note_observable_use(host, *trigger, evidence).is_err() {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: UserAutomation owner queue drain skipped: the observable-use admission failed and the envelopes stay queued"
+            );
+            return;
+        }
+    }
+    if !activation_admits_governed_work(host) {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "eliot-host: UserAutomation owner queue drain skipped: the post-admission activation state admits no governed work"
+        );
         return;
     }
     if let Err(error) = host.process_user_automation_requests(&queue) {
@@ -1972,6 +2043,9 @@ fn process_backup_dispatch_requests(host: &HostComposition) {
 ///   I1.5 "ELIOT-launched `AgentAttempt` or external-agent reconciliation"; the
 ///   two share a class because both are the same attempt on the automation
 ///   plane, one admitting its occurrence and one withdrawing its pending wakes.
+///   The one exception is an admit whose validated carrier proves a scheduler
+///   wake (see [`runtime_control_request_trigger_class`]): I1.5 "Task
+///   Scheduler wake created by an admitted `WakeIntent`".
 #[cfg(windows)]
 fn runtime_control_trigger_class(
     operation: &HostRuntimeControlOperation,
@@ -1982,6 +2056,57 @@ fn runtime_control_trigger_class(
         RuntimeControlDispatch::ReactiveContext => ActivationTriggerClass::AgentBridgeAttach,
         RuntimeControlDispatch::UserAutomation => ActivationTriggerClass::AgentAttempt,
     }
+}
+
+/// Whether a typed UserAutomation execution carrier proves a scheduler wake.
+///
+/// A Task Scheduler wake reaches Host as an admitted occurrence whose
+/// validated carrier proves the scheduler-wake origin. This predicate reuses
+/// exactly the due-wake owner's admission shape
+/// (`refuse_foreign_due_wake_shape` in
+/// `crates/kernel/eliot-kernel-service/src/user_automation_execution.rs`): a
+/// `ScheduledWake` origin plus a `Scheduled` calendar trigger on a top-level
+/// (`child_depth == 0`) occurrence. A Human run-now, an admitted child, a
+/// wake cancellation, or any non-admission carrier proves no scheduler wake
+/// and stays the attempt it serves. The carrier bytes were validated by the
+/// authenticated endpoint before queueing; this predicate only compares the
+/// recorded content, never a second scheme.
+#[cfg(windows)]
+fn execution_proves_scheduled_wake(execution: &UserAutomationHostExecutionRequest) -> bool {
+    match &execution.operation {
+        UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+            request.invocation.trigger_origin == UserAutomationTriggerOrigin::ScheduledWake
+                && matches!(request.invocation.trigger, UserAutomationTrigger::Scheduled { .. })
+                && request.invocation.child_depth == 0
+        }
+        _ => false,
+    }
+}
+
+/// I1.5 trigger class of one authenticated runtime-control request, with the
+/// scheduler-wake producer.
+///
+/// This is the same per-operation projection as
+/// [`runtime_control_trigger_class`], except an
+/// `AdmitUserAutomationOccurrence` transfer whose validated carrier proves a
+/// scheduler wake (see [`execution_proves_scheduled_wake`]) is that wake
+/// reaching the lifecycle: `ScheduledWake`, which requests the runtime and
+/// independent supervision branches but never the store branch. The transfer
+/// operation and the carrier proof are both required, so a carrier can never
+/// promote an operation it does not accompany.
+#[cfg(windows)]
+fn runtime_control_request_trigger_class(
+    request: &eliot_host::HostRuntimeControlRequest,
+) -> ActivationTriggerClass {
+    if request.operation == HostRuntimeControlOperation::AdmitUserAutomationOccurrence
+        && request
+            .user_automation
+            .as_ref()
+            .is_some_and(|carrier| execution_proves_scheduled_wake(&carrier.execution))
+    {
+        return ActivationTriggerClass::ScheduledWake;
+    }
+    runtime_control_trigger_class(&request.operation)
 }
 
 /// Serves every queued authenticated runtime-control request admissions-first.
@@ -2028,7 +2153,7 @@ fn process_runtime_control_requests(
         // that actually arrived on the authenticated front door, so the
         // durable `trigger_class` / `required_capabilities` of this
         // generation reflect the real ingress.
-        let trigger = runtime_control_trigger_class(&envelope.request().operation);
+        let trigger = runtime_control_request_trigger_class(envelope.request());
         // The authenticated request digest is the durable trigger evidence; the
         // endpoint already proved the peer before queueing this envelope.
         let evidence = envelope.request().request_digest.clone();
