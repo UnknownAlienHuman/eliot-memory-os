@@ -254,11 +254,11 @@ fn authority_preparation_phase(error: &AuthorityPreparationError) -> &'static st
 /// audit chain is the Kernel's own diagnostic record, neither grants Store,
 /// ORS, Session, lease, epoch, or work authority.
 ///
-/// Active compositions pass through unchanged. The same
-/// [`KernelService`](eliot_kernel_service::KernelService) lifecycle owner is
-/// constructed in both modes and stays `Cold` through assembly; Host drives
-/// it to `ShadowNoAuthority` through the existing `reconcile` + `Shadow`
-/// boundary, so no transition-table edge and no second service exists.
+/// Active compositions pass through unchanged. The same `KernelService`
+/// lifecycle owner is constructed in both modes and stays `Cold` through
+/// assembly; Host drives it to `ShadowNoAuthority` through the existing
+/// `reconcile` + `Shadow` boundary, so no transition-table edge and no second
+/// service exists.
 ///
 /// Residual (ORS owner lane): the writable `RedbRecoveryStore` open path —
 /// `initialize` migrations, `recover_interrupted_execution`, and the
@@ -285,7 +285,6 @@ fn validate_shadow_candidate_capabilities(config: &KernelConfig) -> Result<(), K
             "shadow candidate admits no child restart policy".to_owned(),
         ));
     }
-    #[cfg(windows)]
     if config.agent_bridge_admission.is_some() {
         return Err(KernelBuildError::Service(
             "shadow candidate binds the candidate pipe only; no bridge admission".to_owned(),
