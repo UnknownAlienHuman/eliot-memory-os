@@ -589,6 +589,7 @@ impl AuditEventKind {
             | Self::PROCESS_LAUNCH_FAILED
             | Self::PROCESS_FAILED
             | Self::PROCESS_CRASHED
+            | Self::PROCESS_RESTARTED
             | Self::PROCESS_RESTART_INTENSITY_EXHAUSTED
             | Self::PROCESS_QUARANTINED
             | Self::SHUTDOWN_DRAIN_REQUESTED
