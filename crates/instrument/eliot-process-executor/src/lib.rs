@@ -31,10 +31,13 @@ use eliot_process::{
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
+#[cfg(windows)]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+#[cfg(windows)]
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
