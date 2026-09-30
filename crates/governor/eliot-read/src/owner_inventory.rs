@@ -590,12 +590,20 @@ impl ReadOwnerInventory {
 
 /// Resolves the whole owner inventory from the registries the read path reads.
 ///
-/// This is the single resolution path for this package's declared surface, and
-/// it is a pure function of crate constants and the Store declaration tables:
-/// it holds no state, is never cached, and creates no freshness. The two
-/// [`LocalReadPort`](crate::LocalReadPort) methods resolve their binding
-/// through it, so an owner that cannot describe its own surface does not
-/// answer.
+/// This resolves this package's declared surface in aggregate, and it is a pure
+/// function of crate constants and the Store declaration tables: it holds no
+/// state, is never cached, and creates no freshness.
+///
+/// It is NOT the resolution path a read takes. The two
+/// [`LocalReadPort`](crate::LocalReadPort) methods resolve their declared row
+/// through [`local_read_port_binding`], the narrow form, precisely so the read
+/// path does not pay for rows it never reads. Nothing in this repository calls
+/// this function: it is a declared public inventory surface (it carries its own
+/// row in `PUBLIC_ITEM_DECLARATIONS`), not a step of any read, so resolving it
+/// proves that the declared surface is resolvable — it is not evidence that any
+/// read was served. The read path's real production entry is
+/// `ReadService::execute`, reached from the `eliotd` reconstruction route; see
+/// the crate's "Disposition" section for that call chain.
 pub fn read_owner_inventory() -> Result<ReadOwnerInventory, ReadError> {
     let read_model_comparisons = compare_activated_read_model()?;
     verify_context_reconstruction_table(&read_model_comparisons)?;
