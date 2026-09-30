@@ -5,7 +5,7 @@
 //! publication path remains responsible for admitting and persisting them.
 
 use eliot_context_contracts::{
-    ContextError as ContractContextError, ContextRecipe, ReactiveInputError,
+    ContextError as ContractContextError, ContextRecipe, ContextRecipePolicy, ReactiveInputError,
     SessionDeliverySnapshot,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -30,11 +30,22 @@ pub enum ContextSourceDocument {
     Delivery(Box<SessionDeliverySnapshot>),
 }
 
-/// Current Context Compiler `ContextRecipe` and exact compiler input admitted for it.
+/// Current Context Compiler recipe identity, its approved policy, and the
+/// exact compiler input admitted for it.
+///
+/// The three members are the three revisions I12.13 and #1724 W1 keep apart:
+/// `policy` is the stable reusable policy definition and its own revision,
+/// `recipe` is the compilation-bound instance that carries the task/attempt/
+/// scope/fence binding and the task revision, and `compiler_input` is the
+/// admitted input for that one compilation. The policy is a required member,
+/// not a defaulted one: a body published without it is refused rather than
+/// read as an instance that was compiled under no approved policy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextCampaignRecipeBody {
-    /// Exact rich immutable `ContextRecipe` policy.
+    /// Exact approved reusable policy this instance was issued under.
+    pub policy: ContextRecipePolicy,
+    /// Exact rich immutable `ContextRecipe` policy instance.
     pub recipe: ContextRecipe,
     /// Current admitted Context input used by the compiler for this recipe.
     pub compiler_input: ContextInput,
@@ -164,18 +175,27 @@ impl ContextSourcePublication {
     }
 }
 
-/// Build the exact campaign source for an admitted current `ContextRecipe` and
-/// its compiler input. This publication is available before Context view
-/// compilation and therefore does not depend on a later delivery.
+/// Build the exact campaign source for an admitted current `ContextRecipe`, the
+/// approved reusable policy it was issued under, and its compiler input. This
+/// publication is available before Context view compilation and therefore does
+/// not depend on a later delivery.
+///
+/// The policy is validated against the instance before either is published:
+/// `binds_recipe` compares the policy's own recorded digest with the digest the
+/// instance recorded in its `DecisionRevision`, and refuses a mandatory role the
+/// policy does not configure or declares suppressible. Nothing here resolves a
+/// policy — the caller supplies the owner-approved one.
 pub fn context_recipe_publication(
     recipe: &ContextRecipe,
+    policy: &ContextRecipePolicy,
     compiler_input: &ContextInput,
 ) -> Result<ContextSourcePublication, ContextPublicationError> {
-    recipe.validate()?;
+    policy.binds_recipe(recipe)?;
     compiler_input.validate()?;
     validate_recipe_input_binding(recipe, compiler_input)?;
 
     let document = ContextSourceDocument::Recipe(Box::new(ContextCampaignRecipeBody {
+        policy: policy.clone(),
         recipe: recipe.clone(),
         compiler_input: compiler_input.clone(),
     }));
@@ -219,11 +239,11 @@ pub fn context_delivery_publication(
     })
 }
 
-/// Compute the canonical digest of the exact current recipe-plus-input body.
+/// Compute the canonical digest of the exact current policy, recipe and input.
 pub fn context_recipe_body_digest(
     body: &ContextCampaignRecipeBody,
 ) -> Result<String, ContextPublicationError> {
-    body.recipe.validate()?;
+    body.policy.binds_recipe(&body.recipe)?;
     body.compiler_input.validate()?;
     validate_recipe_input_binding(&body.recipe, &body.compiler_input)?;
     let bytes = canonical_json_bytes(body)

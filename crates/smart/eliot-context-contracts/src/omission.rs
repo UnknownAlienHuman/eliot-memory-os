@@ -17,7 +17,12 @@ where
 }
 
 /// Why an atom was omitted, including the competing constraint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+///
+/// `Ord` is derived so the recipe policy can canonicalize its permitted-reason
+/// set by sorting; it adds no wire spelling and changes no variant.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OmissionReason {
     Capacity,
@@ -33,7 +38,12 @@ pub enum OmissionReason {
 }
 
 /// Typed explanation for an omission that cannot be reopened.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+///
+/// `Ord` is derived for the same set-canonicalization reason as
+/// [`OmissionReason`].
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NonRecoverableReason {
     Privacy,

@@ -25,6 +25,7 @@ mod reactive_coverage;
 mod reactive_input;
 mod reactive_session;
 mod readback;
+mod recipe;
 mod view;
 
 pub use admission::{
@@ -107,6 +108,13 @@ pub use reactive_session::{
 pub use readback::{
     IndexPreview, MAX_EXCERPT_BYTES, MAX_PREVIEW_BYTES, PreviewAuthority, ProjectedCitation,
     ReadbackRefusal, ReadbackRefusalKind, ReadbackRequest,
+};
+pub use recipe::{
+    CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN, CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, ContextRecipePolicy,
+    ContextSectionBudget, CounterMetricMovement, ProtectedReservePolicy, RecipeAdmissionPolicy,
+    RecipeApplicability, RecipeCounterMetric, RecipeExecutionContour, RecipeLayoutPolicy,
+    RecipeOmissionPolicy, RecipeQualification, RecipeQualificationState, RecipeRolePosition,
+    RecipeStage, RecipeSupersession,
 };
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 
