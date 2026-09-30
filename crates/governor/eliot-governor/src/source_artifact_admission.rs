@@ -56,6 +56,7 @@ pub struct SourceArtifactAdmissionRequest {
 pub struct SourceArtifactAdmission {
     action_lease: ActionLease,
     authorized_effect: AuthorizedEffect,
+    holder: PrincipalRef,
     work_scope: WorkScopeBinding,
     task: TaskBinding,
     session: SessionBinding,
@@ -78,6 +79,13 @@ impl SourceArtifactAdmission {
 
     pub fn authorized_effect(&self) -> &AuthorizedEffect {
         &self.authorized_effect
+    }
+
+    /// Original admitted principal whose exact GrantGraph path authorized
+    /// this effect. Policy-owned source profiles bind their access context to
+    /// this retained value rather than to a caller label.
+    pub fn holder(&self) -> &PrincipalRef {
+        &self.holder
     }
 
     pub fn work_scope(&self) -> &WorkScopeBinding {
@@ -240,6 +248,7 @@ pub fn issue_source_artifact_admission(
     Ok(SourceArtifactAdmission {
         action_lease,
         authorized_effect: compiled.authorized,
+        holder: input.holder,
         work_scope: input.work_scope,
         task: input.task,
         session: input.session,
