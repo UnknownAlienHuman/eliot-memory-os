@@ -3124,7 +3124,6 @@ impl KernelComposition {
             }
             "origin_grant_reconcile" => {
                 self.origin_grant_reconcile_operation(session, payload.clone())
-                    .await
             }
             ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => {
                 self.generation_registry_active_query_operation(session, payload.clone())
@@ -7450,7 +7449,7 @@ impl KernelComposition {
     /// structured `reconciliation_required` recovery obligation, not prose;
     /// every authorization or binding failure fences the session before any
     /// effect or live read.
-    async fn origin_grant_reconcile_operation(
+    fn origin_grant_reconcile_operation(
         &self,
         session: &Session,
         payload: serde_json::Value,
@@ -7464,14 +7463,11 @@ impl KernelComposition {
             .process_gateway
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        match gateway
-            .reconcile_origin_grant_effect(
-                &owner,
-                operation.operation_id.clone(),
-                &operation.request_nonce,
-            )
-            .await
-        {
+        match gateway.reconcile_origin_grant_effect(
+            &owner,
+            &operation.operation_id,
+            &operation.request_nonce,
+        ) {
             Ok(receipt) => Ok(serde_json::json!({
                 "status": "known",
                 "value": {
@@ -10861,9 +10857,10 @@ fn validate_origin_inspection(
     // the Kernel-retained composition identity: a foreign installation
     // fails here, before any challenge is minted or decided. An uncomposed
     // Kernel has no installation identity at all and refuses.
-    let live = super::dispatch_contour()
-        .map(|contour| contour.installation_id())
-        .unwrap_or("");
+    let live = super::dispatch_contour().map_or(
+        "",
+        super::dispatch_launch::ComposedDispatchContour::installation_id,
+    );
     if live.trim().is_empty() || request.installation_id() != live {
         return Err(TransportError::SessionFenced);
     }

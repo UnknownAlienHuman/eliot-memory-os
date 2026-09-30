@@ -1462,7 +1462,7 @@ impl ProcessExecutionGateway {
         // The installation in the request is caller packaging until it is
         // proven against the Kernel-retained composition identity here, so
         // a foreign installation fails before any challenge is minted.
-        if request.installation_id() != live_origin_installation_id()? {
+        if request.installation_id() != Self::live_origin_installation_id()? {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::IdentityMismatch,
             ));
@@ -1478,7 +1478,7 @@ impl ProcessExecutionGateway {
                 expires_at_unix_ms,
                 &self.snapshot_binding,
             )
-            .map_err(origin_contract_error)
+            .map_err(Self::origin_contract_error)
     }
 
     pub(crate) fn decide_origin_control(
@@ -1487,7 +1487,7 @@ impl ProcessExecutionGateway {
     ) -> Result<OriginControlGrant, ProcessExecutionError> {
         // Same anchor as issuance: the decided installation must still be
         // the Kernel-retained one, not merely the value the caller packaged.
-        if presentation.request().installation_id() != live_origin_installation_id()? {
+        if presentation.request().installation_id() != Self::live_origin_installation_id()? {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::IdentityMismatch,
             ));
@@ -1498,7 +1498,7 @@ impl ProcessExecutionGateway {
                 ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
             })?
             .decide_origin_control(presentation, super::unix_ms(), &self.snapshot_binding)
-            .map_err(origin_contract_error)
+            .map_err(Self::origin_contract_error)
     }
 
     /// Reads the Kernel-retained installation identity for origin control.
@@ -1510,9 +1510,10 @@ impl ProcessExecutionGateway {
     /// value. An uncomposed Kernel has no installation identity at all and
     /// refuses; it is never defaulted to a placeholder.
     fn live_origin_installation_id() -> Result<&'static str, ProcessExecutionError> {
-        let installation = super::dispatch_contour()
-            .map(|contour| contour.installation_id())
-            .unwrap_or("");
+        let installation = super::dispatch_contour().map_or(
+            "",
+            super::dispatch_launch::ComposedDispatchContour::installation_id,
+        );
         if installation.trim().is_empty() {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::IdentityMismatch,
@@ -1552,7 +1553,7 @@ impl ProcessExecutionGateway {
                 ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
             })?
             .origin_grant_effect_state(request_nonce, &self.snapshot_binding)
-            .map_err(origin_contract_error)
+            .map_err(Self::origin_contract_error)
     }
 
     /// Durably records the observed effect of a decided origin grant.
@@ -1572,7 +1573,7 @@ impl ProcessExecutionGateway {
             })?
             .record_origin_grant_effect(request_nonce, receipt, &self.snapshot_binding)
             .map(|_| ())
-            .map_err(origin_contract_error)
+            .map_err(Self::origin_contract_error)
     }
 
     /// Replays the preserved original kill receipt for a proven grant effect.
@@ -1589,7 +1590,7 @@ impl ProcessExecutionGateway {
                 ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
             })?
             .origin_grant_effect_receipt(request_nonce, &self.snapshot_binding)
-            .map_err(origin_contract_error)
+            .map_err(Self::origin_contract_error)
     }
 
     /// Reconciles one grant-funded effect after crash or lost response
@@ -1609,14 +1610,14 @@ impl ProcessExecutionGateway {
     /// path. A proven (`Effected`) effect replays the preserved original
     /// kill receipt for the original operation — never a re-execution and
     /// never live executor evidence.
-    pub(crate) async fn reconcile_origin_grant_effect(
+    pub(crate) fn reconcile_origin_grant_effect(
         &self,
         owner: &ProcessOwnerBinding,
-        operation_id: eliot_process::OperationId,
+        operation_id: &eliot_process::OperationId,
         request_nonce: &str,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
         observe_process("kernel.process.grant_reconcile_requested", "attempt");
-        if let Err(error) = self.authorize_operation(owner, &operation_id) {
+        if let Err(error) = self.authorize_operation(owner, operation_id) {
             observe_process("kernel.process.grant_reconcile_rejected", "fenced");
             super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
             return Err(error);
@@ -1628,14 +1629,14 @@ impl ProcessExecutionGateway {
                 ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
             })?
             .origin_grant_reconciliation_source(request_nonce, &self.snapshot_binding)
-            .map_err(origin_contract_error)?;
-        if source.operation_id() != &operation_id {
+            .map_err(Self::origin_contract_error)?;
+        if source.operation_id() != operation_id {
             observe_process("kernel.process.grant_reconcile_rejected", "fenced");
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
             ));
         }
-        if source.installation_id() != live_origin_installation_id()? {
+        if source.installation_id() != Self::live_origin_installation_id()? {
             observe_process("kernel.process.grant_reconcile_rejected", "fenced");
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::IdentityMismatch,
@@ -2213,41 +2214,33 @@ impl ProcessExecutionGateway {
                 }
             }
         }
-        match self.executor.cancel(operation_id.clone()).await {
-            Ok(receipt) => {
-                // The receipt is observed: journal the proven effect with
-                // its preserved original before reporting success. A failed
-                // journal cannot report a clean success; the receipt stays
-                // re-derivable through reconcile.
-                if let Some(granted) = grant {
-                    if let Err(error) =
-                        self.record_origin_grant_effect(granted.request_nonce(), &receipt)
-                    {
-                        observe_process("kernel.process.cancel_unrecorded", "unknown");
-                        super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
-                            &error,
-                        ));
-                        return Err(error);
-                    }
-                }
-                observe_process("kernel.process.cancel_acknowledged", "success");
-                Ok(receipt)
-            }
-            Err(_) => {
-                // Issue #1775 W5: a failed or hung owned child leaves the
-                // effect unproven. The consumed one-shot stays `Unknown` in
-                // the durable journal, and the caller gets the exact
-                // missing-capability report — reconcile the original
-                // target/operation through the retained owner binding and
-                // handles — never a downgrade to name/PID control and never
-                // a blind re-execution.
-                observe_process("kernel.process.cancel_failed", "unknown");
-                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
-                    &ProcessExecutionError::UnknownOutcome,
-                ));
-                Err(ProcessExecutionError::UnknownOutcome)
-            }
+        let Ok(receipt) = self.executor.cancel(operation_id.clone()).await else {
+            // Issue #1775 W5: a failed or hung owned child leaves the
+            // effect unproven. The consumed one-shot stays `Unknown` in
+            // the durable journal, and the caller gets the exact
+            // missing-capability report — reconcile the original
+            // target/operation through the retained owner binding and
+            // handles — never a downgrade to name/PID control and never
+            // a blind re-execution.
+            observe_process("kernel.process.cancel_failed", "unknown");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
+                &ProcessExecutionError::UnknownOutcome,
+            ));
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        // The receipt is observed: journal the proven effect with
+        // its preserved original before reporting success. A failed
+        // journal cannot report a clean success; the receipt stays
+        // re-derivable through reconcile.
+        if let Some(granted) = grant
+            && let Err(error) = self.record_origin_grant_effect(granted.request_nonce(), &receipt)
+        {
+            observe_process("kernel.process.cancel_unrecorded", "unknown");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            return Err(error);
         }
+        observe_process("kernel.process.cancel_acknowledged", "success");
+        Ok(receipt)
     }
 
     /// Closes one registered descendant after cancellation, restart, or
@@ -2457,7 +2450,7 @@ impl ProcessExecutionGateway {
                 super::unix_ms(),
             )
             .map_err(ProcessExecutionError::Contract)?;
-        if grant.installation_id() != live_origin_installation_id()? {
+        if grant.installation_id() != Self::live_origin_installation_id()? {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::IdentityMismatch,
             ));
