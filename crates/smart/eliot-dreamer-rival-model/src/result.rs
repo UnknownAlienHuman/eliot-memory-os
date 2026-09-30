@@ -1,8 +1,9 @@
 //! Retained result carrier for the first rival-model phase.
 
 use crate::analysis::{
-    self, DiscriminatorRequirementFacet, DiscriminatorSearch, InertDiscriminator, ModelDisposition,
-    OmissionFrontier, RivalEquivalenceClass, RivalModelAssessment,
+    self, DiscriminatorRequirementFacet, DiscriminatorRequirementReason, DiscriminatorSearch,
+    InertDiscriminator, ModelDisposition, OmissionFrontier, RivalEquivalenceClass,
+    RivalModelAssessment,
 };
 use crate::bounds::{self, MAX_RIVAL_ITEMS, MAX_RIVAL_WIRE_BYTES};
 use crate::comparison::{
@@ -17,9 +18,12 @@ use crate::states::{ModelOmissionReason, ModelUnavailableReason, OutputSection, 
 use crate::unknown::UnknownSlotRef;
 use eliot_dreamer_contracts::grounding::{ArtifactId, StateFence, TaskId};
 use eliot_dreamer_contracts::rival::{
-    CurrentPositionBinding, DeclarationAvailability, RivalCoverageDeclaration,
-    RivalCoverageReceipt, RivalDeclarationSet, RivalModelDeclaration, RivalModelRef,
-    RivalModelSlot,
+    CurrentPositionBinding, DeclarationAvailability, DiscriminatorPeerAddress as ProbePeerAddress,
+    RequirementFacet as ProbeRequirementFacet, RequirementReason as ProbeRequirementReason,
+    RetainedDiscriminator, RivalCoverageDeclaration, RivalCoverageStatus, RivalCoverageSummary,
+    RivalDeclarationSet, RivalDeclarationSetRef, RivalModelDeclaration,
+    RivalModelRef, RivalModelSet as ProbeRivalModelSet, RivalModelSetParams as ProbeRivalModelSetParams,
+    RivalModelSlot, UnresolvedDiscriminatorRequirement,
 };
 use eliot_dreamer_contracts::{DreamInputBundle, ValidatedGroundingCandidate};
 use eliot_epistemic_contracts::{CurrentEpistemicPosition, DenominatorKind};
@@ -62,6 +66,127 @@ impl SourceSetRef {
             return Err(RivalModelError::InvalidContract("result.source_set"));
         }
         Ok(())
+    }
+}
+
+impl RivalModelSet {
+    /// Projects this validated native result into the owner-neutral input
+    /// contract consumed by the bounded probe planner.
+    ///
+    /// The native value remains the authority and must validate before any
+    /// projection occurs. This adapter preserves each retained discriminator,
+    /// unresolved comparison, coverage status/denominator, and every frontier
+    /// identity the probe contract can represent. Unknown-facet rows and
+    /// non-identity frontier metadata remain in the native value, so this
+    /// narrower contract refuses when it cannot represent them losslessly.
+    pub fn to_probe_projection(&self) -> Result<ProbeRivalModelSet, RivalModelError> {
+        self.validate()?;
+
+        if self.unknown_total != 0
+            || self.unknown_omitted_count != 0
+            || !self.unknown_slots.is_empty()
+            || !self.omission_frontier.sections.is_empty()
+            || self.omission_frontier.exhausted_stage.is_some()
+            || self.omission_frontier.exhausted_model_id.is_some()
+            || self.omission_frontier.exhausted_prediction_id.is_some()
+            || self.omission_frontier.exhausted_pair.is_some()
+            || self.omission_frontier.exhausted_prediction_pair.is_some()
+        {
+            return Err(RivalModelError::InvalidContract(
+                "probe_projection.lossy_native_frontier",
+            ));
+        }
+
+        let declarations = self.declarations.as_deref();
+        let model_coverage = probe_coverage_summary(
+            self.model_coverage,
+            declarations.map(|set| &set.model_coverage),
+        )?;
+        let source_coverage = probe_coverage_summary(
+            self.source_coverage,
+            declarations.map(|set| &set.source_coverage),
+        )?;
+
+        let discriminators = self
+            .discriminators
+            .iter()
+            .map(|item| RetainedDiscriminator {
+                expected_model: item.expected_model.clone(),
+                expected_prediction: item.expected_prediction.clone(),
+                falsifying_model: item.falsifying_model.clone(),
+                falsifying_prediction: item.falsifying_prediction.clone(),
+                target: item.target.clone(),
+                applicability: item.applicability.clone(),
+                condition_assumptions: item.condition_assumptions.clone(),
+                observable: item.observable.clone(),
+            })
+            .collect();
+        let unresolved = self
+            .discriminator_search
+            .requirements
+            .iter()
+            .map(|item| UnresolvedDiscriminatorRequirement {
+                model_row: item.model_row,
+                prediction_ref_entry: item.prediction_ref_entry,
+                facet: match item.facet {
+                    DiscriminatorRequirementFacet::PredictionReferences => {
+                        ProbeRequirementFacet::PredictionReferences
+                    }
+                    DiscriminatorRequirementFacet::Expected => ProbeRequirementFacet::Expected,
+                    DiscriminatorRequirementFacet::Falsifier => ProbeRequirementFacet::Falsifier,
+                    DiscriminatorRequirementFacet::ModelFrontier => {
+                        ProbeRequirementFacet::ModelFrontier
+                    }
+                },
+                peer: item.peer.map(|peer| ProbePeerAddress {
+                    model_row: peer.model_row,
+                    prediction_ref_entry: peer.prediction_ref_entry,
+                }),
+                reason: match item.reason {
+                    DiscriminatorRequirementReason::Unknown => ProbeRequirementReason::Unknown,
+                    DiscriminatorRequirementReason::Unavailable => {
+                        ProbeRequirementReason::Unavailable
+                    }
+                    DiscriminatorRequirementReason::InternallyIdentical => {
+                        ProbeRequirementReason::InternallyIdentical
+                    }
+                    DiscriminatorRequirementReason::NotApplicable => {
+                        ProbeRequirementReason::NotApplicable
+                    }
+                    DiscriminatorRequirementReason::OutsideAnalysisFrontier => {
+                        ProbeRequirementReason::OutsideAnalysisFrontier
+                    }
+                },
+            })
+            .collect();
+
+        let omission_frontier = self
+            .omission_frontier
+            .model_ids
+            .iter()
+            .map(|model| model.model_id.clone())
+            .collect();
+
+        ProbeRivalModelSet::new(ProbeRivalModelSetParams {
+            set_id: self.set_id.clone(),
+            task_id: self.task_id.clone(),
+            scope: self.scope.clone(),
+            state_fence: self.state_fence.clone(),
+            bundle_digest: self.bundle_digest.clone(),
+            validated_input_digest: self.validated_input_digest.clone(),
+            declaration_set: RivalDeclarationSetRef {
+                set_id: self.source_set.set_id.clone(),
+                digest: self.source_set.digest.clone(),
+            },
+            policy_id: self.policy_id.clone(),
+            policy_digest: self.policy_digest.clone(),
+            discriminators,
+            unresolved,
+            model_coverage,
+            source_coverage,
+            omission_frontier,
+        })
+        .map_err(|_| RivalModelError::InvalidContract("probe_projection"))
     }
 }
 
@@ -1636,4 +1761,35 @@ fn coverage_status(declaration: &RivalCoverageDeclaration) -> CoverageStatus {
         }
         RivalCoverageDeclaration::Supplied { .. } => CoverageStatus::Partial,
     }
+}
+
+fn probe_coverage_summary(
+    status: CoverageStatus,
+    declaration: Option<&RivalCoverageDeclaration>,
+) -> Result<RivalCoverageSummary, RivalModelError> {
+    let denominator_digest = match declaration {
+        Some(RivalCoverageDeclaration::Supplied { denominator, .. }) => {
+            Some(denominator.digest.clone())
+        }
+        Some(RivalCoverageDeclaration::Unknown {
+            denominator_digest, ..
+        }) => denominator_digest.clone(),
+        None => None,
+    };
+    let status = match status {
+        CoverageStatus::Complete => RivalCoverageStatus::Complete,
+        CoverageStatus::Partial => RivalCoverageStatus::Partial,
+        CoverageStatus::Unknown => RivalCoverageStatus::Unknown,
+    };
+    if (status == RivalCoverageStatus::Complete && denominator_digest.is_none())
+        || (status == RivalCoverageStatus::Unknown && denominator_digest.is_some())
+    {
+        return Err(RivalModelError::InvalidContract(
+            "probe_projection.coverage_binding",
+        ));
+    }
+    Ok(RivalCoverageSummary {
+        status,
+        denominator_digest,
+    })
 }
