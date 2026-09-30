@@ -927,8 +927,7 @@ fn deny_brief_effects(
     .flat_map(|class| {
         [
             ProhibitedEffectAttempt::for_health_brief(class, brief, subject.to_owned()).deny(),
-            ProhibitedEffectAttempt::for_health_analysis(class, request, subject.to_owned())
-                .deny(),
+            ProhibitedEffectAttempt::for_health_analysis(class, request, subject.to_owned()).deny(),
         ]
     })
     .collect()

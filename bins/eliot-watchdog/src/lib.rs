@@ -1426,10 +1426,7 @@ impl KernelWatchdogPort for IndependentKernelSensor {
     fn health_evidence(&self, now_ms: u64) -> Option<WatchdogHealthEvidence> {
         let corpus = self
             .spool
-            .health_corpus_summary(
-                now_ms,
-                WatchdogSpoolBackupLimits::default().page_ttl_ms,
-            )
+            .health_corpus_summary(now_ms, WatchdogSpoolBackupLimits::default().page_ttl_ms)
             .ok()?;
         Some(WatchdogHealthEvidence {
             owner: WatchdogHealthOwner {
