@@ -223,19 +223,49 @@ pub struct ObservationIngressPolicyBinding {
 /// Exact WorkScope and Policy owner bindings returned before observation
 /// payload staging. Every digest and revision is copied from its named-read
 /// owner reply or validated owner payload; this projection creates no receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ObservationCaptureOwnerOrigin {
+    /// A semantic application Session authenticated by the current Session
+    /// owner. Task applicability is separate and exists only with validated
+    /// task-selection evidence.
+    ApplicationSession {
+        /// Principal recorded by the authenticated Session owner.
+        authenticated_principal_ref: String,
+        /// Exact semantic Session identity.
+        authenticated_session_ref: String,
+        /// Task applicability admitted by an exact task-selection binding.
+        authenticated_task_ref: Option<String>,
+    },
+    /// A raw host capture whose original authority is the Kernel-authenticated
+    /// Agent Bridge peer receipt, with no semantic application identity.
+    HostPeer {
+        /// Typed transport-origin domain for the retained peer receipt.
+        domain: ObservationCaptureHostOriginDomain,
+        /// The complete original authenticated Kernel peer-admission receipt.
+        peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    },
+}
+
+/// Closed domain labels for host-origin observation capture.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ObservationCaptureHostOriginDomain {
+    /// Windows host identity admitted by the Agent Bridge peer gate.
+    AgentBridge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationCaptureOwnerBinding {
     /// Wire version for this typed owner projection.
     pub wire_version: u16,
-    /// Principal authenticated by Kernel and matched to the current Session owner.
-    pub authenticated_principal_ref: String,
-    /// Session authenticated by Kernel and matched to the current Session owner.
-    pub authenticated_session_ref: String,
-    /// Task supplied by the authenticated request, absent for a cold capture.
-    pub authenticated_task_ref: Option<String>,
+    /// Exact semantic application or authenticated host origin. Host captures
+    /// carry the original peer receipt and no app principal/Session/task.
+    pub origin: ObservationCaptureOwnerOrigin,
     /// Current independently read WorkScope identity.
     pub authenticated_scope_ref: String,
-    /// Request State Fence at which both named owners were read.
+    /// Exact origin State Fence at which both named owners were read.
     pub state_fence: StateFence,
     /// Original durable Policy owner revision.
     pub policy_owner_revision: u64,
@@ -277,19 +307,6 @@ impl ObservationCaptureOwnerBinding {
     /// Validates the exact source joins without recomputing named-read digests.
     pub fn validate(&self) -> Result<(), CompositionError> {
         if self.wire_version != 1
-            || self.authenticated_principal_ref.trim().is_empty()
-            || self
-                .authenticated_principal_ref
-                .chars()
-                .any(char::is_control)
-            || self.authenticated_session_ref.trim().is_empty()
-            || self.authenticated_session_ref.chars().any(char::is_control)
-            || self
-                .authenticated_task_ref
-                .as_ref()
-                .is_some_and(|task_ref| {
-                    task_ref.trim().is_empty() || task_ref.chars().any(char::is_control)
-                })
             || self.authenticated_scope_ref.trim().is_empty()
             || self.authenticated_scope_ref.chars().any(char::is_control)
             || self.policy_owner_revision == 0
@@ -300,6 +317,39 @@ impl ObservationCaptureOwnerBinding {
             return Err(CompositionError::Recovery(
                 "Observation owner binding has invalid identity or revision joins".to_owned(),
             ));
+        }
+        match &self.origin {
+            ObservationCaptureOwnerOrigin::ApplicationSession {
+                authenticated_principal_ref,
+                authenticated_session_ref,
+                authenticated_task_ref,
+            } => {
+                if authenticated_principal_ref.trim().is_empty()
+                    || authenticated_principal_ref.chars().any(char::is_control)
+                    || authenticated_session_ref.trim().is_empty()
+                    || authenticated_session_ref.chars().any(char::is_control)
+                    || authenticated_task_ref.as_ref().is_some_and(|task_ref| {
+                        task_ref.trim().is_empty() || task_ref.chars().any(char::is_control)
+                    })
+                {
+                    return Err(CompositionError::Recovery(
+                        "Observation application origin has invalid identity fields".to_owned(),
+                    ));
+                }
+            }
+            ObservationCaptureOwnerOrigin::HostPeer {
+                domain: ObservationCaptureHostOriginDomain::AgentBridge,
+                peer_admission_receipt,
+            } => {
+                peer_admission_receipt
+                    .validate()
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+                if peer_admission_receipt.state_fence != self.state_fence {
+                    return Err(CompositionError::Recovery(
+                        "Observation host origin receipt is not at the owner StateFence".to_owned(),
+                    ));
+                }
+            }
         }
         self.state_fence
             .validate()
@@ -540,7 +590,8 @@ pub struct ObservationCaptureAccess {
     pub privacy: PrivacyClass,
     /// Local-only visibility mandated by the admitted observation policy.
     pub visibility: ObservationCaptureVisibility,
-    /// Original instruction taint from the admitted source assurance.
+    /// Conservative raw-byte taint classification from the admitted capture
+    /// policy; this is not evidence of source screening or assurance.
     pub instruction_taint: InstructionTaint,
 }
 
@@ -567,10 +618,10 @@ pub struct McpObservationCaptureInput {
     pub original_content: serde_json::Value,
     /// Capture clock returned by the retained Kernel/ORS metadata.
     pub capture_clock: ClockReading,
-    /// Principal from the authenticated Kernel claim.
-    pub authenticated_principal_ref: String,
-    /// Current independent WorkScope owner snapshot at the request fence.
-    pub work_scope: eliot_workscope::WorkScopeBindingSnapshot,
+    /// Exact pre-persistence Policy/WorkScope owner projection. A host capture
+    /// carries its original peer receipt under `origin`; an application capture
+    /// carries its validated semantic Session there.
+    pub owner_binding: ObservationCaptureOwnerBinding,
     /// Current owner-issued selection binding, absent only for a cold capture.
     pub task_selection: Option<TaskSelectionAdmissionBinding>,
 }
@@ -582,6 +633,7 @@ pub struct PreparedMcpObservation {
     exchange: crate::PreparedKernelExchange,
     policy: ObservationIngressPolicyBinding,
     access: ObservationCaptureAccess,
+    owner_binding: ObservationCaptureOwnerBinding,
 }
 
 impl PreparedMcpObservation {
@@ -607,6 +659,12 @@ impl PreparedMcpObservation {
     #[must_use]
     pub const fn access(&self) -> &ObservationCaptureAccess {
         &self.access
+    }
+
+    /// Exact pre-persistence owner projection used to prepare the capture.
+    #[must_use]
+    pub const fn owner_binding(&self) -> &ObservationCaptureOwnerBinding {
+        &self.owner_binding
     }
 }
 
@@ -801,90 +859,127 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
         input.identity.validate().map_err(|error| {
             CompositionError::Provider(format!("Observe request identity is invalid: {error}"))
         })?;
+        input.owner_binding.validate()?;
         input.capture_clock.validate().map_err(|error| {
             CompositionError::Provider(format!("Observe capture clock is invalid: {error}"))
         })?;
         let fence = &input.identity.request.metadata.state_fence;
         if input.identity.request.state_fence != *fence
-            || input.work_scope.state_fence != *fence
-            || input.work_scope.owner_revision == 0
+            || input.owner_binding.state_fence != *fence
             || self.canonical.state_fence() != fence
         {
             return Err(identity_refused(
-                "Observe request, WorkScope, and canonical owner fences must match exactly",
+                "Observe request, owner projection, and canonical owner fences must match exactly",
             ));
         }
-        if input.authenticated_principal_ref.trim().is_empty()
-            || input
-                .authenticated_principal_ref
-                .chars()
-                .any(char::is_control)
-        {
-            return Err(identity_refused(
-                "authenticated Observe principal must be non-blank and free of controls",
-            ));
-        }
-        let session_id = input
-            .identity
-            .request
-            .metadata
-            .session_id
-            .as_ref()
-            .ok_or_else(|| identity_refused("Observe request has no authenticated Session"))?;
-        let session_owner = self.session.ok_or_else(|| {
-            CompositionError::Recovery(
-                "current Session owner is unavailable for Observe capture".to_owned(),
-            )
-        })?;
-        let session = session_owner.session(session_id).ok_or_else(|| {
-            CompositionError::Recovery(
-                "current Session owner has no admitted Observe session".to_owned(),
-            )
-        })?;
-        if session.status != SessionState::Active
-            || session.state_fence != *fence
-            || !session
-                .authority_epoch
-                .is_same_authority(&fence.authority_epoch)
-            || input
-                .identity
-                .request
-                .metadata
-                .task_id
-                .as_ref()
-                .is_some_and(|task_id| session.task_scope.as_deref() != Some(task_id.as_str()))
-        {
-            return Err(identity_refused(
-                "Observe Session owner is stale or incompatible with task applicability",
-            ));
-        }
-        let session_actor = session_owner
-            .snapshot()
-            .events
-            .into_iter()
-            .rev()
-            .find(|event| event.session_id == *session_id)
-            .map(|event| event.actor_ref)
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "Session owner has no retained authenticated actor for Observe".to_owned(),
-                )
-            })?;
-        if session_actor != input.authenticated_principal_ref {
-            return Err(identity_refused(
-                "authenticated Observe principal does not match the Session owner actor",
-            ));
+        match &input.owner_binding.origin {
+            ObservationCaptureOwnerOrigin::ApplicationSession {
+                authenticated_principal_ref,
+                authenticated_session_ref,
+                authenticated_task_ref,
+            } => {
+                let session_id = input
+                    .identity
+                    .request
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .ok_or_else(|| identity_refused("application Observe request has no Session"))?;
+                if session_id.as_str() != authenticated_session_ref
+                    || input
+                        .identity
+                        .request
+                        .metadata
+                        .task_id
+                        .as_ref()
+                        .map(TaskId::as_str)
+                        != authenticated_task_ref.as_deref()
+                {
+                    return Err(identity_refused(
+                        "Observe request identity differs from its authenticated application origin",
+                    ));
+                }
+                let session_owner = self.session.ok_or_else(|| {
+                    CompositionError::Recovery(
+                        "current Session owner is unavailable for Observe capture".to_owned(),
+                    )
+                })?;
+                let session = session_owner.session(session_id).ok_or_else(|| {
+                    CompositionError::Recovery(
+                        "current Session owner has no admitted Observe session".to_owned(),
+                    )
+                })?;
+                if session.status != SessionState::Active
+                    || session.state_fence != *fence
+                    || !session.authority_epoch.is_same_authority(&fence.authority_epoch)
+                    || input
+                        .identity
+                        .request
+                        .metadata
+                        .task_id
+                        .as_ref()
+                        .is_some_and(|task_id| {
+                            session.task_scope.as_deref() != Some(task_id.as_str())
+                        })
+                {
+                    return Err(identity_refused(
+                        "Observe Session owner is stale or incompatible with task applicability",
+                    ));
+                }
+                let session_actor = session_owner
+                    .snapshot()
+                    .events
+                    .into_iter()
+                    .rev()
+                    .find(|event| event.session_id == *session_id)
+                    .map(|event| event.actor_ref)
+                    .ok_or_else(|| {
+                        CompositionError::Recovery(
+                            "Session owner has no retained authenticated actor for Observe"
+                                .to_owned(),
+                        )
+                    })?;
+                if session_actor != *authenticated_principal_ref {
+                    return Err(identity_refused(
+                        "authenticated Observe principal does not match the Session owner actor",
+                    ));
+                }
+            }
+            ObservationCaptureOwnerOrigin::HostPeer {
+                peer_admission_receipt,
+                ..
+            } => {
+                if input.identity.request.metadata.session_id.is_some()
+                    || input.identity.request.metadata.task_id.is_some()
+                    || peer_admission_receipt.state_fence != *fence
+                {
+                    return Err(identity_refused(
+                        "cold host Observe identity must have no semantic Session/task and match its peer receipt fence",
+                    ));
+                }
+            }
         }
         let policy = self.current_ingress_policy()?;
-        if policy.state_fence != *fence {
+        if policy.state_fence != *fence
+            || policy.policy_revision != input.owner_binding.policy_owner_revision
+            || policy.canonical_read_digest != input.owner_binding.policy_named_read_digest
+            || policy.snapshot_digest != input.owner_binding.config_policy_snapshot_sha256
+            || policy.config_policy_snapshot != input.owner_binding.config_policy_snapshot
+            || policy.setting_key != input.owner_binding.ingress_setting_key
+            || policy.setting_value_ref != input.owner_binding.ingress_setting_value_ref
+            || policy.setting_owner_ref != input.owner_binding.ingress_setting_owner_ref
+        {
             return Err(identity_refused(
-                "Observation ingress policy is stale for the authenticated request fence",
+                "Observation ingress policy differs from its pre-persistence owner projection",
             ));
         }
-        let current_scope = self.current_work_scope(fence)?;
-        if current_scope != input.work_scope {
+        let current_scope = self
+            .current_work_scope(fence)?;
+        if current_scope != input.owner_binding.work_scope_binding
+            || input.owner_binding.authenticated_scope_ref != current_scope.binding.scope.scope_ref
+        {
             return Err(identity_refused(
-                "supplied WorkScope snapshot is not the current exact owner snapshot",
+                "Observation WorkScope differs from its exact owner projection",
             ));
         }
 
@@ -903,7 +998,13 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                             .as_ref()
                             .map(SessionId::as_str)
                             .unwrap_or_default()
-                    || selection.principal_ref() != input.authenticated_principal_ref
+                    || !matches!(
+                        &input.owner_binding.origin,
+                        ObservationCaptureOwnerOrigin::ApplicationSession {
+                            authenticated_principal_ref,
+                            ..
+                        } if selection.principal_ref() == authenticated_principal_ref
+                    )
                     || selection.state_fence() != fence
                     || selection.work_scope() != &current_scope
                     || selection.evidence().work_scope_ref != current_scope.binding.scope.scope_ref
@@ -952,7 +1053,16 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                         clock: input.capture_clock,
                     },
                     producer_generation_and_trace: ProducerTrace {
-                        producer: input.authenticated_principal_ref,
+                    producer: match &input.owner_binding.origin {
+                        ObservationCaptureOwnerOrigin::ApplicationSession {
+                            authenticated_principal_ref,
+                            ..
+                        } => authenticated_principal_ref.clone(),
+                        ObservationCaptureOwnerOrigin::HostPeer {
+                            peer_admission_receipt,
+                            ..
+                        } => peer_admission_receipt.module_id.clone(),
+                    },
                         generation: fence.resource_generation.value().to_string(),
                         trace_ref: Some(operation.to_owned()),
                     },
@@ -1047,15 +1157,16 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                     other => owner_refused(other.to_string()),
                 })?;
         let access = ObservationCaptureAccess {
-            privacy: current_scope.binding.privacy_class,
-            visibility: ObservationCaptureVisibility::LocalOnly,
-            instruction_taint: InstructionTaint::CommandLike,
+            privacy: input.owner_binding.access.privacy,
+            visibility: input.owner_binding.access.visibility,
+            instruction_taint: input.owner_binding.access.instruction_taint,
         };
         Ok(PreparedMcpObservation {
             submission,
             exchange,
             policy,
             access,
+            owner_binding: input.owner_binding,
         })
     }
 
