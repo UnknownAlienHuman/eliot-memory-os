@@ -3617,15 +3617,14 @@ impl ApprovedGenerationRegistry {
         // tell because the destination identity would then be a generation THIS
         // projection already approves and, if it is the active one, an
         // installation that is currently serving effects.
-        if let Some(active) = self.active_generation.as_ref() {
-            if &admission.destination_installation == active
-                || admission.approved_target_build == *active
-            {
-                return Err(InstallationError::Duplicate {
-                    kind: "active installation offered as an isolated destination".to_owned(),
-                    identity: admission.destination_installation.as_str().to_owned(),
-                });
-            }
+        if let Some(active) = self.active_generation.as_ref()
+            && (&admission.destination_installation == active
+                || admission.approved_target_build == *active)
+        {
+            return Err(InstallationError::Duplicate {
+                kind: "active installation offered as an isolated destination".to_owned(),
+                identity: admission.destination_installation.as_str().to_owned(),
+            });
         }
         if self
             .generations

@@ -1686,8 +1686,13 @@ pub fn classify_installation_host_root(path: &Path) -> InstallationHostRootClass
     }
     match identity.components.get(key_index + 2) {
         Some(leaf) if leaf == "host" => InstallationHostRootClass::InstallationHostRoot,
-        Some(_) => InstallationHostRootClass::InstallationArea,
-        None => InstallationHostRootClass::InstallationArea,
+        // A present leaf that is not `host`, and an ABSENT leaf -- the installation
+        // root itself -- are the same class, not two: both are inside the
+        // owner-declared installation tree, neither is a Host root, and both are
+        // parents a new installation root may be created under. Only the
+        // installation KEY distinguishes this contour from `Unowned`, and that was
+        // already proved above.
+        _ => InstallationHostRootClass::InstallationArea,
     }
 }
 

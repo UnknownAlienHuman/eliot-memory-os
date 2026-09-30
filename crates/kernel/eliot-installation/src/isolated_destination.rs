@@ -292,7 +292,6 @@ impl ProposedRestorationRequirements {
         // step has to overwrite.
         let admitted_classes = vec![facts.archive_class];
         let requirements_digest = Self::digest_over_fields(
-            &wire,
             &admitted_classes,
             max_restore_bytes,
             &target_schema_digest,
@@ -313,7 +312,6 @@ impl ProposedRestorationRequirements {
     /// Recomputes the domain-separated requirements digest.
     pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
         Self::digest_over_fields(
-            &self.wire,
             &self.admitted_classes,
             self.max_restore_bytes,
             &self.target_schema_digest,
@@ -321,13 +319,20 @@ impl ProposedRestorationRequirements {
         )
     }
 
-    /// Digests exactly the five committed requirement fields, with no `Self`.
+    /// Digests exactly the four committed requirement fields, with no `Self`.
     ///
     /// This is the single seam both the issuer and [`Self::validate`]'s
     /// recomputation go through, so the recorded digest and the compared digest
     /// cannot be produced by different code over different field sets.
+    ///
+    /// The record's own `wire` handle is deliberately NOT an input here. The
+    /// digest's first element is [`Self::WIRE`], and [`Self::validate`] already
+    /// refuses any record whose `wire` differs from it with
+    /// [`InstallationError::MigrationRequired`] before the digest is compared, so
+    /// the handle is pinned by that comparison rather than by the digest; hashing
+    /// it as well would add a provably constant element that discriminates
+    /// nothing and would change the hashed bytes.
     fn digest_over_fields(
-        wire: &PlatformHandle,
         admitted_classes: &[BackupClassWire],
         max_restore_bytes: u64,
         target_schema_digest: &PlatformHandle,
