@@ -2252,6 +2252,68 @@ impl DaemonKernelClient {
             .await
     }
 
+    /// Sends one original P-03 operation through the authenticated
+    /// current-source Kernel route. The process request stays nested so its
+    /// serde `operation` tag cannot collide with the daemon routing key; the
+    /// original `RequestIdentity` is carried by the EBP frame and is never
+    /// reconstructed from the process selector.
+    #[cfg(windows)]
+    pub(super) async fn execute_current_source_process(
+        &self,
+        request: eliot_kernel_service::ProcessExecutionRequest,
+        identity: RequestIdentity,
+        admitted_task_id: eliot_contracts::TaskId,
+    ) -> Result<eliot_kernel_service::ProcessExecutionResponse, KernelClientError> {
+        request
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        identity
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let operation_id = request.operation_id().ok_or_else(|| {
+            KernelClientError::Contract(
+                "current-source process request omitted its operation identity".to_owned(),
+            )
+        })?;
+        let binding = &identity.request;
+        let current = &self.snapshot;
+        if binding.metadata.task_id.as_ref() != Some(&admitted_task_id)
+            || binding.metadata.request_id.as_str() != operation_id.as_str()
+            || binding.state_fence != current.state_fence()
+        {
+            return Err(KernelClientError::Contract(
+                "original request identity does not bind the current process operation and Kernel fence".to_owned(),
+            ));
+        }
+        if let eliot_kernel_service::ProcessExecutionRequest::Start(admission) = &request
+            && (admission.recipient_module_id() != current.service.as_str()
+                || admission.deadline_unix_ms() != identity.deadline_unix_ms
+                || admission.intent().operation_id().as_str() != operation_id.as_str()
+                || !admission
+                    .state_fence()
+                    .authority_epoch()
+                    .is_same_authority(&binding.state_fence.authority_epoch)
+                || admission.state_fence().generation().get()
+                    != binding.state_fence.resource_generation.value())
+        {
+            return Err(KernelClientError::Contract(
+                "original process admission differs from its request identity".to_owned(),
+            ));
+        }
+
+        let value = self
+            .transact_async_with_identity(
+                "execute_current_source_process",
+                serde_json::json!({
+                    "request": request,
+                    "admitted_task_id": admitted_task_id,
+                }),
+                identity,
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|error| KernelClientError::Unknown(error.to_string()))
+    }
+
     #[cfg(windows)]
     pub(super) async fn transact_async_with_identity(
         &self,

@@ -254,6 +254,53 @@ impl ArtifactOwner {
         self.max_read_bytes
     }
 
+    /// Revalidates a source archive against its original S-04 readback. This
+    /// keeps the artifact content address, untrusted reference, accepted
+    /// bytes, and non-mintable read receipt joined to the exact captured
+    /// archive supplied by the Git source owner.
+    pub fn validate_source_readback(
+        &self,
+        reference: &ArtifactReference,
+        artifact: &VerifiedArtifact,
+        receipt: &ArtifactReadReceipt,
+        captured_archive: &[u8],
+    ) -> Result<(), ArtifactError> {
+        reference.validate()?;
+        if captured_archive.len() as u64 > self.max_read_bytes {
+            return Err(ArtifactError::Unsupported {
+                field: "artifact.size_bytes",
+                reason: "source archive exceeds the configured read ceiling",
+            });
+        }
+        if artifact.identity() != &reference.identity
+            || artifact.bytes() != captured_archive
+            || artifact.locator() != &reference.locator
+            || artifact.metadata_sha256() != reference.expected_metadata_sha256
+            || artifact.ready_receipt_id() != reference.expected_ready_receipt_id
+        {
+            return Err(ArtifactError::Corrupted {
+                reason:
+                    "verified source archive does not match its immutable reference or Git capture"
+                        .to_owned(),
+            });
+        }
+        reference.identity.verify_content(captured_archive)?;
+        if receipt.identity_digest != reference.identity.identity_digest()?
+            || receipt.content_digest != reference.identity.content.digest_hex
+            || receipt.locator != reference.locator
+            || receipt.metadata_sha256 != reference.expected_metadata_sha256
+            || receipt.ready_receipt_id != reference.expected_ready_receipt_id
+            || receipt.byte_count != captured_archive.len() as u64
+            || receipt.anchor_fingerprint != artifact.anchor_fingerprint()
+        {
+            return Err(ArtifactError::Corrupted {
+                reason: "original S-04 read receipt does not match the verified source archive"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Reads and verifies one artifact through the injected S-04 adapter.
     pub fn read<'a>(
         &'a self,

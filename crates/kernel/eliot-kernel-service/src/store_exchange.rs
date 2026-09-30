@@ -38,6 +38,7 @@ use eliot_ipc::DeliveryOutcome;
 use eliot_protocol::ProtocolVersion;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
+use eliot_store_api::CausalWriteReceipt;
 use eliot_store_api::LegacyStoreFailureV1;
 use eliot_store_api::OperationId;
 use eliot_store_api::RequestMeta;
@@ -491,6 +492,17 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         operation_id: OperationId,
         expected_canonical_request_hash: &str,
     ) -> Result<WriteReceipt, StoreError> {
+        Ok(self
+            .receipt_exact_with_causal(operation_id, expected_canonical_request_hash)
+            .await?
+            .receipt)
+    }
+
+    pub(crate) async fn receipt_exact_with_causal(
+        &self,
+        operation_id: OperationId,
+        expected_canonical_request_hash: &str,
+    ) -> Result<CausalWriteReceipt, StoreError> {
         let expected = operation_id.clone();
         let expected_hash = expected_canonical_request_hash.to_owned();
         let response = self
@@ -506,14 +518,18 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 },
                 failure => failure.into_store_error(),
             })?;
-        let StoreResponse::Receipt {
-            receipt: Some(receipt),
-        } = response
-        else {
-            return Err(StoreError::UnknownOutcome {
-                operation_id: expected,
-            });
+        let causal_receipt = match response {
+            StoreResponse::ReceiptWithCausal {
+                receipt: Some(receipt),
+                causal: Some(causal),
+            } => CausalWriteReceipt::new(receipt, causal)?,
+            _ => {
+                return Err(StoreError::UnknownOutcome {
+                    operation_id: expected,
+                });
+            }
         };
+        let receipt = causal_receipt.receipt.clone();
         if receipt.operation_id != expected {
             return Err(StoreError::IdentityConflict);
         }
@@ -523,7 +539,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 observed: receipt.canonical_request_hash.clone(),
             });
         }
-        Ok(receipt)
+        Ok(causal_receipt)
     }
 
     fn next_request_id(&self, operation: &str) -> Result<RequestId, StoreClientError> {

@@ -79,6 +79,7 @@ mod kernel_config;
 pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
+mod process_stream_readback;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 mod tool_exposure;
