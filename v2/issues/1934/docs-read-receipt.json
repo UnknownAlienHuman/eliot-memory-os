@@ -1,0 +1,483 @@
+{
+  "attestation_required": true,
+  "bundle_bytes": 162414,
+  "bundle_sha256": "08ff3303704c8f1dbee086ca2c62c80120bccf9324fa899fb8a8876688675bd4",
+  "matched_routes": [
+    "generic-source",
+    "host-kernel",
+    "security-privacy"
+  ],
+  "pair_key": "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1",
+  "paths": [
+    "bins/eliot-kernel/src/host_request_route.rs",
+    "crates/kernel/eliot-ors/src/store.rs"
+  ],
+  "read_receipt_id": "sha256:ed0ae36dcc46746c358b52c1905ab7107ae48797f255b8cbff52f190f669a05b",
+  "required": [
+    {
+      "bytes": 2790,
+      "kind": "file",
+      "path": "AGENTS.md",
+      "sha256": "c0a1322afc3550f343ae61cbc02a52bf623dc40d013887de2a60d245a1a64017"
+    },
+    {
+      "bytes": 8465,
+      "kind": "file",
+      "path": "WORKFLOW.md",
+      "sha256": "ceb5fa3190a88386c6e5a9fd233b5ef1a591a50f243f720036bffa9e6d3f6291"
+    },
+    {
+      "bytes": 4672,
+      "kind": "file",
+      "path": "bins/AGENTS.md",
+      "sha256": "e365a17ecec717656517759853620c949ca12d1aea720a7c60028419327d9e53"
+    },
+    {
+      "bytes": 2122,
+      "kind": "file",
+      "path": "crates/AGENTS.md",
+      "sha256": "91459415c207f25802e4c4182b7b0525ff644c3cc913c7be02032540a325e03f"
+    },
+    {
+      "bytes": 4144,
+      "kind": "file",
+      "path": "crates/kernel/AGENTS.md",
+      "sha256": "b1a3607aed10cb8262672e8f5cd3f750a797d42545be4cfc52eb30fb95da02fe"
+    },
+    {
+      "bytes": 5646,
+      "kind": "file",
+      "path": "docs/ARCHITECTURE_CONTRACT.md",
+      "sha256": "b047585cc9be9abeab7e7699cbbcfe160fa7d88e099611e80f5f7c1ff83d3df7"
+    },
+    {
+      "bytes": 14448,
+      "kind": "file",
+      "path": "docs/DEPENDENCY_POLICY.md",
+      "sha256": "ff3dbfeadc5db7f315df59dc419ae481306b215bf810c43b73571c8d4355742b"
+    },
+    {
+      "bytes": 2611,
+      "kind": "file",
+      "path": "docs/architecture/READING_PROTOCOL.md",
+      "sha256": "253cca0f078acd49545baed814c9319d72659ef1e2428edf1ead789beaa4e1c3"
+    },
+    {
+      "bytes": 2357,
+      "kind": "file",
+      "path": "workstreams/ACTIVE.toml",
+      "sha256": "13fc14e9d197b09256371a704dd02204eda087356602bd32285687e48308cc19"
+    },
+    {
+      "anchors": [
+        "a01-purpose-of-the-architecture"
+      ],
+      "bytes": 1871,
+      "handles": [
+        "A0.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-01-purpose-of-the-architecture.md",
+      "sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750"
+    },
+    {
+      "anchors": [
+        "a02-hierarchy-of-architectural-decisions"
+      ],
+      "bytes": 1867,
+      "handles": [
+        "A0.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-02-hierarchy-of-architectural-decisions.md",
+      "sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5"
+    },
+    {
+      "anchors": [
+        "a03-hard-boundaries"
+      ],
+      "bytes": 821,
+      "handles": [
+        "A0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-03-hard-boundaries.md",
+      "sha256": "695fe5e156e0dde052556e23c34b008009348742d4fc4a1146393b8b13a48bc0"
+    },
+    {
+      "anchors": [
+        "a04-conflict-resolution"
+      ],
+      "bytes": 1318,
+      "handles": [
+        "A0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-04-conflict-resolution.md",
+      "sha256": "732d3b9a63973398e07e48691ba56f6538d9168f3102e0702a5ca2e08910f556"
+    },
+    {
+      "anchors": [
+        "a06-changing-the-architecture"
+      ],
+      "bytes": 858,
+      "handles": [
+        "A0.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-06-changing-the-architecture.md",
+      "sha256": "c086ee01cc243b7d7dee465bc0ddfca0c36cc3a344b3b3e803a5eb94ff6f68a8"
+    },
+    {
+      "anchors": [
+        "a22-roles"
+      ],
+      "bytes": 3258,
+      "handles": [
+        "A2.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A02-02-roles.md",
+      "sha256": "bcfddaf37bc39566bd6c49e868f3ddccc2e2eee5086568b33e6ab7a5e2d7f307"
+    },
+    {
+      "anchors": [
+        "a23-modular-architecture"
+      ],
+      "bytes": 6133,
+      "handles": [
+        "A2.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A02-03-modular-architecture.md",
+      "sha256": "6f7d0566576ddfcb88bae531421b58082b44e3ba6cd2b974f55a46990e26fd52"
+    },
+    {
+      "anchors": [
+        "a104-delegation"
+      ],
+      "bytes": 1980,
+      "handles": [
+        "A10.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A10-04-delegation.md",
+      "sha256": "fd9c93b5e66ea93a0a2bb171706449ca8d07d2d48caeb99d1acdc57360014cd9"
+    },
+    {
+      "anchors": [
+        "a122-principal-session-and-visibility"
+      ],
+      "bytes": 546,
+      "handles": [
+        "A12.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A12-02-principal-session-and-visibility.md",
+      "sha256": "9439239952ca4a5b707301c62e044d207ea7f3414b0c0e28b472dad7ed3ca12b"
+    },
+    {
+      "anchors": [
+        "a12-security-provenance-and-bounded-influence"
+      ],
+      "bytes": 52,
+      "handles": [
+        "A12"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A12-security-provenance-and-bounded-influence.md",
+      "sha256": "07ac2807e9d163981dada2fdcec6bbf3e7d5a78ec54a0bb7eec1c38655f7258d"
+    },
+    {
+      "anchors": [
+        "a132-kernel-and-failure-domains"
+      ],
+      "bytes": 1051,
+      "handles": [
+        "A13.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A13-02-kernel-and-failure-domains.md",
+      "sha256": "cb96f113bfc45e53d16469d1d20dfe5ca0fad65a2e2f92d2e5ed5964990d401c"
+    },
+    {
+      "anchors": [
+        "a148-development-doctrine"
+      ],
+      "bytes": 3740,
+      "handles": [
+        "A14.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A14-08-development-doctrine.md",
+      "sha256": "c7da919cd6112e97780407b7a7ae9806185994c2de6a275ed2449cb1b9ca78bb"
+    },
+    {
+      "anchors": [
+        "i03-decision-sources"
+      ],
+      "bytes": 1265,
+      "handles": [
+        "I0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-03-decision-sources.md",
+      "sha256": "c5d7586399d8640484edaa3cb949495bc99a82b50dabddac029b2d08c2d716e8"
+    },
+    {
+      "anchors": [
+        "i04-change-classes"
+      ],
+      "bytes": 3252,
+      "handles": [
+        "I0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-04-change-classes.md",
+      "sha256": "3c1fc91d692bee9494327b7f5375fbe45cddc00c27d5a0bf0dc3b40300a2ae45"
+    },
+    {
+      "anchors": [
+        "i05-conformance-support-and-evidence-status"
+      ],
+      "bytes": 6368,
+      "handles": [
+        "I0.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-05-conformance-support-and-evidence-status.md",
+      "sha256": "bfb599eb462ebfb904ec97ba199a8447371bce91ab73b7bad9e71f150cb837f9"
+    },
+    {
+      "anchors": [
+        "i013-current-support-conformance-and-product-status"
+      ],
+      "bytes": 996,
+      "handles": [
+        "I0.13"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-13-current-support-conformance-and-product-status.md",
+      "sha256": "2d691986e973b4c9191cf5718f32b5035a8470b8355c5d82489df48c18651d2e"
+    },
+    {
+      "anchors": [
+        "i014-documentation-and-evidence-build-integrity"
+      ],
+      "bytes": 3413,
+      "handles": [
+        "I0.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-14-documentation-and-evidence-build-integrity.md",
+      "sha256": "e645a72c291c89a4bc3e2eae99527aa2476dcfab0280e429df80405dbebe3fd9"
+    },
+    {
+      "anchors": [
+        "i11-process-principle"
+      ],
+      "bytes": 437,
+      "handles": [
+        "I1.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I01-01-process-principle.md",
+      "sha256": "4317489fcdaca1646c14643b24ca2979005e2dffa9cf6d607f308492906c8fac"
+    },
+    {
+      "anchors": [
+        "i12-required-processes-of-the-first-complete-runtime"
+      ],
+      "bytes": 4559,
+      "handles": [
+        "I1.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+      "sha256": "ab9e7152dbcc8fd5738b6426dcfcf5472b893a48e096d0048c36ddb59a712a5e"
+    },
+    {
+      "anchors": [
+        "i13-optional-and-on-demand-processes"
+      ],
+      "bytes": 8467,
+      "handles": [
+        "I1.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I01-03-optional-and-on-demand-processes.md",
+      "sha256": "8502f0dad059c66fcb89aab569f41e9fc795ba895a99b9f4e3883e6ce2b966fb"
+    },
+    {
+      "anchors": [
+        "i14-supervision-tree"
+      ],
+      "bytes": 4934,
+      "handles": [
+        "I1.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I01-04-supervision-tree.md",
+      "sha256": "caaea7856f56ccd9b61f529bf381e3c20609926a726c7de2d86c8ac642dad9a2"
+    },
+    {
+      "anchors": [
+        "i15-demand-start-observable-use-supervision-and-idle-shutdown"
+      ],
+      "bytes": 12256,
+      "handles": [
+        "I1.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I01-05-demand-start-observable-use-supervision-and-idle-shutdown.md",
+      "sha256": "bcc3ab6da709b3ff368514c4b9d95e44ca15ea5ff9911b63ff43a5b20b9964c1"
+    },
+    {
+      "anchors": [
+        "i16-windows-isolation"
+      ],
+      "bytes": 1896,
+      "handles": [
+        "I1.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I01-06-windows-isolation.md",
+      "sha256": "a8d3e6de32fa52c62ca665de8b4ffa96557fc65e0da06bf3eaa04638c145a83a"
+    },
+    {
+      "anchors": [
+        "i17-linux-portability-boundary"
+      ],
+      "bytes": 758,
+      "handles": [
+        "I1.7"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I01-07-linux-portability-boundary.md",
+      "sha256": "a27c53f9eac878809da43276ef45552f9756e9a8176c8ead562421115c8a4c14"
+    },
+    {
+      "anchors": [
+        "i18-exact-ownership-and-call-paths"
+      ],
+      "bytes": 3472,
+      "handles": [
+        "I1.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+      "sha256": "9585782187e155a239911388a0ed5ca489b9e8808cd95b159dcaf7fa71bedf28"
+    },
+    {
+      "anchors": [
+        "i217-parallel-agent-development-contract"
+      ],
+      "bytes": 1834,
+      "handles": [
+        "I2.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-17-parallel-agent-development-contract.md",
+      "sha256": "6c333908b112859dbffe00c04a9e942b38c5d369a85d89d78788ab576a1d7cb1"
+    },
+    {
+      "anchors": [
+        "i220-module-contract-kit-crate-context-capsule-and-module-test-capsule"
+      ],
+      "bytes": 5497,
+      "handles": [
+        "I2.20"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+      "sha256": "8a5d8276f2e1357eb58dd06acc7e5ac4017a4515048a5049c84e33849c381ef5"
+    },
+    {
+      "anchors": [
+        "i55-write-envelope"
+      ],
+      "bytes": 3403,
+      "handles": [
+        "I5.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I05-05-write-envelope.md",
+      "sha256": "fecc4f8b15d18926c697fcfacbf83b952a39f99465c30c9b034a9da5a139fd76"
+    },
+    {
+      "anchors": [
+        "i526-derived-disclosure-and-observation-domain-closure"
+      ],
+      "bytes": 5402,
+      "handles": [
+        "I5.26"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I05-26-derived-disclosure-and-observation-domain-closure.md",
+      "sha256": "1d3c3bc0ca89c15a65d16909d5ba953e0ba3f82fa220f1c439d3a129d5ec26bb"
+    },
+    {
+      "anchors": [
+        "i615-capability-grant-lineage-introductions-and-resource-facets"
+      ],
+      "bytes": 9590,
+      "handles": [
+        "I6.15"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md",
+      "sha256": "e92d12a6e0d9f0fe0c627bb5445fa341c4a775802a5f4e9a2667ed1844346efc"
+    },
+    {
+      "anchors": [
+        "i1414-module-hot-replacement"
+      ],
+      "bytes": 4405,
+      "handles": [
+        "I14.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I14-14-module-hot-replacement.md",
+      "sha256": "6df1f51b37bbf6da8cc61177ea21e8261a5a256a331ace7c8433811fc8e3f196"
+    },
+    {
+      "anchors": [
+        "i15-security-and-bypass-resistance"
+      ],
+      "bytes": 39,
+      "handles": [
+        "I15"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I15-security-and-bypass-resistance.md",
+      "sha256": "c4b9877ee0f83ad816b8fd21842ee753ad0a63eb088a0c53e6ef8ffe5995f525"
+    },
+    {
+      "anchors": [
+        "i1617-instrument-plane-observability"
+      ],
+      "bytes": 1294,
+      "handles": [
+        "I16.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I16-17-instrument-plane-observability.md",
+      "sha256": "d2fd3980a440f1fae1b8b2edddefd601bafd4230ad3b4d6f832b57053bc673b9"
+    },
+    {
+      "anchors": [
+        "i18-testing-and-instrumental-grounding-strategy"
+      ],
+      "bytes": 52,
+      "handles": [
+        "I18"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I18-testing-and-instrumental-grounding-strategy.md",
+      "sha256": "facd29dfe4a6fdb98a70f5a5decb7d960f8ca95419924828a44596c57940fb10"
+    }
+  ],
+  "route_receipt_id": "sha256:f55e2c5c9eff7934b3c9147ebfe66dab068615922280c5b74dafdb5b1fda69eb",
+  "schema_version": "eliot-doc-read-v1",
+  "topic": "bridge-event privacy verdict resolved through retained WorkScope owner binding"
+}
