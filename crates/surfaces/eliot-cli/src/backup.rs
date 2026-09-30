@@ -2944,7 +2944,9 @@ pub fn backup_restore_test(
         // owner field is echoed, so the floor here is never the one an operator
         // reads — it exists only so this value is well-defined on the path that
         // refuses.
-        proof_level: claim.map_or(BackupStage::Requested, |claim| claim.stage),
+        proof_level: claim
+            .as_ref()
+            .map_or(BackupStage::Requested, |claim| claim.stage),
         // A rehearsal proves no archive VERIFICATION level, no class ceiling, no
         // capture receipt and no archived-fence relation, whatever the restore
         // receipt says: those three are the capture and verify owners' fields,
@@ -3262,7 +3264,10 @@ fn restore_test_claim(
     // so the caller renders it through the module's one refusal shape.
     let rehearsed_band = rehearsed
         .map(|evidence| {
-            rehearsal_ceiling(evidence.receipt.evidence_level, evidence.receipt.receipt_id)
+            rehearsal_ceiling(
+                evidence.receipt.evidence_level,
+                &evidence.receipt.receipt_id,
+            )
         })
         .transpose()
         .map_err(RestoreTestClaimFailure::Unproven)?;
