@@ -2190,7 +2190,7 @@ impl DaemonComposition {
         reason = "the W1 seam keeps one original admitted request on-stack across launch, live capture, publication, and canonical commit"
     )]
     pub async fn invoke_lsp_capture_w1<G, C, F>(
-        &self,
+        &mut self,
         kernel: &DaemonKernelClient,
         invocation: LiveLspCaptureInvocation<'_, G, C>,
     ) -> Result<CapturedLspW1Outcome, CapturedLspAdoptionError>

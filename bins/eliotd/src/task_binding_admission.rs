@@ -2429,7 +2429,8 @@ pub fn admit_lsp_capture_from_owner(
         .request
         .metadata
         .task_id
-        .as_deref()
+        .as_ref()
+        .map(TaskId::as_str)
         .ok_or_else(|| {
             TaskBindingError::selection_required(
                 "task-bound LSP capture requires the original request Task",
@@ -2522,7 +2523,7 @@ pub(crate) fn validate_lsp_capture_source_admission(
         ))
     })?;
     let metadata = &identity.request.metadata;
-    let Some(request_task) = metadata.task_id.as_deref() else {
+    let Some(request_task) = metadata.task_id.as_ref().map(TaskId::as_str) else {
         return Err(TaskBindingError::selection_required(
             "task-bound LSP capture requires the original request Task",
         ));
@@ -2570,7 +2571,7 @@ fn validate_lsp_capture_owner_join(
         ))
     })?;
     let metadata = &identity.request.metadata;
-    let Some(request_task) = metadata.task_id.as_deref() else {
+    let Some(request_task) = metadata.task_id.as_ref().map(TaskId::as_str) else {
         return Err(TaskBindingError::selection_required(
             "task-bound LSP capture requires the original request Task",
         ));
