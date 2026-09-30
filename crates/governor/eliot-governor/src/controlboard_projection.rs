@@ -43,15 +43,21 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_coordination::{
     AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding,
 };
+use eliot_evaluation_contracts::HumanAttentionEvaluation;
 use eliot_observation::ObservationJournal;
 use eliot_store_api::ScopeRevisionView;
 use eliot_task::TaskLifecycleOwner;
 use serde::Serialize;
 use thiserror::Error;
+
+use crate::attention_evaluation_commit::{
+    AttentionEvaluationValidity, AttentionUnknownSummary, attention_evaluation_validity,
+    attention_unknown_summary,
+};
 
 /// Fail-closed errors for `ControlBoard` projection assembly.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -319,6 +325,112 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
                 .collect(),
         })
         .collect()
+}
+
+/// One persisted Human-attention-evaluation revision as the `ControlBoard`
+/// read projection serves it (issue #1784 W5 readback half).
+///
+/// The row reproduces the persisted record's identity, window, validity, and
+/// observed/unknown/not-applicable counts, and only the evidence references
+/// the record's own manifest binds. It carries no aggregate score, no
+/// superiority badge, no visibility or privacy fact, and no Problem,
+/// approval, or policy outcome: an evaluation result neither resolves a
+/// Problem nor grants an approval nor changes policy (I11.2), and a quieter
+/// profile is shown alongside its missed-risk, harm, and false-block/task
+/// costs rather than as an automatic positive (I11.7). A stale or invalidated
+/// revision is visibly unusable for current tuning through
+/// `unusable_for_current_tuning`; suppressing a notification never removes its
+/// persistent obligation, which lives with the notification owner, not here.
+/// Unknowns render as unknown counts from the read-back bytes — a prevented
+/// action with no observed harm is not a false alarm, and missing follow-up
+/// is not zero harm — because the persist leg re-proves the digest over the
+/// exact producer bytes instead of substituting defaults.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardAttentionEvaluationRow {
+    /// Evaluation identity this revision belongs to.
+    pub evaluation_id: String,
+    /// Monotonic revision within the evaluation, starting at one.
+    pub revision: u64,
+    /// Observation window the record binds.
+    pub window_id: String,
+    /// Current-applicability verdict at the supplied observation instant.
+    pub validity: AttentionEvaluationValidity,
+    /// Per-group observed/unknown/not-applicable counts; denominators for
+    /// display, never ranking inputs.
+    pub summary: AttentionUnknownSummary,
+    /// Manifest-bound evidence references, exactly as persisted.
+    pub evidence_refs: Vec<String>,
+    /// True unless the revision is currently valid: expired and invalidated
+    /// revisions are retained for history but unusable for current tuning.
+    pub unusable_for_current_tuning: bool,
+}
+
+/// Projects one persisted evaluation revision into its board row.
+///
+/// The record is re-validated structurally; validity is evaluated against the
+/// caller-supplied observation instant so unknown expiry timing never
+/// silently passes. The join invents no visibility, privacy, role, score, or
+/// lifecycle fact.
+pub fn project_attention_evaluation_row(
+    record: &HumanAttentionEvaluation,
+    observed_now_ms: Option<i64>,
+) -> Result<ControlBoardAttentionEvaluationRow, ControlBoardProjectionError> {
+    record
+        .validate()
+        .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
+    let validity = attention_evaluation_validity(record, observed_now_ms);
+    let unusable_for_current_tuning = validity != AttentionEvaluationValidity::Current;
+    Ok(ControlBoardAttentionEvaluationRow {
+        evaluation_id: record.evaluation_id.as_str().to_owned(),
+        revision: record.revision,
+        window_id: record
+            .observation_window
+            .specification
+            .window_id
+            .as_str()
+            .to_owned(),
+        validity,
+        summary: attention_unknown_summary(record),
+        evidence_refs: record
+            .evidence_manifest
+            .evidence_refs
+            .iter()
+            .map(ArtifactId::to_string)
+            .collect(),
+        unusable_for_current_tuning,
+    })
+}
+
+/// Authorizes one evidence-expansion request against the persisted manifest.
+///
+/// Every requested reference must be listed in the record's own evidence
+/// manifest; a foreign reference fails the whole expansion rather than
+/// serving a partial grant. The check is re-evaluated per call against the
+/// presented record and never widens into a cached grant.
+pub fn expand_attention_evidence(
+    record: &HumanAttentionEvaluation,
+    requested: &[ArtifactId],
+) -> Result<Vec<ArtifactId>, ControlBoardProjectionError> {
+    record
+        .validate()
+        .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
+    let mut granted = Vec::with_capacity(requested.len());
+    for candidate in requested {
+        if !record
+            .evidence_manifest
+            .evidence_refs
+            .iter()
+            .any(|bound| bound == candidate)
+        {
+            return Err(ControlBoardProjectionError::Owner(format!(
+                "attention evaluation evidence expansion refused for foreign reference {candidate}"
+            )));
+        }
+        if !granted.contains(candidate) {
+            granted.push(candidate.clone());
+        }
+    }
+    Ok(granted)
 }
 
 #[cfg(test)]
