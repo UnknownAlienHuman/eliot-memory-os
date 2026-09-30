@@ -12,6 +12,11 @@ param(
     [switch]$PlanOnly,
     [ValidateSet('legacy', 'agent-bridge')]
     [string]$ClaudeCodeFrontDoor = 'legacy',
+    # Issue #18 W11: explicit absolute path to the installation-owned
+    # agent-bridge client declaration (client-declaration-v2.json). Empty is
+    # absence, never a default: without it the delegated MCP edges fail
+    # closed at launch, and the bundle never invents the file.
+    [string]$AgentBridgeClientDeclaration = '',
     [switch]$PlanRetiredGovernor,
     [Alias('VerifyBundle')]
     [string]$BuilderVerifyBundle,
@@ -1136,6 +1141,51 @@ function Get-FrontDoorBridgePlan([object]$Metadata, [string]$Selection) {
     return $entry
 }
 
+function Get-FrontDoorDeclarationPlan([string]$InputPath, [string]$Selection) {
+    # Issue #18 W11: declaration provisioning for the delegated MCP edges.
+    # crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge resolves
+    # agent-bridge/client-declaration-v2.json beside the launched Governor and
+    # fails closed when it is absent; the Bridge re-validates its digest plus
+    # the live Kernel challenge before serving. The declaration is
+    # installation-owned (docs/integrations/claude/CLAUDE_CODE_PLUGIN.md): the
+    # bundle never invents it, so it arrives only through the explicit
+    # -AgentBridgeClientDeclaration absolute input. There is no environment
+    # selection, no default path, and no directory search. Empty input is
+    # absence: the delegated edges keep failing closed at launch. Supplying it
+    # under any other front-door selection throws: legacy keeps today's set
+    # unchanged, and the declaration stages only beside the delegated command.
+    if ([string]::IsNullOrWhiteSpace($InputPath)) {
+        return [pscustomobject]@{
+            supplied = $false
+            provisioned = $false
+            staged_path = $null
+            source = $null
+            sha256 = $null
+            bytes = [int64]0
+        }
+    }
+    if ($Selection -cne 'agent-bridge') {
+        throw 'the agent-bridge client declaration is provisioned only with -ClaudeCodeFrontDoor agent-bridge; legacy keeps today''s set unchanged'
+    }
+    $evidence = Read-VerifiedResidentFile $InputPath 'installation-owned agent-bridge client declaration'
+    if ([int64]$evidence.length -le 0) {
+        throw 'the installation-owned agent-bridge client declaration is empty'
+    }
+    try {
+        [void]([System.Text.Encoding]::UTF8.GetString($evidence.bytes) | ConvertFrom-Json)
+    }
+    catch {
+        throw 'the installation-owned agent-bridge client declaration is not well-formed JSON'
+    }
+    return [pscustomobject]@{
+        supplied = $true
+        provisioned = $true
+        staged_path = 'agent-bridge/client-declaration-v2.json'
+        source = [string]$evidence.path
+        sha256 = [string]$evidence.sha256
+        bytes = [int64]$evidence.length
+    }
+}
 function Get-VerifiedRuntimeArtifacts([object[]]$Plan, [string]$Version) {
     $artifacts = foreach ($entry in @($Plan)) {
         if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) {
@@ -2985,7 +3035,7 @@ function Assert-ClosedCodeBearingPayload([string]$BundlePath, [object[]]$Signing
 # below invoke that slice with the repository root, pinned source commit,
 # staged bundle root, and staged Bridge record.
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [object]$FrontDoorDeclaration, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -3070,6 +3120,18 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             generation = $SourceCommit
             proof_ceiling = 'unsigned-build-evidence (Claude Code front-door selection; signing scope is Part B)'
             gate = '#1719-claude-front-door plus #1858 unconditional cutover (GATED: provisioned Bridge serves the three delegated hosts; every legacy entrypoint and non-delegated host refuses unconditionally with no ambient operator flag)'
+        }
+    }
+    }
+    if ($FrontDoorDeclaration) {
+        $entries += [ordered]@{
+            path = 'agent-bridge/client-declaration-v2.json'
+            selection = 'caller-supplied absolute installation-owned declaration bound to the release plan, staged at the bundle-root sibling layout the facade delegation resolves'
+            owner = 'installation owner (operator-supplied input; the bundle never invents it)'
+            install_destination = './agent-bridge/'
+            generation = $SourceCommit
+            proof_ceiling = 'unsigned-build-evidence (plan-bound digest; the Bridge re-validates the declaration digest plus the live Kernel challenge before serving)'
+            gate = '#18-delegated-edge-provisioning (GATED: staged only with -ClaudeCodeFrontDoor agent-bridge plus an explicit -AgentBridgeClientDeclaration input; absence keeps the delegated edges fail-closed)'
         }
     }
     $entries += [ordered]@{
@@ -3977,6 +4039,7 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
 }
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
 $frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDoor
+$frontDoorDeclarationPlan = Get-FrontDoorDeclarationPlan $AgentBridgeClientDeclaration $ClaudeCodeFrontDoor
 # Issue #2968: the retirement decision is resolved BEFORE any bundle content
 # is decided, and only from an explicit detached approval input. The input is
 # the only caller-supplied retirement artifact; the trust root is one exact
@@ -4099,6 +4162,12 @@ $plan = [ordered]@{
         bridge_argv = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '<installation-absolute>/agent-bridge/client-declaration-v2.json')
         bridge_path = [string]$frontDoorBridgePlan.path
         bridge_provisioned = [bool]$frontDoorBridgePlan.provisioned
+        declaration_path = [string]$frontDoorDeclarationPlan.staged_path
+        declaration_supplied = [bool]$frontDoorDeclarationPlan.supplied
+        declaration_provisioned = [bool]$frontDoorDeclarationPlan.provisioned
+        declaration_source = [string]$frontDoorDeclarationPlan.source
+        declaration_sha256 = [string]$frontDoorDeclarationPlan.sha256
+        declaration_bytes = [int64]$frontDoorDeclarationPlan.bytes
         other_hosts = if ($legacyGovernorPresent) {
             'source-declared unconditional cutover owned by #1858: MCP stdio --host claude, claude-desktop and opencode at the default profile always redirect to the approved Bridge with no ambient operator flag; MCP stdio for any other host/profile (including codex codex_controller, whose behavior home is the eliot-mcp track) always returns structured ERROR before legacy mcp stdio, and every non-stdio legacy arm always refuses before its handler. ELIOT_CLAUDE_FRONT_DOOR survives only as refusal evidence. Source configs do not declare the flag and effective inherited values are NOT_OBSERVED.'
         }
@@ -4337,6 +4406,7 @@ try {
         throw "release governor executable is missing: $governor"
     }
     $frontDoorBridge = [string]$frontDoorBridgePlan.path
+    $frontDoorDeclarationStaged = $null
     $frontDoorBridgeStaged = $null
     if ($frontDoorBridgePlan.provisioned) {
         if (-not (Test-Path -LiteralPath $frontDoorBridge -PathType Leaf)) {
@@ -4402,6 +4472,31 @@ try {
     }
     if ($frontDoorBridgeStaged) {
         Copy-Item -LiteralPath $frontDoorBridge -Destination (Join-Path $bundle 'eliot-agent-bridge.exe')
+    if ([bool]$frontDoorDeclarationPlan.provisioned) {
+        # Issue #18 W11: stage the installation-owned client declaration at
+        # exactly the bundle-root sibling layout the facade delegation
+        # resolves (exe_dir/agent-bridge/client-declaration-v2.json). The
+        # bytes are the operator-supplied input verified above, never
+        # generated: CreateNew refuses to replace an existing file, and the
+        # staged digest is re-verified against the plan binding below.
+        $declarationEvidence = Read-VerifiedResidentFile ([string]$frontDoorDeclarationPlan.source) 'installation-owned agent-bridge client declaration for staging'
+        if ($declarationEvidence.sha256 -cne [string]$frontDoorDeclarationPlan.sha256 -or
+            [int64]$declarationEvidence.length -ne [int64]$frontDoorDeclarationPlan.bytes) {
+            throw 'installation-owned agent-bridge client declaration changed between plan and stage'
+        }
+        $stagedDeclarationPath = Join-Path $bundle 'agent-bridge/client-declaration-v2.json'
+        $writtenDeclaration = Write-VerifiedResidentFile $stagedDeclarationPath $declarationEvidence.bytes 'staged agent-bridge client declaration'
+        if ($writtenDeclaration.sha256 -cne [string]$frontDoorDeclarationPlan.sha256 -or
+            [int64]$writtenDeclaration.length -ne [int64]$frontDoorDeclarationPlan.bytes) {
+            throw 'staged agent-bridge client declaration changed while being copied'
+        }
+        $frontDoorDeclarationStaged = [ordered]@{
+            path = 'agent-bridge/client-declaration-v2.json'
+            source = 'caller-supplied absolute installation-owned declaration bound to the release plan'
+            sha256 = [string]$writtenDeclaration.sha256
+            bytes = [int64]$writtenDeclaration.length
+        }
+    }
     }
     $runtimeRoot = Join-Path $bundle 'runtime'
     New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
@@ -4621,6 +4716,11 @@ try {
             bridge_provisioned = [bool]$frontDoorBridgeStaged
             bridge_sha256 = if ($frontDoorBridgeStaged) { [string]$frontDoorBridgeStaged.sha256 } else { $null }
             bridge_bytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { $null }
+            declaration_path = if ($frontDoorDeclarationStaged) { [string]$frontDoorDeclarationStaged.path } else { $null }
+            declaration_provisioned = [bool]$frontDoorDeclarationStaged
+            declaration_sha256 = if ($frontDoorDeclarationStaged) { [string]$frontDoorDeclarationStaged.sha256 } else { $null }
+            declaration_bytes = if ($frontDoorDeclarationStaged) { [int64]$frontDoorDeclarationStaged.bytes } else { $null }
+            declaration_source = if ($frontDoorDeclarationStaged) { [string]$frontDoorDeclarationPlan.source } else { $null }
             legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(Get-LegacyEntrypointDispositions $repo $sourceCommit $bundle $frontDoorBridgeStaged) }
             else {
                 @(
