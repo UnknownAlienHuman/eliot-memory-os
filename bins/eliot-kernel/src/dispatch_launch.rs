@@ -3830,6 +3830,8 @@ pub(crate) fn native_worker_process_start_binding(
             "retained native worker admission receipt is invalid".to_owned(),
         )
     })?;
+    validate_native_worker_launch_binding(&request, claim_receipt.admitted_at_unix_ms)
+        .map_err(|reason| DispatchLaunchError::Inconsistent(reason.to_owned()))?;
     process_receipt.validate().map_err(|_| {
         DispatchLaunchError::Inconsistent(
             "retained native worker process receipt is invalid".to_owned(),
@@ -3858,8 +3860,6 @@ pub(crate) fn native_worker_process_start_binding(
         || process.executable_sha256() != request.worker_artifact_digest.as_str()
         || process_receipt.operation_id().as_str() != retained.operation_id.as_str()
         || executable_binding.launch_nonce != retained.nonce
-        || executable_binding.capability_cell.as_str().is_empty()
-        || executable_binding.capability_cell_registry_digest.len() != 64
     {
         return Err(DispatchLaunchError::Inconsistent(
             "retained native worker process does not bind the exact admitted cell claim".to_owned(),
@@ -4898,6 +4898,50 @@ struct NativeWorkerLaunchAttempt {
     material_path: PathBuf,
 }
 
+/// Requires a live executable join to the Kernel's independently compiled
+/// #13 capability-cell registry before the claim can cross the process-start
+/// boundary. The claim envelope itself is owner-produced; Kernel only joins
+/// its cell, facet, config, epoch, generation, fence, and deadline to the
+/// exact values it can independently observe here.
+fn validate_native_worker_launch_binding(
+    request: &NativeWorkerClaimRequest,
+    now_unix_ms: u64,
+) -> Result<(), &'static str> {
+    if request.wire_version != NativeWorkerClaimRequest::CONTRACT_VERSION {
+        return Err("legacy native-worker claims cannot authorize process launch");
+    }
+    let binding = request
+        .executable_binding
+        .as_ref()
+        .ok_or("native-worker launch requires an owner executable binding")?;
+    if now_unix_ms == 0
+        || now_unix_ms >= request.deadline_unix_ms
+        || now_unix_ms >= binding.expires_at_unix_ms
+        || binding.config_digest.as_str() != request.worker_config_digest.as_str()
+        || !binding.authority_epoch.is_same_authority(&request.authority_epoch)
+        || binding.generation.value() != request.worker_generation
+        || binding.state_fence != request.state_fence
+        || binding.deadline_unix_ms != request.deadline_unix_ms
+    {
+        return Err("native-worker executable binding does not join the live claim");
+    }
+
+    let expected_facet = eliot_contracts::native_worker_resource_facet_v1()
+        .and_then(|facet| facet.canonical_ref())
+        .map_err(|_| "native-worker resource facet is unavailable")?;
+    if binding.facet_manifest_ref.as_str() != expected_facet.as_str() {
+        return Err("native-worker claim names a different capability facet");
+    }
+
+    let current_registry_digest = super::composition_bootstrap::native_worker_cell_registry_digest(
+        &binding.capability_cell,
+    )?;
+    if binding.capability_cell_registry_digest.as_str() != current_registry_digest {
+        return Err("native-worker claim does not bind the current #13 cell registry");
+    }
+    Ok(())
+}
+
 /// Admits one native-worker claim and prepares its launch: nonce-bound
 /// material written to the protected dispatch file, ready to spawn.
 ///
@@ -4944,6 +4988,14 @@ pub fn prepare_native_worker_launch(
         .request
         .validate_canonical_digest()
         .map_err(gate_error)?;
+    let now_unix_ms = now_unix_nanos / 1_000_000;
+    if now_unix_ms == 0 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "admission time must be non-zero milliseconds".to_owned(),
+        ));
+    }
+    validate_native_worker_launch_binding(material.request, now_unix_ms)
+        .map_err(|reason| DispatchLaunchError::Gate(reason.to_owned()))?;
     if material.request.worker_artifact_digest != material.executable_sha256 {
         return Err(DispatchLaunchError::InvalidMaterial(
             "composition-pinned native worker executable does not match the claim artifact digest"
@@ -4953,12 +5005,6 @@ pub fn prepare_native_worker_launch(
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
-    let now_unix_ms = now_unix_nanos / 1_000_000;
-    if now_unix_ms == 0 {
-        return Err(DispatchLaunchError::InvalidMaterial(
-            "admission time must be non-zero milliseconds".to_owned(),
-        ));
-    }
     let (authority_epoch, generation, response) = {
         let service = kernel
             .service
@@ -6298,23 +6344,38 @@ mod tests {
         let invocation_digest = native_test_invocation_digest(claim_id, operation_id);
         let owner_digest =
             native_test_owner_digest(claim_id, operation_id, nonce, &invocation_digest);
+        let capability_cell = eliot_contracts::CapabilityCellId::new("native-worker-core")
+            .expect("cell id");
+        let capability_cell_registry_digest =
+            super::composition_bootstrap::native_worker_cell_registry_digest(&capability_cell)
+                .expect("current #13 capability-cell registry")
+                .to_owned();
         eliot_kernel_service::NativeWorkerExecutableBinding {
             route_ref: "route://test/full-canonical-route".to_owned(),
             adapter_id: "adapter-test".to_owned(),
             adapter_revision: 3,
             config_digest: "b".repeat(64),
-            facet_manifest_ref: "facet-manifest-7".to_owned(),
-            capability_cell: eliot_contracts::CapabilityCellId::new("native-worker-core")
-                .expect("cell id"),
+            facet_manifest_ref: eliot_contracts::native_worker_resource_facet_v1()
+                .and_then(|facet| facet.canonical_ref())
+                .expect("canonical native-worker facet"),
+            capability_cell,
             grant_graph_revision: 5,
             module_catalog_revision: 7,
+            capability_cell_registry_digest,
+            kernel_execution_manifest_digest: "c".repeat(64),
+            job_object_lineage_ref: "job-lineage-1".to_owned(),
+            resource_limits_digest: "d".repeat(64),
+            cancellation_policy_ref: "cancel-1".to_owned(),
+            checkpoint_policy_digest: "e".repeat(64),
+            drain_policy_ref: "drain-1".to_owned(),
+            restart_policy_digest: "f".repeat(64),
             replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
             launch_nonce: nonce.to_owned(),
             process_invocation_digest: invocation_digest,
             authority_epoch: test_epoch(1),
             generation: ResourceGeneration::genesis(),
             state_fence: native_live_fence(),
-            deadline_unix_ms: 1_750_000_100_000,
+            deadline_unix_ms: 1_750_000_120_000,
             expires_at_unix_ms: 1_750_000_200_000,
             executable_wire_version:
                 eliot_kernel_service::NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
