@@ -176,6 +176,20 @@ impl KernelComposition {
                 finish_attempt: LocalReadAttemptState::default(),
             });
         }
+        // Issue #1745 R7 persistence tail: same dispatch-owned exposure
+        // evidence as the query/skill lane, from the packet admission owner.
+        // Fresh staging only — replays return early above — so the recorded
+        // original is reconciled, never duplicated. Best-effort like every
+        // observation: a populate failure is terminal-visible but never
+        // changes the staged admission.
+        match crate::tool_exposure::dispatch_exposure_draft(envelope, tool, &admission) {
+            Ok(draft) => {
+                self.audit_observe(draft);
+            }
+            Err(_) => crate::kernel_diagnostics::observe_terminal_error(
+                crate::kernel_audit::KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+            ),
+        }
         Ok(())
     }
 

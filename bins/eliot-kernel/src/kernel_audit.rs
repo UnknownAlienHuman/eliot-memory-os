@@ -432,6 +432,20 @@ impl AuditEventKind {
     pub const RECEIPT_ADMISSION_ISSUED: &'static str = "receipt.admission_issued";
     /// The durable eliotd live receipt was published.
     pub const RECEIPT_LIVE_PUBLISHED: &'static str = "receipt.live_published";
+    /// Dispatch-seam exposure evidence was recorded for one freshly staged
+    /// pair (issue #1745, R7 persistence tail).
+    ///
+    /// Body schema (digest/identity/boolean-only, I15.4): the admitted tool
+    /// name, the admission-derived route fingerprint, the dispatch-owned
+    /// eligible/selected facts in the receipt-contract fact shape
+    /// (`{observed, source_ref}`), the surface identity, explicit-null
+    /// turn/run/attempt identities and non-owned stages (explicitly
+    /// unresolved unknown owned elsewhere — never `false`, never inferred),
+    /// the entry contract version the populated stages conform to, and the
+    /// idempotency key (`operation_id:request_digest`) the replay join
+    /// dedupes on. A replayed staging emits no new draft: the recorded
+    /// original stands and the replay reconciles against it.
+    pub const RECEIPT_EXPOSURE_RECORDED: &'static str = "receipt.exposure_recorded";
     /// A typed cancellation was requested for its exact parent.
     pub const CANCEL_REQUESTED: &'static str = "cancel.requested";
     /// A cancellation reached its exact parent: cancelled, fenced to
@@ -513,6 +527,7 @@ impl AuditEventKind {
         Self::DEFER_CLAIM_DEFERRED,
         Self::RECEIPT_ADMISSION_ISSUED,
         Self::RECEIPT_LIVE_PUBLISHED,
+        Self::RECEIPT_EXPOSURE_RECORDED,
         Self::CANCEL_REQUESTED,
         Self::CANCEL_CONFIRMED,
         Self::ORPHAN_QUEUE_RETIRED,
@@ -1922,6 +1937,26 @@ impl AuditEventDraft {
                 "supervision_lease_id": supervision_lease_id,
                 "request_digest": process.request_digest(),
             }),
+        }
+    }
+
+    /// Returns the dispatch-seam exposure draft for one freshly staged pair.
+    ///
+    /// The body arrives prebuilt from the dispatch seam; this entry fills
+    /// envelope lineage only and never interprets exposure semantics. The
+    /// body carries digest/identity/boolean-only evidence (I15.4) plus the
+    /// idempotency key the replay join dedupes on.
+    #[must_use]
+    pub fn receipt_exposure_recorded(
+        envelope: &HostRequestEnvelope,
+        body: serde_json::Value,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        Self {
+            kind: AuditEventKind::RECEIPT_EXPOSURE_RECORDED,
+            lineage,
+            body,
         }
     }
 
