@@ -952,7 +952,7 @@ impl CanaryRemovalOperation {
                 }
             }
         }
-        let expected = if unknown > 0 {
+        if unknown > 0 {
             CanaryRemovalStage::Reconciling
         } else if open == 0 {
             CanaryRemovalStage::Completed
@@ -960,8 +960,7 @@ impl CanaryRemovalOperation {
             CanaryRemovalStage::Executing
         } else {
             CanaryRemovalStage::Admitted
-        };
-        expected
+        }
     }
 
     fn project(&self) -> CanaryRemovalStatus {
