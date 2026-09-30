@@ -621,7 +621,7 @@ impl ObservationIngressPolicyBinding {
     }
 
     /// Stable opaque domain identity derived from the actual setting record
-/// and the independently current `WorkScope` identity.
+    /// and the independently current `WorkScope` identity.
     #[must_use]
     pub fn privacy_domain_ref(&self, work_scope_ref: &str) -> String {
         format!("{}/domain/{work_scope_ref}", self.setting_record_ref())
@@ -775,8 +775,9 @@ impl McpObservationCompletion {
     /// successful canonical-write lineage claim.
     pub fn semantic_receipt_ref(&self) -> Result<&str, CompositionError> {
         let receipt = match self {
-            Self::Committed { receipt, .. }
-            | Self::CommittedWithStaleContext { receipt, .. } => receipt,
+            Self::Committed { receipt, .. } | Self::CommittedWithStaleContext { receipt, .. } => {
+                receipt
+            }
         };
         let envelope = receipt
             .require_reconciliation_envelope()
@@ -839,8 +840,8 @@ fn mcp_observation_envelope(
     expected_ordering_sequence: u64,
     task_selection: Option<&TaskSelectionAdmissionBinding>,
 ) -> Result<CanonicalWriteEnvelope, CompositionError> {
-    let submission_json = serde_json::to_string(submission)
-        .map_err(|error| owner_refused(error.to_string()))?;
+    let submission_json =
+        serde_json::to_string(submission).map_err(|error| owner_refused(error.to_string()))?;
     let mut parameters = BTreeMap::new();
     parameters.insert(
         "subject".to_owned(),
@@ -1009,11 +1010,12 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             ordering_head.sequence,
             input.task_selection.as_ref(),
         )?;
-        let exchange = crate::finish_attempt::prepare_exchange(self.canonical, &input.identity, envelope)
-            .map_err(|error| match error {
-                FinishAttemptError::Composition(error) => error,
-                other => owner_refused(other.to_string()),
-            })?;
+        let exchange =
+            crate::finish_attempt::prepare_exchange(self.canonical, &input.identity, envelope)
+                .map_err(|error| match error {
+                    FinishAttemptError::Composition(error) => error,
+                    other => owner_refused(other.to_string()),
+                })?;
         let access = ObservationCaptureAccess {
             privacy: input.owner_binding.access.privacy,
             visibility: input.owner_binding.access.visibility,
@@ -1032,7 +1034,13 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
     fn validate_capture_owners(
         &self,
         input: &McpObservationCaptureInput,
-    ) -> Result<(ObservationIngressPolicyBinding, eliot_workscope::WorkScopeBindingSnapshot), CompositionError> {
+    ) -> Result<
+        (
+            ObservationIngressPolicyBinding,
+            eliot_workscope::WorkScopeBindingSnapshot,
+        ),
+        CompositionError,
+    > {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -1107,9 +1115,15 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                 ..
             } => peer_admission_receipt.module_id.clone(),
         };
-        let work_scope = WorkScopeId::new(scope_ref)
-            .map_err(|error| owner_refused(error.to_string()))?;
-        let source_ref = input.identity.request.metadata.source_id.as_str().to_owned();
+        let work_scope =
+            WorkScopeId::new(scope_ref).map_err(|error| owner_refused(error.to_string()))?;
+        let source_ref = input
+            .identity
+            .request
+            .metadata
+            .source_id
+            .as_str()
+            .to_owned();
         let submission = ObservationSubmission {
             operation_id: operation.to_owned(),
             idempotency_key: input.identity.idempotency_key.clone(),
@@ -1302,14 +1316,16 @@ fn validate_prepared_observation_receipt(
     prepared
         .exchange
         .validate_receipt(receipt)
-        .map_err(|error| owner_refused(format!(
-            "Observe receipt does not match the original prepared transition: {error}"
-        )))?;
-    let envelope = receipt
-        .require_reconciliation_envelope()
-        .map_err(|error| owner_refused(format!(
+        .map_err(|error| {
+            owner_refused(format!(
+                "Observe receipt does not match the original prepared transition: {error}"
+            ))
+        })?;
+    let envelope = receipt.require_reconciliation_envelope().map_err(|error| {
+        owner_refused(format!(
             "Observe receipt has no Store-issued reconciliation envelope: {error}"
-        )))?;
+        ))
+    })?;
     prepared
         .submission
         .validate()
@@ -1455,7 +1471,12 @@ fn validate_observation_origin_current(
                 .as_ref()
                 .ok_or_else(|| identity_refused("application Observe request has no Session"))?;
             if session_id.as_str() != authenticated_session_ref
-                || identity.request.metadata.task_id.as_ref().map(TaskId::as_str)
+                || identity
+                    .request
+                    .metadata
+                    .task_id
+                    .as_ref()
+                    .map(TaskId::as_str)
                     != task_selection.map(|selection| selection.task_ref.as_str())
             {
                 return Err(identity_refused(
@@ -1474,7 +1495,9 @@ fn validate_observation_origin_current(
             })?;
             if session.status != SessionState::Active
                 || session.state_fence != *fence
-                || !session.authority_epoch.is_same_authority(&fence.authority_epoch)
+                || !session
+                    .authority_epoch
+                    .is_same_authority(&fence.authority_epoch)
                 || session.task_scope.as_deref() != authenticated_task_ref.as_deref()
             {
                 return Err(identity_refused(
