@@ -1725,6 +1725,62 @@ impl ChangeMonitor {
             .values()
             .any(|record| record.verification.is_none())
     }
+
+    /// Returns whether a host/filesystem hint for one tracked resource
+    /// still needs a verified content/Git readback.
+    pub fn has_pending_hint_for(&self, resource_ref: &str) -> bool {
+        self.hints.values().any(|record| {
+            record.verification.is_none() && record.hint.resource_ref == resource_ref
+        })
+    }
+
+    /// Returns whether an unreconciled unknown-origin Material change
+    /// touches one tracked resource. Reconciled changes and attributed
+    /// (non-unknown) observations never block; unknown stays unknown and
+    /// is never coerced to clean by this query.
+    pub fn has_unreconciled_unknown_change_for(&self, resource_ref: &str) -> bool {
+        self.observations.keys().any(|change_id| {
+            self.has_unresolved_unknown_change(change_id)
+                && self.observations.get(change_id).is_some_and(|record| {
+                    record.observation.resource_ref() == resource_ref
+                })
+        })
+    }
+
+    /// Returns whether governed acceptance for one tracked resource is
+    /// currently blocked: a host/filesystem hint for that resource still
+    /// needs a verified readback, or an unreconciled unknown-origin
+    /// Material change touches that resource.
+    ///
+    /// Scoping is by the tracked source identity carried on the admitted
+    /// hint/observation. A candidate for an unrelated resource is
+    /// unaffected, so an out-of-lane re-pin of another source cannot wedge
+    /// its acceptance; a candidate touching a blocked resource still waits
+    /// for explicit reconciliation. The global
+    /// [`ChangeMonitor::blocks_acceptance`] gate is unchanged.
+    pub fn blocks_acceptance_for(&self, resource_ref: &str) -> bool {
+        self.has_pending_hint_for(resource_ref)
+            || self.has_unreconciled_unknown_change_for(resource_ref)
+    }
+
+    /// Returns the tracked resources currently blocking governed
+    /// acceptance — those with a still-unverified hint or an
+    /// unreconciled unknown-origin Material change — in deterministic
+    /// order.
+    pub fn blocked_resources(&self) -> Vec<String> {
+        let mut blocked = BTreeSet::new();
+        for record in self.hints.values() {
+            if record.verification.is_none() {
+                blocked.insert(record.hint.resource_ref.clone());
+            }
+        }
+        for (change_id, record) in &self.observations {
+            if self.has_unresolved_unknown_change(change_id) {
+                blocked.insert(record.observation.resource_ref().to_owned());
+            }
+        }
+        blocked.into_iter().collect()
+    }
 }
 
 /// Candidate current location supplied by VCS/content/code-intelligence
