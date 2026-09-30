@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_store_api::{
     CanonicalEvent, CanonicalRequestView, CommitId, EventId, EventProjectionRelationIntents,
     ExactJsonBytes, NamedMutationOperation, ORDERING_LINK_GENESIS_HASH, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    OrderingHeadExpectation, OrderingScopeId, OutboxIntent, OutboxIntentKind, OutboxState,
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, PreparedTransition, ProjectionMode,
     ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
     Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, SplitView,
@@ -1137,6 +1137,21 @@ fn projection_records(
         .collect()
 }
 
+/// Commits the outbox rows for one canonical transition: the existing
+/// per-event projection intents plus the one LAUNCH intent I10.15 step 3 and
+/// I14.6 name alongside the `ADMITTED` decision ("canonical state records
+/// `ADMITTED` and the launch outbox").
+///
+/// The launch row is NOT a second outbox scheme: it is built by this same
+/// function, from the same `PreparedTransition`, under the same
+/// `operation_id`, and carries the same `payload_digest` and `state_fence` as
+/// the event intents. It is committed in the same store transaction as the
+/// `ADMITTED` decision and its `WriteReceipt`, because
+/// `apply/atomic_write.rs` creates every `plan.outbox_records` row inside the
+/// one `TX_BEGIN`/`TX_COMMIT` that creates the receipt. The only distinction
+/// is the store-owned [`OutboxIntentKind`] naming, so the saga that reads the
+/// launch row back selects on that kind and finds exactly one row per
+/// admission operation.
 fn outbox_records(
     transition: &PreparedTransition,
     operation_key: &str,
@@ -1144,14 +1159,19 @@ fn outbox_records(
     payload_digest: &str,
     next_sequence: u64,
 ) -> Result<(Vec<OutboxIntent>, u64), StoreError> {
-    let mut records = Vec::with_capacity(event_ids.len());
+    let mut records = Vec::with_capacity(event_ids.len() + 1);
     let mut sequence_cursor = next_sequence;
-    for (index, _) in event_ids.iter().enumerate() {
+    let kinds = event_ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| (OutboxIntentKind::EventProjection, index))
+        .chain(std::iter::once((OutboxIntentKind::Launch, 0)));
+    for (kind, index) in kinds {
         let sequence = sequence_cursor;
         sequence_cursor =
             checked_increment(sequence_cursor, "outbox.sequence", "sequence overflow")?;
         let record = OutboxIntent {
-            outbox_id: OutboxId::new(format!("outbox-{operation_key}-{index}"))?,
+            outbox_id: kind.outbox_id(operation_key, index)?,
             operation_id: transition.identity.operation_id.clone(),
             sequence,
             payload_digest: payload_digest.to_owned(),

@@ -5141,6 +5141,82 @@ pub enum OutboxState {
     Irreconcilable,
 }
 
+/// What one committed outbox row exists to hand off (issue #1678 W3/A3).
+///
+/// A launch outbox is not a second outbox scheme and not a second table: it is
+/// the SAME `OutboxIntent` row, committed in the SAME store transaction as the
+/// `ADMITTED` decision and its `WriteReceipt`, distinguished only by this
+/// closed naming so a launch reader can select on it. Every other producer —
+/// the event-projection planners in the adapters — names its rows exactly as
+/// before; this adds no field, no table, no persistence layer and no digest to
+/// `OutboxIntent`, so no existing producer or stored row changes shape.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OutboxIntentKind {
+    /// The existing default: one intent per canonical event, projected to
+    /// downstream consumers. Unchanged by issue #1678.
+    EventProjection,
+    /// The launch intent I10.15 step 3 and I14.6 name alongside the canonical
+    /// `ADMITTED` transition: "canonical state records `ADMITTED` and the
+    /// launch outbox". Exactly one launch intent is committed per canonical
+    /// admission operation, under that operation's own identity, and it is the
+    /// row the reservation saga reads back before activation.
+    Launch,
+}
+
+impl OutboxIntentKind {
+    /// Closed, store-owned spelling of one outbox row's outbox-id prefix.
+    ///
+    /// A launch reader selects on this prefix, so the kind lives inside the
+    /// type that names outbox rows rather than in a planner's format string:
+    /// the store plan that commits a launch row and the reservation saga that
+    /// reads it back cannot drift on the spelling, and an event-projection row
+    /// can never be mistaken for a launch row because its prefix differs.
+    pub const fn id_prefix(self) -> &'static str {
+        match self {
+            Self::EventProjection => "outbox",
+            Self::Launch => "launch-outbox",
+        }
+    }
+
+    /// Names one outbox row of this kind under its committed operation.
+    ///
+    /// This is the one spelling of an outbox id, used by the store plan that
+    /// commits the row and by the reservation saga that reads it back, so a
+    /// launch row is found under the identity the commit actually used rather
+    /// than under a spelling the reader re-invented.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidField`] when the derived label is not a
+    /// usable `OutboxId`; no row is named that the owner could not store.
+    pub fn outbox_id(self, operation_key: &str, index: usize) -> Result<OutboxId, StoreError> {
+        OutboxId::new(format!("{}-{operation_key}-{index}", self.id_prefix()))
+    }
+
+    /// Classifies one committed outbox row by its store-owned id spelling.
+    ///
+    /// This is the inverse of [`Self::outbox_id`]: a reader that already holds
+    /// a row asks which kind it is, and a row whose id carries no known prefix
+    /// is `None` rather than a guessed kind. Classification is therefore by
+    /// content the owner itself wrote, never by a caller assertion.
+    #[must_use]
+    pub fn of(outbox_id: &OutboxId) -> Option<Self> {
+        let text = outbox_id.as_str();
+        // The prefix must be followed by the `-` that separates it from the
+        // operation key, so an id merely CONTAINING the word is not classified
+        // as a launch row.
+        [Self::Launch, Self::EventProjection]
+            .into_iter()
+            .find(|kind| {
+                let prefix = kind.id_prefix();
+                text.len() > prefix.len()
+                    && text.starts_with(prefix)
+                    && text.as_bytes()[prefix.len()] == b'-'
+            })
+    }
+}
+
 /// One atomic outbox intent linked to the canonical transition.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
