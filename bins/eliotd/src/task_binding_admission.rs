@@ -1719,7 +1719,7 @@ pub fn resolve_task_selection(
 /// It reads no caller-supplied `TaskSelectionEvidence`: structural validation
 /// of evidence a request carried is never sufficient here.
 ///
-/// Owner seam, stated exactly: the TaskContract revision, `WorkScope`,
+/// Owner seam, stated exactly: the `TaskContract` revision, `WorkScope`,
 /// principal/session, and fence are rechecked against the live
 /// [`eliot_governor::GovernorActivationSnapshot`], which carries all four;
 /// the acceptance digest and owner-proven selection source/evidence refs rest
