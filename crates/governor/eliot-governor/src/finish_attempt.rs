@@ -248,9 +248,9 @@ impl PreparedKernelExchange {
                 "prepared exchange has no original versioned write source".to_owned(),
             ))
         })?;
-        source
-            .validate()
-            .map_err(|error| FinishAttemptError::Kernel(KernelPortError::Contract(error.to_string())))?;
+        source.validate().map_err(|error| {
+            FinishAttemptError::Kernel(KernelPortError::Contract(error.to_string()))
+        })?;
         let transition = self.transition.clone().ok_or_else(|| {
             FinishAttemptError::Kernel(KernelPortError::NotAdmitted(
                 "versioned original-write exchange has no prepared transition".to_owned(),
@@ -400,9 +400,9 @@ pub(crate) fn prepare_exchange_with_original_submission(
     envelope: CanonicalWriteEnvelope,
     original_write_submission: eliot_store_api::OriginalWriteSubmission,
 ) -> Result<PreparedKernelExchange, FinishAttemptError> {
-    original_write_submission
-        .validate()
-        .map_err(|error| FinishAttemptError::Composition(CompositionError::Provider(error.to_string())))?;
+    original_write_submission.validate().map_err(|error| {
+        FinishAttemptError::Composition(CompositionError::Provider(error.to_string()))
+    })?;
     let mut exchange = prepare_exchange(canonical, identity, envelope)?;
     exchange.original_write_submission = Some(original_write_submission);
     Ok(exchange)
