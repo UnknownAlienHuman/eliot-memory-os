@@ -532,7 +532,16 @@ impl EffectAuthorizer {
     /// original decision only when it names the full stored material identity
     /// and the presented lease is still current for that exact effect:
     /// historical replay never renews expired or revoked authority.
+    ///
+    /// A new admission additionally re-validates the proposal and the
+    /// lease's receipt obligations against the same retention rules the
+    /// recovery snapshot enforces, so only snapshot-retainable
+    /// authorizations are ever stored.
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the validated proposal is moved into the stored AuthorizedEffect; the shadow rebuild only re-checks its fields first"
+    )]
     pub fn authorize_with_revoked_roots(
         &mut self,
         lease: &mut ActionLease,
@@ -561,6 +570,27 @@ impl EffectAuthorizer {
             // new effect.)
             lease.still_current(&existing.proposal, current_work_scope, current_session, now)?;
             return Ok(existing.clone());
+        }
+        // Persist before exposing executable admission (I6.6 seq 3): the
+        // ledger is the retention side of the semantic write path, and the
+        // recovery snapshot refuses records with incomplete input or without
+        // receipt obligations. Re-validate both here so a stored
+        // authorization is always snapshot-retainable: incomplete input or
+        // authorization refuses before the lease is charged and the ledger
+        // is touched, and can never become executable acceptance below. The
+        // durable write of the snapshot itself stays cross-process (STITCH).
+        let proposed = ProposedEffect::new(
+            proposed.action_id.clone(),
+            proposed.operation.clone(),
+            proposed.operation_name.clone(),
+            proposed.resource_ref.clone(),
+            proposed.canonical_payload_sha256.clone(),
+        )?;
+        if lease.receipt_obligations.is_empty() {
+            return Err(AuthorityError::InvalidField("receipt_obligations"));
+        }
+        for obligation in &lease.receipt_obligations {
+            obligation.validate()?;
         }
         lease.authorize(&proposed, current_work_scope, current_session, now)?;
         let authorized = AuthorizedEffect {
