@@ -15,7 +15,7 @@
 //! | Construct/admit `ModelRouteRequest` | none in-repo: no producer exists outside the contract owner and its tests | named implementation work |
 //! | Execute the admitted provider route, return `ModelRouteOutcome` | none: provider text lives outside the dreamer binary | named implementation work |
 //! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | none in-binary: no Governor orientation-supply channel exists | named implementation work |
-//! | Acquire each mandatory stage's owner input/receipt | none in-binary: records must arrive owner-built via the future carrier supply | named implementation work |
+//! | Acquire each mandatory stage's owner input/receipt | caller-supplied through ProductionOrientationSupply; no production producer is wired in-binary | consumer wired; producer absent |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
 //!
@@ -91,13 +91,15 @@ const DIGEST_UNAVAILABLE: &str = "digest unavailable";
 const OWNER_MODEL_ROUTE: &str = "model-route runtime owner";
 /// Missing-owner identity for the CC-004 projection owner.
 const OWNER_PROJECTIONS: &str = "governor canonical projection owner";
+/// Blocked reason when a caller reports that its owner snapshot is stale.
+pub(crate) const ORIENTATION_SUPPLY_STALE: &str = "governor orientation owner snapshot is stale";
 
 /// Immutable route-measurement function supplied with the understanding record.
 ///
 /// A plain `fn` item keeps the carrier non-generic: the Governor channel
 /// supplies the measurement with the admitted set, and the composer invokes it
 /// at most once through the understanding owner entry.
-type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
+pub(crate) type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
 
 /// Versioned runtime-owned production carrier: everything one complete
 /// Orientation pulse must consume, with no optional mandatory member.
@@ -157,6 +159,65 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub deadline_unix_ms: u64,
     /// True when cancellation was observed before composition.
     pub cancelled: bool,
+}
+
+/// Owner-produced members of a production pulse. Dispatch fills the admitted
+/// job, bundle, validated candidate, and sealed policy from the exact inputs
+/// it just checked; this type carries only values that must arrive from their
+/// real model, Governor, and stage owners.
+pub(crate) struct ProductionOrientationOwnerInputs<'a> {
+    /// CC-002 admitted model-route request (denominator, timeout, privacy).
+    pub model_request: &'a ModelRouteRequest,
+    /// CC-002 outcome returned by the admitted model route.
+    pub model_outcome: &'a ModelRouteOutcome,
+    /// CC-004 set returned by the canonical projection owner.
+    pub projections: &'a CanonicalProjectionSet,
+    /// Governor-resolved epistemic-position handles for the packet.
+    pub cep_handles: &'a [CurrentEpistemicPositionHandle],
+    /// Classification stage inputs.
+    pub classification: ClassificationStage<'a>,
+    /// Cue-activation stage inputs.
+    pub cue_activation: CueActivationStage<'a>,
+    /// Epistemic resolution request over admitted records.
+    pub epistemic: &'a PositionRequest,
+    /// Understanding stage inputs with the route measurement.
+    pub understanding: UnderstandingStage<'a, MeasureFn>,
+    /// Claim-grounding request (the owner takes an owned clone).
+    pub grounding: &'a GroundingRequest,
+    /// Rival-structuring stage inputs.
+    pub rivals: RivalStage<'a>,
+    /// Conflict-analysis stage inputs.
+    pub conflict: ConflictStage<'a>,
+    /// Discriminative probe-plan parameters.
+    pub probes: ProbePlanParams<'a>,
+    /// Context-candidate stage inputs.
+    pub candidates: CandidateStage<'a>,
+    /// Owner-declared shared operation identity.
+    pub operation_id: String,
+    /// Owner-declared shared task identity.
+    pub task_id: String,
+    /// Owner-declared shared scope identity.
+    pub scope_id: String,
+    /// Owner-declared shared state fence.
+    pub state_fence: StateFence,
+    /// Owner snapshot deadline in Unix milliseconds.
+    pub deadline_unix_ms: u64,
+    /// True when the owner observed cancellation before composition.
+    pub cancelled: bool,
+}
+
+/// Caller-supplied owner-channel result for one admitted Orientation call.
+///
+/// Ready must contain actual owner-produced records. Missing and Stale
+/// preserve the live fail-closed result without fabricating any boundary or
+/// stage values.
+pub(crate) enum ProductionOrientationSupply<'a> {
+    /// The caller has all mandatory, owner-produced pulse inputs.
+    Ready(ProductionOrientationOwnerInputs<'a>),
+    /// At least one mandatory producer is not available to this caller.
+    Missing,
+    /// An owner returned inputs for a prior or otherwise stale snapshot.
+    Stale,
 }
 
 /// Resolves the production carrier from admitted dispatch artifacts.
