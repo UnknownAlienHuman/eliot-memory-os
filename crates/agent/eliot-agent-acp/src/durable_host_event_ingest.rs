@@ -680,6 +680,195 @@ pub struct StageRedacted<'a> {
     pub transformation_version: &'a str,
 }
 
+/// Owner-derived route digests for one execution-unit event (issue #2645
+/// W1/W3).
+///
+/// This is the production execution-unit caller path into durable staging:
+/// instead of accepting caller-supplied requested/actual hashes, the caller
+/// supplies the exact owner material — the recorded #361 binding, the
+/// governing #369 admission, and the applicable #369 physical observation
+/// (or its explicit absence) — and this resolver derives the role-qualified
+/// column digests with the existing [`route_fingerprint_digest_for`] recipe
+/// and validates the observation with the existing
+/// [`PhysicalRouteObservationReceipt::validate_against`] (which itself runs
+/// the observation's [`PhysicalRouteObservationReceipt::validate`]). No new
+/// hash recipe, no reinterpreted column, no test-only caller:
+/// [`StageAllowed::execution_unit`] and [`StageRedacted::execution_unit`]
+/// are the real constructors the execution-unit producer/normalizer calls,
+/// and the staging guard recomputes the same digests from the same owners
+/// before any mutation, so substituted caller bytes can never pass through
+/// this path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionUnitRouteEvidence {
+    /// Fingerprint digest recomputed from the admission's original requested
+    /// route (logical-request identity, never the admission self-digest).
+    pub requested_route_digest: LowercaseSha256,
+    /// Fingerprint digest recomputed from the validated observation's
+    /// observed route; `None` exactly when no observation applies yet (a
+    /// valid pre-observation event) or the observation reports `Unobserved`.
+    /// Never copied from requested/selected/admission bytes.
+    pub actual_route_digest: Option<LowercaseSha256>,
+}
+
+impl ExecutionUnitRouteEvidence {
+    /// Resolves role-qualified digests from validated owner material.
+    ///
+    /// The admission and binding validate through their existing owners;
+    /// a supplied observation fully validates against them (exact
+    /// attempt/binding/fence/generation/admission linkage plus the
+    /// legitimate admission-selection boundary); the requested column binds
+    /// the admission's original requested route and the actual column binds
+    /// the observation's observed route, each recomputed here rather than
+    /// trusted as a caller string. Typed contract failures travel as
+    /// [`IngestError::Contract`]; digest-encoding failures as
+    /// [`IngestError::DigestEncoding`].
+    pub fn resolve(
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        physical_observation: Option<&PhysicalRouteObservationReceipt>,
+    ) -> Result<Self, IngestError> {
+        admission.validate()?;
+        binding.validate_internal()?;
+        let requested_route_digest =
+            route_fingerprint_digest_for(&admission.requested_route)
+                .map_err(|_| IngestError::DigestEncoding)?;
+        let Some(observation) = physical_observation else {
+            return Ok(Self {
+                requested_route_digest,
+                actual_route_digest: None,
+            });
+        };
+        observation.validate_against(binding, admission)?;
+        let actual_route_digest = observation
+            .observed_route
+            .as_ref()
+            .map(route_fingerprint_digest_for)
+            .transpose()
+            .map_err(|_| IngestError::DigestEncoding)?;
+        Ok(Self {
+            requested_route_digest,
+            actual_route_digest,
+        })
+    }
+}
+
+/// Binds a supplied observation's causal position to the envelope's
+/// lineage-declared position before any owner digest is derived (issue #2645
+/// W1/A1): a receipt minted for another cursor/sequence boundary — even with
+/// the same attempt, binding, admission, fence, and generation — cannot
+/// justify this event's actual-route column. Session lineage carries no
+/// attempt authority, so an execution-unit construction over it rejects.
+fn check_execution_unit_observation_applicability(
+    envelope: &NormalizedHostEventEnvelope,
+    physical_observation: Option<&PhysicalRouteObservationReceipt>,
+) -> Result<(), IngestError> {
+    match &envelope.lineage {
+        ProviderObservationLineage::SessionObservation(_) => {
+            Err(IngestError::InvalidInput("binding/lineage"))
+        }
+        ProviderObservationLineage::ExecutionUnitObservation(lineage) => {
+            if let Some(observation) = physical_observation {
+                if observation.event_cursor != lineage.cursor
+                    || observation.event_sequence != lineage.sequence
+                {
+                    return Err(IngestError::Contract(ContractError::BindingMismatch));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+impl<'a> StageAllowed<'a> {
+    /// Builds an execution-unit staging request from validated owner
+    /// material (issue #2645 W1/W3).
+    ///
+    /// The production execution-unit producer/normalizer calls this
+    /// constructor — not the struct literal — with the exact binding,
+    /// governing admission, and applicable physical observation (or its
+    /// explicit absence for a valid pre-observation event). Requested/actual
+    /// digests are derived from those owners here and re-verified by the
+    /// staging guard before any mutation; no caller hash is trusted. The
+    /// session-only producer path keeps its struct-literal `None` shape
+    /// untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execution_unit(
+        stream_id: &'a str,
+        stream_sequence: u64,
+        transport_bytes: &'a [u8],
+        envelope: NormalizedHostEventEnvelope,
+        binding: &'a ProviderExecutionBinding,
+        admission: &'a AdmittedRouteReceipt,
+        physical_observation: Option<&'a PhysicalRouteObservationReceipt>,
+        predecessors: Vec<EventId>,
+        warnings: Vec<String>,
+        transformation_version: &'a str,
+    ) -> Result<Self, IngestError> {
+        check_execution_unit_observation_applicability(&envelope, physical_observation)?;
+        let evidence =
+            ExecutionUnitRouteEvidence::resolve(binding, admission, physical_observation)?;
+        Ok(Self {
+            stream_id,
+            stream_sequence,
+            transport_bytes,
+            envelope,
+            binding: Some(binding),
+            admission: Some(admission),
+            physical_observation,
+            requested_route_digest: Some(evidence.requested_route_digest),
+            actual_route_digest: evidence.actual_route_digest,
+            predecessors,
+            warnings,
+            transformation_version,
+        })
+    }
+}
+
+impl<'a> StageRedacted<'a> {
+    /// Builds an execution-unit redacted staging request from validated
+    /// owner material (issue #2645 W1/W3).
+    ///
+    /// Identical owner rules to [`StageAllowed::execution_unit`]: the exact
+    /// binding, governing admission, and applicable physical observation (or
+    /// its explicit absence) supply the requested/actual digests through
+    /// [`ExecutionUnitRouteEvidence::resolve`], and the allowed and redacted
+    /// paths enforce identical route rules. The session-only producer path
+    /// keeps its struct-literal `None` shape untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execution_unit(
+        stream_id: &'a str,
+        stream_sequence: u64,
+        transport_bytes: &'a [u8],
+        redacted_classes: Vec<String>,
+        envelope: NormalizedHostEventEnvelope,
+        binding: &'a ProviderExecutionBinding,
+        admission: &'a AdmittedRouteReceipt,
+        physical_observation: Option<&'a PhysicalRouteObservationReceipt>,
+        predecessors: Vec<EventId>,
+        warnings: Vec<String>,
+        transformation_version: &'a str,
+    ) -> Result<Self, IngestError> {
+        check_execution_unit_observation_applicability(&envelope, physical_observation)?;
+        let evidence =
+            ExecutionUnitRouteEvidence::resolve(binding, admission, physical_observation)?;
+        Ok(Self {
+            stream_id,
+            stream_sequence,
+            transport_bytes,
+            redacted_classes,
+            envelope,
+            binding: Some(binding),
+            admission: Some(admission),
+            physical_observation,
+            requested_route_digest: Some(evidence.requested_route_digest),
+            actual_route_digest: evidence.actual_route_digest,
+            predecessors,
+            warnings,
+            transformation_version,
+        })
+    }
+}
+
 /// Per-stream durable progress.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StreamProgress {
