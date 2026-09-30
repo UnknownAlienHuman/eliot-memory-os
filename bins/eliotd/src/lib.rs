@@ -22,8 +22,8 @@ use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
     AgentActivationObservationPolicyReadback, AgentActivationOwnerEvidence,
-    AgentActivationOwnerReadback, AgentActivationResolutionResult,
-    AgentActivationResolutionDisposition, AgentActivationResolutionTicket,
+    AgentActivationOwnerReadback, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
     AgentActivationResolvedBinding, RequestIdentity,
 };
 use serde::{Deserialize, Serialize};
@@ -2471,9 +2471,11 @@ impl DaemonComposition {
             || readback.owner_projection_value != owner_value
             || readback.owner_projection_sha256 != owner_digest
         {
-            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                "Host-origin workspace locator is not bound to the accepted ticket and current owner projection",
-            ));
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "Host-origin workspace locator is not bound to the accepted ticket and current owner projection",
+                ),
+            );
         }
         let root = ticket.workspace_selector.as_deref().ok_or_else(|| {
             crate::task_binding_admission::TaskBindingError::scope_incompatible(
@@ -2482,9 +2484,11 @@ impl DaemonComposition {
         })?;
         let root = Path::new(root);
         if !root.is_absolute() {
-            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                "retained Host-origin workspace locator is not absolute",
-            ));
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained Host-origin workspace locator is not absolute",
+                ),
+            );
         }
         owner_binding
             .work_scope_binding
@@ -2581,9 +2585,11 @@ impl DaemonComposition {
             } if retained_principal == principal_ref && retained_session == session_ref
         );
         if !origin_matches || locator.work_scope_ref != work_scope.binding.scope.scope_ref {
-            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                "retained activation locator does not match the authenticated request and current WorkScope",
-            ));
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained activation locator does not match the authenticated request and current WorkScope",
+                ),
+            );
         }
         Ok(locator.root.clone())
     }
@@ -2608,9 +2614,11 @@ impl DaemonComposition {
         })?;
         let live_fence = self.governor.kernel_snapshot().state_fence();
         if !eliot_contracts::fences_match_exact(&work_scope.state_fence, &live_fence) {
-            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                "current WorkScope snapshot fence is no longer live",
-            ));
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "current WorkScope snapshot fence is no longer live",
+                ),
+            );
         }
         let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
             crate::task_binding_admission::TaskBindingError::scope_incompatible(
@@ -2625,9 +2633,11 @@ impl DaemonComposition {
             } if peer_admission_receipt == receipt && retained_request_id == activation_request_id
         );
         if !origin_matches || locator.work_scope_ref != work_scope.binding.scope.scope_ref {
-            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                "retained Host-origin locator does not match the peer receipt and current WorkScope",
-            ));
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained Host-origin locator does not match the peer receipt and current WorkScope",
+                ),
+            );
         }
         Ok(locator.root.clone())
     }

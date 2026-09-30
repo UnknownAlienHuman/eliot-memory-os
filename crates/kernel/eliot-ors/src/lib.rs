@@ -139,8 +139,8 @@ pub use status_projection::{
 pub use store::{
     CanonicalEvidenceProvider, ColdStartReadinessRecordOwner, HostRequestObserveResult,
     OperationalRecoveryStore, OrsCoordinator, OrsStoreIdentity, RedbRecoveryStore,
-    RuntimeLeaseCensusRows,
-    ScanDisclosureRecordOwner, StoreStopObligationCensus, StoreStopObligationCounts,
+    RuntimeLeaseCensusRows, ScanDisclosureRecordOwner, StoreStopObligationCensus,
+    StoreStopObligationCounts,
 };
 pub use store_route_ownership::CanonicalStoreRouteOwnership;
 pub use user_broker::{

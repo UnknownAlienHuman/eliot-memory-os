@@ -7884,7 +7884,10 @@ impl HostRequestApplicationBinding {
                 field: "host_request_source_activation_ticket_digest",
                 reason: "the original ticket digest is required",
             })?;
-        validate_digest(ticket_digest, "host_request_source_activation_ticket_digest")?;
+        validate_digest(
+            ticket_digest,
+            "host_request_source_activation_ticket_digest",
+        )?;
         let mut unsigned_ticket = self.source_activation_ticket.clone();
         let unsigned_object = unsigned_ticket
             .as_object_mut()
@@ -7893,8 +7896,7 @@ impl HostRequestApplicationBinding {
         let bytes = canonical_json_bytes(&unsigned_ticket)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         if sha256_hex(&bytes) != ticket_digest
-            || ticket_object
-                .get("peer_admission_receipt")
+            || ticket_object.get("peer_admission_receipt")
                 != Some(&self.host_peer_admission_receipt)
             || ticket_object
                 .get("peer_admission_receipt_sha256")
@@ -7933,7 +7935,10 @@ impl HostRequestApplicationBinding {
                 field: "host_request_source_activation_result_digest",
                 reason: "the original result digest is required",
             })?;
-        validate_digest(result_digest, "host_request_source_activation_result_digest")?;
+        validate_digest(
+            result_digest,
+            "host_request_source_activation_result_digest",
+        )?;
         let mut unsigned_result = self.source_activation_result.clone();
         unsigned_result
             .as_object_mut()
@@ -7958,10 +7963,7 @@ impl HostRequestApplicationBinding {
         self.validate_source_activation_disposition(result_digest)
     }
 
-    fn validate_source_activation_disposition(
-        &self,
-        result_digest: &str,
-    ) -> Result<(), OrsError> {
+    fn validate_source_activation_disposition(&self, result_digest: &str) -> Result<(), OrsError> {
         let result = &self.source_activation_result;
         let disposition = result
             .get("disposition")
@@ -8010,14 +8012,14 @@ impl HostRequestApplicationBinding {
     }
 
     fn validate_host_policy_readback(&self, result: &Value) -> Result<(), OrsError> {
-        let readback = result
-            .get("observation_host_policy_readback")
-            .ok_or(OrsError::InvalidField {
-                field: "host_request_source_activation_policy_readback",
-                reason: "negative host-origin results must retain their exact policy readback",
-            })?;
-        if readback.get("owner_projection_value")
-            != Some(&self.observation_policy_binding)
+        let readback =
+            result
+                .get("observation_host_policy_readback")
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_source_activation_policy_readback",
+                    reason: "negative host-origin results must retain their exact policy readback",
+                })?;
+        if readback.get("owner_projection_value") != Some(&self.observation_policy_binding)
             || readback
                 .get("owner_projection_sha256")
                 .and_then(Value::as_str)
@@ -8106,7 +8108,10 @@ impl HostRequestApplicationBinding {
                 )
             }
             (None, None, None, None, None)
-                if self.task_ref.is_none() && self.task_revision.is_none() => Ok(()),
+                if self.task_ref.is_none() && self.task_revision.is_none() =>
+            {
+                Ok(())
+            }
             _ => Err(OrsError::InvalidField {
                 field: "host_request_activation_binding",
                 reason: "activation decision and evidence must be complete together, and absent only for task-free requests",
@@ -8364,7 +8369,9 @@ impl HostRequestApplicationBinding {
     ) -> Result<(), OrsError> {
         let policy = &self.observation_policy_binding;
         self.validate_observation_policy_origin(policy)?;
-        if policy.get("authenticated_scope_ref").and_then(Value::as_str)
+        if policy
+            .get("authenticated_scope_ref")
+            .and_then(Value::as_str)
             != self.scope_ref.as_ref().map(OpaqueLabel::as_str)
         {
             return Err(OrsError::FenceMismatch);
@@ -8391,23 +8398,28 @@ impl HostRequestApplicationBinding {
         match origin.get("kind").and_then(Value::as_str) {
             Some("APPLICATION_SESSION") => {
                 if self.principal_ref.as_ref().map(OpaqueLabel::as_str)
-                    != origin.get("authenticated_principal_ref").and_then(Value::as_str)
+                    != origin
+                        .get("authenticated_principal_ref")
+                        .and_then(Value::as_str)
                     || self.session_ref.as_ref().map(OpaqueLabel::as_str)
-                        != origin.get("authenticated_session_ref").and_then(Value::as_str)
+                        != origin
+                            .get("authenticated_session_ref")
+                            .and_then(Value::as_str)
                     || self.principal_ref.is_none()
                     || self.session_ref.is_none()
                     || origin.get("authenticated_task_ref").is_none()
                 {
                     return Err(OrsError::FenceMismatch);
                 }
-                let origin_task = origin
-                    .get("authenticated_task_ref")
-                    .and_then(Value::as_str);
-                if self.task_ref.as_ref().is_some_and(|task| Some(task.as_str()) != origin_task) {
+                let origin_task = origin.get("authenticated_task_ref").and_then(Value::as_str);
+                if self
+                    .task_ref
+                    .as_ref()
+                    .is_some_and(|task| Some(task.as_str()) != origin_task)
+                {
                     return Err(OrsError::FenceMismatch);
                 }
-                if origin.get("domain").is_some()
-                    || origin.get("peer_admission_receipt").is_some()
+                if origin.get("domain").is_some() || origin.get("peer_admission_receipt").is_some()
                 {
                     return Err(OrsError::InvalidField {
                         field: "host_request_observation_policy_origin",
@@ -8533,13 +8545,11 @@ impl HostRequestApplicationBinding {
                 request_digest: record.request_digest.clone(),
             });
         }
-        for (field, value, expected) in [
-            (
-                "host_request_owner_task",
-                self.request_identity.get("task_id").and_then(Value::as_str),
-                record.task_ref.as_ref().map(OpaqueLabel::as_str),
-            ),
-        ] {
+        for (field, value, expected) in [(
+            "host_request_owner_task",
+            self.request_identity.get("task_id").and_then(Value::as_str),
+            record.task_ref.as_ref().map(OpaqueLabel::as_str),
+        )] {
             if value != expected {
                 return Err(OrsError::InvalidField {
                     field,
@@ -8814,12 +8824,8 @@ impl HostRequestExecutableInput {
 
     fn validate_host_peer_receipt(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
         let receipt = &self.application_binding.host_peer_admission_receipt;
-        let observed_session_id = receipt
-            .get("observed_session_id")
-            .and_then(Value::as_u64);
-        if receipt
-            .get("receipt_sha256")
-            .and_then(Value::as_str)
+        let observed_session_id = receipt.get("observed_session_id").and_then(Value::as_u64);
+        if receipt.get("receipt_sha256").and_then(Value::as_str)
             != Some(self.peer_admission_receipt_sha256.as_str())
             || receipt.get("observed_sid").and_then(Value::as_str)
                 != Some(self.authenticated_principal_ref.as_str())

@@ -53,11 +53,10 @@ use eliot_governor::{
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationObservationHostPolicyReadback,
-    AgentActivationOwnerReadback,
-    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
-    AgentActivationResultReconcile, HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestResultBody,
-    host_request_operation_id,
+    AgentActivationOwnerReadback, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket, AgentActivationResultAck,
+    AgentActivationResultAckOutcome, AgentActivationResultReconcile,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestResultBody, host_request_operation_id,
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus, WriteReceipt};
@@ -4817,8 +4816,7 @@ async fn run_observe_poll(
         suboperation: Some(deferral.suboperation.as_str()),
         owner_capability: Some(deferral.owner_capability),
         residual_owner: Some(deferral.residual_owner),
-        resume: (outcome != ObservePollOutcome::ReconciliationRequired)
-            .then_some(deferral.resume),
+        resume: (outcome != ObservePollOutcome::ReconciliationRequired).then_some(deferral.resume),
     };
     if deferral.suboperation == eliotd::governor_observe_serve::ObserveSuboperation::Observation {
         let body = match prepare_observation_capture(kernel, composition, claimed).await {
@@ -4841,8 +4839,7 @@ async fn run_observe_poll(
             // expired/stale attempt response cannot turn that effect into a
             // no-effect outcome; leave the original operation for repair.
             Ok(
-                eliotd::ObserveSubmitOutcome::Expired
-                | eliotd::ObserveSubmitOutcome::StaleAttempt,
+                eliotd::ObserveSubmitOutcome::Expired | eliotd::ObserveSubmitOutcome::StaleAttempt,
             ) => ObservePollOutcome::ReconciliationRequired,
             Err(error) => {
                 kernel
@@ -4897,7 +4894,10 @@ async fn prepare_observation_capture(
     composition: &SharedComposition,
     claimed: &eliotd::ObserveClaimedPair,
 ) -> Result<HostRequestResultBody, String> {
-    let services = ObserveCaptureServices { kernel, composition };
+    let services = ObserveCaptureServices {
+        kernel,
+        composition,
+    };
     let retained = retain_observe_capture(claimed)?;
     let owner_binding = read_current_observe_binding(&services, &retained).await?;
     let initial_selection =
@@ -4936,8 +4936,9 @@ fn retain_observe_capture(
         .as_ref()
         .ok_or_else(|| "Observe claim has no retained executable input".to_owned())?
         .application_binding;
-    if application.request_identity != serde_json::to_value(host_identity)
-        .map_err(|error| format!("Host Observe identity cannot encode: {error}"))?
+    if application.request_identity
+        != serde_json::to_value(host_identity)
+            .map_err(|error| format!("Host Observe identity cannot encode: {error}"))?
     {
         return Err("Observe application binding differs from its admitted identity".to_owned());
     }
@@ -4948,7 +4949,9 @@ fn retain_observe_capture(
         serde_json::from_value(application.source_activation_ticket.clone())
             .map_err(|error| format!("retained activation ticket cannot decode: {error}"))?;
     if claimed.peer_admission_receipt != peer || claimed.source_activation_ticket != ticket {
-        return Err("Observe ORS row differs from its exact peer receipt or activation ticket".to_owned());
+        return Err(
+            "Observe ORS row differs from its exact peer receipt or activation ticket".to_owned(),
+        );
     }
     let owner_binding: ObservationCaptureOwnerBinding =
         serde_json::from_value(application.observation_policy_binding.clone())
@@ -4963,7 +4966,9 @@ fn retain_observe_capture(
             .as_deref()
             .is_some_and(|scope| scope != owner_binding.authenticated_scope_ref)
     {
-        return Err("Observe scope claim differs from the current retained WorkScope owner".to_owned());
+        return Err(
+            "Observe scope claim differs from the current retained WorkScope owner".to_owned(),
+        );
     }
     Ok(RetainedObserveCapture {
         claimed,
@@ -4994,24 +4999,36 @@ fn validate_observe_origin(
             if !matches!(
                 &claimed.source_activation_result.disposition,
                 AgentActivationResolutionDisposition::Resolved { .. }
-            ) || application.principal_ref.as_ref().map(|value| value.as_str())
+            ) || application
+                .principal_ref
+                .as_ref()
+                .map(|value| value.as_str())
                 != Some(authenticated_principal_ref.as_str())
                 || application.session_ref.as_ref().map(|value| value.as_str())
                     != Some(authenticated_session_ref.as_str())
-                || claimed.envelope.identity.session_id
+                || claimed
+                    .envelope
+                    .identity
+                    .session_id
                     .as_deref()
                     .is_some_and(|session| session != authenticated_session_ref)
             {
-                return Err("Observe app owner identity differs from retained Policy origin".to_owned());
+                return Err(
+                    "Observe app owner identity differs from retained Policy origin".to_owned(),
+                );
             }
         }
         ObservationCaptureOwnerOrigin::HostPeer {
             domain,
             peer_admission_receipt,
         } => {
-            let readback = claimed.source_activation_result.observation_host_policy_readback
+            let readback = claimed
+                .source_activation_result
+                .observation_host_policy_readback
                 .as_ref()
-                .ok_or_else(|| "Host-origin capture has no retained negative-result policy readback".to_owned())?;
+                .ok_or_else(|| {
+                    "Host-origin capture has no retained negative-result policy readback".to_owned()
+                })?;
             if *domain != eliot_governor::ObservationCaptureHostOriginDomain::AgentBridge
                 || peer_admission_receipt != &claimed.peer_admission_receipt
                 || application.principal_ref.is_some()
@@ -5024,7 +5041,9 @@ fn validate_observe_origin(
                 || readback.owner_projection_value != application.observation_policy_binding
                 || readback.owner_projection_sha256 != application.observation_policy_binding_sha256
             {
-                return Err("Observe Host-origin binding contains unrelated app selection".to_owned());
+                return Err(
+                    "Observe Host-origin binding contains unrelated app selection".to_owned(),
+                );
             }
         }
     }
@@ -5113,11 +5132,7 @@ async fn resolve_initial_observe_selection(
     let owner = {
         let guard = services.composition.lock().await;
         guard
-            .finish_task_selection_for_request(
-                pending,
-                unix_ms(SystemTime::now())?,
-                acceptance,
-            )
+            .finish_task_selection_for_request(pending, unix_ms(SystemTime::now())?, acceptance)
             .map_err(|error| format!("Observe task selection revalidation: {error}"))?
     };
     if owner.work_scope() != &binding.work_scope_binding
@@ -5210,13 +5225,12 @@ async fn observe_host_workspace(
                 scope,
             ),
         };
-        locator.map_err(|error| format!("Observe retained Host scope workspace locator: {error}"))?
+        locator
+            .map_err(|error| format!("Observe retained Host scope workspace locator: {error}"))?
     };
-    let observed = eliotd::task_binding_admission::observe_explicit_workspace(
-        &root,
-        &retained.state_fence,
-    )
-    .map_err(|error| format!("Observe fresh Host scope observation: {error}"))?;
+    let observed =
+        eliotd::task_binding_admission::observe_explicit_workspace(&root, &retained.state_fence)
+            .map_err(|error| format!("Observe fresh Host scope observation: {error}"))?;
     if !matches!(
         eliotd::task_binding_admission::scope_guard_disposition(
             &binding.work_scope_binding.binding,
@@ -5270,11 +5284,7 @@ async fn revalidate_observe_selection(
     let current = {
         let guard = services.composition.lock().await;
         guard
-            .finish_task_selection_for_request(
-                pending,
-                unix_ms(SystemTime::now())?,
-                acceptance,
-            )
+            .finish_task_selection_for_request(pending, unix_ms(SystemTime::now())?, acceptance)
             .map_err(|error| format!("Observe final task selection revalidation: {error}"))?
     };
     if current.evidence() != previous.evidence()
@@ -5304,12 +5314,17 @@ async fn prepare_governed_capture(
         &retained.policy_origin,
         unix_ms(SystemTime::now())?,
     )?;
-    let current_value = current.canonical_value().map_err(|error| error.to_string())?;
+    let current_value = current
+        .canonical_value()
+        .map_err(|error| error.to_string())?;
     let retained_value = retained
         .owner_binding
         .canonical_value()
         .map_err(|error| error.to_string())?;
-    let admitted_value = admitted.owner_binding.canonical_value().map_err(|error| error.to_string())?;
+    let admitted_value = admitted
+        .owner_binding
+        .canonical_value()
+        .map_err(|error| error.to_string())?;
     if current_value != retained_value
         || current_value != admitted_value
         || guard.governor_kernel_fence() != admitted.live_fence
@@ -5338,8 +5353,9 @@ async fn exchange_governed_capture(
     prepared: &eliot_governor::PreparedMcpObservation,
 ) -> Result<WriteReceipt, String> {
     let receipt = if let Some(owner) = admitted.selection.as_ref() {
-        let (principal, session) = app_identity(&retained.policy_origin)
-            .ok_or_else(|| "task-bound Observe selection lost its authenticated owner".to_owned())?;
+        let (principal, session) = app_identity(&retained.policy_origin).ok_or_else(|| {
+            "task-bound Observe selection lost its authenticated owner".to_owned()
+        })?;
         let task_ref = admitted
             .identity
             .request
@@ -5360,10 +5376,16 @@ async fn exchange_governed_capture(
             &admitted.observed_scope,
             &admitted.live_fence,
         );
-        prepared.exchange().exchange(&port).await
+        prepared
+            .exchange()
+            .exchange(&port)
+            .await
             .map_err(|error| format!("Governor Observe capture exchange: {error}"))?
     } else {
-        prepared.exchange().exchange(services.kernel).await
+        prepared
+            .exchange()
+            .exchange(services.kernel)
+            .await
             .map_err(|error| format!("Governor cold Observe capture exchange: {error}"))?
     };
     if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
@@ -5467,7 +5489,9 @@ fn observe_result_body(
             .proof_ceiling
             .is_at_most(eliot_receipts::ProofCeiling::Observation)
     {
-        return Err("Observe completion does not retain a capture-only canonical receipt".to_owned());
+        return Err(
+            "Observe completion does not retain a capture-only canonical receipt".to_owned(),
+        );
     }
     let response = if stale_context {
         serde_json::json!({
