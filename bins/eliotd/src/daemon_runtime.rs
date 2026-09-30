@@ -225,6 +225,9 @@ enum ActivationCompletion {
 struct ActivationResolvedTicket {
     ticket: AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
+    /// Shared composition retained for the post-acceptance readiness-owner
+    /// bind. It is not held across any Kernel await or blocking scanner call.
+    composition: SharedComposition,
     /// The exact Host-observed bounded discovery lease/key/evidence created
     /// while resolving this ticket. The accepted-result trigger consumes this
     /// value; it never re-observes the workspace or recreates the lease.
@@ -342,7 +345,13 @@ fn start_activation_resolve(
             Ok(now) => now,
             Err(error) => return ActivationCompletion::Resolve(Err(error)),
         };
-        ActivationCompletion::Resolve(resolve_valid_ticket(&guard, kernel_owner, ticket, now))
+        ActivationCompletion::Resolve(resolve_valid_ticket(
+            &guard,
+            Arc::clone(&composition),
+            kernel_owner,
+            ticket,
+            now,
+        ))
     })
 }
 
@@ -3092,6 +3101,7 @@ async fn submit_supervision_heartbeat(
 /// surfaced only once a `Resolved` result actually needs the pair.
 fn resolve_valid_ticket(
     composition: &DaemonComposition,
+    readiness_composition: SharedComposition,
     kernel_owner: Result<Option<AgentActivationKernelOwnerReadback>, String>,
     ticket: AgentActivationResolutionTicket,
     now: u64,
@@ -3207,6 +3217,7 @@ fn resolve_valid_ticket(
     Ok(Some(Box::new(ActivationResolvedTicket {
         ticket,
         result,
+        composition: readiness_composition,
         cold_start_discovery,
         owner_readback,
     })))
@@ -3231,6 +3242,7 @@ fn start_activation_dispatch(
         Box::pin(async move {
             let outcome = dispatch_agent_activation_result(
                 kernel_clone,
+                resolved.composition,
                 &resolved.ticket,
                 resolved.result,
                 resolved.owner_readback,
@@ -6136,6 +6148,7 @@ async fn testd_owner_drain_admitted(composition: &SharedComposition) -> bool {
 /// carried in diagnostics.
 async fn dispatch_agent_activation_result(
     kernel: Arc<DaemonKernelClient>,
+    composition: SharedComposition,
     ticket: &AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
     owner_readback: Option<eliot_protocol::AgentActivationOwnerReadback>,
@@ -6158,7 +6171,13 @@ async fn dispatch_agent_activation_result(
     {
         Ok(ack) => {
             classify_submit_ack(ticket, &result, &ack)?;
-            trigger_accepted_cold_start(&kernel, ticket, cold_start_discovery).await;
+            trigger_accepted_cold_start(
+                &kernel,
+                Arc::clone(&composition),
+                ticket,
+                cold_start_discovery,
+            )
+            .await;
             Ok(())
         }
         // #839 (W14/A3): the submit failure's own provenance now decides the
@@ -6193,7 +6212,13 @@ async fn dispatch_agent_activation_result(
                     ))
                 })?;
             classify_reconcile_ack(ticket, &result, &ack, &submit_detail)?;
-            trigger_accepted_cold_start(&kernel, ticket, cold_start_discovery).await;
+            trigger_accepted_cold_start(
+                &kernel,
+                Arc::clone(&composition),
+                ticket,
+                cold_start_discovery,
+            )
+            .await;
             Ok(())
         }
     }
@@ -6205,6 +6230,7 @@ async fn dispatch_agent_activation_result(
 /// paths.
 async fn trigger_accepted_cold_start(
     kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
     ticket: &AgentActivationResolutionTicket,
     discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
 ) {
@@ -6212,8 +6238,50 @@ async fn trigger_accepted_cold_start(
         let kernel = Arc::clone(kernel);
         let ticket_id = ticket.ticket_id.clone();
         let worker_ticket = ticket.clone();
+        let route_kernel = Arc::clone(&kernel);
+        let route_connection_id = ticket.connection_id.clone();
+        let route_ticket_id = ticket.ticket_id.clone();
+        let contour_result = tokio::task::spawn_blocking(move || {
+            eliotd::task_binding_admission::request_scan_disclosure_contour(
+                &route_kernel,
+                &route_connection_id,
+                &route_ticket_id,
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(format!(
+                "accepted activation readiness contour worker failed closed: {error}"
+            ))
+        });
+        if let Ok(contour) = &contour_result {
+            let owner = Arc::new(
+                eliotd::task_binding_admission::KernelColdStartReadinessRecordOwner::new(
+                    Arc::clone(&kernel),
+                    ticket.connection_id.clone(),
+                    ticket.ticket_id.clone(),
+                ),
+            );
+            let bind_result = composition
+                .lock()
+                .await
+                .bind_cold_start_readiness_owner(contour, owner);
+            if let Err(error) = bind_result {
+                tracing::warn!(
+                    ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                    error = %error,
+                    "accepted activation readiness owner bind refused"
+                );
+            }
+        } else if let Err(error) = &contour_result {
+            tracing::warn!(
+                ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                error = %error,
+                "accepted activation readiness contour unavailable"
+            );
+        }
         tokio::task::spawn_blocking(move || {
-            trigger_cold_start_controller(&kernel, &worker_ticket, discovery)
+            trigger_cold_start_controller(&kernel, &worker_ticket, discovery, contour_result)
         })
         .await
         .map_or_else(
@@ -6256,14 +6324,16 @@ async fn trigger_accepted_cold_start(
 /// Fires the I4.4.1 `AttachOrLaunch` trigger only after Kernel accepted the
 /// exact typed activation result. The same retained Host lease/evidence is
 /// passed to `ColdStartController`; no second filesystem observation or new
-/// lease is created. The authenticated owner route and scanner adapter are
-/// reachable here. Completion remains fail-closed while the durable ORS
-/// generation, admitted privacy policy, and Kernel-visible lease owner have
-/// no current producers.
+/// lease is created. The accepted ticket now binds the authenticated readiness
+/// transport adapter to the installation contour. The current Host discovery
+/// still lacks admitted privacy-boundary and governing-source digest evidence,
+/// so it can deliver its typed smallest-question result but cannot construct a
+/// durable readiness claim, join a lease, or compile a terminal receipt.
 fn trigger_cold_start_controller(
     kernel: &Arc<DaemonKernelClient>,
     ticket: &AgentActivationResolutionTicket,
     mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
+    contour_result: Result<eliot_governor::InstallationScanContour, String>,
 ) -> Result<eliot_workscope::BootstrapScanOutcome, String> {
     let now = unix_ms(SystemTime::now())?;
     let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
@@ -6276,11 +6346,6 @@ fn trigger_cold_start_controller(
     // Every accepted explicit attach reaches the authenticated installation
     // owner routes. The contour and binding are derived there; this caller
     // supplies no authority-bearing storage or binding fields.
-    let contour_result = eliotd::task_binding_admission::request_scan_disclosure_contour(
-        kernel,
-        &ticket.connection_id,
-        &ticket.ticket_id,
-    );
     let binding_result = eliotd::task_binding_admission::request_scan_disclosure_binding(
         kernel,
         &ticket.connection_id,
