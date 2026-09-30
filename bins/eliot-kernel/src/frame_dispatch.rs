@@ -1484,6 +1484,18 @@ fn is_daemon_operation(operation: &str) -> bool {
             // payload.
             | super::daemon_request_dispatch::GRANT_CLOSURE_RECEIPT_OPERATION
             | super::daemon_request_dispatch::LINK_GRANT_CLOSURE_RECEIPT_OPERATION
+            // Issue #1694 W2: the persist-before-ack maintenance-trigger
+            // intake. The marker is the one string the admitted dispatch arm
+            // already serves
+            // (`MAINTENANCE_TRIGGER_INTAKE_OPERATION`); it was absent here,
+            // so the frame fell through every predicate, failed the
+            // `ProcessExecutionRequest` decode, and fenced the session
+            // before the arm was ever entered. The entry only lets the frame
+            // reach the arm: the arm still proves the module binding, the
+            // peer principal, and the exact session State Fence, and staging
+            // proof plus ledger admission still come from the gateway owner
+            // rather than the payload.
+            | super::daemon_request_dispatch::MAINTENANCE_TRIGGER_INTAKE_OPERATION
             | "store_recovery"
             | "store_initialize_genesis"
             | "apply_prepared"
