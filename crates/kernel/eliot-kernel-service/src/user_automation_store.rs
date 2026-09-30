@@ -2110,6 +2110,48 @@ const AUTOMATION_NORMALIZATION_OPERATION_KIND: &str = "user-automation.schedule.
 /// Stable authority identity of the schedule normalizer on this leg.
 const AUTOMATION_NORMALIZATION_AUTHORITY_ID: &str = "eliot-user-automation:schedule-normalizer";
 
+/// Owner-issued task and session bindings for the normalization envelope.
+///
+/// The task/session bindings mirror the canonical Store receipt owner: a
+/// request that carries a task without the fence revision that task is pinned
+/// at cannot be bound honestly, so it is refused here instead of being
+/// committed with the binding dropped. The refusal stays ahead of any receipt
+/// construction, exactly where it stood inline, so a request carrying a task
+/// without its fence revision is still rejected before any envelope identity is
+/// derived.
+fn owner_normalization_bindings(
+    request: &UserAutomationStoreRequest,
+    state_fence: &StateFence,
+) -> Result<(Option<TaskBinding>, Option<SessionBinding>), StoreError> {
+    let task = match (
+        request.context.task_id.clone(),
+        state_fence.task_revision.clone(),
+    ) {
+        (Some(task_id), Some(task_revision)) => Some(TaskBinding {
+            task_id,
+            task_revision,
+            state_fence: state_fence.clone(),
+        }),
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(StoreError::InvalidField {
+                field: "automation.context.task_id",
+                reason: "normalization receipt requires the fenced task revision",
+            });
+        }
+    };
+    let session = request
+        .context
+        .session_id
+        .clone()
+        .map(|session_id| SessionBinding {
+            session_id,
+            authority_epoch: state_fence.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+        });
+    Ok((task, session))
+}
+
 /// Returns the immutable revision with the owner-issued schedule normalization
 /// receipt this Store leg mints over exactly that revision's compiled occurrence
 /// set, together with the canonical envelope that receipt projects out of.
@@ -2173,33 +2215,7 @@ fn revision_with_owner_normalization_receipt(
     revision: &UserAutomationRevision,
 ) -> Result<(UserAutomationRevision, ReceiptEnvelope), StoreError> {
     let state_fence = request.context.state_fence.clone();
-    // The owner-issued task/session bindings mirror the canonical Store
-    // receipt owner: a request that carries a task without the fence revision
-    // that task is pinned at cannot be bound honestly, so it is refused here
-    // instead of being committed with the binding dropped.
-    let task = match (request.context.task_id.clone(), state_fence.task_revision) {
-        (Some(task_id), Some(task_revision)) => Some(TaskBinding {
-            task_id,
-            task_revision,
-            state_fence: state_fence.clone(),
-        }),
-        (None, _) => None,
-        (Some(_), None) => {
-            return Err(StoreError::InvalidField {
-                field: "automation.context.task_id",
-                reason: "normalization receipt requires the fenced task revision",
-            });
-        }
-    };
-    let session = request
-        .context
-        .session_id
-        .clone()
-        .map(|session_id| SessionBinding {
-            session_id,
-            authority_epoch: state_fence.authority_epoch.clone(),
-            state_fence: state_fence.clone(),
-        });
+    let (task, session) = owner_normalization_bindings(request, &state_fence)?;
     let core = ReceiptCore {
         contract: eliot_receipts::contract_identity().map_err(StoreError::Receipt)?,
         kind: ReceiptKind::Verification,
