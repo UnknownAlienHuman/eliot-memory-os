@@ -176,8 +176,11 @@ impl<'de> serde::de::Visitor<'de> for ObservabilityWriteEnvelopeVisitor {
                 "input_hash" => set_once(&mut input_hash, map.next_value()?, "input_hash")?,
                 "created_at" => {
                     let value = map.next_value::<String>()?;
-                    let parsed = OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
-                        .map_err(serde::de::Error::custom)?;
+                    let parsed = OffsetDateTime::parse(
+                        &value,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .map_err(serde::de::Error::custom)?;
                     set_once(&mut created_at, parsed, "created_at")?;
                 }
                 _ => {
