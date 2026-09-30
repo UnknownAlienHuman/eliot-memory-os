@@ -1178,6 +1178,7 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-cue-contracts",
+ "eliot-epistemic-context-provider",
  "eliot-epistemic-contracts",
  "eliot-evidence",
  "eliot-learning-contracts",

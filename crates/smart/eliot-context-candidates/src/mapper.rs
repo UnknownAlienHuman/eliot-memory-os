@@ -613,7 +613,11 @@ fn collect_epistemic(
         // that would silently widen if the enum grows.
         Currentness::Superseded => slot.clone(),
     };
-    let derived = derive_epistemic(input, &registered.provider, AtomAvailability::PresentCurrent)?;
+    let derived = derive_epistemic(
+        input,
+        &registered.provider,
+        AtomAvailability::PresentCurrent,
+    )?;
     for member in &derived {
         let rule = kind_rule(PROVIDER_EPISTEMIC, member.kind.as_str())
             .ok_or(ContextError::InvalidField("epistemic.kind"))?;
