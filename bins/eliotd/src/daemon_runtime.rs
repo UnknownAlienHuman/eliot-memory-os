@@ -59,6 +59,7 @@ use eliot_protocol::{
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus, WriteReceipt};
+use eliotd::OwnerSelectionKernelPort;
 use eliotd::diagnostics::RepeatedFailureGuard;
 use eliotd::startup_capability_bindings::{
     DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
@@ -73,7 +74,6 @@ use eliotd::testd_terminal_completion::{
     emit_testd_owner_drain_skip, query_testd_owner_pending_dispatches,
     query_testd_owner_terminal_evidence,
 };
-use eliotd::OwnerSelectionKernelPort;
 use eliotd::{
     ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
     DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
@@ -4890,9 +4890,7 @@ fn start_observe_poll(
     let kernel_clone = Arc::clone(kernel);
     let composition_clone = Arc::clone(composition);
     Box::pin(async move {
-        ObserveCompletion::Settled(
-            run_observe_poll(&kernel_clone, &composition_clone).await,
-        )
+        ObserveCompletion::Settled(run_observe_poll(&kernel_clone, &composition_clone).await)
     })
 }
 
@@ -5011,8 +5009,7 @@ async fn run_observe_poll(
         return Ok(step(outcome));
     }
     let outcome =
-        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, attempt)
-            .await?
+        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, attempt).await?
         {
             ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
             ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,
@@ -5042,8 +5039,9 @@ async fn prepare_observation_capture(
     let retained_policy_value = &application.observation_policy_binding;
     let retained_policy_digest = &application.observation_policy_binding_sha256;
     let retained_capture_clock = application.clock_reading.clone();
-    if application.request_identity != serde_json::to_value(&identity)
-        .map_err(|error| format!("Observe identity cannot encode: {error}"))?
+    if application.request_identity
+        != serde_json::to_value(&identity)
+            .map_err(|error| format!("Observe identity cannot encode: {error}"))?
         || application.state_fence != claimed.envelope.state_fence
         || application.session_ref.as_str()
             != identity
@@ -5053,7 +5051,10 @@ async fn prepare_observation_capture(
                 .as_ref()
                 .map(eliot_contracts::SessionId::as_str)
                 .unwrap_or_default()
-        || application.task_ref.as_ref().map(eliot_contracts::TaskId::as_str)
+        || application
+            .task_ref
+            .as_ref()
+            .map(eliot_contracts::TaskId::as_str)
             != identity
                 .request
                 .metadata
@@ -5088,7 +5089,9 @@ async fn prepare_observation_capture(
             || current_value != *retained_policy_value
             || &current_digest != retained_policy_digest
         {
-            return Err("Observe retained policy/work-scope owners are stale or changed".to_owned());
+            return Err(
+                "Observe retained policy/work-scope owners are stale or changed".to_owned(),
+            );
         }
         binding
     };
@@ -5132,11 +5135,7 @@ async fn prepare_observation_capture(
         let owner = {
             let guard = composition.lock().await;
             let owner = guard
-                .finish_task_selection_for_request(
-                    pending,
-                    unix_ms(SystemTime::now())?,
-                    acceptance,
-                )
+                .finish_task_selection_for_request(pending, unix_ms(SystemTime::now())?, acceptance)
                 .map_err(|error| format!("Observe task selection revalidation: {error}"))?;
             if owner.work_scope() != &work_scope
                 || owner.principal_ref() != principal_ref
@@ -5144,7 +5143,9 @@ async fn prepare_observation_capture(
                 || owner.task_ref() != task_ref.as_str()
                 || owner.state_fence() != &claimed.envelope.state_fence
             {
-                return Err("Observe task selection does not match retained owner inputs".to_owned());
+                return Err(
+                    "Observe task selection does not match retained owner inputs".to_owned(),
+                );
             }
             owner
         };
@@ -5170,20 +5171,14 @@ async fn prepare_observation_capture(
                 .activation_workspace_locator_for_selection(owner)
                 .map_err(|error| format!("Observe retained task workspace locator: {error}"))?,
             None => guard
-                .activation_workspace_locator_for_scope(
-                    &principal_ref,
-                    session_ref,
-                    &work_scope,
-                )
+                .activation_workspace_locator_for_scope(&principal_ref, session_ref, &work_scope)
                 .map_err(|error| format!("Observe retained scope workspace locator: {error}"))?,
         }
     };
     let live_fence = claimed.envelope.state_fence.clone();
-    let observed_scope = eliotd::task_binding_admission::observe_explicit_workspace(
-        &explicit_root,
-        &live_fence,
-    )
-    .map_err(|error| format!("Observe fresh Host scope observation: {error}"))?;
+    let observed_scope =
+        eliotd::task_binding_admission::observe_explicit_workspace(&explicit_root, &live_fence)
+            .map_err(|error| format!("Observe fresh Host scope observation: {error}"))?;
     if !matches!(
         eliotd::task_binding_admission::scope_guard_disposition(
             &work_scope.binding,
@@ -5238,11 +5233,7 @@ async fn prepare_observation_capture(
         let current = {
             let guard = composition.lock().await;
             guard
-                .finish_task_selection_for_request(
-                    pending,
-                    unix_ms(SystemTime::now())?,
-                    acceptance,
-                )
+                .finish_task_selection_for_request(pending, unix_ms(SystemTime::now())?, acceptance)
                 .map_err(|error| format!("Observe final task selection revalidation: {error}"))?
         };
         if current.evidence() != previous.evidence()
@@ -5267,8 +5258,12 @@ async fn prepare_observation_capture(
         let current = guard
             .observation_capture_owner_binding(&identity, &principal_ref)
             .map_err(|error| format!("Observe owner revalidation before prepare: {error}"))?;
-        if current.canonical_value().map_err(|error| error.to_string())?
-            != capture_binding.canonical_value().map_err(|error| error.to_string())?
+        if current
+            .canonical_value()
+            .map_err(|error| error.to_string())?
+            != capture_binding
+                .canonical_value()
+                .map_err(|error| error.to_string())?
             || guard.governor_kernel_fence() != live_fence
         {
             return Err("Observe owners changed before capture preparation".to_owned());

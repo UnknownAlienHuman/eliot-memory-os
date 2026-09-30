@@ -187,8 +187,8 @@ use crate::problem_owner_transitions::{
     ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
 use crate::{
-    CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
-    FinishAttemptError, KernelTransitionPort, PolicyOwner, TaskSelectionAdmissionBinding,
+    CanonicalAdmissionOwner, CompositionError, CompositionReadiness, FinishAttemptError,
+    KernelPortError, KernelTransitionPort, PolicyOwner, TaskSelectionAdmissionBinding,
 };
 
 /// Exact current observation-ingress policy retained from the admitted
@@ -276,12 +276,18 @@ impl ObservationCaptureOwnerBinding {
     pub fn validate(&self) -> Result<(), CompositionError> {
         if self.wire_version != 1
             || self.authenticated_principal_ref.trim().is_empty()
-            || self.authenticated_principal_ref.chars().any(char::is_control)
+            || self
+                .authenticated_principal_ref
+                .chars()
+                .any(char::is_control)
             || self.authenticated_session_ref.trim().is_empty()
             || self.authenticated_session_ref.chars().any(char::is_control)
-            || self.authenticated_task_ref.as_ref().is_some_and(|task_ref| {
-                task_ref.trim().is_empty() || task_ref.chars().any(char::is_control)
-            })
+            || self
+                .authenticated_task_ref
+                .as_ref()
+                .is_some_and(|task_ref| {
+                    task_ref.trim().is_empty() || task_ref.chars().any(char::is_control)
+                })
             || self.authenticated_scope_ref.trim().is_empty()
             || self.authenticated_scope_ref.chars().any(char::is_control)
             || self.policy_owner_revision == 0
@@ -620,11 +626,11 @@ struct ObservationContentWire {
     source_handles: Vec<String>,
 }
 
-fn validate_observation_content(
-    content: &ObservationContentWire,
-) -> Result<(), CompositionError> {
+fn validate_observation_content(content: &ObservationContentWire) -> Result<(), CompositionError> {
     if content.content.is_null() {
-        return Err(owner_refused("MCP ObservationContent.content must not be null"));
+        return Err(owner_refused(
+            "MCP ObservationContent.content must not be null",
+        ));
     }
     for (references, field) in [
         (&content.affected_resources, "affected_resources"),
@@ -670,8 +676,7 @@ fn mcp_observation_envelope(
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
-        scope_id: ScopeId::new(work_scope_ref)
-            .map_err(|error| owner_refused(error.to_string()))?,
+        scope_id: ScopeId::new(work_scope_ref).map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity
             .request
             .metadata
@@ -745,7 +750,9 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
 
     /// Returns the current explicit local-private capture policy with its
     /// unchanged canonical Policy owner provenance.
-    pub fn current_ingress_policy(&self) -> Result<ObservationIngressPolicyBinding, CompositionError> {
+    pub fn current_ingress_policy(
+        &self,
+    ) -> Result<ObservationIngressPolicyBinding, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -784,7 +791,10 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             ));
         }
         if input.authenticated_principal_ref.trim().is_empty()
-            || input.authenticated_principal_ref.chars().any(char::is_control)
+            || input
+                .authenticated_principal_ref
+                .chars()
+                .any(char::is_control)
         {
             return Err(identity_refused(
                 "authenticated Observe principal must be non-blank and free of controls",
@@ -796,15 +806,17 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                 "Observation ingress policy is stale for the authenticated request fence",
             ));
         }
-        let current_scope = self
-            .current_work_scope(fence)?;
+        let current_scope = self.current_work_scope(fence)?;
         if current_scope != input.work_scope {
             return Err(identity_refused(
                 "supplied WorkScope snapshot is not the current exact owner snapshot",
             ));
         }
 
-        let task_selection = match (&input.identity.request.metadata.task_id, &input.task_selection) {
+        let task_selection = match (
+            &input.identity.request.metadata.task_id,
+            &input.task_selection,
+        ) {
             (Some(task_id), Some(selection)) => {
                 if selection.task_ref() != task_id.as_str()
                     || selection.session_ref()
@@ -819,8 +831,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                     || selection.principal_ref() != input.authenticated_principal_ref
                     || selection.state_fence() != fence
                     || selection.work_scope() != &current_scope
-                    || selection.evidence().work_scope_ref
-                        != current_scope.binding.scope.scope_ref
+                    || selection.evidence().work_scope_ref != current_scope.binding.scope.scope_ref
                 {
                     return Err(CompositionError::Kernel(
                         KernelPortError::TaskScopeIncompatible,
@@ -874,10 +885,18 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                     affected_scope: ObservationScope {
                         work_scope: WorkScopeId::new(scope_ref)
                             .map_err(|error| owner_refused(error.to_string()))?,
-                        task_ref: task_selection.as_ref().map(|selection| selection.task_ref.clone()),
+                        task_ref: task_selection
+                            .as_ref()
+                            .map(|selection| selection.task_ref.clone()),
                         attempt_ref: None,
                         module_or_route_ref: Some(
-                            input.identity.request.metadata.source_id.as_str().to_owned(),
+                            input
+                                .identity
+                                .request
+                                .metadata
+                                .source_id
+                                .as_str()
+                                .to_owned(),
                         ),
                     },
                     observed_delta,
@@ -926,21 +945,14 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                 )));
             }
         }
-        let envelope = mcp_observation_envelope(
-            &input.identity,
-            &input.operation_id,
-            &submission,
-            scope_ref,
-        )?;
-        let exchange = crate::finish_attempt::prepare_exchange(
-            self.canonical,
-            &input.identity,
-            envelope,
-        )
-        .map_err(|error| match error {
-            FinishAttemptError::Composition(error) => error,
-            other => owner_refused(other.to_string()),
-        })?;
+        let envelope =
+            mcp_observation_envelope(&input.identity, &input.operation_id, &submission, scope_ref)?;
+        let exchange =
+            crate::finish_attempt::prepare_exchange(self.canonical, &input.identity, envelope)
+                .map_err(|error| match error {
+                    FinishAttemptError::Composition(error) => error,
+                    other => owner_refused(other.to_string()),
+                })?;
         let access = ObservationCaptureAccess {
             privacy: current_scope.binding.privacy_class,
             visibility: ObservationCaptureVisibility::LocalOnly,
