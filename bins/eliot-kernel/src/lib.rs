@@ -4482,9 +4482,32 @@ impl KernelComposition {
     pub async fn shutdown(&self) -> Result<ShutdownOutcome, ProcessExecutionError> {
         let coordinator =
             coordinator_for(&self.work_root).map_err(ProcessExecutionError::Unavailable)?;
-        coordinator
+        // #1686 item 2: freeze the admission scope with the request — the
+        // lease census observation code plus the live module set — so the
+        // gate closure in `run_shutdown_drain` can tell ordinary work that
+        // arrived between admission and closure from work already in scope.
+        // A live repeat keeps the earlier freeze rather than moving the
+        // admission instant; a generation that never froze (for example after
+        // a control-plane request) freezes here, still before the gate. A
+        // contour this read cannot hold is an unsampled frontier, not an
+        // empty module set: the freeze is skipped rather than fabricated, and
+        // the gate then has nothing to compare. An unreadable census is still
+        // sampled honestly as its `unavailable` code; the later
+        // StoreStopLeaseZero census fails closed on it.
+        let admitted = coordinator
             .request_shutdown()
             .map_err(ProcessExecutionError::Unavailable)?;
+        if admitted || coordinator.admission_scope().is_none() {
+            let admission_census = self.idle_lease_census();
+            if let Ok(admission_modules) = self.drain_live_branches() {
+                coordinator
+                    .record_admission_scope(
+                        admission_census.observation_code().to_owned(),
+                        admission_modules,
+                    )
+                    .map_err(ProcessExecutionError::Unavailable)?;
+            }
+        }
         // Issue #1837: durable audit evidence for shutdown phases.
         self.audit_observe(AuditEventDraft::shutdown_drain_requested());
         // Issue #1839 (I16.4 quiesce): the drain request quiesces daemon
@@ -4712,19 +4735,29 @@ impl KernelComposition {
 
         // AdmissionsClosed: the service gate closes normal admission; the
         // frame-dispatch Ready gate denies new work from `Draining` on.
-        match self.apply_control(KernelControlCommand::Drain) {
-            Ok(state) => record(
-                ShutdownPhase::AdmissionsClosed,
-                format!("service-drain-admitted:{state}"),
-            )?,
+        let gate_detail = match self.apply_control(KernelControlCommand::Drain) {
+            Ok(state) => format!("service-drain-admitted:{state}"),
             Err(_) => match self.service_state() {
-                Ok(KernelServiceState::Draining | KernelServiceState::Stopped) => record(
-                    ShutdownPhase::AdmissionsClosed,
-                    "service-already-draining".to_owned(),
-                )?,
+                Ok(KernelServiceState::Draining | KernelServiceState::Stopped) => {
+                    "service-already-draining".to_owned()
+                }
                 _ => return Err(DrainHalt::new("admissions-close-rejected")),
             },
-        }
+        };
+        // Scope-freeze arrival revalidation (#1686 item 2, Kernel half): the
+        // admission froze the lease census code and the live module set, so a
+        // lease obligation or a module that appears between the snapshot and
+        // the gate entered as ordinary work in the race window and blocks the
+        // drain with its residual instead of passing unaccounted. Releases
+        // are drain progress, not new work: an admission that already carried
+        // leases imposes no census equality, and a module that disappears
+        // imposes none either — only arrivals race. Unsampled generations
+        // carry no freezable scope, so there is nothing to compare them
+        // against. I14.3 is preserved: this gates only normal-work arrivals,
+        // never the checkpoint/cancel/reconcile protected capacity, which
+        // travels the control-request path.
+        self.revalidate_admission_scope_freeze(coordinator)?;
+        record(ShutdownPhase::AdmissionsClosed, gate_detail)?;
 
         // AuthorityRevoked: with the service `Draining`, no new action
         // authority is admitted; post-linearization control/cutover authority
@@ -4802,9 +4835,36 @@ impl KernelComposition {
                 return Err(DrainHalt::new(reason));
             }
         }
+        // Unknown-transaction gate (#1686 item 5, Kernel half): retained
+        // unreconciled unknown-outcome store failures and still-open
+        // unknown-commit records fence the drain through the same typed
+        // rescan machinery as the rebind family. Committed and proven-aborted
+        // transactions are terminal evidence the observer never registers, so
+        // they cannot fence; an unknown is never cleared because a task
+        // stopped — only a resolving receipt observed here removes it, and any
+        // remainder makes this drain incomplete with its exact residuals.
+        let mut known_open_commits = BTreeSet::new();
+        match coordinator
+            .reconcile_pending_observation(
+                DRAIN_RECEIPT_DEADLINE,
+                ReceiptOwnerFamily::StoreUnknownOutcome,
+                |remaining| {
+                    self.pending_unknown_transaction_receipts(&mut known_open_commits, remaining)
+                },
+            )
+            .await
+        {
+            ReceiptReconciliation::Reconciled => {}
+            ReceiptReconciliation::Incomplete { pending, reason } => {
+                return Err(DrainHalt::with_pending(reason, pending));
+            }
+            ReceiptReconciliation::Unavailable { reason } => {
+                return Err(DrainHalt::new(reason));
+            }
+        }
         record(
             ShutdownPhase::CanonicalDrainReceiptsReconciled,
-            "store-rebind-pending-reconciled-empty;supervision-lease-staging-owned-by-lease-authority-handoff;host-request-staging-owned-by-governor-handoff"
+            "store-rebind-pending-reconciled-empty;store-unknown-outcome-reconciled-empty;supervision-lease-staging-owned-by-lease-authority-handoff;host-request-staging-owned-by-governor-handoff"
                 .to_owned(),
         )?;
 
@@ -4835,25 +4895,10 @@ impl KernelComposition {
         // refused there rather than placed by assumption. This phase records
         // the quiesce *request* against that derived order; each owner's
         // completed stop is recorded separately at the phase that owner stops
-        // in, from that owner's own post-stop state.
-        let mut live_branches: Vec<String> = Vec::new();
-        #[cfg(windows)]
-        match self.canonical_store_gateway.lock() {
-            Ok(gateway) => {
-                if gateway.is_some() {
-                    live_branches.push(shutdown_drain::STORE_BRIDGE_BRANCH.to_owned());
-                }
-            }
-            Err(_) => return Err(DrainHalt::new("store-contour-unavailable")),
-        }
-        match self.daemon_active_launch.lock() {
-            Ok(launch) => {
-                if launch.is_some() {
-                    live_branches.push(shutdown_drain::DAEMON_BRANCH.to_owned());
-                }
-            }
-            Err(_) => return Err(DrainHalt::new("daemon-contour-unavailable")),
-        }
+        // in, from that owner's own post-stop state. The contour is the same
+        // live-branch read the admission froze, so the quiesce request and
+        // the gate race check observe one contour through one reader.
+        let live_branches = self.drain_live_branches()?;
         let quiescence = reverse_quiescence_order(&live_branches)
             .map_err(|_| DrainHalt::new("module-contour-unprovable"))?;
         record(
@@ -5229,6 +5274,203 @@ impl KernelComposition {
             complete,
             absence_resolves: false,
             revision,
+            pending,
+            resolved,
+        })
+    }
+
+    /// Live module branches sampled from the declared quiescence vocabulary
+    /// (#1686 item 2, Kernel half): the same two contour reads the
+    /// `ModulesQuiescedReverse` phase consumes, so the admission freeze and
+    /// the quiesce request observe one contour through one reader. Only
+    /// presence is reported, in a deterministic order — never owner state —
+    /// and a poisoned guard is fenced state reported as a halt, never an
+    /// empty set.
+    fn drain_live_branches(&self) -> Result<Vec<String>, DrainHalt> {
+        let mut branches = Vec::new();
+        #[cfg(windows)]
+        match self.canonical_store_gateway.lock() {
+            Ok(gateway) => {
+                if gateway.is_some() {
+                    branches.push(shutdown_drain::STORE_BRIDGE_BRANCH.to_owned());
+                }
+            }
+            Err(_) => return Err(DrainHalt::new("store-contour-unavailable")),
+        }
+        match self.daemon_active_launch.lock() {
+            Ok(launch) => {
+                if launch.is_some() {
+                    branches.push(shutdown_drain::DAEMON_BRANCH.to_owned());
+                }
+            }
+            Err(_) => return Err(DrainHalt::new("daemon-contour-unavailable")),
+        }
+        branches.sort();
+        Ok(branches)
+    }
+
+    /// Revalidates the frozen admission scope at gate closure (#1686 item 2,
+    /// Kernel half): arrivals since admission refuse the drain with named
+    /// residuals rather than passing unaccounted. Only arrivals race — a
+    /// lease release or a module that disappeared is drain progress — and an
+    /// unsampled generation carries nothing to compare, so the gate skips it.
+    fn revalidate_admission_scope_freeze(
+        &self,
+        coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,
+    ) -> Result<(), DrainHalt> {
+        let Some((admission_census, admission_modules)) = coordinator.admission_scope() else {
+            return Ok(());
+        };
+        let mut race_residuals = Vec::new();
+        // `idle` is the frozen durable literal the census owner emits for the
+        // zero-obligation answer (`idle_lease_census.rs`); the comparison
+        // names that same literal rather than re-deriving it, so a recorded
+        // freeze keeps meaning what the owner meant when it was sampled.
+        if admission_census == "idle" {
+            let gate_census = self.idle_lease_census();
+            if gate_census.observation_code() != "idle" {
+                race_residuals.push(format!(
+                    "admission-lease-raced:{}",
+                    gate_census.observation_code()
+                ));
+            }
+        }
+        // A fenced contour read proves no frontier at all: the drain cannot
+        // pass unaccounted, so the halt names the unreadable read rather than
+        // the race it could not observe.
+        let gate_modules = self.drain_live_branches()?;
+        for branch in &gate_modules {
+            if !admission_modules
+                .iter()
+                .any(|admitted| admitted == branch)
+            {
+                race_residuals.push(format!("admission-module-raced:{branch}"));
+            }
+        }
+        if race_residuals.is_empty() {
+            return Ok(());
+        }
+        Err(DrainHalt::with_pending(
+            "drain-admission-raced-gate-closure",
+            race_residuals,
+        ))
+    }
+
+    /// Reads the ORS unknown-outcome family as one typed, bounded observation
+    /// for the drain gate (#1686 item 5, Kernel half). Read-only: shutdown
+    /// never mutates staged rows or recovery records.
+    ///
+    /// Every retained failure is reported with the exact operation/request
+    /// binding the owner stored. Only unreconciled `UnknownOutcome`
+    /// retentions and still-open unknown-commit records fence: committed and
+    /// proven-aborted transactions are terminal evidence this observer never
+    /// registers. Resolution is proven only by a resolving receipt
+    /// (`reconciled_receipt`, or an exact `load_unknown_commit` proof for a
+    /// key that left the open list via the known-keys carry below); absence
+    /// never resolves, and an unknown is never cleared because a task
+    /// stopped. The observation reports revision zero; the reconciliation
+    /// loop's monotonicity guard neither clears nor blocks on it.
+    ///
+    /// `known_open_commits` carries the idempotency keys this gate already saw
+    /// open across rescan ticks, so a key that left the open list is proven
+    /// resolved with an exact read instead of being cleared by absence. A key
+    /// that vanished without a resolving receipt, or whose proof read fails,
+    /// is omitted: absence keeps the registered obligation fenced.
+    ///
+    /// `budget` bounds this tick's owner reads: the reconciliation loop hands
+    /// each rescan only the time still remaining on the drain receipt
+    /// deadline, and a scan that exhausts it between reads reports an
+    /// unavailable observation — proving nothing — instead of extending the
+    /// deadline. I14.23 deadline expiry then retains the residuals rather than
+    /// silently discarding them.
+    fn pending_unknown_transaction_receipts(
+        &self,
+        known_open_commits: &mut BTreeSet<String>,
+        budget: Duration,
+    ) -> Result<ReceiptRescanObservation, String> {
+        let scan_start = Instant::now();
+        let budget_exhausted = || scan_start.elapsed() >= budget;
+        let failures = self
+            .generation_gateway
+            .ors
+            .load_all_store_failures()
+            .map_err(|_| "ors-unknown-scan-failed".to_owned())?;
+        if budget_exhausted() {
+            return Err("ors-unknown-scan-budget-exhausted".to_owned());
+        }
+        let opens = self
+            .generation_gateway
+            .ors
+            .list_open_unknown_commits()
+            .map_err(|_| "ors-unknown-scan-failed".to_owned())?;
+        let mut pending = Vec::new();
+        let mut resolved = Vec::new();
+        for record in &failures {
+            let evidence = ReceiptOwnerEvidence::new(
+                format!("store-unknown:{}", record.record_key()),
+                record.request_digest.clone(),
+                0,
+                0,
+            );
+            if record.failure.disposition
+                == eliot_store_api::StoreFailureDisposition::UnknownOutcome
+            {
+                if record.reconciled_receipt.is_some() {
+                    resolved.push(evidence);
+                } else {
+                    pending.push(evidence);
+                }
+            }
+        }
+        let mut still_open = BTreeSet::new();
+        for record in &opens {
+            still_open.insert(record.record_key());
+            known_open_commits.insert(record.record_key());
+            pending.push(ReceiptOwnerEvidence::new(
+                format!("unknown-commit:{}", record.record_key()),
+                record.canonical_request_hash.clone(),
+                0,
+                0,
+            ));
+        }
+        let stale: Vec<String> = known_open_commits
+            .difference(&still_open)
+            .cloned()
+            .collect();
+        for key in stale {
+            // Each proof read is admitted only by remaining budget: an
+            // exhausted tick proves nothing further rather than overrunning
+            // the deadline one key at a time.
+            if budget_exhausted() {
+                return Err("ors-unknown-scan-budget-exhausted".to_owned());
+            }
+            match self.generation_gateway.ors.load_unknown_commit(&key) {
+                Ok(Some(record)) if !record.is_open() => {
+                    known_open_commits.remove(&key);
+                    resolved.push(ReceiptOwnerEvidence::new(
+                        format!("unknown-commit:{}", record.record_key()),
+                        record.canonical_request_hash.clone(),
+                        0,
+                        0,
+                    ));
+                }
+                Ok(Some(record)) => {
+                    // Raced the open list: still open, still fenced.
+                    pending.push(ReceiptOwnerEvidence::new(
+                        format!("unknown-commit:{}", record.record_key()),
+                        record.canonical_request_hash.clone(),
+                        0,
+                        0,
+                    ));
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+        Ok(ReceiptRescanObservation {
+            family: ReceiptOwnerFamily::StoreUnknownOutcome,
+            complete: true,
+            absence_resolves: false,
+            revision: 0,
             pending,
             resolved,
         })

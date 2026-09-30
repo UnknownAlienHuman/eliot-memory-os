@@ -114,6 +114,25 @@ const DRAIN_STATE_MAX_BYTES: u64 = 64 * 1024;
 /// Poll interval for the bounded receipt-reconciliation wait.
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Upper bound on each obligation list a drain admission scope freeze
+/// carries. The admitted scope names already-registered obligations rather
+/// than proving zero work, and the durable file itself is capped at
+/// `DRAIN_STATE_MAX_BYTES`; a frozen list past this bound is refused as
+/// corrupt on write and on recovery read instead of persisting unbounded
+/// evidence.
+const ADMISSION_SNAPSHOT_MAX_OBLIGATIONS: usize = 1024;
+
+/// Marker for a drain generation that never sampled its admission scope
+/// freeze: the composition root could not read the live contour at admission,
+/// or the durable record predates the freeze fields (which decode to this
+/// through the serde default below). Gate revalidation compares only sampled
+/// freezes; this marker is retained scope evidence, never a zero proof.
+const ADMISSION_SCOPE_UNSAMPLED: &str = "unsampled";
+
+fn unsampled_scope_code() -> String {
+    ADMISSION_SCOPE_UNSAMPLED.to_owned()
+}
+
 static DRAIN_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn durable_replace(source: &Path, destination: &Path) -> io::Result<()> {
@@ -454,6 +473,29 @@ struct DurableDrainState {
     /// pre-field file is accounted, not revived.
     #[serde(default)]
     admission_pending_snapshot: Vec<String>,
+    /// Bounded lease-census observation frozen at admission: the exact
+    /// `KernelIdleLeaseCensus::observation_code` the Kernel lease census
+    /// answered when the drain was admitted — never a lease identity, digest,
+    /// or owner error text. [`ADMISSION_SCOPE_UNSAMPLED`] for generations
+    /// that never sampled the freeze (degraded admissions and records written
+    /// before the freeze existed); the gate revalidation compares only sampled
+    /// freezes, so an unsampled record is retained, never proven scoped.
+    ///
+    /// `#[serde(default)]` through the constructor below for the same
+    /// compatibility reason `fenced_activation_generations` carries: the
+    /// field is additive, so a state file written before it existed still
+    /// decodes, and `DRAIN_STATE_VERSION` did not have to move.
+    #[serde(default = "unsampled_scope_code")]
+    admission_lease_census: String,
+    /// Live module branches sampled at admission from the declared quiescence
+    /// vocabulary. Empty for unsampled generations; a branch that disappears
+    /// after admission is drain progress, while a branch that appears races
+    /// the gate. Entries name only declared branches, never owner state.
+    ///
+    /// `#[serde(default)]` so a state admitted before the freeze existed
+    /// still decodes with no frozen module scope rather than a fabricated one.
+    #[serde(default)]
+    admission_modules: Vec<String>,
     /// Installation-scoped activation fence, keyed by journal lineage.
     ///
     /// `#[serde(default)]` for the same compatibility reason
@@ -486,6 +528,17 @@ struct CoordinatorState {
     /// [`ShutdownDrainCoordinator::request_shutdown`]: each generation owns
     /// its own admission scope.
     admission_snapshot: BTreeSet<String>,
+    /// Drain-generation-scoped admission scope freeze (see
+    /// [`DurableDrainState::admission_lease_census`]): the lease census code
+    /// and live module set sampled at admission, revalidated for arrivals at
+    /// the `AdmissionsClosed` gate transition. Like `admission_snapshot` it
+    /// is reset by [`Self::fresh`] and frozen per generation by
+    /// [`ShutdownDrainCoordinator::record_admission_scope`], never inherited
+    /// across the rollover.
+    admission_lease_census: String,
+    /// Frozen live module set paired with the census above, in the
+    /// deterministic order the composition root sampled it.
+    admission_modules: Vec<String>,
     /// Highest activation-generation sequence a linearized drain fenced per
     /// journal lineage. This is deliberately *not* drain-generation state: see
     /// [`Self::fresh`] and [`ShutdownDrainCoordinator::request_shutdown`].
@@ -513,6 +566,8 @@ impl CoordinatorState {
             terminal: None,
             pending: BTreeSet::new(),
             admission_snapshot: BTreeSet::new(),
+            admission_lease_census: unsampled_scope_code(),
+            admission_modules: Vec::new(),
             fenced_activation_generations: BTreeMap::new(),
         }
     }
@@ -544,6 +599,39 @@ fn fenced_activation_generation(
 pub(crate) enum ReceiptOwnerFamily {
     /// ORS store-rebind replay rows, the family the drain gate registers today.
     StoreRebind,
+    /// ORS unknown-outcome store failures and still-open unknown-commit
+    /// recovery records: the family whose unreconciled remainder fences the
+    /// drain until an evidence-backed resolution is observed.
+    StoreUnknownOutcome,
+}
+
+impl ReceiptOwnerFamily {
+    /// Whether this identity belongs to this family's vocabulary, so one
+    /// family's rescan can never subtract another family's obligation from
+    /// the shared registry. Identities no family claims keep the historical
+    /// absence-removal semantics; an identity another family claims is
+    /// retained for that family's own pass.
+    fn owns_identity(&self, identity: &str) -> bool {
+        match self {
+            Self::StoreRebind => identity.starts_with("store-rebind:"),
+            Self::StoreUnknownOutcome => {
+                identity.starts_with("store-unknown:")
+                    || identity.starts_with("unknown-commit:")
+            }
+        }
+    }
+
+    /// True when another owner family claims this identity. The reconciling
+    /// pass below removes only what its own observation proves; a foreign
+    /// obligation stays pending even under a complete snapshot whose absence
+    /// would otherwise resolve, because absence in one family's read is never
+    /// evidence about another family's rows.
+    fn foreign_identity(&self, identity: &str) -> bool {
+        match self {
+            Self::StoreRebind => Self::StoreUnknownOutcome.owns_identity(identity),
+            Self::StoreUnknownOutcome => Self::StoreRebind.owns_identity(identity),
+        }
+    }
 }
 
 /// One obligation exactly as its owner recorded it.
@@ -827,6 +915,38 @@ fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
         return Err("shutdown state contains invalid admission snapshot identity".to_owned());
     }
 
+    // The frozen lease census is one bounded observation code, never a lease
+    // identity; a blank code is corruption, and the unsampled marker is the
+    // only honest absent value. A file written before the field existed
+    // decodes to the marker through the serde default, which this check
+    // accepts — and no repair rewrites it, because an unsampled generation
+    // carries no freezable scope to re-anchor.
+    if durable.admission_lease_census.trim().is_empty() {
+        return Err("shutdown state has no admission lease census".to_owned());
+    }
+    // The frozen module set names only declared quiescence branches: a branch
+    // with no declared edge has no provable stop position, so it is refused
+    // here rather than ordered by assumption at quiescence time. The bound
+    // keeps the freeze from persisting unbounded evidence; an empty set is a
+    // sampled-empty or unsampled contour, never a zero proof by itself.
+    if durable.admission_modules.len() > ADMISSION_SNAPSHOT_MAX_OBLIGATIONS {
+        return Err("shutdown state exceeds the bounded admission module limit".to_owned());
+    }
+    if durable
+        .admission_modules
+        .iter()
+        .any(|module| module.trim().is_empty())
+    {
+        return Err("shutdown state retains a blank admission module".to_owned());
+    }
+    if durable
+        .admission_modules
+        .iter()
+        .any(|module| !declares_quiescence_branch(module))
+    {
+        return Err("shutdown state names an undeclared admission module".to_owned());
+    }
+
     if let Some(terminal) = &durable.terminal {
         if !durable.requested {
             return Err("shutdown state has a terminal without a request".to_owned());
@@ -847,6 +967,16 @@ fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
         return Err("shutdown state has drain progress without a request".to_owned());
     }
     Ok(())
+}
+
+/// True when a declared quiescence edge names this branch, so its stop
+/// position is provable from the declarations rather than assumed. Defined
+/// here for the recovery read path and the admission freeze validation; the
+/// edges themselves stay the composition root's declaration below.
+fn declares_quiescence_branch(branch: &str) -> bool {
+    KERNEL_QUIESCENCE_EDGES
+        .iter()
+        .any(|edge| edge.dependent == branch || edge.dependency == branch)
 }
 
 /// Returns the process-wide coordinator for one Kernel `work_root`,
@@ -893,6 +1023,8 @@ impl ShutdownDrainCoordinator {
                 state.terminal = durable.terminal;
                 state.pending = durable.pending.into_iter().collect();
                 state.admission_snapshot = durable.admission_pending_snapshot.into_iter().collect();
+                state.admission_lease_census = durable.admission_lease_census;
+                state.admission_modules = durable.admission_modules;
                 state.fenced_activation_generations = durable.fenced_activation_generations;
                 // One-directional repair of a pre-field admission snapshot: a
                 // recovered drain whose closure phase is already recorded
@@ -961,6 +1093,8 @@ impl ShutdownDrainCoordinator {
             terminal: state.terminal.clone(),
             pending: state.pending.iter().cloned().collect(),
             admission_pending_snapshot: state.admission_snapshot.iter().cloned().collect(),
+            admission_lease_census: state.admission_lease_census.clone(),
+            admission_modules: state.admission_modules.clone(),
             fenced_activation_generations: state.fenced_activation_generations.clone(),
         };
         // The write path is held to the same contract the recovery read path
@@ -1069,6 +1203,60 @@ impl ShutdownDrainCoordinator {
         *state = candidate;
         observe_shutdown("kernel.shutdown.requested", "admitted");
         Ok(true)
+    }
+
+    /// Freezes the admission scope this drain generation owns: the lease
+    /// census observation code and the live module set the composition root
+    /// sampled at admission (#1686 items 2+5, I1.5
+    /// `lease_and_pending_operation_snapshot`).
+    ///
+    /// The freeze is drain-generation state: a fresh generation resets it to
+    /// unsampled, and this call persists it through the same recovery-checked
+    /// write as every other transition, so a reported freeze always names
+    /// resumable durable state and a failed publication never reports a
+    /// frozen scope. The gate closure revalidates arrivals against it; an
+    /// unsampled generation carries no freezable scope, so the gate has
+    /// nothing to compare and the pending-identity accounting applies
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reason when no drain was requested, the generation already
+    /// committed or terminated, the candidate fails recovery validation — a
+    /// blank census code, an over-bound module list, or a module no declared
+    /// quiescence edge names — or the durable publication fails.
+    pub(crate) fn record_admission_scope(
+        &self,
+        lease_census_code: String,
+        modules: Vec<String>,
+    ) -> Result<(), String> {
+        let mut state = self.lock();
+        if !state.requested {
+            return Err("no shutdown requested".to_owned());
+        }
+        if state.committed.is_some() || state.terminal.is_some() {
+            return Err("admission scope freeze after drain decision".to_owned());
+        }
+        let mut candidate = state.clone();
+        candidate.admission_lease_census = lease_census_code;
+        candidate.admission_modules = modules;
+        self.persist_state(&candidate)?;
+        *state = candidate;
+        Ok(())
+    }
+
+    /// The frozen admission scope, or `None` for a generation that never
+    /// sampled it. The gate revalidation compares only sampled freezes:
+    /// `None` is retained scope evidence, never a zero proof.
+    pub(crate) fn admission_scope(&self) -> Option<(String, Vec<String>)> {
+        let state = self.lock();
+        if state.admission_lease_census == ADMISSION_SCOPE_UNSAMPLED {
+            return None;
+        }
+        Some((
+            state.admission_lease_census.clone(),
+            state.admission_modules.clone(),
+        ))
     }
 
     /// Current drain generation identity (linearization correlation).
@@ -1304,7 +1492,22 @@ impl ShutdownDrainCoordinator {
                 if state.generation == generation {
                     if covered {
                         for identity in &baseline {
-                            if proven_resolved(&verdicts, identity, observation.absence_resolves) {
+                            // Removal authority is family-scoped: one
+                            // family's observation can never clear another
+                            // family's obligation, so a foreign identity
+                            // stays pending even under a complete snapshot
+                            // whose absence would otherwise resolve it.
+                            // Absence in one family's read is never evidence
+                            // about another family's rows; the owning
+                            // family's own pass is the only thing that may
+                            // subtract them.
+                            if !family.foreign_identity(identity)
+                                && proven_resolved(
+                                    &verdicts,
+                                    identity,
+                                    observation.absence_resolves,
+                                )
+                            {
                                 candidate.pending.remove(identity);
                             }
                         }
