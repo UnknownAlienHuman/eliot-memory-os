@@ -1904,16 +1904,26 @@ fn test_eliotd_live_receipt(
 #[cfg(windows)]
 #[test]
 fn eliotd_receipt_replay_and_renewal_require_exact_operation_lineage() {
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
     let first = test_eliotd_live_receipt(1, &"b".repeat(64), "daemon-ready-1");
     assert_eq!(
-        classify_eliotd_live_receipt_transition(&first, &first, false, None, None)
-            .expect("exact response-loss replay"),
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context, &first, &first, false, None, None,
+        )
+        .expect("exact response-loss replay"),
         EliotdLiveReceiptDisposition::ExactReplay
     );
     let foreign_request = test_eliotd_live_receipt(1, &"b".repeat(64), "daemon-ready-foreign");
     assert!(
-        classify_eliotd_live_receipt_transition(&first, &foreign_request, false, None, None,)
-            .is_err()
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &foreign_request,
+            false,
+            None,
+            None,
+        )
+        .is_err()
     );
 
     let renewed = test_eliotd_live_receipt(2, &"c".repeat(64), "daemon-ready-1");
@@ -1926,15 +1936,29 @@ fn eliotd_receipt_replay_and_renewal_require_exact_operation_lineage() {
         previous_receipt_sha256: Some(first.supervision.receipt_sha256.clone()),
     };
     assert_eq!(
-        classify_eliotd_live_receipt_transition(&first, &renewed, true, None, Some(&successor),)
-            .expect("exact ORS renewal predecessor"),
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &renewed,
+            true,
+            None,
+            Some(&successor),
+        )
+        .expect("exact ORS renewal predecessor"),
         EliotdLiveReceiptDisposition::ReplaceRenewalPredecessor
     );
     let mut substituted = successor;
     substituted.previous_receipt_sha256 = Some("d".repeat(64));
     assert!(
-        classify_eliotd_live_receipt_transition(&first, &renewed, true, None, Some(&substituted),)
-            .is_err()
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &renewed,
+            true,
+            None,
+            Some(&substituted),
+        )
+        .is_err()
     );
 }
 
@@ -6020,7 +6044,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
     assert_eq!(progress.boot_id.as_deref(), Some("boot-88-w2"));
     let recorded = test_observation("obs-88-w2-1");
     let recorded_sha256 = recorded.digest().expect("recorded observation digest");
-    progress.record_renewed(&recorded, recorded_sha256.clone(), 8, DUE_MS);
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    progress.record_renewed_in_context(&context, &recorded, recorded_sha256.clone(), 8, DUE_MS);
     assert!(progress.accepted_cursors.contains(&DaemonChannelCursor {
         channel: DaemonProgressChannel::Claim,
         cursor: 8,
