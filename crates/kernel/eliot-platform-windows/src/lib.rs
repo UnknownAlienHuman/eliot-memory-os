@@ -299,9 +299,10 @@ pub use terminal_containment::{
     TERMINAL_CONTAINMENT_RECORD_BYTES, TERMINAL_CONTAINMENT_RECORD_VERSION,
     TERMINAL_CONTAINMENT_SITE_MAX_BYTES, TerminalContainmentError, TerminalContainmentReadback,
     TerminalContainmentRecord, TerminalContainmentSink, TerminalContainmentUnresolved,
-    TerminalSubmission, fail_stop_with_terminal_containment, prepare_terminal_containment,
-    submit_terminal_containment, terminal_containment_operation_digest,
-    validate_terminal_containment_readback, validate_terminal_containment_readback_for,
+    TerminalRestartGate, TerminalSubmission, fail_stop_with_terminal_containment,
+    gate_terminal_restart_for, prepare_terminal_containment, submit_terminal_containment,
+    terminal_containment_operation_digest, validate_terminal_containment_readback,
+    validate_terminal_containment_readback_for,
 };
 pub(crate) use user_owned_leases::current_process_sid;
 #[cfg(any(test, feature = "test-support"))]
