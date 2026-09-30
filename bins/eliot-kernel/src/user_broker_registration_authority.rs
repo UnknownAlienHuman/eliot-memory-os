@@ -10,9 +10,7 @@ use std::sync::Mutex;
 
 use eliot_contracts::{EpochId, StateFence};
 use eliot_ipc::{PeerIdentity, Session};
-use eliot_ors::{
-    OperationIdentity, OperationalRecordInput, UserBrokerRegistrationReceipt,
-};
+use eliot_ors::{OperationIdentity, OperationalRecordInput, UserBrokerRegistrationReceipt};
 use eliot_protocol::{ProtocolVersion, RequestIdentity};
 use eliot_user_broker_core::{
     RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt,

@@ -10,12 +10,11 @@
 //! on poisoned or stale state; it does not dispatch frames, grant semantic
 //! authority, or persist canonical transitions.
 
-use super::*;
 use super::user_broker_registration_route::{
-    USER_BROKER_FENCE_OPERATION, USER_BROKER_HEARTBEAT_OPERATION,
-    USER_BROKER_REGISTER_OPERATION,
+    USER_BROKER_FENCE_OPERATION, USER_BROKER_HEARTBEAT_OPERATION, USER_BROKER_REGISTER_OPERATION,
     USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
 };
+use super::*;
 
 fn observe_front_door_session(event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
@@ -1409,18 +1408,15 @@ impl KernelComposition {
         client.validate()?;
         if client.module_generation != policy.module_generation
             || !client
-            .authority_epoch
-            .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
+                .authority_epoch
+                .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
             || client.module_generation.state_fence != policy.module_generation.state_fence
         {
             return Err(TransportError::SessionFenced);
         }
 
         let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
-        session.capabilities = broker_capabilities
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        session.capabilities = broker_capabilities.into_iter().map(str::to_owned).collect();
         session
             .privacy_classes
             .retain(|class| policy.allowed_privacy_classes.contains(class));

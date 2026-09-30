@@ -10,7 +10,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use eliot_contracts::{EpochId, StateFence};
-use eliot_security_contracts::NativeResourceSelection;
 use eliot_ors::{
     EpochIdentity, EpochLineage, OperationIdentity, OperationalPhase, OperationalRecordContext,
     OperationalRecordInput, OperationalRecoveryStore, StateFenceSnapshot, UserBrokerFence,
@@ -18,6 +17,7 @@ use eliot_ors::{
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{Frame, ProtocolPayload, RequestIdentity};
+use eliot_security_contracts::NativeResourceSelection;
 use eliot_user_broker_core::{
     RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt,
     RegistrationRequest, RegistrationStatus,
@@ -428,9 +428,7 @@ fn explicit_fence_record(
     .map_err(|_| TransportError::SessionFenced)
 }
 
-fn registration_fence_receipt(
-    request: &RegistrationFenceRequest,
-) -> RegistrationFenceReceipt {
+fn registration_fence_receipt(request: &RegistrationFenceRequest) -> RegistrationFenceReceipt {
     RegistrationFenceReceipt {
         registration_digest: request.registration.registration_digest.clone(),
         windows_sid: request.registration.windows_sid.clone(),
@@ -565,7 +563,8 @@ impl KernelComposition {
         }
         if operation == USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION {
             let request: UserBrokerResourceSelectionCurrentPayload =
-                serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+                serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
             self.validate_user_broker_resource_selection_current(
                 session, frame, &request, identity, now,
             )?;
@@ -783,8 +782,7 @@ impl KernelComposition {
                 self.fence_user_broker_session(session);
                 return Err(TransportError::SessionFenced);
             }
-            return serde_json::to_value(&current.grant)
-                .map_err(|_| TransportError::SessionFenced);
+            return serde_json::to_value(&current.grant).map_err(|_| TransportError::SessionFenced);
         }
 
         if request.registration != current.receipt
@@ -807,11 +805,8 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
 
-        let grant_expires_at = bounded_grant_expiration(
-            now,
-            current.registration.lease_expires_at,
-            heartbeat_ms,
-        )?;
+        let grant_expires_at =
+            bounded_grant_expiration(now, current.registration.lease_expires_at, heartbeat_ms)?;
         if grant_expires_at <= current.receipt.expires_at {
             return Err(TransportError::SessionFenced);
         }
@@ -1032,8 +1027,7 @@ impl KernelComposition {
             if !fenced_user_broker_snapshot_matches(&snapshot, &replay) {
                 return Err(TransportError::SessionFenced);
             }
-            return serde_json::to_value(replay.receipt)
-                .map_err(|_| TransportError::SessionFenced);
+            return serde_json::to_value(replay.receipt).map_err(|_| TransportError::SessionFenced);
         }
 
         let mut live = self
@@ -1101,9 +1095,9 @@ impl KernelComposition {
                     user_broker_fence_snapshot_matches(snapshot, &input, prior_order)
                 }),
         };
-        let Some(snapshot) = snapshot.filter(|snapshot| {
-            user_broker_fence_snapshot_matches(snapshot, &input, prior_order)
-        }) else {
+        let Some(snapshot) = snapshot
+            .filter(|snapshot| user_broker_fence_snapshot_matches(snapshot, &input, prior_order))
+        else {
             drop(live);
             self.fence_user_broker_session(session);
             return Err(TransportError::SessionFenced);
