@@ -20,9 +20,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value;
 
 use super::lifecycle_admission::{
-    EmittedAuditLink, ForwardRevisionParams, LifecycleAdmission, LifecycleMutationOperation,
-    ObservationGenesisParams, admit_forward_revision, admit_observation_genesis,
-    bind_emitted_audit_events,
+    EmittedAuditLink, ForwardRevisionParams, LifecycleAdmission, LifecycleAdmissionError,
+    LifecycleMutationOperation, ObservationGenesisParams, admit_forward_revision,
+    admit_observation_genesis, bind_emitted_audit_events,
 };
 use super::lifecycle_persist::{
     AuthenticatedLifecycleSession, HopMutation, HopMutationInput, LifecyclePersistError,
@@ -1378,7 +1378,7 @@ async fn mutation_mismatch_and_paraphrase_refusal_fail_before_dispatch() {
     assert!(
         matches!(
             refused,
-            Err(AdmissionError::Lifecycle(
+            Err(LifecycleAdmissionError::Lifecycle(
                 LifecycleError::ForbiddenElevation { .. }
             ))
         ),
