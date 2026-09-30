@@ -1855,7 +1855,12 @@ impl KernelStoreGateway {
             .map_err(MaintenanceTriggerDeliveryError::OwnerUnavailable)?;
         receipt.validate()?;
         let session = self.bind_maintenance_session(principal_ref)?;
-        let operation_id = OperationId::new(receipt.canonical_receipt_ref.clone())?;
+        let operation_id = OperationId::new(receipt.canonical_receipt_ref.clone()).map_err(|_| {
+            MaintenanceTriggerDeliveryError::Protocol(ProtocolError::InvalidField {
+                field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
+                reason: "decision receipt names no well-formed canonical receipt",
+            })
+        })?;
         let stored = self.store.receipt(operation_id).await?;
         let stored = stored.ok_or_else(|| {
             MaintenanceTriggerDeliveryError::Protocol(ProtocolError::InvalidField {
