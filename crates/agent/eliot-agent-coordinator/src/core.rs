@@ -1563,7 +1563,22 @@ impl AgentCoordinator {
     ///
     /// The pull selects; it does not start anything. A caller that receives a
     /// `selected_attempt_id` starts that attempt through the existing
-    /// [`Self::start_attempt`], which remains the only state transition.
+    /// [`Self::start_attempt`], which remains the only state transition. That
+    /// transition revalidates the selection at the owner boundary before it
+    /// spends it — it re-presents the stored admission receipt to the sealed
+    /// verifier and re-checks the route's capacity reservation — so a selection
+    /// held across intervening work cannot be launched on the snapshot it was
+    /// taken from.
+    ///
+    /// One residual this method's contract does not close, stated rather than
+    /// implied: the per-class ceilings it reports (`max_concurrency`,
+    /// `max_bytes`, WIP partitions) were measured on the pull that produced this
+    /// selection, and `start_attempt` carries no [`SchedulingProfile`], so it
+    /// cannot re-measure them. A hand-driven selection is therefore bounded by
+    /// the ceilings of its own pull. The pull-driven path does not rely on that:
+    /// [`Self::drive_fair_pull`] re-runs the selector over the live view after
+    /// every start, so no selection it acts on is older than the view it was
+    /// measured against.
     ///
     /// Unreachable in production, and the reason is upstream of the profile.
     /// Measured on `origin/main` @ `5d691922c`, the whole production gap is:
@@ -1618,6 +1633,15 @@ impl AgentCoordinator {
     /// requires a caller to present — and from the attempt's own stored record
     /// and enqueue ordinal. No provider, admission, lease or route evidence is
     /// minted, synthesized or re-derived, so a drive can never admit work.
+    ///
+    /// Issue #1683 W3, select then revalidate then reserve: the drive's
+    /// select-then-start pair is only sound because `start_attempt` revalidates
+    /// the owner-issued admission receipt and re-checks the route's capacity
+    /// reservation at the boundary between them, before any state moves. A
+    /// selection is therefore never spent on the snapshot it was taken from: a
+    /// stale receipt is refused by its owner, and a route whose live capacity
+    /// view moved is `StaleCapacity` / `Backpressure`. See [`Self::start_attempt`]
+    /// for both checks.
     ///
     /// Bounded, and the bound is derived rather than chosen here: the drive
     /// starts at most one attempt per currently non-terminal admitted attempt,
@@ -1828,6 +1852,73 @@ impl AgentCoordinator {
         &self.events
     }
 
+    /// Starts one admitted attempt, revalidating the selection at the owner
+    /// boundary immediately before the reservation it spends (issue #1683 W3,
+    /// I14.8).
+    ///
+    /// A pull decides on a projection read; this transition consumes it. Two
+    /// owner checks run here that neither existed at this boundary before, and
+    /// both run before any mutation:
+    ///
+    /// - **Revalidate.** The owner-issued [`ProviderAdmissionReceipt`] that
+    ///   admitted this item is re-presented to the sealed provider verifier under
+    ///   [`ProviderProofKind::Admission`], over the **stored** receipt's own
+    ///   canonical bytes and its own `g11_admission_receipt_ref`. That receipt is
+    ///   the reservation this coordinator holds for the item — it carries the
+    ///   owner-issued `g11_admission_receipt_ref` and `durable_job_ref`, and its
+    ///   per-lane route, lease and budget — so a stale selection is refused by
+    ///   the owner instead of being spent on the strength of this coordinator's
+    ///   own in-memory map. Every failure stays the verifier's existing typed
+    ///   refusal (`CoordinatorError::StaleProviderBinding`, `StaleCapacity`,
+    ///   `StaleFence`, `StaleController`, `RouteEvidence`,
+    ///   `ProviderVerification`); none is flattened.
+    /// - **Reserve.** The item's stored capacity claim is re-validated at this
+    ///   boundary through [`Self::validate_route_capacity`] — the same owner-side
+    ///   validator `admit` and `reassign` use, not a second scheme — so the
+    ///   per-route physical resource vector is re-counted at the moment the
+    ///   selection is spent. The check compares the item's own stored
+    ///   `capacity_identity`/`capacity_revision`/`capacity_limit` against the
+    ///   coordinator's current live capacity view and re-counts the route's
+    ///   active attempts against the effective limit, refusing `StaleCapacity`
+    ///   or `Backpressure` before any state moves.
+    ///
+    ///   Stated precisely, because it is weaker than it may look: within one
+    ///   coordinator instance the config is immutable and every attempt was
+    ///   admitted through this same validator, so the identity/revision
+    ///   comparison cannot diverge here and the route count is an
+    ///   **invariant re-assertion** rather than a fresh gate against a second
+    ///   writer. What it does buy is that the route's resource vector is
+    ///   re-confirmed at the start boundary instead of only at admission, and
+    ///   that a start arriving on a route already at its limit is refused here
+    ///   rather than after the transition. The cross-writer guarantee W3 asks
+    ///   for is the owner verifier's, above: it is the only check at this
+    ///   boundary that can fail against evidence this coordinator does not
+    ///   hold.
+    ///
+    /// Nothing is minted, re-derived or synthesized: the receipt, the proof
+    /// reference and the canonical bytes are all read from the coordinator's own
+    /// stored admission, and the capacity claim from the item's own stored
+    /// record.
+    ///
+    /// What this deliberately does **not** do is re-evaluate the per-class
+    /// profile ceilings (`max_concurrency`, `max_bytes`, WIP partitions). Those
+    /// are policy applied at selection inside [`Self::select_ready`], they need
+    /// the [`SchedulingProfile`] a caller supplies per pull, and this transition
+    /// carries no profile. The pull-driven path is unaffected because
+    /// [`Self::drive_fair_pull`] re-runs the selector over the live view after
+    /// every start. A hand-driven [`Self::pull_next`] selection revalidates its
+    /// owner evidence and its route reservation here, and its per-class ceilings
+    /// were measured on the pull that produced it — see the residual on
+    /// [`Self::pull_next`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the owner rejection unchanged, plus
+    /// [`CoordinatorError::UnknownAttempt`] for an attempt this coordinator does
+    /// not hold, [`CoordinatorError::StaleController`] when the presented
+    /// context names another admission, and
+    /// [`CoordinatorError::InvalidAttemptState`] for any state other than
+    /// `Admitted`.
     pub fn start_attempt(
         &mut self,
         context: ExecutionContext,
@@ -1845,6 +1936,42 @@ impl AgentCoordinator {
         if current.state != CoordinatedAttemptState::Admitted {
             return Err(CoordinatorError::InvalidAttemptState(current.state));
         }
+        // Issue #1683 W3, revalidate: re-present this item's own owner-issued
+        // admission receipt to the sealed verifier before the selection is
+        // spent. The bytes are the stored receipt's, so a receipt that changed
+        // under the coordinator cannot authenticate itself.
+        let receipt = self
+            .admissions
+            .get(&current.admission_id)
+            .ok_or(CoordinatorError::UnknownAdmission)?
+            .receipt
+            .clone();
+        self.provider.verify(
+            ProviderProofKind::Admission,
+            &receipt.provider_identity,
+            &receipt.g11_admission_receipt_ref,
+            &canonical(&receipt)?,
+        )?;
+        // Issue #1683 W3, reserve: re-check the item's stored capacity claim
+        // against the current live capacity view and the route's reservation as
+        // it stands now, through the same validator admission and reassignment
+        // use.
+        //
+        // `requested` is 0, not 1, and the distinction is load-bearing. The
+        // record was inserted by `admit` and is already non-terminal, so it is
+        // already counted as active on this route; this transition reclassifies
+        // an existing slot from queued to in-flight and adds no new one.
+        // Requesting 1 here would double-count the item against its own route
+        // and refuse a start that admission legitimately reserved.
+        self.validate_route_capacity(BTreeMap::from([(
+            route_key(&current.route),
+            RouteCapacityRequest {
+                requested: 0,
+                capacity_identity: current.capacity_identity.clone(),
+                capacity_revision: current.capacity_revision.clone(),
+                capacity_limit: current.capacity_limit,
+            },
+        )]))?;
         let record = self
             .attempts
             .get_mut(&attempt_id)
