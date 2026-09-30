@@ -15,7 +15,7 @@
 //!   shape-valid identifier, or a matching content hash. A dimension whose owner
 //!   permit is stale, revoked, or bound to another generation reads as
 //!   [`HeadroomOutcome::Unknown`], never as granted.
-//! - "CPU_memory_GPU_disk_network_context_model_and_queue_reservations" are
+//! - "`CPU_memory_GPU_disk_network_context_model_and_queue_reservations`" are
 //!   independent dimensions. Each carries its own owner
 //!   [`CapacityBottleneck`] and [`CapacityUnit`]; no arithmetic in this module
 //!   ever joins two dimensions, and none of them joins a token count.
@@ -357,7 +357,14 @@ pub enum HeadroomOutcome {
     /// owner-minted [`CapacityPermitBinding`] this variant cannot be built.
     Granted {
         /// The owner-issued permit binding for this dimension.
-        reservation: CapacityPermitBinding,
+        ///
+        /// Boxed because the permit binding is an order of magnitude wider
+        /// than this enum's other outcomes' payloads: one granted decision
+        /// would otherwise make every decision in a result pay that width,
+        /// including the refused and unknown ones that carry no permit. The
+        /// box is a storage detail only — the wire shape is unchanged, and a
+        /// grant is still read through [`CapacityPermitBinding`] by value.
+        reservation: Box<CapacityPermitBinding>,
         /// The demand the owner actually admitted, in the owner unit.
         admitted_demand: HeadroomQuantity,
     },
@@ -395,7 +402,14 @@ impl HeadroomOutcome {
     #[must_use]
     pub const fn reservation(&self) -> Option<&CapacityPermitBinding> {
         match self {
-            Self::Granted { reservation, .. } => Some(reservation),
+            // Deref coercion through the box, at a binding with an explicit
+            // type so the coercion site is this `let` and not the return value.
+            // `Box::as_ref` is not usable here: this accessor is `const`, and
+            // the box is a storage detail the caller must never see.
+            Self::Granted { reservation, .. } => {
+                let binding: &CapacityPermitBinding = reservation;
+                Some(binding)
+            }
             Self::Refused { .. } | Self::Unknown { .. } | Self::NotApplicable { .. } => None,
         }
     }

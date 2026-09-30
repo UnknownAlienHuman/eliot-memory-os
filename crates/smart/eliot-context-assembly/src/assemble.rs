@@ -67,7 +67,7 @@ impl AssemblyPolicy {
 
 /// The typed refusal this assembly owner returns instead of an assembled packet.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("downstream headroom handoff refused for recipe {attempt.attempted_recipe_digest}")]
+#[error("downstream headroom handoff refused: {attempt}")]
 pub struct HeadroomHandoffRefusal {
     /// The attempted recipe and omissions preserved across the refusal.
     pub attempt: HeadroomAttempt,

@@ -191,7 +191,12 @@ pub enum HeadroomAdmissionOutcome {
         check: HeadroomCheck,
     },
     /// The reservation was withheld; no admitted set exists.
-    Refused(HeadroomRefusalRecord),
+    ///
+    /// The record is boxed for the same reason the admitted arm boxes its
+    /// result: it carries the whole attempted binding and typed refusal, which
+    /// is far wider than the traces and the bounded check. Boxing it keeps a
+    /// refusal from charging the admitted arm that width on every packet.
+    Refused(Box<HeadroomRefusalRecord>),
 }
 
 /// Reject a demanded dimension the owner did not reserve.
@@ -301,7 +306,7 @@ pub fn admit_context_traced_with_headroom(
         .clone()
         .unwrap_or_else(|| input.floor.floor.rule_evidence.clone());
     let refusal = |error: ContextError| {
-        HeadroomAdmissionOutcome::Refused(HeadroomRefusalRecord {
+        HeadroomAdmissionOutcome::Refused(Box::new(HeadroomRefusalRecord {
             reason: match &error {
                 ContextError::StaleFloor | ContextError::InvalidFence => HeadroomRefusal::Stale {
                     reason: reason_ref.clone(),
@@ -323,7 +328,7 @@ pub fn admit_context_traced_with_headroom(
             error,
             attempted_recipe_digest: input.recipe.recipe_sha256.clone(),
             attempted_binding: input.binding.clone(),
-        })
+        }))
     };
     // A headroom failure is a TYPED REFUSAL, not a transport error, so it is
     // returned as `Ok(Refused(..))` on the same footing as the floor-path
@@ -337,12 +342,14 @@ pub fn admit_context_traced_with_headroom(
     // typed refusal carries the same exact error the floor path reports for an
     // unsatisfiable required floor, plus the limiting dimensions.
     if let HeadroomCheck::Refused(reason) = &check {
-        return Ok(HeadroomAdmissionOutcome::Refused(HeadroomRefusalRecord {
-            reason: reason.clone(),
-            error: ContextError::MissingFloor,
-            attempted_recipe_digest: input.recipe.recipe_sha256.clone(),
-            attempted_binding: input.binding.clone(),
-        }));
+        return Ok(HeadroomAdmissionOutcome::Refused(Box::new(
+            HeadroomRefusalRecord {
+                reason: reason.clone(),
+                error: ContextError::MissingFloor,
+                attempted_recipe_digest: input.recipe.recipe_sha256.clone(),
+                attempted_binding: input.binding.clone(),
+            },
+        )));
     }
     match admit_context_inner_with_headroom(input, Some(headroom)) {
         Ok(result) => {

@@ -1370,7 +1370,8 @@ pub enum PacketCompositionError {
     /// packet that reads as complete. The owner still holds every permit it
     /// issued, so its release or reconcile duty is unaffected by this refusal.
     #[error(
-        "packet downstream headroom refused for attempted recipe {refusal.attempted_recipe_digest}"
+        "packet downstream headroom refused for attempted recipe {}",
+        refusal.attempted_recipe_digest
     )]
     HeadroomRefused {
         /// The admission owner's typed headroom refusal record, carrying the
@@ -1962,7 +1963,7 @@ fn admit_packet_candidates(
     {
         HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
         HeadroomAdmissionOutcome::Refused(refusal) => {
-            return Err(PacketCompositionError::HeadroomRefused(Box::new(refusal)));
+            return Err(PacketCompositionError::HeadroomRefused(refusal));
         }
     };
     result
