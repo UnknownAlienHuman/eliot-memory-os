@@ -65,6 +65,28 @@ impl UserBrokerSessionBinding {
     }
 }
 
+/// One admitted User Broker operation identity retained for cross-operation
+/// reuse detection (issue #74 W7; I5.5 identity-conflict rule).
+///
+/// The entry binds the spent request id, cancellation id, and idempotency key
+/// to the exact operation and canonical digest they were admitted for. A
+/// later presentation of the same idempotency key must name the same
+/// operation and digest (an exact-retry candidate the per-operation handler
+/// then confirms); any other use of a spent identity is a typed identity
+/// conflict. Entries live and die with their registration cell: a fenced or
+/// dropped registration carries its spent evidence into its fence replay or
+/// disappears with the dead session, and a new registration starts a new
+/// chain. An expired deadline is never permission to forget a spent identity
+/// while its registration cell lives.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpentUserBrokerOperationIdentity {
+    pub(crate) operation: String,
+    pub(crate) request_id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) cancellation_id: String,
+    pub(crate) canonical_digest: String,
+}
+
 /// The exact typed registration returned by Kernel for one live connection.
 #[derive(Clone, Debug)]
 pub(crate) struct LiveUserBrokerRegistration {
@@ -81,6 +103,7 @@ pub(crate) struct LiveUserBrokerRegistration {
     pub(crate) store_record: OperationalRecordInput,
     pub(crate) last_observed_at: u64,
     pub(crate) heartbeat_replay: Option<UserBrokerHeartbeatReplay>,
+    pub(crate) spent: Vec<SpentUserBrokerOperationIdentity>,
 }
 
 /// The exact last heartbeat revision may be replayed only while it still
@@ -95,6 +118,9 @@ pub(crate) struct UserBrokerHeartbeatReplay {
 
 /// Terminal response evidence for one exact explicit fence retry. This row
 /// holds no live authority and is removed when its transport session ends.
+/// It carries the spent operation identities of its dead registration so a
+/// retried fence under a reused key is still judged against the exact bytes
+/// that key was admitted for.
 #[derive(Clone, Debug)]
 pub(crate) struct UserBrokerFenceReplay {
     pub(crate) session: UserBrokerSessionBinding,
@@ -106,6 +132,7 @@ pub(crate) struct UserBrokerFenceReplay {
     pub(crate) store_receipt: UserBrokerRegistrationReceipt,
     pub(crate) store_operation_order: u64,
     pub(crate) store_record: OperationalRecordInput,
+    pub(crate) spent: Vec<SpentUserBrokerOperationIdentity>,
 }
 
 /// The Kernel-owned current registration table. It is deliberately not a
