@@ -187,7 +187,7 @@ impl FileWatchdogAdmission {
     /// without durable supervision authority.
     pub fn pending_phase_b_fence_readiness(
         registry_path: impl Into<PathBuf>,
-        bootstrap: ServiceBootstrapArguments,
+        bootstrap: &ServiceBootstrapArguments,
     ) -> Result<WatchdogReadiness, SpoolError> {
         let _span = tracing::debug_span!("watchdog.fence_readiness_probe").entered();
         tracing::debug!(
@@ -226,7 +226,7 @@ impl FileWatchdogAdmission {
         )
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
         .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
-        let selected_manifest = select_runtime_manifest(&registry, &bootstrap)?;
+        let selected_manifest = select_runtime_manifest(&registry, bootstrap)?;
         let authority = registry
             .provisioned_supervision_authority_for_generation(&selected_manifest.generation)
             .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
@@ -250,7 +250,7 @@ impl FileWatchdogAdmission {
                     .to_owned(),
             ));
         }
-        let _ = load_approved_service_registrations(&registry, &selected_manifest, &bootstrap)?;
+        let _ = load_approved_service_registrations(&registry, &selected_manifest, bootstrap)?;
         if selected_manifest.runtime_launch.runtime_state_roots.profile
             != InstallationProfile::SystemService
         {
@@ -719,7 +719,7 @@ mod tests {
         );
         let fence = FileWatchdogAdmission::pending_phase_b_fence_readiness(
             registry_path.clone(),
-            bootstrap.clone(),
+            &bootstrap,
         )
         .unwrap_or_else(|error| panic!("pre-Phase-B fence was rejected: {error}"));
         assert_eq!(
@@ -734,7 +734,7 @@ mod tests {
         assert!(
             FileWatchdogAdmission::pending_phase_b_fence_readiness(
                 registry_path.clone(),
-                bootstrap.clone()
+                &bootstrap
             )
             .is_err()
         );
@@ -742,7 +742,7 @@ mod tests {
         // not an awaitable bootstrap state, so it must also stay fail-closed.
         fixture.write_registry(&fixture.active_only());
         assert!(
-            FileWatchdogAdmission::pending_phase_b_fence_readiness(registry_path, bootstrap)
+            FileWatchdogAdmission::pending_phase_b_fence_readiness(registry_path, &bootstrap)
                 .is_err()
         );
     }
