@@ -117,8 +117,9 @@ use eliot_ors::{
     AdmissionReservationClaimRef, AdmissionReservationClaims,
     AdmissionReservationIdentityInput, AdmissionReservationLaunchPrerequisite, DoctorAttemptRecord,
     DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger, NativeWorkerClaimRecord,
-    OpaqueLabel, OperationIdentity, StateFenceSnapshot, admission_reservation_identity,
-    epoch_lineage_for, verify_admission_reservation_launch_prerequisite,
+    OperationalRecoveryStore, OpaqueLabel, OperationIdentity, StateFenceSnapshot,
+    admission_reservation_identity, epoch_lineage_for,
+    verify_admission_reservation_launch_prerequisite,
 };
 use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
@@ -4906,30 +4907,32 @@ fn verify_native_worker_launch_prerequisite(
             work_item_id,
             proposed_attempt_id,
         } => Err(DispatchLaunchError::Gate(format!(
-            "native worker launch refused: no admission reservation covers work item {work_item_id} and proposed attempt {proposed_attempt_id}"
+            "native worker launch refused: no admission reservation covers work item {} and proposed attempt {}",
+            work_item_id.as_str(),
+            proposed_attempt_id.as_str()
         ))),
         AdmissionReservationLaunchPrerequisite::Staged { reservation } => Err(
             DispatchLaunchError::Gate(format!(
                 "native worker launch refused: admission reservation {} is STAGED_INACTIVE and grants no launch authority",
-                reservation.reservation_id
+                reservation.reservation_id.as_str()
             )),
         ),
         AdmissionReservationLaunchPrerequisite::Released { reservation } => Err(
             DispatchLaunchError::Gate(format!(
                 "native worker launch refused: admission reservation {} is RELEASED with disposition {:?}",
-                reservation.reservation_id, reservation.disposition_reason
+                reservation.reservation_id.as_str(), reservation.disposition_reason
             )),
         ),
         AdmissionReservationLaunchPrerequisite::Expired { reservation } => Err(
             DispatchLaunchError::Gate(format!(
                 "native worker launch refused: admission reservation {} is EXPIRED at {} and grants no launch authority",
-                reservation.reservation_id, reservation.expires_at_ms
+                reservation.reservation_id.as_str(), reservation.expires_at_ms
             )),
         ),
         AdmissionReservationLaunchPrerequisite::Reconciling { reservation } => Err(
             DispatchLaunchError::Gate(format!(
                 "native worker launch refused: admission reservation {} is RECONCILING and cannot create a new effect",
-                reservation.reservation_id
+                reservation.reservation_id.as_str()
             )),
         ),
         AdmissionReservationLaunchPrerequisite::StaleFence {
@@ -4937,14 +4940,16 @@ fn verify_native_worker_launch_prerequisite(
             expected_state_fence,
         } => Err(DispatchLaunchError::Gate(format!(
             "native worker launch refused: admission reservation {} was staged under State Fence {} but the launch verifies against {}",
-            reservation.reservation_id, reservation.state_fence.sha256, expected_state_fence.sha256
+            reservation.reservation_id.as_str(),
+            reservation.state_fence.sha256,
+            expected_state_fence.sha256
         ))),
         AdmissionReservationLaunchPrerequisite::ForeignOwner {
             reservation,
             expected_authority_epoch,
         } => Err(DispatchLaunchError::Gate(format!(
             "native worker launch refused: admission reservation {} is owned by Authority Epoch {} lineage {}, not by the launching epoch {} lineage {}",
-            reservation.reservation_id,
+            reservation.reservation_id.as_str(),
             reservation.authority_epoch.current.epoch,
             reservation.authority_epoch.current.lineage_id.as_str(),
             expected_authority_epoch.current.epoch,
@@ -4956,11 +4961,11 @@ fn verify_native_worker_launch_prerequisite(
             expected_proposed_attempt_id,
         } => Err(DispatchLaunchError::Gate(format!(
             "native worker launch refused: admission reservation {} covers work item {} and proposed attempt {}, not {} and {}",
-            reservation.reservation_id,
-            reservation.work_item_id,
-            reservation.proposed_attempt_id,
-            expected_work_item_id,
-            expected_proposed_attempt_id
+            reservation.reservation_id.as_str(),
+            reservation.work_item_id.as_str(),
+            reservation.proposed_attempt_id.as_str(),
+            expected_work_item_id.as_str(),
+            expected_proposed_attempt_id.as_str()
         ))),
     }
 }
