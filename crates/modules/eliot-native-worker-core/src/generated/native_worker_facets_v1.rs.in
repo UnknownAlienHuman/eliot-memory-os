@@ -7,8 +7,17 @@ use eliot_agent_api::{AttemptId, ProposedEffect};
 use eliot_contracts::{
     CapabilityCellId, ContractIdentity, ContractVersion, native_worker_resource_facet_v1,
 };
+use eliot_protocol::{
+    EncodingProfile, Frame, NativeWorkerFramePayloadV1, NativeWorkerOperationV1, ProtocolPayload,
+    ProtocolVersion, NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    WorkerError,
+    protocol::{JSON_ENCODING_PROFILE, WorkerFrame, WorkerFrameBody},
+};
 
 pub(crate) const NATIVE_WORKER_EXECUTE_FACET_ID: &str = @@FACET_ID@@;
 pub(crate) const NATIVE_WORKER_EXECUTE_FACET_VERSION: ContractVersion =
@@ -45,7 +54,7 @@ pub struct NativeWorkerExecuteEbpCallV1 {
     pub capability_cell: CapabilityCellId,
     /// Typed method input derived from the ELIOT-owned facet contract.
     /// `attempt_id` is bound to the admitted claim; the exact State Fence
-    /// remains in the enclosing EBP `WorkerFrame`.
+    /// remains in the canonical `NativeWorkerFramePayloadV1`.
     pub input: WorkerRequest,
 }
 
@@ -89,6 +98,106 @@ impl NativeWorkerExecuteEbpCallV1 {
         }
         Ok(())
     }
+}
+
+/// Encodes the worker's internal dispatch projection through the canonical,
+/// versioned EBP/native envelope. The complete EBP field contract remains
+/// owned by `eliot-protocol`; only the Execute method body above is generated
+/// from the resource-facet contract.
+pub(crate) fn encode_native_worker_frame_stub_v1(
+    worker: &WorkerFrame,
+) -> Result<Frame, WorkerError> {
+    worker.validate_shape()?;
+    let body = serde_json::to_value(&worker.body)
+        .map_err(|_| WorkerError::InvalidFrame("body_serialization"))?;
+    let operation_tag = body
+        .get("kind")
+        .cloned()
+        .ok_or(WorkerError::InvalidFrame("body_operation"))?;
+    let operation = serde_json::from_value::<NativeWorkerOperationV1>(operation_tag)
+        .map_err(|_| WorkerError::InvalidFrame("body_operation"))?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: worker.connection_id.clone(),
+        request_id: Some(worker.request_id.clone()),
+        kind: operation.frame_kind(),
+        message_type: operation.message_type(),
+        request_identity: None,
+        payload: ProtocolPayload::NativeWorkerFrameV1(NativeWorkerFramePayloadV1 {
+            wire_version: NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
+            native_protocol_version: worker.protocol_version.clone(),
+            operation,
+            deadline_unix_ms: worker.deadline_unix_ms,
+            authority_epoch: worker.authority_epoch.clone(),
+            state_fence: worker.state_fence.clone(),
+            lease_id: worker.lease_id.clone(),
+            admission_revision: worker.admission_revision.clone(),
+            producer_generation: worker.producer_generation,
+            body,
+        }),
+        trace_context: worker.trace_context.clone(),
+    };
+    frame
+        .validate()
+        .map_err(|_| WorkerError::InvalidFrame("ebp_frame"))?;
+    Ok(frame)
+}
+
+/// Decodes the canonical EBP/native owner contracts into the internal worker
+/// dispatch projection. This stub never introduces a second envelope schema.
+pub(crate) fn decode_native_worker_frame_stub_v1(
+    frame: Frame,
+) -> Result<WorkerFrame, WorkerError> {
+    frame
+        .validate()
+        .map_err(|_| WorkerError::InvalidFrame("ebp_frame"))?;
+    let Frame {
+        encoding_profile,
+        connection_id,
+        request_id,
+        request_identity: _,
+        payload,
+        trace_context,
+        ..
+    } = frame;
+    if encoding_profile != EncodingProfile::JsonV1 {
+        return Err(WorkerError::UnsupportedEncoding);
+    }
+    let ProtocolPayload::NativeWorkerFrameV1(native) = payload else {
+        return Err(WorkerError::InvalidFrame("native_worker_payload"));
+    };
+    if native.wire_version != NATIVE_WORKER_FRAME_V1_WIRE_VERSION {
+        return Err(WorkerError::InvalidFrame("native_worker_stub_version"));
+    }
+    let request_id = request_id.ok_or(WorkerError::InvalidFrame("request_id"))?;
+    let body: WorkerFrameBody = serde_json::from_value(native.body)
+        .map_err(|_| WorkerError::InvalidFrame("body_deserialization"))?;
+    let body_kind = serde_json::to_value(&body)
+        .map_err(|_| WorkerError::InvalidFrame("body_serialization"))?
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(WorkerError::InvalidFrame("body_operation"))?
+        .to_owned();
+    if body_kind != native.operation.body_kind() {
+        return Err(WorkerError::InvalidFrame("operation_body_mismatch"));
+    }
+    let worker = WorkerFrame {
+        protocol_version: native.native_protocol_version,
+        encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
+        connection_id,
+        request_id,
+        trace_context,
+        deadline_unix_ms: native.deadline_unix_ms,
+        authority_epoch: native.authority_epoch,
+        state_fence: native.state_fence,
+        lease_id: native.lease_id,
+        admission_revision: native.admission_revision,
+        producer_generation: native.producer_generation,
+        body,
+    };
+    worker.validate_shape()?;
+    Ok(worker)
 }
 
 #[derive(Clone, Copy, Debug)]

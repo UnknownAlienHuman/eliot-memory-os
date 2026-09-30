@@ -29,6 +29,7 @@ pub use eliot_agent_api::{
 };
 use eliot_agent_api::{AuthorizedEffect, ProposedEffect};
 use eliot_contracts::RequestId;
+use eliot_protocol::Frame;
 use eliot_process::{
     CancellationStatus, EvidenceSinkError, FencingToken, OperationId,
     PROCESS_CONTRACT_SCHEMA_VERSION, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
@@ -756,7 +757,20 @@ where
         })
     }
 
-    /// Handles one complete native-worker protocol frame.
+    /// Production transport entry point for one canonical EBP native-worker
+    /// frame. The generated versioned stub projects the EBP/native envelope
+    /// before the lifecycle core sees its internal DTO.
+    pub async fn handle_ebp_frame(
+        &mut self,
+        frame: Frame,
+    ) -> Result<Vec<WorkerEventEnvelope>, WorkerError> {
+        self.handle(WorkerFrame::from_ebp_frame(frame)?).await
+    }
+
+    /// Handles one already-projected internal native-worker frame.
+    ///
+    /// Transport callers use [`Self::handle_ebp_frame`] so the shared EBP
+    /// envelope remains the sole production wire entry.
     pub async fn handle(
         &mut self,
         frame: WorkerFrame,
