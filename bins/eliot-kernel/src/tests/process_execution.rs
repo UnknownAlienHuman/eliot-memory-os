@@ -232,6 +232,7 @@ impl ProcessStartPorts for GatewayTestPorts {
         &self,
         _owner: &ProcessOwnerBinding,
         _operation_id: &OperationId,
+        _context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
         // The effect operation lease is an ORS-owned durable record; this
         // fixture has no ORS store, so it admits every replay it is asked

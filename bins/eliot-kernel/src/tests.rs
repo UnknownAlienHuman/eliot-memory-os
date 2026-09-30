@@ -3626,7 +3626,13 @@ fn process_owner_survives_reconnect_but_rejects_cross_owner() {
         .expect("owner");
     let reconnected = ProcessOwnerBinding::new("testd", "a".repeat(64), test_epoch(3), generation)
         .expect("owner");
-    assert!(authorize_process_owner(&owner, &reconnected).is_ok());
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    assert!(crate::process_execution::authorize_process_owner_in_context(
+        &owner,
+        &reconnected,
+        &context,
+    )
+    .is_ok());
 
     let wrong_module =
         ProcessOwnerBinding::new("native", "a".repeat(64), test_epoch(3), generation)
@@ -3642,7 +3648,12 @@ fn process_owner_survives_reconnect_but_rejects_cross_owner() {
     )
     .expect("owner");
     for candidate in [wrong_module, wrong_principal, wrong_generation] {
-        assert!(authorize_process_owner(&owner, &candidate).is_err());
+        assert!(crate::process_execution::authorize_process_owner_in_context(
+            &owner,
+            &candidate,
+            &context,
+        )
+        .is_err());
     }
 }
 
@@ -4257,7 +4268,13 @@ fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
     let first_session = ProcessSessionBinding::new("connection-a", 1).expect("session");
     let restarted_session = ProcessSessionBinding::new("connection-b", 2).expect("session");
     assert_ne!(first_session, restarted_session);
-    assert!(authorize_process_owner(&first, &restarted).is_ok());
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    assert!(crate::process_execution::authorize_process_owner_in_context(
+        &first,
+        &restarted,
+        &context,
+    )
+    .is_ok());
 
     for (sid, module, authority, candidate_generation) in [
         ("S-1-5-19", "testd", test_epoch(3), generation),
@@ -4273,7 +4290,12 @@ fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
         let digest = stable_owner_principal_digest(sid, module, &authority, candidate_generation);
         let candidate = ProcessOwnerBinding::new(module, digest, authority, candidate_generation)
             .expect("owner");
-        assert!(authorize_process_owner(&first, &candidate).is_err());
+        assert!(crate::process_execution::authorize_process_owner_in_context(
+            &first,
+            &candidate,
+            &context,
+        )
+        .is_err());
     }
 }
 
