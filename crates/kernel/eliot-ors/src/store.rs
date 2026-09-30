@@ -815,12 +815,25 @@ const BRIDGE_STREAM_OWNER_NAMESPACE: &str = "eliot.bridge-event.stream-owner.v1"
 /// Owner-namespace domain for newly admitted connection-level (unscoped)
 /// coverage-gap occurrences (issue #2729). V2 adds the Kernel-observed
 /// connection, launch nonce, and session epoch to lineage/principal; producer
-/// and stream remain explicit unbound markers. Existing v1 owner rows are
-/// preserved under their original keys; this change does not migrate them or
-/// establish reconnect rights.
-const BRIDGE_GAP_OWNER_NAMESPACE: &str = "eliot.bridge-event.gap-owner.v2";
-/// Version of the bridge-stream owner binding carried by every owner row.
-const BRIDGE_STREAM_OWNER_VERSION: u16 = 1;
+/// and stream remain explicit unbound markers. V3 additionally binds the
+/// Kernel-composed installation identity, so two installations never share
+/// one gap namespace. Existing v1/v2 owner rows are preserved under their
+/// original keys; this change does not migrate them or establish reconnect
+/// rights.
+const BRIDGE_GAP_OWNER_NAMESPACE: &str = "eliot.bridge-event.gap-owner.v3";
+/// Version of the bridge-stream owner binding carried by new owner rows
+/// (issue #2729). Version 2 rows additionally pin the Kernel-composed
+/// installation identity compared on every reuse; version 1 rows predate
+/// that binding and stay readable under their original keys without
+/// migration. The stream namespace digest itself is unchanged: the privacy
+/// verdict scope and legacy recovery derive from the same digest, so a
+/// digest change would orphan retained rows with no admission evidence to
+/// migrate them.
+const BRIDGE_STREAM_OWNER_VERSION: u16 = 2;
+/// Owner-row version predating the installation binding (issue #2729).
+/// Accepted on read so legacy rows stay preserved and recoverable; never
+/// written by new binds.
+const BRIDGE_STREAM_OWNER_LEGACY_VERSION: u16 = 1;
 /// Incarnation assigned at the first admitted bind of a stream namespace.
 /// Re-creation under a new incarnation belongs to retention/recreation
 /// (#2731), which owns no writer here: the store assigns this value, never
@@ -2882,6 +2895,10 @@ struct BridgeStreamOwnerRow {
     authority_lineage: String,
     principal: String,
     producer: String,
+    /// Kernel-composed installation identity pinned at first bind (issue
+    /// #2729). Empty on legacy version 1 rows, which predate the binding.
+    #[serde(default)]
+    installation_id: String,
     creating_connection: String,
     creating_launch_nonce: String,
     creating_session_epoch: u64,
@@ -2895,10 +2912,12 @@ impl BridgeStreamOwnerRow {
         if self.contract_version != crate::CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
         }
-        if self.owner_version != BRIDGE_STREAM_OWNER_VERSION {
+        if self.owner_version != BRIDGE_STREAM_OWNER_VERSION
+            && self.owner_version != BRIDGE_STREAM_OWNER_LEGACY_VERSION
+        {
             return Err(OrsError::InvalidField {
                 field: "owner_version",
-                reason: "bridge stream owner binding carries the current owner version",
+                reason: "bridge stream owner binding carries a known owner version",
             });
         }
         crate::model::validate_digest(&self.namespace, "owner_namespace")?;
@@ -2931,6 +2950,9 @@ impl BridgeStreamOwnerRow {
             }
         } else {
             bridge_owner_component(&self.producer, "producer")?;
+        }
+        if self.owner_version == BRIDGE_STREAM_OWNER_VERSION {
+            bridge_owner_component(&self.installation_id, "installation_id")?;
         }
         crate::model::validate_text(&self.creating_connection, "creating_connection")?;
         crate::model::validate_text(&self.creating_launch_nonce, "creating_launch_nonce")?;
@@ -3003,16 +3025,20 @@ impl BridgeStreamAccess {
 
 /// Kernel-derived owner evidence for one stream bind (issue #2729).
 ///
-/// Built by the Kernel route from the retained Session and the presenting
-/// fence only — never from bridge-authored session text. The store treats
-/// every field as an untrusted input to the namespace digest and the
-/// stored-row equality check, never as authority: a forged digest selects
-/// at most another row, which then fails the field-equality check.
+/// Built by the Kernel route from the retained Session, the presenting
+/// fence, and the composed installation identity only — never from
+/// bridge-authored session text. The store treats every field as an
+/// untrusted input to the namespace digest and the stored-row equality
+/// check, never as authority: a forged digest selects at most another row,
+/// which then fails the field-equality check. The installation and the
+/// creating occurrence enter the stored-row equality check; the
+/// last-staging connection stays observation metadata only.
 struct BridgeOwnerEvidence {
     lineage: String,
     principal: String,
     producer: String,
     local: String,
+    installation_id: String,
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
@@ -3048,8 +3074,8 @@ struct BridgeCheckedStage {
 }
 
 /// Parsed inputs for one owner-checked gap record (issue #2729): the gap
-/// identity and interval with the presenter's lineage, principal, and
-/// creating occurrence.
+/// identity and interval with the presenter's lineage, principal,
+/// installation, and creating occurrence.
 struct BridgeCheckedGap {
     gap_id: String,
     stream_id: String,
@@ -3059,6 +3085,7 @@ struct BridgeCheckedGap {
     staging_connection: String,
     lineage: String,
     principal: String,
+    installation_id: String,
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
@@ -13106,9 +13133,10 @@ impl RedbRecoveryStore {
 
     /// Extracts the Kernel-derived stream owner evidence from a staged
     /// JSON object (issue #2729). The producer and local stream ride the
-    /// top-level identity fields; the lineage, principal, and creating
-    /// occurrence ride the `owner_*` fields the Kernel route derived from
-    /// the retained Session and the presenting fence.
+    /// top-level identity fields; the lineage, principal, installation,
+    /// and creating occurrence ride the `owner_*` fields the Kernel route
+    /// derived from the retained Session, the presenting fence, and the
+    /// composed installation identity.
     fn bridge_stream_evidence_from(
         staged: &serde_json::Value,
     ) -> Result<BridgeOwnerEvidence, OrsError> {
@@ -13131,6 +13159,7 @@ impl RedbRecoveryStore {
             principal: Self::bridge_owner_field(staged, "owner_principal")?,
             producer,
             local,
+            installation_id: Self::bridge_owner_field(staged, "owner_installation_id")?,
             connection: bridge_text(staged, "owner_connection")?,
             launch_nonce: bridge_text(staged, "owner_launch_nonce")?,
             session_epoch: Self::bridge_owner_epoch(staged)?,
@@ -13178,17 +13207,21 @@ impl RedbRecoveryStore {
         Ok(crate::model::sha256_hex(text.as_bytes()))
     }
 
-    /// Computes the v2 owner-namespace digest for one connection-level gap
-    /// reporter occurrence (issue #2729). The occurrence fields are derived by
-    /// Kernel and validated here; producer and stream stay fixed to the
-    /// explicit unbound marker, so this creates neither a producer nor a task.
+    /// Computes the v3 owner-namespace digest for one connection-level gap
+    /// reporter occurrence (issue #2729). The installation and the
+    /// occurrence fields are derived by Kernel and validated here, so two
+    /// distinct admitted sessions — or two installations — never share one
+    /// namespace; producer and stream stay fixed to the explicit unbound
+    /// marker, so this creates neither a producer nor a task.
     fn bridge_gap_owner_digest(
+        installation_id: &str,
         lineage: &str,
         principal: &str,
         connection: &str,
         launch_nonce: &str,
         session_epoch: u64,
     ) -> Result<String, OrsError> {
+        bridge_owner_component(installation_id, "owner_installation_id")?;
         bridge_owner_component(lineage, "owner_authority_lineage")?;
         bridge_owner_component(principal, "owner_principal")?;
         bridge_owner_component(connection, "owner_connection")?;
@@ -13201,7 +13234,7 @@ impl RedbRecoveryStore {
         }
         let unbound = HOST_REQUEST_UNBOUND_MARKER;
         let text = format!(
-            "{BRIDGE_GAP_OWNER_NAMESPACE}\x1flineage={lineage}\x1fprincipal={principal}\x1fconnection={connection}\x1flaunch_nonce={launch_nonce}\x1fsession_epoch={session_epoch}\x1fproducer={unbound}\x1fstream={unbound}"
+            "{BRIDGE_GAP_OWNER_NAMESPACE}\x1finstallation={installation_id}\x1flineage={lineage}\x1fprincipal={principal}\x1fconnection={connection}\x1flaunch_nonce={launch_nonce}\x1fsession_epoch={session_epoch}\x1fproducer={unbound}\x1fstream={unbound}"
         );
         Ok(crate::model::sha256_hex(text.as_bytes()))
     }
@@ -15865,10 +15898,13 @@ impl RedbRecoveryStore {
     /// #2729): the first admitted bind durably retains the binding with
     /// its store-assigned incarnation and revision, while a later bind
     /// under the same namespace must present the identical binding —
-    /// changed lineage, principal, producer, local scope, or creating
-    /// connection/launch-nonce/session-epoch occurrence fails with
+    /// changed lineage, principal, producer, local scope, installation, or
+    /// creating connection/launch-nonce/session-epoch occurrence fails with
     /// [`OrsError::DuplicateConflict`] and never overwrites the retained
-    /// owner. Enforces the owner-table bound for fresh namespaces.
+    /// owner. A predictable local name is not ownership: the creating
+    /// occurrence is compared on every reuse, so a later session presenting
+    /// the same lineage/principal/producer/local tuple never inherits the
+    /// retained row. Enforces the owner-table bound for fresh namespaces.
     fn bind_bridge_stream_owner_in(
         write: &redb::WriteTransaction,
         evidence: &BridgeOwnerEvidence,
@@ -15895,6 +15931,7 @@ impl RedbRecoveryStore {
                 || row.principal != evidence.principal
                 || row.producer != evidence.producer
                 || row.local_stream != evidence.local
+                || row.installation_id != evidence.installation_id
                 || row.creating_connection != evidence.connection
                 || row.creating_launch_nonce != evidence.launch_nonce
                 || row.creating_session_epoch != evidence.session_epoch
@@ -15913,6 +15950,7 @@ impl RedbRecoveryStore {
             authority_lineage: evidence.lineage.clone(),
             principal: evidence.principal.clone(),
             producer: evidence.producer.clone(),
+            installation_id: evidence.installation_id.clone(),
             creating_connection: evidence.connection.clone(),
             creating_launch_nonce: evidence.launch_nonce.clone(),
             creating_session_epoch: evidence.session_epoch,
@@ -18645,7 +18683,7 @@ impl RedbRecoveryStore {
 
     /// Parses and validates one owner-checked gap request (issue #2729):
     /// the gap identity and interval with the presenter's lineage,
-    /// principal, and creating occurrence.
+    /// principal, installation, and creating occurrence.
     fn parse_bridge_gap_checked(gap: &serde_json::Value) -> Result<BridgeCheckedGap, OrsError> {
         let start_sequence = bridge_sequence(gap, "start_sequence")?;
         let end_sequence = bridge_sequence(gap, "end_sequence")?;
@@ -18665,6 +18703,7 @@ impl RedbRecoveryStore {
             staging_connection: bridge_text(gap, "staging_connection")?,
             lineage,
             principal,
+            installation_id: Self::bridge_owner_field(gap, "owner_installation_id")?,
             connection: bridge_text(gap, "owner_connection")?,
             launch_nonce: bridge_text(gap, "owner_launch_nonce")?,
             session_epoch: Self::bridge_owner_epoch(gap)?,
@@ -18683,6 +18722,7 @@ impl RedbRecoveryStore {
     ) -> Result<(String, String), OrsError> {
         if parsed.stream_id.is_empty() {
             let namespace = Self::bridge_gap_owner_digest(
+                &parsed.installation_id,
                 &parsed.lineage,
                 &parsed.principal,
                 &parsed.connection,
@@ -18694,6 +18734,7 @@ impl RedbRecoveryStore {
                 principal: parsed.principal.clone(),
                 producer: HOST_REQUEST_UNBOUND_MARKER.to_owned(),
                 local: HOST_REQUEST_UNBOUND_MARKER.to_owned(),
+                installation_id: parsed.installation_id.clone(),
                 connection: parsed.connection.clone(),
                 launch_nonce: parsed.launch_nonce.clone(),
                 session_epoch: parsed.session_epoch,

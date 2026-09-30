@@ -6523,6 +6523,7 @@ impl KernelComposition {
             "requested_route": AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
             "owner_principal": evidence.principal,
             "owner_authority_lineage": evidence.authority_lineage,
+            "owner_installation_id": evidence.installation_id,
             "owner_connection": evidence.connection,
             "owner_launch_nonce": evidence.launch_nonce,
             "owner_session_epoch": evidence.session_epoch,
@@ -6735,6 +6736,10 @@ impl KernelComposition {
         object.insert(
             "owner_authority_lineage".to_owned(),
             serde_json::Value::String(evidence.authority_lineage),
+        );
+        object.insert(
+            "owner_installation_id".to_owned(),
+            serde_json::Value::String(evidence.installation_id),
         );
         object.insert(
             "owner_connection".to_owned(),
@@ -7802,17 +7807,20 @@ const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
 /// Kernel-derived owner evidence for one bridge-event operation (issue
 /// #2729).
 ///
-/// Built from the retained Session and the presenting fence only: the
-/// principal is the platform-verified peer identity, the lineage is the
-/// presenting authority lineage, and the occurrence is the admitted
+/// Built from the retained Session, the presenting fence, and the composed
+/// installation identity only: the principal is the platform-verified peer
+/// identity, the lineage is the presenting authority lineage, the
+/// installation is the set-once dispatch-contour identity from the
+/// authenticated Host startup binding, and the occurrence is the admitted
 /// transport session. No bridge-authored session text is accepted — the
 /// frame carries none by design, and the Kernel builds the sender binding
-/// itself from the retained Session. A matching Windows identity, a
+/// itself from retained state. A matching Windows identity, a
 /// current generation, or an earlier connection alone never satisfies
 /// this evidence: the store still requires the full binding tuple.
 struct BridgeOwnerEvidence {
     principal: String,
     authority_lineage: String,
+    installation_id: String,
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
@@ -7856,6 +7864,20 @@ fn bridge_owner_evidence(
     if authority_lineage.trim().is_empty() {
         return Err(TransportError::SessionFenced);
     }
+    // The installation is the Kernel's existing one: the set-once dispatch
+    // contour cell composed from the authenticated Host startup binding
+    // (the same identity restore admission compares against). It is never
+    // taken from request, config, or fixture text: an uncomposed process
+    // has no installation identity and fails closed here.
+    let installation_id = super::dispatch_contour()
+        .map_or(
+            "",
+            super::dispatch_launch::ComposedDispatchContour::installation_id,
+        )
+        .to_owned();
+    if installation_id.trim().is_empty() || installation_id.chars().any(char::is_control) {
+        return Err(TransportError::SessionFenced);
+    }
     if session.connection_id.trim().is_empty()
         || session.launch_nonce.trim().is_empty()
         || session.session_epoch == 0
@@ -7865,6 +7887,7 @@ fn bridge_owner_evidence(
     Ok(BridgeOwnerEvidence {
         principal,
         authority_lineage: authority_lineage.to_owned(),
+        installation_id,
         connection: session.connection_id.clone(),
         launch_nonce: session.launch_nonce.clone(),
         session_epoch: session.session_epoch,
