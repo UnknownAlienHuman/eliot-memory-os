@@ -157,9 +157,9 @@
 //! and the candidate is admitted as a brand-new entry that can never merge with
 //! the old one — the daemon's own code treats fence movement as live and
 //! REFUSES mid-flight rather than proceeding on it: "daemon reconstruction
-//! fence moved before serve" (`daemon_runtime.rs:4395-4397`) and "the admitted
+//! fence moved before serve" (`daemon_runtime.rs:4463-4465`) and "the admitted
 //! state fence moved between the dedup registry read and the admission"
-//! (`daemon_runtime.rs:5465-5470`). Convergence across a fence move is
+//! (`daemon_runtime.rs:5533-5537`). Convergence across a fence move is
 //! therefore NOT claimed, and is not achievable by anything in this file.
 //!
 //! It did NOT previously converge to one STORE row, and this claim used to say
@@ -180,7 +180,9 @@
 //! re-commit under a new digest legitimately produces a second row for the same
 //! candidate" (`candidate_bounds.rs:640-646`) — and the read side tolerates it
 //! by keeping the highest `candidate.revision` per `candidate_id`
-//! (`restored_registry`, `improvement_dedup_read.rs:652-663`).
+//! (`restored_registry`, `improvement_dedup_read.rs:516-559`, whose
+//! `BoundedBacklog::restored` keeps the highest revision per candidate id at
+//! `candidate_bounds.rs:647-663`).
 //!
 //! Stated plainly because the previous claim was the opposite and would have
 //! been believed: the durable rows accumulate per tick; the convergence is
@@ -326,11 +328,11 @@
 //! | candidate ingress surface | measured result |
 //! |---|---|
 //! | listener / socket / stdin in `bins/eliotd` | ZERO. `TcpListener`, `UnixListener`, `UnixStream`, `read_line`, `accept(` and `stdin()` match nothing under `bins/eliotd` |
-//! | the daemon's only transport | OUTBOUND. `daemon_kernel_client.rs:1885 connect_authenticated_kernel_front_door` is the authenticated named-pipe CLIENT. `eliotd` dials the Kernel; nothing dials `eliotd` |
-//! | the daemon's pull queues | REAL, but wrong-typed. `local_read_claim` (`frame_dispatch.rs:1451`), `task_controller_claim` (`:1498`), `campaign_packet_claim` (`:1500`) and `finish_claim` (`:1506`) are genuine Kernel→daemon routes, and each carries one fixed attempt type. None carries a brief decision, and adding one is a Kernel operation plus a store record kind |
+//! | the daemon's only transport | OUTBOUND. `daemon_kernel_client.rs:2038 connect_authenticated_kernel_front_door` is the authenticated named-pipe CLIENT. `eliotd` dials the Kernel; nothing dials `eliotd` |
+//! | the daemon's pull queues | REAL, but wrong-typed. `local_read_claim` (`frame_dispatch.rs:1493`), `semantic_observe_claim` (`:1495`), `task_controller_claim` (`:1552`), `campaign_packet_claim` (`:1554`) and `finish_claim` (`:1560`) are genuine Kernel→daemon routes, and each carries one fixed attempt type. None carries a brief decision, and adding one is a Kernel operation plus a store record kind |
 //! | `eliot_user_automation` / `UserAutomationOperation` | never reaches `eliotd`: `git grep -c user_automation -- bins/eliotd` is 0. Served inside the Kernel, which dispatches a wake to the Host |
-//! | the `DecideImprovementBrief` operation itself | the vocabulary entry is closed, authenticated and live — `daemon_request_dispatch.rs:4214` binds `intent.principal_ref` from `authenticated_user_automation_principal(session)` — and it is REFUSED at both ends: the automation Store answers `StoreError::UnknownOperation` (`user_automation_store.rs:954`) and the operator route answers `TransportError::SessionFenced` (`daemon_request_dispatch.rs:4208-4213`) |
-//! | a durable decision an owner could write for the daemon to read | none. The daemon's read client admits a closed set of named reads (`kernel_context_read_client.rs:190-249`) and `GetUserAutomationState` is not among them; and the only row the daemon re-reads is its OWN `Candidate` artifact, written by this same pass under the same record key, so an owner cannot pre-empt it |
+//! | the `DecideImprovementBrief` operation itself | the vocabulary entry is closed, authenticated and live - `daemon_request_dispatch.rs:5393` binds `principal` from `authenticated_user_automation_principal(session)` and `:5399-5403` puts it in `intent.principal_ref` - and it is REFUSED at both ends: the automation Store answers `StoreError::UnknownOperation` at both of its own refusals (`user_automation_store.rs:1027-1029` and `:2527`) and the operator route answers `TransportError::SessionFenced` (`daemon_request_dispatch.rs:5387-5392`, before the principal is bound) |
+//! | a durable decision an owner could write for the daemon to read | none. The daemon's read client admits a closed set of named reads (`kernel_context_read_client.rs:186-253`) and `GetUserAutomationState` is not among them; and the only row the daemon re-reads is its OWN `Candidate` artifact, written by this same pass under the same record key, so an owner cannot pre-empt it |
 //!
 //! Two consequences follow, and both are stated rather than worked around:
 //!
@@ -366,18 +368,19 @@
 //!
 //! 1. a Kernel dispatch arm that COMMITS the authenticated decision as a durable
 //!    row, beside `dispatch_user_automation_operator_transition`
-//!    (`bins/eliot-kernel/src/daemon_request_dispatch.rs:4242`), replacing the
-//!    `SessionFenced` refusal at `:4208-4213` for this one operation. It is
+//!    (`bins/eliot-kernel/src/daemon_request_dispatch.rs:5421`), replacing the
+//!    `SessionFenced` refusal at `:5387-5392` for this one operation. It is
 //!    refused today because the automation Store owns no ordering scope a brief
 //!    can join, which is correct; the commit belongs to the improvement owner's
 //!    own canonical record, not to the automation Store.
 //! 2. a Kernel queue the daemon can claim, beside the existing pull legs in
-//!    `DaemonKernelClient` (`daemon_kernel_client.rs:2130` is the first,
-//!    `claim_local_read_pair_async`; `claim_finish_pair_async` at `:2395` is the
+//!    `DaemonKernelClient` (`daemon_kernel_client.rs:2308` is the first,
+//!    `claim_local_read_pair_async`; `claim_finish_pair_async` at `:2573` is the
 //!    last), carrying the committed decision's `brief_id`, its closed decision
 //!    string, and the principal the Session authenticated.
 //! 3. the daemon-side poll, in `daemon_runtime::run_improvement_intake`
-//!    (`bins/eliotd/src/daemon_runtime.rs:4791` is the guarded phase it would
+//!    (`bins/eliotd/src/daemon_runtime.rs:5604` is `run_improvement_intake`
+//!    itself, the guarded phase it would
 //!    have to precede) — outside this change's two files — which maps the closed
 //!    decision string onto [`OwnerDecisionKind`] FAILING CLOSED on an unmapped
 //!    value, and calls this module with the claimed principal as the owner.
@@ -408,11 +411,11 @@
 //! | candidate owner-facing surface | measured result |
 //! |---|---|
 //! | `LearningRecordKind` vocabulary | CLOSED at six variants — `Delta`, `Overlay`, `Closure`, `ActivationReceipt`, `Candidate`, `ViewRef` (`learning_store.rs:100-113`). There is NO `Brief` kind, so the brief cannot become a first-class durable record without a store-contract change this file does not own |
-//! | who reads `GetLearningRecordRange` for `Candidate` | the DAEMON ONLY. Three production call sites exist and every one filters a different kind: `improvement_dedup_read.rs:379` asks for `Candidate` and re-proves the daemon's own committed row (its `:849` check is a self-consistency proof of that row, not an owner reading it); `skill_evidence_read.rs:171` and `negative_memory_action_gate.rs:419` both ask for `ActivationReceipt`. `git grep -l GetLearningRecordRange -- "*.cs" -- bins/eliot/src` returns nothing: no Operator surface and no CLI reads any learning record |
-//! | ControlBoard | the `items` vector is a LITERAL `Vec::new()` (`controlboard_adapters.rs:987`), and the comment above it states why: the Governor owners carry no ControlBoard visibility/privacy/epistemic facts and inventing rows "would be a privacy expansion" (`controlboard_projection.rs:23-29`). A brief has no `BoardItem` to land in, and `BoardItem` itself carries no field for benefit, risk, cost, unknowns, or `brief_id` (`eliot-controlboard/src/lib.rs:467-478`) |
-//! | the ControlBoard read edge | not reachable either. `controlboard.read` is admitted by no host request: `daemon_runtime.rs:4144` records that "nothing in this repository presents a host request naming this capability" |
-//! | the canonical notification record | REAL, durable, and Human-read — it is the one owner-facing surface that genuinely exists, and it is the honest candidate. But its closed shape ([`eliot_kernel_core::Notification`], `notification_state.rs:317-337`) has `subject`, `summary`, `evidence_handles`, `affected_scope`, `owner`, `required_action` and no slot for likely benefit, risk, cost, next reversible step, unknowns, or `brief_id`. The brief would have to be re-spelled into `summary` prose, which is the "re-spelled into a log string" failure I12.24:74 exists to prevent, and the record's own `dedup_key` is derived from the maintenance decision (`automation_failure_key`), not from the brief — so two briefs over one trigger would collide onto one record or churn `IdentityConflict` |
-//! | the notification emitter's reachability | it is a free function in another file, `emit_blocked_automation_notification` (`notification_state_emit.rs:582`), reached from the health-heartbeat arm `note_blocked_automation_notification` (`daemon_runtime.rs:2641`). It is not reachable from this module and its signature takes an `AutomationTriggerDecision`, not a brief |
+//! | who reads `GetLearningRecordRange` for `Candidate` | the DAEMON ONLY. Three production call sites exist and every one filters a different kind: `improvement_dedup_read.rs:377-384` asks for `Candidate` and re-proves the daemon's own committed row (its `:810` digest check and `:869-881` self-binding checks are self-consistency proofs of that row, not an owner reading it); `skill_evidence_read.rs:170-176` and `negative_memory_action_gate.rs:418-424` both ask for `ActivationReceipt`. `git grep -l GetLearningRecordRange -- "*.cs" -- bins/eliot/src` returns nothing: no Operator surface and no CLI reads any learning record |
+//! | ControlBoard | the `items` vector is a LITERAL `Vec::new()` (`controlboard_adapters.rs:987`), and the comment above it states why: the Governor owners carry no ControlBoard visibility/privacy/epistemic facts and inventing rows "would be a privacy expansion" (`crates/governor/eliot-governor/src/controlboard_projection.rs:23-29`). A brief has no `BoardItem` to land in, and `BoardItem` itself carries no field for benefit, risk, cost, unknowns, or `brief_id` (`crates/surfaces/eliot-controlboard/src/lib.rs:467-477`) |
+//! | the ControlBoard read edge | not reachable either. `controlboard.read` is admitted by no host request: `daemon_runtime.rs:4369-4370` records that "nothing in this repository presents a host request naming this capability" |
+//! | the canonical notification record | REAL, durable, and Human-read — it is the one owner-facing surface that genuinely exists, and it is the honest candidate. But its closed shape ([`eliot_kernel_core::Notification`], `crates/kernel/eliot-kernel-core/src/module/notification_state.rs:317-345`) has `subject`, `summary`, `evidence_handles`, `affected_scope`, `owner`, `required_action` and no slot for likely benefit, risk, cost, next reversible step, unknowns, or `brief_id`. The brief would have to be re-spelled into `summary` prose, which is the "re-spelled into a log string" failure I12.24:74 exists to prevent, and the record's own `dedup_key` is derived from the maintenance decision (`automation_failure_key`), not from the brief — so two briefs over one trigger would collide onto one record or churn `IdentityConflict` |
+//! | the notification emitter's reachability | it is a free function in another file, `emit_blocked_automation_notification` (`notification_state_emit.rs:582`), reached from the health-heartbeat arm `note_blocked_automation_notification` (`daemon_runtime.rs:2839`, called at `:3101`). It is not reachable from this module and its signature takes an `AutomationTriggerDecision`, not a brief |
 //! | Host / operator console | `host_console_protocol.rs` serves exactly `Status` and `Stop`; `apps/Eliot.Operator` reads `controlboard.read` and the runtime-status contract only. Neither names a learning record, a brief, or `DecideImprovementBrief` |
 //!
 //! ## The two artifacts a publication would need, in two other owners
@@ -434,7 +437,7 @@
 //!    not this dispatch layer's.
 //!
 //! Neither is in this file, and neither can be honestly faked here. A
-//! `tracing` span field carrying `brief_id` (`daemon_runtime.rs:5340`) is a
+//! `tracing` span field carrying `brief_id` (`daemon_runtime.rs:5684`) is a
 //! diagnostic, not a publication: nothing outside this process reads it, and no
 //! owner can act on it. So this module states the gap and stops.
 //!
@@ -905,7 +908,7 @@ pub fn assemble_improvement_artifact(
 /// evidence rather than of this file's choice:
 ///
 /// - [`AutomationDecision::Block`] is "Policy, route, budget or session
-///   requirements deny execution" (`eliot-maintenance/src/lib.rs:194`). The
+///   requirements deny execution" (`eliot-maintenance/src/lib.rs:211-212`). The
 ///   daemon's own triage of a brief proposing to "evaluate and resolve the
 ///   blocked maintenance family" is therefore [`OwnerDecisionKind::Reject`]:
 ///   the owner denied the work, so the daemon stops pursuing the proposal. This
@@ -975,7 +978,10 @@ fn daemon_disposition_kind(
 /// `source_id`), and the exchange it makes over is authenticated in the other
 /// direction too: the Kernel front door proves this daemon's peer SID, session
 /// identity and artifact digest before the connection is used
-/// (`daemon_kernel_client.rs:1878-1908`). It grants nothing either way —
+/// (`daemon_kernel_client.rs:2031-2060`: the `KernelFrontDoorServerExpectation`
+/// carries the expected SID, session id and artifact digest, and
+/// `transport.peer_identity()` is matched against them at `:2045`). It grants
+/// nothing either way -
 /// `is_non_mutating` is what makes the record advisory. A note that says "the
 /// daemon triaged this and no owner has ruled on it" is a smaller claim than the
 /// one it replaces, and it is a TRUE one.
@@ -1087,10 +1093,12 @@ fn maintenance_trigger_text(decision: &eliot_maintenance::AutomationTriggerDecis
 /// control characters (`crates/foundation/eliot-contracts/src/lib.rs:334-342`)
 /// — no charset and no length bound — and `StoredLearningDelta::validate` bounds
 /// only `delta_artifact` for NON-EMPTINESS (its 256-character check at
-/// `stored.rs:250` covers `actor_id` and `route_id`). The Self-Quality side, by
+/// `crates/smart/eliot-learning-delta/src/stored.rs:246-253` covers `actor_id`
+/// and `route_id`; `delta_artifact` itself is checked for non-blank only at
+/// `:236-245`). The Self-Quality side, by
 /// contrast, refuses any ref longer than `MAX_SELF_QUALITY_TEXT_BYTES = 1024`
 /// (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:68`,
-/// `:1898`). So a committed closure whose artifact identity exceeds 1007 bytes
+/// enforced at `:1898-1903`). So a committed closure whose artifact identity exceeds 1007 bytes
 /// — the 1024-byte bound less this file's 17-byte prefix — makes the CONFORMANCE
 /// arm refuse with a typed `SelfQualityError::Contract`, where before this
 /// change that same closure was accepted. The digest ref cannot trigger it: it
@@ -1203,7 +1211,7 @@ fn closure_bound_evidence_refs(
 /// fills positionally and then SORTS, and the sorted result is what
 /// `validate_handoff` → `validate_ref_set` checks for repeats
 /// (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:1227`,
-/// `:1933-1958`). The `ConformanceDiagnosis` field group this file builds is
+/// with the repeat and ordering checks in `validate_ref_set` at `:1933-1959`). The `ConformanceDiagnosis` field group this file builds is
 /// never itself sorted-checked, so the arm assembles its refs to suit that
 /// constructor's slots and owes exactly one property of its own: that they are
 /// DISTINCT. Building them next to the other nine keeps that visible; inheriting
@@ -1566,7 +1574,7 @@ fn enforce_improvement_class_gate(
 ///   reach this function is EXACTLY [`crate::SELF_OBSERVED_FAMILY`] and
 ///   `MaintenanceFamily::DonorConformance`. That is measured, not assumed: the
 ///   sole caller of `assemble_improvement_artifact` is
-///   `daemon_runtime::improvement_intake_artifact` (`daemon_runtime.rs:4813`),
+///   `daemon_runtime::improvement_intake_artifact` (`daemon_runtime.rs:5462`),
 ///   it is the only caller of `run_improvement_intake`, and the one observation
 ///   that function is ever handed is built by
 ///   `daemon_runtime::improvement_intake_observation` — whose family is
@@ -1590,16 +1598,16 @@ fn enforce_improvement_class_gate(
 ///
 /// What used to be true, and is not any more: the decision carried no
 /// origin at all. [`eliot_maintenance::AutomationTriggerDecision`]
-/// (`crates/governor/eliot-maintenance/src/lib.rs:304-336`) now carries
-/// `trigger: MaintenanceTrigger` (`:323`), copied verbatim from
+/// (`crates/governor/eliot-maintenance/src/lib.rs:310-339`) now carries
+/// `trigger: MaintenanceTrigger` (`:326`), copied verbatim from
 /// `MaintenanceTriggerInput::trigger` at both construction sites
-/// (`lib.rs:762` and `lib.rs:1123`) and never selected, widened or defaulted
+/// (`lib.rs:798` and `lib.rs:1207`) and never selected, widened or defaulted
 /// there. The origin is therefore READABLE on the decision this function
 /// receives, and the arm is missing a producer rather than a field.
 ///
 /// What is still true, and is what blocks the arm: the observation this
 /// dispatch records is built from `MaintenanceTriggerOrigin::IdleTransition`
-/// (`daemon_runtime::improvement_intake_observation`, `daemon_runtime.rs:5690`),
+/// (`daemon_runtime::improvement_intake_observation`, `daemon_runtime.rs:6028`),
 /// and the origin→trigger map is exhaustive over the four-member origin enum
 /// (`maintenance_trigger_evaluator.rs:122-128`), so that origin maps to
 /// `MaintenanceTrigger::Policy` — never `WatchdogProblem`. A policy-driven
@@ -1615,7 +1623,7 @@ fn enforce_improvement_class_gate(
 /// `Escalate`, although the owner's evaluator pairs `Defer` — never `Block` —
 /// with `NotIdle`, `OutsideSchedule`, `RouteUnavailable`, `BudgetUnavailable`
 /// and `UserSessionRequired`
-/// (`crates/governor/eliot-maintenance/src/lib.rs:628-643`), so it could in
+/// (`crates/governor/eliot-maintenance/src/lib.rs:832-845`), so it could in
 /// fact match `AutomationOff` alone. A label the decision's own content cannot
 /// support is the misattribution this issue exists to remove, so the residual
 /// is dropped rather than renamed.
@@ -1628,7 +1636,7 @@ fn enforce_improvement_class_gate(
 ///
 /// The contract half of that ceiling is now CLOSED and no longer part of the
 /// reason. `AutomationTriggerDecision::trigger` exists and travels verbatim
-/// (`lib.rs:323`, copied at `lib.rs:762` and `lib.rs:1123`), so "the origin does
+/// (`lib.rs:326`, copied at `lib.rs:798` and `lib.rs:1207`), so "the origin does
 /// not travel with the decision" is no longer true of any of the three. What
 /// remains is per-source, and each remaining step is recorded at the source
 /// below: an observation whose origin is not `IdleTransition` reaching this
@@ -1649,22 +1657,23 @@ fn enforce_improvement_class_gate(
 ///
 /// - `Watchdog` is the closest. The origin that denotes a Watchdog/Doctor
 ///   occurrence, `MaintenanceTriggerOrigin::AdmittedObservation`, is live and has
-///   exactly ONE construction site in this daemon (`daemon_runtime.rs:2868`, the
+///   exactly ONE construction site in this daemon (`daemon_runtime.rs:3067`, the
 ///   store-health poll). The origin→trigger map is exhaustive over the
 ///   four-member origin enum (`maintenance_trigger_evaluator.rs:122-128`), and
 ///   only `AdmittedObservation` maps to
 ///   `MaintenanceTrigger::WatchdogProblem`, so that one site is the only
 ///   producer of a `WatchdogProblem` decision — and that decision does not reach
-///   this function. It is consumed at `daemon_runtime.rs:2902-2906` by
+///   this function. It is consumed at `daemon_runtime.rs:3100-3104` by
 ///   `note_blocked_automation_notification` and
 ///   `publish_maintenance_source_results`, while the one observation that DOES
 ///   reach here is built at `daemon_runtime::improvement_intake_observation`
-///   (`:5684`) from `MaintenanceTriggerOrigin::IdleTransition`, which maps to
+///   (`:6028`) from `MaintenanceTriggerOrigin::IdleTransition`, which maps to
 ///   `MaintenanceTrigger::Policy`. The exact remaining step is therefore a route
 ///   carrying that existing site into the intake; the classifier needs no
 ///   further change, because it already reads the field the route would deliver.
 /// - `Dreamer` needs a NEW `MaintenanceTriggerOrigin` member. `MaintenanceTrigger`
-///   HAS a `Dreamer` member (`lib.rs:184-185`) and this classifier now reads it,
+///   HAS a `Dreamer` member (`lib.rs:184-197`, the member at `:188`) and this
+///   classifier now reads it,
 ///   but NO origin maps to it: the exhaustive map at
 ///   `maintenance_trigger_evaluator.rs:122-128` names only `Policy`,
 ///   `Onboarding` and `WatchdogProblem`. So unlike `Watchdog`, a `Dreamer`
@@ -1695,9 +1704,9 @@ fn enforce_improvement_class_gate(
 ///
 /// - `EvaluatorVerdict` has a constructor and no caller.
 ///   [`eliot_improvement::sourced_evidence_from_repeated_verifier_failure`]
-///   exists and is re-exported (`evidence_sources.rs:118`, `lib.rs:379`). Its
+///   exists and is re-exported (`evidence_sources.rs:118`, `lib.rs:424`). Its
 ///   occurrences are that definition, that re-export, a prose mention in the
-///   improvement crate's own header (`lib.rs:163`), and citations in this
+///   improvement crate's own header (`lib.rs:181`), and citations in this
 ///   comment — and ZERO call sites. That is the finding, and it is stated as a
 ///   call-site count rather than as an exhaustive hit list deliberately: a hit
 ///   list necessarily includes this comment, so no phrasing of one can return
@@ -1708,7 +1717,7 @@ fn enforce_improvement_class_gate(
 ///   (`git grep -n "eliot-verification\|verifier" -- bins/eliotd/Cargo.toml` is
 ///   empty) and its only repeated-failure counter,
 ///   [`crate::diagnostics::RepeatedFailureGuard`], is an output cap
-///   (`should_emit` stops emitting after a fixed count, `diagnostics.rs:1571`)
+///   (`should_emit` stops emitting after a fixed count, `diagnostics.rs:1588`)
 ///   and records no verifier, no attempt and no outcome. Calling the constructor
 ///   would mean inventing a `verifier_ref` and a set of `failure_refs` this
 ///   process never observed, which is precisely the fabrication this function
@@ -1716,12 +1725,12 @@ fn enforce_improvement_class_gate(
 /// - `ImplementationDeviation` (I12.24:47, "accepted
 ///   `ImplementationDeviation`") names an ACCEPTED deviation, so the evidence
 ///   must be an accepted-deviation record. `eliot_problem::ImplementationDeviation`
-///   is that record type (`crates/governor/eliot-problem/src/lib.rs:2897`) and
+///   is that record type (`crates/governor/eliot-problem/src/lib.rs:3038`) and
 ///   its only consumer is
 ///   `eliot_runtime_status::project_implementation_deviation_status`
 ///   (`crates/meta/eliot-runtime-status/src/implementation_deviation_status.rs:62`),
 ///   which has no call site either: its occurrences are that definition, the
-///   re-export at `eliot-runtime-status/src/lib.rs:82`, and citations in this
+///   re-export at `eliot-runtime-status/src/lib.rs:79-83`, and citations in this
 ///   comment. So
 ///   there is no admitted writer of an accepted deviation reaching any binary,
 ///   and `eliotd` has no dependency on either crate
@@ -1735,7 +1744,7 @@ fn enforce_improvement_class_gate(
 ///   `ExperienceEventKind::CoverageComplaint` enum member
 ///   (`crates/foundation/eliot-observation-contracts/src/experience/records.rs:157`),
 ///   a vocabulary entry with no writer: its occurrences are that declaration, the
-///   doc comment above it (`records.rs:143`), and citations in this comment, with
+///   doc comment above it (`records.rs:143-144`), and citations in this comment, with
 ///   no call site. There is no authenticated Human or agent ingress on this daemon
 ///   that could raise one (the ingress census is in this module's header: zero
 ///   listeners, sockets or stdin readers under `bins/eliotd`, and the only
@@ -1807,7 +1816,7 @@ pub fn maintenance_evidence_source(
         // 2. The one daemon site whose trigger origin IS the Watchdog/Doctor
         //    problem origin (`MaintenanceTriggerOrigin::AdmittedObservation`,
         //    `maintenance_trigger_evaluator.rs:126`) is the store-health poll
-        //    (`daemon_runtime.rs:2868-2876`), and it observes
+        //    (`daemon_runtime.rs:3066-3074`), and it observes
         //    `StoreHealth::manifest_digest` — the store API's own
         //    operation-manifest identity — naming `SELF_OBSERVED_FAMILY`. That
         //    is not a scanner receipt, and it is ineligible for this family
@@ -1823,8 +1832,9 @@ pub fn maintenance_evidence_source(
         // 3. The exhaustive family census confirms the gap is total, not a
         //    missing match arm: the only `MaintenanceFamily` values any
         //    production trigger site names are `SELF_OBSERVED_FAMILY`
-        //    (`SelfQualityDebt`) and `MaintenanceFamily::DonorConformance`
-        //    (`maintenance_trigger_evaluator.rs:372`, and
+        //    (`SelfQualityDebt`, `maintenance_trigger_evaluator.rs:658`) and
+        //    `MaintenanceFamily::DonorConformance`
+        //    (`maintenance_trigger_evaluator.rs:644`, and
         //    `daemon_runtime::conformance_observed_family`).
         //
         // What would make it reachable, concretely: an admitted owner that
@@ -1854,12 +1864,12 @@ pub fn maintenance_evidence_source(
 /// [`AutomationTriggerDecision::trigger`] is the Governor evaluator's verbatim
 /// copy of the caller-observed origin — copied at both construction sites and
 /// never selected, widened or defaulted there
-/// (`crates/governor/eliot-maintenance/src/lib.rs:762`, `:1123`) — so a decision
+/// (`crates/governor/eliot-maintenance/src/lib.rs:798`, `:1207`) - so a decision
 /// cannot claim an origin the evaluated trigger did not carry. That makes this a
 /// derivation from the observation, not a label: `WatchdogProblem` is
 /// documented "Watchdog or Doctor recovery/problem recipe"
 /// (`maintenance_trigger_evaluator.rs:118-119`) and `Dreamer` is "Accepted
-/// Dreamer maintenance plan candidate" (`lib.rs:184-185`), which are exactly
+/// Dreamer maintenance plan candidate" (`lib.rs:187-188`), which are exactly
 /// the two occurrences I12.24:54 names.
 ///
 /// The other four origin members are deliberately not arms:
@@ -1925,7 +1935,7 @@ fn maintenance_trigger_evidence_source(trigger: MaintenanceTrigger) -> EvidenceS
 /// `validate_handoff` → `validate_ref_set` refuses an adjacent repeated value in
 /// the sorted result
 /// (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:1227`,
-/// `:1947-1956`). Sortedness is NOT this function's to establish — `make_handoff`
+/// `:1947-1957`). Sortedness is NOT this function's to establish — `make_handoff`
 /// establishes it before validation runs, and this `ConformanceDiagnosis` field
 /// group is never itself sorted-checked. A committed closure whose artifact
 /// identity is longer than the handoff's own text bound does make this arm
@@ -1949,7 +1959,7 @@ fn conformance_diagnosis_evidence(
         // on this tree rather than assumed. It takes a
         // `SelfQualityObservation`, whose every variant wraps an
         // `ObservationCore`
-        // (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:362-376`),
+        // (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:365-376`),
         // and that core has ten required fields. Most of them are owner-binding,
         // window and measurement facts this daemon does not hold and cannot
         // honestly produce at any trigger site: `OwnerBinding`
@@ -2008,8 +2018,8 @@ fn conformance_diagnosis_evidence(
 ///
 /// `ASSUMPTION:` the maintenance `AutomationDecision` names the urgency the
 /// owner itself assigned: `Escalate` is documented as "Escalate to a Human or
-/// recovery owner" (`eliot-maintenance/src/lib.rs:194`) and `Block` as
-/// "Policy, route, budget or session requirements deny execution" (`:192`), so
+/// recovery owner" (`eliot-maintenance/src/lib.rs:213-214`) and `Block` as
+/// "Policy, route, budget or session requirements deny execution" (`:211-212`), so
 /// those two map to `Urgent` and `High` and every remaining decision
 /// (`Start`, `Suggest`, `Defer`, `SuppressDuplicate`, none of which hands the
 /// occurrence to a Human or a recovery owner) maps to `Medium`. I12.24 does
@@ -2622,7 +2632,7 @@ fn improvement_commit_identity(
 /// the outcome is `Merged`. A merge in which the surviving and absorbed
 /// candidates are the SAME identity writes no receipt at all, and that is the
 /// ordinary steady state rather than a corner: the reader refuses such a receipt
-/// (`improvement_dedup_read.rs:613-617`) and the refusal fails the entire
+/// (`improvement_dedup_read.rs:615-619`) and the refusal fails the entire
 /// deduplication read, so producing one would make the read fail permanently
 /// from the next pass onward. The self-merge arm at the call site states why
 /// nothing is lost by omitting it.
@@ -2783,9 +2793,9 @@ pub async fn commit_improvement_artifact(
         // Writing a receipt for it would be fatal, and the reader's refusal is
         // correct. `classify_merge_receipt` rejects any receipt whose
         // `absorbed_candidate_id` equals the survivor's
-        // (`improvement_dedup_read.rs:613-617`, "names no distinct absorbed
+        // (`improvement_dedup_read.rs:615-619`, "names no distinct absorbed
         // candidate"), the rejection propagates through `classify_row` at
-        // `improvement_dedup_read.rs:529`, and `restored_registry` therefore
+        // `improvement_dedup_read.rs:531`, and `restored_registry` therefore
         // fails as a WHOLE. Nothing deletes learning rows, so one such receipt
         // would make every later pass's deduplication read fail permanently.
         //
@@ -2806,10 +2816,11 @@ pub async fn commit_improvement_artifact(
         // 1. `evidence_refs` union (`:1101-1104`) — unchanged. Equal
         //    `candidate_id` implies equal identity content, because
         //    `derive_candidate_id` hashes the canonical evidence lineage
-        //    (`lib.rs:782-792`, `:813-827`), so the absorbed set is already a
+        //    (`crates/meta/eliot-improvement/src/lib.rs:853-855`, over the field
+        //    group passed at `:714-722`), so the absorbed set is already a
         //    subset of the survivor's.
         // 2. `source_trace_refs` union (`:1105-1108`) — unchanged on the same
-        //    citation: the identity digest hashes that field too (`:822-824`).
+        //    citation: the identity digest hashes that field too (`:847-849`).
         // 3. `merged_from` (`:1109-1111`) — the push DOES fire, and it pushes
         //    the survivor's OWN id, because on a self-merge the absorbed id and
         //    the surviving id are the same string read from the same candidate
@@ -2819,26 +2830,27 @@ pub async fn commit_improvement_artifact(
         // 4. `value` (`:1112-1114`) — DOES fire whenever the incoming
         //    assessment exceeds the restored floor, and it is a real raise, not
         //    a no-op: a candidate row restores `value` at
-        //    `enforced_bound.min_value` (`improvement_dedup_read.rs:902`), and
+        //    `enforced_bound.min_value` (`improvement_dedup_read.rs:930`), and
         //    the crate says so in as many words (`:603-605`). It is discarded
         //    because the durable record carries no assessed value to carry it
         //    — `DurableCandidateRecord` has `admitted_value_floor` and no
         //    `value` (`:218-224`, `:212-217`). Only a merge receipt makes a
         //    survivor's value durable, by re-reading it as the next floor
-        //    (`improvement_dedup_read.rs:653`), and this arm writes none.
+        //    (`improvement_dedup_read.rs:655`), and this arm writes none.
         // 5. `owner` (`:1115-1117`) — cannot fire on a restored entry. A
         //    candidate row sets it `Some(candidate.owner_and_decision_authority)`
         //    only AFTER that candidate validated
-        //    (`improvement_dedup_read.rs:894-900`), and `validate` refuses a
-        //    blank one (`lib.rs:771-774`, whose emptiness test trims, so
-        //    `lib.rs:1295-1300`); a
-        //    receipt row carries the PREVIOUS survivor's, re-validated at
-        //    `improvement_dedup_read.rs:634-642` and copied at `:651`. So the
+        //    (`improvement_dedup_read.rs:928`, after the `validate()` at
+        //    `:921-924`), and `validate` refuses a blank one
+        //    (`crates/meta/eliot-improvement/src/lib.rs:797-798`, whose emptiness
+        //    test trims, so `lib.rs:1320-1326`); a
+        //    receipt row carries the PREVIOUS survivor's, re-proved at
+        //    `improvement_dedup_read.rs:636-644` and copied at `:653`. So the
         //    entry is inductively never ownerless and the guard never opens.
         // 6. `admitted_under_authority` (`:1118-1120`) — the same shape: a
         //    candidate row sets it `Some(enforced_bound.governor_authority_ref)`
-        //    (`improvement_dedup_read.rs:901`) and a receipt row carries the
-        //    previous survivor's (`:652`). `into_entry` filters only a
+        //    (`improvement_dedup_read.rs:929`) and a receipt row carries the
+        //    previous survivor's (`:654`). `into_entry` filters only a
         //    trimmed-blank ref (`:250-253`), so the one way the guard can open
         //    is a blank committed `governor_authority_ref` — and were it so,
         //    the fill writes the CURRENT permit's `authority_ref` (`:786-787`),
@@ -2846,19 +2858,19 @@ pub async fn commit_improvement_artifact(
         //    it is a re-derivation and not a forged epoch.
         // 7. `revision += 1` (`:1121`) — reaches nothing, and cannot move
         //    identity either: `derive_candidate_id` deliberately EXCLUDES
-        //    `revision` (`lib.rs:788-789`). Only
+        //    `revision` (`crates/meta/eliot-improvement/src/lib.rs:812-816`). Only
         //    `commit_lineage_merge_receipt` commits an advanced revision, and
         //    this arm skips it, so the next pass restores the survivor at its
         //    last committed revision and re-derives it.
         // 8. `updated_at` (`:1122`) — the same fate: a wall-clock stamp into
         //    the candidate, likewise excluded from the identity digest
-        //    (`lib.rs:788`), and likewise committed only by the receipt this
-        //    arm does not write.
+        //    (`crates/meta/eliot-improvement/src/lib.rs:812-816`), and likewise
+        //    committed only by the receipt this arm does not write.
         // 9. the `lineage_digest` recompute (`:1123-1124`) — unchanged, because
         //    it is taken over the union, and per (1) and (2) the union IS the
         //    survivor's own lineage. It is in any case never accepted from a
         //    caller: `into_entry` recomputes it from the candidate's own refs
-        //    (`:227-245`).
+        //    (`:235-246`).
         //
         // So none of the nine leaves DURABLE CONSEQUENCE, and that is the whole
         // reason this arm skips rather than refuses. The durable artifact of
