@@ -1725,7 +1725,10 @@ pub fn resolve_task_selection(
                 || evidence.selection_source_ref != *selection_source_ref
                 || evidence.evidence_ref != *evidence_ref
                 || evidence.work_scope_ref != receipt.scope.scope_ref
-                || receipt.state_fence.task_revision.map(eliot_contracts::TaskRevision::value)
+                || receipt
+                    .state_fence
+                    .task_revision
+                    .map(eliot_contracts::TaskRevision::value)
                     != Some(evidence.task_revision)
             {
                 return Err(TaskBindingError::scope_incompatible(
@@ -3148,7 +3151,8 @@ pub fn admit_prepared_transition_with_owner_selection(
     }
 
     let context_task_ref = context.task_id.as_ref().map(TaskId::as_str);
-    let admitted_task_ref = refuse_task_identity_conflict(context_task_ref, Some(request_task_ref))?;
+    let admitted_task_ref =
+        refuse_task_identity_conflict(context_task_ref, Some(request_task_ref))?;
     if transition.task_id.as_deref() != Some(request_task_ref)
         || owner.task_ref() != request_task_ref
         || evidence.task_ref != request_task_ref
@@ -3159,8 +3163,7 @@ pub fn admit_prepared_transition_with_owner_selection(
     }
 
     let context_session_ref = context.session_id.as_ref().map(SessionId::as_str);
-    if request_session_id != owner.session_ref()
-        || context_session_ref != Some(request_session_id)
+    if request_session_id != owner.session_ref() || context_session_ref != Some(request_session_id)
     {
         return Err(TaskBindingError::scope_incompatible(
             "task selection owner binding belongs to another authenticated session",
