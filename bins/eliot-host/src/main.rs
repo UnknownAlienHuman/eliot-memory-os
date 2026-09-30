@@ -1615,6 +1615,17 @@ fn process_runtime_control_requests(
         };
         // The authenticated request digest is the durable trigger evidence; the
         // endpoint already proved the peer before queueing this envelope.
+        // I1.5 acceptance: the same authenticated request returns an
+        // admission result tied to the current generations. The admission is
+        // a read-only projection of the durable journal snapshot carrying
+        // activation state, generation, governance profile, held lease state
+        // and drain disposition with the operation answer. When no activation
+        // record exists yet the bare operation answer still flows, so the
+        // trigger that creates the record is never blocked.
+        let response = match host.activation_admission_wire() {
+            Ok(admission) => response.with_activation_admission(admission),
+            Err(_) => response,
+        };
         observed.push((trigger, envelope.request().request_digest.clone()));
         let _ = envelope.respond(response);
     }

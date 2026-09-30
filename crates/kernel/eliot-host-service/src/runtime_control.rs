@@ -15,7 +15,9 @@ use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
     ResourceGeneration, SourceId, StateFence,
 };
-use eliot_host_state::IdempotencyIdentity;
+use eliot_host_state::{
+    ActivationState, EpochIdentity, EpochTransition, IdempotencyIdentity, WakeDisposition,
+};
 use eliot_kernel_service::{
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
     UserAutomationHostExecutionResponse,
@@ -784,6 +786,81 @@ pub enum HostRuntimeControlResponse {
     Unknown {
         pending_ref: PlatformHandle,
     },
+    /// Generation-bound activation admission projected with the operation
+    /// answer.
+    ///
+    /// I1.5 acceptance: an authenticated request returns an admission result
+    /// tied to the current generations. The wrapped `response` is the
+    /// unchanged operation answer; `admission` carries the activation state,
+    /// activation generation, governance profile, held lease references and
+    /// drain disposition proven for the current Host/Kernel/Watchdog
+    /// generations. Validators treat the projection transparently: the inner
+    /// answer keeps its exact request binding.
+    AdmissionProjected {
+        response: Box<HostRuntimeControlResponse>,
+        admission: HostActivationAdmission,
+    },
+}
+
+/// Generation-bound activation admission carried on the runtime-control
+/// response path.
+///
+/// I1.5: "A request is not admitted as an active Session/Attempt until it
+/// receives an activation result bound to the current Host/Kernel/Watchdog
+/// generations." Every field reuses the durable journal owner types from
+/// `eliot-host-state`; this struct adds only `Serialize` wire membership
+/// through the existing response owner — no second wire protocol and no new
+/// vocabulary. The Host activation producer projects the same journal
+/// snapshot the local diagnostics line reads, so the caller sees exactly
+/// what the Host proved instead of inferring it from process liveness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostActivationAdmission {
+    /// Durable activation identity of the joined generation.
+    pub activation_id: PlatformHandle,
+    /// Installation-scoped activation generation the result is bound to.
+    pub activation_generation: EpochTransition,
+    /// Current activation state.
+    pub state: ActivationState,
+    /// Host/Kernel/Watchdog/store generations proven for this admission.
+    pub host_epoch: EpochIdentity,
+    pub kernel_epoch: EpochIdentity,
+    pub watchdog_epoch: EpochIdentity,
+    pub store_generation: EpochIdentity,
+    /// Derived governance profile carried by the durable record.
+    pub governance_profile: PlatformHandle,
+    /// Fresh readiness evidence flags proven by the readiness owner.
+    pub control_ready: bool,
+    pub supervision_ready: bool,
+    /// Capabilities requested by the observed triggers of this generation.
+    pub requested_capabilities: Vec<PlatformHandle>,
+    /// Dependency branches the journal proves are running.
+    pub admitted_capabilities: Vec<PlatformHandle>,
+    /// Runtime-lease references the generation holds.
+    pub runtime_lease_refs: Vec<PlatformHandle>,
+    /// Supervision-lease references the generation holds.
+    pub supervision_lease_refs: Vec<PlatformHandle>,
+    /// `WakeIntent` references the generation holds.
+    pub wake_intent_refs: Vec<PlatformHandle>,
+    /// Durable wake-during-drain disposition, once a drain ran.
+    pub drain_disposition: Option<WakeDisposition>,
+    /// Whether a concurrent trigger coalesced behind this generation.
+    pub coalesced: bool,
+}
+
+impl HostActivationAdmission {
+    pub fn validate(&self) -> Result<(), String> {
+        self.activation_generation
+            .validate()
+            .map_err(|error| format!("activation_generation is not a valid transition: {error}"))?;
+        if self.activation_id.as_str().trim().is_empty() {
+            return Err("activation_id is blank".to_owned());
+        }
+        if self.governance_profile.as_str().trim().is_empty() {
+            return Err("governance_profile is blank".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// Exact durable Host queue observation returned for one runtime-control request.
@@ -999,6 +1076,22 @@ impl HostRuntimeControlResponse {
         Self::Unknown { pending_ref }
     }
 
+    /// Project the generation-bound activation admission onto this response.
+    ///
+    /// The operation answer is preserved unchanged inside the projection; the
+    /// admission travels with it so an authenticated caller receives the
+    /// activation state, generation, governance profile, held lease state
+    /// and drain disposition instead of only a local diagnostics line.
+    /// Emission point is the runtime-control dispatch loop (STITCH: the
+    /// `envelope.respond` call in `process_runtime_control_requests`,
+    /// `bins/eliot-host/src/main.rs`, second-writer scope).
+    pub fn with_activation_admission(self, admission: HostActivationAdmission) -> Self {
+        Self::AdmissionProjected {
+            response: Box::new(self),
+            admission,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Restarted { receipt, .. } => receipt.validate(),
@@ -1066,6 +1159,13 @@ impl HostRuntimeControlResponse {
             Self::Unknown { pending_ref, .. } => parse_runtime_control_unknown_ref(pending_ref)
                 .map(|_| ())
                 .ok_or_else(|| "pending_ref is not canonical".to_owned()),
+            Self::AdmissionProjected {
+                response,
+                admission,
+            } => {
+                response.validate()?;
+                admission.validate()
+            }
         }
     }
 }
@@ -1149,6 +1249,12 @@ pub fn response_matches_request(
         }
         HostRuntimeControlResponse::Unknown { pending_ref } => {
             pending_ref_matches_request(pending_ref, request)
+        }
+        // The projection is transparent: the inner operation answer keeps
+        // its exact request binding, and the admission itself was already
+        // validated above as generation-bound durable evidence.
+        HostRuntimeControlResponse::AdmissionProjected { response, .. } => {
+            response_matches_request(request, response)
         }
     }
 }
@@ -1385,19 +1491,13 @@ pub fn decode_runtime_control_request_frame(
     Ok(request)
 }
 
-pub fn runtime_control_response_frame(
-    connection_id: impl Into<String>,
-    response: &HostRuntimeControlResponse,
-) -> Result<Frame, String> {
-    response
-        .validate()
-        .map_err(|_| "SessionFenced".to_owned())?;
-    let digest = match response {
+fn response_frame_digest(response: &HostRuntimeControlResponse) -> Result<String, String> {
+    match response {
         HostRuntimeControlResponse::Restarted { receipt, .. } => {
-            receipt.request_digest.as_str().to_owned()
+            Ok(receipt.request_digest.as_str().to_owned())
         }
         HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
-            receipt.request_digest.as_str().to_owned()
+            Ok(receipt.request_digest.as_str().to_owned())
         }
         HostRuntimeControlResponse::UserAutomationOccurrenceAdmitted { request_digest, .. }
         | HostRuntimeControlResponse::UserAutomationPendingWakesCancelled {
@@ -1405,19 +1505,34 @@ pub fn runtime_control_response_frame(
         }
         | HostRuntimeControlResponse::ReactiveContextPreEffectRejected { request_digest, .. }
         | HostRuntimeControlResponse::ReactiveContextDeliveryUnknown { request_digest, .. } => {
-            request_digest.as_str().to_owned()
+            Ok(request_digest.as_str().to_owned())
         }
         HostRuntimeControlResponse::ReactiveContextDeliveryObserved { observation } => {
-            observation.request_digest.as_str().to_owned()
+            Ok(observation.request_digest.as_str().to_owned())
         }
         HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
-            parse_runtime_control_unknown_ref(pending_ref)
+            Ok(parse_runtime_control_unknown_ref(pending_ref)
                 .ok_or_else(|| "SessionFenced".to_owned())?
                 .request_digest
                 .as_str()
-                .to_owned()
+                .to_owned())
         }
-    };
+        // The projection carries no frame identity of its own; the frame
+        // stays bound to the inner operation answer.
+        HostRuntimeControlResponse::AdmissionProjected { response, .. } => {
+            response_frame_digest(response)
+        }
+    }
+}
+
+pub fn runtime_control_response_frame(
+    connection_id: impl Into<String>,
+    response: &HostRuntimeControlResponse,
+) -> Result<Frame, String> {
+    response
+        .validate()
+        .map_err(|_| "SessionFenced".to_owned())?;
+    let digest = response_frame_digest(response)?;
     let (request_id, request_identity) =
         durable_frame_identity(&digest).map_err(|_| "SessionFenced".to_owned())?;
     let frame = Frame {
@@ -1467,16 +1582,22 @@ pub fn decode_runtime_control_response_frame(
     {
         return Err("SessionFenced".to_owned());
     }
-    match &response {
+    if !response_matches_frame_request_id(&response, frame_request_id.as_str()) {
+        return Err("SessionFenced".to_owned());
+    }
+    Ok(response)
+}
+
+fn response_matches_frame_request_id(
+    response: &HostRuntimeControlResponse,
+    frame_request_id: &str,
+) -> bool {
+    match response {
         HostRuntimeControlResponse::Restarted { receipt, .. } => {
-            if frame_request_id.as_str() != receipt.request_digest.as_str() {
-                return Err("SessionFenced".to_owned());
-            }
+            frame_request_id == receipt.request_digest.as_str()
         }
         HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
-            if frame_request_id.as_str() != receipt.request_digest.as_str() {
-                return Err("SessionFenced".to_owned());
-            }
+            frame_request_id == receipt.request_digest.as_str()
         }
         HostRuntimeControlResponse::UserAutomationOccurrenceAdmitted { request_digest, .. }
         | HostRuntimeControlResponse::UserAutomationPendingWakesCancelled {
@@ -1484,24 +1605,22 @@ pub fn decode_runtime_control_response_frame(
         }
         | HostRuntimeControlResponse::ReactiveContextPreEffectRejected { request_digest, .. }
         | HostRuntimeControlResponse::ReactiveContextDeliveryUnknown { request_digest, .. } => {
-            if frame_request_id.as_str() != request_digest.as_str() {
-                return Err("SessionFenced".to_owned());
-            }
+            frame_request_id == request_digest.as_str()
         }
         HostRuntimeControlResponse::ReactiveContextDeliveryObserved { observation } => {
-            if frame_request_id.as_str() != observation.request_digest.as_str() {
-                return Err("SessionFenced".to_owned());
-            }
+            frame_request_id == observation.request_digest.as_str()
         }
         HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
-            let pending_request = parse_runtime_control_unknown_ref(pending_ref)
-                .ok_or_else(|| "SessionFenced".to_owned())?;
-            if frame_request_id.as_str() != pending_request.request_digest.as_str() {
-                return Err("SessionFenced".to_owned());
-            }
+            parse_runtime_control_unknown_ref(pending_ref).is_some_and(|pending_request| {
+                frame_request_id == pending_request.request_digest.as_str()
+            })
+        }
+        // The projection carries no frame identity of its own; the frame
+        // stays bound to the inner operation answer.
+        HostRuntimeControlResponse::AdmissionProjected { response, .. } => {
+            response_matches_frame_request_id(response, frame_request_id)
         }
     }
-    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
