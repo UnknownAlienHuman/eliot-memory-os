@@ -2885,7 +2885,13 @@ fn cutover_ownership_commit_is_durable_linearization_point() -> TestResult {
     // crash case. It must never become active.
     let staged_only = GenerationCutoverOwnership {
         cutover_id: "cutover-ownership-staged-only".to_owned(),
-        candidate_artifact: candidate.clone(),
+        candidate_artifact: ModuleArtifactIdentity {
+            module_id: "mod-b".to_owned(),
+            semver: "1.2.0".to_owned(),
+            artifact_hash: "e".repeat(64),
+            manifest_digest: "f".repeat(64),
+            layout_root: format!("modules/mod-b/1.2.0/{}", "e".repeat(64)),
+        },
         incumbent_artifact: None,
         scope: CapabilityRouteScope::declare("mod-b", "serve", "work", "effects")?,
         old_generation: None,

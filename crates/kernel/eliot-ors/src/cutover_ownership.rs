@@ -446,6 +446,30 @@ impl GenerationCutoverOwnership {
             incumbent.validate()?;
         }
         self.scope.validate()?;
+        // I14.14: a cutover switches exactly one declared route scope, and a
+        // `CapabilityRouteScope` names that module in its own coordinates. Both
+        // artifact identities must therefore be that scope's module: they are
+        // the two immutable sides of ONE route switch, and a row that named
+        // any other module would attest a transition of a route it never
+        // touched. `ModuleArtifactIdentity::validate` only checks each artifact
+        // against its own digest and layout root, so it cannot see this
+        // cross-field binding, and a committed row is an authority record that
+        // every downstream reader trusts. Refusing the mismatch here keeps a
+        // record from asserting a cutover its own artifact identity contradicts.
+        if self.candidate_artifact.module_id != self.scope.module_id {
+            return Err(OrsError::InvalidField {
+                field: "cutover_ownership_candidate_artifact_module",
+                reason: "the candidate artifact must be the declared route scope's own module",
+            });
+        }
+        if let Some(incumbent) = &self.incumbent_artifact
+            && incumbent.module_id != self.scope.module_id
+        {
+            return Err(OrsError::InvalidField {
+                field: "cutover_ownership_incumbent_artifact_module",
+                reason: "the incumbent artifact must be the declared route scope's own module",
+            });
+        }
         if self.old_generation == Some(self.new_generation) {
             return Err(OrsError::InvalidField {
                 field: "cutover_ownership_new_generation",
