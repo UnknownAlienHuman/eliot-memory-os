@@ -857,6 +857,14 @@ impl KernelComposition {
                 // here keeps it out of the terminal-transition path whose
                 // unauthenticated `transition` correctly refuses it.
                 | KernelControlCommand::ReadRuntimeLeaseCensus(_) => {}
+                // I1.5 W4 (#1751): administrative revocation is an explicit
+                // owner write through the single-revocation helper below,
+                // never a service state transition. Drain and stop never
+                // revoke, so reconciliation duties cannot be abandoned
+                // implicitly.
+                KernelControlCommand::RevokeRuntimeLease(query) => {
+                    self.revoke_runtime_lease(&query.state_fence, &query.lease_id)?;
+                }
                 command => {
                     self.apply_control_with_terminal(command.clone(), false)
                         .map_err(ControlRequestFailure::Transition)?;
@@ -919,6 +927,44 @@ impl KernelComposition {
         }
         .with_computed_digest()
         .map_err(|_| TransportError::SessionFenced.into())
+    }
+
+    /// Revokes one exact-fence `RuntimeLease` on explicit administrative
+    /// command through the owner legality (I1.5 W4, #1751).
+    ///
+    /// Only the named non-terminal row bound to this exact fence moves, to
+    /// `Revoked`, re-recorded through the canonical ORS owner; terminal rows
+    /// are never rewritten and an unknown identity fails closed with the
+    /// boundary's own `SessionFenced`. Drain and stop never revoke:
+    /// revocation is explicit-command only, so reconciliation duties cannot
+    /// be abandoned implicitly. The census keeps classifying recorded rows
+    /// and never rewrites them.
+    fn revoke_runtime_lease(
+        &self,
+        fence: &StateFence,
+        lease_id: &str,
+    ) -> Result<(), TransportError> {
+        let rows = self
+            .generation_gateway
+            .ors
+            .load_runtime_leases_by_state_fence(fence)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let row = rows
+            .iter()
+            .find(|row| row.lease_id.as_str() == lease_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if row.state_fence != *fence {
+            return Err(TransportError::SessionFenced);
+        }
+        row.validate().map_err(|_| TransportError::SessionFenced)?;
+        let revoked = row
+            .transition_to(LeaseState::Revoked)
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.generation_gateway
+            .ors
+            .record_runtime_lease_current(&revoked)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(())
     }
 
     /// Revalidates the presented pre-suspend resume identities against live
