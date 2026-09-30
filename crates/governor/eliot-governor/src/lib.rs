@@ -95,6 +95,7 @@ pub use negative_memory_read::{
     resolve_negative_memory_rule_read,
 };
 mod controlboard_projection;
+mod human_attention_evaluation;
 mod learning_admission;
 mod learning_closure;
 mod learning_delta_integration;
@@ -161,6 +162,13 @@ pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
     ControlBoardReviewBatch, ControlBoardReviewBatchObligation,
+};
+pub use human_attention_evaluation::{
+    BoundHumanAttentionEvidence, BoundHumanAttentionRead, HumanAttentionComparisonInput,
+    HumanAttentionEvaluationError, HumanAttentionEvidenceGap, HumanAttentionEvidenceRequest,
+    HumanAttentionMatchedComparison, HumanAttentionReadPresentation, HumanAttentionReadSlot,
+    NominatedHumanAttentionRead, RequestedHumanAttentionClaim, assemble_human_attention_claims,
+    assemble_human_attention_evidence,
 };
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
