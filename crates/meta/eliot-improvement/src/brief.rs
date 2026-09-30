@@ -106,16 +106,66 @@
 //! the owner from its own request; it therefore cannot be checked here without
 //! constraining that caller. The relationship above is the contract, and the
 //! production caller is held to it.
+//!
+//! # The brief's IDENTITY is the candidate revision it describes
+//!
+//! I12.24:65 puts "decision owner selects reject / investigate / work item /
+//! experiment" AFTER the brief reaches one, so an owner has to be able to NAME
+//! the brief they are ruling on. That was impossible while `brief_id` was a
+//! fresh `Uuid::now_v7()` minted on every call: the same brief over the same
+//! candidate revision carried a different name on every pass, so no handle an
+//! owner could hold, repeat, or hand to another principal existed, and a
+//! disposition recorded against one pass's name named nothing on the next.
+//!
+//! `brief_id` is now derived from the candidate the brief is about — the
+//! candidate's own content-derived `candidate_id` (which
+//! `ImprovementCandidate::derive_candidate_id` hashes over project, target
+//! surface, proposed change, both scope-rule sets, the source trace and the
+//! canonical evidence lineage, and which deliberately excludes every per-pass
+//! value) together with the `candidate_revision` this brief carries. No new
+//! digest, nonce, MAC, or clock reading is introduced: the candidate id already
+//! IS the deduplication handle, and a brief is about ONE candidate revision, so
+//! one candidate revision has exactly one brief name — this pass, the next one,
+//! and after a restart.
+//!
+//! The guarantee is deliberately ONE-DIRECTIONAL, and only that direction is
+//! claimed. The same candidate at the same revision always yields the same
+//! name, so a name identifies one brief revision. The converse is NOT claimed
+//! and is not true: the brief's `problem`, `likely_benefit`, `risk`, `cost`,
+//! `next_reversible_step` and `unknowns` are the CALLER's prose, and two
+//! callers may word them differently over one candidate revision. The name
+//! therefore names the decision subject — this improvement at this revision —
+//! which is what a disposition selects over, and each committed brief still
+//! carries its own full wording verbatim beside the name.
+//!
+//! `created_at` still reads the clock, and nothing here claims row
+//! convergence. The store keys a learning row by `(record_kind, handle,
+//! record_digest)`, so a re-commit whose `created_at` moved is a new digest and
+//! therefore a new row under the same handle; that is the improvement owner's
+//! own recorded expectation, unchanged by this derivation. What IS stable is
+//! the NAME, and the name is what an owner's disposition is recorded against.
+//!
+//! A blank `candidate_id` is refused rather than formatted into a handle: the
+//! handle's content component has to be real for the handle to name one brief
+//! revision rather than every brief built over an unnamed candidate.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use uuid::Uuid;
 
 use crate::{ImprovementCandidate, ImprovementError};
 
 /// Advisory owner-facing brief over one candidate revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ImprovementBrief {
+    /// Stable, owner-nameable identity of the brief over THIS candidate
+    /// revision.
+    ///
+    /// Assigned by `brief_at_safe_boundary` from the candidate's own
+    /// content-derived identity and revision, so one candidate revision has one
+    /// name on every pass and across a restart, and an owner's disposition
+    /// recorded against it names one brief revision rather than one pass over
+    /// it. See the module section "The brief's IDENTITY is the candidate
+    /// revision it describes" for the exact direction of that guarantee.
     pub brief_id: String,
     pub candidate_id: String,
     pub candidate_revision: u64,
@@ -292,10 +342,57 @@ impl SafeBoundary {
     }
 }
 
+/// The brief's stable identity over one candidate revision.
+///
+/// I12.24:65 places "decision owner selects reject / investigate / work item /
+/// experiment" after the brief reaches an owner, and I12.24:74 says the named
+/// decision owner does not search raw metrics. Both require the owner to be
+/// able to NAME the brief they rule on, so the name has to survive a
+/// re-observation.
+///
+/// The two components are the candidate's OWN recorded identity, read
+/// verbatim:
+///
+/// - `candidate.candidate_id` is the content-derived digest
+///   `ImprovementCandidate::new` computes over project, target surface,
+///   proposed change, both scope-rule sets, the source trace and the canonical
+///   evidence lineage, excluding `created_at`, `updated_at`, `revision` and
+///   `lifecycle` precisely so a re-observation yields the same value. It is
+///   therefore already the deduplication handle; nothing is re-hashed here and
+///   no second identity scheme is introduced.
+/// - `candidate.revision` is the revision this brief states, so a brief over a
+///   NEWER candidate revision is a DIFFERENT brief and cannot be confused with
+///   the one an owner already ruled on. `transition`, `transition_lifecycle`
+///   and `promotion_lifecycle` advance it monotonically, so the two components
+///   together name one brief revision.
+///
+/// The spelling mirrors the one the store's own record keys already use for a
+/// revisioned improvement record — `improvement-merge:<candidate_id>@<revision>`
+/// (`improvement_intake_dispatch::lineage_merge_record_key`) — so a brief id
+/// and a merge-record key over the same entry read the same way.
+///
+/// # A blank `candidate_id` is refused, not formatted
+///
+/// [`brief_at_safe_boundary`] validates the candidate before calling this, but
+/// `ImprovementCandidate::validate` does not itself require `candidate_id` to
+/// be non-empty, so a value rebuilt from bytes could otherwise produce the
+/// degenerate handle `brief-@<revision>`, which names no brief revision and
+/// collides across every candidate. This is the same refusal
+/// `canonical_evidence_lineage` and the deduplication registry already apply to
+/// a nameless candidate, and it is a check on the ORIGINAL recorded value.
+fn brief_identity(candidate: &ImprovementCandidate) -> Result<String, ImprovementError> {
+    let candidate_id = candidate.candidate_id.trim();
+    non_empty(candidate_id, "candidate_id")?;
+    Ok(format!("brief-{candidate_id}@{}", candidate.revision))
+}
+
 /// Build a brief for `candidate` at `boundary`.
 ///
 /// Validates the boundary first, then the candidate, then the brief fields.
-/// The brief carries the candidate's evidence refs and revision by value.
+/// The brief carries the candidate's evidence refs and revision by value, and
+/// its `brief_id` is derived by `brief_identity` from that same candidate
+/// revision rather than minted per call — see the module section "The brief's
+/// IDENTITY is the candidate revision it describes".
 ///
 /// `proposed_owner` is a parameter, not a value read from `boundary`, because
 /// `intake_from_evidence` supplies the boundary and the owner from its own
@@ -327,7 +424,7 @@ pub fn brief_at_safe_boundary(
     non_empty(next_reversible_step, "next_reversible_step")?;
     require_refs(&unknowns, "unknowns")?;
     Ok(ImprovementBrief {
-        brief_id: Uuid::now_v7().to_string(),
+        brief_id: brief_identity(candidate)?,
         candidate_id: candidate.candidate_id.clone(),
         candidate_revision: candidate.revision,
         problem: problem.to_string(),
