@@ -115,6 +115,7 @@ mod operator_reconciliation;
 mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
+mod problem_diagnostic_brief;
 mod problem_owner_transitions;
 mod quality_applicability;
 mod reactive_admission;
@@ -247,6 +248,11 @@ pub use owner_closure_provider::{
     AdmittedHydrationsSnapshot, GrantAdmissionParams, IntroductionAdmissionParams,
     OWNER_HYDRATION_SNAPSHOT_SCHEMA, OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider,
     PreservedAdmission,
+};
+pub use problem_diagnostic_brief::{
+    ProblemBriefCoverage, ProblemBriefCoverageCode, ProblemBriefError, ProblemBriefNextStep,
+    ProblemBriefPrivacy, ProblemBriefRevision, ProblemBriefSource, ProblemBriefUnknown,
+    ProblemDiagnosticBrief, ProblemEvidenceVisibility, compile_problem_diagnostic_brief,
 };
 pub use problem_owner_transitions::{
     PreparedProblemOwnerTransition, ProblemOwnerClosure, ProblemOwnerTransitionBody,

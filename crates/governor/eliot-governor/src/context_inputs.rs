@@ -70,6 +70,20 @@
 //! envelopes (`{version, <selector>, scope_id, records, provenance}`), not
 //! admitted Cue arrays or qualified capability; binding those envelopes to the
 //! typed cue families and to #1773's capability work is a separate slice.
+//!
+//! Diagnostic Brief (issue #1759 I7, I13.11): when — and only when — the request
+//! names an exact `attention_problem_id`, the attention role's page is compiled
+//! into a [`ProblemDiagnosticBrief`] and carried on
+//! [`SevenRoleInputs::diagnostic_brief`]. It adds no read, no store operation and
+//! no second Problem model: the brief is a read model over the canonical
+//! `record_json` of the committed `ApplyProblemOwnerState` transitions that same
+//! page already returns, decoded through the store's own
+//! `decode_problem_owner_state_mutation` and validated by the Problem model. It
+//! is a report, not a receipt: it closes nothing, promotes nothing and grants no
+//! repair, and it reports the record's unknowns, missing coverage and privacy
+//! limits rather than filling them in. A page that does not decode to an ordered
+//! history of canonical revisions is a typed
+//! [`ContextInputsError::AttentionPageUndecodable`], never a partial brief.
 
 use std::collections::BTreeMap;
 
@@ -87,6 +101,10 @@ use eliot_store_api::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::problem_diagnostic_brief::{
+    ProblemBriefError, ProblemDiagnosticBrief, compile_problem_diagnostic_brief,
+};
 
 /// Role label for the `TaskFrame` slot.
 pub const ROLE_TASK_FRAME: &str = "task_frame";
@@ -130,6 +148,14 @@ pub enum ContextInputsError {
     /// outcome); this is a programming error, never a role disposition.
     #[error("context reconstruction role request was rejected: {0}")]
     RequestRejected(String),
+    /// The `GetAttentionAndProblems` page the attention role returned is not a
+    /// decodable, ordered history of canonical Problem revisions, so no
+    /// Diagnostic Brief can be compiled from it. This is neither a per-role
+    /// disposition nor an empty result: a page that does not decode is a defect
+    /// in what was read, and emitting a partial brief from it would present a
+    /// prefix or a hole as the Problem's history.
+    #[error(transparent)]
+    AttentionPageUndecodable(#[from] ProblemBriefError),
 }
 
 /// Closed request for one seven-role reconstruction.
@@ -314,6 +340,18 @@ pub struct SevenRoleInputs {
     pub task_frame: RoleAcquisition,
     /// `CriticalAttention`/`Conflict` role (`GetAttentionAndProblems`).
     pub attention: RoleAcquisition,
+    /// The Diagnostic Brief compiled from the attention role for the requested
+    /// `attention_problem_id` (I13.11, issue #1759 I7).
+    ///
+    /// `None` is an honest outcome, not a missing read: it means no specific
+    /// Problem was requested, the attention source authoritatively reported
+    /// nothing committed for the requested identity, or the role was not
+    /// readable enough to hold a Problem. A required member rather than a
+    /// defaulted one, so a reader cannot mistake an absent brief for a Problem
+    /// with nothing to report. The brief is a read model: it carries the
+    /// canonical record's evidence, hypotheses, unknowns, missing coverage and
+    /// privacy limits, and it grants no repair, closure or promotion.
+    pub diagnostic_brief: Option<ProblemDiagnosticBrief>,
     /// `CurrentEpistemicPosition` role (`GetCurrentEpistemicPosition`).
     pub epistemic: RoleAcquisition,
     /// Decoded T11.2 readback when the epistemic role is `Complete`.
@@ -498,6 +536,16 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         if heads_after != heads_before {
             return Err(ContextInputsError::SourceHeadsChanged);
         }
+        // The Diagnostic Brief is compiled from the attention role this same
+        // reconstruction already read (I13.11, issue #1759 I7), under the same
+        // coherent closure: it adds no read, no store operation and no second
+        // Problem model. A Problem-scoped read is the only scope in which a
+        // brief exists; an unscoped attention request names no Problem, so it
+        // produces no brief rather than one about an arbitrary record.
+        let diagnostic_brief = match request.attention_problem_id.as_deref() {
+            Some(problem_id) => compile_problem_diagnostic_brief(&attention, problem_id)?,
+            None => None,
+        };
         Ok(SevenRoleInputs {
             scope_id: request.scope_id.clone(),
             state_fence: ctx.state_fence.clone(),
@@ -506,6 +554,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             heads_after,
             task_frame,
             attention,
+            diagnostic_brief,
             epistemic,
             epistemic_readback,
             cue,
@@ -1376,6 +1425,7 @@ mod reconstruction_tests {
             heads_after: test_heads("scope-a")?,
             task_frame: unavailable_role(NamedReadOperation::GetTaskState),
             attention: unavailable_role(NamedReadOperation::GetAttentionAndProblems),
+            diagnostic_brief: None,
             epistemic: RoleAcquisition {
                 operation: NamedReadOperation::GetCurrentEpistemicPosition,
                 state: ProjectionState::KnownEmpty,
