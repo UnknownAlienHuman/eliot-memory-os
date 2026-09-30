@@ -2235,7 +2235,7 @@ enum IntentRoleLeaseVerification {
 }
 
 enum IntentPublicationResume {
-    Ready(OwnedDirectoryPublication),
+    Ready(Box<OwnedDirectoryPublication>),
     Unknown(Box<CanarySourceBundleMaterializeOutcome>),
 }
 
@@ -2253,7 +2253,7 @@ fn resume_owned_publication_or_unknown(
         journal.parent_identity,
         journal.source_identity,
     ) {
-        Ok(publication) => Ok(IntentPublicationResume::Ready(publication)),
+        Ok(publication) => Ok(IntentPublicationResume::Ready(Box::new(publication))),
         Err(error) => persist_unknown_publication(
             store,
             journal,
@@ -2419,7 +2419,7 @@ fn resume_intent_publication(
         &precommit_files,
         selected_profile_anchor,
     )? {
-        IntentPublicationResume::Ready(publication) => publication,
+        IntentPublicationResume::Ready(publication) => *publication,
         IntentPublicationResume::Unknown(outcome) => return Ok(*outcome),
     };
     match verify_intent_roles_and_release_leases(
