@@ -74,6 +74,37 @@ def plan(root, output, target):
     return rows
 
 
+
+BROAD_TEST_STAGE = "workspace-tests-except-known-compile-blockers"
+FALLBACK_CONDITION = ("Broad selected workspace compilation failed with nonzero exit and "
+                      "no completed or started tests; same members from recorded metadata, "
+                      "excluding COMPILE_BLOCKED; run after the existing isolated blockers")
+
+
+def fallback_required(result, text):
+    counts = result.get("test_counts", {})
+    executed = sum(counts.get(key, 0) for key in ("passed", "failed"))
+    started = re.search(r"(?m)^running [1-9][0-9]* tests?$|^test .+ \.\.\. (?:ok|FAILED)$", text)
+    compile_failure = re.search(r"could not compile|error\[E[0-9]+\]|failed to run custom build command|linking with .* failed", text)
+    return (result.get("name") == BROAD_TEST_STAGE and result.get("status") == "FAILED"
+            and result.get("exit_code") not in (None, 0) and executed == 0
+            and started is None and compile_failure is not None)
+
+
+def fallback_plan(metadata):
+    members = set(metadata["workspace_members"])
+    packages = [package for package in metadata["packages"] if package["id"] in members]
+    if {package["id"] for package in packages} != members:
+        raise ValueError("recorded metadata does not describe every selected workspace member")
+    names = sorted(package["name"] for package in packages
+                   if package["name"] not in COMPILE_BLOCKED)
+    if not names or len(names) != len(set(names)):
+        raise ValueError("selected workspace package names are empty or ambiguous")
+    return [stage("fallback-tests-" + name,
+                  ["cargo", "test", "--locked", "--no-fail-fast", "-p", name,
+                   "--", "--test-threads=1"], 8, tests=True) for name in names]
+
+
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -157,7 +188,26 @@ def self_test():
         timeout = execute(stage("timeout", [sys.executable, "-c", "import time;time.sleep(20)"]), root, root, 0.1)
         skipped = execute(stage("skipped", ["missing"]), root, root, 0)
         assert [row["status"] for row in (ok, negative, bad, zero, timeout, skipped)] == ["EXPECTED_OUTCOME", "EXPECTED_OUTCOME", "FAILED", "FAILED", "TIMED_OUT", "SKIPPED"]
-    print("diagnostic runner self-test: 6 passed")
+    metadata = {"workspace_members": ["a", "b"], "packages": [
+        {"id": "a", "name": "eliot-example"}, {"id": "b", "name": COMPILE_BLOCKED[0]},
+        {"id": "external", "name": "not-a-member"}]}
+    assert [row["name"] for row in fallback_plan(metadata)] == ["fallback-tests-eliot-example"]
+    failed = dict(name=BROAD_TEST_STAGE, status="FAILED", exit_code=101,
+                  test_counts={"passed": 0, "failed": 0})
+    assert fallback_required(failed, "error[E0599]: absent method")
+    assert not fallback_required(failed, "could not compile x\nrunning 1 test")
+    assert not fallback_required(failed, "could not compile x\ntest a ... ok")
+    assert not fallback_required(dict(failed, test_counts={"passed": 1}), "could not compile x")
+    assert not fallback_required(dict(failed, exit_code=0), "could not compile x")
+    assert not fallback_required(dict(failed, status="TIMED_OUT"), "could not compile x")
+    assert not fallback_required(failed, "failed to download dependency")
+    try:
+        fallback_plan(dict(metadata, workspace_members=["missing"]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("incomplete metadata must not reduce the denominator")
+    print("diagnostic runner self-test: 15 passed")
 
 
 def binary_inventory(target, source_sha, build_status):
@@ -191,7 +241,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     target = Path(os.environ.get("CARGO_TARGET_DIR", output / "target")).resolve()
     specs = plan(root, output, target)
-    write_json(output / "plan.json", dict(ceiling=CEILING, profile="native Windows dev/test; not release", stages=specs))
+    write_json(output / "plan.json", dict(ceiling=CEILING, profile="native Windows dev/test; not release", stages=specs, conditional_fallback=dict(condition=FALLBACK_CONDITION,
+               metadata_source="metadata.stdout.log", stages="resolved after metadata stage")))
     if args.plan_only:
         return 0
     if os.name != "nt" or os.environ.get("GITHUB_REF") != "refs/heads/Operator_tests":
@@ -221,10 +272,36 @@ def main():
     write_json(output / "skill-valid.json", payload)
     payload["skills"][0]["body_text"] += "\nAUDIT CORRUPTION\n"
     write_json(output / "skill-corrupt.json", payload)
+    fallback_specs = None
+    fallback_metadata_error = None
+    report["conditional_fallback"] = dict(condition=FALLBACK_CONDITION, status="NOT_NEEDED")
     deadline = time.monotonic() + 165 * 60
     for spec in specs:
         result = execute(spec, output, root, deadline - time.monotonic())
         report["stages"].append(result)
+        if spec["name"] == "metadata":
+            try:
+                if result["status"] != "EXPECTED_OUTCOME":
+                    raise ValueError("metadata stage did not succeed")
+                fallback_specs = fallback_plan(json.loads(Path(result["stdout"]).read_text(encoding="utf-8")))
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                fallback_metadata_error = f"{type(error).__name__}: {error}"
+            write_json(output / "plan.json", dict(ceiling=CEILING,
+                       profile="native Windows dev/test; not release", stages=specs,
+                       conditional_fallback=dict(condition=FALLBACK_CONDITION,
+                           metadata_source="metadata.stdout.log", stages=fallback_specs,
+                           resolution_error=fallback_metadata_error)))
+        if spec["name"] == BROAD_TEST_STAGE:
+            broad_text = "".join(Path(result[key]).read_text(encoding="utf-8", errors="replace")
+                                 for key in ("stdout", "stderr") if result.get(key))
+            if fallback_required(result, broad_text):
+                if fallback_specs is None:
+                    report["conditional_fallback"].update(status="BLOCKED", reason=fallback_metadata_error)
+                else:
+                    report["conditional_fallback"].update(status="TRIGGERED", packages=len(fallback_specs))
+                    # Append after known blockers so their existing priority is retained.
+                    specs.extend(fallback_specs)
+                    write_json(output / "activated-fallback-plan.json", fallback_specs)
         if spec["name"] == "production-build-dev":
             inventory = binary_inventory(target, head, result["status"])
             write_json(output / "linked-binary-inventory.json", inventory)

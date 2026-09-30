@@ -348,6 +348,9 @@ def _run_fixed(root: Path, argv: Sequence[str], timeout: int | None = None) -> C
         "HOME": os.environ.get("HOME", ""),
         "USERPROFILE": os.environ.get("USERPROFILE", ""),
         "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        # Fixed nonsecret Windows inputs needed for native MSVC discovery.
+        "PROGRAMDATA": os.environ.get("PROGRAMDATA", ""),
+        "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", ""),
         "WINDIR": os.environ.get("WINDIR", ""),
         "TEMP": os.environ.get("TEMP", os.environ.get("TMP", "")),
         "TMP": os.environ.get("TMP", os.environ.get("TEMP", "")),

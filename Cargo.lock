@@ -2113,6 +2113,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
  "eliot-contracts",
+ "eliot-host-state",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-platform-windows",

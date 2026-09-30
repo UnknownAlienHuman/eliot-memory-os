@@ -149,10 +149,16 @@ class TestIgnoredTestInventory(unittest.TestCase):
                 _validate_command(cmd)
             self.assertEqual(cm.exception.code, "COMMAND_NOT_ALLOWED")
 
-        # Verify environment filtering in _run_fixed preserves CARGO_TARGET_DIR but drops arbitrary vars
+        # Preserve only fixed toolchain/discovery inputs, never arbitrary or secret keys.
         with tempfile.TemporaryDirectory() as td:
             troot = Path(td).resolve()
-            with patch.dict(os.environ, {"CARGO_TARGET_DIR": "my_custom_target", "ARBITRARY_INJECTION": "secret"}):
+            with patch.dict(os.environ, {
+                "CARGO_TARGET_DIR": "my_custom_target",
+                "PROGRAMDATA": r"C:\ProgramData",
+                "SYSTEMDRIVE": "C:",
+                "ARBITRARY_INJECTION": "unrelated-canary",
+                "GITHUB_TOKEN": "synthetic-secret-canary",
+            }, clear=True):
                 with patch("subprocess.run") as mock_run:
                     mock_run.return_value.returncode = 0
                     mock_run.return_value.stdout = b"fake"
@@ -160,7 +166,21 @@ class TestIgnoredTestInventory(unittest.TestCase):
                     _run_fixed(troot, ("git", "rev-parse", "HEAD"))
                     called_env = mock_run.call_args[1]["env"]
                     self.assertEqual(called_env.get("CARGO_TARGET_DIR"), "my_custom_target")
+                    self.assertEqual(called_env.get("PROGRAMDATA"), r"C:\ProgramData")
+                    self.assertEqual(called_env.get("SYSTEMDRIVE"), "C:")
                     self.assertNotIn("ARBITRARY_INJECTION", called_env)
+                    self.assertNotIn("GITHUB_TOKEN", called_env)
+            for discovery_env in ({}, {"PROGRAMDATA": "", "SYSTEMDRIVE": ""}):
+                with self.subTest(discovery_env=discovery_env):
+                    with patch.dict(os.environ, discovery_env, clear=True):
+                        with patch("subprocess.run") as mock_run:
+                            mock_run.return_value.returncode = 0
+                            mock_run.return_value.stdout = b"fake"
+                            mock_run.return_value.stderr = b""
+                            _run_fixed(troot, ("git", "rev-parse", "HEAD"))
+                            called_env = mock_run.call_args.kwargs["env"]
+                            self.assertNotIn("PROGRAMDATA", called_env)
+                            self.assertNotIn("SYSTEMDRIVE", called_env)
 
     # WORK_UNIT_CASE: 905/3
     def test_ordinary_reason_bearing_ignored_sync_tests_found(self) -> None:

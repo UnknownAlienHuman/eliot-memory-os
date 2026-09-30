@@ -26,6 +26,7 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+eliot-host-state = { path = ".", features = ["test-support"] }
 eliot-agent-contracts.workspace = true
 eliot-receipts.workspace = true
 
