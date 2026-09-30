@@ -1111,7 +1111,6 @@ pub(crate) fn map_transition_receipt_error(error: &AuthorityError) -> P07PortErr
 /// [`EffectAuthorizer::admit_effect_execution`] against the live lease, the
 /// exact executor boundary, and the current contest state; these methods only
 /// retain what the owner observed and report what is still pending.
-
 fn require_effect_text(value: &str, field: &'static str) -> Result<(), CompositionError> {
     if value.trim().is_empty() {
         return Err(CompositionError::Recovery(format!(
