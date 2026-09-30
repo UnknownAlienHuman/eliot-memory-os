@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,9 +22,9 @@ use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerifier, DirectoryPublicationOutcome,
     DirectoryPublicationReceipt, FileIdentity, OwnedDirectoryPublication, PackageFileSpec,
-    PackageManifest, PeCoffEvidence, TrustedSourceBundle, WindowsAuthenticodeVerifier,
-    canonical_windows_path, open_no_follow_directory, parse_pe_coff, resolve_account_sid,
-    validate_package_relative_path,
+    PackageManifest, PeCoffEvidence, TrustedSourceBundle, TrustedSourceFileLease,
+    WindowsAuthenticodeVerifier, canonical_windows_path, open_no_follow_directory, parse_pe_coff,
+    resolve_account_sid, validate_package_relative_path,
 };
 use eliot_runtime_contracts::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
@@ -1676,7 +1676,7 @@ fn build_typed_bundle_with_selection(
     })
 }
 
-fn write_create_new(path: &Path, bytes: &[u8]) -> Result<(), MaterializeError> {
+fn write_create_new(path: &Path, bytes: &[u8]) -> Result<FileIdentity, MaterializeError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(windows)]
@@ -1687,8 +1687,8 @@ fn write_create_new(path: &Path, bytes: &[u8]) -> Result<(), MaterializeError> {
             FILE_SHARE_WRITE,
         };
         // The retained native publication root blocks rename/delete of the
-        // directory.  These child opens add the matching no-follow and
-        // no-delete-sharing fence for every role file.
+        // directory. Each returned create handle supplies the original file
+        // identity; the caller pins that exact child before readback.
         options
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
@@ -1700,7 +1700,118 @@ fn write_create_new(path: &Path, bytes: &[u8]) -> Result<(), MaterializeError> {
         MaterializeError::Platform(format!("write {}: {error}", path.display()))
     })?;
     file.sync_all()
-        .map_err(|error| MaterializeError::Platform(format!("sync {}: {error}", path.display())))
+        .map_err(|error| MaterializeError::Platform(format!("sync {}: {error}", path.display())))?;
+    eliot_platform_windows::file_identity_for_open_handle(&file)
+        .map_err(|error| {
+            MaterializeError::Platform(format!("identify {}: {error}", path.display()))
+        })
+}
+
+fn retain_created_role_lease(
+    publication: &OwnedDirectoryPublication,
+    role: &str,
+    created_identity: FileIdentity,
+) -> Result<TrustedSourceFileLease, MaterializeError> {
+    let bundle = publication.trusted_source_bundle().map_err(|error| {
+        MaterializeError::Platform(format!("retain temporary source bundle: {error}"))
+    })?;
+    let lease = bundle.retain_file(role).map_err(|error| {
+        MaterializeError::Platform(format!("retain created source role {role}: {error}"))
+    })?;
+    if created_identity.volume_serial_number == 0
+        || created_identity.file_index == 0
+        || lease.identity() != created_identity
+    {
+        return Err(MaterializeError::Invalid(format!(
+            "created role identity changed before it could be retained: {role}"
+        )));
+    }
+    Ok(lease)
+}
+
+fn retain_journal_role_leases(
+    publication: &OwnedDirectoryPublication,
+    precommit_files: &[MaterializedRolePrecommitReceipt],
+) -> Result<BTreeMap<String, TrustedSourceFileLease>, MaterializeError> {
+    if precommit_files.len() != REQUIRED_ROLES.len() {
+        return Err(MaterializeError::Invalid(
+            "publication journal does not retain the complete fifteen-role inventory".to_owned(),
+        ));
+    }
+    let bundle = publication.trusted_source_bundle().map_err(|error| {
+        MaterializeError::Platform(format!("retain temporary source bundle: {error}"))
+    })?;
+    let mut leases = BTreeMap::new();
+    for (role, executable) in REQUIRED_ROLES {
+        let mut matches = precommit_files
+            .iter()
+            .filter(|fact| fact.relative_path == role);
+        let fact = matches.next().ok_or_else(|| {
+            MaterializeError::Invalid(format!("publication journal role missing: {role}"))
+        })?;
+        if matches.next().is_some() || fact.executable != executable {
+            return Err(MaterializeError::Invalid(format!(
+                "publication journal role binding is ambiguous: {role}"
+            )));
+        }
+        let lease = bundle.retain_file(role).map_err(|error| {
+            MaterializeError::Platform(format!("retain journal source role {role}: {error}"))
+        })?;
+        if lease.identity() != fact.temporary_identity
+            || lease.size() != fact.size
+            || lease.sha256() != fact.sha256.as_str()
+        {
+            return Err(MaterializeError::Invalid(format!(
+                "journal source role differs from its retained identity: {role}"
+            )));
+        }
+        if leases.insert(role.to_owned(), lease).is_some() {
+            return Err(MaterializeError::Invalid(format!(
+                "publication journal repeats source role: {role}"
+            )));
+        }
+    }
+    if leases.len() != REQUIRED_ROLES.len() {
+        return Err(MaterializeError::Invalid(
+            "retained source-role set is incomplete".to_owned(),
+        ));
+    }
+    Ok(leases)
+}
+
+fn verify_role_lease_set(
+    leases: &BTreeMap<String, TrustedSourceFileLease>,
+    precommit_files: &[MaterializedRolePrecommitReceipt],
+) -> Result<(), MaterializeError> {
+    if leases.len() != REQUIRED_ROLES.len() || precommit_files.len() != REQUIRED_ROLES.len() {
+        return Err(MaterializeError::Invalid(
+            "retained source-role set does not match the complete fifteen-role inventory"
+                .to_owned(),
+        ));
+    }
+    for (role, executable) in REQUIRED_ROLES {
+        let mut matches = precommit_files
+            .iter()
+            .filter(|fact| fact.relative_path == role);
+        let fact = matches.next().ok_or_else(|| {
+            MaterializeError::Invalid(format!("precommit source role missing: {role}"))
+        })?;
+        let lease = leases.get(role).ok_or_else(|| {
+            MaterializeError::Invalid(format!("retained source-role lease missing: {role}"))
+        })?;
+        if matches.next().is_some()
+            || fact.executable != executable
+            || lease.relative_path() != role
+            || lease.identity() != fact.temporary_identity
+            || lease.size() != fact.size
+            || lease.sha256() != fact.sha256.as_str()
+        {
+            return Err(MaterializeError::Invalid(format!(
+                "retained source-role lease differs from precommit evidence: {role}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1823,6 +1934,48 @@ fn precommit_from_journal(
         .collect()
 }
 
+fn validate_precommit_role_inventory(
+    precommit_files: &[MaterializedRolePrecommitReceipt],
+) -> Result<(), MaterializeError> {
+    if precommit_files.len() != REQUIRED_ROLES.len() {
+        return Err(MaterializeError::Invalid(
+            "publication journal does not retain the complete fifteen-role inventory".to_owned(),
+        ));
+    }
+    let mut observed = BTreeSet::new();
+    for fact in precommit_files {
+        if !REQUIRED_ROLES
+            .iter()
+            .any(|(role, _)| *role == fact.relative_path)
+        {
+            return Err(MaterializeError::Invalid(format!(
+                "publication journal contains an unexpected role: {}",
+                fact.relative_path
+            )));
+        }
+        if !observed.insert(fact.relative_path.as_str()) {
+            return Err(MaterializeError::Invalid(format!(
+                "publication journal repeats source role: {}",
+                fact.relative_path
+            )));
+        }
+    }
+    for (role, executable) in REQUIRED_ROLES {
+        let fact = precommit_files
+            .iter()
+            .find(|fact| fact.relative_path == role)
+            .ok_or_else(|| {
+                MaterializeError::Invalid(format!("publication journal role missing: {role}"))
+            })?;
+        if fact.executable != executable {
+            return Err(MaterializeError::Invalid(format!(
+                "publication journal executable binding differs for {role}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn typed_bundle_from_journal(
     journal: &SourceBundlePublicationJournal,
 ) -> Result<
@@ -1833,24 +1986,15 @@ fn typed_bundle_from_journal(
     ),
     MaterializeError,
 > {
-    if journal.precommit_files.len() != REQUIRED_ROLES.len() {
-        return Err(MaterializeError::Invalid(
-            "publication journal does not retain the complete fifteen-role inventory".to_owned(),
-        ));
-    }
+    let precommit_files = precommit_from_journal(&journal.precommit_files);
+    validate_precommit_role_inventory(&precommit_files)?;
     let mut manifest_files = Vec::with_capacity(REQUIRED_ROLES.len());
     let mut expected = Vec::with_capacity(REQUIRED_ROLES.len());
     for (role, executable) in REQUIRED_ROLES {
-        let fact = journal
-            .precommit_files
+        let fact = precommit_files
             .iter()
             .find(|fact| fact.relative_path == role)
             .ok_or_else(|| MaterializeError::Invalid(format!("journal role missing: {role}")))?;
-        if fact.executable != executable {
-            return Err(MaterializeError::Invalid(format!(
-                "journal executable binding differs for {role}"
-            )));
-        }
         manifest_files.push(
             PackageFileSpec::new(role, executable, fact.size)
                 .map_err(|error| MaterializeError::Contract(error.to_string()))?,
@@ -1879,7 +2023,7 @@ fn typed_bundle_from_journal(
     Ok((
         manifest,
         expected,
-        precommit_from_journal(&journal.precommit_files),
+        precommit_files,
     ))
 }
 
@@ -2095,6 +2239,7 @@ fn resume_intent_publication(
     journal: &SourceBundlePublicationJournal,
     precommit_files: Vec<MaterializedRolePrecommitReceipt>,
     selected_profile_anchor: &SelectedProfileAnchor<'_>,
+    mut retained_role_leases: Option<BTreeMap<String, TrustedSourceFileLease>>,
 ) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
     selected_profile_anchor.revalidate()?;
     let publication = match OwnedDirectoryPublication::resume(
@@ -2116,6 +2261,30 @@ fn resume_intent_publication(
         }
     };
     let (manifest, expected, _) = typed_bundle_from_journal(journal)?;
+    let mut retained_role_leases = match retained_role_leases.take() {
+        Some(leases) => leases,
+        None => match retain_journal_role_leases(&publication, &precommit_files) {
+            Ok(leases) => leases,
+            Err(error) => {
+                return persist_unknown_publication(
+                    store,
+                    journal,
+                    precommit_files,
+                    format!("recorded source roles cannot be retained: {error}"),
+                    selected_profile_anchor,
+                );
+            }
+        },
+    };
+    if let Err(error) = verify_role_lease_set(&retained_role_leases, &precommit_files) {
+        return persist_unknown_publication(
+            store,
+            journal,
+            precommit_files,
+            format!("recorded source-role leases differ from Intent: {error}"),
+            selected_profile_anchor,
+        );
+    }
     if let Err(error) = verify_resumed_bundle(
         &publication,
         journal,
@@ -2132,6 +2301,13 @@ fn resume_intent_publication(
         );
     }
     selected_profile_anchor.revalidate()?;
+    // Windows refuses a directory rename while any child file handle remains
+    // open. Keep all exact role leases through Intent and final pre-move
+    // verification, then release them at the rename boundary. The durable
+    // journal still carries the original create-handle identities; the
+    // post-move verifier accepts Published only when those exact objects and
+    // bytes remain at the destination, otherwise the result stays unknown.
+    retained_role_leases.clear();
     let directory_publication = match publication.publish(journal.source_identity) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -2154,6 +2330,27 @@ fn resume_intent_publication(
                 diagnostic: None,
                 ..journal.clone()
             };
+            match reconcile_journal_destination(&published, selected_profile_anchor) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return persist_unknown_publication(
+                        store,
+                        journal,
+                        precommit_files,
+                        "published destination disappeared during role readback",
+                        selected_profile_anchor,
+                    );
+                }
+                Err(error) => {
+                    return persist_unknown_publication(
+                        store,
+                        journal,
+                        precommit_files,
+                        format!("published role identity or readback mismatch: {error}"),
+                        selected_profile_anchor,
+                    );
+                }
+            }
             let recorded = match store.record_source_bundle_publication(&published) {
                 Ok(recorded) => recorded,
                 Err(error) => {
@@ -2236,7 +2433,13 @@ fn reconcile_existing_journal_destination(
             Ok(CanarySourceBundleMaterializeOutcome::Published(receipt))
         }
         Ok(None) if journal.state == SourceBundlePublicationJournalState::Intent => {
-            resume_intent_publication(store, journal, precommit_files, selected_profile_anchor)
+            resume_intent_publication(
+                store,
+                journal,
+                precommit_files,
+                selected_profile_anchor,
+                None,
+            )
         }
         Ok(None) => Ok(journal_unknown_outcome(
             journal,
@@ -2404,18 +2607,21 @@ fn materialize_with_resolved_selection(
     selected_profile_anchor.revalidate()?;
     let temp = publication.temporary_path().to_path_buf();
     let mut source_identities = BTreeMap::<String, FileIdentity>::new();
+    let mut retained_role_leases = BTreeMap::<String, TrustedSourceFileLease>::new();
     for (role, executable) in REQUIRED_ROLES {
         let bytes = role_bytes(role, executables, &typed.json_roles)?;
         let destination = temp.join(role);
         selected_profile_anchor.revalidate()?;
-        write_create_new(&destination, bytes)?;
-        let identity =
-            eliot_platform_windows::file_identity_for_path(&destination).map_err(|error| {
-                MaterializeError::Platform(format!("read source identity {role}: {error}"))
-            })?;
+        let identity = write_create_new(&destination, bytes)?;
         if identity.volume_serial_number == 0 || identity.file_index == 0 {
             return Err(MaterializeError::Invalid(format!(
                 "source identity is zero: {role}"
+            )));
+        }
+        let lease = retain_created_role_lease(&publication, role, identity)?;
+        if retained_role_leases.insert(role.to_owned(), lease).is_some() {
+            return Err(MaterializeError::Invalid(format!(
+                "source role was created more than once: {role}"
             )));
         }
         source_identities.insert(role.to_owned(), identity);
@@ -2435,6 +2641,13 @@ fn materialize_with_resolved_selection(
                 )));
             }
         }
+    }
+    if source_identities.len() != REQUIRED_ROLES.len()
+        || retained_role_leases.len() != REQUIRED_ROLES.len()
+    {
+        return Err(MaterializeError::Invalid(
+            "created source-role set differs from the required inventory".to_owned(),
+        ));
     }
     selected_profile_anchor.revalidate()?;
     sync_directory(&temp).map_err(|error| MaterializeError::RecoveryRequired {
@@ -2511,6 +2724,7 @@ fn materialize_with_resolved_selection(
             authenticode,
         });
     }
+    verify_role_lease_set(&retained_role_leases, &precommit_files)?;
     drop(precommit_bundle);
 
     let operation_id = source_bundle_publication_operation_id(
@@ -2577,6 +2791,7 @@ fn materialize_with_resolved_selection(
             &existing_journal,
             precommit_files,
             selected_profile_anchor,
+            Some(retained_role_leases),
         ),
         SourceBundlePublicationJournalState::Published => {
             let receipt = load_verified_published_receipt(
