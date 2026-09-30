@@ -418,16 +418,13 @@ impl McpInvocationCorrelation {
             HostTerminalObservation::PartialUnknown(_) => "",
         };
         let coverage_proof = window.coverage.as_str();
-        let route_degradation =
-            current.degradation().map_or("", |degradation| degradation.code.as_str());
-        let recovery_actions = latest
-            .assessment
-            .recovery
-            .as_ref()
-            .map_or_else(
-                String::new,
-                eliot_agent_bridge_core::mcp_correlation::RecoveryDirective::action_names,
-            );
+        let route_degradation = current
+            .degradation()
+            .map_or("", |degradation| degradation.code.as_str());
+        let recovery_actions = latest.assessment.recovery.as_ref().map_or_else(
+            String::new,
+            eliot_agent_bridge_core::mcp_correlation::RecoveryDirective::action_names,
+        );
         let superseded_codes = summary
             .superseded_degradation_codes
             .iter()

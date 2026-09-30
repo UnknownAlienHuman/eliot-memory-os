@@ -1092,8 +1092,8 @@ impl CanonicalRecoveryRule {
             return None;
         }
         binding
-            .and_then(OwnerValidatedOperationBinding::approves_same_operation_replay)
-            .then_some(RecoveryAction::ResubmitSameOperationIdentity)
+            .filter(|binding| binding.approves_same_operation_replay())
+            .map(|_| RecoveryAction::ResubmitSameOperationIdentity)
     }
 }
 
