@@ -36,10 +36,10 @@ use eliot_testd_core::{
 use thiserror::Error;
 
 use crate::{
-    CanonicalAdmissionOwner, CanonicalAdmissionSnapshot, CanonicalFinishEvidence,
-    CanonicalPlanBinding, CanonicalVerifierExecutionFact, CompositionError, GovernorOwners,
-    KernelPortError, KernelTransitionPort, acceptance_coverage_from_verifier_fact,
-    evaluate_testd_verification_current,
+    CanonicalAdmissionOwner, CanonicalAdmissionSnapshot, CanonicalContractAcceptance,
+    CanonicalFinishEvidence, CanonicalPlanBinding, CanonicalVerifierExecutionFact,
+    CompositionError, GovernorOwners, KernelPortError, KernelTransitionPort,
+    acceptance_coverage_from_verifier_fact, evaluate_testd_verification_current,
 };
 
 /// The Governor's own canonical store scope identity.
@@ -422,35 +422,70 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         }
 
         let mut observation_refs = BTreeSet::new();
+        // Issue #325 P1, I7.9: the contract acceptance digest is rehydrated from
+        // the task-selection evidence the contract owner admitted for this exact
+        // task revision — a different owner than the canonical plan. It is the
+        // only thing that makes the plan's declared item set the contract's
+        // obligation set rather than the plan's own list, so a plan that names
+        // fewer obligations than the contract carries is refused below instead
+        // of shrinking the denominator the gate is computed over.
+        let mut contract_acceptance_digest: Option<String> = None;
         for entry in self.observation.snapshot() {
             let receipt = match &entry.result {
                 ObservationAdmissionResult::Accepted { receipt }
                 | ObservationAdmissionResult::Replayed { receipt } => receipt,
                 ObservationAdmissionResult::Rejected { .. } => continue,
             };
-            if receipt.state_fence == *fence
-                && receipt.task_selection.as_ref().is_some_and(|selection| {
-                    selection.task_ref == task_id.as_str()
-                        && selection.task_revision == task.revision
-                })
-                && matches_plan(receipt.plan.as_ref(), plan, fence)
-            {
+            if let Some(selection) = receipt.task_selection.as_ref().filter(|selection| {
+                receipt.state_fence == *fence
+                    && selection.task_ref == task_id.as_str()
+                    && selection.task_revision == task.revision
+                    && matches_plan(receipt.plan.as_ref(), plan, fence)
+            }) {
                 receipt.validate().map_err(|error| {
                     FinishAttemptError::Composition(CompositionError::Recovery(format!(
                         "accepted task observation receipt is invalid: {error}"
                     )))
                 })?;
+                // Task-bound receipts that disagree about the contract's
+                // acceptance identity are ambiguous owner state, not a majority
+                // vote; the rehydration fails closed below.
+                if contract_acceptance_digest
+                    .as_ref()
+                    .is_some_and(|seen| *seen != selection.acceptance_digest)
+                {
+                    return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                        "task-bound owner evidence disagrees about the current contract acceptance set"
+                            .to_owned(),
+                    )));
+                }
+                contract_acceptance_digest = Some(selection.acceptance_digest.clone());
                 observation_refs.insert(receipt.record_id.clone());
             }
         }
-        if observation_refs.is_empty() {
+        let Some(contract_acceptance_digest) = contract_acceptance_digest else {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
                 "canonical finish evidence has no accepted task-and-plan-bound observation"
                     .to_owned(),
             )));
-        }
+        };
+        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "canonical plan has no verifier binding".to_owned(),
+            ))
+        })?;
+        let contract_acceptance = CanonicalContractAcceptance {
+            task_id: task_id.as_str().to_owned(),
+            task_revision: task.revision,
+            acceptance_digest: contract_acceptance_digest,
+            item_ids: verifier_plan.required_acceptance_item_ids.clone(),
+        };
 
-        let acceptance = acceptance_coverage_from_verifier_fact(plan, &verifier_fact)?;
+        let acceptance = acceptance_coverage_from_verifier_fact(
+            &contract_acceptance.denominator(),
+            plan,
+            &verifier_fact,
+        )?;
         let stale_verifier_run_refs = if verifier_fact.certifies_completion() {
             Vec::new()
         } else {
@@ -488,6 +523,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             .map_err(|error| FinishAttemptError::Finish(FinishError::from(error)))?;
         let canonical = CanonicalFinishEvidence {
             state_fence: fence.clone(),
+            contract_acceptance,
             evidence,
             effect_reference_bindings: verifier_fact.effect_reference_bindings.clone(),
             descendant_closure,
