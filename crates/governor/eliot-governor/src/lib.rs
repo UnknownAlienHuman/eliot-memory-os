@@ -49,13 +49,15 @@ mod governor_authority_projection;
 pub use attention_evaluation_commit::{
     ATTENTION_EVALUATION_OPERATION_PREFIX, AttentionEvaluationCommitError,
     AttentionEvaluationCommitIdentity, AttentionEvaluationOperation,
-    AttentionEvaluationOperatorRequest, AttentionEvaluationProducedRecord,
-    AttentionEvaluationValidity, AttentionMetricGroupStatus, AttentionUnknownSummary,
-    attention_evaluation_idempotency_key, attention_evaluation_operation_id,
-    attention_evaluation_validity, attention_evidence_commitment, attention_record_digest,
-    attention_unknown_summary, check_attention_commit_receipt, collect_attention_evidence_refs,
+    AttentionEvaluationOperatorRequest, AttentionEvaluationPreparedSeal,
+    AttentionEvaluationProducedRecord, AttentionEvaluationValidity, AttentionMetricGroupStatus,
+    AttentionUnknownSummary, attention_evaluation_idempotency_key,
+    attention_evaluation_operation_id, attention_evaluation_validity,
+    attention_evidence_commitment, attention_record_digest, attention_unknown_summary,
+    check_attention_commit_receipt, collect_attention_evidence_refs,
     produce_and_commit_attention_evaluation, resolve_attention_lost_acknowledgement,
-    validate_attention_evaluation_request, verify_attention_evaluation_readback,
+    seal_attention_evaluation_transition, validate_attention_evaluation_request,
+    verify_attention_evaluation_readback,
 };
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
@@ -172,9 +174,11 @@ pub use capability_evidence_commit::{
 };
 pub use composition::*;
 pub use controlboard_projection::{
-    ControlBoardAttentionEvaluationRow, ControlBoardGovernorSnapshot, ControlBoardOwnerBinding,
-    ControlBoardProjectionError, ControlBoardReviewBatch, ControlBoardReviewBatchObligation,
-    expand_attention_evidence, project_attention_evaluation_row,
+    ControlBoardAttentionCostReading, ControlBoardAttentionEvaluationRow,
+    ControlBoardAttentionReadingStatus, ControlBoardAttentionVolumeVsHarm,
+    ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
+    ControlBoardReviewBatch, ControlBoardReviewBatchObligation, expand_attention_evidence,
+    project_attention_evaluation_row, project_attention_evaluation_row_with_scope_withheld,
 };
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
