@@ -3463,7 +3463,7 @@ impl KernelMcpForwardingPort {
 
     /// Binds the real producer, producer generation, stream/event/sequence,
     /// and `StateFence` of one durable/control event to the presenting attach
-    /// binding (Implements #2561 item 1, second half).
+    /// binding (Implements #2561 item 1, second half; issue #2729 item 4).
     ///
     /// Mirrors the bridge-core authority join: the event and fence authority
     /// epochs must match the attach fence authority, and the producer and
@@ -3473,7 +3473,17 @@ impl KernelMcpForwardingPort {
     /// recovery. Historical events are never relabeled as produced by the
     /// new transport generation: only the live generation forwards, and only
     /// under the validated continuity binding above.
+    ///
+    /// The envelope producer must additionally match the recovery-adopted
+    /// stream owner retained on this admitted transport. The adopted
+    /// producer comes from exact owner recovery facts validated against the
+    /// live attach — never from payload strings — so payload-side producer
+    /// substitution on an adopted stream is refused here, before any frame
+    /// is exchanged. A stream with no adopted identity is not refused:
+    /// fresh admission binds its owner under the presenting principal
+    /// Kernel-side. This check invents no stream, producer, or task binding.
     fn check_event_binding(
+        &self,
         binding: &AttachBinding,
         event: &EventEnvelope,
     ) -> Result<(), ProviderFailure> {
@@ -3494,6 +3504,31 @@ impl KernelMcpForwardingPort {
                  match the presenting attach authority (foreign producer/session/fence binding); \
                  nothing staged, nothing forwarded; recover ownership and cursors through \
                  reconcile_external, never by relabeling history",
+            ));
+        }
+        let adopted_producer = {
+            let owner = self.shared.try_borrow().map_err(|_| {
+                ProviderFailure::new(
+                    "eliot-kernel-front-door",
+                    "event binding check unavailable: retained transport owner is mutably \
+                     borrowed",
+                )
+            })?;
+            owner
+                .owner_identity
+                .get(event.stream_id.as_str())
+                .map(|identity| identity.producer_id.clone())
+        };
+        // A stream with no adopted identity imposes no constraint; anything
+        // adopted contradicts only on a real substitution.
+        if adopted_producer.is_some_and(|adopted| adopted != event.producer_id) {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "event binding refused: presented producer does not match the stream owner \
+                 adopted through reconcile_external on this admitted transport \
+                 (payload-side producer substitution); nothing staged, nothing forwarded; \
+                 recover ownership and cursors through reconcile_external, never by \
+                 relabeling the producer",
             ));
         }
         Ok(())
@@ -4194,7 +4229,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             ));
         }
         self.check_continuity(binding)?;
-        Self::check_event_binding(binding, event)?;
+        self.check_event_binding(binding, event)?;
         let facts = self.transport_facts()?;
         if facts.session.is_none() {
             return Err(event_shape_failure(
@@ -4238,6 +4273,29 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             return Err(event_shape_failure(
                 "gap forwarding refused: no admitted Kernel session; attach and activate before \
                  event delivery",
+            ));
+        }
+        // Issue #2729 item 4: a gap carries no producer/generation claim of
+        // its own, so the presented binding itself must still name the live
+        // admitted producer/session occurrence. A stale or replaced
+        // connection, generation, or authority is refused here — before any
+        // frame is exchanged — exactly like a stale event binding. The empty
+        // stream scope below stays honest: connection-level gaps reconcile
+        // unscoped under the staging connection, never under a fabricated
+        // stream or task.
+        if binding.connection_id().as_str() != facts.connection_id.as_str()
+            || binding.activation_generation().get()
+                != facts.state_fence.resource_generation.value()
+            || !binding
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(&facts.state_fence.authority_epoch)
+        {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "gap binding refused: presented attach is not the live admitted producer/session \
+                 occurrence (stale or replaced connection, generation, or authority); nothing \
+                 staged, nothing forwarded; re-attach and reconcile before reporting coverage",
             ));
         }
         let now_ms = bridge_event_unix_ms()?;
