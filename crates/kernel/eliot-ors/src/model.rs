@@ -7610,7 +7610,43 @@ impl HostRequestRetainedLineage {
                     })?;
             }
         }
+        self.validate_taint_claim()?;
         self.validate_class()?;
+        Ok(())
+    }
+
+    /// Refuses a retained CLEAN instruction-taint claim no named transformation
+    /// supports (issue #1809 item 2).
+    ///
+    /// The wire carrier's rule, mirrored rather than reinterpreted so a row
+    /// cannot be retained that the submission gate would have refused, and so a
+    /// replayer reads back the same refusal. `None` keeps its documented
+    /// meaning — unknown, not cleared — and every current producer submits it.
+    ///
+    /// The check stays one-directional: it does not decide any real result's
+    /// taint, and it never mints a clearance. It refuses only an affirmative
+    /// clean claim whose own final named transformation does not end cleared,
+    /// which is the retained form of the rule that a metadata field, a
+    /// sanitizer reference or a successful serialization is not a verified
+    /// declassification (I15.6, I15.12).
+    fn validate_taint_claim(&self) -> Result<(), OrsError> {
+        if !matches!(self.instruction_taint, Some(InstructionTaint::Cleared)) {
+            return Ok(());
+        }
+        let cleared_by_named_transformation =
+            self.transformation_lineage
+                .as_ref()
+                .is_some_and(|transformations| {
+                    transformations
+                        .last()
+                        .is_some_and(|last| last.output_taint == InstructionTaint::Cleared)
+                });
+        if !cleared_by_named_transformation {
+            return Err(OrsError::InvalidField {
+                field: "host_request_retained_lineage_instruction_taint",
+                reason: "a retained cleared taint claim must name its final transformation",
+            });
+        }
         Ok(())
     }
 
