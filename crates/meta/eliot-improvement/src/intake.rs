@@ -41,7 +41,9 @@
 //! to be durable and backlog/archive history not to stay process-local, so no
 //! receipt is dropped inside this crate.
 
-use crate::application_class::{ChangeDescriptor, check_class_gate, classify};
+use crate::application_class::{
+    ChangeDescriptor, check_class_gate, classify, is_prohibited_tuning_surface,
+};
 use crate::brief::{ImprovementBrief, SafeBoundary, brief_at_safe_boundary};
 use crate::budget_proof::{BudgetProof, require_matched_budget_for_promotion};
 use crate::candidate_bounds::{
@@ -105,6 +107,20 @@ pub struct RetainedReusableClosure {
     pub closure_ref: String,
 }
 
+/// Everything an intake request source supplies, and nothing it may not.
+///
+/// This type carries NO `touches_protected` field on purpose. Whether a change
+/// touches a protected surface (I12.24:93-94) is a fact about
+/// `target_surface`, which the candidate records, and `prepare_intake`
+/// derives the flag through the crate's own
+/// [`is_prohibited_tuning_surface`] rather than reading a caller's claim. A
+/// request therefore cannot disagree with the surface it names: there is no
+/// field in which to state the disagreement.
+///
+/// `bounded_tuning` and `has_work_item_ref` ARE caller-issued, because the
+/// evidence they stand for — a declared safe range (I12.24:85) and a real work
+/// item (I12.24:90-91) — exists on no candidate and can only be supplied by
+/// whoever holds it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IntakeRequest {
     pub project_id: String,
@@ -128,7 +144,6 @@ pub struct IntakeRequest {
     pub unknowns: Vec<String>,
     pub boundary: SafeBoundary,
     pub bounded_tuning: bool,
-    pub touches_protected: bool,
     pub has_work_item_ref: bool,
     pub live_experiments_on_surface: usize,
     pub work_item_ref: Option<String>,
@@ -230,7 +245,6 @@ fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementE
         unknowns,
         boundary,
         bounded_tuning,
-        touches_protected,
         has_work_item_ref,
         live_experiments_on_surface,
         work_item_ref,
@@ -265,10 +279,26 @@ fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementE
         unknowns,
         &boundary,
     )?;
+    // The protected flag is DERIVED from the candidate's OWN recorded surface
+    // through the crate's closed rule, exactly as
+    // `ChangeDescriptor::from_recorded_surface` does, so this entry cannot
+    // present a descriptor that disagrees with the surface it recorded. I12.24:93-94
+    // routes a schema/authority/verifier/privacy/Architecture change onto the
+    // explicit owner decision and migration/proof path, and I12.24:87-88 keeps
+    // a verifier-definition or reserve surface off pre-authorized tuning; a
+    // caller-supplied boolean could under-claim either and route a prohibited
+    // surface into the advisory or tuning class. `check_class_gate` refuses
+    // such a descriptor, but a request source that can only build a consistent
+    // one needs no refusal to catch it.
+    //
+    // `bounded_tuning` and `has_work_item_ref` stay owner-issued parameters:
+    // they stand for a declared safe range (I12.24:85) and a real work item
+    // (I12.24:90-91) that exist on no candidate, so they cannot be derived —
+    // only asserted, and `validate` refuses them on a prohibited surface.
     let change = ChangeDescriptor {
         target_surface: candidate.target_surface,
         bounded_tuning,
-        touches_protected,
+        touches_protected: is_prohibited_tuning_surface(candidate.target_surface),
         has_work_item_ref,
     };
     let class = classify(&change);
