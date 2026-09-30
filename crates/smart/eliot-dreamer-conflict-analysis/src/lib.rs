@@ -117,6 +117,33 @@
 //!   rival/confounder denominator with its omissions, and the retained
 //!   [`EvidenceRecord`] envelopes.
 //!
+//! # What the cell derives, and from what
+//!
+//! A [`CausalEvidenceRecord`] cannot be DERIVED here and this crate does not
+//! pretend otherwise. Every leg of one is an observation its own owner captured:
+//! a retained-byte digest, a recorded verification binding, an executed
+//! intervention's receipt, an evaluator's competence result. The crate reads no
+//! store, runs no verifier, and holds no capture surface, so there is no value
+//! it could put in those fields that would not be invented — and an invented
+//! value there is the forgery the record's own validation exists to refuse.
+//! Those records therefore stay caller-supplied, and the cell's job is to hold
+//! them to what they claim.
+//!
+//! What the cell DOES derive is everything that is a function of the inputs it
+//! already holds, so that no published value is a constant standing in for a
+//! measurement:
+//!
+//! - the rival/confounder SCOPE of a claim read without an owner record, from
+//!   the frozen `ConflictSet` denominator and its counters, with every member
+//!   this analysis cannot show NAMED as an omission
+//!   ([`derive_rival_denominator`]);
+//! - the coverage of any denominator, from its retained evidence
+//!   ([`RivalDenominator::derived_coverage`]), never from the owner-declared
+//!   field;
+//! - the effective causal state, from the declared state's own requirements
+//!   over the shared I12.18 relation vocabulary
+//!   ([`CausalClaimState::relation_status`]).
+//!
 //! Absent, stale, mixed-fence, or incomplete owner records are an explicit
 //! inert result: the relation stays [`CompatibilityRelation::Ambiguous`], the
 //! causal state stays [`CausalClaimState::Unknown`], the valid observations are
@@ -231,9 +258,9 @@ use std::fmt::Write as _;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
 use eliot_dreamer_contracts::{
-    CurationRejectionCode, GroundedDreamDraft, PossibleResultSchema, PreservationDimension,
-    ProbeObjective, ResultTarget, ResultUpdate, ValidatedCurationItem, ValidatedDreamDraft,
-    ValidationReceipt, check_fence, is_hex64_lower,
+    CurationRejectionCode, FailureCausalStatus, GroundedDreamDraft, PossibleResultSchema,
+    PreservationDimension, ProbeObjective, ResultTarget, ResultUpdate, ValidatedCurationItem,
+    ValidatedDreamDraft, ValidationReceipt, check_fence, is_hex64_lower,
 };
 use eliot_epistemic_contracts::{
     ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictSet,
@@ -242,6 +269,10 @@ use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
     EvidenceFreshness,
 };
+
+mod evidence_admission;
+
+pub use evidence_admission::derive_rival_denominator;
 
 // ---------------------------------------------------------------------------
 // Independent bounds (no cross-subsidy between dimensions).
@@ -1204,9 +1235,22 @@ impl RivalDenominator {
 
     /// Returns the coverage this cell derives from the retained evidence,
     /// independent of the coverage the owner declared.
+    ///
+    /// Complete coverage requires a NON-EMPTY expected denominator that is
+    /// wholly observed with no omission. An empty denominator is not complete
+    /// coverage: it is the absence of a scope, and reading "nothing was
+    /// expected" as "everything was covered" is the vacuous-absence move
+    /// I21.6 refuses, because it lets a claim that set out no rivals at all
+    /// clear the coverage leg with no material behind it.
+    ///
+    /// This is the derivation every assessment leg reads, so the
+    /// complete/omitted relation holds on the published cell and not only in
+    /// validation: `coverage` cannot be `CompleteForScope` while `omitted`
+    /// names a member, no matter what the owner declared.
     #[must_use]
     pub fn derived_coverage(&self) -> EvidenceCoverage {
-        if self.observed.len() == self.expected.len()
+        if !self.expected.is_empty()
+            && self.observed.len() == self.expected.len()
             && self
                 .expected
                 .iter()
@@ -2042,6 +2086,34 @@ impl CausalClaimState {
             Self::Intervention => "intervention",
             Self::Refuted => "refuted",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// Returns the shared causal-status reading this state stands for.
+    ///
+    /// I12.18 types one relation status over exactly these seven readings, and
+    /// [`FailureCausalStatus`] already carries that set, so this cell reads the
+    /// accepted vocabulary instead of deciding on a second spelling of it. The
+    /// projection is total and one-to-one: the accepted names are the longer
+    /// and more precise ones (`BehavioralCorrelation` for what this cell calls
+    /// correlation, `PredictionSupported` and `InterventionSupported` for the
+    /// two supported readings), so no state is widened or collapsed on the way
+    /// across.
+    ///
+    /// The shared enum is what this cell's state derivation and its legacy
+    /// proof ceiling MATCH ON, so a reading added to the accepted contract stops
+    /// this crate compiling until it has been decided here, rather than falling
+    /// through a default arm as if it did not exist.
+    #[must_use]
+    pub const fn relation_status(self) -> FailureCausalStatus {
+        match self {
+            Self::Structural => FailureCausalStatus::Structural,
+            Self::Correlational => FailureCausalStatus::BehavioralCorrelation,
+            Self::CausalHypothesis => FailureCausalStatus::CausalHypothesis,
+            Self::Prediction => FailureCausalStatus::PredictionSupported,
+            Self::Intervention => FailureCausalStatus::InterventionSupported,
+            Self::Refuted => FailureCausalStatus::Refuted,
+            Self::Unknown => FailureCausalStatus::Unknown,
         }
     }
 }
@@ -3333,11 +3405,26 @@ fn check_mechanism_revision(
 /// that it is the CURRENT one, so a stale or mixed-fence envelope is otherwise
 /// well-formed evidence: without this comparison it would qualify a claim
 /// under a lease or epoch the analysis does not hold.
+///
+/// The envelope also states, in its own provenance, the owner, scope, revision,
+/// and raw handle the material was captured under. Those are claims the
+/// envelope makes ABOUT ITSELF, so each is compared to the retained member it
+/// is joined to: an envelope naming another owner, another scope, another
+/// revision, or another retained handle is not a reading of this material, and
+/// without the comparison a well-formed envelope could be re-pointed at bytes
+/// it never saw. The raw handle and revision are optional in the shared
+/// contract, so they are compared when present and make no claim when absent.
+///
+/// Finally, receipts are one-to-one with envelopes. A receipt is the proof that
+/// issued one envelope; two envelopes presenting the same receipt is the "two
+/// hashes look right" substitution, and it would let one owner's issuance
+/// stand in for a second envelope's.
 fn check_evidence_joins(
     record: &CausalEvidenceRecord,
     item: &ValidatedCurationItem,
     member: &SourceMemberRecord,
 ) -> Result<(), ConflictAnalysisError> {
+    let mut seen_receipts: Vec<&str> = Vec::with_capacity(record.evidence.len());
     for evidence in &record.evidence {
         if evidence.material_digest != member.record_digest {
             return Err(ConflictAnalysisError::Binding {
@@ -3359,6 +3446,49 @@ fn check_evidence_joins(
                 detail:
                     "the A-05 receipt attests the curation boundary only and is not causal evidence"
                         .to_owned(),
+            });
+        }
+        if seen_receipts.contains(&evidence.receipt_digest.as_str()) {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "one evidence receipt is presented as the issuance of two envelopes for {}",
+                    redact(&record.source_handle)
+                ),
+            });
+        }
+        seen_receipts.push(evidence.receipt_digest.as_str());
+        if evidence.owner != member.source_owner {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.owner".to_owned(),
+                detail: format!(
+                    "envelope owner {} did not retain the material it is joined to",
+                    redact(&evidence.owner)
+                ),
+            });
+        }
+        if evidence.envelope.provenance.scope != member.scope_id {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.envelope.provenance.scope".to_owned(),
+                detail: "envelope names a scope other than the one its retained material was admitted under"
+                    .to_owned(),
+            });
+        }
+        if let Some(revision) = &evidence.envelope.provenance.revision
+            && revision != &member.source_revision
+        {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.envelope.provenance.revision".to_owned(),
+                detail: "envelope names a revision other than the one its retained material was read at"
+                    .to_owned(),
+            });
+        }
+        if let Some(handle) = &evidence.envelope.provenance.raw_handle
+            && handle != &member.retained_handle
+        {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.envelope.provenance.raw_handle".to_owned(),
+                detail: "envelope names a raw handle other than the retained material it is joined to"
+                    .to_owned(),
             });
         }
     }
@@ -4295,34 +4425,55 @@ fn qualified_position_relation(mapping: &[PositionCompatibility]) -> QualifiedPo
 /// prose fields are nonblank. Lower-level structural, correlational, and
 /// prediction declarations are preserved as declarations and explicitly
 /// marked unverified; none is evidence-qualified by this projection.
-fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
+///
+/// `rivals` is the denominator [`derive_rival_denominator`] built over the
+/// frozen `ConflictSet` scope for this position. It is read for coverage and
+/// omission only: a declaration that retains no evidence envelope of its own
+/// observes nothing, so every member the frozen scope names is reported as an
+/// omission rather than being folded into a coverage claim. The declaration's
+/// proof ceiling and its preserved text are untouched by it.
+fn effective_causal_claim(
+    claim: &SuppliedCausalClaim,
+    rivals: &RivalDenominator,
+) -> CausalClaimRecord {
+    let coverage = rivals.derived_coverage();
     let mut effective = claim.declared_state;
     let mut reduction_reason = String::new();
-    if matches!(
-        claim.declared_state,
-        CausalClaimState::CausalHypothesis | CausalClaimState::Intervention
-    ) {
-        effective = CausalClaimState::Unknown;
+    match claim.declared_state.relation_status() {
+        FailureCausalStatus::CausalHypothesis | FailureCausalStatus::InterventionSupported => {
+            effective = CausalClaimState::Unknown;
+            reduction_reason = format!(
+                "declared {} retained as legacy v1 unverified: owner-bound evidence and coverage are absent; rival coverage over the frozen scope is {}",
+                claim.declared_state.as_str(),
+                coverage_spelling(coverage)
+            );
+        }
+        FailureCausalStatus::Structural | FailureCausalStatus::BehavioralCorrelation => {
+            reduction_reason = format!(
+                "declared {} retained as legacy v1 unverified; declaration is not support evidence; rival coverage over the frozen scope is {}",
+                claim.declared_state.as_str(),
+                coverage_spelling(coverage)
+            );
+        }
+        FailureCausalStatus::PredictionSupported | FailureCausalStatus::Refuted => {
+            effective = CausalClaimState::Unknown;
+            reduction_reason = format!(
+                "declared {} retained as legacy v1 unverified: outcome and verifier records are absent; rival coverage over the frozen scope is {}",
+                claim.declared_state.as_str(),
+                coverage_spelling(coverage)
+            );
+        }
+        FailureCausalStatus::Unknown => {
+            reduction_reason = format!(
+                "declared unknown retained as legacy v1 unverified; rival coverage over the frozen scope is {}",
+                coverage_spelling(coverage)
+            );
+        }
+    }
+    if !rivals.omitted.is_empty() {
         reduction_reason = format!(
-            "declared {} retained as legacy v1 unverified: owner-bound evidence and coverage are absent",
-            claim.declared_state.as_str()
-        );
-    } else if matches!(
-        claim.declared_state,
-        CausalClaimState::Structural | CausalClaimState::Correlational
-    ) {
-        reduction_reason = format!(
-            "declared {} retained as legacy v1 unverified; declaration is not support evidence",
-            claim.declared_state.as_str()
-        );
-    } else if matches!(
-        claim.declared_state,
-        CausalClaimState::Prediction | CausalClaimState::Refuted
-    ) {
-        effective = CausalClaimState::Unknown;
-        reduction_reason = format!(
-            "declared {} retained as legacy v1 unverified: outcome and verifier records are absent",
-            claim.declared_state.as_str()
+            "{reduction_reason}; {} rival member(s) omitted and named",
+            rivals.omitted.len()
         );
     }
     CausalClaimRecord {
@@ -4331,7 +4482,7 @@ fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
         effective_state: effective,
         supplement_version: SupplementVersion::LegacyV1Unverified,
         reduction_reason,
-        coverage: EvidenceCoverage::Unknown,
+        coverage,
         mechanism_claim_id: None,
     }
 }
@@ -4388,22 +4539,23 @@ fn derive_causal_state(record: &CausalEvidenceRecord) -> CausalClaimState {
     if blocking_causal_leg(record).is_some() {
         return CausalClaimState::Unknown;
     }
-    match record.declared_state {
-        CausalClaimState::Structural | CausalClaimState::Correlational => record.declared_state,
-        CausalClaimState::CausalHypothesis => match record.falsifier.observed {
+    match record.declared_state.relation_status() {
+        FailureCausalStatus::Structural => CausalClaimState::Structural,
+        FailureCausalStatus::BehavioralCorrelation => CausalClaimState::Correlational,
+        FailureCausalStatus::CausalHypothesis => match record.falsifier.observed {
             FalsifierStatus::Inconsistent => CausalClaimState::Refuted,
             _ => CausalClaimState::CausalHypothesis,
         },
-        CausalClaimState::Prediction => CausalClaimState::Prediction,
-        CausalClaimState::Intervention => match &record.intervention {
+        FailureCausalStatus::PredictionSupported => CausalClaimState::Prediction,
+        FailureCausalStatus::InterventionSupported => match &record.intervention {
             Some(_) => CausalClaimState::Intervention,
             None => CausalClaimState::Unknown,
         },
-        CausalClaimState::Refuted => match record.falsifier.observed {
+        FailureCausalStatus::Refuted => match record.falsifier.observed {
             FalsifierStatus::Inconsistent => CausalClaimState::Refuted,
             _ => CausalClaimState::Unknown,
         },
-        CausalClaimState::Unknown => CausalClaimState::Unknown,
+        FailureCausalStatus::Unknown => CausalClaimState::Unknown,
     }
 }
 
@@ -4446,7 +4598,20 @@ fn owner_causal_record(record: &CausalEvidenceRecord) -> CausalClaimRecord {
 /// a legacy declaration for the same source is still preserved under its own
 /// unverified ceiling rather than dropped, so the declaration stays visible
 /// beside the evidence that qualified or refused it.
-fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRecord> {
+///
+/// A legacy declaration's coverage is the denominator this analysis DERIVES for
+/// its position over the frozen `ConflictSet` scope, never a declared value:
+/// the published cell reports the rival members the scope actually names, and
+/// how many of them the declaration omits. That keeps the field's promise that
+/// coverage is "derived from the retained evidence" honest on the legacy path
+/// too, instead of reporting a hardcoded unknown beside a scope the analysis
+/// can actually measure. The owner-issued path is untouched: an admitted
+/// [`CausalEvidenceRecord`] still carries its own denominator and is still
+/// checked by [`RivalDenominator::validate`] against its own envelopes.
+fn collect_causal_claims(
+    supplements: &ConflictSupplements,
+    conflict_set: &ConflictSet,
+) -> Vec<CausalClaimRecord> {
     let mut out: Vec<CausalClaimRecord> = supplements
         .owner_records
         .causal_evidence
@@ -4461,7 +4626,8 @@ fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRe
         if qualified.contains(&claim.source_handle) {
             continue;
         }
-        out.push(effective_causal_claim(claim));
+        let rivals = derive_rival_denominator(&claim.source_handle, conflict_set);
+        out.push(effective_causal_claim(claim, &rivals));
     }
     out.sort_by(|left, right| left.source_handle.cmp(&right.source_handle));
     out
@@ -5361,7 +5527,7 @@ fn emit_candidate(
         candidate_digest: digest,
         note: note.to_owned(),
         resolution_status: supplements.external_resolution.clone(),
-        causal_states: collect_causal_claims(supplements),
+        causal_states: collect_causal_claims(supplements, conflict_set),
     })
 }
 
