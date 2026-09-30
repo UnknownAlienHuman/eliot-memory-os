@@ -487,7 +487,10 @@ impl BootstrapScanEvidence {
         if let Some(candidates) = &self.governing_source_candidates {
             Self::check_bounded(candidates.len(), 32, "governing_source_candidates")?;
             for candidate in candidates {
-                text(&candidate.source_ref, "governing_source_candidates.source_ref")?;
+                text(
+                    &candidate.source_ref,
+                    "governing_source_candidates.source_ref",
+                )?;
                 if candidate
                     .source_ref
                     .split('/')

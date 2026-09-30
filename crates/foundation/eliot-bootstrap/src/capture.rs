@@ -875,33 +875,84 @@ pub struct WorkspaceSourceDocumentCandidate {
 
 const WORKSPACE_SOURCE_DOCUMENT_PATHS: [(&str, WorkspaceSourceDocumentKind); 31] = [
     ("TASK.md", WorkspaceSourceDocumentKind::UserTask),
-    ("README.md", WorkspaceSourceDocumentKind::SupportingReference),
+    (
+        "README.md",
+        WorkspaceSourceDocumentKind::SupportingReference,
+    ),
     ("AGENTS.md", WorkspaceSourceDocumentKind::AgentInstruction),
-    ("CONTRIBUTING.md", WorkspaceSourceDocumentKind::AgentInstruction),
+    (
+        "CONTRIBUTING.md",
+        WorkspaceSourceDocumentKind::AgentInstruction,
+    ),
     ("ARCHITECTURE.md", WorkspaceSourceDocumentKind::Architecture),
-    ("IMPLEMENTATION.md", WorkspaceSourceDocumentKind::Implementation),
+    (
+        "IMPLEMENTATION.md",
+        WorkspaceSourceDocumentKind::Implementation,
+    ),
     ("BUILD.md", WorkspaceSourceDocumentKind::BuildTestContract),
-    ("BUILDING.md", WorkspaceSourceDocumentKind::BuildTestContract),
+    (
+        "BUILDING.md",
+        WorkspaceSourceDocumentKind::BuildTestContract,
+    ),
     ("TESTING.md", WorkspaceSourceDocumentKind::BuildTestContract),
     ("POLICY.md", WorkspaceSourceDocumentKind::DomainPolicy),
     ("SECURITY.md", WorkspaceSourceDocumentKind::DomainPolicy),
-    ("CHANGELOG.md", WorkspaceSourceDocumentKind::SupportingReference),
+    (
+        "CHANGELOG.md",
+        WorkspaceSourceDocumentKind::SupportingReference,
+    ),
     ("Cargo.toml", WorkspaceSourceDocumentKind::BuildTestContract),
     ("go.mod", WorkspaceSourceDocumentKind::BuildTestContract),
-    ("pyproject.toml", WorkspaceSourceDocumentKind::BuildTestContract),
-    ("package.json", WorkspaceSourceDocumentKind::BuildTestContract),
+    (
+        "pyproject.toml",
+        WorkspaceSourceDocumentKind::BuildTestContract,
+    ),
+    (
+        "package.json",
+        WorkspaceSourceDocumentKind::BuildTestContract,
+    ),
     ("pom.xml", WorkspaceSourceDocumentKind::BuildTestContract),
-    ("CMakeLists.txt", WorkspaceSourceDocumentKind::BuildTestContract),
+    (
+        "CMakeLists.txt",
+        WorkspaceSourceDocumentKind::BuildTestContract,
+    ),
     ("Cargo.lock", WorkspaceSourceDocumentKind::BuildTestContract),
-    ("package-lock.json", WorkspaceSourceDocumentKind::BuildTestContract),
-    ("docs/README.md", WorkspaceSourceDocumentKind::SupportingReference),
-    ("docs/AGENTS.md", WorkspaceSourceDocumentKind::AgentInstruction),
-    ("docs/ARCHITECTURE.md", WorkspaceSourceDocumentKind::Architecture),
-    ("docs/IMPLEMENTATION.md", WorkspaceSourceDocumentKind::Implementation),
-    ("docs/BUILD.md", WorkspaceSourceDocumentKind::BuildTestContract),
-    ("docs/TESTING.md", WorkspaceSourceDocumentKind::BuildTestContract),
-    ("docs/SCHEMA.md", WorkspaceSourceDocumentKind::SupportingReference),
-    ("docs/CHANGELOG.md", WorkspaceSourceDocumentKind::SupportingReference),
+    (
+        "package-lock.json",
+        WorkspaceSourceDocumentKind::BuildTestContract,
+    ),
+    (
+        "docs/README.md",
+        WorkspaceSourceDocumentKind::SupportingReference,
+    ),
+    (
+        "docs/AGENTS.md",
+        WorkspaceSourceDocumentKind::AgentInstruction,
+    ),
+    (
+        "docs/ARCHITECTURE.md",
+        WorkspaceSourceDocumentKind::Architecture,
+    ),
+    (
+        "docs/IMPLEMENTATION.md",
+        WorkspaceSourceDocumentKind::Implementation,
+    ),
+    (
+        "docs/BUILD.md",
+        WorkspaceSourceDocumentKind::BuildTestContract,
+    ),
+    (
+        "docs/TESTING.md",
+        WorkspaceSourceDocumentKind::BuildTestContract,
+    ),
+    (
+        "docs/SCHEMA.md",
+        WorkspaceSourceDocumentKind::SupportingReference,
+    ),
+    (
+        "docs/CHANGELOG.md",
+        WorkspaceSourceDocumentKind::SupportingReference,
+    ),
     (
         "docs/architecture/README.md",
         WorkspaceSourceDocumentKind::Architecture,
@@ -910,7 +961,10 @@ const WORKSPACE_SOURCE_DOCUMENT_PATHS: [(&str, WorkspaceSourceDocumentKind); 31]
         "docs/implementation/README.md",
         WorkspaceSourceDocumentKind::Implementation,
     ),
-    ("schemas/README.md", WorkspaceSourceDocumentKind::SupportingReference),
+    (
+        "schemas/README.md",
+        WorkspaceSourceDocumentKind::SupportingReference,
+    ),
 ];
 
 /// Observes likely governing-source documents under one explicit root.

@@ -2811,9 +2811,7 @@ pub fn observe_cold_start_discovery(
             role: match candidate.kind {
                 WorkspaceSourceDocumentKind::UserTask => GoverningSourceRole::UserTask,
                 WorkspaceSourceDocumentKind::Architecture => GoverningSourceRole::Architecture,
-                WorkspaceSourceDocumentKind::Implementation => {
-                    GoverningSourceRole::Implementation
-                }
+                WorkspaceSourceDocumentKind::Implementation => GoverningSourceRole::Implementation,
                 WorkspaceSourceDocumentKind::AgentInstruction => {
                     GoverningSourceRole::AgentInstruction
                 }

@@ -5577,8 +5577,7 @@ async fn trigger_accepted_cold_start(
                     );
                 }
                 Ok(eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
-                    code,
-                    ..
+                    code, ..
                 }) => {
                     tracing::info!(
                         ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
