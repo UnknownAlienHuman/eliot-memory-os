@@ -5251,6 +5251,45 @@ impl KernelComposition {
         Ok((envelope, tool))
     }
 
+    pub(crate) fn validate_original_write_submission_source(
+        &self,
+        record: &HostRequestRecord,
+        submitted: &eliot_store_api::OriginalWriteSubmission,
+    ) -> Result<(), TransportError> {
+        submitted.validate().map_err(|_| TransportError::SessionFenced)?;
+        let (_, original_tool_request) = self.read_observe_executable_input(record)?;
+        let source = Self::original_write_submission_from_tool_request(&original_tool_request)?;
+        if &source != submitted {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn original_write_submission_from_tool_request(
+        tool_request: &serde_json::Value,
+    ) -> Result<eliot_store_api::OriginalWriteSubmission, TransportError> {
+        if tool_request.get("name").and_then(serde_json::Value::as_str)
+            != Some(OBSERVE_CAPABILITY)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let arguments = tool_request
+            .get("arguments")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TransportError::SessionFenced)?;
+        if arguments.get("kind").and_then(serde_json::Value::as_str) != Some("observation") {
+            return Err(TransportError::SessionFenced);
+        }
+        let original = arguments
+            .get("write_submission")
+            .cloned()
+            .ok_or(TransportError::SessionFenced)?;
+        let source: eliot_store_api::OriginalWriteSubmission = serde_json::from_value(original)
+            .map_err(|_| TransportError::SessionFenced)?;
+        source.validate().map_err(|_| TransportError::SessionFenced)?;
+        Ok(source)
+    }
+
     fn validate_observe_row_against_live_application(
         &self,
         record: &HostRequestRecord,
@@ -6597,6 +6636,17 @@ impl KernelComposition {
             .write_binding
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
+        let (_, original_tool_request) = self.read_observe_executable_input(record)?;
+        let original_submission =
+            Self::original_write_submission_from_tool_request(&original_tool_request)?;
+        if write_binding.write_envelope_protocol_version != original_submission.protocol_version
+            || write_binding.write_intent_id.as_str()
+                != original_submission.write_intent_id.as_str()
+            || write_binding.write_response_mode.as_deref()
+                != Some(original_submission.response_mode.as_str())
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         let staged_fence: eliot_contracts::StateFence =
             serde_json::from_str(&write_binding.state_fence.canonical_json)
                 .map_err(|_| TransportError::SessionFenced)?;
