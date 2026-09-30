@@ -20,15 +20,14 @@ use eliot_process::{
     CancellationStatus, Generation, ProcessExecutionError, ProcessExecutionView,
     ProcessLifecycle, ProcessOwnerBinding, ProcessStartReceipt,
 };
-use eliot_runtime_contracts::AutomaticRestartDecision;
 
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
-    ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS,
-    ELIOTD_RESTART_CLASS, KernelBuildError, KernelComposition, daemon_automatic_restart_decision,
-    daemon_restart_decision_reason, daemon_status_proves_ready, eliotd_launch_attempt_identity,
-    eliotd_operation_id, fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
+    ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS, KernelBuildError,
+    KernelComposition, daemon_refuses_replacement, daemon_restart_refusal_reason,
+    daemon_status_proves_ready, eliotd_launch_attempt_identity, eliotd_operation_id,
+    fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
     stable_owner_principal_digest,
 };
 
@@ -572,30 +571,27 @@ impl KernelComposition {
             ));
             return Err(self.daemon_failure_error(reason));
         }
-        // The declared restart class (I14.10) is decided on the exact
-        // reconciled evidence of the generation being replaced: after its
-        // process is proven terminal and before any replacement is launched.
-        // An exit the process owner could not classify is not read as a
-        // normal exit here and cannot buy a replacement.
+        // The two refusals that no declared restart class may bypass (I14.10)
+        // are decided here, on the exact reconciled evidence of the generation
+        // being replaced: after its process is proven terminal and before any
+        // replacement is launched. An exit the process owner could not
+        // classify is not read as a normal exit and cannot buy a replacement.
+        // Which classifiable exit may restart is the class rule's own decision
+        // and stays with `decide_automatic_restart` once an admitted restart
+        // policy exists for this child.
         if let Some(receipt) = previous_receipt.as_ref() {
             let closed = match self.close_previous_daemon_process(&launch, receipt).await {
                 Ok(closed) => closed,
                 Err(error) => return Err(self.daemon_failure_error(error.to_string())),
             };
-            let decision = daemon_automatic_restart_decision(
-                ELIOTD_RESTART_CLASS,
-                service_state,
-                &status,
-                &closed,
-            );
-            observe_daemon_runtime(
-                "kernel.daemon.restart_class_decided",
-                daemon_restart_decision_reason(decision),
-            );
-            if decision != AutomaticRestartDecision::Eligible {
+            if let Some(refusal) = daemon_refuses_replacement(service_state, &closed) {
+                observe_daemon_runtime(
+                    "kernel.daemon.restart_refused",
+                    daemon_restart_refusal_reason(refusal),
+                );
                 let reason = format!(
-                    "eliotd declared restart class refused a replacement: {}",
-                    daemon_restart_decision_reason(decision)
+                    "eliotd automatic restart refused: {}",
+                    daemon_restart_refusal_reason(refusal)
                 );
                 return Err(self.daemon_failure_error(reason));
             }

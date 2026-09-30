@@ -301,9 +301,9 @@ use daemon_supervision::EliotdSupervisionSuccessorEvidence;
 use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
 #[cfg(windows)]
 use daemon_supervision::{
-    DaemonSupervisionContour, DaemonSupervisionProgressState, ELIOTD_RESTART_CLASS,
-    EliotdLiveReceiptDisposition, classify_eliotd_live_receipt_transition,
-    daemon_automatic_restart_decision, daemon_restart_decision_reason,
+    DaemonSupervisionContour, DaemonSupervisionProgressState, EliotdLiveReceiptDisposition,
+    classify_eliotd_live_receipt_transition, daemon_refuses_replacement,
+    daemon_restart_refusal_reason,
 };
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]

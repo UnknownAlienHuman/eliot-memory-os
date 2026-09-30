@@ -20,9 +20,8 @@ use eliot_process::{
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
-    AutomaticRestartDecision, DaemonChannelCursor, DaemonProgressObservation,
-    DaemonSupervisionRenewalPolicy, RestartClass, RestartFailureEvidence,
-    RestartIdentityEvidence, RestartOwnerLifecycle, decide_restart_class,
+    DaemonChannelCursor, DaemonProgressObservation, DaemonSupervisionRenewalPolicy,
+    RestartOwnerLifecycle,
 };
 use eliot_runtime_contracts::{
     LeaseState, SupervisionGenerationBinding, SupervisionLeaseIncarnationBinding,
@@ -63,20 +62,41 @@ pub(crate) const fn daemon_status_proves_ready(status: &DaemonRuntimeStatus) -> 
 }
 
 // ============================================================================
-// Declared restart class for the Kernel-supervised child (I14.10, #1682 W3).
+// Automatic-restart refusals for the Kernel-supervised child (I14.10, #1682 W3).
 //
-// The class is not chosen here. It is the class the child's own admitted
-// module manifest declares as `child_restart`, which is the I6.4 manifest field
-// this workspace already ships as `transient` for every admitted module. This
-// module only binds that declared class to the rule so the Kernel's own
-// relaunch decision cannot drift from it; it never reads a class off a live
-// process, a PID, a name, or an exit code, and it declares no restart
-// intensity of its own (I8.12 numbers belong to the approved config/fault
-// profile, and the Kernel's existing bounded recovery budget stays the budget).
+// The class rule itself - permanent, transient, temporary - lives in
+// `eliot_runtime_contracts::restart_policy::decide_automatic_restart`, and it is
+// not restated here. Calling it needs a whole `RestartPolicyV1`, and no
+// admitted configuration in this workspace carries the eight
+// `RestartIntensityPolicy` values such a declaration requires:
+// `bins/eliot-kernel/src/kernel_config.rs:28-119` is the Kernel's complete
+// admitted configuration and has no restart-intensity field, and
+// `RestartIntensityPolicy` is never constructed anywhere in the repository
+// (`crates/foundation/eliot-runtime-contracts/src/restart_policy.rs:85` is its
+// only declaration). I08-12 keeps those numbers in config and fault profiles,
+// so inventing them here is forbidden and reading them from `main` is not
+// possible. The class-permission half of W3 therefore stays unwired until that
+// profile exists, and is named rather than faked.
+//
+// What is bound here is the half that is about *refusing* rather than about
+// budgets: the two preconditions that `decide_automatic_restart` consults
+// before any class is read, and which no class may bypass. Both are refusals.
+// Neither can admit a replacement, so binding them can only ever remove an
+// automatic restart that would otherwise have happened; neither widens what
+// restarts, and neither is a second copy of the class rule.
 
-/// The declared restart class of the Kernel's supervised `eliotd` child.
+/// Why the Kernel refuses an automatic replacement before any declared restart
+/// class is consulted.
 #[cfg(windows)]
-pub(crate) const ELIOTD_RESTART_CLASS: RestartClass = RestartClass::Transient;
+pub(crate) enum DaemonRestartRefusal {
+    /// The owner is draining, stopping, retiring or not yet admitted, so a
+    /// deliberate going-away is not a failure to retry.
+    OwnerLifecycle,
+    /// The process owner recorded no exit, or recorded one it could not
+    /// classify. That is not a proved normal exit and not a proved abnormal
+    /// one, so it may not buy a replacement under any class.
+    ExitIdentityNotProved,
+}
 
 /// Maps the owner's own lifecycle onto the value the class rule reads, so a
 /// deliberate going-away is never mistaken for a failure to retry.
@@ -103,86 +123,44 @@ const fn daemon_owner_restart_lifecycle(state: KernelServiceState) -> RestartOwn
     }
 }
 
-/// Classifies one observed previous generation into the evidence the declared
-/// class rule reads.
+/// Returns the refusal that applies to one observed previous generation, or
+/// `None` when neither precondition blocks a replacement.
 ///
-/// `previous_status` is the Kernel's own readiness record and `view` is the
-/// process owner's exact observation of the generation being replaced. Neither
-/// is inferred from liveness:
-///
-/// * an absent exit observation, or one the process owner recorded as
-///   unclassifiable, is `MissingOrAmbiguous`: not a proved normal exit and
-///   not a proved abnormal one, so it permits no replacement under any class;
-/// * a clean exit code is a normal exit, a signal or resource-limit stop is an
-///   abnormal exit, and a tree the owner deliberately cancelled is a planned
-///   stop that is not itself a failure to retry;
-/// * a previous generation that never proved ready failed this child's
-///   health/readiness contract, which is the second condition the transient
-///   class restarts on.
+/// `view` is the process owner's exact observation of the generation being
+/// replaced, not liveness and not a PID. The physical `ExitDisposition` it
+/// records is the only exit identity that exists: a clean exit code, a signal
+/// or resource-limit stop, and a deliberate cancel are all classifiable, and
+/// which of them may buy a replacement is the class rule's decision, not this
+/// function's. Only the unclassifiable case is refused here.
 #[cfg(windows)]
-fn daemon_restart_evidence(
-    previous_status: &DaemonRuntimeStatus,
-    view: &ProcessExecutionView,
-) -> (RestartIdentityEvidence, RestartFailureEvidence) {
-    let Some(exit) = view.exit() else {
-        return (
-            RestartIdentityEvidence::MissingOrAmbiguous,
-            RestartFailureEvidence::NoRestartCondition,
-        );
-    };
-    let classified = match exit.disposition() {
-        ExitDisposition::Unknown => {
-            return (
-                RestartIdentityEvidence::MissingOrAmbiguous,
-                RestartFailureEvidence::NoRestartCondition,
-            );
-        }
-        ExitDisposition::Completed => RestartFailureEvidence::NormalExit,
-        ExitDisposition::Signalled | ExitDisposition::ResourceLimit => {
-            RestartFailureEvidence::AbnormalExit
-        }
-        ExitDisposition::Cancelled => RestartFailureEvidence::NoRestartCondition,
-    };
-    let failure = if daemon_status_proves_ready(previous_status) {
-        classified
-    } else {
-        RestartFailureEvidence::FailedHealthContract
-    };
-    (RestartIdentityEvidence::Exact, failure)
-}
-
-/// Evaluates the declared restart class for one generation the Kernel is about
-/// to replace. It binds only the class rule: it grants no launch, effect or
-/// budget authority, so the owner's own budget and effect checks still decide
-/// whether anything is dispatched.
-#[cfg(windows)]
-pub(crate) fn daemon_automatic_restart_decision(
-    restart_class: RestartClass,
+pub(crate) fn daemon_refuses_replacement(
     owner_state: KernelServiceState,
-    previous_status: &DaemonRuntimeStatus,
     view: &ProcessExecutionView,
-) -> AutomaticRestartDecision {
-    let (identity, failure) = daemon_restart_evidence(previous_status, view);
-    decide_restart_class(
-        restart_class,
-        daemon_owner_restart_lifecycle(owner_state),
-        identity,
-        failure,
-    )
+) -> Option<DaemonRestartRefusal> {
+    if daemon_owner_restart_lifecycle(owner_state) != RestartOwnerLifecycle::Running {
+        return Some(DaemonRestartRefusal::OwnerLifecycle);
+    }
+    match view.exit() {
+        None => Some(DaemonRestartRefusal::ExitIdentityNotProved),
+        Some(exit) => match exit.disposition() {
+            ExitDisposition::Unknown => Some(DaemonRestartRefusal::ExitIdentityNotProved),
+            ExitDisposition::Completed
+            | ExitDisposition::Signalled
+            | ExitDisposition::ResourceLimit
+            | ExitDisposition::Cancelled => None,
+        },
+    }
 }
 
-/// Bounded reason for a class decision, for the diagnostics facade. It is a
-/// fixed vocabulary, so no owner payload can reach an observation.
+/// Bounded reason for a refusal, for the diagnostics facade. It is a fixed
+/// vocabulary, so no owner payload can reach an observation.
 #[cfg(windows)]
-pub(crate) const fn daemon_restart_decision_reason(
-    decision: AutomaticRestartDecision,
+pub(crate) const fn daemon_restart_refusal_reason(
+    refusal: DaemonRestartRefusal,
 ) -> &'static str {
-    match decision {
-        AutomaticRestartDecision::Eligible => "class_permits_replacement",
-        AutomaticRestartDecision::SuppressedByOwnerLifecycle => "owner_lifecycle_suppressed",
-        AutomaticRestartDecision::TemporaryChild => "temporary_child_never_restarts",
-        AutomaticRestartDecision::NoMatchingFailureCondition => "no_matching_failure_condition",
-        AutomaticRestartDecision::BlockedByUncertainIdentity => "exit_identity_not_proved",
+    match refusal {
+        DaemonRestartRefusal::OwnerLifecycle => "owner_lifecycle_suppressed",
+        DaemonRestartRefusal::ExitIdentityNotProved => "exit_identity_not_proved",
     }
 }
 
