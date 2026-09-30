@@ -7,7 +7,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 use eliot_platform::WorkScopePath;
 
@@ -477,7 +477,7 @@ impl BlobFileStore {
             ensure_regular_single_link(&original)?;
             if crate::file_identity_for_open_handle(&original).map_err(map_protected)?
                 != expected_identity
-                || digest_open_file(&original)? != expected_sha256.to_ascii_lowercase()
+                || digest_open_file(&mut original)? != expected_sha256.to_ascii_lowercase()
             {
                 return Err(BlobFileStoreError::PreconditionFailed);
             }
@@ -499,7 +499,7 @@ impl BlobFileStore {
                 // write, delete, and rename opens while staging completes.
                 if crate::file_identity_for_open_handle(&original).map_err(map_protected)?
                     != expected_identity
-                    || digest_open_file(&original)? != expected_sha256.to_ascii_lowercase()
+                    || digest_open_file(&mut original)? != expected_sha256.to_ascii_lowercase()
                 {
                     return Err(BlobFileStoreError::PreconditionFailed);
                 }
@@ -622,6 +622,7 @@ impl BlobFileStore {
         };
         #[cfg(windows)]
         {
+            use std::os::windows::fs::MetadataExt;
             use windows_sys::Win32::Storage::FileSystem::{
                 FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ,
             };
