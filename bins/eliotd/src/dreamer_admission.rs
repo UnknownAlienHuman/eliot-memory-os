@@ -24,9 +24,8 @@ use eliot_contracts::{
     ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
     canonical_json_bytes,
 };
-use eliot_dreamer_contracts::{
-    ContractViolation, DreamJobInput, JobClass, dream_job_input_contract_identity,
-};
+use eliot_dreamer_contracts::job::dream_job_input_contract_identity;
+use eliot_dreamer_contracts::{ContractViolation, DreamJobInput, JobClass};
 use eliot_governor::{CompositionError, CompositionReadiness, KernelPortError};
 use eliot_protocol::dreamer_job::{
     DurableJobRequest, DurableJobResponse, JobOperation, JobRole, JobState, JobSubmission,
