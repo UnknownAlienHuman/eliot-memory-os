@@ -284,7 +284,7 @@ pub trait KernelTransitionPort: Send + Sync {
     ) -> KernelPortFuture<'_, TaskContractAcceptanceSet> {
         Box::pin(async {
             Err(KernelPortError::NotAdmitted(
-                "`TaskContract` owner acceptance-set read is not admitted".to_owned(),
+                "TaskContract owner acceptance-set read is not admitted".to_owned(),
             ))
         })
     }
@@ -8373,7 +8373,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// a second `WorkScope` or "latest task" while the lease is active. The
     /// `Current` task input is accepted only when it agrees with the exact
     /// unique active WorkLease/WorkItem joined to the authenticated
-    /// principal/session/scope/fence; the TaskContract owner's recorded
+    /// principal/session/scope/fence; the `TaskContract` owner's recorded
     /// acceptance digest and those retained owner handles become the receipt's
     /// immutable `TaskSelectionEvidence`.
     ///
