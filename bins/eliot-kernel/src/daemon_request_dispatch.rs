@@ -8274,6 +8274,11 @@ impl KernelComposition {
             // refused without touching a byte. The exact retry condition
             // is retained in the response, never collapsed into a fence.
             Err(eliot_kernel_service::WasmDispatchError::Backpressure(live)) => {
+                // Issue #1679 (caller STITCH): the versioned I14 directive
+                // rides alongside the typed backpressure kind/value, never
+                // replacing them. The observation is whole-or-null — `null`
+                // while the publishing owner supplies no complete directive.
+                let directive = wasm_dispatch_backpressure_directive(claim.operation_id.as_str());
                 return Ok(serde_json::json!({
                     "kind": "wasm_dispatch_backpressure",
                     "value": {
@@ -8281,6 +8286,9 @@ impl KernelComposition {
                         "live_operation_id": live.live_operation_id,
                         "live_expires_at": live.live_expires_at,
                         "retry_condition": live.retry_condition,
+                    },
+                    "recovery": {
+                        "backpressure_directive": directive,
                     },
                 }));
             }
@@ -9197,6 +9205,37 @@ fn store_staging_backpressure_directive(operation_id: &str) -> Option<serde_json
     // and is distinct from this module's process-lane `OperationId` import.
     // The admitted identity is available and well formed here, but the
     // owner-measured byte pressure and staging profile revision above are
+    // not, so the directive is honestly null rather than partial.
+    let _operation_id = eliot_contracts::OperationId::new(operation_id.to_owned()).ok()?;
+    None
+}
+
+/// Builds the complete versioned I14 directive for one backpressured WASM
+/// dispatch publication, or `None` when the owner refuses to produce a valid one.
+///
+/// `operation_id` is the exact handle the admitted publication already
+/// carries, so the directive preserves and the caller retries THAT operation
+/// rather than a fresh one.
+///
+/// Issue #1679 (caller STITCH): the remaining directive inputs are genuinely
+/// unavailable at this call site, so this helper emits `None` rather than a
+/// partial directive. The typed [`WasmDeliveryBackpressure`] the
+/// `WasmDispatchError::Backpressure` arm carries names the live delivery
+/// holding the fixed names plus a prose retry condition — identities only,
+/// never an owner-measured exhausted bottleneck dimension — and this edge
+/// owns no capacity-profile revision artifact or state fence to bind. A BUSY
+/// directive validates only with a claimed, observed exhausted dimension plus
+/// the owner-produced compiled profile revision, so naming one here would
+/// fabricate capacity evidence the publish path never observed. The WASM
+/// dispatch owner is the party that can supply both; until that owner call
+/// site exists, the answer keeps its kind and value with a `null` directive.
+///
+/// [`WasmDeliveryBackpressure`]: eliot_kernel_service::WasmDeliveryBackpressure
+fn wasm_dispatch_backpressure_directive(operation_id: &str) -> Option<serde_json::Value> {
+    // `eliot_contracts::OperationId` is the I14 directive's operation identity
+    // and is distinct from this module's process-lane `OperationId` import.
+    // The admitted identity is available and well formed here, but the
+    // owner-measured capacity pressure and dispatch profile revision above are
     // not, so the directive is honestly null rather than partial.
     let _operation_id = eliot_contracts::OperationId::new(operation_id.to_owned()).ok()?;
     None
