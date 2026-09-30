@@ -346,20 +346,29 @@ fn scope_ref_for(state_fence: &eliot_contracts::StateFence) -> String {
     )
 }
 
-/// The family this daemon's wired trigger sites name.
+/// The family this daemon's wired trigger sites name for its OWN health and
+/// maintenance debt.
 ///
-/// Every trigger origin currently concerns the daemon's own admitted health
-/// and maintenance debt, which is exactly what I14.22's `SelfQualityDebt`
-/// family ("self-quality, feedback and maintenance-debt review") covers.
+/// Every trigger origin that observes the daemon's own admitted health and
+/// maintenance debt concerns exactly what I14.22's `SelfQualityDebt` family
+/// ("self-quality, feedback and maintenance-debt review") covers, so the idle
+/// cadence trigger and the admitted store-health observation name it
+/// unconditionally. It is also the family the startup and improvement-intake
+/// sites name when their own declared-capability evidence shows no gap; when a
+/// gap IS observed they name `MaintenanceFamily::DonorConformance` instead,
+/// through the daemon runtime's own `conformance_observed_family` (issue
+/// #1867 W2/A1). The family is therefore no longer one constant for every
+/// site, and this one is no longer a stand-in for families the daemon has no
+/// observation for.
 ///
 /// #1693 supplied the registered per-family catalog, so this is no longer a
 /// catalog limit: `MaintenanceFamily` carries all fifteen families and
 /// [`maintenance_family_catalog::entry_for`] resolves any of them, and
 /// [`DaemonComposition::evaluate_maintenance_trigger`] routes whichever one the
 /// caller observes. This constant remains the family the daemon's own
-/// observable trigger sites name, because the family is the caller's real
-/// observation and the catalog must not invent which family an observed signal
-/// concerns.
+/// observable health-and-debt trigger sites name, because the family is the
+/// caller's real observation and the catalog must not invent which family an
+/// observed signal concerns.
 pub const SELF_OBSERVED_FAMILY: MaintenanceFamily = MaintenanceFamily::SelfQualityDebt;
 
 /// Fail-closed refusals of the owner-side maintenance decision commit.
