@@ -24,7 +24,12 @@
 //! * a source whose capture is not [`SnapshotCompleteness::Complete`] never
 //!   reaches the archive builder, so no manifest is ever written with an
 //!   unproved boundary;
-//! * the declared event interval must describe exactly the exported events;
+//! * the declared event interval must equal the store-issued `event_ordinal`
+//!   interval observed on the source's own `CanonicalEvent` records, and every
+//!   ordering position those events consumed must sit at or below the declared
+//!   Ordering Heads — so the fence's event range and ordering heads are checked
+//!   against the source Store's own rows rather than against the export's own
+//!   record list, which would only compare a value with its own shadow;
 //! * the observed revision and ordering heads are re-checked through the store
 //!   port's own [`ScopeRevisionView::validate`], so a view assembled from two
 //!   moments, or carrying a duplicate head key, is refused (issue #1141, A3
@@ -101,11 +106,11 @@ use std::path::{Path, PathBuf};
 
 use eliot_blob_api::BlobReadyReceipt;
 use eliot_security_contracts::PurgeLedgerEntry;
-pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
 use eliot_store_api::{
-    OrderingHead, OrderingScopeId, RevisionHead, RevisionKey, ScopeId, ScopeRevisionView,
-    SnapshotCompleteness, WriteReceipt,
+    CanonicalEvent, OrderingHead, OrderingScopeId, RevisionHead, RevisionKey, ScopeId,
+    ScopeRevisionView, SnapshotCompleteness, WriteReceipt,
 };
+pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
 use serde::{Deserialize, Serialize};
 
 use super::{BackupError, CanonicalRecord, EventRange, bytes_sha256, digest, text};
@@ -437,11 +442,6 @@ fn prove_coherent_boundary(
             subject: "authenticated request state fence".to_owned(),
         });
     }
-    if snapshot.event_range.count != snapshot.events.len() as u64 {
-        return Err(BackupError::FenceMismatch {
-            subject: "export event range count".to_owned(),
-        });
-    }
     // Issue #1141, A3 (mixed-revision): the store port already owns the
     // coherent-view contract, so the observed heads are re-checked through
     // `ScopeRevisionView::validate` instead of a second head-checking loop
@@ -472,6 +472,7 @@ fn prove_coherent_boundary(
         .iter()
         .map(|record| record.record_id.as_str())
         .collect();
+    prove_event_range_against_store(snapshot, &orderings)?;
     for receipt in &snapshot.receipts {
         receipt.validate().map_err(BackupError::Store)?;
         if !receipt
@@ -538,6 +539,100 @@ fn prove_coherent_boundary(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// Proves the declared `ExportFence` event range and ordering heads against the
+/// source Store's own canonical event records.
+///
+/// I05-10 "Consistent export boundary" ties an export to an `ExportFence` that
+/// carries the Ordering Heads and the canonical event range, and issue #1871
+/// item A2 requires those values to be *checkable against the source Store*.
+/// Comparing the declared range with the number of records this crate is about
+/// to write would compare a value with its own shadow and prove nothing about
+/// the source, so the expected interval is read from the other side: the
+/// store-issued monotonic `event_ordinal` on the source's own `CanonicalEvent`
+/// records, and the ordering positions those same records consumed.
+///
+/// Two independently recorded positions meet here. The declared side comes from
+/// the source's `ordering_head` rows and its declared interval; the expected side
+/// comes from the `canonical_event` rows of the same capture. Neither is derived
+/// from the other, so a source that declares a range or a head its own events
+/// contradict is refused before an archive is assembled.
+///
+/// Each record is decoded as the store owner's [`CanonicalEvent`] and run
+/// through that owner's existing `validate`, which re-proves every ordering-link
+/// hash over the event's own payload digest and ordinal. Nothing is recomputed
+/// here to stand in for owner-issued material: a record that does not carry the
+/// store's own canonical event cannot be evidence for the fence at all, so it
+/// refuses rather than being read for an ordinal.
+fn prove_event_range_against_store(
+    snapshot: &CoherentSourceExport,
+    orderings: &BTreeMap<&OrderingScopeId, u64>,
+) -> Result<(), BackupError> {
+    let mut observed: Option<(u64, u64)> = None;
+    for record in &snapshot.events {
+        let Ok(event) = serde_json::from_value::<CanonicalEvent>(record.payload.clone()) else {
+            return Err(BackupError::InvalidField {
+                field: "ecxf.event_record",
+                reason: "event record does not carry the source store's own canonical event",
+            });
+        };
+        event.validate().map_err(BackupError::Store)?;
+        if !event.state_fence.is_compatible_with(&snapshot.state_fence) {
+            return Err(BackupError::FenceMismatch {
+                subject: format!("event {} state fence", event.event_id.as_str()),
+            });
+        }
+        // A canonical event records the ordering position its own transition
+        // consumed. If that position is past the head the source declared for
+        // this view, the declared Ordering Head does not describe the events the
+        // export delivers, so the view spans a moment later than its own fence.
+        for link in &event.ordering_links {
+            let Some(declared) = orderings.get(&link.ordering_scope) else {
+                return Err(BackupError::FenceMismatch {
+                    subject: format!(
+                        "event {} ordering scope {} absent from the declared ordering heads",
+                        event.event_id.as_str(),
+                        link.ordering_scope.as_str()
+                    ),
+                });
+            };
+            if link.ordering_sequence > *declared {
+                return Err(BackupError::FenceMismatch {
+                    subject: format!(
+                        "event {} ordering head {}",
+                        event.event_id.as_str(),
+                        link.ordering_scope.as_str()
+                    ),
+                });
+            }
+        }
+        observed = Some(match observed {
+            Some((first, last)) => (
+                first.min(event.event_ordinal),
+                last.max(event.event_ordinal),
+            ),
+            None => (event.event_ordinal, event.event_ordinal),
+        });
+    }
+    // An export that observes no event declares no interval, which stays
+    // representable instead of becoming a fabricated bound.
+    if snapshot.event_range.first_sequence != observed.map(|(first, _)| first) {
+        return Err(BackupError::FenceMismatch {
+            subject: "export event range first sequence".to_owned(),
+        });
+    }
+    if snapshot.event_range.last_sequence != observed.map(|(_, last)| last) {
+        return Err(BackupError::FenceMismatch {
+            subject: "export event range last sequence".to_owned(),
+        });
+    }
+    if snapshot.event_range.count != snapshot.events.len() as u64 {
+        return Err(BackupError::FenceMismatch {
+            subject: "export event range count".to_owned(),
+        });
     }
     Ok(())
 }
