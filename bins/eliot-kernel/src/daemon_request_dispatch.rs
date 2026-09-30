@@ -228,6 +228,20 @@ const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
 /// evidence, so the selector itself grants no authority.
 pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automation";
 
+/// Authenticated named-read selector serving the complete owner-issued
+/// `UserAutomation` preflight projection (issue #1779, I11.12).
+///
+/// This is the exact string the Kernel core contract already publishes as
+/// `USER_AUTOMATION_PREFLIGHT_SELECTOR` and the notify client already sends as
+/// its outer frame selector, multiplexing the inner
+/// `GetUserAutomationPreflightProjection` marker. Until this arm existed the
+/// selector fell through every frame predicate and fenced the session, so a
+/// client asked and nothing answered. The arm below serves the projection from
+/// the same canonical owners the run-now path assembles from; it mints no
+/// receipt, publishes no wake, and admits no execution.
+pub(crate) const USER_AUTOMATION_PREFLIGHT_SELECTOR: &str =
+    eliot_kernel_core::user_automation::USER_AUTOMATION_PREFLIGHT_SELECTOR;
+
 /// Authenticated daemon operation that drives the Kernel-owned I5.11
 /// `canonical_store` storage-replacement coordinator (issue #1872).
 ///
@@ -2016,6 +2030,41 @@ struct UserAutomationOperatorIntent {
     idempotency_key: String,
 }
 
+/// Closed named-read route for one complete `UserAutomation` preflight
+/// projection (issue #1779, I11.12).
+///
+/// The shape mirrors [`UserAutomationOperatorRoute`]: the outer `operation` is
+/// the admitted frame selector the front door routed on, `request_identity` is
+/// the front-door-authenticated identity the frame router copied verbatim, and
+/// `payload` is the caller's closed read request. The inner payload repeats
+/// the exact fields the notify client sends — including the `trigger` and
+/// `mode` it read from its own invocation — so the owner can compare each one
+/// with its live state instead of merely receiving an automation identity.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationPreflightReadRoute {
+    operation: String,
+    /// Front-door-authenticated request identity copied by the frame router.
+    request_identity: RequestIdentity,
+    payload: UserAutomationPreflightReadPayload,
+}
+
+/// Closed `GetUserAutomationPreflightProjection` read request.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationPreflightReadPayload {
+    operation: String,
+    context: eliot_contracts::RequestMetadata,
+    state_fence: StateFence,
+    automation_id: String,
+    automation_revision: String,
+    occurrence_id: String,
+    trigger: eliot_kernel_core::user_automation::UserAutomationTrigger,
+    mode: eliot_kernel_core::user_automation::UserAutomationExecutionMode,
+}
+
 #[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3003,6 +3052,29 @@ impl KernelComposition {
                 .validate()
                 .map_err(|_| TransportError::PeerIdentityUnavailable)?;
             let value = Box::pin(self.user_automation_operator_operation(
+                session,
+                request_id.clone(),
+                payload,
+            ))
+            .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == USER_AUTOMATION_PREFLIGHT_SELECTOR {
+            // The complete preflight projection is a front-door read, not a
+            // daemon-module operation: the principal comes from the
+            // authenticated peer, the State Fence from the session, and every
+            // projection member from the canonical owner that attests it. No
+            // other daemon operation is reachable from this branch, and the
+            // branch mints nothing: no receipt, no wake, no execution.
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let value = Box::pin(self.user_automation_preflight_projection_operation(
                 session,
                 request_id.clone(),
                 payload,
@@ -5335,6 +5407,417 @@ impl KernelComposition {
             )
             .map_err(|_| TransportError::SessionFenced)?;
         serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Serves one complete owner-issued `UserAutomation` preflight projection
+    /// (issue #1779 W4/A3, I11.12).
+    ///
+    /// The client already asks for this named read and the projection type
+    /// already knows how to assemble itself; what was missing was the
+    /// Kernel-side production owner that serves it. This route is that owner.
+    /// Every one of the fifteen members comes from the owner that attests it:
+    /// the immutable revision and the live configuration pointer from the
+    /// canonical owner readback, the persisted invocation lineage from the
+    /// Store, the complete config snapshot from the B-owned policy owner, the
+    /// source verification receipt from the committed `RunNow` Store receipt,
+    /// the execution projection from the Durable Job/history `Status` owner,
+    /// the normalization envelope the revision row retained, the Skill and
+    /// Tool Definition revisions the revision declares, and delivery
+    /// capability from the named platform observation. The observed provider
+    /// fingerprint stays absent because this boundary issues no provider call
+    /// before preflight — which is exactly what deterministic mode requires —
+    /// and `UserAutomationPreflightProjection::assemble` refuses every other
+    /// gap instead of letting it through. A member no reachable owner attests
+    /// is a typed refusal naming that owner, never a default.
+    #[cfg(windows)]
+    async fn user_automation_preflight_projection_operation(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let route: UserAutomationPreflightReadRoute =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if route.operation != USER_AUTOMATION_PREFLIGHT_SELECTOR
+            || route.payload.operation
+                != eliot_kernel_core::user_automation::USER_AUTOMATION_PREFLIGHT_OPERATION
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let identity = route.request_identity;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+            || route.payload.context != identity.request.metadata
+            || route.payload.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let principal = authenticated_user_automation_principal(session)?;
+        // Boxed because the join below is a large composed future; the box
+        // keeps this arm's own future small without changing what it awaits.
+        match Box::pin(self.read_user_automation_preflight_projection(
+            session,
+            &principal,
+            &route.payload,
+        ))
+        .await
+        {
+            Ok(projection) => {
+                let value =
+                    serde_json::to_value(projection).map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "status": "known",
+                    "value": value,
+                    "recovery": null,
+                }))
+            }
+            Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+        }
+    }
+
+    /// Joins the live owner readbacks behind one preflight projection.
+    ///
+    /// The join order is fixed: bind the current owner revision and its live
+    /// configuration pointer, then the persisted invocation lineage, then the
+    /// policy, execution, receipt, and normalization owners, and only then
+    /// assemble. A scheduled occurrence carries no committed `RunNow`
+    /// provenance, so it has no committed `RunNow` source receipt either, and
+    /// it is refused here by name rather than answered from an unrelated
+    /// receipt. A `blocked_config` pointer needs its owner-issued failure
+    /// projection, which only the Store-gateway run-now join can read, so it
+    /// is refused here by name rather than answered without its failure. Both
+    /// refusals name the missing owner instead of substituting a member.
+    #[cfg(windows)]
+    async fn read_user_automation_preflight_projection(
+        &self,
+        session: &Session,
+        principal: &str,
+        read: &UserAutomationPreflightReadPayload,
+    ) -> Result<
+        eliot_kernel_core::user_automation::UserAutomationPreflightProjection,
+        UserAutomationRuntimeError,
+    > {
+        use eliot_kernel_core::user_automation::UserAutomationConfigurationState;
+
+        let unavailable = UserAutomationRuntimeError::Unavailable;
+        let fence = session.module_generation.state_fence.clone();
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            unavailable("canonical UserAutomation Store owner is unavailable".to_owned())
+        })?;
+        let (owner, invocation) = self
+            .user_automation_preflight_occurrence(&gateway, principal, read, &fence, unavailable)
+            .await?;
+        // The source verification receipt is the committed `RunNow` Store
+        // receipt's reconciliation envelope, proved under the provenance the
+        // persisted invocation carries. A scheduled occurrence never committed
+        // one, so there is no owner-issued receipt to serve here; that is a
+        // named missing owner, not a receipt this route may borrow from
+        // another occurrence.
+        let (source_receipt, provenance) = self
+            .user_automation_preflight_source_receipt(&gateway, &invocation, &fence)
+            .await?;
+        let source_identity = OperationIdentity {
+            operation_id: provenance.operation_id.clone(),
+            idempotency_key: provenance.idempotency_key.clone(),
+            canonical_request_hash: provenance.canonical_request_hash.clone(),
+        };
+        let provenance_context = provenance.request_metadata.clone();
+
+        let config_snapshot = self.read_user_automation_policy_snapshot(&fence).await?;
+        let execution = self
+            .user_automation_preflight_execution_view(
+                &gateway,
+                principal,
+                &owner,
+                &provenance_context,
+                &source_identity,
+                &fence,
+            )
+            .await?;
+        if execution.history_query_ref != owner.revision.execution_history_query_ref {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        // The blocked failure projection is owner-issued by the Store-gateway
+        // run-now join, which this binary cannot reach without sealing a
+        // canonical Store transition for a read. A `blocked_config` pointer
+        // therefore cannot be answered here; it is refused by name rather than
+        // served without its failure. Every other state assembles with no
+        // failure, and assembly itself refuses a failure where none belongs.
+        let failure = match owner.current_configuration_state {
+            UserAutomationConfigurationState::BlockedConfig => {
+                return Err(unavailable(
+                    "the current owner configuration state is blocked_config but its \
+                     owner-issued failure projection is readable only from the Store-gateway \
+                     run-now owner, so no preflight projection can be reported"
+                        .to_owned(),
+                ));
+            }
+            _ => None,
+        };
+        // The normalization envelope is the retained bytes the revision row
+        // carries, selected by the content-derived identity the immutable
+        // revision names — the same selection the run-now assembler makes —
+        // and assembly re-checks that those bytes name the compiled occurrence
+        // digest. A row that retained none leaves the occurrence unadmitted by
+        // name instead of receiving a substituted receipt.
+        let normalization_receipts = Self::user_automation_preflight_normalization_receipts(
+            &owner.revision,
+            owner.normalization_receipt.as_ref(),
+            unavailable,
+        )?;
+        // Live evidence below the Kernel decoding boundary. This read issues
+        // no provider call before preflight, so the only honest provider
+        // observation is none — which is exactly what deterministic mode
+        // requires and what assembly enforces for every other mode through the
+        // revision's own provider policy. The Tool Definition set is the exact
+        // closure the canonical owner revision declares, repeated here so
+        // assembly can compare the two instead of trusting this member.
+        let evidence = eliot_kernel_core::user_automation::UserAutomationPreflightEvidence {
+            observed_provider_fingerprint: None,
+            trusted_tool_definition_refs: owner.revision.trusted_tool_definition_refs.clone(),
+            delivery_available: Self::user_automation_preflight_delivery_capability(
+                &owner.revision,
+            ),
+            failure,
+        };
+        eliot_kernel_core::user_automation::UserAutomationPreflightProjection::assemble(
+            &eliot_kernel_core::user_automation::UserAutomationPreflightAssembly {
+                revision: &owner.revision,
+                configuration_state: owner.current_configuration_state,
+                config_snapshot: &config_snapshot,
+                source_receipt: &source_receipt,
+                normalization_receipts: &normalization_receipts,
+                execution: &execution,
+                invocation: &invocation,
+                request_metadata: &read.context,
+                evidence: &evidence,
+            },
+        )
+        .map_err(|error| {
+            UserAutomationRuntimeError::UnknownOutcome(format!(
+                "UserAutomation preflight assembly is not admitted: {error}"
+            ))
+        })
+    }
+
+    /// Reads and proves the owner revision and the persisted occurrence.
+    ///
+    /// Both readbacks are joined to the REQUEST, not merely to each other: the
+    /// owner snapshot must name the requested automation, revision and mode
+    /// under the requesting principal and the session fence, and the persisted
+    /// invocation must recompute to the requested occurrence identity while
+    /// agreeing with that owner on revision, trigger, mode, principal, work
+    /// scope and workdir. A disagreement on any axis is an identity conflict
+    /// rather than a projection of whichever record happened to be read.
+    #[cfg(windows)]
+    async fn user_automation_preflight_occurrence(
+        &self,
+        gateway: &eliot_kernel_service::KernelStoreGateway,
+        principal: &str,
+        read: &UserAutomationPreflightReadPayload,
+        fence: &StateFence,
+        unavailable: fn(String) -> UserAutomationRuntimeError,
+    ) -> Result<
+        (
+            eliot_kernel_service::UserAutomationOwnerSnapshot,
+            eliot_kernel_core::user_automation::UserAutomationInvocation,
+        ),
+        UserAutomationRuntimeError,
+    > {
+        let lookup = eliot_kernel_service::UserAutomationOwnerLookup {
+            automation_id: read.automation_id.clone(),
+            requested_revision: read.automation_revision.clone(),
+            authenticated_principal: principal.to_owned(),
+            state_fence: fence.clone(),
+        };
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(unavailable)?;
+        if owner.automation_id != read.automation_id
+            || owner.revision.revision != read.automation_revision
+            || owner.revision.automation_id != read.automation_id
+            || owner.revision.mode != read.mode
+            || owner.authenticated_principal != principal
+            || owner.state_fence != *fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let invocation = gateway
+            .read_user_automation_invocation(fence, &read.automation_id, &read.occurrence_id)
+            .await
+            .map_err(unavailable)?;
+        let occurrence_id = invocation
+            .occurrence_identity()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        if occurrence_id != read.occurrence_id
+            || invocation.automation_id != owner.revision.automation_id
+            || invocation.automation_revision != owner.revision.revision
+            || invocation.trigger != read.trigger
+            || invocation.mode != owner.revision.mode
+            || invocation.principal_ref != owner.authenticated_principal
+            || invocation.work_scope_ref != owner.revision.work_scope.scope_id
+            || invocation.workdir_ref != owner.revision.workdir_ref
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok((owner, invocation))
+    }
+
+    /// Reads the Durable Job / history projection for this occurrence.
+    ///
+    /// The view reuses the committed occurrence identity the run-now provenance
+    /// already proved, and the leg is the closed `Status` operation, so it
+    /// issues no transition and mints no canonical identity: a read that sealed
+    /// a write would turn a projection request into a mutation.
+    #[cfg(windows)]
+    async fn user_automation_preflight_execution_view(
+        &self,
+        gateway: &eliot_kernel_service::KernelStoreGateway,
+        principal: &str,
+        owner: &eliot_kernel_service::UserAutomationOwnerSnapshot,
+        provenance_context: &eliot_contracts::RequestMetadata,
+        source_identity: &OperationIdentity,
+        fence: &StateFence,
+    ) -> Result<
+        eliot_kernel_core::user_automation::UserAutomationExecutionProjection,
+        UserAutomationRuntimeError,
+    > {
+        let unavailable = UserAutomationRuntimeError::Unavailable;
+        let sealed = eliot_kernel_service::UserAutomationServiceRequest {
+            context: provenance_context.clone(),
+            authenticated_principal: principal.to_owned(),
+            identity: source_identity.clone(),
+            intent: eliot_kernel_core::UserAutomationOperatorIntent {
+                intent_id: format!(
+                    "{}:preflight-owner-execution-view",
+                    source_identity.operation_id.as_str()
+                ),
+                principal_ref: principal.to_owned(),
+                state_fence: fence.clone(),
+                operation: eliot_kernel_core::UserAutomationOperation::Status {
+                    automation_id: owner.automation_id.clone(),
+                },
+            },
+        };
+        gateway
+            .read_user_automation_owner_execution_view(&sealed, &owner.automation_id)
+            .await
+            .map_err(unavailable)
+    }
+
+    /// Resolves the committed `RunNow` source receipt for one persisted
+    /// occurrence.
+    ///
+    /// The receipt is the Store owner's own record for the exact operation the
+    /// invocation's run-now provenance names, so the lookup key is derived from
+    /// that provenance rather than from the request. An occurrence with no
+    /// committed run-now provenance has no owner-issued source receipt to serve
+    /// and is refused by name; borrowing a receipt from another occurrence would
+    /// attest this occurrence with another's evidence.
+    ///
+    /// The provenance is returned alongside the envelope because the run-now
+    /// join proves the receipt's own request binding against the provenance the
+    /// invocation committed, and this read performs that same proof rather than
+    /// accepting the envelope on identity alone.
+    #[cfg(windows)]
+    async fn user_automation_preflight_source_receipt(
+        &self,
+        gateway: &eliot_kernel_service::KernelStoreGateway,
+        invocation: &eliot_kernel_core::user_automation::UserAutomationInvocation,
+        fence: &StateFence,
+    ) -> Result<
+        (
+            eliot_receipts::ReceiptEnvelope,
+            eliot_kernel_core::user_automation::UserAutomationInvocationProvenance,
+        ),
+        UserAutomationRuntimeError,
+    > {
+        let provenance = invocation.require_run_now_provenance(fence).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "UserAutomation preflight source receipt requires committed run-now provenance: {error}"
+            ))
+        })?;
+        let identity = OperationIdentity {
+            operation_id: provenance.operation_id.clone(),
+            idempotency_key: provenance.idempotency_key.clone(),
+            canonical_request_hash: provenance.canonical_request_hash.clone(),
+        };
+        let receipt = ensure_user_automation_store_receipt(gateway, fence, &identity).await?;
+        let envelope = receipt
+            .require_reconciliation_envelope()
+            .cloned()
+            .map_err(|error| {
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "canonical UserAutomation source receipt envelope is not retained: {error}"
+                ))
+            })?;
+        // The envelope must be THIS provenance's receipt, proven against the
+        // envelope's own request binding and work scope — the same joint the
+        // run-now join makes. An envelope that merely exists for some other
+        // operation, or one whose request body differs from the committed
+        // provenance, is not this occurrence's source evidence.
+        if envelope.core.request.metadata != provenance.request_metadata
+            || envelope.core.work_scope.product_id != provenance.request_metadata.product_id
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok((envelope, provenance.clone()))
+    }
+
+    /// Selects the retained normalization envelopes the immutable revision names.
+    ///
+    /// Selection is by the content-derived receipt identity the revision declares,
+    /// never by position or by trusting the caller, and an empty selection is a
+    /// refusal rather than a default: a row that retained no matching envelope
+    /// leaves the compiled occurrence set self-asserted, which is exactly the
+    /// state the occurrence must not be admitted from.
+    #[cfg(windows)]
+    fn user_automation_preflight_normalization_receipts(
+        revision: &eliot_kernel_core::user_automation::UserAutomationRevision,
+        retained: Option<&eliot_receipts::ReceiptEnvelope>,
+        unavailable: fn(String) -> UserAutomationRuntimeError,
+    ) -> Result<Vec<eliot_receipts::ReceiptEnvelope>, UserAutomationRuntimeError> {
+        let declared = &revision.schedule.normalization_receipt;
+        let selected = retained
+            .filter(|envelope| {
+                envelope.identity.receipt_id.as_str() == declared.receipt_id.as_str()
+            })
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(unavailable(
+                "no owner-issued schedule normalization receipt envelope is retained under this \
+                 State Fence for the receipt identity the immutable revision names, so the \
+                 compiled occurrence set stays self-asserted and the occurrence is not admitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(selected)
+    }
+
+    /// Observes whether the declared delivery target is currently capable.
+    ///
+    /// This is the same named observation the run-now assembler applies: of
+    /// the canonical channels only native toast is gated on a live interactive
+    /// user session, so a declared toast target with no session behind it
+    /// reports the capability it actually observed instead of defaulting to
+    /// capable. The rule lives in one sentence here rather than behind a
+    /// second helper because the owner it observes — the platform session —
+    /// is the same one.
+    #[cfg(windows)]
+    fn user_automation_preflight_delivery_capability(
+        revision: &eliot_kernel_core::user_automation::UserAutomationRevision,
+    ) -> bool {
+        !revision
+            .delivery_target
+            .channels
+            .contains(&eliot_kernel_core::user_automation::DeliveryChannel::NativeToast)
+            || eliot_platform_windows::interactive_user_session_available()
     }
 
     #[cfg(windows)]
