@@ -11,6 +11,8 @@
 //! fence and payload digest are checked against the journal row, while its
 //! contents remain outside this owner's semantics.
 
+use eliot_contracts::{EpochId, ResourceGeneration};
+use eliot_runtime_contracts::{CapacityBottleneck, PermitTerminalDisposition};
 use serde::{Deserialize, Serialize};
 
 use crate::OrsError;
@@ -801,4 +803,399 @@ fn text(value: &str, field: &'static str) -> Result<(), OrsError> {
         });
     }
     Ok(())
+}
+
+// ── ORS capacity-permit durable fate (issue #1679, W5) ─────────────────────
+//
+// A permit whose life can survive an await, cross a process/store boundary or
+// outlive the issuing frame needs durable owner evidence. A local in-memory
+// counter dies on restart, an in-memory ledger used as durable reconciliation
+// is forbidden, and ownership can never be inferred from a live process, PID,
+// queue entry or surviving counter. Fate rows therefore travel through the
+// existing journal ports below, and restart derives availability only from a
+// denominator-checked readback, never from a reset counter.
+//
+// How the six states map onto the existing ports (no port was extended: every
+// state below is already expressible, so none is added):
+//
+// - `IssuedHeld` and `ReleaseRequested` are journal intent rows: a state claim
+//   the owner must still act on. Each fate carries its own phase operation
+//   (`ors_permit_fate/<fate>`), so every transition occupies a distinct slot
+//   in the journal's unique operation index.
+// - `Released` is the terminal row answering the fate slot. Exactly-once
+//   release falls out of the existing mechanics: the first release appends
+//   under compare-and-append, and an exact replay observes the same durable
+//   row (receipt `replayed`) instead of returning capacity a second time.
+// - `LeakedOrUnknown` and `StaleOwnerReconciliationRequired` are intent rows
+//   recording doubt. Both keep the capacity excluded until owner
+//   reconciliation supplies a terminal disposition.
+// - "not issued" is the absence of any fate row for the permit identity: the
+//   reconciler returns no disposition, which holds no capacity.
+//
+// The store adapter (STITCH: no production caller yet) persists one
+// [`OrsPermitFateEvidence`] per transition with
+// [`OrsPermitFateEvidence::journal_phase_operation`] as the operation phase
+// and [`OrsPermitFateEvidence::binding_digest`] as both the request and the
+// body digest, then restarts through [`reconcile_permit_fate_at_restart`].
+
+/// Stable fate-row schema tag carried by every permit-fate journal payload.
+pub const ORS_PERMIT_FATE_SCHEMA: &str = "ors-permit-fate-v1";
+/// Phase-operation namespace for permit-fate rows. The full phase is
+/// `ors_permit_fate/<fate>`, so each lifecycle transition binds a distinct
+/// slot in the journal's unique operation index.
+pub const ORS_PERMIT_FATE_PHASE_PREFIX: &str = "ors_permit_fate";
+
+/// Durable lifecycle fate of one ORS capacity permit.
+///
+/// This is not a second copy of the frozen
+/// [`PermitTerminalDisposition`](eliot_runtime_contracts::PermitTerminalDisposition):
+/// that vocabulary covers terminal release records only, while this enum
+/// covers the whole durable lifecycle including the non-terminal
+/// issued/held and release-requested states. [`OrsPermitFate::terminal_disposition`]
+/// projects the terminal fates onto the contract vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrsPermitFate {
+    /// Issued and currently held; the capacity stays accounted.
+    IssuedHeld,
+    /// The holder asked for release; the owner has not durably completed it.
+    ReleaseRequested,
+    /// Durably released exactly once; terminal and safe to forget.
+    Released,
+    /// Possibly leaked or otherwise unknown; excluded until the owner
+    /// reconciles it to a terminal disposition.
+    LeakedOrUnknown,
+    /// The issuing owner is stale; excluded until the current owner
+    /// reconciles it. Never auto-released and never restored by counter
+    /// reset.
+    StaleOwnerReconciliationRequired,
+}
+
+impl OrsPermitFate {
+    /// Returns the exact wire spelling bound into journal phase operations.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IssuedHeld => "issued_held",
+            Self::ReleaseRequested => "release_requested",
+            Self::Released => "released",
+            Self::LeakedOrUnknown => "leaked_or_unknown",
+            Self::StaleOwnerReconciliationRequired => "stale_owner_reconciliation_required",
+        }
+    }
+
+    /// Returns `true` for the one terminal fate. Doubt fates are not
+    /// terminal: leaked/unknown and stale-owner rows still require owner
+    /// reconciliation before the capacity may be forgotten.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Released)
+    }
+
+    /// Checks one durable fate step. A genesis row must be `IssuedHeld`: "not
+    /// issued" is the absence of rows, never a recorded state. `Released` has
+    /// no successor, and doubt fates exit only through owner reconciliation
+    /// (`Released`, or confirmed doubt), never back to held and never by
+    /// silent reissue.
+    #[must_use]
+    pub const fn allowed_from(self, prior: Option<Self>) -> bool {
+        match (self, prior) {
+            (Self::IssuedHeld, None) => true,
+            (
+                Self::ReleaseRequested
+                | Self::Released
+                | Self::LeakedOrUnknown
+                | Self::StaleOwnerReconciliationRequired,
+                Some(Self::IssuedHeld),
+            ) => true,
+            (
+                Self::Released | Self::LeakedOrUnknown | Self::StaleOwnerReconciliationRequired,
+                Some(Self::ReleaseRequested),
+            ) => true,
+            (
+                Self::Released | Self::StaleOwnerReconciliationRequired,
+                Some(Self::LeakedOrUnknown),
+            ) => true,
+            (
+                Self::Released | Self::LeakedOrUnknown,
+                Some(Self::StaleOwnerReconciliationRequired),
+            ) => true,
+            _ => false,
+        }
+    }
+
+    /// Projects a terminal fate onto the frozen contract release vocabulary.
+    /// Non-terminal fates have no contract disposition yet: they are still
+    /// owned capacity, not release records.
+    #[must_use]
+    pub const fn terminal_disposition(self) -> Option<PermitTerminalDisposition> {
+        match self {
+            Self::Released => Some(PermitTerminalDisposition::Released),
+            Self::LeakedOrUnknown => Some(PermitTerminalDisposition::LeakSuspected),
+            Self::StaleOwnerReconciliationRequired => Some(PermitTerminalDisposition::StaleOwner),
+            Self::IssuedHeld | Self::ReleaseRequested => None,
+        }
+    }
+}
+
+/// Durable owner evidence for one permit-fate transition.
+///
+/// Every field is load-bearing identity or binding, mirroring the
+/// owner-issued permit pattern (`control_reserve.rs`, read-only): the permit
+/// and operation identities, the exact bottleneck, the issuing owner
+/// generation, the typed Authority Epoch and the profile revision the permit
+/// was issued under. A fate row that changes any of them names a different
+/// permit and never advances this one's history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrsPermitFateEvidence {
+    /// Owner-minted permit identity; the exactly-once release key.
+    pub permit_id: String,
+    /// Durable operation identity the permit was granted for.
+    pub operation_id: String,
+    /// Owner the permit was granted to.
+    pub owner: String,
+    /// Exact bottleneck dimension holding the capacity.
+    pub bottleneck: CapacityBottleneck,
+    /// Issuing owner generation the permit is bound to.
+    pub owner_generation: ResourceGeneration,
+    /// Typed Authority Epoch the permit is bound to.
+    pub authority_epoch: EpochId,
+    /// Profile revision the permit was issued under.
+    pub profile_revision: String,
+    /// The lifecycle state this row records.
+    pub fate: OrsPermitFate,
+}
+
+impl OrsPermitFateEvidence {
+    /// Validates the bounded owner-evidence text. The typed members
+    /// (`bottleneck`, `owner_generation`, `authority_epoch`, `fate`) are
+    /// validated by their own constructors and wire decoders, so only the
+    /// free-text bindings are checked here.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        text(&self.permit_id, "ors_permit_fate.permit_id")?;
+        text(&self.operation_id, "ors_permit_fate.operation_id")?;
+        text(&self.owner, "ors_permit_fate.owner")?;
+        text(&self.profile_revision, "ors_permit_fate.profile_revision")?;
+        Ok(())
+    }
+
+    /// Returns the journal phase operation binding this fate row into the
+    /// unique operation index: `ors_permit_fate/<fate>`. The store adapter
+    /// pairs it with the permit's durable operation identity as the journal
+    /// transaction, so each transition occupies a distinct, replay-safe slot.
+    #[must_use]
+    pub fn journal_phase_operation(&self) -> String {
+        format!("{ORS_PERMIT_FATE_PHASE_PREFIX}/{}", self.fate.as_str())
+    }
+
+    /// Computes the canonical digest binding this exact fate row. The store
+    /// adapter records it as both the request and the body digest of the
+    /// journal operation, so a changed permit, owner, generation, epoch,
+    /// profile or fate cannot be mistaken for this row.
+    pub fn binding_digest(&self) -> Result<String, OrsError> {
+        self.validate()?;
+        let material = OrsPermitFateDigestMaterial {
+            domain: "eliot.ors.permit-fate",
+            version: RESTORE_JOURNAL_SCHEMA_VERSION,
+            schema: ORS_PERMIT_FATE_SCHEMA,
+            permit_id: &self.permit_id,
+            operation_id: &self.operation_id,
+            owner: &self.owner,
+            bottleneck: self.bottleneck,
+            owner_generation: self.owner_generation,
+            authority_epoch: &self.authority_epoch,
+            profile_revision: &self.profile_revision,
+            fate: self.fate,
+        };
+        canonical_digest(&material)
+    }
+
+    /// Checks that a journal operation carries exactly this fate row: the
+    /// fate phase operation and both digests must equal this row's binding.
+    /// Anything else is a different row, never this fate.
+    pub fn matches_journal_operation(
+        &self,
+        operation: &RestoreJournalOperation,
+    ) -> Result<bool, OrsError> {
+        let digest = self.binding_digest()?;
+        Ok(operation.phase_operation == self.journal_phase_operation()
+            && operation.request_digest == digest
+            && operation.body_digest == digest)
+    }
+}
+
+#[derive(Serialize)]
+struct OrsPermitFateDigestMaterial<'a> {
+    domain: &'static str,
+    version: u32,
+    schema: &'static str,
+    permit_id: &'a str,
+    operation_id: &'a str,
+    owner: &'a str,
+    bottleneck: CapacityBottleneck,
+    owner_generation: ResourceGeneration,
+    authority_epoch: &'a EpochId,
+    profile_revision: &'a str,
+    fate: OrsPermitFate,
+}
+
+/// The current owner's view a restart reconciles durable fate against.
+///
+/// This is live owner state supplied by the restarting owner, never a
+/// caller assertion and never a reset counter: reconciliation compares each
+/// durably observed fate row against exactly this view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrsPermitRestartView<'a> {
+    /// Current owner identity.
+    pub owner: &'a str,
+    /// Current issuing owner generation.
+    pub owner_generation: ResourceGeneration,
+    /// Current typed Authority Epoch.
+    pub authority_epoch: &'a EpochId,
+    /// Current profile revision.
+    pub profile_revision: &'a str,
+}
+
+impl OrsPermitRestartView<'_> {
+    /// Validates the bounded view text. Typed members are validated by their
+    /// own constructors.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        text(self.owner, "ors_permit_fate_restart.owner")?;
+        text(self.profile_revision, "ors_permit_fate_restart.profile_revision")?;
+        Ok(())
+    }
+}
+
+/// What restart concluded about one permit's durable fate.
+///
+/// Every outcome except `TerminalReleased` keeps the capacity excluded from
+/// availability: restart never restores capacity by resetting a local
+/// counter, and unknown or stale ownership stays excluded until owner
+/// reconciliation supplies a terminal disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrsPermitRestartOutcome {
+    /// Issued and held under the current owner: stays accounted.
+    RetainHeld,
+    /// Release was requested but never durably completed: the owner must
+    /// still complete the exactly-once release; stays excluded meanwhile.
+    ReleaseRequestedPending,
+    /// Durably released: safe to forget.
+    TerminalReleased,
+    /// Possibly leaked or unknown: stays excluded until the owner reconciles
+    /// it to a terminal disposition.
+    ExcludedUnknownOrLeaked,
+    /// Owner, generation, epoch or profile moved: reconcile against the
+    /// current owner, release exactly once, and keep it excluded meanwhile.
+    StaleOwnerRequiresReconciliation,
+}
+
+/// One permit's restart disposition, proved from durable journal fate rows.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OrsPermitRestartDisposition {
+    /// Owner-minted permit identity reconciled.
+    pub permit_id: String,
+    /// Durable operation identity reconciled.
+    pub operation_id: String,
+    /// Exact bottleneck dimension the outcome applies to.
+    pub bottleneck: CapacityBottleneck,
+    /// What restart concluded.
+    pub outcome: OrsPermitRestartOutcome,
+}
+
+/// Reconciles one permit's durably observed fate history against the current
+/// owner view after restart.
+///
+/// `history` is the permit's fate rows in journal sequence order, read back
+/// from durable state under a denominator-checked readback. An empty history
+/// is "not issued": returns `None` and holds no capacity. A non-empty history
+/// must agree on every identity field and follow the legal fate chain;
+/// otherwise reconciliation fails instead of guessing.
+///
+/// Staleness is exact: owner, owner generation, Authority Epoch tuple and
+/// profile revision must all match the current view. A durably `Released` row
+/// stays terminal across an owner change (the capacity was already returned
+/// exactly once); any other fate under a stale owner requires reconciliation
+/// and stays excluded. A recorded stale-owner or leaked/unknown fate stays
+/// excluded even when the rest of the row matches: doubt exits only through
+/// owner reconciliation, never through a counter reset.
+///
+/// # Errors
+///
+/// Returns [`OrsError::InvalidField`] for malformed evidence or view text, or
+/// [`OrsError::IntegrityProblem`] when the history mixes permit identities or
+/// breaks the legal fate chain.
+pub fn reconcile_permit_fate_at_restart(
+    current: &OrsPermitRestartView<'_>,
+    history: &[OrsPermitFateEvidence],
+) -> Result<Option<OrsPermitRestartDisposition>, OrsError> {
+    current.validate()?;
+    let Some(first) = history.first() else {
+        return Ok(None);
+    };
+    first.validate()?;
+    let mut prior: Option<OrsPermitFate> = None;
+    for evidence in history {
+        evidence.validate()?;
+        if evidence.permit_id != first.permit_id
+            || evidence.operation_id != first.operation_id
+            || evidence.owner != first.owner
+            || evidence.bottleneck != first.bottleneck
+            || evidence.owner_generation != first.owner_generation
+            || evidence.authority_epoch != first.authority_epoch
+            || evidence.profile_revision != first.profile_revision
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_permit_fate",
+                reason: "fate history mixes permit identities".to_owned(),
+            });
+        }
+        if !evidence.fate.allowed_from(prior) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_permit_fate",
+                reason: "fate history breaks the legal permit lifecycle".to_owned(),
+            });
+        }
+        prior = Some(evidence.fate);
+    }
+    let Some(last) = history.last() else {
+        return Ok(None);
+    };
+    let stale = last.owner != current.owner
+        || last.owner_generation != current.owner_generation
+        || !last
+            .authority_epoch
+            .is_same_authority(current.authority_epoch)
+        || last.profile_revision != current.profile_revision;
+    let outcome = if stale {
+        // A durable release already returned the capacity exactly once, so it
+        // survives an owner change. Everything else stays excluded until the
+        // current owner reconciles it.
+        if last.fate == OrsPermitFate::Released {
+            OrsPermitRestartOutcome::TerminalReleased
+        } else {
+            OrsPermitRestartOutcome::StaleOwnerRequiresReconciliation
+        }
+    } else {
+        match last.fate {
+            OrsPermitFate::IssuedHeld => OrsPermitRestartOutcome::RetainHeld,
+            OrsPermitFate::ReleaseRequested => {
+                OrsPermitRestartOutcome::ReleaseRequestedPending
+            }
+            OrsPermitFate::Released => OrsPermitRestartOutcome::TerminalReleased,
+            OrsPermitFate::LeakedOrUnknown => {
+                OrsPermitRestartOutcome::ExcludedUnknownOrLeaked
+            }
+            OrsPermitFate::StaleOwnerReconciliationRequired => {
+                OrsPermitRestartOutcome::StaleOwnerRequiresReconciliation
+            }
+        }
+    };
+    Ok(Some(OrsPermitRestartDisposition {
+        permit_id: last.permit_id.clone(),
+        operation_id: last.operation_id.clone(),
+        bottleneck: last.bottleneck,
+        outcome,
+    }))
 }
