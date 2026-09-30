@@ -30,7 +30,11 @@ use eliot_installation::InstallationProfile;
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
-use eliot_platform_windows::profile_supervision::USER_MODE_SUPERVISOR_SWITCH;
+use eliot_platform_windows::profile_supervision::{
+    USER_MODE_RUNEX_EFFECT_ARGUMENT, USER_MODE_RUNEX_EFFECT_SWITCH,
+    USER_MODE_RUNEX_TRANSACTION_ARGUMENT, USER_MODE_RUNEX_TRANSACTION_SWITCH,
+    USER_MODE_SUPERVISOR_SWITCH,
+};
 use host_console_protocol::{Request, Response, write_response};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
@@ -323,9 +327,21 @@ fn main() {
         };
     #[cfg(not(windows))]
     let profile_supervisor_selection: Option<()> = None;
-    if profile_supervisor_selection.is_some() {
+    #[cfg(windows)]
+    let user_mode_runex_operation = if profile_supervisor_selection.is_some() {
         process_args.drain(0..2);
-    }
+        match take_user_mode_runex_operation(&mut process_args) {
+            Ok(operation) => operation,
+            Err(error) => {
+                let _ = writeln!(io::stderr().lock(), "eliot-host: {error}");
+                std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let user_mode_runex_operation: Option<()> = None;
     let bootstrap = if profile_supervisor_selection.is_some() {
         HostLaunchOptions::parse(process_args.clone()).map_err(|error| error.to_string())
     } else {
@@ -357,7 +373,7 @@ fn main() {
     });
     #[cfg(windows)]
     if let Some(profile) = profile_supervisor_selection {
-        let result = run_profile_supervisor(process_args, profile);
+        let result = run_profile_supervisor(process_args, profile, user_mode_runex_operation);
         eliot_host::host_diagnostics::shutdown_event_log_reporting();
         if let Err(error) = result {
             let _ = writeln!(
@@ -633,9 +649,82 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UserModeRunExOperation {
+    transaction_id: PlatformHandle,
+    effect_id: PlatformHandle,
+}
+
+/// Removes the fixed RunEx slots before `HostLaunchOptions` sees the action
+/// bootstrap. Empty or unexpanded placeholders are ordinary LogonTrigger
+/// launches, so they deliberately carry no operation authority and cannot
+/// acknowledge a staged RunEx effect.
+#[cfg(windows)]
+fn take_user_mode_runex_operation(
+    arguments: &mut Vec<OsString>,
+) -> Result<Option<UserModeRunExOperation>, String> {
+    let transaction_switch_count = arguments
+        .iter()
+        .filter(|argument| argument.to_str() == Some(USER_MODE_RUNEX_TRANSACTION_SWITCH))
+        .count();
+    let effect_switch_count = arguments
+        .iter()
+        .filter(|argument| argument.to_str() == Some(USER_MODE_RUNEX_EFFECT_SWITCH))
+        .count();
+    if transaction_switch_count == 0 && effect_switch_count == 0 {
+        return Ok(None);
+    }
+    if transaction_switch_count != 1
+        || effect_switch_count != 1
+        || arguments.first().and_then(|argument| argument.to_str())
+            != Some(USER_MODE_RUNEX_TRANSACTION_SWITCH)
+        || arguments.get(2).and_then(|argument| argument.to_str())
+            != Some(USER_MODE_RUNEX_EFFECT_SWITCH)
+    {
+        return Err("current-user RunEx operation arguments are malformed".to_owned());
+    }
+    let transaction_id = arguments
+        .get(1)
+        .and_then(|argument| argument.to_str())
+        .ok_or_else(|| "current-user RunEx transaction argument is not Unicode".to_owned())?
+        .to_owned();
+    let effect_id = arguments
+        .get(3)
+        .and_then(|argument| argument.to_str())
+        .ok_or_else(|| "current-user RunEx effect argument is not Unicode".to_owned())?
+        .to_owned();
+    arguments.drain(0..4);
+
+    if (transaction_id.is_empty() && effect_id.is_empty())
+        || (transaction_id == USER_MODE_RUNEX_TRANSACTION_ARGUMENT
+            && effect_id == USER_MODE_RUNEX_EFFECT_ARGUMENT)
+    {
+        return Ok(None);
+    }
+    if transaction_id.is_empty()
+        || effect_id.is_empty()
+        || transaction_id == USER_MODE_RUNEX_TRANSACTION_ARGUMENT
+        || effect_id == USER_MODE_RUNEX_EFFECT_ARGUMENT
+    {
+        return Err(
+            "current-user RunEx operation arguments are incomplete or unexpanded".to_owned(),
+        );
+    }
+    let transaction_id = PlatformHandle::new(transaction_id)
+        .map_err(|error| format!("invalid current-user RunEx transaction ID: {error}"))?;
+    let effect_id = PlatformHandle::new(effect_id)
+        .map_err(|error| format!("invalid current-user RunEx effect ID: {error}"))?;
+    Ok(Some(UserModeRunExOperation {
+        transaction_id,
+        effect_id,
+    }))
+}
+
+#[cfg(windows)]
 fn run_profile_supervisor(
     arguments: Vec<OsString>,
     profile: InstallationProfile,
+    runex_operation: Option<UserModeRunExOperation>,
 ) -> Result<(), HostError> {
     use std::sync::atomic::Ordering;
 
@@ -647,6 +736,11 @@ fn run_profile_supervisor(
             "current-user supervisor handoff requires UserMode or PortableDev".to_owned(),
         ));
     }
+    if runex_operation.is_some() && profile != InstallationProfile::UserMode {
+        return Err(HostError::ProcessContour(
+            "RunEx operation arguments are accepted only for UserMode profiles".to_owned(),
+        ));
+    }
     STOP_REQUESTED.store(false, Ordering::Release);
     let launch_options = HostLaunchOptions::parse(arguments)?;
     if launch_options.registration_nonce().is_some() {
@@ -656,6 +750,11 @@ fn run_profile_supervisor(
     }
     let mut host = HostComposition::open_for_profile(launch_options.clone(), profile)?;
     if host.registry().pending_activation().is_some() {
+        if runex_operation.is_some() {
+            return Err(HostError::ProcessContour(
+                "RunEx operation cannot acknowledge a pending UserMode activation".to_owned(),
+            ));
+        }
         return run_pending_current_user_bootstrap(&mut host);
     }
     let active = host.registry().active().ok_or_else(|| {
@@ -680,9 +779,24 @@ fn run_profile_supervisor(
                 "profile Host stopped before authenticated readiness".to_owned(),
             ));
         }
-        match run_scm_contour_tick(&mut host)? {
-            ScmContourTickOutcome::LeasePreserved
-            | ScmContourTickOutcome::Reconciled(HostBranchDisposition::Healthy) => break,
+        let outcome = run_scm_contour_tick(&mut host)?;
+        let outcome =
+            if outcome == ScmContourTickOutcome::LeasePreserved && runex_operation.is_some() {
+                ScmContourTickOutcome::Reconciled(host.reconcile_approved_contour()?)
+            } else {
+                outcome
+            };
+        match outcome {
+            ScmContourTickOutcome::LeasePreserved => break,
+            ScmContourTickOutcome::Reconciled(HostBranchDisposition::Healthy) => {
+                if let Some(operation) = runex_operation.as_ref() {
+                    host.acknowledge_user_mode_task_run(
+                        &operation.transaction_id,
+                        &operation.effect_id,
+                    )?;
+                }
+                break;
+            }
             ScmContourTickOutcome::ReadinessRetryPending
             | ScmContourTickOutcome::Reconciled(
                 HostBranchDisposition::LiveAwaitingReadiness

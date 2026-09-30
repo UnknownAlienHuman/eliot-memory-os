@@ -1635,7 +1635,8 @@ use eliot_installation::{
     InstallerServiceRegistrationApproval, InstallerServiceRole, LOCAL_SERVICE_SID,
     PHASE_B_PENDING_MARKER, PendingActivationState, PhaseBLiveBinding,
     ProvisionedSupervisionAuthority, RedbInstallationRegistry, RuntimeLaunchDescriptor,
-    StoreCredentialProvider, StoreCredentialScope,
+    StoreCredentialProvider, StoreCredentialScope, UserModeTaskRunHostAck,
+    UserModeTaskRunHostReadinessEvidence,
     phase_b_credential_receipt_digest as installation_phase_b_credential_receipt_digest,
     phase_b_host_state_root_digest as installation_phase_b_host_state_root_digest,
     phase_b_scm_selector, phase_b_static_template_for_candidate,
@@ -6062,6 +6063,239 @@ impl HostComposition {
         #[cfg(any(test, not(windows)))]
         let profile_selection = None;
         open_registry_store_at_profile(&self.registry_host_root, profile, profile_selection)
+    }
+
+    /// Records fresh authenticated Host readiness for the exact staged
+    /// current-user `RunEx` operation. Scheduler launch acceptance is not
+    /// inferred from the argv markers or engine PID; the durable registry
+    /// intent, exact task readback, active approved Host image, retained roots,
+    /// and a new Kernel readiness proof must all agree first.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "RunEx acknowledgement keeps staged intent, exact registration readback, fresh authenticated readiness, CAS, and readback in causal order"
+    )]
+    pub fn acknowledge_user_mode_task_run(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        effect_id: &PlatformHandle,
+    ) -> Result<(), HostError> {
+        use eliot_platform_windows::profile_supervision::{
+            CurrentUserTaskObservation, open_profile_root_leases,
+        };
+
+        let initial_store = self.open_registry_store()?;
+        let initial_registry = initial_store.load()?;
+        let record = initial_registry
+            .user_mode_task_run_record()
+            .cloned()
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "RunEx operation has no durable current-user task run intent".to_owned(),
+                )
+            })?;
+        drop(initial_store);
+
+        let intent = record.intent();
+        let task_receipt = &intent.task_receipt;
+        let request = &task_receipt.request;
+        let run_intent = &intent.run_intent;
+        if request.transaction_id != transaction_id.as_str()
+            || request.effect_id != effect_id.as_str()
+            || request.roots.profile
+                != eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+        {
+            return Err(HostError::ProcessContour(
+                "RunEx operation markers do not match the durable UserMode task intent".to_owned(),
+            ));
+        }
+
+        let active = initial_registry.active().cloned().ok_or_else(|| {
+            HostError::ProcessContour(
+                "RunEx task intent has no active approved generation".to_owned(),
+            )
+        })?;
+        if initial_registry.pending_activation().is_some()
+            || active.manifest.runtime_launch.profile != InstallationProfile::UserMode
+            || self.registry.active() != Some(&active)
+            || self.registry.pending_activation().is_some()
+        {
+            return Err(HostError::ProcessContour(
+                "RunEx task intent is not bound to this active UserMode Host generation".to_owned(),
+            ));
+        }
+        let retained_selection = initial_registry
+            .profile_selection_receipt_for_generation(&active.manifest.generation)
+            .map_err(HostError::Installation)?;
+        if !eliot_installation::profile_selection_receipts_match_retained_roots(
+            retained_selection,
+            &task_receipt.selection,
+        )
+        .map_err(HostError::Installation)?
+            || request.roots
+                != host_job_launch::profile_root_request(&active.manifest.runtime_launch)?
+            || request.roots.generation != active.manifest.generation.as_str()
+            || !windows_paths_equal(
+                &request.executable,
+                std::path::Path::new(active.manifest.runtime_launch.host_executable_path.as_str()),
+            )
+            || request.executable_sha256
+                != active.manifest.runtime_launch.host_artifact_digest.as_str()
+        {
+            return Err(HostError::ProcessContour(
+                "RunEx task intent differs from the active approved generation or retained root receipt"
+                    .to_owned(),
+            ));
+        }
+        let request_digest = request
+            .request_digest()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if run_intent.request_digest.as_str() != request_digest
+            || run_intent.task_name != task_receipt.task_name
+            || run_intent.sid != task_receipt.sid
+            || run_intent.task_xml_sha256.as_str() != task_receipt.task_xml_sha256
+        {
+            return Err(HostError::ProcessContour(
+                "RunEx intent does not bind the exact registered task request".to_owned(),
+            ));
+        }
+
+        let retained_roots = open_profile_root_leases(&request.roots)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if !eliot_installation::profile_selection_receipts_match_retained_roots(
+            &task_receipt.selection,
+            retained_roots.selection(),
+        )
+        .map_err(HostError::Installation)?
+            || retained_roots.selection().owner_sid != run_intent.sid
+            || retained_roots.selection().session_id != run_intent.session_id
+        {
+            return Err(HostError::ProcessContour(
+                "RunEx task intent SID, session, or retained UserMode roots differ from this Host"
+                    .to_owned(),
+            ));
+        }
+        retained_roots
+            .verify_stable_identity()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        verify_current_host_artifact(&active.manifest)?;
+
+        let observation = eliot_platform_windows::profile_supervision::inspect_current_user_task(
+            request,
+            Some(task_receipt),
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        match observation {
+            CurrentUserTaskObservation::Matching {
+                task_xml_sha256,
+                sid,
+                session_id,
+                receipt,
+            } if task_xml_sha256 == run_intent.task_xml_sha256.as_str()
+                && sid == run_intent.sid
+                && session_id == run_intent.session_id
+                && receipt.task_name == task_receipt.task_name
+                && receipt.request == task_receipt.request
+                && receipt.request_digest == task_receipt.request_digest
+                && receipt.sid == task_receipt.sid
+                && receipt.executable == task_receipt.executable
+                && receipt.executable_sha256 == task_receipt.executable_sha256
+                && receipt.working_directory == task_receipt.working_directory
+                && receipt.arguments == task_receipt.arguments
+                && receipt.task_xml_sha256 == task_receipt.task_xml_sha256 => {}
+            _ => {
+                return Err(HostError::ProcessContour(
+                    "RunEx task XML and current-user registration readback do not match the staged intent"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let (_confirmed_contour, proof) =
+            self.persist_fresh_authenticated_readiness_with_proof(&active.manifest.generation)?;
+        let host_process = &proof.request.candidate.host_process;
+        if proof.request.candidate.installation_id
+            != active
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+            || host_process.process_id != std::process::id()
+            || !windows_paths_equal(
+                std::path::Path::new(&host_process.image_path),
+                std::path::Path::new(active.manifest.runtime_launch.host_executable_path.as_str()),
+            )
+            || proof.ready.activation_id != self.activation_id
+        {
+            return Err(HostError::ProcessContour(
+                "fresh authenticated Host readiness differs from the active UserMode image or activation"
+                    .to_owned(),
+            ));
+        }
+        retained_roots
+            .verify_stable_identity()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+
+        if let Some(ack) = record.host_ack() {
+            if &ack.intent != record.intent()
+                || ack.evidence.launch_transaction_id != transaction_id.as_str()
+                || ack.evidence.launch_effect_id != effect_id.as_str()
+            {
+                return Err(HostError::ProcessContour(
+                    "durable UserMode task run acknowledgement conflicts with this RunEx operation"
+                        .to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let ack = UserModeTaskRunHostAck {
+            intent: record.intent().clone(),
+            evidence: UserModeTaskRunHostReadinessEvidence {
+                launch_transaction_id: transaction_id.as_str().to_owned(),
+                launch_effect_id: effect_id.as_str().to_owned(),
+                host_process_id: host_process.process_id,
+                host_process_start_time_100ns: host_process.start_time_100ns,
+                host_process_image_path: host_process.image_path.clone(),
+                activation_id: proof.ready.activation_id.clone(),
+                activation_operation_id: proof.ready.activation_operation_id.clone(),
+                kernel_process_id: proof.ready.process.process_id.clone(),
+                kernel_job_object_id: proof.ready.process.job_object_id.clone(),
+                kernel_process_evidence_refs: proof.ready.process.evidence_refs.clone(),
+                kernel_ready_evidence_refs: proof.ready.evidence_refs.clone(),
+            },
+        };
+
+        let mut commit_store = self.open_registry_store()?;
+        let commit_registry = commit_store.load()?;
+        if commit_registry.user_mode_task_run_record() != Some(&record)
+            || commit_registry.pending_activation().is_some()
+            || commit_registry.active() != Some(&active)
+        {
+            return Err(HostError::ProcessContour(
+                "UserMode task run intent or active generation changed during fresh readiness"
+                    .to_owned(),
+            ));
+        }
+        let owner_capability = self.owner_lease.activation_capability();
+        let committed = commit_store.acknowledge_user_mode_task_run(
+            &owner_capability,
+            commit_registry.revision(),
+            ack.clone(),
+        )?;
+        drop(commit_store);
+
+        let readback_store = self.open_registry_store()?;
+        let readback_registry = readback_store.load()?;
+        if readback_registry.user_mode_task_run_record() != Some(&committed)
+            || committed.host_ack() != Some(&ack)
+        {
+            return Err(HostError::ProcessContour(
+                "UserMode task run acknowledgement did not survive exact registry readback"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Prepares one isolated backup destination through registry-committed
@@ -11085,14 +11319,23 @@ impl HostComposition {
         Ok(admitted)
     }
     #[cfg(windows)]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "fresh readiness keeps probe, exact supervision publication, final ORS fence, journal append, and readback in causal order"
-    )]
     fn persist_fresh_authenticated_readiness(
         &mut self,
         generation: &PlatformHandle,
     ) -> Result<ReadinessContourIdentity, HostError> {
+        self.persist_fresh_authenticated_readiness_with_proof(generation)
+            .map(|(contour, _proof)| contour)
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fresh readiness keeps probe, exact supervision publication, final ORS fence, journal append, and readback in causal order"
+    )]
+    fn persist_fresh_authenticated_readiness_with_proof(
+        &mut self,
+        generation: &PlatformHandle,
+    ) -> Result<(ReadinessContourIdentity, AuthenticatedKernelReadiness), HostError> {
         // F-LOG-HOST-1: ready only with actual proof fence; phase only here,
         // outer reconcile owns the terminal. Never claims ready from liveness.
         host_lifecycle_observe_requested(BOUNDARY_READINESS_PROOF_REQUESTED);
@@ -11237,7 +11480,7 @@ impl HostComposition {
         }
         // F-LOG-HOST-1: ready only now that the proof fence is confirmed.
         host_lifecycle_observe_requested(BOUNDARY_READINESS_PROOF_READY);
-        Ok(confirmed)
+        Ok((confirmed, proof))
     }
 
     #[cfg(windows)]

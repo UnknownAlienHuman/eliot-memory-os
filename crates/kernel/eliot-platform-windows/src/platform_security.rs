@@ -1503,7 +1503,7 @@ fn run_user_mode_profile_task_windows(
     use windows::Win32::System::TaskScheduler::{
         CLSID_CTaskScheduler, ITaskService, TASK_RUN_USE_SESSION_ID, TASK_STATE_RUNNING,
     };
-    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::System::Variant::{VARIANT, VariantClear};
     use windows::core::BSTR;
 
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -1532,15 +1532,18 @@ fn run_user_mode_profile_task_windows(
         }
         let session_id =
             i32::try_from(receipt.session_id).map_err(|_| WindowsAdapterError::InvalidInput)?;
-        let running = unsafe {
+        let mut run_parameters = user_mode_runex_parameters(receipt)?;
+        let run_result = unsafe {
             task.RunEx(
-                &empty,
+                &run_parameters,
                 TASK_RUN_USE_SESSION_ID.0,
                 session_id,
                 &BSTR::from(receipt.sid.as_str()),
             )
-        }
-        .map_err(|_| WindowsAdapterError::Unavailable)?;
+        };
+        let clear_result = unsafe { VariantClear(&mut run_parameters) };
+        let running = run_result.map_err(|_| WindowsAdapterError::Unavailable)?;
+        clear_result.map_err(|_| WindowsAdapterError::Unavailable)?;
         let state = unsafe {
             running
                 .State()
@@ -1573,6 +1576,47 @@ fn run_user_mode_profile_task_windows(
         CoUninitialize();
     }
     result
+}
+
+#[cfg(windows)]
+fn user_mode_runex_parameters(
+    receipt: &UserModeProfileTaskReceipt,
+) -> Result<windows::Win32::System::Variant::VARIANT, WindowsAdapterError> {
+    use std::mem::ManuallyDrop;
+    use windows::Win32::System::Ole::{
+        SafeArrayCreateVector, SafeArrayDestroy, SafeArrayPutElement,
+    };
+    use windows::Win32::System::Variant::{
+        VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_ARRAY, VT_BSTR,
+    };
+    use windows::core::BSTR;
+
+    let array = unsafe { SafeArrayCreateVector(VT_BSTR, 0, 2) };
+    if array.is_null() {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    for (index, value) in [
+        (0_i32, &receipt.transaction_id),
+        (1_i32, &receipt.effect_id),
+    ] {
+        let value = BSTR::from(value.as_str());
+        if unsafe { SafeArrayPutElement(array, &index, (&value as *const BSTR).cast()) }.is_err() {
+            let _ = unsafe { SafeArrayDestroy(array) };
+            return Err(WindowsAdapterError::Unavailable);
+        }
+    }
+
+    Ok(VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VARENUM(VT_ARRAY.0 | VT_BSTR.0),
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { parray: array },
+            }),
+        },
+    })
 }
 
 #[cfg(windows)]
