@@ -1908,7 +1908,13 @@ fn recheck_packet_headroom(
         headroom.result,
         headroom.now_ms,
     )
-    .map_err(|refusal| PacketCompositionError::HeadroomHandoff(Box::new(refusal)))
+    .map_err(|refusal| PacketCompositionError::HeadroomHandoff(Box::new(refusal)))?;
+    // The release instructions this step returns are DISCARDED here, and that
+    // is pre-existing rather than introduced by the extraction: the call site
+    // has always used `?` and dropped the value. It is recorded as a residual
+    // in the issue report - the owner still holds every permit it issued, so
+    // the release duty is real, and no production caller consumes it yet.
+    Ok(())
 }
 
 /// Closes the candidate stage's set and the owner's admission pieces into the
