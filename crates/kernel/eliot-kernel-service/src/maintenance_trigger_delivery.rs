@@ -57,6 +57,7 @@ use eliot_protocol::{
     MaintenanceTriggerRevocation, MaintenanceTriggerTerminalDisposition,
     MaintenanceTriggerTerminalKind, ProtocolError,
 };
+use eliot_store_api::StoreError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -126,6 +127,12 @@ pub enum MaintenanceTriggerDeliveryError {
     /// The ORS owner could not prove the record's staged trigger payload.
     #[error("maintenance trigger staging proof failed: {0}")]
     StagingProof(#[from] OrsError),
+    /// The canonical Store refused the receipt read backing this transition.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The Kernel owner could not reach its service or ledger state.
+    #[error("maintenance trigger owner unavailable: {0}")]
+    OwnerUnavailable(String),
 }
 
 /// Durable delivery row for one retained trigger.
