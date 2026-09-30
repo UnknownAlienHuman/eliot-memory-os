@@ -1208,6 +1208,20 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
     }
 }
 
+/// The committed owner revision for one semantic record, together with the
+/// canonical Store receipt that proves the commit (#1702 W3).
+///
+/// The revision and its receipt are one fact and are never presented apart: a
+/// revision without its receipt is an uncommitted claim, and a receipt without
+/// its revision names no content to compare. Bundling them keeps a caller from
+/// forgetting one of the two.
+pub struct CommittedOwnerRevision<'a> {
+    /// The Store-committed owner revision.
+    pub owner_revision: &'a SwarmOwnerRevision,
+    /// The committed canonical transaction receipt for that revision.
+    pub receipt: &'a WriteReceipt,
+}
+
 /// Requires the canonical Store transaction that durably persists one
 /// owner-separated revision, before that revision may be published as current
 /// (issue #1702 W2, I1.8 canonical write path).
@@ -2901,11 +2915,15 @@ impl AgentFabric {
     /// payload digest does not prove its author's authority" failure: a
     /// foreign coordinator could present an execution revision carrying a
     /// lease it chose itself and pass. The durable owner revision must be the
-    /// execution record verbatim on the AgentCoordinator stream, so the only
+    /// execution record verbatim on the `AgentCoordinator` stream, so the only
     /// presenter that gets through is the one the canonical transaction
     /// actually recorded for this execution. A stale or foreign coordinator
     /// fails with [`FabricError::StaleOwnerLease`]; a coordinator stream that
     /// is not the one committed fails with [`FabricError::RevisionNotDurable`].
+    /// The presented-lease comparison itself stays where the contracts owner
+    /// put it, in `check_execution_update`
+    /// (eliot-agent-contracts/src/lib.rs:2131), so there is one lease check
+    /// here rather than two.
     ///
     /// # Errors
     ///
@@ -2921,8 +2939,7 @@ impl AgentFabric {
         update: &ExecutionUpdateProposal,
         caller_holder: &str,
         caller_epoch: u64,
-        owner_revision: &SwarmOwnerRevision,
-        receipt: &WriteReceipt,
+        committed: &CommittedOwnerRevision<'_>,
     ) -> Result<(), FabricError> {
         let admission_key = admission_id.as_str().to_owned();
         let admission = self
@@ -2944,17 +2961,11 @@ impl AgentFabric {
             FabricError::Contract(format!("semantic execution encode: {error}"))
         })?;
         require_durable_owner_revision(
-            owner_revision,
-            receipt,
+            committed.owner_revision,
+            committed.receipt,
             &record,
             SwarmSemanticOwnerKind::AgentCoordinator,
         )?;
-        if !execution
-            .coordinator
-            .authorizes(caller_holder, caller_epoch)
-        {
-            return Err(FabricError::StaleOwnerLease("swarm coordinator".to_owned()));
-        }
         let definition_key = admission.definition_id.as_str().to_owned();
         let definition = self
             .semantic_definitions
