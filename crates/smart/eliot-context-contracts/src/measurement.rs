@@ -4,7 +4,10 @@ use eliot_contracts::{ArtifactId, ContractVersion};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextBinding, ContextError, validate_digest, validate_text};
+use crate::{
+    ContextBinding, ContextError, QualityDimension, SourceSnapshot, QUALITY_DIMENSIONS,
+    validate_digest, validate_text,
+};
 
 /// Whether a measurement is independently qualified for capacity decisions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -58,6 +61,30 @@ pub struct SerializedContextMeasurement {
     pub false_safe_overflow: Option<ArtifactId>,
     pub false_rejection_or_decomposition: Option<ArtifactId>,
     pub valid_until: Option<ArtifactId>,
+    /// Source snapshots the measured packet carried, in admitted order.
+    ///
+    /// This measurement is the owner of the route identity, and a route is
+    /// served from a named set of source snapshots. The exact snapshots the
+    /// route read therefore have to be readable from the record that describes
+    /// that route: without them nothing downstream can tell which source
+    /// revision a grade was read from, and a source change becomes invisible
+    /// exactly where the route identity is already being checked.
+    ///
+    /// Each entry is the admitted source's own [`SourceSnapshot`], projected
+    /// with no change to a load-bearing field (the same projection
+    /// `RenderedAtom::from_admitted` applies), so the recorded
+    /// `snapshot_id` and `revision` are the source owner's own values.
+    pub sources: Vec<SourceSnapshot>,
+    /// Verifier contract revisions in force per graded dimension on this route.
+    ///
+    /// Empty means this route declares no verifier identity, which is reported
+    /// as absent rather than inferred: a dimension with no declared verifier
+    /// has no verifier revision to compare, and inventing one would let an
+    /// absent declaration invalidate a grade.
+    ///
+    /// A repeated dimension states no additional verifier identity, so the
+    /// dimension is the key and the list carries one entry per dimension.
+    pub verifier_rule_revisions: Vec<(QualityDimension, ArtifactId)>,
 }
 
 impl SerializedContextMeasurement {
@@ -92,6 +119,31 @@ impl SerializedContextMeasurement {
                 "measurement.tokenizer_version",
             )?;
             validate_digest(&tokenizer.tokenizer_hash, "measurement.tokenizer_hash")?;
+        }
+        // The source snapshots are this route's own source records, so each is
+        // validated by its own owner rather than trusted because it is here.
+        // A repeated snapshot states no additional source revision, so a
+        // duplicated entry cannot pose as wider source coverage.
+        let mut snapshots = std::collections::BTreeSet::new();
+        for source in &self.sources {
+            source.validate()?;
+            if !snapshots.insert(source.snapshot_id.clone()) {
+                return Err(ContextError::Duplicate("measurement.sources"));
+            }
+        }
+        // The dimension is the key here too: a repeated dimension would state
+        // two different verifier revisions for one graded dimension.
+        let mut verifier_dimensions = std::collections::BTreeSet::new();
+        for (dimension, rule_revision) in &self.verifier_rule_revisions {
+            if !QUALITY_DIMENSIONS.contains(dimension)
+                || !verifier_dimensions.insert(*dimension)
+            {
+                return Err(ContextError::Duplicate("measurement.verifier_rule_revisions"));
+            }
+            validate_text(
+                rule_revision.as_str(),
+                "measurement.verifier_rule_revisions.rule_revision",
+            )?;
         }
         Ok(())
     }
