@@ -70,6 +70,10 @@ fn record_process_receipt_context(context: &tracing::Span, process: &ProcessStar
         record_live_receipt_context_field(context, "state_fence", epoch);
         record_live_receipt_context_field(context, "authority_epoch", epoch);
     }
+    let identity = process.identity();
+    record_live_receipt_context_field(context, "process_id", &identity.physical().process_id().to_string());
+    record_live_receipt_context_field(context, "process_start_100ns", &identity.physical().start_time_100ns().to_string());
+    record_live_receipt_context_field(context, "image_sha256", identity.executable_sha256());
 }
 
 /// Maps one live-receipt/readiness failure to its stable diagnostic code.
@@ -133,6 +137,7 @@ impl KernelComposition {
             "attempt",
             context,
         );
+        let mut replayed = false;
         match self.publish_eliotd_live_receipt_inner(
             launch,
             process,
@@ -140,9 +145,14 @@ impl KernelComposition {
             supervision_contour,
             supervision_successor,
             context,
+            &mut replayed,
         ) {
             Ok(receipt) => {
-                observe_live_receipt("kernel.live_receipt.published", "success", context);
+                if replayed {
+                    observe_live_receipt("kernel.live_receipt.publication_replayed", "confirmed", context);
+                } else {
+                    observe_live_receipt("kernel.live_receipt.published", "success", context);
+                }
                 // Issue #1837: durable audit evidence for receipt issuance.
                 self.audit_observe(AuditEventDraft::receipt_live_published(
                     process,
@@ -169,7 +179,11 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "publication retains its existing ordered owner checks and explicitly exports the confirmed replay observation"
+    )]
     fn publish_eliotd_live_receipt_inner(
         &self,
         launch: &EliotdLaunchDescriptor,
@@ -178,6 +192,7 @@ impl KernelComposition {
         supervision_contour: &DaemonSupervisionContour,
         supervision_successor: Option<&SupervisionLeaseSnapshot>,
         context: &tracing::Span,
+        replayed: &mut bool,
     ) -> Result<EliotdLiveReceipt, KernelServiceError> {
         let runtime_binding = self
             .eliotd_receipt_binding
@@ -413,6 +428,7 @@ impl KernelComposition {
         if post_supervision != supervision || post_issued_at_ms != supervision_issued_at_ms {
             return Err(KernelServiceError::ReadinessNotProven);
         }
+        *replayed = reconciled_existing;
         Ok(receipt)
     }
 

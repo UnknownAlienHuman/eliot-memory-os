@@ -2970,16 +2970,16 @@ impl KernelComposition {
         match &result {
             Ok(_) => {
                 context.in_scope(|| {
-                    observe_daemon_request("kernel.daemon_request_validated", "success")
+                    observe_daemon_request("kernel.daemon_request_validated", "success");
                 });
                 context.in_scope(|| {
-                    observe_daemon_request("kernel.daemon_request_admitted", "success")
+                    observe_daemon_request("kernel.daemon_request_admitted", "success");
                 });
                 context.in_scope(|| {
-                    observe_daemon_operation(trusted_daemon_operation(operation), "dispatched")
+                    observe_daemon_operation(trusted_daemon_operation(operation), "dispatched");
                 });
                 context.in_scope(|| {
-                    observe_daemon_request("kernel.daemon_response_prepared", "success")
+                    observe_daemon_request("kernel.daemon_response_prepared", "success");
                 });
                 // F-LOG-KERNEL-1 (#897 W3): prepared, delivered and unknown
                 // are three independent records. `delivered` marks the reply
@@ -2990,21 +2990,21 @@ impl KernelComposition {
                 // scope), so the post-handoff transport outcome stays
                 // `unknown` at this boundary.
                 context.in_scope(|| {
-                    observe_daemon_request("kernel.daemon_response_delivered", "success")
+                    observe_daemon_request("kernel.daemon_response_delivered", "success");
                 });
                 context.in_scope(|| {
-                    observe_daemon_request("kernel.daemon_response_unknown", "unknown")
+                    observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                 });
                 context.in_scope(|| {
-                    observe_daemon_request("kernel.daemon_request_cleanup", "complete")
+                    observe_daemon_request("kernel.daemon_request_cleanup", "complete");
                 });
             }
             Err(error) => {
                 context.in_scope(|| {
-                    observe_daemon_request("kernel.daemon_request_validated", "fenced")
+                    observe_daemon_request("kernel.daemon_request_validated", "fenced");
                 });
                 context.in_scope(|| {
-                    observe_daemon_operation(trusted_daemon_operation(operation), "fenced")
+                    observe_daemon_operation(trusted_daemon_operation(operation), "fenced");
                 });
                 if matches!(error, TransportError::Cancelled) {
                     // F-LOG-KERNEL-1 (#897 W3): cancellation observed as the
@@ -3012,7 +3012,7 @@ impl KernelComposition {
                     // request (`kernel.daemon_cancel_requested`). Info only;
                     // the terminal below stays the single designated terminal.
                     context.in_scope(|| {
-                        observe_daemon_request("kernel.daemon_cancel_observed", "cancelled")
+                        observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
                     });
                 }
                 // F-LOG-KERNEL-1 (#897 T20): a failed receipt sub-dispatch
@@ -4817,6 +4817,10 @@ impl KernelComposition {
     /// producer halts itself on terminal expiry; the Kernel never revives an
     /// expired lease from further heartbeats.
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "progress dispatch keeps renewal, cleanup, publication and its propagated terminal-owner signal in their original order"
+    )]
     fn daemon_supervision_progress_operation(
         &self,
         payload: serde_json::Value,

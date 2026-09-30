@@ -217,10 +217,13 @@ fn record_daemon_progress_operation_context(
             observation.map(|value| value.observation_id.as_str()),
         ),
         ("generation", generation.as_deref()),
-        ("state_fence", fence.as_ref().map(|value| value.as_str())),
+        (
+            "state_fence",
+            fence.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
+        ),
         (
             "authority_epoch",
-            epoch.as_ref().map(|value| value.as_str()),
+            epoch.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
         ),
     ] {
         if let Some(original) = original {
@@ -3722,9 +3725,8 @@ impl KernelComposition {
         };
         let current = authority
             .commit_active_in_context(&stage.ticket, context)
-            .map_err(|error| {
+            .inspect_err(|_| {
                 *terminal_owned = true;
-                error
             })?;
         authority.verify_active_snapshot(&current, lease_id, now_ms)?;
         if !supervision_binding_matches_contour(&current.record.binding, contour)? {
@@ -3920,6 +3922,11 @@ impl KernelComposition {
     /// after live-receipt publication, so a renewal can never ship without
     /// its publication evidence.
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the original ordered renewal boundary explicitly carries its caller span and failed-child terminal ownership"
+    )]
     fn renew_current_supervision_with_progress(
         authority: &KernelSupervisionLeaseAuthority,
         contour: &DaemonSupervisionContour,
@@ -4105,6 +4112,7 @@ impl KernelComposition {
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
+        clippy::too_many_arguments,
         reason = "probe renewal threads the exact launch, process, ready, contour, and head identities explicitly"
     )]
     fn progress_renewal_for_probe(
@@ -4269,6 +4277,10 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "probe renewal preserves the original owner-read, commit, publication and final evidence checks in their existing order"
+    )]
     fn renew_daemon_supervision_for_probe_in_context(
         &self,
         request: &KernelControlRequest,

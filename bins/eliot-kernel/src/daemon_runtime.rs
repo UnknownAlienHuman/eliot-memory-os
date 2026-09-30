@@ -107,7 +107,7 @@ fn record_daemon_recovery_operation_context(
         ("state_fence", state_fence.as_deref()),
         (
             "authority_epoch",
-            epoch.as_ref().map(|value| value.as_str()),
+            epoch.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
         ),
     ] {
         if let Some(original) = original {
@@ -1013,15 +1013,12 @@ impl KernelComposition {
             }
         }
         let mut recovery_terminal_owned = false;
-        let recovered = match self
+        let Ok(recovered) = self
             .recover_eliotd_in_context(parent, &mut recovery_terminal_owned)
             .await
-        {
-            Ok(receipt) => receipt,
-            Err(_) => {
-                *terminal_owned = recovery_terminal_owned;
-                return Err(KernelServiceError::ReadinessNotProven);
-            }
+        else {
+            *terminal_owned = recovery_terminal_owned;
+            return Err(KernelServiceError::ReadinessNotProven);
         };
         *terminal_owned = false;
         let current_launch = self

@@ -254,7 +254,7 @@ impl KernelComposition {
             validated.then_some(request.message_id.as_str()),
             generation.as_deref(),
             None,
-            epoch.as_ref().map(|value| value.as_str()),
+            epoch.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
         );
         if validated {
             let request_id = super::kernel_diagnostics::bound_field(request.message_id.as_str());
