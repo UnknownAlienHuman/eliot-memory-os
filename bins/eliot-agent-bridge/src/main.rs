@@ -4881,6 +4881,7 @@ mod tests {
                         Request::Status => "status",
                         Request::Stop => "stop",
                         Request::Bootstrap { .. } => "bootstrap",
+                        Request::ResourceRead { .. } => "resource_read",
                     };
                     if let Some(op) = case.get("op").and_then(Value::as_str) {
                         assert_eq!(seen, op, "{id} decoded the wrong operation");
@@ -5082,7 +5083,10 @@ mod tests {
             panic!("first successful response must carry the bootstrap")
         };
         assert!(
-            !carried.governance.limiting_integration_evidence.is_empty(),
+            !bootstrap
+                .governance
+                .limiting_integration_evidence
+                .is_empty(),
             "bootstrap must carry limiting integration evidence"
         );
         let mut second = Response::Forwarded {

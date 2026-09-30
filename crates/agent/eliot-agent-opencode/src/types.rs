@@ -4466,9 +4466,7 @@ mod tests {
                 delivery: HostEventDeliveryDisposition::DurableOrdered,
                 admission: Some(&admission),
             }),
-            Err(OpenCodeObservationConversionError::InvalidInput(
-                "sequence".to_owned(),
-            ))
+            Err(OpenCodeObservationConversionError::InvalidInput(field)) if field == "sequence"
         ));
         // Missing admission for execution-unit lineage fails closed.
         assert!(matches!(
@@ -4485,9 +4483,7 @@ mod tests {
                 delivery: HostEventDeliveryDisposition::DurableOrdered,
                 admission: None,
             }),
-            Err(OpenCodeObservationConversionError::InvalidInput(
-                "admission/lineage"
-            ))
+            Err(OpenCodeObservationConversionError::InvalidInput(field)) if field == "admission/lineage"
         ));
         // A forged caller-supplied output digest fails closed at validation.
         let (mut envelope, _) = normalize_opencode_event(OpenCodeHostEventInput {
