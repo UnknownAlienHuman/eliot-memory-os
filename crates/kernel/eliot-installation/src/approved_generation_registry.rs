@@ -2655,7 +2655,7 @@ pub struct ApprovedGenerationRegistry {
     /// pending activation.  A new stage supersedes this single terminal
     /// receipt.
     pub(crate) last_terminal_activation: Option<PendingActivationTerminal>,
-    /// Original SystemService Host-state root object identity for this
+    /// Original `SystemService` Host-state root object identity for this
     /// installation. It is shared by all generations and never reselected
     /// from a path during registry reopen.
     pub(crate) system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
@@ -3101,7 +3101,7 @@ impl ApprovedGenerationRegistry {
         self.revision
     }
 
-    /// Returns the original SystemService Host-state root identity retained by
+    /// Returns the original `SystemService` Host-state root identity retained by
     /// this registry, when one has been bound.
     #[must_use]
     pub const fn system_service_host_root_receipt(&self) -> Option<&SystemServiceHostRootReceipt> {
@@ -3111,7 +3111,7 @@ impl ApprovedGenerationRegistry {
     /// Returns whether this registry has only the exact empty first-install
     /// projection. This is used to admit a crash replay before its first
     /// pending activation is projected; every other state requires its
-    /// persisted SystemService Host-root receipt.
+    /// persisted `SystemService` Host-root receipt.
     #[must_use]
     pub fn is_uninitialized_for_system_service_bootstrap(&self) -> bool {
         self.registry_wire_version == INSTALLATION_REGISTRY_WIRE_VERSION

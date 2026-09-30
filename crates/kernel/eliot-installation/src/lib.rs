@@ -385,8 +385,8 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// selection receipt; v28 adds exact current-user Task registration intent,
 /// receipt and unresolved progress. Version 29 adds exact Task `RunEx` intent
 /// and receipt plus the source-publication profile-anchor object identity.
-/// Version 30 binds the original SystemService Host-state root object identity
-/// on the transaction wire. Legacy SystemService records require recovery;
+/// Version 30 binds the original `SystemService` Host-state root object identity
+/// on the transaction wire. Legacy `SystemService` records require recovery;
 /// current-user records retain their prior decode path.
 pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(30, 0, 0);
 
@@ -399,8 +399,8 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 /// service-control grant receipt. Version 17 adds immutable User Broker path
 /// and digest pins and the mandatory retained I3.1 profile-root binding to
 /// each candidate and runtime launch descriptor. Version 18 persists the
-/// original SystemService Host-state root object identity for the registry.
-/// Older SystemService projections require recovery; current-user projections
+/// original `SystemService` Host-state root object identity for the registry.
+/// Older `SystemService` projections require recovery; current-user projections
 /// retain their prior decode path.
 pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(18, 0, 0);
 

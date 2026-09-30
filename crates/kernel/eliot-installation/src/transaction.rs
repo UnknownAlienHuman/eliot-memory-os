@@ -179,10 +179,10 @@ pub struct RetainedProfileAnchor {
     pub identity: FileIdentity,
 }
 
-/// Current wire revision for the original SystemService Host-state root binding.
+/// Current wire revision for the original `SystemService` Host-state root binding.
 pub const SYSTEM_SERVICE_HOST_ROOT_RECEIPT_VERSION: u32 = 1;
 
-/// Original no-follow identity of one SystemService installation's Host-state
+/// Original no-follow identity of one `SystemService` installation's Host-state
 /// root. The receipt is captured from a retained protected-root lease and is
 /// carried by both the installation transaction and approved-generation
 /// registry; a path string alone is never used to recreate this identity.
@@ -880,9 +880,9 @@ pub struct InstallationTransaction {
     /// roots. Once captured, the original file identities are persisted and
     /// never reconstructed from the descriptor's path strings.
     pub(crate) profile_selection_receipt: Option<ProfileSelectionReceipt>,
-    /// Original SystemService Host-state root object identity, captured from a
+    /// Original `SystemService` Host-state root object identity, captured from a
     /// held protected-root lease before the installation registry is created
-    /// or projected. UserMode and PortableDev leave this absent.
+    /// or projected. `UserMode` and `PortableDev` leave this absent.
     pub(crate) system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
     /// Governing request identity.
     pub request: ManagedEnvironmentChangeRequest,
@@ -1038,13 +1038,13 @@ impl InstallationTransaction {
         self.profile_selection_receipt.as_ref()
     }
 
-    /// Returns the original retained SystemService Host-state root identity.
+    /// Returns the original retained `SystemService` Host-state root identity.
     #[must_use]
     pub const fn system_service_host_root_receipt(&self) -> Option<&SystemServiceHostRootReceipt> {
         self.system_service_host_root_receipt.as_ref()
     }
 
-    /// Records the original SystemService Host-state root while its protected
+    /// Records the original `SystemService` Host-state root while its protected
     /// directory lease is held. A later observation may confirm the same
     /// object, but can never replace the original path or file identity.
     pub(crate) fn record_system_service_host_root_receipt(
@@ -1062,7 +1062,7 @@ impl InstallationTransaction {
     }
 
     /// Binds the original registry-owned receipt to a new or resumed
-    /// SystemService transaction after comparing it with the held Host-root
+    /// `SystemService` transaction after comparing it with the held Host-root
     /// lease and the immutable transaction descriptor.
     pub(crate) fn bind_system_service_host_root_receipt(
         &mut self,
@@ -3205,8 +3205,12 @@ impl InstallationTransaction {
                     return Err(InstallationError::IdentityConflict);
                 }
             }
-            (InstallationProfile::SystemService, None)
-            | (InstallationProfile::UserMode | InstallationProfile::PortableDev, None) => {}
+            (
+                InstallationProfile::SystemService
+                | InstallationProfile::UserMode
+                | InstallationProfile::PortableDev,
+                None,
+            ) => {}
             (InstallationProfile::UserMode | InstallationProfile::PortableDev, Some(_)) => {
                 return Err(InstallationError::ProfileViolation(
                     "current-user transactions cannot carry a SystemService Host-root receipt"
@@ -4989,7 +4993,7 @@ struct InstallationTransactionWire {
     profile_governed_roots: InstallationRoots,
     /// Explicit null before root selection; omission is a current-wire error.
     profile_selection_receipt: Option<ProfileSelectionReceipt>,
-    /// Explicit null for current-user profiles and not-yet-bound SystemService
+    /// Explicit null for current-user profiles and not-yet-bound `SystemService`
     /// plans; the current decoder separately requires this member's presence.
     system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
     request: ManagedEnvironmentChangeRequest,
@@ -5236,14 +5240,9 @@ fn validate_current_transaction_progress(
     Ok(())
 }
 
-fn decode_installation_transaction_json_with_policy(
-    bytes: &[u8],
-    allow_advanced_state: bool,
-) -> Result<InstallationTransaction, InstallationError> {
-    let mut value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
-            reason: error.to_string(),
-        })?;
+fn prepare_transaction_json_for_current_wire(
+    value: &mut serde_json::Value,
+) -> Result<(), InstallationError> {
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
             reason: "installation transaction predates the required v29 discriminator".to_owned(),
@@ -5306,6 +5305,18 @@ fn decode_installation_transaction_json_with_policy(
             ),
         });
     }
+    Ok(())
+}
+
+fn decode_installation_transaction_json_with_policy(
+    bytes: &[u8],
+    allow_advanced_state: bool,
+) -> Result<InstallationTransaction, InstallationError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    prepare_transaction_json_for_current_wire(&mut value)?;
     if !value
         .as_object()
         .is_some_and(|object| object.contains_key("activation_projection_intent"))
