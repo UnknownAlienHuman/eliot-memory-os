@@ -292,7 +292,10 @@ impl ProposedRestorationRequirements {
             max_restore_bytes,
             target_schema_digest,
             requires_source_key_material,
-            requirements_digest: target_schema_digest,
+            // The commitment is recomputed from the fields immediately below and
+            // then re-validated, so the placeholder here is overwritten before
+            // this value is ever returned or compared against.
+            requirements_digest: String::new(),
         };
         requirements.requirements_digest = requirements.computed_digest()?;
         requirements.validate()?;
