@@ -572,12 +572,10 @@ pub fn admit_maintenance_trigger_intake(
         &persist.payload_hash,
         owner,
     )
-    .map_err(|source| {
-        MaintenanceTriggerIntakeError::BindingConflict {
-            trigger_id: statement.trigger_id.clone(),
-            operation_hash: statement.operation_hash.clone(),
-            source: Box::new(source),
-        }
+    .map_err(|source| MaintenanceTriggerIntakeError::BindingConflict {
+        trigger_id: statement.trigger_id.clone(),
+        operation_hash: statement.operation_hash.clone(),
+        source: Box::new(source),
     })?;
     // Bind the delivery obligation before admission: the staged envelope
     // reference, payload hash, trigger identity, and operation hash must name
@@ -757,9 +755,8 @@ fn map_intake_to_wire_record(
     // Derivation already refused a zero producer generation, so this
     // conversion cannot fail on a derived statement; a hand-built statement
     // carrying one fails here before any write.
-    let producer_generation =
-        ResourceGeneration::new(statement.source_event.producer_generation)
-            .map_err(ProtocolError::Foundation)?;
+    let producer_generation = ResourceGeneration::new(statement.source_event.producer_generation)
+        .map_err(ProtocolError::Foundation)?;
     let created_at_unix_ms =
         u64::try_from(statement.created_at_ms).map_err(|_| ProtocolError::InvalidField {
             field: "maintenance_trigger.created_at_unix_ms",
@@ -1159,9 +1156,8 @@ pub fn collect_pending_maintenance_triggers(
                 now_unix_ms,
             )
             .map_err(page_walk_error)?;
-        page.validate().map_err(|source| {
-            page_walk_error(MaintenanceTriggerDeliveryError::Protocol(source))
-        })?;
+        page.validate()
+            .map_err(|source| page_walk_error(MaintenanceTriggerDeliveryError::Protocol(source)))?;
         walk.members.extend(page.members);
         walk.gaps.extend(page.gaps);
         walk.pages_walked += 1;
