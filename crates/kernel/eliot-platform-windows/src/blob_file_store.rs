@@ -1422,12 +1422,13 @@ struct BlobNativeFileRenameInformationEx {
 
 #[cfg(windows)]
 fn create_unique_sibling(parent: &File) -> Result<(String, File), BlobFileStoreError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     for _ in 0..32 {
         let mut random = [0_u8; 16];
         crate::fill_system_random(&mut random).map_err(|error| {
             BlobFileStoreError::Platform(BlobFileStorePlatformFailure::WindowsAdapter(error))
         })?;
-        const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut suffix = String::with_capacity(random.len() * 2);
         for byte in random {
             suffix.push(char::from(HEX[usize::from(byte >> 4)]));
