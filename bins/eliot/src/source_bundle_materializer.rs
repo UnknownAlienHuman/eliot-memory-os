@@ -118,6 +118,12 @@ pub struct CanarySourceBundleMaterializeInput {
     /// derivation.
     pub transaction_id: PlatformHandle,
     /// Explicit destination staging root used by the bound generation planner.
+    ///
+    /// This is the same admitted object as
+    /// [`ProfileSelectionInput::staging_root`], restated at the materializer
+    /// seam the bound planner reads. `validate_materializer_selection` refuses
+    /// any input whose two statements of it differ, so the restatement can
+    /// never become a second, unvalidated staging root.
     pub staging_root: PlatformHandle,
 }
 
@@ -579,6 +585,7 @@ fn validate_materializer_selection(
     if selection.governance.profile != input.profile_selection.profile
         || selection.roots.runtime_state_roots.profile_anchor_root
             != input.profile_selection.profile_anchor_root
+        || input.staging_root != input.profile_selection.staging_root
         || (input.profile_selection.profile == InstallationProfile::PortableDev
             && input.profile_selection.generation.as_deref() != Some(input.generation.as_str()))
         || !eliot_platform_windows::windows_paths_equal(
@@ -2092,7 +2099,13 @@ mod tests {
         // of weakening that ACL contract for tests.
         UserOwnedRootLease::open_existing(anchor.path()).unwrap();
         let output_bundle = source_parent.path().join("bundle");
-        let staging_root = staging.path().join("staging");
+        let staging_root = handle(
+            staging
+                .path()
+                .join("staging")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let profile_anchor_root = handle(anchor.path().to_string_lossy().into_owned());
         let local_app_data = handle(
             eliot_platform_windows::current_user_local_app_data_root()
@@ -2137,9 +2150,10 @@ mod tests {
                 version: "dev".to_owned(),
                 generation: Some("generation-test".to_owned()),
                 source_root: handle(output_bundle.to_string_lossy().into_owned()),
-                staging_root: handle(staging_root.to_string_lossy().into_owned()),
+                staging_root: staging_root.clone(),
             },
             transaction_id: handle("transaction:test"),
+            staging_root,
         }
     }
 
@@ -2312,7 +2326,7 @@ mod tests {
                 agent_bridge_source: None,
             },
             &input.profile_selection,
-            binding.profile_governed_roots,
+            &binding.profile_governed_roots,
             binding.source_identity,
             binding.files,
             binding.evidence_digest,

@@ -201,10 +201,6 @@ pub use owned_directory_retirement::{
     OwnedDirectoryRetirementUnknownReason, observe_owned_directory_exact,
     retire_owned_directory_exact,
 };
-pub use profile_supervision::{
-    ProfileRootLeaseSet, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
-    open_profile_root_leases,
-};
 pub use package_staging::{
     AGENT_BRIDGE_STAGE_WIRE, AGENT_BRIDGE_STAGE_WIRE_VERSION, AgentBridgeStagePrepared,
     AgentBridgeStagingCreateDisposition, AgentBridgeStagingReceipt, AgentBridgeStagingRequest,
@@ -257,6 +253,10 @@ pub use process_job::{
     ValidatedSuspendedJobChild, cancel_capture_thread_io,
 };
 pub use process_path_lease::RetainedProcessPathLease;
+pub use profile_supervision::{
+    ProfileRootLeaseSet, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
+    open_profile_root_leases,
+};
 pub use protected_path::{
     ProtectedPathError, ProtectedPathLease, ProtectedPathStage, ProtectedRootLease,
     ProtectedRootRemovalOutcome, ProtectedRootRemovalProof, canonical_windows_path,

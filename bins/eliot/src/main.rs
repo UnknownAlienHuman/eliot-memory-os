@@ -2615,7 +2615,7 @@ where
     let transaction = match GenerationPackagePlanner::plan_with_published_profile_binding(
         input,
         &profile_selection,
-        source_publication.profile_governed_roots,
+        &source_publication.profile_governed_roots,
         source_publication.source_identity,
         source_publication.files,
         source_publication.evidence_digest,
@@ -2857,6 +2857,9 @@ fn run_installation_materialize_source_bundle(
         },
         profile_selection: profile_selection.clone(),
         transaction_id: cli_handle(transaction_id.clone(), "transaction_id")?,
+        // The materializer seam restates the selection's own staging root; it
+        // is the same admitted object, not a second independently-proved one.
+        staging_root: profile_selection.staging_root.clone(),
     };
     let receipt =
         match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {

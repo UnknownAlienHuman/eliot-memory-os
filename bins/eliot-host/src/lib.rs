@@ -4603,6 +4603,59 @@ impl HostJobBranches {
         launch
             .require_phase_b_live()
             .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        self.verify_relaunch_descriptor_bindings(launch, config_path, artifact, host)?;
+        let (_, store_working_directory) =
+            Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
+        // Issue #1775: an owned reconnect resolves the collision against the
+        // same approved identity as the fresh launch, so a foreign occupant
+        // produces the typed directive and an unreadable owner defers.
+        host_job_launch::ensure_store_endpoint_available(
+            &launch.canonical_store_arguments,
+            &host_job_launch::StoreEndpointOwnershipBinding {
+                installation: &host.installation,
+                generation,
+                state_fence: &launch.authority_state_fence,
+            },
+        )?;
+        let child = Self::launch(
+            &executable,
+            executable_lease,
+            &self.store_identity,
+            generation,
+            config_digest,
+            artifact,
+            config_path,
+            config_lease,
+            approved_executable_path,
+            approved_config_path,
+            config_pin,
+            host,
+            &launch.store_bridge_arguments,
+            &store_working_directory,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        Ok(child)
+    }
+
+    /// Proves every retained descriptor and lease the Store relaunch admits
+    /// still names the exact approved generation, before any child is created.
+    ///
+    /// The generation config, the Store bootstrap descriptor, the eliotd
+    /// Governor config and the eliotd launch descriptor are each bound to a
+    /// lease, re-read through it, and checked against the approved digest and
+    /// artifact. A lease that is absent, points somewhere other than the
+    /// approved path, or no longer reproduces the retained requirement is a
+    /// typed `ProcessContour` refusal, never a defaulted value.
+    fn verify_relaunch_descriptor_bindings(
+        &self,
+        launch: &RuntimeLaunchDescriptor,
+        config_path: &Path,
+        artifact: &PlatformHandle,
+        host: &HostInstallationEpoch,
+    ) -> Result<(), HostError> {
         let config_handle = PlatformHandle::new(config_path.to_string_lossy().into_owned())
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         launch
@@ -4653,41 +4706,7 @@ impl HostJobBranches {
             eliotd_descriptor_lease,
             &launch.eliotd_descriptor_digest,
             launch,
-        )?;
-        let (_, store_working_directory) =
-            Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
-        // Issue #1775: an owned reconnect resolves the collision against the
-        // same approved identity as the fresh launch, so a foreign occupant
-        // produces the typed directive and an unreadable owner defers.
-        host_job_launch::ensure_store_endpoint_available(
-            &launch.canonical_store_arguments,
-            &host_job_launch::StoreEndpointOwnershipBinding {
-                installation: &host.installation,
-                generation,
-                state_fence: &launch.authority_state_fence,
-            },
-        )?;
-        let child = Self::launch(
-            &executable,
-            executable_lease,
-            &self.store_identity,
-            generation,
-            config_digest,
-            artifact,
-            config_path,
-            config_lease,
-            approved_executable_path,
-            approved_config_path,
-            config_pin,
-            host,
-            &launch.store_bridge_arguments,
-            &store_working_directory,
-            None,
-            None,
-            None,
-            None,
-        )?;
-        Ok(child)
+        )
     }
 
     fn branch_state(
