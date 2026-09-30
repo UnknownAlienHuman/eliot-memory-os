@@ -212,16 +212,6 @@ pub enum EcxfCaptureGap {
     ExternalSourceIdentityEvidenceUnavailable,
     /// The adapter has no durable source-side ECXF export receipt.
     SourceExportReceiptUnavailable,
-    /// The capture point reads the schema generation and the canonical fence
-    /// only. `StateFence::resource_generation` is the generation relevant to one
-    /// decision, not the store's own generation, so it cannot stand in for it.
-    StoreResourceGenerationUnavailable,
-    /// The adapter declares no identity or version of its own, and a build
-    /// constant of the running binary is not an observation of the source store.
-    SourceAdapterIdentityUnavailable,
-    /// No owner declares the compression or encryption profile this export
-    /// applies; the emitted package's codecs are not read from the source store.
-    ExportProfileUnavailable,
 }
 
 /// Exact transaction observation available to the ECXF composition owner.
@@ -241,6 +231,11 @@ pub struct EcxfSourceCapture {
     pub state_fence: StateFence,
     /// Schema generation observed in that transaction.
     pub schema_generation: String,
+    /// The store's own generation identity, read from its `schema_meta` row in
+    /// that same transaction. Distinct from `schema_generation`: this is the
+    /// applied-migration identity the store records about itself, which is what
+    /// an `ECXF/1` store-generation fence member is checked against.
+    pub store_generation: String,
     /// Next commit sequence observed in that transaction.
     pub next_commit_sequence: u64,
     /// Next outbox sequence observed in that transaction.
@@ -793,6 +788,40 @@ fn captures_scope_column(ddl: &'static str) -> bool {
         .all(|table| ddl.contains(&format!("DEFINE FIELD scope_id ON {table} ")))
 }
 
+/// The row field carrying the admitted scope of one captured canonical row.
+///
+/// Named by reference to the single schema owner, which defines the column on
+/// every captured table. The value is written by the canonical write path from
+/// the transition's own admitted `ScopeId` (see `apply::atomic_write`), so it is
+/// the store's record of which scope a row belongs to rather than something this
+/// capture infers.
+const ROW_SCOPE_FIELD: &str = "scope_id";
+
+/// Closes the observed source set over the requested scope.
+///
+/// This is the proof that makes [`EcxfCaptureGap::RequestedScopeClosureUnproven`]
+/// closable, and it is deliberately a *per-row content* check rather than a
+/// statement that the baseline declares the column: the census predicate
+/// [`captures_scope_column`] only says the schema can carry a scope, while this
+/// function reads the scope the store actually recorded on every row and keeps
+/// only the rows that carry exactly the requested one.
+///
+/// A row whose recorded scope is absent is dropped along with a row of a
+/// different scope, never assumed to match. That is what makes the closure
+/// sound in both directions: a row of unknown or different scope is never
+/// delivered as though it belonged to this scope, and a row the store never
+/// attributed to any scope cannot enter a scoped export. Rows of other scopes
+/// are legitimately held by the store and are simply not part of this export.
+fn close_capture_over_scope(class_rows: &mut [Vec<Map<String, Value>>], requested: &ScopeId) {
+    for rows in class_rows.iter_mut() {
+        rows.retain(|row| {
+            row.get(ROW_SCOPE_FIELD)
+                .and_then(Value::as_str)
+                .is_some_and(|scope| scope == requested.as_str())
+        });
+    }
+}
+
 /// Reports whether the census captures any source erasure/purge ledger table.
 fn captures_purge_ledger() -> bool {
     captured_member_tables().any(|table| SOURCE_PURGE_LEDGER_TABLES.contains(&table))
@@ -818,17 +847,29 @@ fn captures_blob_residency() -> bool {
 /// The remaining entries are declared absences of *this owner*, and no baseline
 /// or census can close them:
 ///
+/// * the source purge ledger: the erasure tables are defined by the additive v3
+///   baseline, but the admitted generation is v2, whose baseline does not define
+///   them, and reading an undefined table inside the one `BEGIN`/`COMMIT` batch
+///   aborts the whole transaction. `verify_canonical_source_classes` refuses that
+///   pin rather than silently dropping the ledger, so the census cannot capture
+///   them until the bridge admits a generation that defines them;
+/// * blob residency reachability: the store holds no blob-residency column at
+///   all, and residency identity belongs to the blob owner, not to a table this
+///   census reads;
 /// * the Architecture source digest and the `NormativePair` identity receipt are
 ///   sealed by owners outside the store, so they are not columns any baseline
 ///   defines;
-/// * a source-side ECXF export receipt has no durable artifact anywhere;
-/// * the capture point reads the schema generation and the canonical fence, and
-///   `StateFence::resource_generation` is the generation relevant to one
-///   decision, not the store's own generation, so it cannot stand in for one;
-/// * this adapter declares no identity or version of its own, and a build
-///   constant of the running binary is not an observation of the source store;
-/// * no owner declares the compression or encryption profile this export
-///   applies, and the emitted package's codecs are not read from the store.
+/// * a source-side ECXF export receipt has no durable artifact anywhere.
+///
+/// Three former absences now have real owners and therefore no longer appear
+/// here. The store's own generation is read from its `schema_meta` row
+/// ([`store_generation_identity`]), so `StoreResourceGenerationUnavailable` is
+/// gone. This adapter declares its own contract identity
+/// ([`crate::ADAPTER_NAME`] and [`crate::ADAPTER_CONTRACT_VERSION`]), so
+/// `SourceAdapterIdentityUnavailable` is gone. And the compression/encryption
+/// profile is declared by the exporter that applies the codec
+/// (`eliot_backup::ExportSectionCodec`), not read from the source store, so
+/// `ExportProfileUnavailable` is gone.
 fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreError> {
     let Some(ddl) = admitted_generation_ddl(generation) else {
         return Err(StoreError::InvalidField {
@@ -846,13 +887,8 @@ fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreE
     if !captures_blob_residency() {
         gaps.push(EcxfCaptureGap::BlobStoreEvidenceUnavailable);
     }
-    gaps.extend([
-        EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
-        EcxfCaptureGap::SourceExportReceiptUnavailable,
-        EcxfCaptureGap::StoreResourceGenerationUnavailable,
-        EcxfCaptureGap::SourceAdapterIdentityUnavailable,
-        EcxfCaptureGap::ExportProfileUnavailable,
-    ]);
+    gaps.push(EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable);
+    gaps.push(EcxfCaptureGap::SourceExportReceiptUnavailable);
     Ok(gaps)
 }
 
@@ -976,9 +1012,20 @@ fn verify_canonical_source_classes(generation: &str) -> Result<(), StoreError> {
 }
 
 /// The schema-meta projection of the bound point.
+///
+/// `migration_id` and `migration_checksum_sha256` are the store's *own* durable
+/// record of the migration it applied, and they are read here from the same
+/// fixed transaction as the member batch. They are what an `ECXF/1` export's
+/// store-generation member is checked against: the store states which
+/// generation of itself it is, and this capture reports exactly that recorded
+/// value rather than re-deriving one. `StateFence::resource_generation` is a
+/// different thing entirely — the generation relevant to one admitted decision —
+/// so it is deliberately not substituted here.
 #[derive(Deserialize)]
 struct PointSchemaMeta {
     generation: String,
+    migration_id: String,
+    migration_checksum_sha256: String,
 }
 
 /// The canonical-fence projection of the bound point.
@@ -1002,6 +1049,9 @@ struct CapturePoint {
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
     schema_generation: String,
+    /// The store's own applied-migration identity, read from `schema_meta` in
+    /// the same transaction as the member batch. See [`PointSchemaMeta`].
+    store_generation: String,
 }
 
 /// Frozen per-capture state. No `Debug` impl by design: registry contents
@@ -1955,10 +2005,17 @@ fn parse_capture_point(
     meta: Option<PointSchemaMeta>,
     fence: Option<PointFence>,
 ) -> Result<CapturePoint, StoreError> {
-    let generation = meta.map(|meta| meta.generation).unwrap_or_default();
-    if generation.is_empty() || generation.chars().any(char::is_control) {
+    let Some(meta) = meta else {
+        return Err(StoreError::Unavailable);
+    };
+    if meta.generation.is_empty() || meta.generation.chars().any(char::is_control) {
         return Err(StoreError::Unavailable);
     }
+    // The store generation is the store's own recorded applied-migration
+    // identity, bound as one value so the two halves cannot be read from
+    // different rows. An absent or malformed pair is an unobserved point, never
+    // a synthesized generation.
+    let store_generation = store_generation_identity(&meta)?;
     let fence = fence.ok_or(StoreError::Unavailable)?;
     fence
         .state_fence
@@ -1968,8 +2025,41 @@ fn parse_capture_point(
         state_fence: fence.state_fence,
         next_commit_sequence: fence.next_commit_sequence,
         next_outbox_sequence: fence.next_outbox_sequence,
-        schema_generation: generation,
+        schema_generation: meta.generation,
+        store_generation,
     })
+}
+
+/// Binds the store's own generation identity from its `schema_meta` row.
+///
+/// The two recorded columns travel together because either alone is ambiguous:
+/// the migration id names *which* plan the store applied and the checksum
+/// proves *which bytes* of that plan it applied. Both are the store's own
+/// recorded values — nothing is recomputed, and no fence field is substituted
+/// for them — so an `ECXF/1` export's store-generation member is checkable
+/// against the source store's `schema_meta` row directly.
+fn store_generation_identity(meta: &PointSchemaMeta) -> Result<String, StoreError> {
+    if meta.migration_id.trim().is_empty() || meta.migration_id.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.migration_id",
+            reason: "the store's recorded migration id is not store-owned text",
+        });
+    }
+    if meta.migration_checksum_sha256.len() != 64
+        || meta
+            .migration_checksum_sha256
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.migration_checksum_sha256",
+            reason: "the store's recorded migration checksum is not a SHA-256 digest",
+        });
+    }
+    Ok(format!(
+        "{}@{}",
+        meta.migration_id, meta.migration_checksum_sha256
+    ))
 }
 
 /// Refuses a request whose claimed source is not this adapter's own admitted
@@ -2215,6 +2305,11 @@ pub async fn capture_ecxf_source(
     if point.state_fence != request.context.state_fence {
         return Err(StoreError::FenceMismatch);
     }
+    // Close the observed set over the requested scope BEFORE anything is
+    // projected out of it, so every typed record below is read from a row the
+    // store itself attributed to this scope.
+    let mut class_rows = class_rows;
+    close_capture_over_scope(&mut class_rows, &request.scope_id);
 
     // Projected from the rows this call already read, before they are consumed.
     let (revision_heads, ordering_heads) = observed_heads(&class_rows, &point)?;
@@ -2248,6 +2343,7 @@ pub async fn capture_ecxf_source(
         scope_id: request.scope_id.clone(),
         state_fence: point.state_fence,
         schema_generation: point.schema_generation,
+        store_generation: point.store_generation,
         next_commit_sequence: point.next_commit_sequence,
         next_outbox_sequence: point.next_outbox_sequence,
         source_classes,

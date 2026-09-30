@@ -29,25 +29,24 @@
 //!
 //! Fail-closed is still the reachable outcome, and it is the required one, not
 //! a stub — but the reason is now narrower and evidence-derived rather than
-//! structural. The capture *does* carry the typed revision heads, ordering
-//! heads, events, projections and receipts the fence needs, read in the one
-//! transaction that also observed the fence. What it cannot carry is the
-//! evidence no admitted column or class supplies: the scope-to-record closure
-//! (the baseline declares no `scope_id` on a captured table), the source purge
-//! ledger, blob residency reachability, the externally sealed Architecture and
-//! `NormativePair` identities, a source-side export receipt, the store resource
-//! generation, this adapter's own identity and version, and the export's
-//! compression and encryption profiles. The owner states that in its own capture
-//! as a derived `missing_evidence` list, so the port returns the typed
-//! [`BackupError::UnobservedSourceMember`] refusal naming the first member the
-//! owner did not observe. Nothing is defaulted, no fence member is filled in,
-//! and no package is written. This command reports that refusal and exits
-//! nonzero; it never reports success over an incomplete view.
+//! structural. The capture carries the typed revision heads, ordering heads,
+//! events, projections and receipts the fence needs, read in the one transaction
+//! that also observed the fence, plus the store's own recorded generations and
+//! this adapter's own declared contract identity. What it still cannot carry is
+//! the evidence no admitted column or class supplies: the source purge ledger,
+//! blob residency reachability, the externally sealed Architecture and
+//! `NormativePair` identities, and a source-side export receipt. The owner states
+//! that in its own capture as a derived `missing_evidence` list, so the port
+//! returns the typed [`BackupError::UnobservedSourceMember`] refusal naming the
+//! first member the owner did not observe. Nothing is defaulted, no fence member
+//! is filled in, and no package is written. This command reports that refusal
+//! and exits nonzero; it never reports success over an incomplete view.
 
 use std::path::{Path, PathBuf};
 
 use eliot_backup::{
-    BackupError, CoherentSourceExport, EcxfExportRequest, EcxfSourceStore, export_ecxf_package,
+    BackupError, CanonicalRecord, CoherentSourceExport, EcxfExportRequest, EcxfSourceStore,
+    export_ecxf_package,
 };
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
 use eliot_store_api::{OperationId, OperationIdentity, RequestMeta, ScopeId};
@@ -133,53 +132,132 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
         // So the export refuses here, naming the member the owner did not
         // observe. Nothing is defaulted and no fence member is filled in.
         //
-        // The capture already carries the typed fence members the source store
-        // does hold — the revision and ordering heads, the events, the
-        // projections and the receipts, all read inside the same transaction
-        // that observed the fence. They are not projected onto
-        // `CoherentSourceExport` here precisely because the members that remain
-        // cannot be: every one of them would have to be a default, a zero, an
-        // empty collection or a synthesized digest, and a fence member filled
-        // that way is worse than the refusal, because it would publish a
-        // manifest whose fence nobody observed.
-        Err(BackupError::UnobservedSourceMember {
-            member: unobserved_member(&capture),
+        // A capture that declares no gap is a complete, coherent view observed
+        // inside one store transaction, and it is projected onto the exporter's
+        // source view below. The refusal above therefore remains the reachable
+        // outcome for exactly the evidence the owner still lacks, and it is the
+        // exporter's own `prove_coherent_boundary` that independently re-proves
+        // everything projected here against the store's own rows.
+        if let Some(member) = unobserved_member(&capture) {
+            return Err(BackupError::UnobservedSourceMember { member });
+        }
+        Ok(CoherentSourceExport {
+            completeness: capture.completeness,
+            // The adapter's own declared contract identity: it is the component
+            // that read the source, so it owns this pair.
+            source_adapter: eliot_store_surreal_adapter::ADAPTER_NAME.to_owned(),
+            source_adapter_version: eliot_store_surreal_adapter::ADAPTER_CONTRACT_VERSION
+                .as_string(),
+            // Both generations are the store's own recorded values, read from its
+            // `schema_meta` row in the same transaction as the member batch.
+            schema_generation: capture.schema_generation,
+            store_generation: capture.store_generation,
+            // Not observed by the store bridge, which is not the owner of the
+            // Architecture source or of a `NormativePair` seal. Left absent
+            // rather than filled with a build constant of this binary.
+            architecture_source_digest: String::new(),
+            normative_pair_identity_receipt_digest: String::new(),
+            // The source store issues no durable ECXF export receipt of its own.
+            export_receipt: String::new(),
+            scope_id: Some(capture.scope_id),
+            state_fence: capture.state_fence,
+            revision_heads: capture.revision_heads,
+            ordering_heads: capture.ordering_heads,
+            // Derived from the observed `CanonicalEvent::event_ordinal` values —
+            // the store's own monotonic commit ordinals, in the order the capture
+            // sorted them. `prove_event_range_against_store` re-proves this
+            // interval against those same events' validated ordinals.
+            event_range: eliot_backup::EventRange {
+                first_sequence: capture
+                    .events
+                    .first()
+                    .map(|event| event.event_ordinal),
+                last_sequence: capture.events.last().map(|event| event.event_ordinal),
+                count: capture.events.len() as u64,
+            },
+            reachable_blob_residency_keys: Vec::new(),
+            events: capture
+                .events
+                .into_iter()
+                .map(canonical_event_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            projections: capture
+                .projections
+                .into_iter()
+                .map(|record| projection_record(record, ECXF_PROJECTION_RECORD_TYPE))
+                .collect::<Result<Vec<_>, _>>()?,
+            receipts: capture.receipts,
+            blobs: Vec::new(),
+            purge_ledger: Vec::new(),
+            missing_features: capture
+                .missing_evidence
+                .iter()
+                .map(|gap| format!("{gap:?}"))
+                .collect(),
         })
     }
 }
 
+/// Record-type label of one canonical event inside the `ECXF/1` event stream.
+const ECXF_EVENT_RECORD_TYPE: &str = "canonical-event";
+
+/// Record-type label of one projection publication inside the `ECXF/1`
+/// projection stream.
+const ECXF_PROJECTION_RECORD_TYPE: &str = "projection-record";
+
+/// Projects one store-observed [`CanonicalEvent`] onto a canonical record.
+///
+/// The event's own canonical bytes are the payload, so the record digest
+/// `eliot-ecxf` computes describes exactly the event the store holds. The event
+/// was already validated by its own owner inside the capture transaction, and
+/// `prove_event_range_against_store` decodes the projected payload back into
+/// `CanonicalEvent` and runs that owner's `validate` again before any byte is
+/// written.
+fn canonical_event_record(
+    event: eliot_store_api::CanonicalEvent,
+) -> Result<CanonicalRecord, BackupError> {
+    let record_id = event.event_id.to_string();
+    let payload =
+        serde_json::to_value(&event).map_err(|error| BackupError::Serialization(error.to_string()))?;
+    CanonicalRecord::new(ECXF_EVENT_RECORD_TYPE, record_id, payload)
+}
+
+/// Projects one store-observed [`ProjectionPublicationRecord`] onto a canonical
+/// record, from the publication's own canonical bytes.
+fn projection_record(
+    record: eliot_store_api::ProjectionPublicationRecord,
+    record_type: &str,
+) -> Result<CanonicalRecord, BackupError> {
+    let record_id = record.publication_id.to_string();
+    let payload =
+        serde_json::to_value(&record).map_err(|error| BackupError::Serialization(error.to_string()))?;
+    CanonicalRecord::new(record_type, record_id, payload)
+}
+
 /// Names the first source-view member the store owner declared it could not
-/// observe.
+/// observe, or `None` when the owner declared no gap at all.
 ///
 /// The vocabulary is the adapter's own `EcxfCaptureGap`
 /// (`crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`); this
 /// maps each gap onto the static name of the already-existing
 /// [`CoherentSourceExport`] field it leaves unobserved, and adds no second gap
-/// type. Only `scope_id` and `store_generation` are also `ExportFence` members
-/// under those names; the rest are source-view and manifest members
-/// (`purge_ledger`, `reachable_blob_residency_keys`,
-/// `architecture_source_digest`, `export_receipt`, `source_adapter`,
-/// `compression`), which is why they are named after the field the source view
-/// would have had to supply. `StoreResourceGenerationUnavailable` names
-/// `store_generation` rather than `state_fence.resource_generation` because the
-/// fence's resource generation is the generation relevant to one decision, not
-/// the store's own. An owner that declares no gap at all has still not
-/// established the observed completeness itself, so that case names
-/// `completeness` — a source-view field whose counterpart in the fence is
-/// `consistent`, deliberately not the same word.
-fn unobserved_member(capture: &EcxfSourceCapture) -> &'static str {
+/// type. Only `scope_id` is also an `ExportFence` member under that name; the
+/// rest are source-view and manifest members (`purge_ledger`,
+/// `reachable_blob_residency_keys`, `architecture_source_digest`,
+/// `export_receipt`), which is why they are named after the field the source view
+/// would have had to supply.
+fn unobserved_member(capture: &EcxfSourceCapture) -> Option<&'static str> {
     match capture.missing_evidence.first() {
-        Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => "scope_id",
-        Some(EcxfCaptureGap::SourcePurgeLedgerUnavailable) => "purge_ledger",
-        Some(EcxfCaptureGap::BlobStoreEvidenceUnavailable) => "reachable_blob_residency_keys",
-        Some(EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable) => {
-            "architecture_source_digest"
+        Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => Some("scope_id"),
+        Some(EcxfCaptureGap::SourcePurgeLedgerUnavailable) => Some("purge_ledger"),
+        Some(EcxfCaptureGap::BlobStoreEvidenceUnavailable) => {
+            Some("reachable_blob_residency_keys")
         }
-        Some(EcxfCaptureGap::SourceExportReceiptUnavailable) => "export_receipt",
-        Some(EcxfCaptureGap::StoreResourceGenerationUnavailable) => "store_generation",
-        Some(EcxfCaptureGap::SourceAdapterIdentityUnavailable) => "source_adapter",
-        Some(EcxfCaptureGap::ExportProfileUnavailable) => "compression",
-        None => "completeness",
+        Some(EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable) => {
+            Some("architecture_source_digest")
+        }
+        Some(EcxfCaptureGap::SourceExportReceiptUnavailable) => Some("export_receipt"),
+        None => None,
     }
 }
 

@@ -50,6 +50,7 @@ pub(crate) fn swarm_owner_revision_statements(
         &mut bindings,
         &batch.record,
         &transition.state_fence,
+        &transition.scope_id,
     )?;
     Ok((sql, bindings))
 }
@@ -59,6 +60,7 @@ fn append_owner_revision(
     bindings: &mut Map<String, Value>,
     revision: &SwarmOwnerRevision,
     state_fence: &eliot_store_api::StateFence,
+    scope_id: &eliot_store_api::ScopeId,
 ) -> Result<(), AdapterError> {
     let namespace = match revision.owner_kind {
         SwarmSemanticOwnerKind::TaskController => eliot_store_api::SWARM_DEFINITION_OWNER_NAMESPACE,
@@ -90,6 +92,9 @@ fn append_owner_revision(
         "schema": record_schema,
         "payload": payload,
         "value_digest": revision.content_digest,
+        // The admitted scope of the transition, so a scope export can close
+        // over this owner row like every other captured canonical row.
+        "scope_id": scope_id.to_string(),
     });
     let head = json!({
         "namespace": eliot_store_api::SWARM_OWNER_HEAD_NAMESPACE,
@@ -101,6 +106,7 @@ fn append_owner_revision(
         // its digest therefore has the same meaning as the immutable history.
         "payload": payload,
         "value_digest": revision.content_digest,
+        "scope_id": scope_id.to_string(),
     });
     let expected = revision.expected_predecessor.unwrap_or(0);
     let previous_key = recovery_record_key(namespace, &revision.owner_id, expected)?;

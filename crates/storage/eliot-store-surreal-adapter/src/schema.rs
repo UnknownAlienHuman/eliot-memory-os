@@ -248,7 +248,51 @@ DEFINE FIELD value_digest ON recovery_job TYPE string;
 DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
 ";
 
-pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
+/// Additive v1-to-v2 migration body: the recovery tables plus the scope column
+/// on every captured canonical table.
+///
+/// Issue #1871: a scope-bounded `ECXF/1` export can only close over the records
+/// of its requested scope if the store records which scope each row belongs to.
+/// The scope column is therefore introduced here, so the generation chain stays
+/// exactly additive: the first-generation baseline is untouched (its recorded
+/// SHA-256 is pinned), and the v2 baseline is the v1 baseline plus this delta.
+///
+/// The values themselves are written by the canonical write path from the
+/// admitted transition's own `ScopeId`, so this delta declares where the scope
+/// is recorded without deciding what any particular row's scope is. It declares
+/// no table, so the delta remains a pure column addition over the recovery
+/// tables it creates alongside it.
+pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = r"
+DEFINE TABLE recovery_owner SCHEMALESS;
+DEFINE FIELD namespace ON recovery_owner TYPE string;
+DEFINE FIELD key ON recovery_owner TYPE string;
+DEFINE FIELD state_fence ON recovery_owner TYPE object;
+DEFINE FIELD revision ON recovery_owner TYPE int;
+DEFINE FIELD schema ON recovery_owner TYPE string;
+DEFINE FIELD payload ON recovery_owner TYPE bytes;
+DEFINE FIELD value_digest ON recovery_owner TYPE string;
+DEFINE INDEX ro_namespace_key ON recovery_owner FIELDS namespace, key UNIQUE;
+
+DEFINE TABLE recovery_job SCHEMALESS;
+DEFINE FIELD namespace ON recovery_job TYPE string;
+DEFINE FIELD key ON recovery_job TYPE string;
+DEFINE FIELD state_fence ON recovery_job TYPE object;
+DEFINE FIELD revision ON recovery_job TYPE int;
+DEFINE FIELD schema ON recovery_job TYPE string;
+DEFINE FIELD payload ON recovery_job TYPE bytes;
+DEFINE FIELD value_digest ON recovery_job TYPE string;
+DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
+
+DEFINE FIELD scope_id ON write_receipt TYPE string;
+DEFINE FIELD scope_id ON revision_head TYPE string;
+DEFINE FIELD scope_id ON ordering_head TYPE string;
+DEFINE FIELD scope_id ON canonical_event TYPE string;
+DEFINE FIELD scope_id ON projection_record TYPE string;
+DEFINE FIELD scope_id ON relation_record TYPE string;
+DEFINE FIELD scope_id ON outbox_event TYPE string;
+DEFINE FIELD scope_id ON recovery_owner TYPE string;
+DEFINE FIELD scope_id ON recovery_job TYPE string;
+";
 
 /// Erasure intent/outcome tables (688-B). Additive delta applied on top of a
 /// v2 baseline: `erasure_intent` carries the exact durable intent row bound by
@@ -469,6 +513,15 @@ DEFINE FIELD schema ON recovery_job TYPE string;
 DEFINE FIELD payload ON recovery_job TYPE bytes;
 DEFINE FIELD value_digest ON recovery_job TYPE string;
 DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
+DEFINE FIELD scope_id ON write_receipt TYPE string;
+DEFINE FIELD scope_id ON revision_head TYPE string;
+DEFINE FIELD scope_id ON ordering_head TYPE string;
+DEFINE FIELD scope_id ON canonical_event TYPE string;
+DEFINE FIELD scope_id ON projection_record TYPE string;
+DEFINE FIELD scope_id ON relation_record TYPE string;
+DEFINE FIELD scope_id ON outbox_event TYPE string;
+DEFINE FIELD scope_id ON recovery_owner TYPE string;
+DEFINE FIELD scope_id ON recovery_job TYPE string;
 ";
 
 /// Third-generation full schema: every v2 table verbatim plus the two
@@ -539,6 +592,15 @@ DEFINE FIELD schema ON recovery_job TYPE string;
 DEFINE FIELD payload ON recovery_job TYPE bytes;
 DEFINE FIELD value_digest ON recovery_job TYPE string;
 DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
+DEFINE FIELD scope_id ON write_receipt TYPE string;
+DEFINE FIELD scope_id ON revision_head TYPE string;
+DEFINE FIELD scope_id ON ordering_head TYPE string;
+DEFINE FIELD scope_id ON canonical_event TYPE string;
+DEFINE FIELD scope_id ON projection_record TYPE string;
+DEFINE FIELD scope_id ON relation_record TYPE string;
+DEFINE FIELD scope_id ON outbox_event TYPE string;
+DEFINE FIELD scope_id ON recovery_owner TYPE string;
+DEFINE FIELD scope_id ON recovery_job TYPE string;
 
 DEFINE TABLE erasure_intent SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_intent TYPE string;
