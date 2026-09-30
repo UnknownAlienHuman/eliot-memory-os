@@ -205,6 +205,9 @@ pub(crate) use daemon_kernel_client::{
 };
 pub use daemon_kernel_client::{parse_local_read_claimed_pair, parse_local_read_submit_outcome};
 pub use daemon_kernel_client::{
+    StateSubmitOutcome, parse_state_claimed_pair, parse_state_submit_outcome,
+};
+pub use daemon_kernel_client::{
     parse_observe_claimed_pair, parse_observe_defer_outcome, parse_observe_submit_outcome,
 };
 pub(crate) use daemon_kernel_port_adapters::kind_value;
