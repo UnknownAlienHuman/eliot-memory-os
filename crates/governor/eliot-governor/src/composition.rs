@@ -406,6 +406,20 @@ pub struct PendingCanonicalRevocation {
     pub phase: CanonicalRevocationPhase,
 }
 
+/// The admitted canonical identity one grant-revocation saga commits under.
+///
+/// The operation identity, the canonical operation id and the canonical
+/// request identity are one indivisible admission: they are composed together
+/// by the caller from admitted ingress and are never derived from the durable
+/// closure. They travel as one value so the prepare step cannot be handed a
+/// mixture of two different operations.
+#[derive(Clone, Copy, Debug)]
+struct CanonicalRevocationCommit<'a> {
+    canonical_operation_id: &'a OperationId,
+    canonical_request_identity: &'a RequestIdentity,
+    operation: &'a RevocationOperationIdentity,
+}
+
 /// Internal carrier for a canonical-phase refusal: which phase failed and the
 /// typed error to report. Never surfaced directly; the composition retains the
 /// matching [`PendingCanonicalRevocation`] first.
@@ -8146,9 +8160,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .reconcile_canonical_revocation(
                 request,
                 &authority_receipt,
-                canonical_operation_id,
-                canonical_request_identity,
-                operation,
+                &CanonicalRevocationCommit {
+                    canonical_operation_id,
+                    canonical_request_identity,
+                    operation,
+                },
                 durable_link,
                 closure_source,
             )
@@ -8193,9 +8209,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &mut self,
         request: &GrantRevocationRequest,
         authority_receipt: &AuthorityRevocationReceipt,
-        canonical_operation_id: &OperationId,
-        canonical_request_identity: &RequestIdentity,
-        operation: &RevocationOperationIdentity,
+        commit: &CanonicalRevocationCommit<'_>,
         durable_link: &L,
         closure_source: &C,
     ) -> Result<AuthorityRevocationReconciliation, PendingCanonicalHandoff> {
@@ -8215,7 +8229,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || closure.declaration.target_grant_id != request.grant_id.as_str()
             || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
             || closure.authority.state_fence != request.binding.state_fence
-            || canonical_request_identity.request.metadata.state_fence
+            || commit
+                .canonical_request_identity
+                .request
+                .metadata
+                .state_fence
                 != closure.authority.state_fence
         {
             return Err(PendingCanonicalHandoff {
@@ -8243,17 +8261,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // the canonical revocation transition over the SAME target and
         // closure and proves that its own origin-bound re-derivation binds
         // the durable declaration this saga is about to commit.
-        self.prepare_revocation_transition_for_commit(
-            request,
-            &closure,
-            canonical_operation_id,
-            canonical_request_identity,
-            operation,
-        )
-        .map_err(|error| PendingCanonicalHandoff {
-            phase: CanonicalRevocationPhase::ClosureReadback,
-            error,
-        })?;
+        self.prepare_revocation_transition_for_commit(request, &closure, commit)
+            .map_err(|error| PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::ClosureReadback,
+                error,
+            })?;
         // The Kernel already fenced the complete declared closure. Fence the
         // exact same declared members in this projection so an already-issued
         // narrower descendant cannot keep reading an effective right out of the
@@ -8270,8 +8282,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             })?;
         self.owners.authority.invalidate_owner_hydrations();
         let envelope = authority_revocation_envelope_from_closure(
-            canonical_request_identity,
-            canonical_operation_id,
+            commit.canonical_request_identity,
+            commit.canonical_operation_id,
             &closure,
         )
         .map_err(|error| PendingCanonicalHandoff {
@@ -8279,7 +8291,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             error,
         })?;
         let canonical_receipt = self
-            .commit_canonical(canonical_request_identity, envelope)
+            .commit_canonical(commit.canonical_request_identity, envelope)
             .await
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::CanonicalCommit,
@@ -8399,9 +8411,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         request: &GrantRevocationRequest,
         closure: &GrantClosureReceipt,
-        canonical_operation_id: &OperationId,
-        canonical_request_identity: &RequestIdentity,
-        operation: &RevocationOperationIdentity,
+        commit: &CanonicalRevocationCommit<'_>,
     ) -> Result<(), CompositionError> {
         let origin = RevocationOrigin::Grant(request.grant_id.clone());
         let prepared = self
@@ -8411,15 +8421,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .prepare_revocation_transition(
                 &origin,
                 &RevocationTransitionRequest {
-                    operation_id: canonical_operation_id.as_str().to_owned(),
-                    idempotency_key: canonical_request_identity.idempotency_key.clone(),
+                    operation_id: commit.canonical_operation_id.as_str().to_owned(),
+                    idempotency_key: commit.canonical_request_identity.idempotency_key.clone(),
                     snapshot_id: request.snapshot_id.clone(),
                     state_fence: closure.authority.state_fence.clone(),
                     bounds: RevocationBounds::default_bounds(),
                     reason: RevocationReason::SourceRevoked,
                     disposition: RevocationTransitionDisposition::Prepared,
                     write_receipt: None,
-                    operation: operation.clone(),
+                    operation: commit.operation.clone(),
                 },
                 None,
             )
