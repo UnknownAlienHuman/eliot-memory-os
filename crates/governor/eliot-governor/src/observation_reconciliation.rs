@@ -36,13 +36,20 @@
 //!   name against its admitted `ProblemOwner` revisions and requires exactly
 //!   one match: zero matches (unknown problem) and several matches
 //!   (ambiguous binding) both fail closed without a commit;
-//! - domain legality on scratch copies only: the verification is admitted to
-//!   a cloned journal through [`ObservationJournal::admit`] (same key plus
-//!   same bytes replays, changed bytes conflict), and a scratch
-//!   [`Problem`](eliot_problem::Problem) assembled in `Verifying` state at
-//!   the expected revision is transitioned to `Resolved` through
-//!   [`Problem::transition`](eliot_problem::Problem::transition). Neither
-//!   scratch result is published; revision bumps are never hand-rolled.
+//! - domain legality on a scratch copy only: the verification is admitted to a
+//!   cloned journal through [`ObservationJournal::admit`] (same key plus same
+//!   bytes replays, changed bytes conflict). The scratch result is never
+//!   published.
+//!
+//! The Problem/Incident record itself is deliberately *not* re-simulated here
+//! (see "Named prerequisite" below). A `Problem` can only carry a live owner
+//! through an [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease),
+//! and this composition holds none, so any record synthesized here would have
+//! to invent one. It also could not assert the edge it used to assert:
+//! `Verifying -> Resolved` is refused as a bare
+//! [`Problem::transition`](eliot_problem::Problem::transition) and is reachable
+//! only through [`Problem::resolve`](eliot_problem::Problem::resolve) against
+//! the record's own pre-fixed `expected_resolution` set.
 //!
 //! Canonical persistence is two sequential commits through
 //! [`CanonicalAdmissionOwner::commit`]:
@@ -90,9 +97,9 @@
 //! compiling): request-identity, fence, and operation-identity mismatches are
 //! [`CompositionError::Provider`]; every other deterministic admission
 //! refusal — false verification, unknown/ambiguous problem binding, empty or
-//! invalid evidence, scratch legality failure, journal conflict, malformed
-//! store receipt — is [`CompositionError::Owner`]. Detail strings name the
-//! refused property; they are diagnostics, never control flow.
+//! invalid evidence, non-candidate supervision signal, journal conflict,
+//! malformed store receipt — is [`CompositionError::Owner`]. Detail strings
+//! name the refused property; they are diagnostics, never control flow.
 //!
 //! Honest gaps: the `problem:{problem_id}` revision-head key namespace is a
 //! Governor-to-Store compare-and-swap contract proposal owned by the store
@@ -100,6 +107,34 @@
 //! interim binding until the lineaged epoch migration (T6/#64) lands. No
 //! verifier is implemented here and no repair is executed: endorsement
 //! consumes evidence produced outside the effect executor.
+//!
+//! Named prerequisite (#1759) — **no production
+//! [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists in this
+//! tree.** The trait is declared in `eliot-problem/src/ownership.rs` and its
+//! only implementation anywhere is a `#[cfg(test)]` issuer inside that crate's
+//! own unit tests, so
+//! [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease) is
+//! unreachable from `eliot-governor`. This Governor holds problem identities
+//! and revisions only (`ProblemOwner` is a `BTreeMap<String, u64>`), never
+//! records and never leases. Consequently the
+//! two Problem/Incident scratch probes that used to live here — a
+//! `Verifying -> Resolved` probe and a watchdog-gap `Candidate` Incident probe,
+//! both built from a literal `owner: OwnerRef { principal: GOVERNOR_SCOPE_ID }`
+//! — have been removed rather than re-pointed at a self-named principal.
+//! Naming yourself the owner is not ownership, and a scratch that asserted it
+//! proved only that the Governor's own literal was well formed.
+//!
+//! What still gates both paths is unchanged and is checked against real
+//! admitted state: exact problem binding (zero and ambiguous matches both
+//! refuse), non-empty deduplicated verifier evidence, `endorse` against the
+//! projected fence echo, and the `problem:{problem_id}` compare-and-swap
+//! revision head carried by `recovery_envelope`. What is genuinely missing
+//! and named rather than stubbed: closing the bound Problem needs
+//! `Problem::resolve` with a `ClosureEvidence` whose verifier is independent
+//! of the current owner and whose `verified_observables` cover the record's
+//! pre-fixed `expected_resolution`, and raising any Problem or Incident needs
+//! an `AuthenticatedOwnerLease` from a real issuer. Both belong to the lease
+//! owner and the Problem owner respectively, not to this Governor.
 
 #![forbid(unsafe_code)]
 
@@ -119,9 +154,8 @@ use eliot_observation::{
 };
 use eliot_observation_contracts::{MaintenanceRecord, MaintenanceResultV1};
 use eliot_problem::{
-    DeliveryState, Incident, IncidentId, IncidentReason, IncidentReviewRequest, IncidentState,
-    OwnerRef, Problem, ProblemId, ProblemState, Signal, SignalAttribution, SignalDisposition,
-    SignalId, SignalProcessingState, SignalSeverity,
+    DeliveryState, Signal, SignalAttribution, SignalDisposition, SignalId, SignalProcessingState,
+    SignalSeverity,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
@@ -344,57 +378,6 @@ fn verification_submission(
         task_selection: None,
         evidence: None,
     })
-}
-
-/// Proves the `Verifying -> Resolved` edge is legal for the bound problem
-/// through the production domain entry point on a scratch copy. The scratch
-/// problem is discarded; its revision is never written back.
-fn check_problem_transition(
-    fence: &StateFence,
-    problem_id: &str,
-    expected_revision: u64,
-    attempt_digest: &str,
-    effect_digest: &str,
-    evidence_refs: &[String],
-) -> Result<(), CompositionError> {
-    let mut evidence = Vec::with_capacity(evidence_refs.len());
-    for reference in evidence_refs {
-        evidence.push(
-            eliot_contracts::ArtifactId::new(reference)
-                .map_err(|error| owner_refused(error.to_string()))?,
-        );
-    }
-    let mut scratch = Problem {
-        problem_id: ProblemId::new(problem_id).map_err(|error| owner_refused(error.to_string()))?,
-        signal_refs: vec![
-            SignalId::new(format!("doctor-attempt:{attempt_digest}"))
-                .map_err(|error| owner_refused(error.to_string()))?,
-        ],
-        title: format!("verified doctor repair for {problem_id}"),
-        scope_id: GOVERNOR_SCOPE_ID.to_owned(),
-        owner: OwnerRef {
-            principal: GOVERNOR_SCOPE_ID.to_owned(),
-            generation: fence.resource_generation.value().to_string(),
-        },
-        state: ProblemState::Verifying,
-        evidence_refs: evidence,
-        resolution_condition: format!("independent verification of effect {effect_digest}"),
-        acknowledged_by: None,
-        state_fence: fence.clone(),
-        revision: expected_revision,
-        reopen_count: 0,
-    };
-    scratch.validate().map_err(|error| {
-        owner_refused(format!(
-            "verified problem scratch state is not admissible: {error}"
-        ))
-    })?;
-    scratch
-        .transition(fence, ProblemState::Resolved)
-        .map_err(|error| {
-            owner_refused(format!("verified problem cannot legally resolve: {error}"))
-        })?;
-    Ok(())
 }
 
 /// Builds the observation-leg envelope under the derived child operation
@@ -1015,14 +998,22 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         })
     }
 
-    /// Admits the verification to a scratch journal clone and proves the
-    /// `Verifying -> Resolved` edge is legal, without publishing authority.
+    /// Admits the verification to a scratch journal clone, without publishing
+    /// authority.
+    ///
+    /// The scratch journal is the only thing proved legal here. The bound
+    /// `Problem` is not re-simulated: this composition holds no Problem record
+    /// and no `AuthenticatedOwnerLease`, and the `Verifying -> Resolved` edge it
+    /// used to assert is refused as a bare `Problem::transition` and is
+    /// reachable only through `Problem::resolve` against the record's own
+    /// pre-fixed `expected_resolution` set. That closure is the Problem owner's
+    /// decision on independent evidence, not the Governor's; the named
+    /// prerequisite is in the module documentation.
     fn admit_scratch_observation(
         &self,
         operation_id: &OperationId,
         identity: &eliot_protocol::RequestIdentity,
         report: &VerificationReport,
-        verified: &IndependentVerification,
         binding: &ResolvedDoctorBinding,
     ) -> Result<ScratchAdmittedLeg, CompositionError> {
         let submission = verification_submission(
@@ -1052,14 +1043,6 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
                 )));
             }
         };
-        check_problem_transition(
-            &identity.request.metadata.state_fence,
-            &binding.problem_id,
-            binding.expected_revision,
-            verified.attempt().digest(),
-            verified.effect().digest(),
-            &binding.evidence_refs,
-        )?;
         Ok(ScratchAdmittedLeg {
             submission,
             observation_record_id: observation_receipt.record_id,
@@ -1669,12 +1652,30 @@ fn watchdog_submission(
     })
 }
 
-/// Proves a gap-like entry yields a `ProblemCandidate` signal and a legal
-/// `Open -> Triaged` problem edge on scratch copies only. Severity is fixed
-/// `Info` and the transition target is fixed to `Triaged`: an incident is
-/// never self-certified here. The same Signal may record an Incident review
-/// request, which leaves the Incident a `Candidate` (see
-/// [`check_incident_review_only`]).
+/// Proves a gap-like entry yields a `ProblemCandidate` signal, and nothing more.
+///
+/// This is the whole of the watchdog's authority over a gap. A coverage gap is
+/// an *observation* the watchdog supplies, not a canonical Problem and not
+/// Incident authority, so no `Problem`/`Incident` record is synthesized here.
+/// Doing so would have required naming an owner — the literal this function
+/// used to build asserted `owner: OwnerRef { principal: GOVERNOR_SCOPE_ID }`,
+/// which is the self-certification #1759 removes and which this composition
+/// cannot now express anyway (see the named prerequisite in the module
+/// documentation). The synthetic `Problem` proved only that the Governor's own
+/// literal was well formed, and the synthetic Incident review request named a
+/// `source_problem` that was never raised, which is exactly the nonexistent-ID
+/// link the issue forbids.
+///
+/// What remains is checked against the real admitted Signal and is the
+/// property the removed scratches stood in for. `PromotionAuthority` has
+/// exactly two variants, `DeterministicPolicy { rule_id }` and
+/// `AuthorizedHuman { decision_ref }`, and a supervision gap supplies neither:
+/// its `rule_id` names the observation rule that fired, not an admitted
+/// Incident policy decision, and `Suspected` attribution is by definition a
+/// hypothesis rather than a finding. So the three axes are required together —
+/// a `ProblemCandidate` disposition, a severity that is not
+/// `IncidentCandidate`, and `Suspected` attribution — and any promotion stays
+/// with the authority that actually holds one.
 fn check_watchdog_gap_candidate(
     fence: &StateFence,
     batch_id: &str,
@@ -1689,13 +1690,13 @@ fn check_watchdog_gap_candidate(
     ))
     .map_err(|error| owner_refused(error.to_string()))?;
     let signal = Signal {
-        signal_id: signal_id.clone(),
+        signal_id,
         rule_id: "watchdog-spool-gap".to_owned(),
         severity: SignalSeverity::Info,
         subject: format!("watchdog spool gap sequence {}", entry.sequence),
         scope_id: GOVERNOR_SCOPE_ID.to_owned(),
         observed_at: ClockReading::default(),
-        evidence_handles: vec![evidence.clone()],
+        evidence_handles: vec![evidence],
         observation: None,
         attribution: SignalAttribution::Suspected,
         processing_state: SignalProcessingState::Observed,
@@ -1718,106 +1719,10 @@ fn check_watchdog_gap_candidate(
             "watchdog gap signal must stay a non-incident problem candidate".to_owned(),
         ));
     }
-    let mut scratch = Problem {
-        problem_id: ProblemId::new(format!(
-            "watchdog-gap-problem:{batch_id}:{}",
-            entry.sequence
-        ))
-        .map_err(|error| owner_refused(error.to_string()))?,
-        signal_refs: vec![signal_id],
-        title: format!(
-            "watchdog coverage gap candidate batch {batch_id} sequence {}",
-            entry.sequence
-        ),
-        scope_id: GOVERNOR_SCOPE_ID.to_owned(),
-        owner: OwnerRef {
-            principal: GOVERNOR_SCOPE_ID.to_owned(),
-            generation: fence.resource_generation.value().to_string(),
-        },
-        state: ProblemState::Open,
-        evidence_refs: vec![evidence],
-        resolution_condition: format!("watchdog recovery observed for sequence {}", entry.sequence),
-        acknowledged_by: None,
-        state_fence: fence.clone(),
-        revision: 1,
-        reopen_count: 0,
-    };
-    scratch.validate().map_err(|error| {
-        owner_refused(format!(
-            "watchdog gap problem scratch state is not admissible: {error}"
-        ))
-    })?;
-    scratch
-        .transition(fence, ProblemState::Triaged)
-        .map_err(|error| {
-            owner_refused(format!(
-                "watchdog gap problem cannot legally become a candidate: {error}"
-            ))
-        })?;
-    check_incident_review_only(fence, batch_id, entry, &signal, &scratch)
-}
-
-/// Proves a supervision Signal can request Incident review but cannot open one.
-///
-/// The Signal is the evidence: the request is built from `signal`'s own
-/// severity and evidence handles, so it is refused if it restates anything the
-/// Signal did not carry. After the request is recorded the Incident must still
-/// be a `Candidate` with no committed promotion — the model-derived severity
-/// names no `PromotionAuthority`, so nothing here reaches `Open`.
-fn check_incident_review_only(
-    fence: &StateFence,
-    batch_id: &str,
-    entry: &WatchdogEntryAdmission,
-    signal: &Signal,
-    source_problem: &Problem,
-) -> Result<(), CompositionError> {
-    let request = IncidentReviewRequest {
-        reason: IncidentReason::CriticalTelemetryOrControlPathLost,
-        source_problem: source_problem.problem_id.clone(),
-        signal_id: signal.signal_id.clone(),
-        evidence_refs: signal.evidence_handles.clone(),
-        signal_severity: signal.severity,
-    };
-    let mut incident = Incident {
-        incident_id: IncidentId::new(format!(
-            "watchdog-gap-incident:{batch_id}:{}",
-            entry.sequence
-        ))
-        .map_err(|error| owner_refused(error.to_string()))?,
-        title: format!(
-            "watchdog coverage gap review candidate batch {batch_id} sequence {}",
-            entry.sequence
-        ),
-        scope_id: GOVERNOR_SCOPE_ID.to_owned(),
-        owner: OwnerRef {
-            principal: GOVERNOR_SCOPE_ID.to_owned(),
-            generation: fence.resource_generation.value().to_string(),
-        },
-        state: IncidentState::Candidate,
-        evidence_refs: signal.evidence_handles.clone(),
-        source_problem: None,
-        promotion: None,
-        review_requests: Vec::new(),
-        acknowledged_by: None,
-        state_fence: fence.clone(),
-        revision: 1,
-        reopen_count: 0,
-    };
-    incident.validate().map_err(|error| {
-        owner_refused(format!(
-            "watchdog gap incident scratch state is not admissible: {error}"
-        ))
-    })?;
-    incident
-        .request_review(fence, signal, request)
-        .map_err(|error| {
-            owner_refused(format!(
-                "watchdog gap signal cannot request incident review: {error}"
-            ))
-        })?;
-    if incident.state != IncidentState::Candidate || incident.promotion.is_some() {
+    if signal.attribution != SignalAttribution::Suspected {
         return Err(owner_refused(
-            "a supervision signal must not open an incident".to_owned(),
+            "watchdog gap signal must stay suspected; a coverage gap is an observation, not a finding that could name an incident promotion authority"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -2221,8 +2126,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         let doctor_fence = self.validate_identity_fence(identity)?;
         let verified = validate_report_independence(report, &doctor_fence)?;
         let binding = self.resolve_problem_binding(report)?;
-        let scratch =
-            self.admit_scratch_observation(operation_id, identity, report, &verified, &binding)?;
+        let scratch = self.admit_scratch_observation(operation_id, identity, report, &binding)?;
         let legs = build_doctor_leg_envelopes(
             identity,
             operation_id,
