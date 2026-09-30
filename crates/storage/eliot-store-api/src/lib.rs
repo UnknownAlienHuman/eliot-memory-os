@@ -57,6 +57,7 @@ mod reactive_state;
 mod request_hash;
 mod store_failure;
 mod swarm_owner_revisions;
+mod task_contract_acceptance;
 mod user_automation_state;
 mod wire;
 pub mod write_admission;
@@ -231,6 +232,14 @@ pub use swarm_owner_revisions::{
     SwarmOwnerAuthorization, SwarmOwnerRevision, SwarmOwnerRevisionBatch, SwarmSemanticOwnerKind,
     decode_swarm_owner_revisions, swarm_owner_revisions_request,
     validate_swarm_owner_revision_authorization, validate_swarm_owner_revision_transition,
+};
+
+pub use task_contract_acceptance::{
+    TASK_CONTRACT_ACCEPTANCE_RECORD_MUTATION_NAME, TASK_CONTRACT_ACCEPTANCE_RECORD_NAMESPACE,
+    TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1, TASK_CONTRACT_ACCEPTANCE_SET_READ_NAME,
+    TaskContractAcceptanceRecord, decode_task_contract_acceptance_record,
+    task_contract_acceptance_record_key, task_contract_acceptance_record_request,
+    validate_acceptance_record_identity,
 };
 
 pub use wire::{
@@ -3784,14 +3793,18 @@ pub enum NamedReadOperation {
     /// `required_acceptance_item_ids` is a plan's own list rather than the
     /// contract owner's enumeration, so the denominator needs its own read.
     ///
-    /// Known-but-unsupported until a store-owned task-contract slice activates
-    /// its catalogue row with a proven handler. The typed parameters
-    /// (`task_id`, `task_revision`) and the payload contract
-    /// ([`TaskContractAcceptanceSet`]) are already closed, so a consumer may
-    /// already build and submit the read through
-    /// [`task_contract_acceptance_read_request`]; until the row is activated
-    /// every admission path refuses it with [`StoreError::UnknownOperation`],
-    /// and no consumer may synthesize the set locally.
+    /// Served from the owner's durable `TaskContract` acceptance record
+    /// ([`TaskContractAcceptanceRecord`], committed by
+    /// [`NamedMutationOperation::RecordTaskContractAcceptanceSet`]) at the exact
+    /// `task_id` and `task_revision` the caller was admitted against.
+    ///
+    /// The obligation set therefore comes from the owner that holds the
+    /// contract, never from the verifier plan being checked against it: a plan
+    /// that declares fewer obligations cannot be answered with a smaller set,
+    /// and a plan that declares more cannot make the gate carry an obligation
+    /// the contract never required. The read refuses when the owner has
+    /// persisted nothing at that exact revision; it never answers with an empty
+    /// set, and no consumer may synthesize the set locally.
     GetTaskContractAcceptanceSet,
 }
 
@@ -4114,6 +4127,19 @@ pub enum NamedMutationOperation {
     /// Governor registry re-evaluates through its own exact-fingerprint,
     /// freshness, invalidation, and requalification predicates.
     RecordCapabilityEvidenceRecord,
+    /// Canonical `TaskContract` acceptance-set record commit (issue #325 P1,
+    /// I7.9).
+    ///
+    /// Durable owner-acceptance persistence only: the prepared transition must
+    /// carry [`TransitionClass::TaskControl`], the declared reversible-effect
+    /// ceiling, and the closed acceptance-set typed parameters (exact task
+    /// identity, non-zero task revision, the owner's own recorded acceptance
+    /// digest, the enumerated obligations and the issuing State Fence). The row
+    /// is create-only and addressed by `(task_id, task_revision)`, so the store
+    /// arbitrates one immutable owner record per contract revision and never
+    /// derives acceptance semantics, coverage, or completion from it. Committing
+    /// the record asserts only what the contract owner already required.
+    RecordTaskContractAcceptanceSet,
     /// Canonical problem owner-state transaction (issue #1759 I2, I13.9/I13.7).
     ///
     /// Durable Problem-registry ownership and lifecycle only: the prepared
@@ -4141,7 +4167,9 @@ impl NamedMutationOperation {
             | Self::ApplyBlackboardItem
             | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
-            Self::UpdateTaskState | Self::ApplySwarmOwnerRevisions => TransitionClass::TaskControl,
+            Self::UpdateTaskState
+            | Self::ApplySwarmOwnerRevisions
+            | Self::RecordTaskContractAcceptanceSet => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
             Self::ReconcileRecovery
             | Self::RecordFinishDecision

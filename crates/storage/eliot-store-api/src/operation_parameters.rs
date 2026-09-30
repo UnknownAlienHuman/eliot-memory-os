@@ -179,6 +179,13 @@ pub enum ParameterShape {
     /// commits. The value must be a JSON object; the problem owner-state
     /// contract owns its identity, revision and source-Signal bindings.
     ProblemOwnerState,
+    /// Closed owner-issued `TaskContract` acceptance-set record for issue #325
+    /// P1, I7.9: the exact task identity, non-zero task revision, the owner's
+    /// own recorded acceptance digest, the enumerated obligations, and the
+    /// issuing State Fence. The value must be a JSON object; the acceptance
+    /// record contract owns its task/revision binding and its obligation list,
+    /// and the neutral acceptance-set validator proves the digest against it.
+    TaskContractAcceptanceRecord,
 }
 
 impl ParameterShape {
@@ -198,6 +205,7 @@ impl ParameterShape {
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
             Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
+            Self::TaskContractAcceptanceRecord => crate::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1,
         }
     }
 }
@@ -1213,6 +1221,19 @@ static APPLY_SWARM_OWNER_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [Param
     shape: ParameterShape::SwarmOwnerRevision,
     required: true,
 }];
+/// The single owner-issued `TaskContract` acceptance-set record for
+/// `RecordTaskContractAcceptanceSet` (issue #325 P1, I7.9).
+///
+/// The record travels whole, exactly as the swarm owner revision does: the
+/// enumeration and the owner's recorded acceptance digest are only meaningful
+/// together, so splitting them across sibling parameters would create a second
+/// way to present a set that commits to a different obligation list.
+static RECORD_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS: [ParameterDeclaration; 1] =
+    [ParameterDeclaration {
+        name: "record",
+        shape: ParameterShape::TaskContractAcceptanceRecord,
+        required: true,
+    }];
 /// Exact owner-acceptance selectors for `GetTaskContractAcceptanceSet`
 /// (issue #1741, I7.9).
 ///
@@ -1358,6 +1379,9 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
         NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
         NamedMutationOperation::RecordCapabilityEvidenceRecord => "RecordCapabilityEvidenceRecord",
+        NamedMutationOperation::RecordTaskContractAcceptanceSet => {
+            "RecordTaskContractAcceptanceSet"
+        }
     }
 }
 
@@ -1391,6 +1415,9 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordLearningRecord" => Some(NamedMutationOperation::RecordLearningRecord),
         b"RecordCapabilityEvidenceRecord" => {
             Some(NamedMutationOperation::RecordCapabilityEvidenceRecord)
+        }
+        b"RecordTaskContractAcceptanceSet" => {
+            Some(NamedMutationOperation::RecordTaskContractAcceptanceSet)
         }
         _ => None,
     }
@@ -1572,6 +1599,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordCapabilityEvidenceRecord => {
             &COMMIT_CAPABILITY_EVIDENCE_PARAMETERS
         }
+        NamedMutationOperation::RecordTaskContractAcceptanceSet => {
+            &RECORD_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS
+        }
     }
 }
 
@@ -1658,7 +1688,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::SwarmOwnerRevision
         | ParameterShape::BlackboardItemRevision
         | ParameterShape::InstrumentRegistrySnapshot
-        | ParameterShape::ProblemOwnerState => true,
+        | ParameterShape::ProblemOwnerState
+        | ParameterShape::TaskContractAcceptanceRecord => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1833,6 +1864,17 @@ fn check_declared_shape(
                     reason: "problem owner transition candidate record must be a JSON object",
                 })
             }
+        }
+        ParameterShape::TaskContractAcceptanceRecord => {
+            // The record is self-contained: its own task identity, task
+            // revision, acceptance digest, obligation list and fence are the
+            // whole contract, so the existing closed acceptance-set validator
+            // is the complete check. There is no sibling parameter to compare
+            // it against, and inventing one would be a second scheme.
+            let record: crate::TaskContractAcceptanceRecord =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            record.validate()
         }
     }
 }
