@@ -871,15 +871,10 @@ impl ActiveAdmissionReservation {
         if record.state != AdmissionReservationState::Active {
             return Err(OrsError::InvalidTransition);
         }
-        if record.canonical_admission_receipt.is_none()
-            || record.activation_receipt.is_none()
-        {
+        if record.canonical_admission_receipt.is_none() || record.activation_receipt.is_none() {
             return Err(OrsError::InvalidTransition);
         }
-        Ok(Self::verified(
-            record.clone(),
-            snapshot.receipt().clone(),
-        ))
+        Ok(Self::verified(record.clone(), snapshot.receipt().clone()))
     }
 
     /// Exact active reservation record the verifier accepted.
@@ -932,9 +927,7 @@ impl ActiveAdmissionReservation {
     /// Returns [`OrsError::InvalidTransition`] when the sealed value does not
     /// carry the retained commit, for the same reason as
     /// [`Self::activation_receipt`].
-    pub fn canonical_admission(
-        &self,
-    ) -> Result<&AdmissionReservationCanonicalAdmission, OrsError> {
+    pub fn canonical_admission(&self) -> Result<&AdmissionReservationCanonicalAdmission, OrsError> {
         self.reservation
             .canonical_admission
             .as_ref()
