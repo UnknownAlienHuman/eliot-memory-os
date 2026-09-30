@@ -598,9 +598,7 @@ pub fn parse_task_controller_claimed_pair(
         .as_str()
         .filter(|principal| !principal.trim().is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| {
-            "Kernel Task Controller claim has no authenticated principal".to_owned()
-        })?;
+        .ok_or_else(|| "Kernel Task Controller claim has no authenticated principal".to_owned())?;
     let tool = decode("tool")?;
     let request_identity: RequestIdentity = match pair.get("identity") {
         Some(value) => serde_json::from_value(value.clone())
