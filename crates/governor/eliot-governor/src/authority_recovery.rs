@@ -1191,9 +1191,7 @@ pub enum EffectDispatchProgress {
     DispatchedAwaitingObservation,
     /// A post-dispatch lost result (or otherwise unobserved effect): the
     /// original unknown outcome is retained, not upgraded or rolled back.
-    UnknownOutcome {
-        reason: String,
-    },
+    UnknownOutcome { reason: String },
     /// Terminal observed disposition with its linked outcome evidence.
     /// Immutable: reconciliation never rewrites this entry.
     Reconciled {
@@ -1326,9 +1324,7 @@ pub enum EffectOutcomeView {
     /// Dispatched; the outcome is not yet observed.
     AwaitingObservation,
     /// The original unknown outcome is retained; reconciliation is pending.
-    Unknown {
-        reason: String,
-    },
+    Unknown { reason: String },
     /// Terminal observed disposition with its linked evidence coordinates.
     Reconciled {
         outcome: EffectOutcome,
@@ -1346,9 +1342,7 @@ pub enum EffectPendingItem {
     MissingAuthorization,
     /// The current standing is challenged by the named revoked roots and
     /// must be rebuilt from clean inputs before further reliance.
-    ContestedByRoots {
-        revoked_roots: Vec<String>,
-    },
+    ContestedByRoots { revoked_roots: Vec<String> },
     /// A sealed dispatch has no observation yet.
     DispatchUnobserved,
     /// The original unknown outcome is retained until linked evidence
@@ -1413,7 +1407,10 @@ impl AuthorityOwner {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let mut created = 0;
         for record in &snapshot.records {
-            if !self.effect_obligations.contains_key(&record.idempotency_key) {
+            if !self
+                .effect_obligations
+                .contains_key(&record.idempotency_key)
+            {
                 self.effect_obligations.insert(
                     record.idempotency_key.clone(),
                     RetainedEffectObligation::from_authorized_record(record),
@@ -1438,12 +1435,19 @@ impl AuthorityOwner {
         &mut self,
         idempotency_key: &str,
     ) -> Result<(), CompositionError> {
-        let obligation = self.effect_obligations.get_mut(idempotency_key).ok_or_else(|| {
-            CompositionError::Recovery(
-                "effect dispatch names an identity with no retained authorization".to_owned(),
-            )
-        })?;
-        if self.effects.dependent_effect_state(idempotency_key).is_contested() {
+        let obligation = self
+            .effect_obligations
+            .get_mut(idempotency_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect dispatch names an identity with no retained authorization".to_owned(),
+                )
+            })?;
+        if self
+            .effects
+            .dependent_effect_state(idempotency_key)
+            .is_contested()
+        {
             return Err(CompositionError::Recovery(
                 "effect dispatch is contested by current revocation state".to_owned(),
             ));
@@ -1479,11 +1483,14 @@ impl AuthorityOwner {
     ) -> Result<(), CompositionError> {
         let reason = reason.into();
         require_effect_text(&reason, "unknown_outcome.reason")?;
-        let obligation = self.effect_obligations.get_mut(idempotency_key).ok_or_else(|| {
-            CompositionError::Recovery(
-                "effect outcome names an identity with no retained authorization".to_owned(),
-            )
-        })?;
+        let obligation = self
+            .effect_obligations
+            .get_mut(idempotency_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect outcome names an identity with no retained authorization".to_owned(),
+                )
+            })?;
         if obligation.progress.is_terminal() {
             return Err(CompositionError::Recovery(
                 "effect outcome cannot overwrite immutable terminal history".to_owned(),
@@ -1515,11 +1522,15 @@ impl AuthorityOwner {
                 "effect reconciliation requires a terminal observed outcome".to_owned(),
             ));
         }
-        let obligation = self.effect_obligations.get_mut(idempotency_key).ok_or_else(|| {
-            CompositionError::Recovery(
-                "effect reconciliation names an identity with no retained authorization".to_owned(),
-            )
-        })?;
+        let obligation = self
+            .effect_obligations
+            .get_mut(idempotency_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect reconciliation names an identity with no retained authorization"
+                        .to_owned(),
+                )
+            })?;
         if evidence.idempotency_key != obligation.idempotency_key
             || evidence.operation_id != obligation.operation_id
         {
@@ -1552,22 +1563,30 @@ impl AuthorityOwner {
     ) -> Result<(), CompositionError> {
         require_effect_text(compensation_key, "compensation.idempotency_key")?;
         require_effect_text(compensation_operation_id, "compensation.operation_id")?;
-        let compensation = self.effect_obligations.get(compensation_key).ok_or_else(|| {
-            CompositionError::Recovery(
-                "effect compensation names an identity with no retained authorization".to_owned(),
-            )
-        })?;
+        let compensation = self
+            .effect_obligations
+            .get(compensation_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect compensation names an identity with no retained authorization"
+                        .to_owned(),
+                )
+            })?;
         if compensation.operation_id != compensation_operation_id {
             return Err(CompositionError::Recovery(
                 "effect compensation operation identity disagrees with the retained record"
                     .to_owned(),
             ));
         }
-        let original = self.effect_obligations.get_mut(original_key).ok_or_else(|| {
-            CompositionError::Recovery(
-                "effect compensation names an original with no retained authorization".to_owned(),
-            )
-        })?;
+        let original = self
+            .effect_obligations
+            .get_mut(original_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect compensation names an original with no retained authorization"
+                        .to_owned(),
+                )
+            })?;
         if original
             .compensations
             .iter()
@@ -1677,7 +1696,12 @@ impl AuthorityOwner {
         let current_contest = self.effects.dependent_effect_state(idempotency_key);
         let contested = current_contest.is_contested();
         let (proposal, authorization, dispatch, outcome) = match obligation {
-            None => (None, None, EffectDispatchView::NeverAuthorized, EffectOutcomeView::None),
+            None => (
+                None,
+                None,
+                EffectDispatchView::NeverAuthorized,
+                EffectOutcomeView::None,
+            ),
             Some(obligation) => {
                 let ledger = self.effect_ledger_record(idempotency_key);
                 let proposal = EffectProposalView {
@@ -1796,14 +1820,11 @@ impl AuthorityOwner {
         &self,
         idempotency_key: &str,
     ) -> Option<AuthorizedEffectRecoveryRecord> {
-        self.effects
-            .snapshot()
-            .ok()
-            .and_then(|snapshot| {
-                snapshot
-                    .records
-                    .into_iter()
-                    .find(|record| record.idempotency_key == idempotency_key)
-            })
+        self.effects.snapshot().ok().and_then(|snapshot| {
+            snapshot
+                .records
+                .into_iter()
+                .find(|record| record.idempotency_key == idempotency_key)
+        })
     }
 }
