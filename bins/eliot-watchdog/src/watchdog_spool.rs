@@ -1665,8 +1665,8 @@ impl WatchdogSpool {
             producer_generation,
             record_reason,
         } = observation;
-        let episode_key = eliot_watchdog_core::FailureEpisodeKey::derive(&identity)
-            .map_err(|error| {
+        let episode_key =
+            eliot_watchdog_core::FailureEpisodeKey::derive(&identity).map_err(|error| {
                 SpoolError::Corrupt(format!(
                     "watchdog signal episode identity is not derivable: {error:?}"
                 ))
@@ -1726,9 +1726,7 @@ impl WatchdogSpool {
                 // event by its own identity before deciding, so the caller is
                 // never handed a second record for an event that already has
                 // one.
-                match self
-                    .reconcile_accepted_signal_event(ledger_key.as_str(), &source_event)
-                {
+                match self.reconcile_accepted_signal_event(ledger_key.as_str(), &source_event) {
                     Some(reconciled) => Ok(reconciled),
                     None => Err(SpoolError::Database(error.to_string())),
                 }
@@ -1800,7 +1798,13 @@ impl WatchdogSpool {
         observed_at_ms: u64,
         producer_generation: u64,
         record_reason: crate::GapRecoveryReason,
-    ) -> Result<(episode::SignalEpisodeOutcome, Option<episode::StoredSignalEpisode>), SpoolError> {
+    ) -> Result<
+        (
+            episode::SignalEpisodeOutcome,
+            Option<episode::StoredSignalEpisode>,
+        ),
+        SpoolError,
+    > {
         match admission {
             eliot_watchdog_core::SourceEventAdmission::Retransmission { .. } => {
                 // Already accepted under the same identity and digest: reuse
