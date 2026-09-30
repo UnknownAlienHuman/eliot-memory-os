@@ -3812,12 +3812,18 @@ impl KernelStoreGateway {
         // Live evidence below the Kernel decoding boundary. The run-now path
         // issues no provider call before preflight, so the only honest provider
         // observation here is none — which is exactly what deterministic mode
-        // requires (I11.12:49) and what an agent revision still cannot obtain
-        // at this boundary. The exact Tool Definitions are the Tool-Definition
-        // half of the closure the canonical owner revision already declares, so
-        // they are read from that same owner instead of being left unattested.
-        // Delivery capability is a named observation of the declared channels,
-        // not an inference from an adapter result.
+        // requires (I11.12:49) and what an active agent revision still cannot
+        // obtain at this boundary. That absence is not a missing Cargo edge this
+        // crate could close: an observed route is a post-attempt runtime fact
+        // (I3.4), so no observation of provider/model/adapter exists yet at this
+        // point in the causal order anywhere in the tree, and the one route the
+        // revision names is its own declared Human route policy, so admitting
+        // against it would compare the policy with itself. The exact Tool
+        // Definitions are the Tool-Definition half of the closure the canonical
+        // owner revision already declares, so they are read from that same owner
+        // instead of being left unattested. Delivery capability is a named
+        // observation of the declared channels, not an inference from an adapter
+        // result.
         let evidence = UserAutomationPreflightEvidence {
             observed_provider_fingerprint: None,
             trusted_tool_definition_refs: owner.revision.trusted_tool_definition_refs.clone(),
@@ -3936,9 +3942,11 @@ impl KernelStoreGateway {
         // provider call before preflight either, so the only honest provider
         // observation here is none - which is what deterministic mode requires
         // (I11.12:49) and what an agent revision still cannot obtain at this
-        // boundary. There is no owner-issued blocked failure to carry either:
-        // `resolve_due_wake` refuses every configuration state that is not
-        // `Active`, so `UserAutomationPreflightProjection::assemble` never sees a
+        // boundary for the same reason and against the same named owner
+        // `Self::require_run_now_agent_evidence` records. There is no owner-issued
+        // blocked failure to carry either: `resolve_due_wake` refuses every
+        // configuration state that is not `Active`, so
+        // `UserAutomationPreflightProjection::assemble` never sees a
         // `BlockedConfig` projection on this leg. The assembly itself refuses an
         // active revision whose declared closure, delivery capability, or
         // provider policy these members do not satisfy, so no caller-side
@@ -4089,13 +4097,43 @@ impl KernelStoreGateway {
     /// Deterministic mode reaches the Durable Job owner from the revision and
     /// the named delivery observation alone, so this arm exists only for the
     /// one member no Kernel-side route can produce: the observed
-    /// provider/model/adapter fingerprint. The observed set lives in the
-    /// Governor route registry (`ObservedRoute` /
-    /// `RouteBehaviorFingerprint`), which is outside this crate's dependency
-    /// graph, and `provider_and_model_request` there is a request rather than an
-    /// observation, so the Kernel cannot derive it. That absence is reported
-    /// with its exact owner instead of being filled with the policy's own
-    /// expectation, which would make drift undetectable (I11.12:47).
+    /// provider/model/adapter fingerprint.
+    ///
+    /// **The invariant this arm protects.** I11.12:47 requires unexpected
+    /// provider/model drift to fail closed "unless the Human policy already
+    /// admitted the observed compatible set", and forbids silent route
+    /// substitution. The check can only mean that if the value compared against
+    /// the admitted set came from outside that set, so the observation must be
+    /// independent of `provider_policy` by construction.
+    ///
+    /// **Why no observation can be produced here.** The only provider-route
+    /// observations in the tree (`ObservedRoute`, `ActualRouteReceipt`,
+    /// `effective_route_key`, `RouteFingerprint`) are post-attempt runtime
+    /// facts: the Governor route registry stores requested and observed routes
+    /// separately and refuses any receipt naming no evidence-bearing runtime
+    /// handshake, and a configured route's provider/model field is documented
+    /// as a request. Before the first model call there is therefore no
+    /// observation of provider/model/adapter to read anywhere. The two
+    /// substitutes are both provably wrong here. Reading the configured route
+    /// the revision names resolves nothing — the Kernel submits only the
+    /// opaque `route_class` label and route selection stays with its own owner —
+    /// and even if it resolved, that route is chosen by the same Human route
+    /// policy this revision declares, so `admits` would compare the policy
+    /// against itself and every provider would pass. Reading the first member
+    /// of `provider_policy` is the same comparison spelled out.
+    ///
+    /// **The owner that must produce it.** The route/runtime owner that performs
+    /// the handshake — `CapabilityRouteRegistry` in `eliot-governor`, driven from
+    /// the eliotd route-receipt contour — must publish the observed
+    /// provider/model/adapter for this exact pending occurrence *before* the
+    /// Durable Job admission, over an authenticated leg this boundary reads.
+    /// The Governor registry is not an edge this crate may take: it is a runtime
+    /// root above the Kernel (I2.3 dependency direction is outward only), and
+    /// the Store recovery snapshot this boundary already reads carries no route
+    /// owner record, so there is no such read to widen. Until that publication
+    /// exists, the absence is reported with this exact owner instead of being
+    /// filled with the policy's own expectation, which would make drift
+    /// undetectable while still appearing to be enforced.
     ///
     /// The unresolved-prior-effect refusal stays here because it is an
     /// execution fact, not an evidence fact: I14.21 reconciliation owns that
@@ -4135,11 +4173,14 @@ impl KernelStoreGateway {
             .admits(evidence.observed_provider_fingerprint.as_ref())
         {
             return Err(RunNowPreflightAssembly::Unavailable(
-                "no provider-route observer issues an observed fingerprint at the Kernel \
-                 preflight boundary: the run-now path makes no provider call before \
-                 preflight, and the observed route set lives in the Governor route \
-                 registry outside this crate, so an agent revision whose policy admits only \
-                 an observed compatible set stays unadmitted"
+                "no observed provider/model/adapter fingerprint exists for this occurrence: the \
+                 only provider-route observations are post-attempt runtime facts that \
+                 CapabilityRouteRegistry refuses to record without a handshake, this boundary \
+                 submits only the opaque route_class label and reads no route owner record, and \
+                 the revision's own route policy is exactly what is being checked, so an active \
+                 agent revision whose policy admits only an observed compatible set stays \
+                 unadmitted until the route owner publishes that observation for this pending \
+                 occurrence"
                     .to_owned(),
             ));
         }
