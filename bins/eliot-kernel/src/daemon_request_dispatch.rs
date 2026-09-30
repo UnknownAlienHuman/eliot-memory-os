@@ -2199,7 +2199,7 @@ fn storage_replacement_outcome(
 }
 
 /// The admitted-reply envelope, identical to every other arm on this channel.
-fn storage_replacement_response(outcome: StorageReplacementOutcome) -> serde_json::Value {
+fn storage_replacement_response(outcome: &StorageReplacementOutcome) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
         "value": outcome,
@@ -2291,7 +2291,7 @@ impl KernelComposition {
         let request: StorageReplacementDriveRequest =
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
-        self.validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
+        Self::validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
         if request.stages.len() > StorageReplacementStage::ORDER.len() {
             return Err(TransportError::SessionFenced);
         }
@@ -2309,7 +2309,7 @@ impl KernelComposition {
             Ok(replacement) => replacement,
             Err(error) => {
                 return Ok(storage_replacement_response(
-                    storage_replacement_refusal_outcome(storage_replacement_terminal_code(&error)),
+                    &storage_replacement_refusal_outcome(storage_replacement_terminal_code(&error)),
                 ));
             }
         };
@@ -2321,7 +2321,7 @@ impl KernelComposition {
                 // The stages already recorded are still reported: an effect that
                 // may have happened must not collapse into an effect-free
                 // refusal, and the operator has to see how far the machine went.
-                return Ok(storage_replacement_response(storage_replacement_outcome(
+                return Ok(storage_replacement_response(&storage_replacement_outcome(
                     &replacement,
                     Some(storage_replacement_terminal_code(&error)),
                     None,
@@ -2341,7 +2341,7 @@ impl KernelComposition {
             Ok(_) => None,
             Err(error) => Some(storage_replacement_terminal_code(&error)),
         };
-        Ok(storage_replacement_response(storage_replacement_outcome(
+        Ok(storage_replacement_response(&storage_replacement_outcome(
             &replacement,
             terminal_code,
             None,
@@ -2365,7 +2365,7 @@ impl KernelComposition {
         let request: StorageReplacementResumeRequest =
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
-        self.validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
+        Self::validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
         if request.stages.len() > StorageReplacementStage::ORDER.len() {
             return Err(TransportError::SessionFenced);
         }
@@ -2381,7 +2381,7 @@ impl KernelComposition {
             Ok(replacement) => replacement,
             Err(terminal_code) => {
                 return Ok(storage_replacement_response(
-                    storage_replacement_refusal_outcome(terminal_code),
+                    &storage_replacement_refusal_outcome(terminal_code),
                 ));
             }
         };
@@ -2395,7 +2395,7 @@ impl KernelComposition {
                 break;
             }
         }
-        Ok(storage_replacement_response(storage_replacement_outcome(
+        Ok(storage_replacement_response(&storage_replacement_outcome(
             &replacement,
             terminal_code,
             None,
@@ -2420,7 +2420,7 @@ impl KernelComposition {
         let request: StorageReplacementRollbackRequest =
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
-        self.validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
+        Self::validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
         let replacement = match self.storage_replacement_resumption(
             STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
             StorageReplacementResumption {
@@ -2437,7 +2437,7 @@ impl KernelComposition {
             // be inventing a decision the coordinator never made.
             Err(terminal_code) => {
                 return Ok(storage_replacement_response(
-                    storage_replacement_refusal_outcome(terminal_code),
+                    &storage_replacement_refusal_outcome(terminal_code),
                 ));
             }
         };
@@ -2471,7 +2471,7 @@ impl KernelComposition {
             // Any other refusal never reached the disposition at all.
             Err(error) => (None, Some(storage_replacement_terminal_code(&error))),
         };
-        Ok(storage_replacement_response(storage_replacement_outcome(
+        Ok(storage_replacement_response(&storage_replacement_outcome(
             &replacement,
             terminal_code,
             rollback,
@@ -2489,7 +2489,6 @@ impl KernelComposition {
     /// transport, before the coordinator is touched, so an unfenced or
     /// stale-fenced request never reaches a stage machine or a cutover.
     fn validate_storage_replacement_fence(
-        &self,
         session: &Session,
         version: u8,
         state_fence: &StateFence,
