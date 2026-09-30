@@ -25048,8 +25048,8 @@ impl RedbRecoveryStore {
                 return Err(OrsError::ReconciliationMismatch);
             }
         };
-        let observed = serde_json::to_vec(&readback)
-            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let observed =
+            serde_json::to_vec(&readback).map_err(|error| OrsError::Encoding(error.to_string()))?;
         if proof.handoff_sha256 != crate::model::sha256_hex(&observed) {
             return Err(OrsError::ReconciliationMismatch);
         }
