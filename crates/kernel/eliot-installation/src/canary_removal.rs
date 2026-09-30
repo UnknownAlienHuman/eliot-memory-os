@@ -427,10 +427,11 @@ impl CanaryRemovalBuildBinding {
 
 /// Read-only, versioned plan for removing one exact installed canary.
 ///
-/// The plan is the complete finite denominator of the removal: every closed
-/// resource category the accepted registry or the original transaction can
-/// describe is present exactly once, and every category that is not removed is
-/// present with an explicit `RETAINED` or `UNSUPPORTED` action.
+/// The plan is the complete finite denominator of the removal: every exact
+/// resource identity the accepted registry or the original transaction can
+/// describe has one row, so a closed resource category spans one row per
+/// roster effect that names it, and every row that is not removed carries an
+/// explicit `RETAINED` or `UNSUPPORTED` action.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanaryRemovalPlan {
@@ -582,12 +583,14 @@ impl CanaryRemovalPlan {
                     identity: effect.effect_id.as_str().to_owned(),
                 });
             }
-            if !categories.insert(effect.category) {
-                return Err(InstallationError::Duplicate {
-                    kind: "canary removal resource category".to_owned(),
-                    identity: format!("{:?}", effect.category),
-                });
-            }
+            // One row names one exact resource identity, not one category: the
+            // frozen graph carries one row per installer effect, so a category
+            // spans as many rows as the roster holds effects for it (one
+            // `CreateRoot`/`ApplyAcl` per hierarchy root, one
+            // `RegisterService`/`StartService` per service role). Row exactness
+            // is carried by the identity uniqueness above and by
+            // `require_complete_effect_coverage`, never by category uniqueness.
+            categories.insert(effect.category);
         }
         for effect in &self.effects {
             if effect
