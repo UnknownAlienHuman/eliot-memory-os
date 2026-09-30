@@ -98,9 +98,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_ipc::ProcessBinding;
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
@@ -115,7 +117,7 @@ use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
     NativeWorkerClaimRecord, OperationIdentity,
 };
-use eliot_process::{OperationId, ProcessRequest};
+use eliot_process::{Generation, OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
@@ -758,6 +760,60 @@ struct TestdLaunchOwnerBinding {
 #[derive(Debug, Default)]
 struct LaunchRecords {
     by_identity: BTreeMap<String, LaunchRecord>,
+    /// Kernel ProcessExecutor receipts for live native-worker children,
+    /// retained beside the original launch identity so lifecycle sessions
+    /// can be checked against the process Kernel actually started.
+    native_worker_process_receipts: BTreeMap<String, NativeWorkerProcessStartReceipt>,
+    /// Exact launch terms staged just before ProcessExecutor start.
+    /// Registration may wait on this record, but it cannot use it as proof
+    /// before the completed ProcessStartReceipt is retained.
+    native_worker_pending_starts: BTreeMap<String, NativeWorkerPendingProcessStart>,
+}
+
+static NATIVE_WORKER_PROCESS_START_CHANGED: Condvar = Condvar::new();
+
+#[derive(Clone, Debug)]
+struct NativeWorkerPendingProcessStart {
+    operation_id: String,
+    executable_path: PathBuf,
+    executable_sha256: String,
+    launch_nonce: String,
+    activation_epoch: EpochId,
+    activation_generation: Generation,
+    executable_file_identity: (u32, u64),
+    deadline_unix_ms: u64,
+}
+
+/// ProcessExecutor evidence plus the activation snapshot that authorized the
+/// child start. Its generation is a separate owner domain from the claim's
+/// worker generation and claim-state fence.
+#[derive(Clone, Debug)]
+struct NativeWorkerProcessStartReceipt {
+    receipt: ProcessStartReceipt,
+    activation_epoch: EpochId,
+    activation_generation: Generation,
+    executable_file_identity: (u32, u64),
+}
+
+/// Exact retained request and Kernel process-start evidence for one live
+/// native worker. The lifecycle route still rechecks the durable claim,
+/// capability cell, registry digest, and authenticated peer on every use.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeWorkerProcessStartBinding {
+    /// The exact claim request admitted before launch.
+    pub request: NativeWorkerClaimRequest,
+    /// Kernel-issued receipt for the exact admission request.
+    pub claim_receipt: NativeWorkerClaimReceipt,
+    /// ProcessExecutor receipt for the launched worker image.
+    pub receipt: ProcessStartReceipt,
+    /// Kernel-minted launch nonce carried through the authenticated session.
+    pub launch_nonce: String,
+    /// Authority epoch that authorized this ProcessExecutor launch.
+    pub activation_epoch: EpochId,
+    /// Kernel activation generation that authorized this ProcessExecutor launch.
+    pub activation_generation: Generation,
+    /// File identity retained from the executable handle used at launch.
+    pub executable_file_identity: (u32, u64),
 }
 
 /// The composed dispatch contour: the Kernel-owned installation identity, the
@@ -2198,6 +2254,15 @@ pub fn native_worker_material_bytes(
             "native action envelope authority epoch is not the live admitted epoch".to_owned(),
         ));
     }
+    if request
+        .executable_binding
+        .as_ref()
+        .is_some_and(|binding| binding.launch_nonce != nonce)
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker launch nonce does not match its owner executable binding".to_owned(),
+        ));
+    }
     let derivation = native_worker_dispatch_derivation(
         request.claim_id.as_str(),
         request.operation_id.as_str(),
@@ -2587,13 +2652,24 @@ fn doctor_ledger(
 /// Releases one launch reservation best-effort (prepare/write failure
 /// path). A later call may retry cleanly under the same identity.
 fn release_launch(contour: &'static ComposedDispatchContour, identity: &str) {
-    if let Ok(mut launches) = contour.launches.lock()
-        && launches
+    let released = if let Ok(mut launches) = contour.launches.lock() {
+        if launches
             .by_identity
             .get(identity)
             .is_some_and(|record| record.phase == LaunchPhase::Reserved)
-    {
-        launches.by_identity.remove(identity);
+        {
+            launches.by_identity.remove(identity);
+            launches.native_worker_process_receipts.remove(identity);
+            launches.native_worker_pending_starts.remove(identity);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if released {
+        NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
     }
 }
 
@@ -2663,6 +2739,7 @@ pub async fn start_ready_doctor_launch(
         &SpawnInputs {
             kind: DispatchedWorkerKind::Doctor,
             operation_id: &ready.operation_id,
+            native_worker_claim_id: None,
             executable: &ready.executable,
             executable_sha256: &ready.executable_sha256,
             working_directory: &ready.working_directory,
@@ -2673,10 +2750,13 @@ pub async fn start_ready_doctor_launch(
     )
     .await?
     {
-        SpawnOutcome::Started(receipt) => Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
-            receipt: *receipt,
-            operation_id: ready.operation_id.clone(),
-        }))),
+        SpawnOutcome::Started(receipt, executable_file_identity) => {
+            Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
+                receipt: *receipt,
+                operation_id: ready.operation_id.clone(),
+                executable_file_identity,
+            })))
+        }
         SpawnOutcome::Unknown(operation_id) => {
             Ok(ChildStartOutcome::Unknown(UncertainSpawn { operation_id }))
         }
@@ -2701,6 +2781,9 @@ pub struct SpawnedChild {
     pub receipt: ProcessStartReceipt,
     /// Child process operation identity.
     pub operation_id: OperationId,
+    /// File identity retained from the exact executable handle used to admit
+    /// this launch.
+    pub executable_file_identity: (u32, u64),
 }
 
 /// A spawn whose outcome is unknown: admitted and possibly started, but
@@ -2713,9 +2796,9 @@ pub struct UncertainSpawn {
 
 /// Outcome of one child spawn: started, or unknown.
 enum SpawnOutcome {
-    /// The child started; carries the admitted receipt (boxed: receipts
-    /// dwarf the unknown outcome).
-    Started(Box<ProcessStartReceipt>),
+    /// The child started; carries the admitted receipt and executable file
+    /// identity retained by the launch path proof.
+    Started(Box<ProcessStartReceipt>, (u32, u64)),
     /// The outcome is unknown; carries the operation identity for
     /// reconcile-by-identity.
     Unknown(OperationId),
@@ -2727,6 +2810,7 @@ enum SpawnOutcome {
 struct SpawnInputs<'a> {
     kind: DispatchedWorkerKind,
     operation_id: &'a OperationId,
+    native_worker_claim_id: Option<&'a str>,
     executable: &'a Path,
     executable_sha256: &'a str,
     working_directory: &'a Path,
@@ -2833,12 +2917,53 @@ async fn spawn_ready_child(
     let proof = kernel
         .retain_process_path_proof(&admission)
         .map_err(|error| DispatchLaunchError::Path(error.to_string()))?;
+    let executable_file_identity = proof.lease.executable_identity();
+    let executable_file_identity = (
+        executable_file_identity.volume_serial_number,
+        executable_file_identity.file_index,
+    );
+    let pending_native_worker_claim = if kind == DispatchedWorkerKind::NativeWorker {
+        let contour = DISPATCH_CONTOUR
+            .get()
+            .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+        let claim_id = inputs.native_worker_claim_id.ok_or_else(|| {
+            DispatchLaunchError::Inconsistent(
+                "native worker start lacks its exact admitted claim identity".to_owned(),
+            )
+        })?;
+        Some(begin_native_worker_process_start(
+            contour,
+            claim_id,
+            operation_id,
+            inputs.executable,
+            inputs.executable_sha256,
+            inputs.authority_epoch,
+            inputs.generation,
+            executable_file_identity,
+            admission.deadline_unix_ms(),
+        )?)
+    } else {
+        None
+    };
     match gateway.start(&owner, admission, proof, outer_binding).await {
-        Ok(receipt) => Ok(SpawnOutcome::Started(Box::new(receipt))),
+        Ok(receipt) => Ok(SpawnOutcome::Started(
+            Box::new(receipt),
+            executable_file_identity,
+        )),
         Err(ProcessExecutionError::UnknownOutcome) => {
+            if let Some(claim_id) = pending_native_worker_claim.as_deref() {
+                if let Some(contour) = DISPATCH_CONTOUR.get() {
+                    discard_native_worker_process_start_pending(contour, claim_id);
+                }
+            }
             Ok(SpawnOutcome::Unknown(operation_id.clone()))
         }
         Err(error) => {
+            if let Some(claim_id) = pending_native_worker_claim.as_deref() {
+                if let Some(contour) = DISPATCH_CONTOUR.get() {
+                    discard_native_worker_process_start_pending(contour, claim_id);
+                }
+            }
             if let Some(path) = inputs.material_path {
                 reap_material_file(path);
             }
@@ -3186,6 +3311,12 @@ fn retain_launch(
     record: LaunchRecord,
 ) -> Result<(), DispatchLaunchError> {
     let mut launches = launches_table(contour)?;
+    retain_launch_record(&mut launches, record);
+    Ok(())
+}
+
+/// Keeps the original launch identity while advancing a reserved slot.
+fn retain_launch_record(launches: &mut LaunchRecords, record: LaunchRecord) {
     launches
         .by_identity
         .entry(record.identity.clone())
@@ -3211,7 +3342,436 @@ fn retain_launch(
             }
         })
         .or_insert(record);
+}
+
+/// Stages one exact launch identity before ProcessExecutor start. The marker
+/// can hold a first registration until the completed receipt is retained,
+/// but it is never accepted as process proof by itself.
+fn begin_native_worker_process_start(
+    contour: &'static ComposedDispatchContour,
+    claim_id: &str,
+    operation_id: &OperationId,
+    executable_path: &Path,
+    executable_sha256: &str,
+    activation_epoch: &EpochId,
+    activation_generation: Generation,
+    executable_file_identity: (u32, u64),
+    deadline_unix_ms: u64,
+) -> Result<String, DispatchLaunchError> {
+    let mut launches = launches_table(contour)?;
+    let Some(record) = launches.by_identity.get(claim_id).filter(|record| {
+        record.kind == DispatchedWorkerKind::NativeWorker
+            && record.phase == LaunchPhase::Reserved
+            && record.operation_id == operation_id.as_str()
+    }) else {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker start lacks its exact reserved claim launch".to_owned(),
+        ));
+    };
+    let request = record.native_request.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Inconsistent(
+            "native worker start lacks its reserved claim request".to_owned(),
+        )
+    })?;
+    let executable_binding = request.executable_binding.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Inconsistent(
+            "native worker start lacks its owner executable binding".to_owned(),
+        )
+    })?;
+    if request.validate().is_err()
+        || request.validate_canonical_digest().is_err()
+        || record.request_digest != request.request_digest
+        || request.claim_id != claim_id
+        || request.authority_epoch != *activation_epoch
+        || request.worker_artifact_digest != executable_sha256
+        || executable_binding.launch_nonce != record.nonce
+        || executable_path.as_os_str().is_empty()
+        || executable_file_identity.1 == 0
+        || deadline_unix_ms <= super::unix_ms()
+        || launches.native_worker_pending_starts.contains_key(claim_id)
+        || launches.native_worker_process_receipts.contains_key(claim_id)
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker pending process terms do not match the reserved claim".to_owned(),
+        ));
+    }
+    let pending = NativeWorkerPendingProcessStart {
+        operation_id: operation_id.as_str().to_owned(),
+        executable_path: executable_path.to_path_buf(),
+        executable_sha256: executable_sha256.to_owned(),
+        launch_nonce: record.nonce.clone(),
+        activation_epoch: activation_epoch.clone(),
+        activation_generation,
+        executable_file_identity,
+        deadline_unix_ms,
+    };
+    launches
+        .native_worker_pending_starts
+        .insert(claim_id.to_owned(), pending);
+    Ok(claim_id.to_owned())
+}
+
+/// Clears an uncompleted start marker and wakes any first-registration waiter.
+fn discard_native_worker_process_start_pending(
+    contour: &'static ComposedDispatchContour,
+    claim_id: &str,
+) {
+    let removed = contour
+        .launches
+        .lock()
+        .ok()
+        .is_some_and(|mut launches| {
+            launches
+                .native_worker_pending_starts
+                .remove(claim_id)
+                .is_some()
+        });
+    if removed {
+        NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
+    }
+}
+
+/// Retains a started native worker and its ProcessExecutor receipt atomically
+/// under the claim's original launch identity.
+fn retain_native_worker_process_start(
+    contour: &'static ComposedDispatchContour,
+    record: LaunchRecord,
+    process_receipt: ProcessStartReceipt,
+    activation_epoch: EpochId,
+    activation_generation: Generation,
+    executable_file_identity: (u32, u64),
+) -> Result<(), DispatchLaunchError> {
+    if record.kind != DispatchedWorkerKind::NativeWorker
+        || record.phase != LaunchPhase::Launched
+        || process_receipt.validate().is_err()
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker launch lacks exact ProcessExecutor start evidence".to_owned(),
+        ));
+    }
+    let Some(request) = record.native_request.as_ref() else {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker launch lacks its exact admitted claim request".to_owned(),
+        ));
+    };
+    let process = process_receipt.identity();
+    let process_fence = process_receipt.binding().state_fence();
+    if request.validate().is_err()
+        || request.validate_canonical_digest().is_err()
+        || request.authority_epoch != activation_epoch
+        || process_receipt.binding().authority_epoch() != &activation_epoch
+        || !process_fence
+            .authority_epoch()
+            .is_same_authority(&activation_epoch)
+        || process_fence.generation() != activation_generation
+        || process_receipt.accepted_generation() != activation_generation
+        || process.generation() != activation_generation
+        || process_receipt.operation_id().as_str() != record.operation_id.as_str()
+        || process.executable_sha256() != request.worker_artifact_digest.as_str()
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "ProcessExecutor receipt does not match its launch activation and admitted worker artifact".to_owned(),
+        ));
+    }
+    let identity = record.identity.clone();
+    let request_digest = record.request_digest.clone();
+    let mut launches = launches_table(contour)?;
+    let reserved = launches.by_identity.get(&identity).is_some_and(|existing| {
+        existing.kind == DispatchedWorkerKind::NativeWorker
+            && existing.phase == LaunchPhase::Reserved
+            && existing.request_digest == request_digest
+    });
+    if !reserved {
+        return Err(DispatchLaunchError::ChangedTerms(format!(
+            "native worker claim {identity} has no matching launch reservation"
+        )));
+    }
+    let pending = launches
+        .native_worker_pending_starts
+        .get(&identity)
+        .ok_or_else(|| {
+            DispatchLaunchError::Inconsistent(
+                "native worker ProcessExecutor receipt has no pending launch marker".to_owned(),
+            )
+        })?;
+    if pending.operation_id != record.operation_id
+        || pending.executable_sha256 != request.worker_artifact_digest
+        || pending.launch_nonce != record.nonce
+        || pending.activation_epoch != activation_epoch
+        || pending.activation_generation != activation_generation
+        || pending.executable_file_identity != executable_file_identity
+        || !pending
+            .executable_path
+            .to_string_lossy()
+            .eq_ignore_ascii_case(process.physical().image_path())
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker ProcessExecutor receipt differs from its pending launch".to_owned(),
+        ));
+    }
+    retain_launch_record(&mut launches, record);
+    launches
+        .native_worker_process_receipts
+        .insert(
+            identity.clone(),
+            NativeWorkerProcessStartReceipt {
+                receipt: process_receipt,
+                activation_epoch,
+                activation_generation,
+                executable_file_identity,
+            },
+        );
+    let pending = launches.native_worker_pending_starts.remove(&identity);
+    drop(launches);
+    if pending.is_some() {
+        NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
+    }
     Ok(())
+}
+
+/// Loads current process-start evidence only for the exact launched claim.
+/// The returned receipt remains inert until the lifecycle route joins it to
+/// the current authenticated peer and durable ORS cell binding.
+pub(crate) fn native_worker_process_start_binding(
+    claim_id: &str,
+) -> Result<NativeWorkerProcessStartBinding, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let launches = launches_table(contour)?;
+    let retained = launches
+        .by_identity
+        .get(claim_id)
+        .filter(|record| {
+            record.kind == DispatchedWorkerKind::NativeWorker
+                && record.phase == LaunchPhase::Launched
+        })
+        .ok_or_else(|| {
+            DispatchLaunchError::Inconsistent(
+                "native worker claim has no retained launched process".to_owned(),
+            )
+        })?;
+    let request = retained.native_request.clone().ok_or_else(|| {
+        DispatchLaunchError::Inconsistent(
+            "native worker launch has no retained claim request".to_owned(),
+        )
+    })?;
+    let claim_receipt = retained.native_receipt.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Inconsistent(
+            "native worker launch has no retained admission receipt".to_owned(),
+        )
+    })?;
+    let process_start = launches
+        .native_worker_process_receipts
+        .get(claim_id)
+        .cloned()
+        .ok_or_else(|| {
+            DispatchLaunchError::Inconsistent(
+                "native worker launch has no retained ProcessExecutor receipt".to_owned(),
+            )
+        })?;
+    let executable_file_identity = process_start.executable_file_identity;
+    let process_receipt = process_start.receipt;
+    let Some(executable_binding) = request.executable_binding.as_ref() else {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker claim has no owner executable binding".to_owned(),
+        ));
+    };
+    request
+        .validate()
+        .and_then(|()| request.validate_canonical_digest())
+        .map_err(|_| {
+            DispatchLaunchError::Inconsistent(
+                "retained native worker claim request is invalid".to_owned(),
+            )
+        })?;
+    claim_receipt.validate().map_err(|_| {
+        DispatchLaunchError::Inconsistent(
+            "retained native worker admission receipt is invalid".to_owned(),
+        )
+    })?;
+    process_receipt.validate().map_err(|_| {
+        DispatchLaunchError::Inconsistent(
+            "retained native worker process receipt is invalid".to_owned(),
+        )
+    })?;
+    let process = process_receipt.identity();
+    let process_fence = process_receipt.binding().state_fence();
+    if request.claim_id != claim_id
+        || retained.request_digest != request.request_digest
+        || retained.admission_digest != claim_receipt.receipt_digest
+        || claim_receipt.claim_id != claim_id
+        || claim_receipt.registration_id != request.registration_id
+        || claim_receipt.attempt_id != request.attempt_id
+        || claim_receipt.operation_id != request.operation_id
+        || claim_receipt.binding_digest != request.binding_digest
+        || claim_receipt.worker_generation != request.worker_generation
+        || claim_receipt.authority_epoch != request.authority_epoch
+        || claim_receipt.state_fence != request.state_fence
+        || process_receipt.accepted_generation() != process_start.activation_generation
+        || process.generation() != process_start.activation_generation
+        || process_receipt.binding().authority_epoch() != &process_start.activation_epoch
+        || !process_fence
+            .authority_epoch()
+            .is_same_authority(&process_start.activation_epoch)
+        || process_fence.generation() != process_start.activation_generation
+        || process.executable_sha256() != request.worker_artifact_digest.as_str()
+        || process_receipt.operation_id().as_str() != retained.operation_id.as_str()
+        || executable_binding.launch_nonce != retained.nonce
+        || executable_binding.capability_cell.as_str().is_empty()
+        || executable_binding.capability_cell_registry_digest.len() != 64
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "retained native worker process does not bind the exact admitted cell claim".to_owned(),
+        ));
+    }
+    Ok(NativeWorkerProcessStartBinding {
+        request,
+        claim_receipt: claim_receipt.clone(),
+        receipt: process_receipt,
+        launch_nonce: retained.nonce.clone(),
+        activation_epoch: process_start.activation_epoch,
+        activation_generation: process_start.activation_generation,
+        executable_file_identity,
+    })
+}
+
+/// Waits for the exact reserved launch that matches a registration peer to
+/// publish its completed ProcessExecutor receipt. This only waits; the
+/// caller must still resolve and validate the retained receipt afterwards.
+pub(crate) fn wait_for_native_worker_process_start(
+    peer: &ProcessBinding,
+    launch_nonce: &str,
+    request_deadline_unix_ms: u64,
+) -> Result<(), DispatchLaunchError> {
+    if cfg!(windows) && peer.executable_file_identity().is_none() {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker peer lacks handle-bound executable file identity".to_owned(),
+        ));
+    }
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let mut launches = launches_table(contour)?;
+    loop {
+        let mut matching = launches
+            .native_worker_process_receipts
+            .iter()
+            .filter_map(|(claim_id, receipt)| {
+                let retained = launches.by_identity.get(claim_id)?;
+                if retained.kind != DispatchedWorkerKind::NativeWorker
+                    || retained.phase != LaunchPhase::Launched
+                    || retained.nonce != launch_nonce
+                {
+                    return None;
+                }
+                let physical = receipt.receipt.identity().physical();
+                (peer.process_id() == physical.process_id()
+                    && peer.start_time_100ns() == physical.start_time_100ns()
+                    && peer.executable_file_identity() == Some(receipt.executable_file_identity)
+                    && peer.image_path().eq_ignore_ascii_case(physical.image_path()))
+                .then_some(claim_id.as_str())
+        });
+        if matching.next().is_some() {
+            if matching.next().is_some() {
+                return Err(DispatchLaunchError::Inconsistent(
+                    "authenticated native worker peer matches multiple retained claims".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        let mut pending_matches = launches
+            .native_worker_pending_starts
+            .iter()
+            .filter(|(claim_id, pending)| {
+                launches.by_identity.get(*claim_id).is_some_and(|record| {
+                    record.kind == DispatchedWorkerKind::NativeWorker
+                        && record.phase == LaunchPhase::Reserved
+                        && record.operation_id == pending.operation_id
+                        && record.nonce == pending.launch_nonce
+                        && pending.launch_nonce == launch_nonce
+                }) && peer.executable_file_identity() == Some(pending.executable_file_identity)
+                    && peer
+                        .image_path()
+                        .eq_ignore_ascii_case(pending.executable_path.to_string_lossy().as_ref())
+            });
+        let Some((_, pending)) = pending_matches.next() else {
+            return Err(DispatchLaunchError::Inconsistent(
+                "authenticated native worker peer has no retained or pending launch".to_owned(),
+            ));
+        };
+        if pending_matches.next().is_some() {
+            return Err(DispatchLaunchError::Inconsistent(
+                "authenticated native worker peer matches multiple pending launches".to_owned(),
+            ));
+        }
+        let deadline = request_deadline_unix_ms.min(pending.deadline_unix_ms);
+        let remaining_ms = deadline.saturating_sub(super::unix_ms());
+        if remaining_ms == 0 {
+            return Err(DispatchLaunchError::Inconsistent(
+                "native worker registration expired before its ProcessExecutor receipt was retained".to_owned(),
+            ));
+        }
+        let (next_launches, result) = NATIVE_WORKER_PROCESS_START_CHANGED
+            .wait_timeout(launches, Duration::from_millis(remaining_ms))
+            .map_err(|_| {
+                DispatchLaunchError::Gate("dispatch launch record lock poisoned".to_owned())
+            })?;
+        launches = next_launches;
+        if result.timed_out() && super::unix_ms() >= deadline {
+            return Err(DispatchLaunchError::Inconsistent(
+                "native worker registration expired before its ProcessExecutor receipt was retained".to_owned(),
+            ));
+        }
+    }
+}
+
+/// Resolves the one retained native-worker launch joined to an authenticated
+/// peer's handle-bound process identity. A caller may additionally constrain
+/// the lookup to the claim identity presented by a lifecycle operation.
+pub(crate) fn native_worker_process_start_binding_for_peer(
+    peer: &ProcessBinding,
+    expected_claim_id: Option<&str>,
+) -> Result<NativeWorkerProcessStartBinding, DispatchLaunchError> {
+    if cfg!(windows) && peer.executable_file_identity().is_none() {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker peer lacks handle-bound executable file identity".to_owned(),
+        ));
+    }
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let launches = launches_table(contour)?;
+    let mut matching = launches
+        .native_worker_process_receipts
+        .iter()
+        .filter_map(|(claim_id, receipt)| {
+            let retained = launches.by_identity.get(claim_id)?;
+            if retained.kind != DispatchedWorkerKind::NativeWorker
+                || retained.phase != LaunchPhase::Launched
+                || expected_claim_id.is_some_and(|expected| expected != claim_id.as_str())
+            {
+                return None;
+            }
+            let physical = receipt.receipt.identity().physical();
+            (peer.process_id() == physical.process_id()
+                && peer.start_time_100ns() == physical.start_time_100ns()
+                && peer.executable_file_identity() == Some(receipt.executable_file_identity)
+                && peer.image_path().eq_ignore_ascii_case(physical.image_path()))
+            .then_some(claim_id.as_str())
+        });
+    let Some(claim_id) = matching.next().map(str::to_owned) else {
+        return Err(DispatchLaunchError::Inconsistent(
+            "authenticated native worker peer has no retained launched process".to_owned(),
+        ));
+    };
+    if matching.next().is_some() {
+        return Err(DispatchLaunchError::Inconsistent(
+            "authenticated native worker peer matches multiple retained claims".to_owned(),
+        ));
+    }
+    drop(launches);
+    native_worker_process_start_binding(&claim_id)
 }
 
 /// Reconciles one launched-but-unreconciled Doctor attempt by its original
@@ -3311,6 +3871,12 @@ fn mark_reconciled(
     let mut launches = launches_table(contour)?;
     if let Some(record) = launches.by_identity.get_mut(identity) {
         record.phase = LaunchPhase::Reconciled;
+    }
+    launches.native_worker_process_receipts.remove(identity);
+    let pending = launches.native_worker_pending_starts.remove(identity).is_some();
+    drop(launches);
+    if pending {
+        NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
     }
     Ok(())
 }
@@ -3705,6 +4271,7 @@ pub async fn start_ready_testd_launch(
         &SpawnInputs {
             kind: DispatchedWorkerKind::Testd,
             operation_id: &ready.operation_id,
+            native_worker_claim_id: None,
             executable: &ready.executable,
             executable_sha256: &ready.executable_sha256,
             working_directory: &ready.working_directory,
@@ -3715,10 +4282,13 @@ pub async fn start_ready_testd_launch(
     )
     .await?
     {
-        SpawnOutcome::Started(receipt) => Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
-            receipt: *receipt,
-            operation_id: ready.operation_id.clone(),
-        }))),
+        SpawnOutcome::Started(receipt, executable_file_identity) => {
+            Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
+                receipt: *receipt,
+                operation_id: ready.operation_id.clone(),
+                executable_file_identity,
+            })))
+        }
         SpawnOutcome::Unknown(operation_id) => {
             Ok(ChildStartOutcome::Unknown(UncertainSpawn { operation_id }))
         }
@@ -3923,8 +4493,13 @@ pub fn release_launched_attempt(
         .is_some_and(|record| record.kind == kind && record.request_digest == request_digest);
     if release {
         launches.by_identity.remove(identity);
+        launches.native_worker_process_receipts.remove(identity);
+        launches.native_worker_pending_starts.remove(identity);
     }
     drop(launches);
+    if release {
+        NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
+    }
     if release && let Some(path) = material_path {
         reap_material_file(&path);
     }
@@ -4111,6 +4686,12 @@ pub fn prepare_native_worker_launch(
         .request
         .validate_canonical_digest()
         .map_err(gate_error)?;
+    if material.request.worker_artifact_digest != material.executable_sha256 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "composition-pinned native worker executable does not match the claim artifact digest"
+                .to_owned(),
+        ));
+    }
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
@@ -4177,6 +4758,16 @@ pub fn prepare_native_worker_launch(
         admitted_at_nanos,
         contour.principal_owner.as_str(),
     )?;
+    if material
+        .request
+        .executable_binding
+        .as_ref()
+        .is_some_and(|binding| binding.launch_nonce != nonce)
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker launch nonce does not match its owner executable binding".to_owned(),
+        ));
+    }
     let generation = Generation::new(generation)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let operation_id = OperationId::new(format!(
@@ -4298,6 +4889,7 @@ pub async fn start_ready_native_worker_launch(
         &SpawnInputs {
             kind: DispatchedWorkerKind::NativeWorker,
             operation_id: &ready.operation_id,
+            native_worker_claim_id: Some(&ready.receipt.claim_id),
             executable: &ready.executable,
             executable_sha256: &ready.executable_sha256,
             working_directory: &ready.working_directory,
@@ -4308,10 +4900,13 @@ pub async fn start_ready_native_worker_launch(
     )
     .await?
     {
-        SpawnOutcome::Started(receipt) => Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
-            receipt: *receipt,
-            operation_id: ready.operation_id.clone(),
-        }))),
+        SpawnOutcome::Started(receipt, executable_file_identity) => {
+            Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
+                receipt: *receipt,
+                operation_id: ready.operation_id.clone(),
+                executable_file_identity,
+            })))
+        }
         SpawnOutcome::Unknown(operation_id) => {
             Ok(ChildStartOutcome::Unknown(UncertainSpawn { operation_id }))
         }
@@ -4368,11 +4963,11 @@ pub async fn launch_admitted_native_worker_attempt(
                     .get(&claim_id)
                     .and_then(|record| record.native_request.clone())
             };
-            retain_launch(
+            let retained = retain_native_worker_process_start(
                 contour,
                 LaunchRecord {
                     kind: DispatchedWorkerKind::NativeWorker,
-                    identity: claim_id,
+                    identity: claim_id.clone(),
                     admission_digest: ready.receipt.receipt_digest.clone(),
                     request_digest,
                     effect_digest: None,
@@ -4385,7 +4980,15 @@ pub async fn launch_admitted_native_worker_attempt(
                     native_receipt: Some((*ready.receipt).clone()),
                     native_request,
                 },
-            )?;
+                spawned.receipt.clone(),
+                ready.authority_epoch.clone(),
+                ready.generation,
+                spawned.executable_file_identity,
+            );
+            if let Err(error) = retained {
+                discard_native_worker_process_start_pending(contour, &claim_id);
+                return Err(error);
+            }
             Ok(NativeWorkerLaunchOutcome::Launched {
                 receipt: ready.receipt,
                 nonce: ready.nonce,
@@ -4442,10 +5045,10 @@ pub async fn launch_admitted_native_worker_attempt(
 /// computed, and no second child is spawned. The retained receipt is then
 /// re-proved against the retained request through the existing service
 /// owner (`KernelService::reconcile_native_worker_claim_admission`) under
-/// live authority (same-authority epoch). A converged receipt reaps the
-/// dispatch file best-effort and closes the slot; anything still
-/// outstanding stays unreconciled for a later call. Unknown identities
-/// report unknown instead of inventing state.
+/// live authority (same-authority epoch). A launched process keeps its
+/// ProcessExecutor proof until explicit terminal release; an unknown start
+/// with no live process receipt may close after receipt reconciliation.
+/// Unknown identities report unknown instead of inventing state.
 pub fn reconcile_launched_native_worker_attempt(
     kernel: &KernelComposition,
     claim_id: &str,
@@ -4515,6 +5118,13 @@ pub fn reconcile_launched_native_worker_attempt(
         .reconcile_native_worker_claim_admission(&receipt, &request)
         .map_err(gate_error)?;
     if binds {
+        if retained.phase == LaunchPhase::Launched {
+            return Ok(ReconcileLaunchedOutcome::Reconciled {
+                kind: DispatchedWorkerKind::NativeWorker,
+                identity: claim_id.to_owned(),
+                admission_digest: retained.admission_digest,
+            });
+        }
         if let Some(path) = retained.material_path.as_deref() {
             reap_material_file(path);
         }
@@ -4907,6 +5517,7 @@ pub async fn start_ready_dreamer_launch(
         &SpawnInputs {
             kind: DispatchedWorkerKind::Dreamer,
             operation_id: &ready.operation_id,
+            native_worker_claim_id: None,
             executable: &ready.executable,
             executable_sha256: &ready.executable_sha256,
             working_directory: &ready.working_directory,
@@ -4918,10 +5529,13 @@ pub async fn start_ready_dreamer_launch(
     .await
     .map_err(dreamer_launch_error)?
     {
-        SpawnOutcome::Started(receipt) => Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
-            receipt: *receipt,
-            operation_id: ready.operation_id.clone(),
-        }))),
+        SpawnOutcome::Started(receipt, executable_file_identity) => {
+            Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
+                receipt: *receipt,
+                operation_id: ready.operation_id.clone(),
+                executable_file_identity,
+            })))
+        }
         SpawnOutcome::Unknown(operation_id) => {
             Ok(ChildStartOutcome::Unknown(UncertainSpawn { operation_id }))
         }
