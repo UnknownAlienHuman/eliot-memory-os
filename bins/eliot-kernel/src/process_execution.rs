@@ -316,12 +316,12 @@ impl KernelGovernedProcessEffectPort {
     fn confirm_external_transition(
         hint_id: &str,
         hint: change_monitor::KernelChangeHint,
-        verification: change_monitor::HintVerification,
+        verification: &change_monitor::HintVerification,
     ) {
         if change_monitor::ingest_hint(hint).is_err() {
             return;
         }
-        let _ = change_monitor::confirm_hint(hint_id, &verification);
+        let _ = change_monitor::confirm_hint(hint_id, verification);
     }
 }
 
@@ -401,7 +401,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 },
                 git: None,
             };
-            Self::confirm_external_transition(&hint_id, hint, verification);
+            Self::confirm_external_transition(&hint_id, hint, &verification);
         }
         if let Ok(mut last) = self.last_observed.lock() {
             last.insert(resource.clone(), first_digest.clone());
@@ -473,13 +473,11 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         // A conflicting identity under the same hint reuses an operation
         // handle for different content: evidence is ambiguous, so nothing
         // is recorded or confirmed for it.
-        match change_monitor::ingest_hint(hint) {
-            Ok(_) => {}
-            Err(change_monitor::ChangeMonitorError::HintConflict) => {
-                observe_process("kernel.process.effect_observed", "unobserved");
-                return Ok(());
-            }
-            Err(_) => {}
+        if let Err(change_monitor::ChangeMonitorError::HintConflict) =
+            change_monitor::ingest_hint(hint)
+        {
+            observe_process("kernel.process.effect_observed", "unobserved");
+            return Ok(());
         }
         let (Some(before_digest), Some(after_first), Some(after_reread)) = (
             baseline.before_digest,
