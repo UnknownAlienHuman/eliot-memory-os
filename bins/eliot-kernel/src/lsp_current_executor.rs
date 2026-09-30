@@ -1,7 +1,8 @@
 //! Kernel-owned adapters for the current LSP bridge process boundary.
 //!
 //! This module deliberately adapts the existing authenticated Kernel P-03
-//! client. It does not issue a process intent, lease, fence, deadline, or
+//! gateway while retaining the original EBP request and owner-read task
+//! identity. It does not issue a process intent, lease, fence, deadline, or
 //! source/artifact authority. Those values must arrive from their original
 //! admitted owners.
 
@@ -11,35 +12,107 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use eliot_contracts::TaskId;
 use eliot_ipc::Session;
 use eliot_git_bridge::{
     AsyncProcessRunner, GitProcessProfile, GitProcessRunError, GitProcessRunFuture,
     ProcessOutcome,
 };
 use eliot_kernel_service::{
-    KernelProcessExecutionClient, ProcessExecutionClient, ProcessExecutionRejection,
+    ProcessExecutionClient, ProcessExecutionFuture, ProcessExecutionRejection,
     ProcessExecutionRequest, ProcessExecutionResponse, ProcessStreamReadRequest,
+    PROCESS_STREAM_READ_CHUNK_MAX_BYTES,
 };
 use eliot_lsp_bridge::{LspProcessOwnerError, LspProcessOwnerFuture, LspProcessOwnerPort};
+use eliot_protocol::RequestIdentity;
 use eliot_process::{
-    ExitDisposition, ProcessEvidence,
-    ProcessExecutionAdmissionRequest, ProcessLifecycle, ProcessStartReceipt, ProcessSessionBinding,
-    ProcessStreamEvidence, ProcessStreamKind, StreamEvidenceGap, StreamTransportStatus,
+    ExitDisposition, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
+    ProcessLifecycle, ProcessStartReceipt, ProcessSessionBinding, ProcessStreamEvidence,
+    ProcessStreamKind, StreamEvidenceGap, StreamTransportStatus,
 };
 use eliot_lsp_bridge::LspCurrentBridge;
 use sha2::{Digest as _, Sha256};
 
-use super::{KernelComposition, process_execution_client};
+use super::process_execution_client::authenticated_process_route;
+use super::KernelComposition;
 
-/// Exact P-04 capture ceiling for this original stream-readback route.
-pub const MAX_GIT_PROCESS_STREAM_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_GIT_STREAM_READ_CHUNK_BYTES: u64 = 1024 * 1024;
+/// Identity-preserving adapter into the existing Kernel P-03 front door. Each
+/// instance retains the original request identity and TaskBinding task for
+/// one source-process operation; it does not expose the physical executor.
+struct CurrentSourceProcessClient {
+    kernel: Arc<KernelComposition>,
+    session: Session,
+    session_binding: ProcessSessionBinding,
+    identity: RequestIdentity,
+    admitted_task_id: TaskId,
+}
+impl CurrentSourceProcessClient {
+    fn new(
+        kernel: &Arc<KernelComposition>,
+        session: &Session,
+        session_binding: &ProcessSessionBinding,
+        identity: RequestIdentity,
+        admitted_task_id: TaskId,
+    ) -> Result<Self, ProcessExecutionRejection> {
+        let reject = |code: &str, detail: &str| ProcessExecutionRejection {
+            code: code.to_owned(),
+            detail: detail.to_owned(),
+        };
+        identity.validate().map_err(|_| {
+            reject(
+                "SOURCE_REQUEST_IDENTITY_INVALID",
+                "original source request identity failed protocol validation",
+            )
+        })?;
+        if identity.request.metadata.task_id.as_ref() != Some(&admitted_task_id)
+            || identity.request.state_fence != session.module_generation.state_fence
+            || identity.request.metadata.state_fence != identity.request.state_fence
+        {
+            return Err(reject(
+                "SOURCE_REQUEST_TASK_OR_FENCE_MISMATCH",
+                "original EBP request identity does not name the admitted task and session fence",
+            ));
+        }
+        // Keep the same eager caller/session/P-03 readiness rejection as the
+        // generic production client. Actual operations still enter the
+        // identity-aware Kernel route below, which revalidates these bindings.
+        drop(authenticated_process_route(kernel, session, session_binding)?);
+        Ok(Self {
+            kernel: Arc::clone(kernel),
+            session: session.clone(),
+            session_binding: session_binding.clone(),
+            identity,
+            admitted_task_id,
+        })
+    }
+}
 
-/// A same-session adapter from the LSP bridge to the existing Kernel P-03
+impl ProcessExecutionClient for CurrentSourceProcessClient {
+    fn execute(&self, request: ProcessExecutionRequest) -> ProcessExecutionFuture<'_> {
+        let kernel = Arc::clone(&self.kernel);
+        let session = self.session.clone();
+        let session_binding = self.session_binding.clone();
+        let identity = self.identity.clone();
+        let admitted_task_id = self.admitted_task_id.clone();
+        Box::pin(async move {
+            kernel
+                .execute_current_source_process_request(
+                    &session,
+                    session_binding,
+                    request,
+                    &identity,
+                    &admitted_task_id,
+                )
+                .await
+        })
+    }
+}
+
+/// An identity-bound adapter from the LSP bridge to the existing Kernel P-03
 /// front door. The wrapped client delegates Start/Reconcile to the original
 /// process gateway; it does not expose the physical executor.
 pub struct KernelLspProcessOwnerPort {
-    client: Arc<KernelProcessExecutionClient>,
+    client: Arc<CurrentSourceProcessClient>,
 }
 
 impl KernelLspProcessOwnerPort {
@@ -49,8 +122,16 @@ impl KernelLspProcessOwnerPort {
         kernel: &Arc<KernelComposition>,
         session: &Session,
         session_binding: &ProcessSessionBinding,
+        original_identity: RequestIdentity,
+        admitted_task_id: TaskId,
     ) -> Result<Self, ProcessExecutionRejection> {
-        let client = process_execution_client(kernel, session, session_binding)?;
+        let client = CurrentSourceProcessClient::new(
+            kernel,
+            session,
+            session_binding,
+            original_identity,
+            admitted_task_id,
+        )?;
         Ok(Self {
             client: Arc::new(client),
         })
@@ -108,18 +189,24 @@ impl LspProcessOwnerPort for KernelLspProcessOwnerPort {
 
 /// Future returned by the existing Instrument/Governor owner for one Git
 /// subprocess admission. The owner must bind the complete command tuple and
-/// return its already-admitted P-03 request; Kernel creates no admission.
+/// return its already-admitted P-03 request with that child's exact EBP
+/// identity; Kernel creates no admission or child identity.
 pub type GitAdmissionFuture<'a> = Pin<
     Box<
-        dyn Future<Output = Result<ProcessExecutionAdmissionRequest, GitProcessRunError>>
-            + Send
+        dyn Future<
+                Output = Result<
+                    (ProcessExecutionAdmissionRequest, RequestIdentity),
+                    GitProcessRunError,
+                >,
+            > + Send
             + 'a,
     >,
 >;
 
 /// Original admitted owner for one isolated-index Git command.
 pub trait GitAdmissionPort: Send + Sync {
-    /// Returns the original owner-created admission for this exact tuple.
+    /// Returns the original owner-created admission and identity for this
+    /// exact tuple. Every Git child has its own request/idempotency identity.
     fn admit_git_command<'a>(
         &'a self,
         exe: &'a str,
@@ -130,21 +217,34 @@ pub trait GitAdmissionPort: Send + Sync {
     ) -> GitAdmissionFuture<'a>;
 }
 
-/// Async Git runner over the same authenticated P-03 client used by the LSP
-/// owner port. Full stream bytes come only from the original P-03 stream reader.
+/// Async Git runner over the authenticated Kernel P-03 route. Each child uses
+/// its own original EBP identity from the admission owner. Full stream bytes
+/// come only from the original P-03 stream reader.
 pub struct KernelGitProcessRunner {
-    client: Arc<KernelProcessExecutionClient>,
+    kernel: Arc<KernelComposition>,
+    session: Session,
+    session_binding: ProcessSessionBinding,
+    admitted_task_id: TaskId,
     admissions: Arc<dyn GitAdmissionPort>,
 }
 
 impl KernelGitProcessRunner {
-    /// Composes a same-session P-03 client with the original admission and
+    /// Composes the identity-aware P-03 route with original admission and
     /// stream-source owners supplied by the current Governor composition.
     pub(crate) fn new(
-        client: Arc<KernelProcessExecutionClient>,
+        kernel: &Arc<KernelComposition>,
+        session: &Session,
+        session_binding: &ProcessSessionBinding,
+        admitted_task_id: TaskId,
         admissions: Arc<dyn GitAdmissionPort>,
     ) -> Self {
-        Self { client, admissions }
+        Self {
+            kernel: Arc::clone(kernel),
+            session: session.clone(),
+            session_binding: session_binding.clone(),
+            admitted_task_id,
+            admissions,
+        }
     }
 }
 
@@ -164,15 +264,24 @@ impl AsyncProcessRunner for KernelGitProcessRunner {
                     "the current Kernel P-03 request has no admitted stdin binding",
                 ));
             }
-            let admission = self
+            let (admission, identity) = self
                 .admissions
                 .admit_git_command(exe, args, cwd, stdin, profile)
                 .await?;
             validate_git_admission(&admission, exe, args, cwd, profile)?;
-            let deadline_unix_ms = admission.deadline_unix_ms();
-            let owner_wait_ms = admission.intent().resource_limits().wall_timeout_ms();
+            let deadline_unix_ms = identity.deadline_unix_ms;
+            let stdout_limit = admission.intent().resource_limits().stdout_bytes();
+            let stderr_limit = admission.intent().resource_limits().stderr_bytes();
+            let client = CurrentSourceProcessClient::new(
+                &self.kernel,
+                &self.session,
+                &self.session_binding,
+                identity,
+                self.admitted_task_id.clone(),
+            )
+            .map_err(|rejection| git_rejection(&rejection.code, &rejection.detail))?;
+            let client: Arc<dyn ProcessExecutionClient> = Arc::new(client);
 
-            let client: Arc<dyn ProcessExecutionClient> = self.client.clone();
             let receipt = match client
                 .execute(ProcessExecutionRequest::Start(admission))
                 .await
@@ -189,8 +298,7 @@ impl AsyncProcessRunner for KernelGitProcessRunner {
                 }
             };
 
-            wait_for_terminal(&client, &receipt, deadline_unix_ms, owner_wait_ms)
-                .await?;
+            wait_for_terminal(&client, &receipt, deadline_unix_ms).await?;
 
             let evidence = match client
                 .execute(ProcessExecutionRequest::Reconcile {
@@ -219,10 +327,22 @@ impl AsyncProcessRunner for KernelGitProcessRunner {
             }
 
             let stdout = self
-                .read_stream(&receipt, &evidence, ProcessStreamKind::Stdout)
+                .read_stream(
+                    &client,
+                    &receipt,
+                    &evidence,
+                    ProcessStreamKind::Stdout,
+                    stdout_limit,
+                )
                 .await?;
             let stderr = self
-                .read_stream(&receipt, &evidence, ProcessStreamKind::Stderr)
+                .read_stream(
+                    &client,
+                    &receipt,
+                    &evidence,
+                    ProcessStreamKind::Stderr,
+                    stderr_limit,
+                )
                 .await?;
             let code = process_exit_code(&evidence)?;
             Ok(ProcessOutcome {
@@ -237,9 +357,11 @@ impl AsyncProcessRunner for KernelGitProcessRunner {
 impl KernelGitProcessRunner {
     async fn read_stream(
         &self,
+        client: &Arc<dyn ProcessExecutionClient>,
         started: &ProcessStartReceipt,
         evidence: &ProcessEvidence,
         kind: ProcessStreamKind,
+        admitted_stream_limit: u64,
     ) -> Result<Vec<u8>, GitProcessRunError> {
         let stream = match kind {
             ProcessStreamKind::Stdout => evidence.stdout(),
@@ -251,8 +373,10 @@ impl KernelGitProcessRunner {
                 "Git process evidence omitted a required output stream",
             )
         })?;
-        validate_complete_stream(stream, started, kind)?;
-        let bytes = self.read_stream_chunks(started, evidence, kind).await?;
+        validate_complete_stream(stream, started, kind, admitted_stream_limit)?;
+        let bytes = self
+            .read_stream_chunks(client, started, evidence, kind)
+            .await?;
         if bytes.len() as u64 != stream.observed_bytes()
             || sha256_hex(&bytes) != stream.observed_sha256()
         {
@@ -266,6 +390,7 @@ impl KernelGitProcessRunner {
 
     async fn read_stream_chunks(
         &self,
+        client: &Arc<dyn ProcessExecutionClient>,
         started: &ProcessStartReceipt,
         evidence: &ProcessEvidence,
         kind: ProcessStreamKind,
@@ -288,10 +413,13 @@ impl KernelGitProcessRunner {
         })?;
         let expected_receipt_digest = sha256_hex(&receipt_bytes);
         let expected_bytes = stream.observed_bytes();
-        let mut output = Vec::with_capacity(expected_bytes as usize);
+        // The original P-03 readback owner enforces its retained-source
+        // ceiling before returning bytes. Avoid allocating from caller-carried
+        // evidence length before that owner check has succeeded.
+        let mut output = Vec::new();
         let mut offset = 0_u64;
         loop {
-            let max_bytes = MAX_GIT_STREAM_READ_CHUNK_BYTES;
+            let max_bytes = PROCESS_STREAM_READ_CHUNK_MAX_BYTES;
             let request = ProcessStreamReadRequest::new(
                 started.clone(),
                 kind,
@@ -299,7 +427,6 @@ impl KernelGitProcessRunner {
                 max_bytes,
             )
             .map_err(|error| git_rejection("PROCESS_STREAM_READ_INVALID", &error.to_string()))?;
-            let client: Arc<dyn ProcessExecutionClient> = self.client.clone();
             let chunk = match client
                 .execute(ProcessExecutionRequest::ReadStream { request })
                 .await
@@ -366,20 +493,29 @@ pub struct KernelLspCurrentExecutor {
 }
 
 impl KernelLspCurrentExecutor {
-    /// Creates the production bridge over one authenticated Kernel session
-    /// and original Git admission/stream owners.
+    /// Creates the production bridge over one authenticated Kernel session,
+    /// the original EBP identity and TaskBinding task, and original Git
+    /// admission/stream owners.
     pub fn from_authenticated_session(
         kernel: &Arc<KernelComposition>,
         session: &Session,
         session_binding: &ProcessSessionBinding,
+        original_identity: RequestIdentity,
+        admitted_task_id: TaskId,
         git_admissions: Arc<dyn GitAdmissionPort>,
     ) -> Result<Self, ProcessExecutionRejection> {
-        let client = Arc::new(process_execution_client(kernel, session, session_binding)?);
-        let process_owner = Arc::new(KernelLspProcessOwnerPort {
-            client: Arc::clone(&client),
-        });
+        let process_owner = Arc::new(KernelLspProcessOwnerPort::from_authenticated_session(
+            kernel,
+            session,
+            session_binding,
+            original_identity,
+            admitted_task_id.clone(),
+        )?);
         let git_owner = Arc::new(KernelGitProcessRunner::new(
-            client,
+            kernel,
+            session,
+            session_binding,
+            admitted_task_id,
             git_admissions,
         ));
         Ok(Self {
@@ -444,17 +580,14 @@ async fn wait_for_terminal(
     client: &Arc<dyn ProcessExecutionClient>,
     receipt: &ProcessStartReceipt,
     deadline_unix_ms: u64,
-    owner_wait_ms: u64,
 ) -> Result<(), GitProcessRunError> {
     let operation_id = receipt.operation_id();
-    let started_at = tokio::time::Instant::now();
-    let wait_budget = Duration::from_millis(owner_wait_ms);
     loop {
         let now_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| git_rejection("PROCESS_CLOCK_UNAVAILABLE", "system clock predates Unix epoch"))?
             .as_millis();
-        if now_unix_ms >= u128::from(deadline_unix_ms) || started_at.elapsed() >= wait_budget {
+        if now_unix_ms >= u128::from(deadline_unix_ms) {
             return Err(git_rejection(
                 "PROCESS_DEADLINE_EXCEEDED",
                 "original admitted process deadline elapsed before terminal observation",
@@ -506,6 +639,7 @@ fn validate_complete_stream(
     stream: &ProcessStreamEvidence,
     started: &ProcessStartReceipt,
     expected_kind: ProcessStreamKind,
+    admitted_stream_limit: u64,
 ) -> Result<(), GitProcessRunError> {
     let disallowed_gap = stream.gaps().iter().any(|gap| {
         !matches!(
@@ -519,7 +653,7 @@ fn validate_complete_stream(
     if stream.stream() != expected_kind
         || stream.binding() != started.binding()
         || stream.transport() != StreamTransportStatus::Complete
-        || stream.observed_bytes() > MAX_GIT_PROCESS_STREAM_BYTES
+        || stream.observed_bytes() > admitted_stream_limit
         || disallowed_gap
     {
         return Err(git_rejection(

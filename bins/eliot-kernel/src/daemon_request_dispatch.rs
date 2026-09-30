@@ -697,6 +697,9 @@ struct CurrentSourceProcessOperation {
     /// The exact closed P-03 operation. It is nested because the daemon's
     /// routing envelope also uses the top-level `operation` JSON key.
     request: ProcessExecutionRequest,
+    /// Original Governor owner-read TaskBinding identity. The EBP identity is
+    /// compared against this value before the process gateway is entered.
+    admitted_task_id: eliot_contracts::TaskId,
 }
 
 /// Strips the daemon transport's routing key from one application body.
@@ -4556,42 +4559,18 @@ impl KernelComposition {
         let operation: CurrentSourceProcessOperation =
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
+        let admitted_task_id = operation.admitted_task_id;
         let request = operation.request;
-        request
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
         let identity = request_identity.ok_or(TransportError::SessionFenced)?;
-        identity
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let operation_id = request
-            .operation_id()
-            .ok_or(TransportError::SessionFenced)?;
-        if identity.request.state_fence != session.module_generation.state_fence
-            || identity.request.metadata.task_id.is_none()
-            || identity.idempotency_key != operation_id.as_str()
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        if let ProcessExecutionRequest::Start(admission) = &request {
-            if admission.recipient_module_id() != session.module_generation.module_id.as_str()
-                || identity.deadline_unix_ms != admission.deadline_unix_ms()
-                || !identity
-                    .request
-                    .state_fence
-                    .authority_epoch
-                    .is_same_authority(admission.state_fence().authority_epoch())
-                || identity.request.state_fence.resource_generation.value()
-                    != admission.state_fence().generation().get()
-                || identity.request.metadata.request_id.as_str()
-                    != admission.intent().operation_id().as_str()
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
         let (_, session_binding) = super::caller_binding(session)?;
         let response = self
-            .execute_current_source_process_request(session, session_binding, request, identity)
+            .execute_current_source_process_request(
+                session,
+                session_binding,
+                request,
+                identity,
+                admitted_task_id,
+            )
             .await;
         let response = serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?;
         Ok(serde_json::json!({
