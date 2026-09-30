@@ -20,6 +20,7 @@ use eliot_process::{
 };
 
 use super::native_worker_lifecycle_route::{native_worker_json_str, native_worker_json_u64};
+use super::process_execution::{observe_process_in_context, process_terminal_code};
 use super::{KernelComposition, ProcessExecutionGateway, caller_binding};
 
 /// Operation port delegating to the gateway under one bound owner.
@@ -78,16 +79,16 @@ impl ProcessStarter for GatewayProcessStarter {
             // F-LOG-KERNEL-3 (#901 W12, case 4 "pre-launch refusal remains
             // not attempted"): the live front-door process start runs the one
             // process-execution material-coverage guard
-            // (`KernelComposition::reject_process_start_without_material_coverage`,
+            // (`KernelComposition::reject_process_start_without_material_coverage_in_context`,
             // owned by `process_execution`) instead of re-deriving the target
             // fence here. A missing independent Host-observed Watchdog
             // carrier, a non-current target generation, or a stale fence
             // therefore denies the start before any path proof is retained and
             // before `gateway.start` is reached, and the typed refusal keeps
             // the same `WATCHDOG_COVERAGE_UNAVAILABLE` projection it already
-            // had (see `ProcessExecutionRejection::from_error`, which recovers
-            // that code from the bounded detail prefix). The guard owns the
-            // single `kernel.process.request_rejected` observation.
+            // had. On refusal the guard owns both the contextual rejection
+            // observation and the one terminal; this caller only returns its
+            // typed rejection for the service client to project.
             let outer_binding =
                 match kernel.reject_process_start_without_material_coverage_in_context(
                     &admission,
@@ -101,7 +102,21 @@ impl ProcessStarter for GatewayProcessStarter {
                         )));
                     }
             };
-            let proof = kernel.retain_process_path_proof(&admission)?;
+            let proof = match kernel.retain_process_path_proof(&admission) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    observe_process_in_context(
+                        &context,
+                        "kernel.process.request_rejected",
+                        "path_proof",
+                    );
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        process_terminal_code(&error),
+                        &context,
+                    );
+                    return Err(error);
+                }
+            };
             gateway
                 .start_in_context(&owner, admission, proof, outer_binding, &context)
                 .await

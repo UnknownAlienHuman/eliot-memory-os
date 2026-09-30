@@ -70,7 +70,11 @@ fn observe_process(event: &'static str, outcome: &'static str) {
 /// Emits one process observation under its explicitly propagated operation
 /// context. The unscoped wrapper above uses an explicit all-unavailable span;
 /// neither path inherits whichever span happens to be current on this task.
-fn observe_process_in_context(context: &tracing::Span, event: &'static str, outcome: &'static str) {
+pub(crate) fn observe_process_in_context(
+    context: &tracing::Span,
+    event: &'static str,
+    outcome: &'static str,
+) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
@@ -172,6 +176,34 @@ fn record_process_start_request_context(
     );
 }
 
+/// Projects the physical identity already validated into a successful start
+/// receipt onto the same bounded operation span.
+fn record_process_start_receipt_identity(
+    context: &tracing::Span,
+    receipt: &ProcessStartReceipt,
+) {
+    let identity = receipt.identity();
+    let physical = identity.physical();
+    let process_id = physical.process_id().to_string();
+    let start_time_100ns = physical.start_time_100ns().to_string();
+    record_process_context_field(context, "process_id", Some(process_id.as_str()));
+    record_process_context_field(
+        context,
+        "process_start_100ns",
+        Some(start_time_100ns.as_str()),
+    );
+    record_process_context_field(
+        context,
+        "image_sha256",
+        Some(identity.executable_sha256()),
+    );
+    observe_process_in_context(
+        context,
+        "kernel.process.start_identity_observed",
+        "validated_receipt",
+    );
+}
+
 fn process_start_request_context(
     admission: &ProcessExecutionAdmissionRequest,
     owner: &ProcessOwnerBinding,
@@ -202,7 +234,7 @@ fn record_process_request_context(
 ///
 /// Only the variant is emitted; any `String` payload (executor detail, sink
 /// message, contract field/reason) is never logged.
-fn process_terminal_code(error: &ProcessExecutionError) -> &'static str {
+pub(crate) fn process_terminal_code(error: &ProcessExecutionError) -> &'static str {
     match error {
         ProcessExecutionError::Contract(_) => "process_contract",
         ProcessExecutionError::NotFound => "process_not_found",
@@ -1512,6 +1544,8 @@ pub(crate) trait ProcessStartPorts {
         operation_id: &eliot_process::OperationId,
         context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError>;
+    /// Returns a completed receipt only after its durable contract and exact
+    /// live running-process binding have been validated by the owner.
     async fn completed_receipt(
         &self,
         record: ProcessExecutionReplayRecord,
@@ -2400,17 +2434,20 @@ impl ProcessExecutionGateway {
             return Err(error);
         }
         let effect_operation_id = admission.intent().operation_id().clone();
-        match Box::pin(run_process_start_in_context(
+        let mut replayed = false;
+        match Box::pin(run_process_start(
             self,
             owner,
             admission,
             path_proof,
             Some(outer_binding),
             context,
+            &mut replayed,
         ))
         .await
         {
-            Ok((receipt, replayed)) => {
+            Ok(receipt) => {
+                record_process_start_receipt_identity(context, &receipt);
                 record_process_context_field(
                     context,
                     "process_tree",
@@ -2679,17 +2716,6 @@ impl ProcessExecutionGateway {
             .await
     }
 
-    pub(crate) async fn cancel_with_origin_grant(
-        &self,
-        owner: &ProcessOwnerBinding,
-        operation_id: eliot_process::OperationId,
-        grant: &OriginControlGrant,
-    ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
-        let context = Self::operation_context_for(owner, &operation_id);
-        self.cancel_with_origin_grant_in_context(owner, operation_id, Some(grant), &context)
-            .await
-    }
-
     /// Cancels or replays one already decided origin grant under the supplied
     /// operation context. The gateway remains the terminal owner for failure.
     pub(crate) async fn cancel_with_origin_grant_in_context(
@@ -2855,16 +2881,6 @@ impl ProcessExecutionGateway {
     /// registration is removed only when the receipt proves closure; an
     /// open receipt retains it, so no running descendant silently leaves
     /// the registry.
-    pub(crate) async fn close_registered_descendant(
-        &self,
-        owner: &ProcessOwnerBinding,
-        operation_id: eliot_process::OperationId,
-    ) -> Result<DescendantClosureReceipt, ProcessExecutionError> {
-        let context = Self::operation_context_for(owner, &operation_id);
-        self.close_registered_descendant_in_context(owner, operation_id, &context)
-            .await
-    }
-
     /// Closes one registered descendant under its caller's existing operation
     /// span. This composed boundary owns exactly one terminal for any failure.
     pub(crate) async fn close_registered_descendant_in_context(
@@ -3193,33 +3209,24 @@ impl ProcessExecutionGateway {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "reservation, canonical projection, authority issue, executor handoff, and replay linearization are one ordered operation"
+)]
+/// Executes one admitted process start in its existing effect order.
+///
+/// The operation span is supplied by the caller and `replayed` is set only
+/// after the owner validates the stored receipt against the live process.
 pub(crate) async fn run_process_start<P: ProcessStartPorts>(
     ports: &P,
     owner: &ProcessOwnerBinding,
     admission: ProcessExecutionAdmissionRequest,
     path_proof: P::PathProof,
     outer_binding: Option<HostKernelCandidateBinding>,
-) -> Result<P::Receipt, ProcessExecutionError> {
-    // Compatibility seam for existing direct callers. Live gateway starts
-    // supply their validated request span to `run_process_start_in_context`.
-    let context = process_start_request_context(&admission, owner);
-    run_process_start_in_context(ports, owner, admission, path_proof, outer_binding, &context)
-        .await
-        .map(|(receipt, _replayed)| receipt)
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "reservation, canonical projection, authority issue, executor handoff, and replay linearization are one ordered operation"
-)]
-async fn run_process_start_in_context<P: ProcessStartPorts>(
-    ports: &P,
-    owner: &ProcessOwnerBinding,
-    admission: ProcessExecutionAdmissionRequest,
-    path_proof: P::PathProof,
-    outer_binding: Option<HostKernelCandidateBinding>,
     diagnostic_context: &tracing::Span,
-) -> Result<(P::Receipt, bool), ProcessExecutionError> {
+    replayed: &mut bool,
+) -> Result<P::Receipt, ProcessExecutionError> {
+    *replayed = false;
     admission.validate()?;
     ports.validate_path(&admission, &path_proof)?;
     ports.validate_admission(&admission, owner)?;
@@ -3293,7 +3300,8 @@ async fn run_process_start_in_context<P: ProcessStartPorts>(
                         "kernel.process.start_replay_observed",
                         "confirmed",
                     );
-                    Ok((receipt, true))
+                    *replayed = true;
+                    Ok(receipt)
                 }
                 ProcessExecutionReplayState::Reserved | ProcessExecutionReplayState::Unknown => {
                     Err(ProcessExecutionError::UnknownOutcome)
@@ -3424,7 +3432,7 @@ async fn run_process_start_in_context<P: ProcessStartPorts>(
         return Err(error);
     }
     reservation.disarm();
-    Ok((receipt, false))
+    Ok(receipt)
 }
 
 impl ProcessStartPorts for ProcessExecutionGateway {
@@ -3808,31 +3816,10 @@ impl KernelComposition {
     /// malformed presented generation is an invalid request, not a coverage
     /// observation, and keeps its own stable code.
     ///
-    /// Crate-visible so the production front-door process start
-    /// ([`GatewayProcessStarter`](crate::process_execution_client) is built
-    /// from the same composition) runs this one guard instead of a parallel
-    /// fence reconstruction: the decision, the refusal projection, and the
-    /// `kernel.process.request_rejected` observation then have exactly one
-    /// owner on every start path.
-    pub(crate) fn reject_process_start_without_material_coverage(
-        &self,
-        admission: &eliot_process::ProcessExecutionAdmissionRequest,
-    ) -> Result<HostKernelCandidateBinding, eliot_kernel_service::ProcessExecutionRejection> {
-        let context = if admission.validate().is_ok() {
-            process_operation_context(
-                Some(admission.intent().operation_id()),
-                Some(admission.intent().generation()),
-                Some(admission.state_fence()),
-                Some(admission.state_fence().authority_epoch()),
-            )
-        } else {
-            super::kernel_diagnostics::operation_context(None, None, None, None)
-        };
-        self.reject_process_start_without_material_coverage_in_context(admission, &context)
-    }
-
     /// Applies the existing material-coverage guard under its caller's start
     /// span so a pre-launch refusal stays correlated with the exact request.
+    /// This guard owns the one typed terminal for its refusal; callers only
+    /// project the returned rejection and do not add another terminal.
     pub(crate) fn reject_process_start_without_material_coverage_in_context(
         &self,
         admission: &eliot_process::ProcessExecutionAdmissionRequest,
@@ -3841,14 +3828,16 @@ impl KernelComposition {
         match self.admit_material_process_start(admission) {
             Ok(candidate) => Ok(candidate),
             Err(error) => {
+                let code =
+                    eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE;
                 observe_process_in_context(
                     context,
                     "kernel.process.request_rejected",
                     "watchdog_coverage",
                 );
+                super::kernel_diagnostics::observe_terminal_error_in_context(code, context);
                 Err(eliot_kernel_service::ProcessExecutionRejection {
-                    code: eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
-                        .to_owned(),
+                    code: code.to_owned(),
                     detail: error.to_string().chars().take(512).collect(),
                 })
             }
