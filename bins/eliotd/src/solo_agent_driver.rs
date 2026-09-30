@@ -1228,12 +1228,18 @@ pub fn drive_solo_delegate(
     })
 }
 
-/// Performs plan-only validation for a direct solo intake. This entry does not
-/// own a Governor composition borrow, so it cannot perform the exact owner
-/// readback/currentness adoption used by the queue path. The legacy client
-/// call is fail-closed and never sends caller-presented digests or revisions
-/// as owner expectations.
+/// Drives one direct solo intake through the verified composition seam.
+///
+/// Plan-only validation and the authenticated Kernel provider-binding check
+/// run first; the fabric is then constructed through the production seam
+/// (`production_fabric_ports` plus `agent_fabric_new_verified`, which
+/// overwrites caller-supplied session halves with the live authenticated
+/// session and binds the live fence), gated on the daemon-held capability
+/// admission view, and dispatched through the shared verified dispatch. Every
+/// owner refusal propagates typed and fail-closed; the queue path is
+/// untouched, so a direct drive never double-drives queued work.
 pub async fn drive_solo_delegate_async(
+    composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     intake: SoloDelegateIntake,
     now_unix_ms: u64,
@@ -1262,10 +1268,16 @@ pub async fn drive_solo_delegate_async(
         .await
         .map_err(|error| DaemonError::Kernel(error.to_string()))?;
 
-    Err(DaemonError::ProviderAdmission(FabricError::Contract(
-        "Kernel verified the claim binding, but the native-worker owner has no durable executable-binding digest for this claim; admitted provider capability and execution remain blocked"
-            .to_owned(),
-    )))
+    let ports = composition.production_fabric_ports()?;
+    let mut fabric =
+        composition.agent_fabric_new_verified(kernel, ports, intake.claimed.material())?;
+    let route = fabric.require_model_route(
+        &intake.requirements,
+        composition.capability_admission()?,
+        &intake.observed_scope,
+        now_unix_ms,
+    )?;
+    dispatch_verified_solo_fabric(composition, &mut fabric, route, &intake, &receipt)
 }
 
 /// Constructs the verified solo fabric through the production seam.

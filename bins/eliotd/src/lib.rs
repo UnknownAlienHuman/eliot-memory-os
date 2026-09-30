@@ -3153,9 +3153,9 @@ impl DaemonComposition {
     }
 
     /// Drives one solo delegate through the nonblocking authenticated Kernel
-    /// provider-binding check (issue #1108). Until native-worker claim records
-    /// retain an independently owner-verified executable-binding digest, this
-    /// entry fails closed before admitted capability construction or dispatch.
+    /// provider-binding check into the verified composition seam (issue #1108).
+    /// Ports and fabric come from the production seam with live session/fence
+    /// overwrite; missing or stale owner evidence fails closed before dispatch.
     pub async fn solo_drive_once_async(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -3164,7 +3164,7 @@ impl DaemonComposition {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        solo_agent_driver::drive_solo_delegate_async(kernel, intake, unix_ms()).await
+        solo_agent_driver::drive_solo_delegate_async(self, kernel, intake, unix_ms()).await
     }
 
     /// Drives at most one queued solo intake; the runtime poll hook
