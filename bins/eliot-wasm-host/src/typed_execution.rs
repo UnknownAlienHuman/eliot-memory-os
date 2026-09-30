@@ -1977,10 +1977,15 @@ pub fn execute_domain_experimental(
     let mut output_bound = TypedBound::default();
     check_result(&result, admitted, &mut output_bound)
         .map_err(|error| staged(TypedStage::Output, error))?;
-    let output_bytes = descriptor_bytes
-        + output_bound
-            .finish(limits.max_output_bytes)
-            .map_err(|error| staged(TypedStage::Output, error))?;
+    // The result bound is still enforced fail-closed against the admitted
+    // ceiling, but the receipt counts exactly what `output_digest` covers:
+    // the validated descriptor fields from `validate_descriptor`. Folding
+    // result bytes into this counter would pair a descriptor-only digest
+    // with descriptor+result bytes.
+    output_bound
+        .finish(limits.max_output_bytes)
+        .map_err(|error| staged(TypedStage::Output, error))?;
+    let output_bytes = descriptor_bytes;
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let terminal = result.terminal().to_owned();
