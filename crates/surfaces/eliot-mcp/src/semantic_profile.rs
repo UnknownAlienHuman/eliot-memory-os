@@ -1111,10 +1111,13 @@ pub fn registration_stage_fact(
     definition_version: &str,
 ) -> Result<OwnerStageFact, SemanticProfileError> {
     match registry.resolve(canonical_name, definition_version) {
-        Ok(profile) => OwnerStageFact::supplied(true, registration_source_ref(profile))
-            .map_err(|_| SemanticProfileError::InvalidText {
-                field: "history.registered",
-            }),
+        Ok(profile) => {
+            OwnerStageFact::supplied(true, registration_source_ref(profile)).map_err(|_| {
+                SemanticProfileError::InvalidText {
+                    field: "history.registered",
+                }
+            })
+        }
         Err(SemanticProfileError::MissingProfile { .. }) => Ok(OwnerStageFact::unresolved()),
         Err(other) => Err(other),
     }
