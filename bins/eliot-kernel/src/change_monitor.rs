@@ -616,9 +616,9 @@ fn read_git_head_substrate(
         if refname.is_empty()
             || refname.contains('\\')
             || refname.contains(':')
-            || refname.split('/').any(|part| {
-                part.is_empty() || part == "." || part == ".." || part == ".git"
-            })
+            || refname
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".." || part == ".git")
         {
             return Err(ChangeMonitorError::NoGitSubstrate);
         }
