@@ -1478,8 +1478,8 @@ impl eliot_process::ProcessEvidenceSink for BoundedEvidenceSink {
 ///   their production gates and answering the exact admitted claim (claim
 ///   identity plus binding digest).
 ///
-/// A validated file is consumed once (best-effort removal; removal failure
-/// never fails the run). A missing file is not an error: it means the
+/// A validated file is consumed once through retirement of its pinned handle;
+/// retirement failure fails closed. A missing file is not an error: it means the
 /// dispatch contour delivered nothing to this invocation, and the caller
 /// keeps the exact fail-closed path. A present but invalid file is a typed
 /// denial, never a drive.
@@ -1499,13 +1499,13 @@ impl eliot_process::ProcessEvidenceSink for BoundedEvidenceSink {
 pub mod admitted_material {
     use std::path::{Path, PathBuf};
 
-    #[cfg(windows)]
-    use eliot_windows_ipc::RetirablePinnedFile;
     use eliot_contracts::RequestId;
     use eliot_native_worker_core::{
         ActionEnvelopeCarrier, ClaimAdmissionRequest, NativeWorkerClaim, ReadinessSubmission,
         WorkerHello,
     };
+    #[cfg(windows)]
+    use eliot_windows_ipc::RetirablePinnedFile;
     use serde::{Deserialize, Serialize};
 
     use crate::ReconcileSubmission;
@@ -1712,9 +1712,7 @@ pub mod admitted_material {
             }
             let validated = match serde_json::from_slice::<AdmittedClaimEnvelope>(&bytes) {
                 Ok(envelope) => validate_envelope(envelope)?,
-                Err(_) if is_kernel_grant_file(&bytes) => {
-                    validate_kernel_file_bytes(&bytes)?
-                }
+                Err(_) if is_kernel_grant_file(&bytes) => validate_kernel_file_bytes(&bytes)?,
                 Err(envelope_error) => {
                     return Err(AdmittedMaterialError::Malformed(truncate_detail(
                         &envelope_error.to_string(),

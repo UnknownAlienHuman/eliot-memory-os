@@ -2670,6 +2670,7 @@ dependencies = [
  "eliot-process-executor",
  "eliot-protocol",
  "eliot-runtime-contracts",
+ "eliot-windows-ipc",
  "serde",
  "serde_json",
  "thiserror",
