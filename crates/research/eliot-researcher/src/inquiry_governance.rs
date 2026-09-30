@@ -33,6 +33,65 @@
 //! module references them, binds them to an inquiry profile, a State Fence and
 //! a reference manifest, and adds only what the `R6` boundary genuinely owns.
 //!
+//! # Where the evidence freeze is persisted: there is no owner, and that is a finding
+//!
+//! #1765 asks for "one canonical encoder per declared domain for hashing,
+//! storage and readback" and for public/reloaded structures to be validated
+//! again. The half of that which is reachable from this crate is the readback
+//! re-proof, which [`EvidenceFreeze::validate_integrity`] now performs over the
+//! record's own stored fields (see [`EvidenceFreeze::validate_published_shape`]).
+//! The other half — storage — has **no owner to delegate to**, and this module
+//! does not invent one. The owners were checked, and what each one actually
+//! holds is:
+//!
+//! - **`GovernedExchange` / `ExchangeSnapshot`**
+//!   (`eliot-research-exchange`). Holds `BTreeMap<String, ExchangeJob>` keyed by
+//!   job id plus a key -> job id idempotency map. A job is an *admitted query*
+//!   ([`ResearchQueryRequest`](eliot_research_exchange_api::ResearchQueryRequest))
+//!   and its lifecycle, not a governance artefact. Nothing in it can hold an
+//!   `EvidenceFreeze` without becoming a second store for research evidence:
+//!   the snapshot is the process-local projection that `DurableExchange` exists
+//!   to make redundant, and a freeze written into it would be lost on the very
+//!   restart the durability path is built to survive. This confirms the prior
+//!   writer's conclusion rather than repeating it.
+//! - **`ExchangeJobLedger`**
+//!   (`eliot-research-exchange-api`), the store-neutral port
+//!   `DurableExchange<B, L>` writes through. It is the *named* canonical-store
+//!   owner the Research subtree is pointed at, and it is correctly shaped for
+//!   this record: `load`/`store` by identity, and its own doc says the record
+//!   "cannot be persisted [but] a typed failure rather than a silently lost
+//!   job". It is nevertheless **unusable here for two independent reasons**:
+//!   it is typed to `ExchangeJobLifecycleRecord` and not to a governance
+//!   record, so a freeze would need a second port; and it has **zero
+//!   implementors in this repository** — `DurableExchange` is itself
+//!   uncalled, so there is no store behind the port to write to. Admitting a
+//!   `Deserialize` shape here would be a boundary decision with no reachable
+//!   owner, not an implementation step.
+//! - **`GovernorSourceTransitionRequest`** (this crate). The Governor-facing
+//!   request that *commits* a freeze. This is the subtree's real, existing
+//!   out-boundary path, and it is already wired: every request carries a
+//!   [`FreezeCommitment`](crate::source_admissibility::FreezeCommitment) with
+//!   the freeze's id, digest, and the retained original, bound inside
+//!   `request_digest`, and `CommittedFreeze::commit` proves the commit by
+//!   refusing every request that does not. It is deliberately a *proposal* —
+//!   `candidate_only: true`, `canonical_write_authorized: false` — so the
+//!   freeze's custody is sealed by an admission decision this crate hands over,
+//!   which is exactly what `crates/research/AGENTS.md` means by "Candidate
+//!   evidence enters canonical state only through Governor admission; this
+//!   subtree has no canonical-store write authority." The half of that boundary
+//!   that does not exist yet is named in the owner's own doc: "the other half —
+//!   the Governor/Kernel/Store commit receipt — is the owner's and does not
+//!   exist yet."
+//! - **`RetainedSourceRevision`** (this crate). The persistence *owner's* value
+//!   for a retained original, per `admitted_excerpt`'s own header. It is
+//!   handed to this crate, never stored by it.
+//!
+//! So the freeze is persisted by an owner that does not exist yet, and the
+//! correct report is that fact, not a second store invented inside the subtree
+//! to paper over it. `InquiryGovernance::validate_integrity` already
+//! re-proves the freeze it carries, so the re-validation requirement is met
+//! against the record as it is actually re-presented.
+//!
 //! No work graph is defined here.
 //! [`crate::inquiry_obligations::TaskGraphCompilationInputs`] carries compiler
 //! *inputs* for the existing deterministic `TaskGraphCompiler` (I10.15); a
@@ -4060,13 +4119,16 @@ impl EvidenceFreeze {
         freeze(&preimage)
     }
 
-    /// Re-proves this freeze's own digest and its successor relation.
+    /// Re-proves this freeze's own digest, its successor relation and the shape
+    /// of every field it publishes.
     ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
     /// disagrees with the stored one, when the record claims canonical state, or
-    /// when the successor relation is half-present.
+    /// when the successor relation is half-present, and the field's own encoding
+    /// refusal when a published field is no longer the shape
+    /// [`Self::freeze`] required it to be.
     pub fn validate_integrity(&self) -> Result<(), InquiryError> {
         if self.canonical {
             return Err(InquiryError::IntegrityMismatch {
@@ -4077,6 +4139,112 @@ impl EvidenceFreeze {
         if self.compute_digest() != self.digest {
             return Err(InquiryError::IntegrityMismatch {
                 field: "freeze.digest",
+            });
+        }
+        self.validate_published_shape()?;
+        Ok(())
+    }
+
+    /// Re-proves that every field this record publishes is still the shape
+    /// [`Self::freeze`] required of it, over the record's own stored fields.
+    ///
+    /// # Why a digest re-proof is not enough
+    ///
+    /// [`Self::validate_integrity`] recomputes the preimage over the bytes
+    /// actually present, so it answers "is this still the record that was
+    /// frozen?" — not "is each field still a field of the required kind?". Those
+    /// are different questions, and the second one has exactly the same answer
+    /// here for both: a record whose `portfolio_digest` is now a blank string
+    /// hashes perfectly well over that blank string. The same defect is already
+    /// closed twice elsewhere in this subtree, on this reasoning:
+    ///
+    /// - [`ClaimAuditRecord::validate_integrity`] re-runs
+    ///   `require_text` on `released_statement`, because a record that lost it
+    ///   "would otherwise pass the digest check under a preimage that hashed the
+    ///   empty string";
+    /// - [`GovernorSourceTransitionRequest::validate_integrity`](crate::source_admissibility::GovernorSourceTransitionRequest::validate_integrity)
+    ///   re-runs `text`/`digest` on the `FreezeCommitment` it carries, "because a
+    ///   digest proves the request was not edited after it was built; it does not
+    ///   prove the artifact reference is nameable or the digests it carries are
+    ///   digests at all".
+    ///
+    /// The freeze is the third record of the same family and was the only one
+    /// that did not ask. Every check below is the constructor's own check, read
+    /// back off the stored value rather than the argument: this adds no new
+    /// requirement, it only makes the requirement the constructor already
+    /// enforced hold for a record that is re-presented rather than freshly
+    /// built.
+    ///
+    /// # Errors
+    ///
+    /// Returns the constructor's own refusal — an [`InquiryError`] carrying the
+    /// offending field's encoding error — for the first published field that is
+    /// no longer a nameable text or a well-formed digest.
+    fn validate_published_shape(&self) -> Result<(), InquiryError> {
+        // The identities a consumer addresses the freeze by. A blank `freeze_id`
+        // is not a weaker version of a real one, it is the statement that no
+        // history can name this freeze at all.
+        require_text(&self.freeze_id, "freeze.freeze_id")?;
+        require_text(&self.inquiry_id, "freeze.inquiry_id")?;
+        require_text(&self.evidence_set_id, "freeze.evidence_set_id")?;
+        // The four commitments the freeze exists to hold together. Each is a
+        // digest the constructor required, so each is re-required here rather
+        // than being trusted because the preimage happened to hash it.
+        for (value, field) in [
+            (self.profile_digest.as_str(), "freeze.profile_digest"),
+            (self.portfolio_digest.as_str(), "freeze.portfolio_digest"),
+            (self.manifest_digest.as_str(), "freeze.manifest_digest"),
+            (
+                self.coverage_receipt_digest.as_str(),
+                "freeze.coverage_receipt_digest",
+            ),
+        ] {
+            require_digest(value, field)?;
+        }
+        // The successor relation, asked a second time with the constructor's
+        // own kinds. `validate_successor` proves the three halves move together;
+        // it does not prove that `supersedes` names a freeze or that
+        // `expected_revision` names a revision, and a record whose predecessor is
+        // a blank string would otherwise re-present as a successor of nothing.
+        for (value, field) in [
+            ("freeze.supersedes", self.supersedes.as_deref()),
+            (
+                "freeze.expected_revision",
+                self.expected_revision.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                require_digest(value, field)?;
+            }
+        }
+        // The recorded cause is bounded text rather than a digest, for the
+        // reason `freeze` gives: a digest would say only that some reason exists
+        // and not which one, and I21.8 requires the reason itself. That makes it
+        // a field a readback most needs to check — a blank cause is a record
+        // that states a relation and states no reason for it.
+        if let Some(reason) = self.supersede_reason.as_deref() {
+            require_text(reason, "freeze.supersede_reason")?;
+        }
+        // The freeze's exclusions are published into the W3 synthesis pack as
+        // reader-facing omission reasons
+        // (`SynthesisInputPack::resolve` copies this list verbatim), and the
+        // whole point of carrying a member here rather than dropping it is that
+        // "considered and refused" stays distinguishable from "never
+        // considered". An exclusion whose reason is blank publishes the first
+        // half of that distinction and loses the second, so each reason is
+        // re-required here.
+        for (handle, reason) in &self.excluded_evidence {
+            require_text(handle, "freeze.excluded_evidence.handle")?;
+            require_text(reason, "freeze.excluded_evidence.reason")?;
+        }
+        // `canonical` is already refused outright above and
+        // `governor_admission_required` is the flag that says promotion is the
+        // Governor's; it is re-required for the same reason
+        // `canonical` is checked rather than hashed, so a record that lost the
+        // flag cannot present as one that was never governed.
+        if !self.governor_admission_required {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "freeze.governor_admission_required",
             });
         }
         Ok(())
