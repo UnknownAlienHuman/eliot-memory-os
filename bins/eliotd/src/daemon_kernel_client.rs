@@ -9,15 +9,19 @@
 //!
 //! Issue #1742 W4/W6 (caller STITCH, no fake consumer): this client owns one
 //! live claim/submit pair per lane — agent-activation, local-read,
-//! campaign-packet, task-controller, observe, finish — and there is no act
-//! claim pair and no retained-checkpoint resume pair, so neither gate below
-//! has a daemon-side call site yet:
+//! campaign-packet, task-controller, observe, finish — plus the live act
+//! claim/defer pair (issue #1739 W5: `claim_act_pair_async` /
+//! `defer_act_claim_async` over the Kernel act queue). There is no
+//! retained-checkpoint resume pair, so that gate below has no daemon-side
+//! call site yet:
 //!
 //! - W4: the daemon-side `eliot-context-admission::admit_material_decision`
 //!   invocation over Governor owner-resolved inputs, with the dispatch
 //!   binding (`bind_material_dispatch`) and dispatch-time revalidation
-//!   (`revalidate_material_dispatch`) through a live act claim/flight, runs
-//!   at the Governor owner's future live act claim, never here. The Kernel
+//!   (`revalidate_material_dispatch`) through the live act claim/flight,
+//!   runs at the Governor owner's connected act admission, never here. The
+//!   claim/flight join in this file only carries the admitted envelope to
+//!   that owner under a fenced attempt and honestly defers it. The Kernel
 //!   submit arm owns only the mechanical binding
 //!   (`bins/eliot-kernel/src/host_request_route.rs::check_act_submit_binding`)
 //!   and the bridge owns only linkage revalidation
@@ -1209,6 +1213,101 @@ pub fn parse_observe_defer_outcome(
         "Kernel semantic_observe_deferred answer is neither deferred, settled, expired, nor stale"
             .to_owned(),
     )
+}
+
+/// Typed outcome of one `semantic_act_deferred` deferral (issue #1739 W5
+/// act-consumer join).
+///
+/// Lane-neutral twin of [`ObserveDeferOutcome`] over the shared defer shape:
+/// the same four outcomes with the same wire contract.
+pub type ActDeferOutcome = ObserveDeferOutcome;
+
+/// Parses one unwrapped `semantic_act_claim` answer value into the claimed
+/// admitted envelope plus its fenced attempt capability (issue #1739 W5
+/// act-consumer join).
+///
+/// The Kernel arm
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_act_claim`)
+/// answers the single-`operation`-key poll with `{"pair": {"envelope",
+/// "attempt"}}` or `{"pair": null}`. `None` is the empty-queue backoff
+/// signal, not an error — exactly like the observe claim. Act pairs carry
+/// no tool bytes: the envelope digest commits to the exact canonical
+/// request through admission. The claimed envelope must already decode as
+/// admitted shape, name the `eliot.act` capability, and bind the attempt;
+/// their closed linkage and fence binding are re-proved inside the act
+/// flight before any defer touches them. A pair without an attempt fails
+/// closed: absent authority is never invented.
+pub fn parse_act_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<(HostRequestEnvelope, LocalReadAttempt)>, String> {
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel semantic_act_claim answer omits the pair".to_owned())?;
+    match pair {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(_) => {
+            let envelope_value = pair.get("envelope").cloned().ok_or_else(|| {
+                "Kernel semantic_act_claim pair omits the envelope".to_owned()
+            })?;
+            if pair.get("tool").is_some() {
+                return Err(
+                    "Kernel semantic_act_claim pair carries tool bytes outside the digest-only act lane"
+                        .to_owned(),
+                );
+            }
+            let attempt_value = pair
+                .get("attempt")
+                .cloned()
+                .ok_or_else(|| "Kernel semantic_act_claim pair omits the attempt".to_owned())?;
+            let envelope: HostRequestEnvelope =
+                serde_json::from_value(envelope_value).map_err(|error| {
+                    format!("Kernel semantic_act_claim pair envelope does not decode: {error}")
+                })?;
+            envelope.validate().map_err(|error| {
+                format!(
+                    "Kernel semantic_act_claim pair envelope is not admitted shape: {error}"
+                )
+            })?;
+            if envelope.identity.capability != "eliot.act" {
+                return Err(
+                    "Kernel semantic_act_claim pair is not the admitted act capability".to_owned(),
+                );
+            }
+            let attempt: LocalReadAttempt =
+                serde_json::from_value(attempt_value).map_err(|error| {
+                    format!("Kernel semantic_act_claim pair attempt does not decode: {error}")
+                })?;
+            attempt.validate().map_err(|error| {
+                format!("Kernel semantic_act_claim pair attempt is not bound shape: {error}")
+            })?;
+            if attempt.operation_id != host_request_operation_id(&envelope) {
+                return Err(
+                    "Kernel semantic_act_claim pair attempt does not bind the envelope".to_owned(),
+                );
+            }
+            if attempt.facet_method != "eliot.act" {
+                return Err(
+                    "Kernel semantic_act_claim pair attempt is not admitted for the act operation"
+                        .to_owned(),
+                );
+            }
+            Ok(Some((envelope, attempt)))
+        }
+        _ => Err(
+            "Kernel semantic_act_claim pair is neither an admitted pair nor null".to_owned(),
+        ),
+    }
+}
+
+/// Parses one unwrapped `semantic_act_deferred` answer value into the typed
+/// defer outcome (issue #1739 W5 act-consumer join).
+///
+/// Lane-neutral twin of [`parse_observe_defer_outcome`] over the shared
+/// defer shape the Kernel emits once.
+pub fn parse_act_defer_outcome(value: &serde_json::Value) -> Result<ActDeferOutcome, String> {
+    parse_observe_defer_outcome(value).map_err(|error| {
+        error.replace("semantic_observe_deferred", "semantic_act_deferred")
+    })
 }
 
 impl DaemonKernelClient {
@@ -2522,6 +2621,86 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_observe_defer_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Claims one queued admitted digest-only `eliot.act` invocation for the
+    /// outbound-only act poller (issue #1739 W5 act-consumer join).
+    ///
+    /// Mirrors [`claim_observe_pair_async`](Self::claim_observe_pair_async):
+    /// the call travels as the single-`operation`-key `"semantic_act_claim"`
+    /// payload and a null `pair` is the empty-queue backoff signal, not an
+    /// error. The claimed pair is the exact admitted envelope alone (no tool
+    /// bytes) plus the Kernel-minted fenced attempt capability, which the
+    /// caller must present back on the defer leg. The claimed pair still
+    /// proves its closed linkage and fence binding inside the act flight
+    /// before any defer touches it.
+    #[cfg(windows)]
+    pub async fn claim_act_pair_async(
+        &self,
+    ) -> Result<Option<(HostRequestEnvelope, LocalReadAttempt)>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                "semantic_act_claim",
+                serde_json::json!({ "operation": "semantic_act_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let pair = parse_act_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|(envelope, _)| {
+            envelope.identity.capability != "eliot.act"
+        }) {
+            // Issue #1839: structured route-mismatch evidence for the live
+            // claim. The pair is rejected closed without execution.
+            let _ = crate::diagnostics::RejectionRecord::of(
+                crate::diagnostics::RejectionReason::RouteMismatch,
+                crate::diagnostics::OwningComponent::Kernel,
+                "Kernel semantic_act_claim returned a non-act pair",
+            )
+            .emit();
+            return Err(super::DaemonError::Kernel(
+                "Kernel semantic_act_claim returned a pair outside the act lane".to_owned(),
+            ));
+        }
+        if let Some((envelope, attempt)) = pair.as_ref() {
+            let _ = crate::diagnostics::RequestReceipt::of(
+                envelope.identity.request_id.as_str(),
+                &attempt.operation_id,
+            )
+            .emit();
+        }
+        Ok(pair)
+    }
+
+    /// Defers one claimed act pair the daemon flight cannot execute yet
+    /// (issue #1739 W5 act-consumer join).
+    ///
+    /// The presenting attempt must be the live Kernel-minted triple the claim
+    /// returned. Kernel retires the queue pair and advances the durable
+    /// record `Admitted -> Routed`, so the pending handle stays live with its
+    /// exact resume condition while no queue entry spins. No effect is
+    /// produced and none is claimed by this leg.
+    #[cfg(windows)]
+    pub async fn defer_act_claim_async(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        attempt: &LocalReadAttempt,
+    ) -> Result<ActDeferOutcome, super::DaemonError> {
+        attempt
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "semantic_act_deferred",
+                serde_json::json!({
+                    "operation_id": operation_id,
+                    "request_digest": request_digest,
+                    "attempt": attempt,
+                }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_act_defer_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
     /// Submits one result for the exact admitted Task Controller attempt.

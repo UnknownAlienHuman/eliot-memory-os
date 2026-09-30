@@ -180,6 +180,8 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                act_envelope: None,
+                act_attempt: LocalReadAttemptState::default(),
             });
         }
         // Issue #1745 R7 persistence tail: same dispatch-owned exposure
@@ -289,6 +291,8 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                act_envelope: None,
+                act_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -557,6 +561,8 @@ impl KernelComposition {
                 finish_envelope: Some(envelope.clone()),
                 finish_tool: Some(tool.clone()),
                 finish_attempt,
+                act_envelope: None,
+                act_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())

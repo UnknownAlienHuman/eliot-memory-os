@@ -630,6 +630,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
+        "semantic_act_claim" => "semantic_act_claim",
+        "semantic_act_deferred" => "semantic_act_deferred",
         "campaign_packet_claim" => "campaign_packet_claim",
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
@@ -3625,6 +3627,99 @@ impl KernelComposition {
                         Ok(host_request_route::ObserveDeferDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "semantic_act_claim" => {
+                // Outbound-only eliotd act poller for admitted digest-only
+                // `eliot.act` invocations (issue #1739 W5 act-consumer
+                // join): mirrors `semantic_observe_claim` — same
+                // session/auth/ready/fence gates via the dispatcher head and
+                // `frame_dispatch` allowlist, same single-`operation`-key
+                // payload shape, same null poll (not error) when empty. The
+                // claimed pair is the exact admitted envelope alone (no tool
+                // bytes: the envelope digest commits to the canonical
+                // request) plus the Kernel-minted fenced attempt capability
+                // (admitted `facet_method: eliot.act`) the daemon must
+                // present back on the defer leg; no time lease is involved.
+                // Read pairs are never served here.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_act_pair(session).map(|pair| match pair {
+                        Some((envelope, attempt)) => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": { "envelope": envelope, "attempt": attempt } },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "semantic_act_deferred" => {
+                // Daemon deferral leg for the claimed act pair (issue #1739
+                // W5 act-consumer join): mirrors
+                // `semantic_observe_deferred`. The flight consumed the pair
+                // but the Governor action-model owner has no connected act
+                // admission yet, so no effect was produced and none is
+                // claimed. The presenting attempt must be the live triple;
+                // anything else quarantines as the known stale outcome. The
+                // durable record advances `Admitted -> Routed`, the queue
+                // pair retires, and the pending handle stays live with its
+                // exact resume condition (resubmit the same logical request
+                // once the owner connects). An already-terminal record
+                // settles: consult it.
+                #[cfg(windows)]
+                {
+                    let operation_id = payload
+                        .get("operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let request_digest = payload
+                        .get("request_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let attempt_value = payload
+                        .get("attempt")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let attempt: LocalReadAttempt = serde_json::from_value(attempt_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.defer_act_claim(session, operation_id, request_digest, &attempt) {
+                        Ok(host_request_route::ActDeferDisposition::Deferred(record)) => Ok(
+                            Self::deferred_act_daemon_response(record.operation_id.as_str()),
+                        ),
+                        Ok(host_request_route::ActDeferDisposition::Settled(record)) => Ok(
+                            Self::settled_act_daemon_response(record.operation_id.as_str()),
+                        ),
+                        Ok(host_request_route::ActDeferDisposition::StaleAttempt(observation)) => {
+                            Ok(Self::stale_attempt_daemon_response(&observation))
+                        }
                         Err(TransportError::Timeout) => {
                             // F-LOG-KERNEL-1 (#897 T19): timeout after
                             // possible work stays `unknown` in the diagnostic
@@ -7793,6 +7888,26 @@ impl KernelComposition {
             },
             "recovery": null,
         })
+    }
+
+    /// Typed outcome for an honestly deferred act pair (issue #1739 W5
+    /// act-consumer join).
+    ///
+    /// Lane-neutral twin of [`Self::deferred_observe_daemon_response`] over
+    /// the shared defer shape the daemon parses once: the flight consumed
+    /// the claimed pair and the durable record advanced to `Routed`, but the
+    /// Governor action-model owner has no connected admission yet.
+    fn deferred_act_daemon_response(operation_id: &str) -> serde_json::Value {
+        Self::deferred_observe_daemon_response(operation_id)
+    }
+
+    /// Typed outcome when an act deferral arrives for an already-terminal
+    /// record (issue #1739 W5 act-consumer join).
+    ///
+    /// Lane-neutral twin of [`Self::settled_observe_daemon_response`] over
+    /// the shared defer shape.
+    fn settled_act_daemon_response(operation_id: &str) -> serde_json::Value {
+        Self::settled_observe_daemon_response(operation_id)
     }
 
     /// Typed acknowledgement for a v2 semantic-result submit: the exact

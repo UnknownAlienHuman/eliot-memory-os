@@ -413,6 +413,22 @@ pub(crate) struct HostRequestOperationRef {
     pub(crate) finish_envelope: Option<HostRequestEnvelope>,
     pub(crate) finish_tool: Option<serde_json::Value>,
     pub(crate) finish_attempt: LocalReadAttemptState,
+    /// Act invocation pair queued for the authenticated daemon act poller
+    /// (issue #1739 W5 act-consumer join). Digest-only `eliot.act` submits
+    /// carry no tool bytes — the envelope digest already commits to the
+    /// exact canonical request through admission — so the pair is the exact
+    /// admitted envelope alone. The daemon flight claims it under a
+    /// Kernel-minted fenced attempt and honestly defers to the Governor
+    /// action-model owner until its admission connects. Never served to any
+    /// other poller; act pairs are never served as reads and read pairs are
+    /// never served here.
+    pub(crate) act_envelope: Option<HostRequestEnvelope>,
+    /// Governed attempt ownership for the queued act pair. Reuses the
+    /// shared [`LocalReadAttemptState`] vehicle (generation, boot-unique
+    /// identity, owner session); the wire capability disambiguates through
+    /// its admitted `facet_method` (`eliot.act`). Never time-expires; only
+    /// explicit retire/fence transitions invalidate it.
+    pub(crate) act_attempt: LocalReadAttemptState,
 }
 
 /// Governed attempt ownership record for one queued local-read pair.
@@ -523,6 +539,7 @@ enum ExpiryRetireLane {
     Observe,
     TaskController,
     Finish,
+    Act,
 }
 
 /// Expiry observation for one deadline-passed claimed pair (issue #1839).
@@ -564,7 +581,13 @@ impl<'a> ExpiredClaimObservation<'a> {
 }
 
 impl KernelComposition {
-    fn persist_observe_claim_attempt(
+    /// Persists one governed daemon claim attempt for a queued pair.
+    ///
+    /// Shared by the observe and act lanes (issue #1739 W5): the durable
+    /// attempt record, generation discipline, and owner binding are
+    /// lane-neutral; the wire capability disambiguates through its admitted
+    /// `facet_method`.
+    fn persist_daemon_claim_attempt(
         &self,
         operation_id: &OperationIdentity,
         request_digest: &str,
@@ -2499,6 +2522,8 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                act_envelope: None,
+                act_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -2737,6 +2762,8 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                act_envelope: None,
+                act_attempt: LocalReadAttemptState::default(),
             });
         }
         // Issue #1837: durable audit evidence for queue admission.
@@ -3300,6 +3327,7 @@ impl KernelComposition {
                         candidate.task_controller_envelope.is_some()
                     }
                     ExpiryRetireLane::Finish => candidate.finish_envelope.is_some(),
+                    ExpiryRetireLane::Act => candidate.act_envelope.is_some(),
                 };
                 if candidate.operation_id == operation_id
                     && candidate.request_digest == request_digest
@@ -3813,6 +3841,15 @@ const MAX_QUEUED_OBSERVE_PAIRS: usize = 64;
 /// without trusting the caller-declared size.
 const MAX_OBSERVE_TOOL_BYTES: usize = 64 * 1024;
 
+/// Bound on queued act pairs for the daemon act poller (issue #1739 W5
+/// act-consumer join).
+///
+/// Mirrors the bounded observe queue (64): the durable ORS record owns
+/// lifecycle state, so eviction only drops daemon-leg queue memory and never
+/// fabricates admission. Act pairs carry the admitted envelope alone — no
+/// tool bytes — so no byte bound applies.
+const MAX_QUEUED_ACT_PAIRS: usize = 64;
+
 /// Process-wide monotonic salt for observe queue lifecycles.
 ///
 /// Separate from the local-read salt so the two legs never share a lifecycle
@@ -3850,6 +3887,21 @@ fn next_observe_reservation() -> Result<u64, TransportError> {
 /// mismatched, or revoked deferral exactly like the submit leg.
 #[derive(Clone, Debug)]
 pub(crate) enum ObserveDeferDisposition {
+    Deferred(Box<HostRequestRecord>),
+    Settled(Box<HostRequestRecord>),
+    StaleAttempt(StaleLocalReadObservation),
+}
+
+/// Disposition of one daemon act-poller deferral (issue #1739 W5
+/// act-consumer join).
+///
+/// Mirrors [`ObserveDeferDisposition`] over the envelope-only act queue:
+/// `Deferred` consumes the queue pair and advances the durable ORS record
+/// `Admitted -> Routed` with no effect produced; `Settled` means the durable
+/// record already closed the operation; `StaleAttempt` quarantines a late,
+/// duplicate, mismatched, or revoked deferral.
+#[derive(Clone, Debug)]
+pub(crate) enum ActDeferDisposition {
     Deferred(Box<HostRequestRecord>),
     Settled(Box<HostRequestRecord>),
     StaleAttempt(StaleLocalReadObservation),
@@ -3995,7 +4047,20 @@ impl KernelComposition {
             None
         };
         let Some(tool) = tool.filter(|_| is_observe) else {
-            return self.admit_host_request_envelope_under_transition(envelope);
+            // Act effect dispatch (issue #1739 W5 act-consumer join):
+            // digest-only `eliot.act` submits take this same entry with no
+            // tool bytes. Admit, then queue the exact admitted envelope for
+            // the authenticated daemon act poller when the record is still
+            // executable; a replayed terminal/resulted record never queues.
+            // Every other digest-only capability keeps the legacy
+            // admission-only shape untouched.
+            let admitted = self.admit_host_request_envelope_under_transition(envelope)?;
+            if envelope.identity.capability == ACT_CAPABILITY
+                && envelope.kind == HostRequestKind::Invocation
+            {
+                self.queue_act_pair_if_executable(envelope, &admitted.1)?;
+            }
+            return Ok(admitted);
         };
         self.host_request_connection_gate_under_transition(envelope)?;
 
@@ -4147,6 +4212,8 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                act_envelope: None,
+                act_attempt: LocalReadAttemptState::default(),
             });
         Ok(ObserveQueueReservation::Reserved {
             token,
@@ -4503,7 +4570,7 @@ impl KernelComposition {
                     None => tool.clone(),
                 };
                 let envelope = envelope.clone();
-                let durable_attempt = self.persist_observe_claim_attempt(
+                let durable_attempt = self.persist_daemon_claim_attempt(
                     &operation_id,
                     &request_digest,
                     &stored,
@@ -4579,6 +4646,531 @@ impl KernelComposition {
                     && candidate.observe_envelope.is_some())
             });
         }
+    }
+
+    /// Queues one admitted digest-only act invocation for the daemon act
+    /// poller when its durable record is still executable (issue #1739 W5
+    /// act-consumer join).
+    ///
+    /// A replayed terminal/resulted record never queues: any stale queue
+    /// pair is pruned instead, so the waiter serves the retained truth.
+    fn queue_act_pair_if_executable(
+        &self,
+        envelope: &HostRequestEnvelope,
+        record: &HostRequestRecord,
+    ) -> Result<(), TransportError> {
+        if matches!(
+            record.state,
+            HostRequestState::Admitted | HostRequestState::Routed
+        ) && record.result_digest.is_none()
+            && record.result_response.is_none()
+        {
+            return self.enqueue_act_pair_under_transition(envelope);
+        }
+        self.remove_act_pair_if_not_executable(
+            record.operation_id.as_str(),
+            &envelope.envelope_sha256,
+            record,
+        )
+    }
+
+    /// Enqueues the exact admitted act envelope for the authenticated daemon
+    /// act poller.
+    ///
+    /// Mirrors [`Self::enqueue_finish_pair_under_transition`](crate::KernelComposition::enqueue_finish_pair_under_transition)
+    /// for an envelope-only lane: the Kernel-owned dispatch binding
+    /// ([`check_act_submit_binding`]) is revalidated, a conflicting
+    /// connection fails closed as `IdentityConflict`, an exact replay is
+    /// idempotent, and a full queue evicts only a stale (never claimed)
+    /// pair before refusing with backpressure. Queue memory only — the
+    /// durable ORS record owns lifecycle state.
+    fn enqueue_act_pair_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(), TransportError> {
+        check_act_submit_binding(envelope)?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.host_request_connection_gate_under_transition(envelope)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = host_request_operation_id(envelope);
+        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.clone())
+        });
+        if let Some(existing_connection) = existing_connection.as_deref() {
+            if existing_connection != envelope.connection_id {
+                return Err(TransportError::IdentityConflict);
+            }
+            if index
+                .get(existing_connection)
+                .into_iter()
+                .flatten()
+                .any(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                        && candidate.act_envelope.is_some()
+                })
+            {
+                return Ok(());
+            }
+        }
+        let queued = index
+            .values()
+            .flatten()
+            .filter(|candidate| candidate.act_envelope.is_some())
+            .count();
+        if queued >= MAX_QUEUED_ACT_PAIRS {
+            let mut evicted = false;
+            for refs in index.values_mut() {
+                if let Some(position) = refs.iter().position(|candidate| {
+                    candidate.act_envelope.is_some() && !candidate.act_attempt.is_live()
+                }) {
+                    refs.remove(position);
+                    evicted = true;
+                    break;
+                }
+            }
+            if !evicted {
+                return Err(TransportError::Backpressure);
+            }
+        }
+        let act_attempt = LocalReadAttemptState {
+            enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            ..LocalReadAttemptState::default()
+        };
+        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        if let Some(candidate) = refs.iter_mut().find(|candidate| {
+            candidate.operation_id == operation_id
+                && candidate.request_digest == envelope.envelope_sha256
+        }) {
+            candidate.act_envelope = Some(envelope.clone());
+            candidate.act_attempt = act_attempt;
+        } else {
+            refs.push(HostRequestOperationRef {
+                operation_id,
+                request_digest: envelope.envelope_sha256.clone(),
+                local_read_envelope: None,
+                local_read_tool: None,
+                local_read_held_bytes: 0,
+                local_read_attempt: LocalReadAttemptState::default(),
+                observe_envelope: None,
+                observe_tool: None,
+                observe_reservation: None,
+                observe_attempt: LocalReadAttemptState::default(),
+                campaign_packet_envelope: None,
+                campaign_packet_tool: None,
+                campaign_packet_attempt: LocalReadAttemptState::default(),
+                task_controller_envelope: None,
+                task_controller_tool: None,
+                task_controller_attempt: LocalReadAttemptState::default(),
+                finish_envelope: None,
+                finish_tool: None,
+                finish_attempt: LocalReadAttemptState::default(),
+                act_envelope: Some(envelope.clone()),
+                act_attempt,
+            });
+        }
+        Ok(())
+    }
+
+    fn remove_act_pair_if_not_executable(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        record: &HostRequestRecord,
+    ) -> Result<(), TransportError> {
+        if matches!(
+            record.state,
+            HostRequestState::Admitted | HostRequestState::Routed
+        ) && record.result_digest.is_none()
+            && record.result_response.is_none()
+        {
+            return Ok(());
+        }
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        for refs in index.values_mut() {
+            refs.retain(|candidate| {
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.act_envelope.is_some())
+            });
+        }
+        Ok(())
+    }
+
+    /// Claims the next admitted act pair for the daemon act poller under
+    /// governed attempt ownership (issue #1739 W5 act-consumer join).
+    ///
+    /// Mirrors [`Self::claim_observe_pair`] for an envelope-only lane:
+    /// deterministic connection-then-fifo order, skipping expired pairs. The
+    /// first claim for a pair mints fencing generation 1 with a boot-unique
+    /// attempt identity bound to the presenting daemon session; a re-claim by
+    /// the same owner session returns the identical current capability
+    /// (lost-answer retry without a new identity); a claim by a different
+    /// owner reassigns the attempt (generation bump, fresh identity, new
+    /// owner), so the superseded capability can never complete. `None` is a
+    /// null poll, not an error. The exact ORS row must still be Admitted or
+    /// Routed with no result before an attempt is minted or returned. Closed
+    /// queue entries are pruned from this bounded volatile index while their
+    /// durable rows stay untouched. Store read errors fail closed without
+    /// discarding the pair or its possible-effect evidence. Read pairs are
+    /// never served here. The material floor/lineage/authority verdict stays
+    /// the Governor owner's `admit_material_decision`, never a Kernel
+    /// verdict: this leg only hands the admitted envelope to the daemon
+    /// flight under a fenced attempt.
+    pub(crate) fn claim_act_pair(
+        &self,
+        session: &Session,
+    ) -> Result<
+        Option<(
+            HostRequestEnvelope,
+            eliot_protocol::LocalReadAttempt,
+        )>,
+        TransportError,
+    > {
+        let _transition = self.agent_bridge_transition_read()?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        // Deterministic order: `BTreeMap` iterates connections sorted, pairs
+        // stay in enqueue (fifo) order within one connection.
+        for refs in index.values_mut() {
+            let mut position = 0;
+            while position < refs.len() {
+                let Some(envelope) = refs[position].act_envelope.as_ref() else {
+                    position += 1;
+                    continue;
+                };
+                if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    position += 1;
+                    continue;
+                }
+                check_act_submit_binding(envelope)?;
+                // Act is task-relative and effectful: the exact applicable
+                // task binding must be live for the claim.
+                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                    position += 1;
+                    continue;
+                }
+                if envelope.identity.capability != ACT_CAPABILITY {
+                    return Err(TransportError::SessionFenced);
+                }
+                let operation_id = OperationIdentity::new(refs[position].operation_id.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let request_digest = refs[position].request_digest.clone();
+                let stored = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation_id, &request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let Some(stored) = stored else {
+                    return Err(TransportError::UnknownRequest);
+                };
+                let expected = requested_host_request_record(envelope)?;
+                if stored.operation_id != operation_id
+                    || stored.request_digest != request_digest
+                    || !stored.same_binding(&expected)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let executable = matches!(
+                    stored.state,
+                    HostRequestState::Admitted | HostRequestState::Routed
+                ) && stored.result_digest.is_none()
+                    && stored.result_response.is_none();
+                if !executable {
+                    refs.remove(position);
+                    continue;
+                }
+                let envelope = envelope.clone();
+                let durable_attempt = self.persist_daemon_claim_attempt(
+                    &operation_id,
+                    &request_digest,
+                    &stored,
+                    &refs[position].act_attempt,
+                    session,
+                )?;
+                let Some(durable_attempt) = durable_attempt else {
+                    refs.remove(position);
+                    continue;
+                };
+                let candidate = &mut refs[position];
+                candidate.act_attempt = LocalReadAttemptState {
+                    attempt_id: durable_attempt.attempt_id.as_str().to_owned(),
+                    generation: durable_attempt.generation,
+                    enqueue_salt: candidate.act_attempt.enqueue_salt,
+                    owner_connection_id: durable_attempt.owner_connection_ref.as_str().to_owned(),
+                    owner_launch_nonce: durable_attempt.owner_launch_nonce.as_str().to_owned(),
+                    owner_session_epoch: durable_attempt.owner_session_epoch,
+                };
+                let attempt = self.local_read_attempt_capability(
+                    &envelope,
+                    &candidate.operation_id,
+                    &candidate.act_attempt,
+                )?;
+                return Ok(Some((envelope, attempt)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn live_act_attempt_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<LocalReadAttemptState>, TransportError> {
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.act_envelope.is_some()
+            })
+            .map(|candidate| candidate.act_attempt.clone())
+            .filter(LocalReadAttemptState::is_live))
+    }
+
+    /// Retires one queued act pair without failing.
+    ///
+    /// Called after the daemon flight honestly defers the pair (defer leg
+    /// advances the durable ORS phase, so the pending handle stays live
+    /// without the queue entry), so later claims skip it. Like disconnect
+    /// fencing, this never fails: every lock/store error is contained
+    /// because retirement must hold even when the store is unavailable.
+    fn retire_act_pair_under_transition(&self, operation_id: &str, request_digest: &str) {
+        // Issue #1837: durable audit evidence for orphan cleanup.
+        self.audit_observe(AuditEventDraft::orphan_queue_retired(
+            operation_id,
+            request_digest,
+        ));
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return;
+        };
+        for refs in index.values_mut() {
+            refs.retain(|candidate| {
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.act_envelope.is_some())
+            });
+        }
+    }
+
+    /// Disposition of one daemon act-poller deferral (issue #1739 W5
+    /// act-consumer join).
+    ///
+    /// Mirrors [`ObserveDeferDisposition`]: `Deferred` is the single honest
+    /// outcome while the Governor action-model owner has no connected
+    /// act admission: the queue pair is consumed and the durable ORS record
+    /// advances `Admitted -> Routed`, so the pending handle stays live under
+    /// the daemon owner with its exact resume condition (resubmit the same
+    /// logical request once the owner connects; the status/resolve/rehydrate
+    /// entries keep serving the live record meanwhile). `Settled` means the
+    /// durable record already closed the operation — consult it instead of
+    /// deferring. `StaleAttempt` quarantines a late, duplicate, mismatched,
+    /// or revoked deferral exactly like the submit leg.
+    pub(crate) fn defer_act_claim(
+        &self,
+        session: &Session,
+        operation_id: &str,
+        request_digest: &str,
+        attempt: &eliot_protocol::LocalReadAttempt,
+    ) -> Result<ActDeferDisposition, TransportError> {
+        attempt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation = OperationIdentity::new(operation_id.to_owned())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if stored.operation_id.as_str() != operation_id || stored.request_digest != request_digest {
+            return Err(TransportError::SessionFenced);
+        }
+        if stored.capability_ref.as_str() != ACT_CAPABILITY {
+            // Issue #1739 W5: the act defer leg serves only the admitted
+            // `eliot.act` lane. A stored capability outside the serving lane
+            // is a requested-versus-actual route divergence, never a silent
+            // fence.
+            self.audit_observe(AuditEventDraft::route_mismatch_submit(
+                session, &stored, "act",
+            ));
+            return Err(TransportError::SessionFenced);
+        }
+        if stored.state.is_terminal() {
+            return Ok(ActDeferDisposition::Settled(Box::new(stored)));
+        }
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+            return self.expired_claim_timeout(ExpiredClaimObservation {
+                session: Some(session),
+                stored: &stored,
+                lane: "act",
+                retire: Some(ExpiryRetireLane::Act),
+                phase: "defer",
+                presented_attempt_id: Some(attempt.attempt_id.as_str()),
+                presented_generation: Some(attempt.fencing_generation),
+            });
+        }
+        let live = self.live_act_attempt_under_transition(operation_id, request_digest)?;
+        match live {
+            Some(state)
+                if attempt.attempt_id == state.attempt_id
+                    && attempt.fencing_generation == state.generation =>
+            {
+                if !state.is_owned_by(session) {
+                    return Ok(ActDeferDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: operation_id.to_owned(),
+                            request_digest: request_digest.to_owned(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::OwnerMismatch,
+                        },
+                    ));
+                }
+                if attempt.expires_at_unix_ms != stored.deadline_unix_ms
+                    || !attempt
+                        .authority_epoch
+                        .is_same_authority(&stored.authority_epoch)
+                {
+                    return Ok(ActDeferDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: operation_id.to_owned(),
+                            request_digest: request_digest.to_owned(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::Superseded,
+                        },
+                    ));
+                }
+            }
+            Some(state) => {
+                return Ok(ActDeferDisposition::StaleAttempt(
+                    StaleLocalReadObservation {
+                        operation_id: operation_id.to_owned(),
+                        request_digest: request_digest.to_owned(),
+                        presented_attempt_id: Some(attempt.attempt_id.clone()),
+                        presented_generation: Some(attempt.fencing_generation),
+                        current_generation: Some(state.generation),
+                        reason: StaleLocalReadReason::Superseded,
+                    },
+                ));
+            }
+            None => {
+                return Ok(ActDeferDisposition::StaleAttempt(
+                    StaleLocalReadObservation {
+                        operation_id: operation_id.to_owned(),
+                        request_digest: request_digest.to_owned(),
+                        presented_attempt_id: Some(attempt.attempt_id.clone()),
+                        presented_generation: Some(attempt.fencing_generation),
+                        current_generation: None,
+                        reason: StaleLocalReadReason::Unclaimed,
+                    },
+                ));
+            }
+        }
+        let queued_envelope = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == request_digest
+                })
+                .and_then(|candidate| candidate.act_envelope.clone())
+        };
+        if let Some(envelope) = queued_envelope {
+            if !session
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+                || session.module_generation.generation != envelope.state_fence.resource_generation
+                || session.module_generation.state_fence != envelope.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        } else if !session
+            .authority_epoch
+            .is_same_authority(&stored.authority_epoch)
+            || session.module_generation.generation.value() != stored.generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let Some(durable_attempt) = stored.attempt.as_ref().filter(|durable| {
+            durable.attempt_id.as_str() == attempt.attempt_id
+                && durable.generation == attempt.fencing_generation
+                && durable.owner_connection_ref.as_str() == session.connection_id
+                && durable.owner_launch_nonce.as_str() == session.launch_nonce
+                && durable.owner_session_epoch == session.session_epoch
+                && matches!(
+                    durable.phase,
+                    eliot_ors::HostRequestAttemptPhase::Claimed
+                        | eliot_ors::HostRequestAttemptPhase::DeferredNoEffect
+                )
+        }) else {
+            return Ok(ActDeferDisposition::StaleAttempt(
+                StaleLocalReadObservation {
+                    operation_id: operation_id.to_owned(),
+                    request_digest: request_digest.to_owned(),
+                    presented_attempt_id: Some(attempt.attempt_id.clone()),
+                    presented_generation: Some(attempt.fencing_generation),
+                    current_generation: stored.attempt.as_ref().map(|value| value.generation),
+                    reason: StaleLocalReadReason::Superseded,
+                },
+            ));
+        };
+        let routed = self
+            .generation_gateway
+            .ors
+            .defer_host_request_attempt(&operation, request_digest, durable_attempt)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        // Issue #1839: durable audit evidence for the deferral.
+        self.audit_observe(AuditEventDraft::claim_deferred(
+            session, attempt, &routed, "act",
+        ));
+        self.retire_act_pair_under_transition(operation_id, request_digest);
+        Ok(ActDeferDisposition::Deferred(Box::new(routed)))
     }
 
     /// Submits one daemon-produced observe result for its waiting host request.
@@ -9167,6 +9759,8 @@ mod invoke_read_tool_tests {
             finish_envelope: None,
             finish_tool: None,
             finish_attempt: LocalReadAttemptState::default(),
+            act_envelope: None,
+            act_attempt: LocalReadAttemptState::default(),
         }
     }
 

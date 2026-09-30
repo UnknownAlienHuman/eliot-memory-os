@@ -1495,6 +1495,12 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "semantic_observe_claim"
             | "semantic_observe_result"
             | "semantic_observe_deferred"
+            // Issue #1739 W5 act-consumer join: the act claim/defer legs
+            // are separate admitted operations with their own queue, so the
+            // frame must reach their own dispatch instead of falling through
+            // to the generic `ProcessExecutionRequest` decode.
+            | "semantic_act_claim"
+            | "semantic_act_deferred"
             | "initialize_owner_revision"
             // I1.5 (#1750): the Host request leg. These are the four admitted
             // lifecycle legs of the Host request surface; the branch admits

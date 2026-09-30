@@ -1609,6 +1609,23 @@ impl AuditEventDraft {
         attempt: &LocalReadAttempt,
         routed: &HostRequestRecord,
     ) -> Self {
+        Self::claim_deferred(session, attempt, routed, "observe")
+    }
+
+    /// Returns the claim-deferred draft for one daemon-lane deferral over the
+    /// shared defer shape (issue #1739 W5 act-consumer join).
+    ///
+    /// Lane-neutral twin of [`Self::observe_claim_deferred`]: the durable
+    /// `DeferredNoEffect` persist precedes the observation and the queue pair
+    /// retires on the same leg. `lane` names the serving lane (`observe`,
+    /// `act`).
+    #[must_use]
+    pub fn claim_deferred(
+        session: &Session,
+        attempt: &LocalReadAttempt,
+        routed: &HostRequestRecord,
+        lane: &'static str,
+    ) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.fill_stored(routed);
         lineage.fill_daemon_leg(session);
@@ -1617,7 +1634,7 @@ impl AuditEventDraft {
             kind: AuditEventKind::DEFER_CLAIM_DEFERRED,
             lineage,
             body: serde_json::json!({
-                "lane": "observe",
+                "lane": lane,
                 "attempt_id": attempt.attempt_id,
                 "fencing_generation": attempt.fencing_generation,
                 "attempt_phase": "deferred_no_effect",
