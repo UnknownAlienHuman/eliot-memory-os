@@ -822,11 +822,27 @@ fn apply(
             // same reason: the operation was admitted and its destination may
             // exist, so closing a clean Host epoch lineage would re-base this
             // journal and discard the only durable proof that it was admitted.
-            // A recorded result is settled history and does not block shutdown.
+            //
+            // A recorded result is normally settled history and does not block
+            // shutdown - with ONE exception that the cleanup transition
+            // introduced. `CleanupPending` IS a recorded result, and it is not
+            // settled: the reclamation is authorized and its effect has NOT been
+            // observed. It is the same shape as `Pending` one step later, so it
+            // is named here explicitly rather than left to "anything that is not
+            // Pending". Accepting a clean marker while one is retained would
+            // re-base the journal and discard the only durable "may have been
+            // reclaimed" record - precisely the loss the `Pending` arm exists
+            // to prevent. `Reclaimed` is terminal and does settle, because the
+            // absence was observed before it was written.
             let preparations_settled = state
                 .backup_preparations
                 .iter()
-                .all(|record| record.state != BackupPreparationState::Pending);
+                .all(|record| {
+                    !matches!(
+                        record.state,
+                        BackupPreparationState::Pending | BackupPreparationState::CleanupPending
+                    )
+                });
             let reactive_context_clean = state
                 .reactive_context
                 .as_ref()
@@ -1000,9 +1016,12 @@ fn apply(
             //  * a changed source, archive, class, admission, destination or
             //    owner-issued identity under one operation identity is a
             //    conflict, not a re-scoped preparation;
-            //  * `Prepared` is terminal, so an unsettled admission is never
-            //    re-opened and a partial destination is never silently replaced
-            //    by a second outcome.
+            //  * a `Prepared` result moves only forward, to the owner-authorized
+            //    `CleanupPending` and then the terminal `Reclaimed`, so an
+            //    unsettled admission is never re-opened, a partial destination
+            //    is never silently replaced by a second outcome, and a
+            //    reclamation whose effect was not observed can never be
+            //    reported as history that has settled.
             let index = state
                 .backup_preparations
                 .iter()
