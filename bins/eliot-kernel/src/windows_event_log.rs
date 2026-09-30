@@ -52,7 +52,7 @@ impl EventLogAdmission {
 }
 
 /// Starts the single worker and admits the startup event after the entrypoint
-/// has validated both the SystemService binding and ProgramData contour.
+/// has validated both the `SystemService` binding and `ProgramData` contour.
 ///
 /// The event means that the Kernel entered startup. It does not mean the
 /// service is ready or that the OS accepted the record.
@@ -105,7 +105,7 @@ fn initialize_worker() -> Option<&'static SyncSender<QueuedKernelEvent>> {
             let (sender, receiver) = sync_channel(EVENT_LOG_QUEUE_CAPACITY);
             thread::Builder::new()
                 .name("eliot-kernel-event-log".to_owned())
-                .spawn(move || report_worker(receiver))
+                .spawn(move || report_worker(&receiver))
                 .map_err(|_| ())?;
             Ok(sender)
         })
@@ -178,7 +178,7 @@ fn report_admission(
     admission
 }
 
-fn report_worker(receiver: Receiver<QueuedKernelEvent>) {
+fn report_worker(receiver: &Receiver<QueuedKernelEvent>) {
     while let Ok(record) = receiver.recv() {
         match report_kernel_event(record.event, &record.insertion) {
             Ok(receipt) => {
