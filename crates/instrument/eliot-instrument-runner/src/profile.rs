@@ -1552,11 +1552,14 @@ impl InstrumentRegistry {
     /// Recovery treats the snapshot as untrusted input: the schema identity
     /// is checked first, then every spec, stage, profile, and receipt is
     /// rebuilt through its validated constructor, and the rebuilt
-    /// definitions are re-admitted through [`InstrumentRegistry::build`], so
-    /// orphan receipts, spec drift, generation mismatch, and cyclic stage
-    /// graphs fail closed here exactly as they do at first admission. A
-    /// receipt admitted at generation N is therefore recovered and
-    /// re-validated at generation N+1 instead of being trusted blindly.
+    /// definitions are re-admitted through [`InstrumentRegistry::build`] at
+    /// the snapshot's own generation, so orphan receipts, spec drift,
+    /// generation mismatch, and cyclic stage graphs fail closed here exactly
+    /// as they do at first admission. A registry that has moved on recovers
+    /// nothing from the old bytes: replacement ships as a new generation
+    /// with freshly admitted receipts, so a replaced spec, parser, receipt,
+    /// or route invalidates new admission instead of being trusted blindly,
+    /// while historical run evidence keeps its sealed grant.
     ///
     /// # Errors
     ///
