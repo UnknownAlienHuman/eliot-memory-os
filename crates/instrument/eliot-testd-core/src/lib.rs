@@ -4024,7 +4024,45 @@ impl TestdStore {
                 return Err(TestdError::InvalidBinding);
             }
         }
+        // Issue #1897 (W1): the lane's checkout and workspace identity must BE the
+        // admitted ones, not a caller-asserted pair beside them. The layout
+        // binding already derived its workspace component from the
+        // Governor-issued project identity and its checkout component from the
+        // canonical source root; an allocated lane naming different values would
+        // place the governed build root in a lane that is not the admitted
+        // checkout. Comparing them here makes the main checkout's identity the
+        // one the lane runs under.
+        if let (Some(envelope), Some(layout)) = (work_envelope.as_ref(), target_layout.as_ref())
+            && (envelope.workspace_id != layout.workspace_id
+                || envelope.worktree_id != layout.checkout_id)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        // Issue #1897 (W3), and the layout reconciliation the I2.22 target-root
+        // rule needs: an allocated lane is the ONE target-root authority for
+        // this job. `TargetRoots` (issue #1806) and `TargetLayoutBinding` are a
+        // second, competing derivation; leaving both in place lets a governed
+        // invocation run in the layout root while its result is attributed to
+        // the lane's root. The two are therefore reconciled here rather than by
+        // weakening either rule: the persisted target root must be exactly the
+        // lane's governed root, and `TargetRoots::validate` keeps its existing
+        // `cache_root == target_root` equality and its strict-descendant
+        // requirement — so this adds no distinctness on either side, it refuses
+        // the disagreement. `cache_root` equality follows from the same check,
+        // so the cache and the target can never be one governed root here and
+        // two elsewhere.
         let mut target_roots = target_roots;
+        if let Some(envelope) = work_envelope.as_ref() {
+            let governed = envelope
+                .derive_target_root()
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            if Path::new(&target_roots.target_root) != governed.as_path() {
+                return Err(TestdError::Invalid {
+                    field: "target_roots.target_root",
+                    reason: "must be the governed work envelope's allocated target root",
+                });
+            }
+        }
         target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
         if let Some(layout) = target_layout.as_ref() {
@@ -4296,27 +4334,36 @@ impl TestdStore {
             .allocate(&job.job_id, &job.resource_profile)
             .map_err(|error| TestdError::ResourceConflict(error.to_string()))?;
         job.scheduling = Some(
-            scheduling_decision(job.job_class, &job.resource_profile, leases)
+            scheduling_decision(job.job_class, &job.resource_profile, leases.clone())
                 .map_err(|error| TestdError::ResourceConflict(error.to_string()))?,
         );
-        // Issue #1897 (W1): record the granted leases on the allocated
-        // envelope, so the persisted work item keeps the leases it was
-        // admitted with. The scheduler's allocate-or-refuse above stays the
-        // enforced claims gate: a parallel declaration with no exclusive
-        // claim is legitimate, so the envelope-level non-empty admission
-        // gate is not the claim gate.
-        if let (Some(envelope), Some(decision)) =
-            (job.work_envelope.as_mut(), job.scheduling.as_ref())
-        {
-            envelope.runtime_leases = decision
-                .leases
-                .iter()
-                .map(|lease| RuntimeEnvironmentLease {
-                    kind: lease.kind,
-                    resource: lease.resource.clone(),
-                    holder: lease.holder.clone(),
-                })
-                .collect();
+        // Issue #1897 (W1/W5): record the allocator's ACTUAL grant on the
+        // allocated envelope, so the persisted work item keeps the leases it
+        // was admitted with. `leases` is the live `ResourceLeaseAllocator`
+        // outcome, not a reconstruction of matching field values: the
+        // allocator refused above if any declared resource or serial group was
+        // already held, and `with_granted_leases` additionally refuses a record
+        // whose holder is not this job. The envelope is the only writer of that
+        // record, so two jobs cannot claim one exclusive resource by presenting
+        // identical lease DTOs. The scheduler's allocate-or-refuse above stays
+        // the enforced claims gate: a parallel declaration with no exclusive
+        // claim is legitimate, so the envelope-level non-empty admission gate is
+        // not the claim gate.
+        if let Some(envelope) = job.work_envelope.take() {
+            job.work_envelope = Some(
+                envelope
+                    .with_granted_leases(
+                        leases
+                            .iter()
+                            .map(|lease| RuntimeEnvironmentLease {
+                                kind: lease.kind,
+                                resource: lease.resource.clone(),
+                                holder: lease.holder.clone(),
+                            })
+                            .collect(),
+                    )
+                    .map_err(|error| TestdError::ResourceConflict(error.to_string()))?,
+            );
         }
         job.state = JobState::Running;
         job.attempts = job.attempts.saturating_add(1);
@@ -4371,6 +4418,15 @@ impl TestdStore {
         job.target_roots.validate()?;
         if let Some(layout) = job.target_layout.as_ref() {
             verify_layout_binding(&job.target_roots, layout)?;
+        }
+        // Issue #1897 (W1/W5): requalify the retained envelope with its owner
+        // before this attempt starts. The row just read is the durable
+        // authority — this method never re-derives a tuple from the current
+        // ambient environment — and the retained lease record is checked against
+        // the job that must own it, so a restart cannot execute under a lease
+        // another job holds or under a malformed tuple.
+        if let Some(envelope) = job.work_envelope.as_ref() {
+            envelope.requalify().map_err(|_| TestdError::InvalidBinding)?;
         }
         let request = permit.request();
         request
@@ -4507,7 +4563,13 @@ impl TestdStore {
                 let (key, value) = item.map_err(database)?;
                 let job: TestJob = serde_json::from_slice(value.value())
                     .map_err(|error| TestdError::Corrupt(error.to_string()))?;
-                if matches!(job.state, JobState::Running) {
+                // A cancelled attempt that still reports `Running` execution
+                // (issue #1897) holds runtime leases its cancelled process may
+                // still be using, so it is swept with the running rows.
+                if matches!(job.state, JobState::Running)
+                    || (job.state == JobState::Cancelled
+                        && job.execution == Some(ExecutionStatus::Running))
+                {
                     running.push(key.value().to_owned());
                 }
             }
@@ -4534,9 +4596,15 @@ impl TestdStore {
             .map_or("testd-reconciler", |lease| lease.owner.as_str())
             .to_owned();
         let previous = job.state;
+        let cancelled_unresolved =
+            job.state == JobState::Cancelled && job.execution == Some(ExecutionStatus::Running);
         job.execution = Some(decision.execution);
         job.lease = None;
-        let terminal = if job.attempts < self.retry.max_attempts {
+        let terminal = if cancelled_unresolved {
+            // A cancelled attempt stays cancelled: reconciliation here releases
+            // its runtime leases, it does not resurrect the work (issue #1897).
+            JobState::Cancelled
+        } else if job.attempts < self.retry.max_attempts {
             JobState::RetryWait
         } else {
             JobState::Failed
@@ -4682,6 +4750,14 @@ impl TestdStore {
     }
 
     /// Cancels a queued or currently leased job using its current fence.
+    ///
+    /// Cancelling a *running* attempt clears the worker fence but does not
+    /// release its runtime-environment leases: the process may still be alive
+    /// and its effect on a port, service, fixture, or database volume is not yet
+    /// observed. The retained [`SchedulingDecision`](super::SchedulingDecision)
+    /// therefore stays on the row, and the reconciler — not this call — resolves
+    /// the attempt and frees the leases. A queued job holds no lease and is
+    /// released immediately.
     pub fn cancel(
         &self,
         job_id: &str,
@@ -4698,9 +4774,23 @@ impl TestdStore {
         validate_cancellation_lease(&job, lease, actor, now)?;
         validate_text(actor, "actor")?;
         let previous = job.state;
+        let was_running = previous == JobState::Running;
         job.state = JobState::Cancelled;
         job.lease = None;
-        job.execution = Some(ExecutionStatus::Cancelled);
+        // Issue #1897 (W5): cancelling a *running* attempt records the
+        // cancellation, not the outcome. The worker fence is cleared so the
+        // cancelled worker loses write authority, but the process may still be
+        // alive and its effect on a leased port, service, fixture, or database
+        // volume is unobserved. The execution projection therefore stays
+        // `Running` — the one value that means "attempt started, outcome
+        // unproven" — so the lease holder set keeps holding and the reconciler
+        // releases it. A queued job never started, so its outcome is the
+        // cancellation itself.
+        job.execution = Some(if was_running {
+            ExecutionStatus::Running
+        } else {
+            ExecutionStatus::Cancelled
+        });
         job.updated_at_ms = now;
         let write = self.database.begin_write().map_err(database)?;
         let mut table = write.open_table(JOBS).map_err(database)?;
@@ -4819,9 +4909,19 @@ const RESERVED_FOREGROUND_WEIGHT: u32 = 3;
 
 /// Builds the lease state held by every durably running job. Recomputed from
 /// the record rather than cached, so a restart reconstructs the same leases.
+///
+/// A cancelled attempt whose execution is still `Running` holds its leases too:
+/// its worker fence is gone but its process may still be alive, so releasing the
+/// exclusive resource here would let a second job claim a port, service,
+/// fixture, or database volume the cancelled process is still using (issue
+/// #1897).
 fn running_lease_allocator(jobs: &[TestJob]) -> ResourceLeaseAllocator {
     let mut allocator = ResourceLeaseAllocator::new();
-    for job in jobs.iter().filter(|job| job.state == JobState::Running) {
+    for job in jobs.iter().filter(|job| {
+        job.state == JobState::Running
+            || (job.state == JobState::Cancelled
+                && job.execution == Some(ExecutionStatus::Running))
+    }) {
         let leases = job
             .scheduling
             .as_ref()
