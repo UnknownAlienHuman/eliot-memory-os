@@ -1,7 +1,7 @@
 //! Store-owned causal receipt projection for canonical source-artifact work.
 //!
 //! This module does not accept a causal binding from a request or receipt.
-//! Callers first read the canonical fence and predecessor row from SurrealDB;
+//! Callers first read the canonical fence and predecessor row from `SurrealDB`;
 //! only that readback can construct the projection passed to the Store API.
 
 use eliot_store_api::{

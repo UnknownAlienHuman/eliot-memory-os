@@ -69,8 +69,8 @@ use eliot_blob_api::{
     BlobReachabilityView, BlobReadChunk, BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding,
     BlobReceiptContext, BlobReferenceObservation, BlobReferenceRequest, BlobRootLease,
     BlobStageRequest, BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState,
-    SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path,
-    verify_receipt,
+    ObjectResidencyKey, SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt,
+    VersionedContentDigest, metadata_path, payload_path, verify_receipt,
 };
 use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_receipts::{
@@ -86,6 +86,8 @@ pub use stream_sink::{BlobStoreStreamSink, BlobStreamSinkStoreBinding};
 
 const FORMAT_ID: &str = "eliot-blob-envelope";
 const FORMAT_VERSION: u32 = 1;
+const CONTENT_DIGEST_ALGORITHM: &str = "blake3";
+const CONTENT_DIGEST_VERSION: u32 = 1;
 const PATH_GENERATION: u32 = 1;
 const MAX_BLOB_ENVELOPE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BLOB_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
@@ -5072,6 +5074,67 @@ pub struct BlobStoreService<P, C, K, A, L> {
     core: Arc<BlobStoreCore<P, C, K, A, L>>,
 }
 
+/// Explicit six-domain residency profile supplied by the original policy
+/// owner. It contains no content digest; the Blob owner derives that identity
+/// from the exact bytes it stages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobResidencyDomains {
+    /// Lawful WorkScope or source namespace binding.
+    pub scope_domain_id: BlobId,
+    /// Principal/access binding.
+    pub access_domain_id: BlobId,
+    /// Disclosure/confidentiality binding.
+    pub confidentiality_domain_id: BlobId,
+    /// Permitted key-lineage binding.
+    pub encryption_key_domain_id: BlobId,
+    /// Lifecycle/retention binding.
+    pub retention_domain_id: BlobId,
+    /// Purge-closure/erasure binding.
+    pub erasure_domain_id: BlobId,
+}
+
+impl BlobResidencyDomains {
+    /// Creates a complete source residency profile from six explicit domain
+    /// identities. No value is inferred or defaulted here.
+    #[must_use]
+    pub fn new(
+        scope_domain_id: BlobId,
+        access_domain_id: BlobId,
+        confidentiality_domain_id: BlobId,
+        encryption_key_domain_id: BlobId,
+        retention_domain_id: BlobId,
+        erasure_domain_id: BlobId,
+    ) -> Self {
+        Self {
+            scope_domain_id,
+            access_domain_id,
+            confidentiality_domain_id,
+            encryption_key_domain_id,
+            retention_domain_id,
+            erasure_domain_id,
+        }
+    }
+
+    fn bind_exact_bytes(self, bytes: &[u8]) -> Result<ObjectResidencyKey, BlobError> {
+        let digest = BlobHash::new(blake3::hash(bytes).to_hex().to_string())?;
+        let residency = ObjectResidencyKey {
+            scope_domain_id: self.scope_domain_id,
+            access_domain_id: self.access_domain_id,
+            confidentiality_domain_id: self.confidentiality_domain_id,
+            encryption_key_domain_id: self.encryption_key_domain_id,
+            retention_domain_id: self.retention_domain_id,
+            erasure_domain_id: self.erasure_domain_id,
+            content_digest: VersionedContentDigest {
+                algorithm: BlobId::new(CONTENT_DIGEST_ALGORITHM)?,
+                version: CONTENT_DIGEST_VERSION,
+                digest,
+            },
+        };
+        residency.validate()?;
+        Ok(residency)
+    }
+}
+
 /// Construction bundle for [`BlobStoreService`] (T3-B): the six injected
 /// dependencies travel as one value so constructors stay within the argument
 /// ceiling without hiding any dependency. Every field is still supplied by
@@ -5176,6 +5239,28 @@ where
         request: BlobStageRequest,
     ) -> Result<BlobReadyReceipt, BlobError> {
         self.core.stage_sync(request)
+    }
+
+    /// Stages source bytes using the six explicit policy-owner residency
+    /// domains and derives the versioned content digest over these exact
+    /// bytes inside the Blob owner. The usual stage core still validates the
+    /// request, key lineage, physical publication, and ready receipt.
+    pub fn stage_source_with_domains(
+        &self,
+        context: BlobReceiptContext,
+        root_lease: BlobRootLease,
+        bytes: &[u8],
+        policy: BlobPolicyBinding,
+        domains: BlobResidencyDomains,
+    ) -> Result<BlobReadyReceipt, BlobError> {
+        let residency = domains.bind_exact_bytes(bytes)?;
+        self.stage_source(BlobStageRequest {
+            context,
+            root_lease,
+            bytes: bytes.to_vec(),
+            policy,
+            residency,
+        })
     }
 
     /// Reads and verifies exact plaintext bytes through the canonical
