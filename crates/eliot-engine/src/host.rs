@@ -57,7 +57,8 @@ pub struct SkillPackEntryReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SkillPackLintReport {
-    /// Validates nonmeasurement lint conditions; token-policy fit is unknown.
+    /// Validates lint conditions and the existing planning estimate limits;
+    /// actual route-tokenizer fit remains unknown.
     pub valid: bool,
     pub skill_count: usize,
     pub listing_characters: usize,
@@ -192,6 +193,16 @@ impl SkillPackService {
             if nonblank_lines > 100 {
                 errors.push(format!("{name}: body exceeds 100 nonblank lines"));
             }
+            if stu_estimate.value > 500 {
+                errors.push(format!(
+                    "{name}: body unvalidated STU planning estimate exceeds 500; actual token fit is unknown"
+                ));
+            }
+            if description_stu_estimate.value > 25 {
+                errors.push(format!(
+                    "{name}: description unvalidated STU planning estimate exceeds 25; actual token fit is unknown"
+                ));
+            }
             let lower = body.to_ascii_lowercase();
             for forbidden in [
                 "surrealdb",
@@ -271,6 +282,12 @@ impl SkillPackService {
         let serialized_listing = serde_json::to_vec(&listing_descriptions)?;
         let (listing_utf8_bytes, listing_stu_estimate, listing_content_sha256) =
             exact_text_measurement(&serialized_listing)?;
+        if listing_stu_estimate.value > 100 {
+            errors.push(
+                "combined descriptions unvalidated STU planning estimate exceeds 100; actual token fit is unknown"
+                    .to_owned(),
+            );
+        }
         let (
             listing_serializer_id,
             listing_serializer_version,
