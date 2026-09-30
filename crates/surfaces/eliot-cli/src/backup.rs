@@ -2402,7 +2402,16 @@ fn apply_restore_owner_receipt(
     let receipt_id = envelope_nested_text(receipt, "receipt_id")?;
     let evidence_level = restore_receipt_evidence_level(response)?
         .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
-    outcome.result_identity = Some(receipt_id.to_owned());
+    // A `BackupResultIdentity` is six owner-issued facts, not one receipt id:
+    // the producing operation, the canonical request digest, the durable-row
+    // namespace, the archive digest, the capture receipt and the verifier's
+    // validity attestation. This owner's restore receipt names only the receipt
+    // id, so there is nothing honest to put in the other five, and filling them
+    // from the envelope echo would replace the owner's identity proof with a
+    // local value. The identity therefore stays an EXPLICIT ABSENCE and the
+    // receipt id is reported as the owner's own fact beside it.
+    outcome.result_identity = None;
+    outcome.capture_receipt = Some(receipt_id.to_owned());
     outcome.reason = format!(
         "the restore owner issued receipt {receipt_id} for this rehearsal at evidence level {evidence_level}; this surface renders the stage {:?} it graded from that level",
         claim.stage
@@ -2588,16 +2597,15 @@ pub fn backup_restore_test(
             // that fact attached: the Kernel refuses it that way precisely so
             // an operator never reads a failed restore as one that left the
             // isolated destination untouched.
-            if let Some(may_remain) = response
+            if response
                 .get("staged_output_may_remain")
                 .and_then(Value::as_bool)
+                == Some(true)
             {
-                if may_remain {
-                    outcome.missing_obligations.push(
-                        "the restore owner reported that bounded cleanup of this execution's staged output did not complete, so output may remain in the isolated destination"
-                            .to_owned(),
-                    );
-                }
+                outcome.missing_obligations.push(
+                    "the restore owner reported that bounded cleanup of this execution's staged output did not complete, so output may remain in the isolated destination"
+                        .to_owned(),
+                );
             }
         }
         BACKUP_STATE_CANCELLED => {
@@ -2829,7 +2837,8 @@ fn require_restore_test_ceiling(
             ),
             reason: format!(
                 "owner answered {status} to {BACKUP_RESTORE_TEST_OPERATION} with lifecycle stage {:?}, which is below the stage this operation starts at ({:?}); a stage the operation never reached is refused rather than rendered",
-                claim.stage, BackupStage::Requested
+                claim.stage,
+                BackupStage::Requested
             ),
         });
     }
@@ -2853,4 +2862,3 @@ fn require_restore_test_ceiling(
     }
     Ok(())
 }
-

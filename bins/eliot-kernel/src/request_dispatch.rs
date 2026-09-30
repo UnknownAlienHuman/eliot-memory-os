@@ -3381,10 +3381,7 @@ const fn backup_restore_archive_class(
 /// The evidence level is serialised through the owner's own `serde` derivation
 /// rather than a hand-written string, so the wire spelling cannot drift from
 /// the vocabulary the level is defined in.
-fn restore_owner_success_reply(
-    idempotency_key: &str,
-    outcome: &KernelRestoreOutcome,
-) -> Value {
+fn restore_owner_success_reply(idempotency_key: &str, outcome: &KernelRestoreOutcome) -> Value {
     let receipt = &outcome.receipt;
     let evidence_level = serde_json::to_value(receipt.evidence_level)
         .unwrap_or_else(|_| Value::String("unreadable".to_owned()));
@@ -3416,7 +3413,10 @@ fn restore_owner_success_reply(
                         .collect(),
                 ),
             ),
-            ("journal_owner", Value::String(outcome.journal_owner.clone())),
+            (
+                "journal_owner",
+                Value::String(outcome.journal_owner.clone()),
+            ),
             ("rehearsal", Value::Bool(outcome.rehearsal)),
             (
                 "destination_root",
@@ -3473,7 +3473,9 @@ fn restore_owner_reply(idempotency_key: &str, error: &KernelRestoreError) -> Val
         KernelRestoreError::FenceMismatch(_) => ("refused", "restore_fence_mismatch"),
         KernelRestoreError::ArchiveInvalid(_) => ("refused", "restore_archive_invalid"),
         KernelRestoreError::CapabilityMissing { .. } => ("refused", "restore_capability_missing"),
-        KernelRestoreError::OwnerEvidenceInvalid(_) => ("refused", "restore_owner_evidence_invalid"),
+        KernelRestoreError::OwnerEvidenceInvalid(_) => {
+            ("refused", "restore_owner_evidence_invalid")
+        }
         KernelRestoreError::CutoverNotAuthorized => ("refused", "restore_cutover_not_authorized"),
         KernelRestoreError::TargetFailed(_) => ("refused", "restore_target_failed"),
         KernelRestoreError::StagedCleanupIncomplete { .. } => {
@@ -3482,10 +3484,7 @@ fn restore_owner_reply(idempotency_key: &str, error: &KernelRestoreError) -> Val
     };
     let mut fields = vec![
         ("code", Value::String((*code).to_owned())),
-        (
-            "reason",
-            Value::String(bounded_reason(&error.to_string())),
-        ),
+        ("reason", Value::String(bounded_reason(&error.to_string()))),
     ];
     if let KernelRestoreError::InvalidInput { field, reason } = error {
         fields.push(("field", Value::String((*field).to_owned())));
@@ -3502,7 +3501,12 @@ fn restore_owner_reply(idempotency_key: &str, error: &KernelRestoreError) -> Val
         ));
     }
     fields.push(("gates_passed", restore_test_gates_passed()));
-    backup_reply(BACKUP_RESTORE_TEST_OPERATION, status, idempotency_key, fields)
+    backup_reply(
+        BACKUP_RESTORE_TEST_OPERATION,
+        status,
+        idempotency_key,
+        fields,
+    )
 }
 
 impl KernelComposition {
