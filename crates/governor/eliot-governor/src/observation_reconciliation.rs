@@ -809,6 +809,18 @@ struct ObservationContentWire {
     write_submission: OriginalWriteSubmission,
 }
 
+fn validate_observation_write_source(
+    input: &McpObservationCaptureInput,
+    content: &ObservationContentWire,
+) -> Result<(), CompositionError> {
+    if content.write_submission != input.original_write_submission {
+        return Err(owner_refused(
+            "Observe content write metadata differs from the explicit capture source",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_observation_content(content: &ObservationContentWire) -> Result<(), CompositionError> {
     if content.content.is_null() {
         return Err(owner_refused(
@@ -1124,13 +1136,9 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
         let original_content: ObservationContentWire =
             serde_json::from_value(input.original_content.clone()).map_err(|error| {
                 owner_refused(format!("MCP ObservationContent shape is invalid: {error}"))
-            })?;
+        })?;
         validate_observation_content(&original_content)?;
-        if original_content.write_submission != input.original_write_submission {
-            return Err(owner_refused(
-                "Observe content write metadata differs from the explicit capture source",
-            ));
-        }
+        validate_observation_write_source(input, &original_content)?;
         let observed_delta = String::from_utf8(
             canonical_json_bytes(&input.original_content)
                 .map_err(|error| owner_refused(error.to_string()))?,
