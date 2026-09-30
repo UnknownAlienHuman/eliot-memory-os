@@ -208,11 +208,14 @@ pub(crate) fn controlboard_read_intent(
     if attempt.fencing_generation == 0 {
         return Err(ControlBoardError::InvalidField("generation"));
     }
-    if envelope.identity.session_id.as_deref() != Some(attempt.session_id.as_str()) {
+    let Some(session_id) = attempt.session_id.as_deref() else {
+        return Err(ControlBoardError::Unauthorized);
+    };
+    if envelope.identity.session_id.as_deref() != Some(session_id) {
         return Err(ControlBoardError::Unauthorized);
     }
     ReadRequest::new(
-        attempt.session_id.clone(),
+        session_id.to_owned(),
         envelope.connection_id.clone(),
         envelope.descriptor_sha256.clone(),
         envelope.peer_admission_receipt_sha256.clone(),
