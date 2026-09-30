@@ -491,6 +491,20 @@ impl StorageReplacementStage {
         }
     }
 
+    /// The exact stage an operator-visible stage name selects, or `None` when
+    /// the name is not one of the eleven I5.11 stages.
+    ///
+    /// This is the only name-to-stage direction, and it is resolved over
+    /// [`Self::ORDER`] rather than written out a second time, so a caller's
+    /// stage vocabulary cannot drift from the declared order or name a stage
+    /// this coordinator does not have. It is what lets an admitted ingress
+    /// select a stage from a wire name without this module growing a second
+    /// stage spelling.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ORDER.into_iter().find(|stage| stage.name() == name)
+    }
+
     /// The stable operator-visible stage name.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -667,6 +681,21 @@ pub struct StorageReplacement {
     irreversible_effects: BTreeSet<IrreversibleStorageEffect>,
     cutover: Option<GenerationCutoverOwnership>,
     receipt: Option<StorageReplacementCutoverReceipt>,
+}
+
+impl fmt::Display for StorageRollbackDisposition {
+    /// The stable operator-visible disposition name.
+    ///
+    /// Same snake-case vocabulary [`StorageReplacementStage::name`] and
+    /// [`IrreversibleStorageEffect`] already publish, so the disposition is
+    /// projectable on an admitted reply without this module growing a second
+    /// spelling beside the decision it names.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::GenerationRollbackPermitted => "generation_rollback_permitted",
+            Self::ForwardRepairRequired { .. } => "forward_repair_required",
+        })
+    }
 }
 
 impl StorageReplacement {
