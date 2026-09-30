@@ -39,6 +39,8 @@ pub const MAX_ALLOWED_ROUTES: usize = 16;
 pub const MAX_ROUTE_CHARS: usize = 128;
 /// Maximum human-readable note length in bytes.
 pub const MAX_NOTE_CHARS: usize = 1024;
+/// Maximum provider usage claim text (including decimal cost strings).
+pub const MAX_PROVIDER_USAGE_TEXT_CHARS: usize = 128;
 
 /// Closed privacy class for one routed call.
 ///
@@ -310,6 +312,137 @@ impl CostUsageReceipt {
     }
 }
 
+/// Provider and harness identity actually used for one model-route attempt.
+///
+/// `route` is the route key selected from the admitted denominator;
+/// `provider_id` and `model_id` retain the exact provider selection, while
+/// `harness_id` identifies the runtime adapter/profile that executed it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRouteExecutionIdentity {
+    /// Selected route key from `ModelRouteRequest::allowed_routes`.
+    pub route: String,
+    /// Exact provider identity reported by the admitted route owner.
+    pub provider_id: String,
+    /// Exact model identity reported by the admitted route owner.
+    pub model_id: String,
+    /// Exact provider harness/profile identity.
+    pub harness_id: String,
+    /// Grounding-owner identity projected from the physically observed route.
+    /// Its revision is the original full execution-configuration fingerprint.
+    /// Older outcomes and unobserved routes carry no such evidence.
+    #[serde(default)]
+    pub grounding_route: Option<crate::grounding::RouteIdentity>,
+}
+
+impl ModelRouteExecutionIdentity {
+    /// Validates the bounded route and provider execution identity.
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        check_text(&self.route, "execution.route", MAX_ROUTE_CHARS)?;
+        check_text(&self.provider_id, "execution.provider_id", MAX_ROUTE_CHARS)?;
+        check_text(&self.model_id, "execution.model_id", MAX_ROUTE_CHARS)?;
+        check_text(
+            &self.harness_id,
+            "execution.harness_id",
+            MAX_PROVIDER_USAGE_TEXT_CHARS,
+        )?;
+        if let Some(route) = &self.grounding_route {
+            check_text(
+                &route.route_revision,
+                "execution.route_revision",
+                MAX_ROUTE_CHARS,
+            )?;
+            if route.provider != self.provider_id
+                || route.model != self.model_id
+                || crate::grounding::route_fingerprint(route)? != route.fingerprint
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "execution.grounding_route",
+                    reason: "grounding route differs from observed provider/model or recorded fingerprint"
+                        .to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Availability state of provider-reported token/cost telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouteUsageState {
+    /// The provider returned a usage object; individual fields may still be absent.
+    Available,
+    /// The provider explicitly reported usage as unavailable.
+    Unavailable,
+}
+
+/// Provider-reported telemetry preserved separately from locally observed
+/// input/output byte counts and elapsed time in [`CostUsageReceipt`]. The
+/// cost string remains a provider claim; it is not measured billing evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRouteProviderUsage {
+    /// Whether the provider returned its telemetry object.
+    pub state: ModelRouteUsageState,
+    /// Provider-reported input token count, when available.
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    /// Provider-reported output token count, when available.
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    /// Provider-reported total token count, when available.
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    /// Provider-reported cost in USD as a decimal string, when available.
+    #[serde(default)]
+    pub provider_cost_usd: Option<String>,
+    /// Bounded reason when the provider explicitly reports unavailable usage.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+}
+
+impl ModelRouteProviderUsage {
+    /// Validates the provider telemetry projection without treating it as a
+    /// locally measured cost or usage receipt.
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        if let Some(cost) = &self.provider_cost_usd {
+            check_text(
+                cost,
+                "provider_usage.provider_cost_usd",
+                MAX_PROVIDER_USAGE_TEXT_CHARS,
+            )?;
+            if cost.parse::<f64>().is_err() {
+                return Err(ContractViolation::Malformed {
+                    field: "provider_usage.provider_cost_usd",
+                    reason: "provider cost must be a decimal number".to_string(),
+                });
+            }
+        }
+        if let Some(reason) = &self.unavailable_reason {
+            check_text(reason, "provider_usage.unavailable_reason", MAX_NOTE_CHARS)?;
+        }
+        if self.state == ModelRouteUsageState::Available && self.unavailable_reason.is_some() {
+            return Err(ContractViolation::BindingMismatch {
+                field: "provider_usage.unavailable_reason",
+                reason: "available usage must not carry an unavailable reason".to_string(),
+            });
+        }
+        if self.state == ModelRouteUsageState::Unavailable
+            && (self.input_tokens.is_some()
+                || self.output_tokens.is_some()
+                || self.total_tokens.is_some()
+                || self.provider_cost_usd.is_some())
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "provider_usage",
+                reason: "unavailable usage must not carry token or cost values".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Versioned outcome of one routed call: raw bytes and/or a structured draft.
 ///
 /// This carries no semantic or canonical authority: it never grounds claims,
@@ -327,6 +460,14 @@ pub struct ModelRouteOutcome {
     pub bundle_digest: String,
     /// Chosen provider route; `Some` exactly for completed/partial/malformed.
     pub provider_route: Option<String>,
+    /// Actual route/provider/model/harness identity when route execution began.
+    /// Older v1 outcomes omit this additive evidence.
+    #[serde(default)]
+    pub execution: Option<ModelRouteExecutionIdentity>,
+    /// Provider-reported token/cost telemetry, preserved separately from the
+    /// measured byte/call/time receipt. Older v1 outcomes omit it.
+    #[serde(default)]
+    pub provider_usage: Option<ModelRouteProviderUsage>,
     /// Terminal disposition of the call.
     pub disposition: ModelRouteDisposition,
     /// Untouched provider payload, present for partial/malformed.
@@ -362,6 +503,22 @@ impl ModelRouteOutcome {
         check_text(&self.note, "note", MAX_NOTE_CHARS)?;
         if let Some(route) = &self.provider_route {
             check_text(route, "provider_route", MAX_ROUTE_CHARS)?;
+        }
+        if let Some(execution) = &self.execution {
+            execution.validate()?;
+            if self
+                .provider_route
+                .as_ref()
+                .is_some_and(|route| route != &execution.route)
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "execution.route",
+                    reason: "execution identity route differs from provider_route".to_string(),
+                });
+            }
+        }
+        if let Some(usage) = &self.provider_usage {
+            usage.validate()?;
         }
         match self.disposition {
             ModelRouteDisposition::Completed => {
@@ -477,6 +634,17 @@ impl ModelRouteOutcome {
             return Err(ContractViolation::BindingMismatch {
                 field: "provider_route",
                 reason: "chosen route is outside the admitted denominator".to_string(),
+            });
+        }
+        if let Some(execution) = &self.execution
+            && !request
+                .allowed_routes
+                .iter()
+                .any(|allowed| allowed == &execution.route)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "execution.route",
+                reason: "executed route is outside the admitted denominator".to_string(),
             });
         }
         if request.cancelled && self.disposition != ModelRouteDisposition::Cancelled {

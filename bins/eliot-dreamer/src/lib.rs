@@ -26,6 +26,7 @@ mod error;
 mod grounding_stage;
 pub(crate) mod kernel_port;
 mod model_stage;
+mod orientation_owner_inputs;
 mod production_orientation;
 mod pulse;
 mod result_stage;
@@ -618,6 +619,25 @@ fn run_admitted_pipeline(
         ))?;
         return dispatch_stage::dispatch_curation(binding, protection, carrier);
     }
+    if job.job_class == JobClass::Orientation {
+        let (validated, supply) = match orientation_supply {
+            Some(source) => (
+                Some(source.validated_draft),
+                production_orientation::borrow_governor_supply(admission, source),
+            ),
+            None => (None, production_orientation::ProductionOrientationSupply::Missing),
+        };
+        return dispatch_stage::dispatch_admitted_with_orientation_supply(
+            admission,
+            job,
+            None,
+            None,
+            None,
+            job.job_class,
+            validated,
+            supply,
+        );
+    }
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
     let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
@@ -632,17 +652,15 @@ fn run_admitted_pipeline(
     // threads into dispatch, which proves its binding before any native
     // handler runs and never re-runs the owner validation.
     let validated = validation_stage::validate_admitted_draft(&validation_input)?;
-    dispatch_stage::dispatch_admitted(
+    dispatch_stage::dispatch_admitted_with_orientation_supply(
         admission,
         job,
         screen_binding,
         None,
-        dispatch_stage::OwnerCarriers {
-            curation: None,
-            orientation: orientation_supply,
-        },
+        None,
         job.job_class,
         Some(&validated),
+        production_orientation::ProductionOrientationSupply::Missing,
     )
 }
 
@@ -905,7 +923,7 @@ pub struct CurationCandidate {
 }
 
 /// Exact schema version accepted by [`OrientationPulseResult`].
-pub const ORIENTATION_PULSE_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const ORIENTATION_PULSE_RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// Closed per-stage disposition for one Orientation pulse member (issue #2901).
 ///
@@ -980,12 +998,12 @@ pub struct OrientationBoundaryRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationAdmittedPrefix {
-    /// Canonical digest of the v1 `ValidatedCandidate`.
-    pub candidate_digest: String,
-    /// Canonical digest of the sealed `OrientationPolicy`.
-    pub policy_digest: String,
-    /// Canonical digest of the `DreamInputBundle`.
-    pub bundle_digest: String,
+    /// Original candidate commitment, absent before candidate acquisition.
+    pub candidate_digest: Option<String>,
+    /// Policy commitment, absent before policy acquisition.
+    pub policy_digest: Option<String>,
+    /// Bundle commitment, absent before bundle acquisition.
+    pub bundle_digest: Option<String>,
 }
 
 /// Typed production Orientation pulse result (issue #2901).
@@ -1000,7 +1018,7 @@ pub struct OrientationAdmittedPrefix {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationPulseResult {
-    /// Exact schema version; must be 1.
+    /// Exact schema version; must be 2.
     pub schema_version: u32,
     /// Overall pulse disposition (`Complete`, `Partial`, or `Blocked`).
     pub disposition: OrientationDisposition,

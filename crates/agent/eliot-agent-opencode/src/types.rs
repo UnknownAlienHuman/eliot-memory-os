@@ -1593,6 +1593,22 @@ pub struct UsageTelemetry {
     pub extra: UnknownFields,
 }
 
+/// Exact malformed assistant payload retained by the admitted route owner.
+/// Its payload is boxed by `OpenCodeRunError` so a large provider response
+/// does not inflate every error value.
+#[derive(Debug, thiserror::Error)]
+#[error("OpenCode assistant returned malformed structured output: {reason}")]
+pub struct MalformedProviderOutput {
+    /// Provider/model identity observed in the assistant message.
+    pub observed_model: ModelSelection,
+    /// Exact UTF-8 assistant output text returned by the provider.
+    pub raw_output: String,
+    /// Provider-reported usage telemetry, including partial fields.
+    pub usage: Option<UsageTelemetry>,
+    /// Bounded parser or output-schema reason.
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UsageAvailability {
     pub state: AvailabilityState,
@@ -1698,6 +1714,12 @@ pub struct NoAuthorityRunResult {
     #[serde(flatten)]
     pub extra: UnknownFields,
 }
+
+/// Key in [`NoAuthorityRunResult::extra`] containing the exact UTF-8
+/// assistant text from a successfully reconciled provider response. The
+/// structured `output` remains a convenience projection and never replaces
+/// this retained provider payload.
+pub const OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY: &str = "provider_raw_output_utf8";
 
 pub type ActualRouteResult = NoAuthorityRunResult;
 pub type OpenCodeRunResult = NoAuthorityRunResult;
@@ -3212,6 +3234,91 @@ impl AdmittedAttemptCandidate {
         admitted: &AdmittedOpenCodeAttempt,
         result: &NoAuthorityRunResult,
     ) -> Result<Self, AdmittedAttemptError> {
+        Self::validate_run_for_admission(admitted, result)?;
+        let result_digest = Self::result_digest_for(result)?;
+        Ok(Self {
+            attempt_id: admitted.attempt().id.clone(),
+            admitted_route_digest: admitted.admitted_route_digest().clone(),
+            result_digest,
+            authority: AuthorityCeiling::CandidateOnly,
+            status: RunStatus::Succeeded,
+            // The route disposition is attached by the sealer
+            // (`seal_admitted_outcome`) immediately after sealing: it is
+            // computed from the wire receipt against this run, never from the
+            // candidate fields, so it cannot be derived here.
+            route_disposition: None,
+        })
+    }
+
+    /// Validates the original recorded candidate digest against the exact
+    /// preimage used when it was sealed, without minting or replacing a
+    /// candidate. The terminal observation is the only run field added after
+    /// the digest was recorded; it is removed from a cloned preimage and then
+    /// independently checked against this candidate's existing digest.
+    pub fn validate_for_run(
+        &self,
+        admitted: &AdmittedOpenCodeAttempt,
+        result: &NoAuthorityRunResult,
+        route: &SealedRouteDisposition,
+    ) -> Result<(), AdmittedAttemptError> {
+        if self.attempt_id != admitted.attempt().id
+            || self.admitted_route_digest != *admitted.admitted_route_digest()
+            || self.authority != AuthorityCeiling::CandidateOnly
+            || self.status != RunStatus::Succeeded
+            || self.status != result.status
+            || self.route_disposition.as_ref() != Some(route)
+        {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "candidate identity, authority, or status differs from its admitted run",
+            });
+        }
+
+        let route_summary = route.summary_value(admitted.admission())?;
+        if result.extra.get("route_disposition") != Some(&route_summary)
+            || result.extra.get("edge").and_then(Value::as_str)
+                != Some(OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE)
+        {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "route disposition or candidate edge is not bound to the run digest",
+            });
+        }
+
+        let terminal_value = result.extra.get("admitted_terminal_observation").ok_or(
+            AdmittedAttemptError::SealRejected {
+                reason: "sealed run has no terminal observation",
+            },
+        )?;
+        let mut original_preimage = result.clone();
+        original_preimage
+            .extra
+            .remove("admitted_terminal_observation");
+        Self::validate_run_for_admission(admitted, &original_preimage)?;
+        let expected_result_digest = Self::result_digest_for(&original_preimage)?;
+        if self.result_digest != expected_result_digest {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "recorded result digest does not match its original run preimage",
+            });
+        }
+
+        let expected_terminal = AdmittedObservation::new(
+            admitted,
+            AdmittedObservationKind::Terminal,
+            format!("sealed candidate {}", self.compute_digest()?.as_str()),
+        );
+        let expected_terminal_value = serde_json::to_value(expected_terminal)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
+        if terminal_value != &expected_terminal_value {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "terminal observation does not reference the recorded candidate",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_run_for_admission(
+        admitted: &AdmittedOpenCodeAttempt,
+        result: &NoAuthorityRunResult,
+    ) -> Result<(), AdmittedAttemptError> {
         if !result.candidate_only || result.authority != AuthorityCeiling::CandidateOnly {
             return Err(AdmittedAttemptError::SealRejected {
                 reason: "run result claims authority beyond candidate-only",
@@ -3246,23 +3353,16 @@ impl AdmittedAttemptCandidate {
         {
             return Err(AdmittedAttemptError::SessionMismatch);
         }
+        Ok(())
+    }
+
+    fn result_digest_for(
+        result: &NoAuthorityRunResult,
+    ) -> Result<LowercaseSha256, AdmittedAttemptError> {
         let bytes = canonical_json_bytes(result)
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
-        let result_digest: LowercaseSha256 =
-            serde_json::from_value(Value::String(sha256_hex(&bytes)))
-                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
-        Ok(Self {
-            attempt_id: admitted.attempt().id.clone(),
-            admitted_route_digest: admitted.admitted_route_digest().clone(),
-            result_digest,
-            authority: AuthorityCeiling::CandidateOnly,
-            status: RunStatus::Succeeded,
-            // The route disposition is attached by the sealer
-            // (`seal_admitted_outcome`) immediately after sealing: it is
-            // computed from the wire receipt against this run, never from the
-            // candidate fields, so it cannot be derived here.
-            route_disposition: None,
-        })
+        serde_json::from_value(Value::String(sha256_hex(&bytes)))
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))
     }
 
     /// Recomputes the canonical digest of this sealed candidate. Re-sealing

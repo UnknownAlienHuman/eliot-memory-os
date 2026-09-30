@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub use eliot_contracts::{ArtifactId, StateFence, TaskId};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,7 +75,7 @@ pub struct AttemptIdentity {
     pub maximum_attempts: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteIdentity {
     pub provider: String,

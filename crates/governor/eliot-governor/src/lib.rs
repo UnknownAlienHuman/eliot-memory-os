@@ -45,6 +45,7 @@ mod epistemic_composition;
 mod experience_commit;
 mod finish_attempt;
 mod governor_authority_projection;
+pub mod orientation_projection_owner;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
