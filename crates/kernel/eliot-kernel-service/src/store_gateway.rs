@@ -6234,12 +6234,20 @@ impl KernelStoreGateway {
                     reason: unestablished_run_now_execution_reason(occurrence_id, &error),
                 },
             )),
-            // A refusal the Durable Job owner answered before any owner effect,
-            // and a precondition this leg could not prove locally, provably
-            // admitted nothing. They are not an unknown outcome, and the closed
-            // execution vocabulary has no member for a decided refusal that is
-            // not an owner policy deferral, so the operation is refused instead
-            // of being dressed up as one.
+            // A refusal the runtime owner answered before any owner effect is a
+            // DECIDED answer, not a lost one: the owner read the typed admission
+            // request and refused it, so the occurrence provably admitted nothing
+            // and there is no effect to reconcile. It is therefore neither an
+            // unknown outcome (which would claim an effect may have issued) nor
+            // an admission (which would claim a job that does not exist), and the
+            // owner's own reason is carried through rather than re-derived here —
+            // only the refusing owner can say why it refused.
+            Err(UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::Rejected(
+                reason,
+            ))) => Ok((wake, UserAutomationExecutionPhase::Rejected { reason })),
+            // A precondition this leg could not prove locally also admitted
+            // nothing, but it carries no owner decision to report, so it stays a
+            // route error rather than being dressed up as one.
             Err(error) => Err(error.to_string()),
         }
     }

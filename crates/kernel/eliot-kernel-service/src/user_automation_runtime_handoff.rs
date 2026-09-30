@@ -1548,17 +1548,16 @@ impl UserAutomationOperatorTransition {
                                         UserAutomationDeferReason::Paused
                                             | UserAutomationDeferReason::Retired
                                     )) => {}
-                            UserAutomationExecutionPhase::BlockedConfig { .. }
-                            | UserAutomationExecutionPhase::UnknownOutcome { .. }
-                                if wake_proven => {}
-                            // A rejected occurrence provably admitted nothing: the
-                            // owner refused the typed admission before any effect,
-                            // so the refusal sits beside the same proven wake a
-                            // blocked or unresolved execution sits beside. A
-                            // rejection beside an unresolved wake is refused
+                            // A rejected occurrence provably admitted nothing:
+                            // the owner refused the typed admission before any
+                            // effect, so the refusal sits beside the same proven
+                            // wake a blocked or unresolved execution sits beside.
+                            // A rejection beside an unresolved wake is refused
                             // rather than joined, because that wake proves
                             // neither for this occurrence.
-                            UserAutomationExecutionPhase::Rejected { .. }
+                            UserAutomationExecutionPhase::BlockedConfig { .. }
+                            | UserAutomationExecutionPhase::UnknownOutcome { .. }
+                            | UserAutomationExecutionPhase::Rejected { .. }
                                 if wake_proven => {}
                             UserAutomationExecutionPhase::Unavailable { .. } => {}
                             _ => {
