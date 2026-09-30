@@ -1427,10 +1427,26 @@ fn maintenance_sourced_evidence(
             // `BTreeSet<&str>` probed with the plain `&str`. Both sides are
             // compared as content, so a ref is skipped only on an exact byte
             // match against a ref the constructor already retained.
-            let already: BTreeSet<&str> = evidence.evidence_refs.iter().map(String::as_str).collect();
-            evidence
-                .evidence_refs
-                .extend(evidence_refs.iter().filter(|r| !already.contains(r.as_str())).cloned());
+            //
+            // The additions are materialised on their own statement so the
+            // borrow `already` holds of `evidence.evidence_refs` ends there,
+            // before the mutation below. `improvement_dedup_read.rs` never has
+            // to end such a borrow because it never mutates the collection it
+            // borrowed from; here the bundle IS extended, so probe and mutate
+            // are separated into two steps instead of fused into one `extend`.
+            // Only the refs that will actually be added are copied — the
+            // retained refs are still probed by reference — so the per-cadence
+            // clone of the whole bundle stays gone.
+            let additions: Vec<String> = {
+                let already: BTreeSet<&str> =
+                    evidence.evidence_refs.iter().map(String::as_str).collect();
+                evidence_refs
+                    .iter()
+                    .filter(|r| !already.contains(r.as_str()))
+                    .cloned()
+                    .collect()
+            };
+            evidence.evidence_refs.extend(additions);
             evidence.validate()?;
             Ok(evidence)
         }
