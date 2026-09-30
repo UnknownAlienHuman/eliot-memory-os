@@ -8,15 +8,19 @@
 
 #![forbid(unsafe_code)]
 
+use eliot_blob_api::BlobReadChunk;
 use eliot_graph_api::{
     CoordinateKind, GraphCoordinate, GraphCoverage, GraphEdge, GraphFreshness, GraphNode,
     GraphQueryResult, GraphRevision,
 };
 use eliot_instrument_api::{EvidenceAxes, EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
+use eliot_receipts::{CausalBinding, TaskBinding};
+use eliot_store_api::CapturedBlobPayloadRefV1;
 use eliot_lsp_bridge::{
     Coverage as LspCoverage, DiagnosticSeverity, FailureDisposition, Freshness as LspFreshness,
     LspAdoptionProjection, LspRawOutputKind, NormalizedResult, RetainedLspObservationV1,
-    SemanticOperation, adopt_retained_observation,
+    SemanticOperation, adopt_captured_observation_from_blob_readback,
+    adopt_retained_observation,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,8 +42,106 @@ pub enum CodeCortexError {
     InvalidGraph(String),
     #[error("evidence is invalid: {0}")]
     InvalidEvidence(String),
+    #[error("captured LSP evidence is bound to another task")]
+    TaskBindingMismatch,
     #[error("index revision overflow")]
     RevisionOverflow,
+}
+
+/// One exact Store pointer, its owner-authenticated immutable Blob readback,
+/// and the historical task binding attached to the captured Store row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedLspObservation {
+    pub reference: CapturedBlobPayloadRefV1,
+    pub readback: BlobReadChunk,
+    pub historical_task_binding: TaskBinding,
+}
+
+impl CapturedLspObservation {
+    #[must_use]
+    pub fn new(
+        reference: CapturedBlobPayloadRefV1,
+        readback: BlobReadChunk,
+        historical_task_binding: TaskBinding,
+    ) -> Self {
+        Self {
+            reference,
+            readback,
+            historical_task_binding,
+        }
+    }
+}
+
+fn validate_current_read_binding(
+    task_binding: &TaskBinding,
+    causal_binding: &CausalBinding,
+) -> Result<(), CodeCortexError> {
+    if task_binding.state_fence != causal_binding.state_fence {
+        return Err(CodeCortexError::InvalidEvidence(
+            "current Store read task and causal fences disagree".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_captured_lsp_payload_reference(
+    reference: &CapturedBlobPayloadRefV1,
+) -> Result<(), CodeCortexError> {
+    reference
+        .validate()
+        .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+    if reference.receipt_kind != eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND {
+        return Err(CodeCortexError::InvalidEvidence(
+            "captured Blob reference is not an LSP observation payload".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_captured_lsp_task_join(
+    captured: &CapturedLspObservation,
+    record: &RetainedLspObservationV1,
+    current_read_task_binding: &TaskBinding,
+    current_read_causal_binding: &CausalBinding,
+) -> Result<(), CodeCortexError> {
+    let invalid = || {
+        CodeCortexError::InvalidEvidence(
+            "captured LSP payload does not join its Store and Blob owner bindings".to_owned(),
+        )
+    };
+    let readback = &captured.readback;
+    let ready = readback.ready_receipt();
+    let ready_receipt = ready.receipt();
+    let read_receipt = readback.receipt();
+    let reference = &captured.reference;
+    if &reference.locator != ready.locator()
+        || reference.metadata_sha256 != ready.metadata_sha256()
+        || reference.ready_receipt_id != ready_receipt.identity.receipt_id.to_string()
+        || reference.plaintext_length != ready.plaintext_length()
+        || reference.plaintext_sha256 != ready.plaintext_sha256()
+        || ready_receipt.core.task.as_ref() != Some(&captured.historical_task_binding)
+        || ready_receipt.core.request.metadata.task_id.as_ref()
+            != Some(&captured.historical_task_binding.task_id)
+        || ready_receipt.core.request.state_fence
+            != captured.historical_task_binding.state_fence
+        || ready_receipt.core.request.metadata.state_fence
+            != captured.historical_task_binding.state_fence
+        || ready_receipt.core.causal.state_fence
+            != captured.historical_task_binding.state_fence
+        || read_receipt.core.task.as_ref() != Some(current_read_task_binding)
+        || &read_receipt.core.causal != current_read_causal_binding
+        || read_receipt.core.request.metadata.task_id.as_ref()
+            != Some(&current_read_task_binding.task_id)
+        || read_receipt.core.request.state_fence != current_read_task_binding.state_fence
+        || read_receipt.core.request.metadata.state_fence != current_read_task_binding.state_fence
+        || record.instrument_invocation.request.task_id.as_ref()
+            != Some(&captured.historical_task_binding.task_id)
+        || record.instrument_invocation.request.state_fence
+            != captured.historical_task_binding.state_fence
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -161,6 +263,7 @@ struct RetainedLspProjection {
     workspace_root: String,
     process_operation_id: String,
     raw_handles: Vec<String>,
+    evidence: NormalizedEvidence,
     result: NormalizedResult,
     currentness: LspFreshness,
 }
@@ -378,21 +481,18 @@ impl SemanticIndex {
         evidence
             .validate()
             .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
-        if self.retained_lsp.contains_key(&process_operation_id)
-            || self.evidence.contains_key(&process_operation_id)
-        {
+        if self.retained_lsp.contains_key(&process_operation_id) {
             return Err(CodeCortexError::InvalidEvidence(
-                "the original process operation is already used as an evidence key".to_owned(),
+                "the original process operation is already retained".to_owned(),
             ));
         }
-        let key = process_operation_id.clone();
-        self.evidence.insert(key.clone(), evidence);
         self.retained_lsp.insert(
-            key,
+            process_operation_id.clone(),
             RetainedLspProjection {
                 workspace_root,
                 process_operation_id,
                 raw_handles,
+                evidence,
                 result,
                 currentness,
             },
@@ -407,7 +507,16 @@ impl SemanticIndex {
         IndexSnapshot {
             revision,
             graph_results: self.graphs.values().cloned().collect(),
-            instrument_evidence: self.evidence.values().cloned().collect(),
+            instrument_evidence: self
+                .evidence
+                .values()
+                .cloned()
+                .chain(
+                    self.retained_lsp
+                        .values()
+                        .map(|observation| observation.evidence.clone()),
+                )
+                .collect(),
         }
     }
 
@@ -422,11 +531,15 @@ impl SemanticIndex {
 
 pub struct CodeCortexService {
     index: SemanticIndex,
+    current_task_binding: Option<TaskBinding>,
 }
 
 impl CodeCortexService {
     pub fn new(index: SemanticIndex) -> Self {
-        Self { index }
+        Self {
+            index,
+            current_task_binding: None,
+        }
     }
 
     /// Builds a service over caller-supplied normalized instrument evidence.
@@ -439,7 +552,10 @@ impl CodeCortexService {
     pub fn with_evidence(evidence: Vec<NormalizedEvidence>) -> Result<Self, CodeCortexError> {
         let mut index = SemanticIndex::new();
         index.admit_evidence_batch(evidence)?;
-        Ok(Self { index })
+        Ok(Self {
+            index,
+            current_task_binding: None,
+        })
     }
 
     /// Builds a service from caller-supplied original bridge observations.
@@ -454,7 +570,10 @@ impl CodeCortexService {
         for record in records {
             index.admit_retained_lsp_observation(record)?;
         }
-        Ok(Self { index })
+        Ok(Self {
+            index,
+            current_task_binding: None,
+        })
     }
 
     /// Builds a service from original bridge observations paired with the
@@ -468,7 +587,53 @@ impl CodeCortexService {
         for (record, projection) in observations {
             index.admit_lsp_adoption_projection(record, &projection)?;
         }
-        Ok(Self { index })
+        Ok(Self {
+            index,
+            current_task_binding: None,
+        })
+    }
+
+    /// Builds a stale-only service from exact captured LSP payload references
+    /// and the original Blob owner's non-deserializable read capabilities.
+    /// It validates the current read receipt separately from the historical
+    /// task binding, re-adopts the original bytes through the bridge, and
+    /// preserves each original LSP observation receipt unchanged.
+    pub fn with_captured_lsp_observations(
+        current_read_task_binding: TaskBinding,
+        current_read_causal_binding: CausalBinding,
+        observations: Vec<CapturedLspObservation>,
+    ) -> Result<Self, CodeCortexError> {
+        validate_current_read_binding(
+            &current_read_task_binding,
+            &current_read_causal_binding,
+        )?;
+        let mut index = SemanticIndex::new();
+        for observation in observations {
+            validate_captured_lsp_payload_reference(&observation.reference)?;
+            let (record, result) = adopt_captured_observation_from_blob_readback(
+                &observation.readback,
+            )
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+            validate_captured_lsp_task_join(
+                &observation,
+                &record,
+                &current_read_task_binding,
+                &current_read_causal_binding,
+            )?;
+            let process_operation_id = record.process_evidence.operation_id().as_str().to_owned();
+            index.admit_lsp_observation(
+                record,
+                result,
+                process_operation_id,
+                LspFreshness::Stale {
+                    reason: "captured immutable bytes lack current process and source-owner reconciliation".to_owned(),
+                },
+            )?;
+        }
+        Ok(Self {
+            index,
+            current_task_binding: Some(current_read_task_binding),
+        })
     }
 
     pub fn index(&self) -> &SemanticIndex {
@@ -484,6 +649,11 @@ impl CodeCortexService {
         request: &CompositionRequest,
     ) -> Result<CodeCortexReport, CodeCortexError> {
         request.validate()?;
+        if self.current_task_binding.as_ref().is_some_and(|binding| {
+            request.task_id != binding.task_id.to_string()
+        }) {
+            return Err(CodeCortexError::TaskBindingMismatch);
+        }
         let mut report = compose_snapshot(request, &self.index.snapshot())?;
         project_retained_lsp_observations(request, &self.index.retained_lsp, &mut report)?;
         Ok(report)
@@ -899,9 +1069,9 @@ fn project_retained_lsp_observations(
 
 fn has_empty_lookup_result(result: &NormalizedResult) -> bool {
     match result {
-        NormalizedResult::Definitions { items, .. }
-        | NormalizedResult::References { items, .. }
-        | NormalizedResult::Symbols { items, .. } => items.is_empty(),
+        NormalizedResult::Definitions { items, .. } => items.is_empty(),
+        NormalizedResult::References { items, .. } => items.is_empty(),
+        NormalizedResult::Symbols { items, .. } => items.is_empty(),
         NormalizedResult::Diagnostics { observations, .. } => observations.is_empty(),
         NormalizedResult::Rename { .. } | NormalizedResult::Version { .. } => false,
     }
