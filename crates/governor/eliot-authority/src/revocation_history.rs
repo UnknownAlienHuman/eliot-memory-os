@@ -347,9 +347,7 @@ fn digest_bounds(bounds: &RevocationBounds) -> RevocationClosureDigestBounds {
 fn recorded_commit_epoch_is_current(recorded: &StateFence, live: &StateFence) -> bool {
     matches!(
         live.authority_epoch.relation_to(&recorded.authority_epoch),
-        EpochRelation::Same
-            | EpochRelation::DirectChild
-            | EpochRelation::SameLineageNewer
+        EpochRelation::Same | EpochRelation::DirectChild | EpochRelation::SameLineageNewer
     )
 }
 
