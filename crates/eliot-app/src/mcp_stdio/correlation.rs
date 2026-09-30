@@ -385,6 +385,10 @@ impl McpInvocationCorrelation {
             transport_edge: None,
             operation_binding: self.operation_binding.as_ref(),
             canonical: &canonical,
+            // This boundary cannot confirm a stale Desktop UI: it never reads
+            // one. Asserting it here would offer refresh-the-UI on evidence
+            // this process does not have, so it stays false and the recovery
+            // stays withheld (issue #2899 W10.3).
             ui_confirmed_stale: false,
         };
         let assessment = assess_correlation(&inputs);
@@ -392,32 +396,43 @@ impl McpInvocationCorrelation {
         if self.assessments.append(&digest, assessment).is_err() {
             return;
         }
-        let summary =
-            eliot_agent_bridge_core::AssessmentSummary::summarize(self.assessments.revisions());
+        let summary = eliot_agent_bridge_core::AssessmentSummary::summarize(&self.assessments);
         let missing: Vec<&str> = summary
             .missing_evidence
             .iter()
             .map(String::as_str)
             .collect();
-        let Some(latest) = self.assessments.latest() else {
+        // Read the correlation's CURRENT assessment, not every revision it ever
+        // held (#2899 W9.3): a degradation superseded by a later healthy
+        // completion stays in the chain as history but must never be reported as
+        // the current one. `supersedes_earlier` is the positive evidence that
+        // this correlation was re-assessed.
+        let Some(current) = self.assessments.current() else {
             return;
         };
-        let assessment_state = latest.assessment.state.as_str();
+        let latest = current.revision;
+        let assessment_state = current.state().as_str();
         let assessment_revision = latest.revision;
         let host_terminal_state = match host {
             HostTerminalObservation::Observed { state, .. } => state.as_str(),
             HostTerminalObservation::PartialUnknown(_) => "",
         };
         let coverage_proof = window.coverage.as_str();
-        let route_degradation = latest
+        let route_degradation =
+            current.degradation().map_or("", |degradation| degradation.code.as_str());
+        let recovery_actions = latest
             .assessment
-            .degradation
+            .recovery
             .as_ref()
-            .map_or("", |degradation| degradation.code.as_str());
-        let recovery_actions = latest.assessment.recovery.as_ref().map_or_else(
-            String::new,
-            eliot_agent_bridge_core::mcp_correlation::RecoveryDirective::action_names,
-        );
+            .map_or_else(
+                String::new,
+                eliot_agent_bridge_core::mcp_correlation::RecoveryDirective::action_names,
+            );
+        let superseded_codes = summary
+            .superseded_degradation_codes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         tracing::info!(
             schema = self.schema,
             mcp_request_id = %self.mcp_request_id,
@@ -455,11 +470,19 @@ impl McpInvocationCorrelation {
             coverage_note = %observation.coverage.coverage_note,
             assessment_state = assessment_state,
             assessment_revision = assessment_revision,
+            assessment_supersedes_earlier = current.supersedes_earlier,
             route_degradation = route_degradation,
             recovery_actions = %recovery_actions,
+            recovery_canonical_rule = latest
+                .assessment
+                .recovery
+                .as_ref()
+                .map_or("", |recovery| recovery.canonical_rule.as_str()),
             pending_count = summary.pending,
             completed_count = summary.completed,
             degraded_count = summary.degraded,
+            superseded_degradation_count = summary.superseded_degradations,
+            superseded_degradation_codes = ?superseded_codes,
             missing_evidence = ?missing,
             "mcp invocation correlation"
         );

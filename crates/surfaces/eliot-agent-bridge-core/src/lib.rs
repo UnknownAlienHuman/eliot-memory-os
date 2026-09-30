@@ -88,13 +88,14 @@ pub use mcp_bridge_join::{
 pub use mcp_correlation::{
     Assessment, AssessmentEvidence, AssessmentInputs, AssessmentLog, AssessmentLogError,
     AssessmentRevision, AssessmentSummary, CORRELATION_IDENTITY_VERSION, CORRELATION_SCHEMA_ID,
-    CanonicalDisposition, CommitEvidence, CorrelationAssessmentState, CorrelationIdentity,
-    CorrelationIdentityParts, CorrelationStage, CoverageIndeterminacy, CoverageProof,
-    EliotEmissionObservation, EmissionCause, HandlerOutcome, HostObservationEvidence,
-    HostTerminalObservation, HostTerminalState, MAX_ASSESSMENT_REVISIONS, MAX_SUMMARY_EVIDENCE,
-    ObservationWindow, OperationEffectClass, OperationIdentity, OwnerBindingError,
-    OwnerValidatedOperationBinding, PartialObservation, RecoveryAction, RouteDegradation,
-    RouteDegradationCode, StdioEmissionReceipt, assess_correlation, derive_recovery, sha256_hex,
+    CanonicalDisposition, CanonicalRecoveryRule, CommitEvidence, CorrelationAssessmentState,
+    CorrelationIdentity, CorrelationIdentityParts, CorrelationStage, CoverageIndeterminacy,
+    CoverageNote, CoverageProof, EliotEmissionObservation, EmissionCause, HandlerOutcome,
+    HostObservationEvidence, HostTerminalObservation, HostTerminalState, MAX_ASSESSMENT_REVISIONS,
+    MAX_RECOVERY_ACTIONS, MAX_SUMMARY_EVIDENCE, ObservationWindow, OperationEffectClass,
+    OperationIdentity, OwnerBindingError, OwnerValidatedOperationBinding, PartialObservation,
+    RecoveryAction, RevisionOutcome, RouteDegradation, RouteDegradationCode, StdioEmissionReceipt,
+    assess_correlation, derive_recovery, sha256_hex,
 };
 // `mcp_correlation::CoverageGap` and `mcp_correlation::RecoveryDirective` are
 // deliberately NOT re-exported here. The crate root already exports a
