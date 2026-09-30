@@ -10,6 +10,13 @@ namespace Eliot.Operator.Services;
 /// Redeems the inherited one-shot handoff with the User Broker before the
 /// Governor connection is opened. The client has one owner-issued pipe, one
 /// challenge/redeem exchange and no cached authority or retry path.
+///
+/// The redeemed binding is RETURNED, never stored here: the broker-issued
+/// Kernel session token lives only in the caller's process memory, bound to
+/// the connection the redemption vouched for, and is discarded with it. It is
+/// never written to a file, an envelope, a log or a banner, so a UI restart
+/// creates a new operational binding and never revives authority from cached
+/// application state (I11.8).
 internal static class BrokerPipeClient
 {
     private const string Preface = "ELIOT-BROKER-1\n";
@@ -37,7 +44,57 @@ internal static class BrokerPipeClient
 
     private static readonly string[] ErrorProperties = ["status", "code", "detail"];
 
-    public static async Task RedeemOperatorHandoffAsync(
+    /// The broker-ADMITTED Human binding one redemption vouched for: the
+    /// principal, session, process, Kernel session token, role and exact
+    /// capability set the broker echoed on its authenticated pipe, each proved
+    /// equal to the owner-issued handoff and the live process identity before
+    /// this record is built.
+    ///
+    /// The principal is the broker's own echo of the OS-observed pipe peer
+    /// (`peer.sid()` on the broker side), never a self-declared string
+    /// (A12.2): the redemption checks below prove it equal to this process's
+    /// observed SID before it is retained. The token is opaque process memory:
+    /// it is compared by exact ordinal equality only, never recomputed,
+    /// never logged, and never placed in an envelope, a file or a banner.
+    public sealed record RedeemedOperatorBinding(
+        string Principal,
+        string InteractiveSessionId,
+        int ClientProcessId,
+        string KernelSessionToken,
+        OperatorRoleBinding Grant,
+        ulong BrokerEpoch)
+    {
+        public void Validate()
+        {
+            OperatorIdentityFields.RequireText(Principal, "principal");
+            OperatorIdentityFields.RequireText(InteractiveSessionId, "interactive_session_id");
+            if (ClientProcessId <= 0)
+            {
+                throw new InvalidOperationException("Redeemed binding client_process_id must be a positive process id.");
+            }
+            OperatorIdentityFields.RequireText(KernelSessionToken, "kernel_session_token");
+            ArgumentNullException.ThrowIfNull(Grant);
+            OperatorIdentityFields.RequireText(Grant.Role, "role");
+            foreach (var capability in Grant.Capabilities)
+            {
+                OperatorIdentityFields.RequireText(capability, "capabilities");
+            }
+        }
+
+        /// Proves this binding still describes the given live process
+        /// identity. A process cannot change its SID, logon session or PID,
+        /// so a mismatch means the retained authority belongs to another
+        /// binding and must be discarded, never honoured.
+        public bool DescribesProcess(OperatorProcessIdentity current, int processId) =>
+            string.Equals(Principal, current.UserSid, StringComparison.Ordinal)
+            && string.Equals(
+                InteractiveSessionId,
+                current.LogonSessionId.ToString(CultureInfo.InvariantCulture),
+                StringComparison.Ordinal)
+            && ClientProcessId == processId;
+    }
+
+    public static async Task<RedeemedOperatorBinding> RedeemOperatorHandoffAsync(
         OperatorEndpoint endpoint,
         OperatorProcessIdentity clientIdentity,
         CancellationToken cancellationToken)
@@ -185,6 +242,25 @@ internal static class BrokerPipeClient
         {
             throw new OperatorRestartRequiredException(OperatorFaultReason.HandshakeRefused);
         }
+
+        // Every value below was proved equal to the broker's authenticated
+        // echo above: the principal and session against the redeemed record,
+        // the process id against it, the token against it, and the role and
+        // exact capability set against it. The binding is therefore the
+        // ADMITTED one, and the caller retains it in process memory only.
+        // The capability list is copied, never aliased: `OperatorEndpoint.
+        // Capabilities` is the client's authority material, so handing out
+        // the aliased instance would let a holder rewrite what the binding
+        // was admitted for.
+        var binding = new RedeemedOperatorBinding(
+            clientIdentity.UserSid,
+            sessionId,
+            processId,
+            token,
+            new OperatorRoleBinding(endpoint.Role, [.. endpoint.Capabilities]),
+            endpoint.BrokerEpoch);
+        binding.Validate();
+        return binding;
     }
 
     /// The endpoint is the only owner-issued statement of WHICH broker
