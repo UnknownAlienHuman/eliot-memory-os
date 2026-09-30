@@ -615,10 +615,7 @@ fn attention_command_parameters(
             "attention_evaluation.evaluation_id",
             params.evaluation_id.to_owned(),
         ),
-        (
-            "attention_evaluation.revision",
-            params.revision.to_string(),
-        ),
+        ("attention_evaluation.revision", params.revision.to_string()),
         (
             "attention_evaluation.record_digest",
             params.record_digest.to_owned(),
