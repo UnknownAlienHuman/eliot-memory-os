@@ -116,7 +116,7 @@ def plan(root, output, install):
     a = common()
     base = ['cargo', 'test', '--locked', '-p', 'eliot-kernel', '--test', 'store_concurrency_product']
     return [
-        a.stage('rustc-identity', ['rustc', '-vV'], 1, contains='host: x86_64-pc-windows-msvc'),
+        a.stage('rustc-identity', ['rustc', '-vV'], 5, contains='host: x86_64-pc-windows-msvc'),
         a.stage('cargo-identity', ['cargo', '--version'], 1),
         a.stage('metadata', ['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'], 2),
         a.stage('fixed-official-provider-download', [sys.executable, str(Path(__file__).resolve()), '--acquire', str(install / 'runtime/surreal.exe')], 4),
@@ -174,6 +174,7 @@ def self_test():
         def test_plan(self):
             rows = plan(Path('/repo'), Path('/evidence'), Path('/install'))
             self.assertEqual(len(rows), 8)
+            self.assertEqual(rows[0]['timeout_seconds'], 300)
             self.assertIn('--no-run', rows[5]['command'])
             self.assertIn('--exact', rows[6]['command'])
             self.assertIn(SMOKE, rows[6]['command'])
