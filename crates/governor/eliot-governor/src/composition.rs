@@ -7673,7 +7673,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .ok_or(CompositionError::ActivationScopeSelectionRequired)?
             .read_current(request_fence)
             .map_err(CompositionError::ScanDisclosure)?;
-        ensure_snapshot_fresh(&work_scope, "Task Controller WorkScope is not freshly matched")?;
+        ensure_snapshot_fresh(
+            &work_scope,
+            "Task Controller WorkScope is not freshly matched",
+        )?;
         if work_scope.binding.scope.scope_ref != request_scope_ref {
             return Err(CompositionError::ActivationScopeSelectionRequired);
         }
@@ -7698,8 +7701,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if now < pending.now {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let (activation, selected) =
-            self.read_unique_agent_activation_with_selection(now)?;
+        let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
         let current_scope = self
             .owners
             .work_scope
@@ -7707,11 +7709,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .ok_or(CompositionError::ActivationScopeSelectionRequired)?
             .read_current(&pending.activation.state_fence)
             .map_err(CompositionError::ScanDisclosure)?;
-        ensure_snapshot_fresh(&current_scope, "Task Controller WorkScope changed during acceptance read")?;
+        ensure_snapshot_fresh(
+            &current_scope,
+            "Task Controller WorkScope changed during acceptance read",
+        )?;
         if activation != pending.activation
             || selected != pending.selected
             || current_scope != pending.work_scope
-            || !fences_match_exact(&self.snapshot.state_fence(), &pending.activation.state_fence)
+            || !fences_match_exact(
+                &self.snapshot.state_fence(),
+                &pending.activation.state_fence,
+            )
         {
             return Err(CompositionError::ActivationStaleFence);
         }

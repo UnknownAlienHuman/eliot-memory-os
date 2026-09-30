@@ -776,9 +776,19 @@ fn bind_task_selection_to_envelope(
         .validate()
         .map_err(|error| TaskLifecycleError::Composition(CompositionError::from(error)))?;
     let fence = &identity.request.state_fence;
-    if identity.request.metadata.session_id.as_ref().map(|id| id.as_str())
+    if identity
+        .request
+        .metadata
+        .session_id
+        .as_ref()
+        .map(|id| id.as_str())
         != Some(selection.session_ref())
-        || identity.request.metadata.task_id.as_ref().map(|id| id.as_str())
+        || identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|id| id.as_str())
             != Some(record.task_id.as_str())
         || selection.task_ref() != record.task_id.as_str()
         || evidence.task_ref != record.task_id.as_str()
@@ -794,9 +804,10 @@ fn bind_task_selection_to_envelope(
         ));
     }
 
-    let operation = envelope.semantic_commands.first_mut().ok_or_else(|| {
-        TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope"))
-    })?;
+    let operation = envelope
+        .semantic_commands
+        .first_mut()
+        .ok_or_else(|| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))?;
     let parameters = &mut operation.parameters;
     parameters.insert(
         "task_selection_evidence_json".to_owned(),
@@ -825,12 +836,10 @@ fn bind_task_selection_to_envelope(
         "task_selection_evidence_ref".to_owned(),
         serde_json::Value::String(selection.evidence_ref().to_owned()),
     );
-    envelope
-        .required_proof_and_approval_refs
-        .extend([
-            selection.selection_source_ref().to_owned(),
-            selection.evidence_ref().to_owned(),
-        ]);
+    envelope.required_proof_and_approval_refs.extend([
+        selection.selection_source_ref().to_owned(),
+        selection.evidence_ref().to_owned(),
+    ]);
     envelope
         .validate()
         .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))
