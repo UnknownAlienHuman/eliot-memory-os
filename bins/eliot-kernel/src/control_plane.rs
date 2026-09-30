@@ -479,8 +479,9 @@ impl KernelComposition {
             .command
         {
             KernelControlCommand::RebindStore(handoff) => {
-                let receipt = self
-                    .rebind_store(handoff.clone(), request.payload_digest.clone())
+                let receipt = Box::pin(
+                    self.rebind_store(handoff.clone(), request.payload_digest.clone()),
+                )
                     .await
                     .map_err(|_| TransportError::SessionFenced)?;
                 Some(receipt)
