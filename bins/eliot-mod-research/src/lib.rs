@@ -1504,18 +1504,19 @@ pub fn project_admitted_inquiry(
             .unwrap_or(receipt.reason_code)
             .to_owned(),
         assessment_time_ms,
-        // MEASURED: `ResearchQueryRequest` carries no predecessor-freeze or
-        // reopen-reason custody, and this crate is not the owner of the exchange
-        // wire contract, so a run admitted here has no declared predecessor and
-        // the freeze it produces is an honest first freeze rather than a silent
-        // successor. Both fields are therefore initialised to their honest
-        // first-freeze value rather than to a fabricated relation:
-        // `EvidenceFreeze` will name, re-prove and refuse a successor the moment
-        // an admitted request does carry the pair; supplying that custody on the
-        // request is BLOCKED-BY #1762, which owns inquiry/R6 composition. No
-        // value is invented here to make the successor arm fire.
-        predecessor_freeze_digest: None,
-        reopen_reason: None,
+        // Read straight off the admitted request. `freeze_predecessor` in
+        // `eliot_researcher::inquiry_governance` builds the successor relation
+        // from exactly these two fields and invents neither, and
+        // `ResearchQueryRequest::validate` refuses the half-present pair at the
+        // exchange boundary, so a run admitted with a predecessor and a reason
+        // produces a real successor freeze while a first freeze stays an honest
+        // first freeze. The two move together off one source rather than being
+        // decided here: a projection that could set one without the other would
+        // be the only way to publish a relation the admitted request never
+        // carried, which is exactly what the request-level refusal exists to
+        // prevent.
+        predecessor_freeze_digest: request.predecessor_freeze_digest.clone(),
+        reopen_reason: request.reopen_reason.clone(),
     };
     InquiryGovernance::record(observation).map_err(crate::R6ProjectionError::from)
 }
@@ -1751,6 +1752,8 @@ pub(crate) mod support {
             budget_units: 10,
             deadline_ms: 1_800_000_000_000,
             required_schema: "research-evidence-bundle/v1".to_owned(),
+            predecessor_freeze_digest: None,
+            reopen_reason: None,
         }
     }
 }

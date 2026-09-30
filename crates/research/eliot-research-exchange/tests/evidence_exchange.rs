@@ -90,6 +90,12 @@ fn request() -> ResearchQueryRequest {
         budget_units: 10,
         deadline_ms: 1_800_000_000_000,
         required_schema: "research-evidence-bundle/v1".to_owned(),
+        // This fixture is a first freeze: the exchange-level contract under
+        // test is admission and delivery, not the reopen relation, and the
+        // first-freeze shape is the honest state for a request admitted without
+        // a predecessor.
+        predecessor_freeze_digest: None,
+        reopen_reason: None,
     }
 }
 
