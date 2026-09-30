@@ -1609,6 +1609,45 @@ pub struct MalformedProviderOutput {
     pub reason: String,
 }
 
+/// Provider evidence already observed by the route owner when later route
+/// reconciliation cannot complete. `raw_output` is populated only from the
+/// exact assistant message text; `events` retain typed stream observations
+/// when the message body was not available. Route receipts are copied only
+/// after their respective owner validators have produced them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderOutputObservation {
+    /// Provider/model identity observed on an assistant message, if valid.
+    pub observed_model: Option<ModelSelection>,
+    /// Exact UTF-8 assistant text read from the owner message surface.
+    pub raw_output: Option<String>,
+    /// Provider-reported token/cost values, including partial telemetry.
+    pub usage: Option<UsageTelemetry>,
+    /// Exact availability wrapper when the owner result reached this shape.
+    pub usage_availability: Option<UsageAvailability>,
+    /// Whether the observed assistant message has a terminal stop attestation.
+    pub terminal: bool,
+    /// Exact typed SSE observations retained when message text was not read.
+    pub events: Vec<OpenCodeEvent>,
+    /// Original validated wire route receipt, if success projection created it.
+    pub actual_route: Option<OpenCodeWireRouteReceipt>,
+    /// Original physical receipt, only if the route-observation owner created it.
+    pub physical_route: Option<PhysicalRouteObservationReceipt>,
+}
+
+impl ProviderOutputObservation {
+    /// Returns whether this observation carries provider output or route data.
+    #[must_use]
+    pub fn has_evidence(&self) -> bool {
+        self.observed_model.is_some()
+            || self.raw_output.is_some()
+            || self.usage.is_some()
+            || self.usage_availability.is_some()
+            || !self.events.is_empty()
+            || self.actual_route.is_some()
+            || self.physical_route.is_some()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UsageAvailability {
     pub state: AvailabilityState,
@@ -2431,8 +2470,25 @@ pub enum AdmittedAttemptError {
     SealRejected { reason: &'static str },
     #[error("admitted attempt digest failed: {0}")]
     DigestFailed(String),
+    #[error("admitted candidate sealing failed after route-owner output was observed")]
+    ObservedOutputFailure(Box<AdmittedAttemptOutputFailure>),
     #[error(transparent)]
     Run(#[from] crate::OpenCodeRunError),
+}
+
+/// Original typed failure plus the exact run evidence already available when
+/// a later candidate-seal phase refused. The candidate is retained only if
+/// its original seal had already been created; no replacement seal is made.
+#[derive(Debug)]
+pub struct AdmittedAttemptOutputFailure {
+    /// Exact owner failure that stopped the admitted attempt.
+    pub cause: Box<AdmittedAttemptError>,
+    /// Output, usage, and route evidence already observed by the owner.
+    pub observation: Box<ProviderOutputObservation>,
+    /// Original candidate seal when a later phase failed after sealing.
+    pub candidate: Option<Box<AdmittedAttemptCandidate>>,
+    /// Boundary that refused after provider output had been observed.
+    pub reconciliation: String,
 }
 
 impl AdmittedOpenCodeAttempt {
