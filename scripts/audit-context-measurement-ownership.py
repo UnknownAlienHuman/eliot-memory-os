@@ -145,11 +145,41 @@ CANONICAL_MEASUREMENT_PORT = "measure_serialized_context"
 # Closed disposition set every baseline row must end with. A baseline row
 # that simply disappears is an erased requirement and is rejected; a row
 # that is still present but carries no explicit disposition is rejected.
+# The set stays closed at four: every disposition here is derivable by
+# :func:`_derive_baseline_disposition` from a row's own recorded facts, and
+# none of the four is unreachable from any code path.
 BASELINE_DISPOSITIONS: tuple[str, ...] = (
     "canonical-owner-consumer",
     "legitimate-non-context-metric",
     "exact-versioned-legacy-adapter",
     "explicit-unresolved",
+)
+
+# An *exact* versioned legacy adapter is, per TASK.md:75, an approved adapter
+# that implements/uses #704's port and binds provider/model/tokenizer
+# ID/version/hash to the final serialized bytes. The bound *identity* side of
+# that is carried on an inventory row by the #866 rule-5 route-identity
+# signals (``context_measurement_inventory.py:80-81,1064-1073``), so those two
+# values are the only exact version-identity facts a row can record.
+#
+# The *closed* (expired/retirement-bound) side is carried by the two recorded
+# facts that express "no longer a writable current owner": the row's
+# ``write_scope`` and its producer-derived ``dispatch_blocked``. Both are
+# written on every row (``context_measurement_inventory.py:1445-1475``,
+# ``ROW_KEYS`` closed set at :502-528) and both are validated as mutually
+# consistent by the producer's own read path
+# (``context_measurement_inventory.py:2213-2214``), so reading them is a real
+# recorded-fact comparison and not a presence probe.
+#
+# An authorised adapter is always ``status == "owned"``: #866's
+# ``_owner_confirmed`` (``context_measurement_inventory.py:1233-1256``) fails
+# closed to ``unresolved`` for any owner/scope the frozen owner map does not
+# confirm, so authorisation cannot be satisfied by an unresolved row.
+BASELINE_LEGACY_ADAPTER_IDENTITY_SIGNALS: frozenset[str] = frozenset(
+    {"tokenizer_hash", "tokenizer_config_digest"}
+)
+BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES: frozenset[str] = frozenset(
+    {"read-only", "none"}
 )
 
 # The frozen pre-migration baseline requirement denominator. Written out here
@@ -1486,6 +1516,72 @@ def _proof_escalation(
         )
 
 
+def _derive_baseline_disposition(row: Mapping[str, Any]) -> str:
+    """Derive one baseline row's disposition from the row's own recorded facts.
+
+    The four closed dispositions in :data:`BASELINE_DISPOSITIONS` are mutually
+    exclusive here: every arm below assigns a value no other arm can also
+    assign, so no branch is a duplicate of another and no disposition is
+    declared without a code path that produces it.
+
+    ``explicit-unresolved``
+        The producer itself could not attribute the row: either its ``status``
+        is not ``owned`` or its ``owner`` is the literal ``unresolved``. Both
+        are values #866 writes (``context_measurement_inventory.py:1233-1256``,
+        ``:1474``) and both are validated as a closed pair on the producer's
+        read path (``context_measurement_inventory.py:2211-2216``). No other
+        disposition may be claimed for a row nobody owns.
+    ``legitimate-non-context-metric``
+        A real value comparison against the producer's own closed
+        classification for a true byte/KiB/line/UI-character metric that is
+        never carried as a token or STU count. Same shape as the pre-existing
+        check, so this arm is not a new rule -- it is the one that existed.
+    ``exact-versioned-legacy-adapter``
+        Requires BOTH halves of "closed and exact versioned legacy adapter" to
+        be stated by the row itself, and it is read as a conjunction of real
+        comparisons, never as a name match or a per-case list:
+
+          * exact  -- the row's recorded ``signal`` is one of the two bound
+            tokenizer-identity signals #866 classifies as route identity
+            (:data:`BASELINE_LEGACY_ADAPTER_IDENTITY_SIGNALS`), and the row is
+            consequently classified ``route-identity-bound``. An unbound
+            provider/model/tokenizer identity is not an exact adapter.
+          * closed -- the row's recorded ``write_scope`` is a closed scope
+            (not ``writable``), or its recorded ``dispatch_blocked`` is true
+            (:data:`BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES`). A row that is
+            still a writable, dispatch-open current owner is not retired.
+          * authorised -- the ``explicit-unresolved`` arm is ordered first, so
+            only a row the producer confirmed against the frozen owner map can
+            reach this disposition.
+
+    ``canonical-owner-consumer``
+        The honest residual: a present, owned, current writable row in the
+        #704 algorithm crate or in a consumer's declared seam, i.e. the row
+        still carries a live current owner. This replaces the previous
+        duplicated ``elif write_scope == "read-only"`` / ``else`` pair: a
+        read-only consumer span IS a canonical consumer and needs no separate
+        arm, because no second disposition value exists to give it.
+    """
+    owner = str(row["owner"])
+    classification = str(row["classification"])
+    status = str(row["status"])
+    if status == "unresolved" or owner == "unresolved":
+        return "explicit-unresolved"
+    if classification == "unrelated_byte_or_character_metric":
+        return "legitimate-non-context-metric"
+    signal = str(row["signal"])
+    if (
+        signal in BASELINE_LEGACY_ADAPTER_IDENTITY_SIGNALS
+        and classification == "route-identity-bound"
+        and (
+            str(row["write_scope"]) in BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES
+            or bool(row["dispatch_blocked"])
+        )
+    ):
+        return "exact-versioned-legacy-adapter"
+    return "canonical-owner-consumer"
+
+
 def _baseline_findings(
     rows: list[dict[str, Any]],
     by_case: dict[str, dict[str, Any]],
@@ -1494,10 +1590,12 @@ def _baseline_findings(
     """Baseline reconciliation: every frozen baseline row must survive with an
     explicit disposition. Returns the disposition tally.
 
-    An erased baseline row (removed requirement) is rejected. A surviving row
-    with no explicit disposition is rejected. A baseline row whose owner is
-    no longer a consumer (an unknown/unresolved owner that is not one of the
-    four dispositions) is rejected.
+    An erased baseline row (removed requirement) is rejected. Every surviving
+    row's disposition comes from :func:`_derive_baseline_disposition`, which
+    can derive exactly the four closed dispositions of
+    :data:`BASELINE_DISPOSITIONS` -- ``canonical-owner-consumer``,
+    ``legitimate-non-context-metric``, ``exact-versioned-legacy-adapter`` and
+    ``explicit-unresolved`` -- and no other value.
     """
     dispositions: dict[str, int] = {d: 0 for d in BASELINE_DISPOSITIONS}
     for case_ref, expected_owner in EXPECTED_BASELINE_ROWS:
@@ -1511,20 +1609,19 @@ def _baseline_findings(
                 rule="baseline-reconciliation",
             )
             continue
-        # Derive the disposition from the row's own closed fields.
-        owner = str(row["owner"])
-        classification = str(row["classification"])
-        status = str(row["status"])
-        if status == "unresolved" or owner == "unresolved":
-            disposition = "explicit-unresolved"
-        elif classification == "unrelated_byte_or_character_metric":
-            disposition = "legitimate-non-context-metric"
-        elif str(row["write_scope"]) == "read-only":
-            disposition = "canonical-owner-consumer"
-        else:
-            disposition = "canonical-owner-consumer"
+        # Derive the disposition from the row's own closed fields. The
+        # derivation is total over the four closed values, so the membership
+        # guard below is a structural invariant of the closed set rather than
+        # a check that no recorded row could ever fail; it is kept so that
+        # widening the tuple above fails loudly here instead of raising a
+        # KeyError on the tally.
+        disposition = _derive_baseline_disposition(row)
         if disposition not in BASELINE_DISPOSITIONS:
-            disposition = "explicit-unresolved"
+            raise OracleError(
+                "DETERMINISTIC_INTERNAL_DEFECT",
+                f"baseline row {case_ref} derived a disposition outside the closed set: "
+                f"{disposition!r}",
+            )
         dispositions[disposition] += 1
     return dispositions
 
