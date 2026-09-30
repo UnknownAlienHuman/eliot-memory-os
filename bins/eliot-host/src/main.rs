@@ -590,12 +590,26 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         "ready_written",
     );
     observe_console_ready(&host, &launch_options);
+    // I1.5 observable-use owner for the console/CLI plane: every served
+    // console request is admitted through this supervisor before it is
+    // served (see `serve_console_line`). The console path runs no lease
+    // census and no drain evaluation; the supervisor here only classifies,
+    // admits, resets the idle obligation, and drives drain cancel/resume.
+    #[cfg(windows)]
+    let mut idle_drain = HostIdleDrainSupervisor::new();
     for line in io::stdin().lock().lines() {
         let (response, terminate, served) = match line {
             // Blank input still skips silently by design: not a failure, so
             // intentionally unobserved (keeps the hot path quiet).
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&mut host, &line, &launch_options),
+            Ok(line) => {
+                #[cfg(windows)]
+                let served =
+                    serve_console_line(&mut host, &mut idle_drain, &line, &launch_options);
+                #[cfg(not(windows))]
+                let served = dispatch(&mut host, &line, &launch_options);
+                served
+            }
             Err(error) => {
                 // F-LOG-HOST-7 B8 (issue #982): read failure keeps Error plus
                 // terminate; the raw error text stays out of diagnostics.
@@ -984,6 +998,95 @@ fn dispatch(
                 None,
             )
         }
+    }
+}
+
+/// Classifies one console input line as its served request kind.
+///
+/// The classification reuses the exact `Request` wire parse `dispatch`
+/// serves, so no second request scheme exists: a line `dispatch` would
+/// reject maps to `None` and keeps the existing malformed path.
+#[cfg(windows)]
+fn console_request_kind(line: &str) -> Option<HostConsoleRequest> {
+    match serde_json::from_str::<Request>(line) {
+        Ok(Request::Status) => Some(HostConsoleRequest::Status),
+        Ok(Request::Stop) => Some(HostConsoleRequest::Stop),
+        Err(_) => None,
+    }
+}
+
+/// Durable trigger evidence for one served console request.
+///
+/// The digest binds the evidence to the exact trigger content by hashing the
+/// frozen request spelling (`cli-request:status`, `cli-request:stop`), so a
+/// repeated identical request compares equal in the drain `evidence_refs`
+/// content compare and is recognised as a replay of the already-consumed
+/// attempt instead of a fresh trigger.
+#[cfg(windows)]
+fn console_trigger_evidence(request: HostConsoleRequest) -> Result<PlatformHandle, HostError> {
+    use sha2::{Digest as _, Sha256};
+    let op = request.as_str();
+    let digest = format!("{:x}", Sha256::digest(format!("cli-request:{op}")));
+    PlatformHandle::new(digest).map_err(|error| HostError::Platform(error.to_string()))
+}
+
+/// Serves one console line admissions-first as an I1.5 `CliRequest` trigger.
+///
+/// I1.5 lists a native UI or `eliot` CLI request first among observable-use
+/// triggers. This binary's console/stdin protocol is that CLI surface: the
+/// launcher that spawned this process holds the installation launch
+/// descriptor and owns the private stdio pipe, so each request served here is
+/// an authenticated local CLI use. From a fully stopped installation the
+/// launch itself demand-starts Host (`open_host` above creates the durable
+/// activation record) and this admission joins that generation; a request
+/// arriving during the pre-commit drain window cancels the drain instead of
+/// racing the linearization point.
+///
+/// The mandatory order mirrors `process_runtime_control_requests`
+/// (activation -> readiness/lease admission -> governed work): the trigger is
+/// classified from the line that actually arrived and durably admitted
+/// through `HostIdleDrainSupervisor::note_observable_use` BEFORE `dispatch`
+/// serves anything, so no `Status` snapshot and no `Stop` effect lands under
+/// a generation that refused the trigger. A refused or post-commit-queued
+/// trigger is answered `Error` with the loop held open (a refused `Stop`
+/// must not stop the host); only an admitted trigger reaches `dispatch`,
+/// whose responses and stay/terminate flags are otherwise unchanged.
+#[cfg(windows)]
+fn serve_console_line(
+    host: &mut HostComposition,
+    idle_drain: &mut HostIdleDrainSupervisor,
+    line: &str,
+    options: &HostLaunchOptions,
+) -> (Response, bool, Option<HostConsoleRequest>) {
+    let Some(request) = console_request_kind(line) else {
+        // Not a decodable console request: the existing malformed path owns
+        // the `Error` plus stay-in-loop response, and the raw line is never
+        // logged (user content, I15.4/I07.20).
+        return dispatch(host, line, options);
+    };
+    let refusal = |detail: &'static str| {
+        (
+            Response::Error {
+                error: detail.to_owned(),
+            },
+            false,
+            Some(request),
+        )
+    };
+    let Ok(evidence) = console_trigger_evidence(request) else {
+        return refusal("console trigger refused: trigger evidence is unusable");
+    };
+    match idle_drain.note_observable_use(host, ActivationTriggerClass::CliRequest, &evidence) {
+        Ok(DrainWakeOutcome::QueueNextGeneration) => {
+            refusal("console trigger queued: the activation generation already committed drain")
+        }
+        Ok(_) if activation_admits_governed_work(host) => dispatch(host, line, options),
+        Ok(_) => refusal(
+            "console trigger refused: the post-admission activation state admits no governed work",
+        ),
+        Err(_) => refusal(
+            "console trigger refused: the current activation generation did not admit observable use",
+        ),
     }
 }
 
@@ -1743,9 +1846,11 @@ fn process_user_automation_request(
 ///
 /// The runtime-control and execution-pipe planes carry no authenticated
 /// caller/principal field and no Watchdog-origin discriminator, so this loop
-/// cannot attribute a carrier to `CliRequest`, `UiRequest`, or
-/// `WatchdogRegisteredActivity`. Those producers belong to the endpoint and
-/// contract owners: the endpoint must propagate the authenticated peer
+/// cannot attribute a carrier to `UiRequest` or `WatchdogRegisteredActivity`,
+/// and it never mints `CliRequest`: the local CLI trigger is produced only
+/// where the CLI actually arrives, the console/stdin plane
+/// (`serve_console_line`). The two remaining producers belong to the endpoint
+/// and contract owners: the endpoint must propagate the authenticated peer
 /// identity onto the envelope, and the Watchdog carrier owner must attest
 /// the watchdog origin (or demand-start Host through a real caller).
 #[cfg(windows)]
