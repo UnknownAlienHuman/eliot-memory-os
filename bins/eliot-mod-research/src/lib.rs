@@ -1053,23 +1053,55 @@ impl AdmittedResearchBridge {
                 reason: "outcome is classified or already reconciled",
             });
         }
-        let operation = self
-            .submitted()
-            .and_then(|state| state.start_attempt.as_ref())
-            .map_or_else(
-                || self.admission.operation_id().clone(),
-                |context| context.operation_id.clone(),
-            );
-        if &operation != self.admission.operation_id() {
-            return Err(BridgeError::NotAdmitted {
-                reason: "retained attempt identity no longer matches its admission",
-            });
-        }
-        let evidence = self.runner.reconcile_operation(&operation)?;
+        let (operation, digest) = self.retained_attempt_binding()?;
+        // Adoption is a lifecycle operation on a physical process, so it carries
+        // the same ownership proof as a cancel: the runner compares the stored
+        // record against this attempt's sealed digest, the admitted generation,
+        // epoch and artifact before the executor is asked to reconcile it.
+        let evidence = self
+            .runner
+            .reconcile_operation(&self.admission, &operation, &digest)?;
         if let BridgePhase::Submitted(state) = &mut self.phase {
             state.reconciled = true;
         }
         Ok(evidence)
+    }
+
+    /// Returns the exact operation identity and sealed invocation digest this
+    /// submitted attempt is bound to.
+    ///
+    /// This is the same retained attempt/evidence owner the cancel path reads:
+    /// the [`StartAttemptContext`] when the executor handoff was reached, and
+    /// otherwise the sealed submit envelope's own digest, which is decoded from
+    /// the recorded bytes rather than assumed. Reconciliation keys on this pair,
+    /// never on the operation name alone.
+    fn retained_attempt_binding(&self) -> Result<(OperationId, String), BridgeError> {
+        let state = self.submitted().ok_or(BridgeError::NotAdmitted {
+            reason: "no submitted attempt owns the operation",
+        })?;
+        if let Some(context) = &state.start_attempt {
+            return Ok((
+                context.operation_id.clone(),
+                context.invocation_digest.clone(),
+            ));
+        }
+        let submission = state.submission.as_ref().ok_or(BridgeError::NotAdmitted {
+            reason: "submitted attempt has no sealed operation binding",
+        })?;
+        let envelope = SubmitEnvelope::decode(&submission.envelope_bytes).map_err(|_| {
+            BridgeError::NotAdmitted {
+                reason: "submitted attempt has no decodable operation binding",
+            }
+        })?;
+        if envelope.operation_id != self.admission.operation_id().as_str() {
+            return Err(BridgeError::NotAdmitted {
+                reason: "sealed submit targets a foreign operation",
+            });
+        }
+        Ok((
+            self.admission.operation_id().clone(),
+            envelope.invocation_digest,
+        ))
     }
 }
 
@@ -1181,57 +1213,15 @@ impl ResearchBridge for AdmittedResearchBridge {
             // Identity/ownership is proven before a cancel as well as before a
             // start: the cancellation is refused unless the stored operation
             // record still answers to this admission's exact operation
-            // identity, request digest, and Authority Epoch. Cancelling by a
-            // bare job id would let a stale generation or a retargeted request
-            // reach another operation's process tree.
-            let (target_operation, expected_digest, expected_generation) = {
-                let state = self.submitted().ok_or(BridgeError::NotAdmitted {
-                    reason: "no submitted attempt owns the operation",
-                })?;
-                if let Some(context) = &state.start_attempt {
-                    (
-                        context.operation_id.clone(),
-                        context.invocation_digest.clone(),
-                        context.process_generation,
-                    )
-                } else {
-                    let submission = state.submission.as_ref().ok_or(BridgeError::NotAdmitted {
-                        reason: "submitted attempt has no sealed operation binding",
-                    })?;
-                    let envelope =
-                        SubmitEnvelope::decode(&submission.envelope_bytes).map_err(|_| {
-                            BridgeError::NotAdmitted {
-                                reason: "submitted attempt has no decodable operation binding",
-                            }
-                        })?;
-                    if envelope.operation_id != self.admission.operation_id().as_str() {
-                        return Err(BridgeError::NotAdmitted {
-                            reason: "sealed submit targets a foreign operation",
-                        });
-                    }
-                    (
-                        self.admission.operation_id().clone(),
-                        envelope.invocation_digest,
-                        self.admission.process_generation().get(),
-                    )
-                }
-            };
-            let view = self.runner.observe_operation(&target_operation)?;
-            if view.operation_id() != &target_operation
-                || &target_operation != self.admission.operation_id()
-                || view.request_digest() != expected_digest
-                || view.fence().generation().get() != expected_generation
-                || view.fence().generation() != self.admission.process_generation()
-                || !view
-                    .fence()
-                    .authority_epoch()
-                    .is_same_authority(self.admission.epoch())
-            {
-                return Err(BridgeError::NotAdmitted {
-                    reason: "stored operation no longer matches the admitted identity, request, generation, or fence",
-                });
-            }
-            let receipt = self.runner.cancel_operation(&target_operation)?;
+            // identity, request digest, Authority Epoch, and admitted artifact
+            // digest. Cancelling by a bare job id would let a stale generation
+            // or a retargeted request reach another operation's process tree.
+            let (target_operation, expected_digest) = self.retained_attempt_binding()?;
+            let receipt = self.runner.cancel_operation(
+                &self.admission,
+                &target_operation,
+                &expected_digest,
+            )?;
             if let BridgePhase::Submitted(state) = &mut self.phase {
                 state.cancellation = Some(CancellationEvidence::from_receipt(&receipt));
             }
@@ -1449,7 +1439,7 @@ pub fn project_admitted_inquiry(
     // receipt, so an unbound receipt would mint provenance out of unverified
     // fields. `ProviderExecutionReceipt::candidate_sha256` is a provider's own
     // claim and proves nothing, which is why it is not read here.
-    if receipt.module_generation_id != admission.module_generation_id()
+    if receipt.module_generation_id != admission.module_generation_id().as_str()
         || receipt.executable_sha256 != admission.bridge().executable_sha256()
         || receipt.process_generation != admission.process_generation().get()
         || receipt.disclosure != admitted_disclosure_wire(admission.disclosure())
