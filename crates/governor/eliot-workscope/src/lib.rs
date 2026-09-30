@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::StateFence;
+use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::{
     FreshnessStatus, IntegrityStatus, ObservationDomainRef, PrivacyClass, QuarantineState,
     SourceAssurance,
@@ -505,6 +506,8 @@ pub enum WorkScopeError {
     UnresolvedSourceConflict,
     #[error("task promotion requires the decision owner or a delegated binding")]
     TaskAuthorityDenied,
+    #[error("task selection evidence is invalid")]
+    InvalidTaskSelectionEvidence,
     #[error("source privacy class is outside the admitted boundary")]
     PrivacyDenied,
     #[error("state fence is invalid")]
@@ -1190,6 +1193,10 @@ pub struct OnboardingReadinessReceipt {
     pub lineage: Option<RepositoryLineageIdentity>,
     pub scope_resolution: ScopeResolutionState,
     pub task_binding: TaskBindingState,
+    /// Original owner-issued evidence used for an exact selected task.
+    /// Legacy `Current` inputs remain structurally known and carry no evidence.
+    #[serde(default)]
+    pub task_selection_evidence: Option<TaskSelectionEvidence>,
     pub state_fence: StateFence,
     pub governing_source_set_ref: String,
     pub governing_source_generation: u64,
@@ -1291,6 +1298,32 @@ impl OnboardingReadinessReceipt {
             .validate()
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
         self.validate_task_binding()?;
+        if let Some(evidence) = &self.task_selection_evidence {
+            evidence
+                .validate()
+                .map_err(|_| WorkScopeError::InvalidTaskSelectionEvidence)?;
+            let TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            } = &self.task_binding
+            else {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            };
+            if evidence.task_ref != *task_ref
+                || evidence.task_revision != *task_revision
+                || evidence.acceptance_digest != *acceptance_digest
+                || evidence.selection_source_ref != *selection_source_ref
+                || evidence.evidence_ref != *evidence_ref
+                || evidence.work_scope_ref != self.scope.scope_ref
+                || self.state_fence.task_revision.map(|revision| revision.value())
+                    != Some(evidence.task_revision)
+            {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
+        }
         if self.limiting_integration_evidence.is_empty()
             || self.limiting_integration_evidence.len() > 8
         {
@@ -1515,6 +1548,8 @@ pub enum TaskBindingInput {
         /// Exact intake evidence that produced the selection.
         evidence_ref: String,
     },
+    /// Exact owner-issued evidence retained unchanged in the readiness receipt.
+    Selected(TaskSelectionEvidence),
     AmbiguousCandidates(Vec<String>),
     Stale {
         task_ref: String,
@@ -1642,6 +1677,10 @@ impl ColdStartController {
         let projection_source_ref = projection_source_ref.into();
         Self::check_lease_and_identities(lease, scope, instance, lineage, candidate, sources, now)?;
         Self::check_fence_sources_privacy(state_fence, sources, scope, candidate, privacy, lease)?;
+        let task_selection_evidence = match &task {
+            TaskBindingInput::Selected(evidence) => Some(evidence.clone()),
+            _ => None,
+        };
         let (task_binding, scope_resolution, readiness, missing_inputs, next_safe_action) =
             Self::resolve_task_binding(task)?;
         let scan_receipt_ref = scan_receipt
@@ -1672,6 +1711,7 @@ impl ColdStartController {
             lineage: lineage.cloned(),
             scope_resolution,
             task_binding: task_binding.clone(),
+            task_selection_evidence,
             state_fence: state_fence.clone(),
             governing_source_set_ref: governing_source_set_ref.clone(),
             governing_source_generation: sources.generation,
@@ -2026,6 +2066,18 @@ impl ColdStartController {
                 selection_source_ref,
                 evidence_ref,
             ),
+            TaskBindingInput::Selected(evidence) => {
+                evidence
+                    .validate()
+                    .map_err(|_| WorkScopeError::InvalidTaskSelectionEvidence)?;
+                Self::check_current_task_ref(
+                    evidence.task_ref,
+                    evidence.task_revision,
+                    evidence.acceptance_digest,
+                    evidence.selection_source_ref,
+                    evidence.evidence_ref,
+                )
+            }
             TaskBindingInput::AmbiguousCandidates(handles) => {
                 Self::check_ambiguous_handles(handles)
             }
