@@ -16,8 +16,8 @@
 //! | Execute the admitted provider route, return `ModelRouteOutcome` | none: provider text lives outside the dreamer binary | named implementation work |
 //! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | none in-binary: no Governor orientation-supply channel exists | named implementation work |
 //! | Acquire each mandatory stage's owner input/receipt | none in-binary: records must arrive owner-built via the future carrier supply | named implementation work |
-//! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
-//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
+//! | Invoke the pure composer | [`compose_production_result`] below (this module) | compiled, UNREACHABLE: no production call site can supply its carrier |
+//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | blocked leg reachable; complete/partial legs are not |
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch cannot impersonate the
@@ -167,6 +167,26 @@ pub(crate) struct ProductionOrientationInputs<'a> {
 /// The `Ok` arm stays compiled-live: when the channel lands, assembly fills
 /// the carrier from admitted artifacts plus the Governor supply and the same
 /// composer below produces complete/partial results with no dispatch change.
+///
+/// MEASURED UNREACHABLE (A1/W1, #40): this body is a single unconditional
+/// `Err`, so no execution can reach
+/// `Ok(inputs) => compose_production_result(...)` at
+/// `dispatch_stage.rs::dispatch_orientation` — the entire complete/partial
+/// composition, including [`build_projection`](eliot_dreamer_orientation::projection::build_projection),
+/// is statically dead in production. Measured on the current base by
+/// enumerating every construction of [`ProductionOrientationInputs`] in the
+/// tree: there are ZERO. Not one struct literal, in this module or anywhere
+/// else in the workspace, and the file carries no test module, so no fixture
+/// reaches the composer either. The only references to the type are this
+/// module's own signatures and helpers plus one doc link in
+/// `pulse.rs`. The `Ok` arm is therefore genuinely required by the signature
+/// and is deliberately not deleted: removing it would delete the only seam the
+/// Governor supply channel can be wired into, and the current typed blocked
+/// behaviour is correct per I9.2. The missing piece is an owner that mints the
+/// mandatory CC-002/CC-004 records, not a dispatch edit. A future owner must add
+/// the real `Ok` construction here; it must NOT be satisfied by synthesising
+/// an outcome, projecting an empty set, or attaching a blocking read, all of
+/// which are self-issued authority.
 pub(crate) fn resolve_production_inputs<'a>(
     admission: &'a KernelJobAdmission,
     admitted_job: &'a AdmittedOrientationJob,
