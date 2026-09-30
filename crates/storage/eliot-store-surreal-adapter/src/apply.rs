@@ -985,7 +985,13 @@ pub(crate) async fn apply_reserved_attempt(
     validate_transition(&attempt.context, &attempt.transition)?;
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
-    apply_with_retry(
+    // Boxed: the retry future holds the multi-kilobyte canonical
+    // `PreparedTransition` across provider awaits, exceeding the default
+    // future-size lint. Same seam and rationale as
+    // `apply_prepared_with_authority`; boxing here also keeps the future of
+    // the `ReservedAttemptTransport::execute_attempt` caller bounded, because
+    // it awaits this one directly.
+    Box::pin(apply_with_retry(
         adapter,
         db,
         &attempt.context,
@@ -994,7 +1000,7 @@ pub(crate) async fn apply_reserved_attempt(
         attempt.expected_ordering_heads.clone(),
         &authorities,
         TxLane::PooledWrite,
-    )
+    ))
     .await
 }
 
