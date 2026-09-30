@@ -38,7 +38,7 @@ pub(super) async fn read_causal_allocation(
     .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
-        if errors.iter().all(client::is_absent_table) {
+        if errors.iter().all(|error| client::is_absent_table(error)) {
             let projection = CanonicalCausalProjection::from_store_readback(
                 expected_state_fence,
                 1,

@@ -1209,13 +1209,12 @@ impl StoreResponse {
             Self::Receipt {
                 receipt: Some(receipt),
             } => validate_legacy_genesis_receipt(receipt).map_err(StoreWireError::Store),
-            Self::Receipt { receipt: None } => Ok(()),
             Self::ReceiptWithCausal {
                 receipt: Some(receipt),
                 causal: Some(causal),
             } => validate_receipt_causal_projection(receipt, causal)
                 .map_err(StoreWireError::Store),
-            Self::ReceiptWithCausal {
+            Self::Receipt { receipt: None } | Self::ReceiptWithCausal {
                 receipt: None,
                 causal: None,
             } => Ok(()),
