@@ -116,6 +116,18 @@
 //!   from the request; captures and non-task-relative writes stay on the
 //!   receipt-only [`admit_canonical_write`] leg, so the cold path never needs
 //!   a retained terminal.
+//! - [`refuse_ready_string_without_evidence`] has **one** production call site:
+//!   [`admit_canonical_write`] for its task-relative leg (after
+//!   [`refuse_task_identity_conflict`], before [`admit_task_bound`]), reached
+//!   through [`admit_canonical_write_with_activation`] from
+//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition).
+//!   A READY string, handshake, or DTO shape alone never passes: without owner
+//!   evidence the write fails closed with `TASK_SELECTION_REQUIRED`, and the
+//!   READY token is never even read.
+//! - [`require_material_bootstrap_for_task_bound`] has **zero call sites**: the
+//!   designated caller is the same composition, between the admission
+//!   projection and the #1742 material gate, passing the bootstrap admitted
+//!   for the same lease at the write fence.
 //! - `DaemonComposition::commit_canonical_and_refresh` itself has **zero**
 //!   production call sites — its only in-tree mentions are documentation and a
 //!   source-string assertion in `bins/eliotd/tests/agent_fabric_wiring.rs`. It
@@ -2563,8 +2575,11 @@ pub fn admit_canonical_write(
 /// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
 /// for task-relative envelopes (see [`envelope_is_task_relative`]): it
 /// resolves the snapshot from the presented readiness lease through
-/// `GovernorComposition::current_task_selection` and passes it here at the
-/// write fence. Captures and non-task-relative writes stay on the
+/// `GovernorComposition::current_task_selection` and passes it here with the
+/// presented write fence for admission and the live Governor kernel-snapshot
+/// fence for the applicability recheck — the recheck never compares the
+/// presentation to itself (I4.2.1: `MATCHED` is required again after any
+/// generation change). Captures and non-task-relative writes stay on the
 /// receipt-only [`admit_canonical_write`] leg, so the cold path never needs a
 /// retained terminal. That routing is enforced in-function as well as by the
 /// caller: a task-free non-task-relative envelope takes the receipt-only leg
@@ -2576,6 +2591,7 @@ pub fn admit_canonical_write_with_activation(
     envelope: &CanonicalWriteEnvelope,
     receipt: &OnboardingReadinessReceipt,
     write_fence: &StateFence,
+    live_fence: &StateFence,
     activation: Option<&eliot_governor::GovernorActivationSnapshot>,
 ) -> Result<TaskBindingAdmission, TaskBindingError> {
     // A task-free non-task-relative envelope can only ever admit `ColdUnbound`
@@ -2588,7 +2604,12 @@ pub fn admit_canonical_write_with_activation(
     if !envelope_is_task_relative(envelope) && context.task_id.is_none() {
         return admit_canonical_write(candidate_id, context, envelope, receipt, write_fence);
     }
-    bind_current_task_selection(activation, receipt, write_fence)?;
+    // Issue #1746, W4/A5: the applicability recheck runs against the live
+    // owner fence, never the caller-presented write fence — `write_fence`
+    // stays the admission-time comparison inside `admit_canonical_write`, so
+    // a generation move between bootstrap and dispatch still fails closed
+    // here (I4.2.1) instead of comparing the presentation to itself.
+    bind_current_task_selection(activation, receipt, live_fence)?;
     admit_canonical_write(candidate_id, context, envelope, receipt, write_fence)
 }
 
