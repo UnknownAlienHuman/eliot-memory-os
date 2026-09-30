@@ -2231,9 +2231,11 @@ function New-GovernorRetirementReplayRecord([object]$Reference, [object]$Approva
     # Exact I5.27 semantics: the same (idempotency_namespace, operation_id)
     # with the same request hash replays the same receipt; the same key with a
     # different request hash is APPROVAL_IDENTITY_CONFLICT and performs no
-    # transition. R(C) immutability itself rides the existing
-    # Authenticode/RFC3161 finalizer chain over the digest-bound bundle files;
-    # no second signing, MAC, digest or nonce scheme is defined here.
+    # transition. Issuance stays fail-closed until the root owner admits
+    # exactly one issuer identity in the trust policy; the existing
+    # Authenticode/RFC3161 finalizer is a cryptographic primitive only and
+    # confers no semantic retirement authority. No second signing, MAC,
+    # digest or nonce scheme is defined here.
     $namespace = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ApprovalBody 'idempotency_namespace'))
     $operation = [string]$Reference.operation_id
     $requestHash = Get-GovernorApprovalRequestDigest $ApprovalBody
