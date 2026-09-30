@@ -21,14 +21,19 @@
 //! and losing the last-resort path surfaces [`KernelError::ControlGuaranteeLost`]
 //! rather than a healthy status.
 //!
-//! Permit replay is operation-, owner- and epoch-bound through the
-//! idempotency ledger: a [`PermitLedgerBinding`] records the exact operation
-//! identity, owner, Authority Epoch and profile revision alongside the
-//! request digest, and the same key presented with changed content resolves
-//! to [`IdempotencyDisposition::Conflict`], never to a replay. Release is
-//! exactly-once: [`ControlPermit::release`] consumes the permit and returns
-//! bound [`ControlReleaseEvidence`], with drop as the backstop returning the
-//! exact partition.
+//! Permit replay and release are operation-, owner-, owner-generation-,
+//! profile-revision- and epoch-bound (issue #1679, A7): a
+//! [`PermitLedgerBinding`] records the exact operation identity, owner,
+//! issuing owner generation, Authority Epoch and profile revision alongside
+//! the request digest, and the same key presented with changed content
+//! resolves to [`IdempotencyDisposition::Conflict`], never to a replay.
+//! Release closes through [`FrontDoor::release_permit`], which validates the
+//! presented originals with the existing contract validators, requires the
+//! release record to [`matches_binding`][eliot_runtime_contracts::CapacityReleaseEvidence::matches_binding]
+//! the issued binding, consumes the permit exactly once, and records the
+//! terminal release in the same ledger; a second release is refused, not
+//! double-applied. Drop remains the backstop returning the exact partition
+//! for permits that never reach the release port.
 //!
 //! Restart never restores capacity by resetting a local counter: the ledger
 //! replays nothing across a restart boundary ([`IdempotencyLedger::note_restart`]
@@ -73,6 +78,9 @@ use crate::error::{KernelError, validate_id};
 pub use eliot_runtime_contracts::{
     CapacityBottleneck, CapacityClass, CapacityPermitBinding, CapacityRequest,
     ControlOperationClass, EmergencyOperationClass, NormalWorkClass, RequestedOperationClass,
+};
+use eliot_runtime_contracts::{
+    CapacityReleaseEvidence as ContractReleaseEvidence, PermitTerminalDisposition,
 };
 
 /// Runtime owner reference minted on every front-door permit binding.
@@ -807,18 +815,19 @@ pub enum IdempotencyDisposition {
     Conflict,
 }
 
-/// Operation-, owner-, epoch- and profile-bound evidence recorded alongside
-/// one idempotency entry (issue #1679, A7).
+/// Operation-, owner-, generation-, epoch- and profile-bound evidence recorded
+/// alongside one idempotency entry (issue #1679, A7).
 ///
 /// The same idempotency key presented with the same digest but changed
 /// binding content resolves to [`IdempotencyDisposition::Conflict`]: a replay
-/// must be the same operation by the same owner under the same epoch and
-/// profile revision, never merely the newest generation presenting an old
-/// key.
+/// must be the same operation by the same owner under the same issuing owner
+/// generation, epoch and profile revision, never merely the newest generation
+/// presenting an old key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PermitLedgerBinding {
     operation_id: String,
     owner: String,
+    owner_generation: ResourceGeneration,
     epoch: AuthorityEpoch,
     profile_revision: String,
 }
@@ -833,6 +842,7 @@ impl PermitLedgerBinding {
     pub fn new(
         operation_id: &str,
         owner: &str,
+        owner_generation: ResourceGeneration,
         epoch: AuthorityEpoch,
         profile_revision: &str,
     ) -> Result<Self, KernelError> {
@@ -842,6 +852,7 @@ impl PermitLedgerBinding {
         Ok(Self {
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            owner_generation,
             epoch,
             profile_revision: profile_revision.to_owned(),
         })
@@ -859,6 +870,12 @@ impl PermitLedgerBinding {
         &self.owner
     }
 
+    /// Returns the bound issuing owner generation.
+    #[must_use]
+    pub const fn owner_generation(&self) -> ResourceGeneration {
+        self.owner_generation
+    }
+
     /// Returns the bound Authority Epoch.
     #[must_use]
     pub const fn epoch(&self) -> AuthorityEpoch {
@@ -874,10 +891,14 @@ impl PermitLedgerBinding {
 
 /// One ledger entry: the request digest, the recorded decision and the exact
 /// permit binding the decision was recorded under, if any.
+///
+/// A `None` decision is a recorded terminal release: the permit was consumed
+/// exactly once and no decision remains to replay. Terminal entries never
+/// replay; any presentation of the key conflicts.
 #[derive(Clone, Debug)]
 struct LedgerEntry {
     digest: String,
-    decision: AuthorityDecision,
+    decision: Option<AuthorityDecision>,
     binding: Option<PermitLedgerBinding>,
 }
 
@@ -929,10 +950,13 @@ impl IdempotencyLedger {
     /// Resolves an idempotency key against a request digest and the exact
     /// permit binding the caller presents.
     ///
-    /// A stored entry replays only when both the digest and the binding
-    /// match; any changed content (different digest, or different operation
-    /// identity, owner, epoch or profile revision) is a conflict. An absent
-    /// key is new and must be evaluated, never reused.
+    /// A stored entry replays only when a replayable decision was recorded
+    /// with both the same digest and the same binding; any changed content
+    /// (different digest, or different operation identity, owner, owner
+    /// generation, epoch or profile revision) is a conflict. A recorded
+    /// terminal release never replays: presenting its key again is a
+    /// conflict, so a second release is refused instead of double-applied.
+    /// An absent key is new and must be evaluated, never reused.
     #[must_use]
     pub fn resolve_bound(
         &self,
@@ -943,10 +967,11 @@ impl IdempotencyLedger {
         match self.entries.get(key) {
             None => IdempotencyDisposition::New,
             Some(entry) if entry.digest != digest => IdempotencyDisposition::Conflict,
-            Some(entry) => match (&entry.binding, binding) {
-                (None, None) => IdempotencyDisposition::Replay(entry.decision.clone()),
-                (Some(stored), Some(presented)) if stored == presented => {
-                    IdempotencyDisposition::Replay(entry.decision.clone())
+            Some(entry) if entry.decision.is_none() => IdempotencyDisposition::Conflict,
+            Some(entry) => match (&entry.decision, &entry.binding, binding) {
+                (Some(decision), None, None) => IdempotencyDisposition::Replay(decision.clone()),
+                (Some(decision), Some(stored), Some(presented)) if stored == presented => {
+                    IdempotencyDisposition::Replay(decision.clone())
                 }
                 _ => IdempotencyDisposition::Conflict,
             },
@@ -989,8 +1014,51 @@ impl IdempotencyLedger {
             key.to_owned(),
             LedgerEntry {
                 digest: digest.to_owned(),
-                decision,
+                decision: Some(decision),
                 binding,
+            },
+        );
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the terminal release of one permit binding, evicting the
+    /// oldest entry (and its binding) on overflow.
+    ///
+    /// The entry carries no replayable decision: the permit was consumed
+    /// exactly once, so any later presentation of the key resolves to
+    /// [`IdempotencyDisposition::Conflict`] and a second release is refused,
+    /// never double-applied. This reuses the admission ledger; there is no
+    /// second ledger and no new authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::InvalidField`] for a blank or malformed key or
+    /// digest, or [`KernelError::IdempotencyConflict`] when the key is already
+    /// recorded — the terminal release exists, a different release names the
+    /// same key, or an admission decision already owns it.
+    pub fn record_release(
+        &mut self,
+        key: &str,
+        digest: &str,
+        binding: PermitLedgerBinding,
+    ) -> Result<(), KernelError> {
+        validate_id(key, "release_key")?;
+        validate_id(digest, "release_digest")?;
+        if self.entries.contains_key(key) {
+            return Err(KernelError::IdempotencyConflict);
+        }
+        self.order.push_back(key.to_owned());
+        self.entries.insert(
+            key.to_owned(),
+            LedgerEntry {
+                digest: digest.to_owned(),
+                decision: None,
+                binding: Some(binding),
             },
         );
         while self.order.len() > self.capacity {
@@ -1467,6 +1535,91 @@ impl FrontDoor {
     pub fn reconcile_after_epoch_advance(&self) -> Result<(), KernelError> {
         let current = self.authority.current_epoch();
         self.reserve.unseal_after_epoch_advance(current)
+    }
+
+    /// Releases one issued permit against its exact binding, at most once
+    /// (issue #1679, A7).
+    ///
+    /// The holder presents the live [`ControlPermit`], the owner-minted
+    /// [`CapacityPermitBinding`] it was issued under, the contract
+    /// [`ContractReleaseEvidence`] record closing it, and a caller-chosen
+    /// release key with its digest. The port validates both presented
+    /// originals with the existing contract validators, then binds the
+    /// release to the exact (operation, owner, owner-generation,
+    /// profile-revision, epoch) tuple: the release record must carry the
+    /// holder [`PermitTerminalDisposition::Released`] disposition and
+    /// [`matches_binding`][eliot_runtime_contracts::CapacityReleaseEvidence::matches_binding]
+    /// the issued binding, and the live permit must name the same class,
+    /// bottleneck, operation tag, operation identity, requesting owner and
+    /// epoch sequence. Any changed content returns
+    /// [`KernelError::IdempotencyConflict`] before any counter moves —
+    /// changed content conflicts instead of releasing.
+    ///
+    /// On an exact match the permit is consumed (its partition slot returns
+    /// exactly once) and the terminal release is recorded in the existing
+    /// idempotency ledger under the release key; presenting the same release
+    /// again resolves to a conflict and is refused with
+    /// [`KernelError::IdempotencyConflict`], never double-applied. There is
+    /// no second ledger and no new authority. Permits without an issued
+    /// binding (legacy holders, direct partition acquisitions) keep the
+    /// [`ControlPermit::release`]/drop path. Owner reconciliation after
+    /// restart or doubt is a different port (see
+    /// [`Self::reconcile_after_epoch_advance`]); this port accepts only the
+    /// holder release disposition.
+    ///
+    /// The embedding composition owner calls this when a permit holder
+    /// reports completion (STITCH).
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed contract refusal when either presented original is
+    /// illegal, [`KernelError::InvalidField`] for a blank or malformed
+    /// release key/digest, or [`KernelError::IdempotencyConflict`] for
+    /// changed content or a replayed release.
+    pub fn release_permit(
+        &self,
+        permit: ControlPermit,
+        binding: &CapacityPermitBinding,
+        release: &ContractReleaseEvidence,
+        release_key: &str,
+        release_digest: &str,
+    ) -> Result<ControlReleaseEvidence, KernelError> {
+        binding.validate()?;
+        release.validate()?;
+        validate_id(release_key, "release_key")?;
+        validate_id(release_digest, "release_digest")?;
+        if release.terminal_disposition != PermitTerminalDisposition::Released {
+            return Err(KernelError::IdempotencyConflict);
+        }
+        if !release.matches_binding(binding) {
+            return Err(KernelError::IdempotencyConflict);
+        }
+        if permit.class != binding.capacity_class
+            || permit.bottleneck != binding.bottleneck
+            || permit.operation.contract_label() != binding.operation.as_contract_str()
+            || permit.operation_id != binding.operation_id
+            || permit.owner != binding.requesting_owner_ref
+            || permit.epoch.value() != binding.authority_epoch_ref.sequence.get()
+        {
+            return Err(KernelError::IdempotencyConflict);
+        }
+        let ledger_binding = PermitLedgerBinding::new(
+            &binding.operation_id,
+            &binding.requesting_owner_ref,
+            binding.capacity_owner_generation_ref,
+            permit.epoch,
+            &binding.profile_revision,
+        )?;
+        let mut ledger = self.lock_ledger();
+        match ledger.resolve_bound(release_key, release_digest, Some(&ledger_binding)) {
+            IdempotencyDisposition::Replay(_) | IdempotencyDisposition::Conflict => {
+                Err(KernelError::IdempotencyConflict)
+            }
+            IdempotencyDisposition::New => {
+                ledger.record_release(release_key, release_digest, ledger_binding)?;
+                Ok(permit.release())
+            }
+        }
     }
 
     /// Returns whether a grant permits an effect without overclaiming proof.
