@@ -1077,18 +1077,13 @@ impl MaintenanceUtilityEvidenceV1 {
             (&self.cost, true),
             (&self.operator_burden, false),
         ];
-        metrics
-            .iter()
-            .all(|(metric, is_cost)| {
-                !metric.claims_direction()
-                    || metric.has_sufficient_measured_evidence(*is_cost)
-            })
-            && metrics.iter().any(|(metric, _)| {
-                metric.directional_assessment == MaintenanceMetricAssessment::SupportsHarm
-            })
-            && metrics.iter().all(|(metric, _)| {
-                metric.directional_assessment != MaintenanceMetricAssessment::SupportsBenefit
-            })
+        metrics.iter().all(|(metric, is_cost)| {
+            !metric.claims_direction() || metric.has_sufficient_measured_evidence(*is_cost)
+        }) && metrics.iter().any(|(metric, _)| {
+            metric.directional_assessment == MaintenanceMetricAssessment::SupportsHarm
+        }) && metrics.iter().all(|(metric, _)| {
+            metric.directional_assessment != MaintenanceMetricAssessment::SupportsBenefit
+        })
     }
 }
 
