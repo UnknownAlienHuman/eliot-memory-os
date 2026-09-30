@@ -2702,7 +2702,6 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         source_scope_after_run: Option<&GovernedGitScope>,
         candidate_identity_after_run: Option<&CandidateIdentity>,
         build_fingerprint_after_run: Option<&BuildFingerprint>,
-        invoked_at_unix_ms: u64,
         source_root: &RepoRoot,
         after_run_source_proof: Option<LspSourceArtifactProof>,
         publisher: &Pub,
@@ -2718,8 +2717,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             .await
             .map_err(BridgeError::ProcessOwner)?;
         validate_process_owner_readback(&started, &process_evidence)?;
-        let raw_outputs =
-            capture_live_raw_outputs(&started, &process_evidence, invoked_at_unix_ms)?;
+        let raw_outputs = capture_live_raw_outputs(&started, &process_evidence)?;
         let mut retained = Self::retain_result(
             &started,
             process_evidence,
@@ -2727,7 +2725,6 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             source_scope_after_run,
             candidate_identity_after_run,
             build_fingerprint_after_run,
-            invoked_at_unix_ms,
         )?;
         if let Some(dispatch_proof) = started.source_artifact_proof.as_ref()
             && dispatch_proof
@@ -2940,7 +2937,6 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         source_scope_after_run: Option<&GovernedGitScope>,
         candidate_identity_after_run: Option<&CandidateIdentity>,
         build_fingerprint_after_run: Option<&BuildFingerprint>,
-        invoked_at_unix_ms: u64,
     ) -> Result<RetainedLspObservationV1, BridgeError> {
         process_evidence
             .validate()
@@ -2964,6 +2960,10 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         let process_completed = process_evidence_completed(&process_evidence);
         let process_truncated = process_outputs_incomplete(&process_evidence, &raw_outputs);
         let exit_code = process_evidence_exit_code(&process_evidence);
+        let invoked_at_unix_ms = started
+            .process_start
+            .identity()
+            .resumed_at_unix_ms();
         let mut result = normalize_retained_operation(
             &started.config,
             &started.source_candidate,
@@ -3199,6 +3199,15 @@ fn validate_retained_observation(record: &RetainedLspObservationV1) -> Result<()
         .process_evidence
         .validate()
         .map_err(BridgeError::ProcessEvidence)?;
+    let process_invoked_at = record
+        .process_evidence
+        .view()
+        .identity()
+        .ok_or(BridgeError::ReceiptMismatch)?
+        .resumed_at_unix_ms();
+    if record.result.receipt().invoked_at_unix_ms != process_invoked_at {
+        return Err(BridgeError::ReceiptMismatch);
+    }
     validate_record_identities(record, &resolved)?;
     validate_source_binding(source_binding)?;
     validate_process_source_binding(record, source_binding)?;
@@ -3792,6 +3801,7 @@ fn validate_process_owner_readback(
         || started.process_start.operation_id() != started.process_intent.operation_id()
         || started.process_start.accepted_generation().get()
             != started.process_intent.generation().get()
+        || evidence.view().identity() != Some(started.process_start.identity())
     {
         return Err(BridgeError::ReceiptMismatch);
     }
@@ -3817,6 +3827,7 @@ fn validate_retained_record_matches_started(
         || started.process_start.request_digest() != started.invocation_digest
         || started.process_start.accepted_generation().get()
             != started.process_intent.generation().get()
+        || record.process_evidence.view().identity() != Some(started.process_start.identity())
     {
         return Err(BridgeError::InconsistentBinding(
             "received observation differs from the original private launch handle".to_owned(),
@@ -3843,7 +3854,6 @@ fn live_capture_projection(
 fn capture_live_raw_outputs(
     started: &LspStartedInvocation,
     process_evidence: &ProcessEvidence,
-    captured_at_unix_ms: u64,
 ) -> Result<Vec<LspRawOutput>, BridgeError> {
     if !matches!(
         process_evidence.view().lifecycle(),
@@ -3880,7 +3890,6 @@ fn capture_live_raw_outputs(
                 kind,
                 bytes,
                 stream.preview().is_truncated(),
-                captured_at_unix_ms,
             )?);
         }
     }
@@ -3935,7 +3944,6 @@ fn capture_live_raw_outputs(
             LspRawOutputKind::ScipSidecar,
             bytes,
             false,
-            captured_at_unix_ms,
         )?);
     }
     Ok(outputs)
@@ -3946,10 +3954,7 @@ fn live_raw_output(
     kind: LspRawOutputKind,
     bytes: Vec<u8>,
     truncated: bool,
-    captured_at_unix_ms: u64,
 ) -> Result<LspRawOutput, BridgeError> {
-    let captured_at =
-        i64::try_from(captured_at_unix_ms).map_err(|_| BridgeError::InvalidCaptureClock)?;
     let channel = match kind {
         LspRawOutputKind::Stdout => "stdout",
         LspRawOutputKind::Stderr => "stderr",
@@ -3973,11 +3978,11 @@ fn live_raw_output(
         content_type: "application/octet-stream".to_owned(),
         sha256: sha256_hex(&bytes),
         bytes,
-        captured_at: ClockReading {
-            valid_time_ms: Some(captured_at),
-            known_time_ms: Some(captured_at),
-            ..ClockReading::default()
-        },
+        // The owner supplies a process-resume time, not an independent time
+        // for when terminal stream/sidecar bytes were captured. Preserve the
+        // existing unknown-clock representation instead of relabeling resume
+        // time as a later raw-output capture time.
+        captured_at: ClockReading::default(),
         truncated,
     };
     evidence.validate().map_err(BridgeError::RawEvidence)?;
@@ -4139,6 +4144,17 @@ fn validate_raw_outputs(
     validate_stream_output(outputs, process_evidence, ProcessStreamKind::Stderr)?;
     let process_completed = process_completed(process_evidence);
     let exit_code = process_exit_code(process_evidence);
+    if process_succeeded(process_completed, exit_code)
+        && matches!(
+            operation,
+            SemanticOperation::Diagnostics | SemanticOperation::ProbeVersion
+        )
+        && output_for(outputs, LspRawOutputKind::Stdout).is_none()
+    {
+        return Err(BridgeError::InconsistentBinding(
+            "successful analyzer invocation has no retained stdout artifact".to_owned(),
+        ));
+    }
     if process_succeeded(process_completed, exit_code)
         && matches!(
             operation,
