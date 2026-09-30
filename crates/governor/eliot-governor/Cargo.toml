@@ -16,6 +16,7 @@ eliot-context-candidates = { path = "../../smart/eliot-context-candidates", vers
 eliot-context-contracts = { path = "../../smart/eliot-context-contracts", version = "0.1.0" }
 eliot-coordination.workspace = true
 eliot-contracts.workspace = true
+eliot-code-cortex = { path = "../../instrument/eliot-code-cortex", version = "0.1.0" }
 eliot-cue-contracts = { path = "../../smart/eliot-cue-contracts", version = "0.1.0" }
 eliot-cue-index = { path = "../../smart/eliot-cue-index", version = "0.1.0" }
 eliot-doctor-core.workspace = true
