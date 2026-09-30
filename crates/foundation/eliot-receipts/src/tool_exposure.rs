@@ -1613,11 +1613,10 @@ impl ToolExposureHistoryEntry {
     /// content cannot be canonically serialized for keying.
     pub fn persistence_idempotency_key(&self) -> Result<String, ToolExposureError> {
         self.validate()?;
-        let bytes =
-            canonical_json_bytes(self).map_err(|_| ToolExposureError::InvalidField {
-                field: "history.revision.idempotency_key",
-                reason: "recorded exposure history cannot be canonically keyed for persistence",
-            })?;
+        let bytes = canonical_json_bytes(self).map_err(|_| ToolExposureError::InvalidField {
+            field: "history.revision.idempotency_key",
+            reason: "recorded exposure history cannot be canonically keyed for persistence",
+        })?;
         Ok(sha256_hex(&bytes))
     }
 }
