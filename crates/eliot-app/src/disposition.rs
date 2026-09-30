@@ -124,11 +124,6 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         body: CLAUDE_PLUGIN_HOOKS,
     },
     ConsumerSurface {
-        path: "integrations/opencode/opencode.json",
-        live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
-        body: OPENCODE_CONFIG,
-    },
-    ConsumerSurface {
         path: "integrations/opencode/plugins/eliot.js",
         live_reference: "host-integrations/opencode/bin/eliot-governor.exe",
         body: OPENCODE_PLUGIN,
@@ -372,13 +367,6 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             expiry: "remove when hooks route through bins/eliot-agent-bridge and crates/surfaces/* under #13",
         },
         ConsumerEntry {
-            consumer: "OpenCode MCP server registration",
-            proof: "integrations/opencode/opencode.json",
-            live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when the OpenCode MCP command resolves to bins/eliot-agent-bridge under #13",
-        },
-        ConsumerEntry {
             consumer: "Codex plugin install route",
             proof: "integrations/codex/marketplace.json",
             live_reference: "\"installation\": \"INSTALLED_BY_DEFAULT\"",
@@ -526,6 +514,14 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
         evidence: "bridge argv mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; the admitted contour the facade's unconditional Bridge redirect already serves for the claude host (crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge); served through the Kernel front door with no Governor, Store, WAL, or writer construction",
     },
+    MigratedConsumerEdge {
+        consumer: "OpenCode MCP server registration",
+        proof: "integrations/opencode/opencode.json",
+        legacy_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
+        current_owner_reference: "\"{env:ELIOT_AGENT_BRIDGE_EXE}\"",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "bridge argv mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; opencode is a bridge-delegated host whose facade entry gate already redirects default-profile mcp stdio to this argv (crates/eliot-app/src/main.rs::BRIDGE_DELEGATED_MCP_HOSTS and crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge); served on the admitted SPINE_FUNCTIONAL contour through the Kernel front door with no Governor, Store, WAL, or writer construction",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -534,6 +530,7 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "plugin/eliot-governor/.mcp.json" => Some(CODEX_PLUGIN_MCP),
         "integrations/claude/claude-desktop/mcpb/manifest.json" => Some(CLAUDE_DESKTOP_MCPB),
         "integrations/claude/eliot/.mcp.json" => Some(CLAUDE_PLUGIN_MCP),
+        "integrations/opencode/opencode.json" => Some(OPENCODE_CONFIG),
         _ => None,
     }
 }
