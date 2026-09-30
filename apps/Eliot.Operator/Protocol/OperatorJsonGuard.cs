@@ -139,6 +139,16 @@ public static class OperatorJsonGuard
                     containers.Pop();
                     break;
                 case JsonTokenType.PropertyName:
+                    // Bounded before allocation: `ValueSpan` is a view over the
+                    // raw token text (escape sequences unprocessed), so its byte
+                    // length is never smaller than the decoded name length.
+                    // `GetString` therefore never materialises an oversized name
+                    // on the heap, exactly as the String and Number cases below
+                    // already refuse on this axis without allocating.
+                    if (reader.ValueSpan.Length > maxStringChars)
+                    {
+                        throw new OperatorProtocolException(shapeName, "name_cap");
+                    }
                     var name = reader.GetString() ?? string.Empty;
                     if (name.Length > maxStringChars)
                     {

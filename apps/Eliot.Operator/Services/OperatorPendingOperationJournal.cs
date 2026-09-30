@@ -433,6 +433,28 @@ public sealed class OperatorPendingOperationJournal : IDisposable
 
             try
             {
+                // The retained envelope is closed, not merely forbidden-name
+                // screened. The serializer profile refuses an unmapped member,
+                // but a DUPLICATE property name is resolved by System.Text.Json
+                // as last-wins, while an independent reader of the very same
+                // retained bytes (`JsonElement.GetProperty` during
+                // reconciliation) resolves it as first-wins. A duplicated
+                // member would therefore let the value this file validates
+                // differ from the value the recovery send actually transmits.
+                // The framing guard already in this application refuses a
+                // duplicate at every object level, so it is applied here rather
+                // than introducing a second scanner. Every axis is set at a
+                // value no currently retained record can exceed — the length
+                // bound above already ran, so the guard's own UTF-8 buffer is
+                // allocated inside the retained-byte ceiling, and the depth is
+                // the same ceiling the closed serializer profile enforces.
+                OperatorJsonGuard.ValidateFramedLine(
+                    operation.EnvelopeJson,
+                    maxMembers: OperatorProtocol.MaxResponseMembers,
+                    maxStringChars: MaxEnvelopeChars,
+                    maxDepth: OperatorProtocol.MaxResponseDepth,
+                    maxTokens: MaxEnvelopeChars,
+                    shapeName: "operator_pending_operation_envelope");
                 using var document = JsonDocument.Parse(operation.EnvelopeJson);
                 EnsureJournalSafe(document.RootElement, operation.Route);
                 switch (operation.Route)
