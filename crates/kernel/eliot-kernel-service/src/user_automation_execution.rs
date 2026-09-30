@@ -2090,7 +2090,7 @@ impl UserAutomationWakeHorizonPublication {
                     UserAutomationError::Invalid("horizon.entry.occurrence_key"),
                 ));
             };
-            if &entry.occurrence_id != &identity.occurrence_id
+            if entry.occurrence_id != identity.occurrence_id
                 || entry.occurrence_key != *occurrence_key
                 || entry.source_digest != source_digest
             {
