@@ -92,8 +92,10 @@
 //! * I7.11 `ContextAtomPolicy` class comparison is owned by
 //!   `eliot-context-admission` (`FloorAtomPolicy`). That crate depends on this
 //!   one, so this contract cannot read its record content; the only binding
-//!   available here is the admission-rule/floor evidence identity compared in
-//!   `authorize`.
+//!   available here is the Decision Safety Floor evidence identity compared in
+//!   `authorize`. `RecipeAdmissionPolicy::admission_rule` has no owner record to
+//!   be compared against anywhere in the workspace, which is why it is outside
+//!   the certified digest domain rather than inside it.
 //! * I12.13's active `Recovery`/`Conflict` Directives have no record type
 //!   anywhere in the workspace. The only owner spelling is
 //!   [`QualityApplicabilityInput::ActiveDirective`], so that is what is
@@ -167,6 +169,60 @@
 //! Run-time qualification experiments are later product-phase work. Nothing here
 //! runs one, records an outcome, or defaults a missing one: the gate refuses
 //! when the evidence reference is absent.
+//!
+//! # A2 — a certified member is one this path reads
+//!
+//! Acceptance A2: "A policy change alters the recipe revision/digest and
+//! effective compiler behavior together; ignored settings cannot be certified."
+//! `policy_sha256` is the approved revision's identity, so every member inside it
+//! is a claim that this path runs what that member declares. Nine members were
+//! inside the digest with no reader anywhere, which made a certified behavioural
+//! no-op expressible: publish a revision that raises a section ceiling, recompute
+//! the digest, issue the matching activation, and every identity that embeds the
+//! published document moves while the delivered content does not. Each of the
+//! nine is now either read on the publication/execution path or explicitly
+//! outside the digest domain:
+//!
+//! ```text
+//! section_budgets[].unit_boundary_kind
+//!     require_executable compares it with EXECUTED_SECTION_UNIT_BOUNDARY, the
+//!     whole-unit boundary kind the assembly projection actually emits
+//! section_budgets[].omission_or_handle_policy
+//!     binds_recipe compares it with the instance's own per-role
+//!     RoleLossRule::loss_policy for the same role
+//! section_budgets[].minimum_required_whole_units
+//! section_budgets[].planning_maximum_whole_units
+//!     authorize compares both with the governing Decision Safety Floor's own
+//!     mandatory member count for that role
+//! protected_reserve.margin_reserve
+//!     ProtectedReservePolicy::validate refuses a declared-but-absent reserve
+//! qualification.counter_metrics[].forbidden_movement
+//!     validate_promotion_basis requires the guardrail a candidate actually
+//!     measured to forbid the same direction the activated revision declares
+//! layout.role_positions[].position
+//!     RecipeLayoutPolicy::validate requires a complete, contiguous, zero-based
+//!     order over every configured feature, so the position is an order and not
+//!     a duplicate-detection token
+//! qualification.qualification
+//!     validate_promotion_basis requires it to be owner evidence the activating
+//!     decision itself cites
+//! admission.admission_rule
+//!     EXCLUDED from policy_sha256; see EXCLUDED_FROM_POLICY_DIGEST_DOMAIN
+//! ```
+//!
+//! Three of those are refusals rather than passes, and that is the point: an
+//! incoherent or unsupported declaration stops the dependent compilation at
+//! publication instead of being certified into a digest that promises a
+//! behaviour this path does not have.
+//!
+//! One residual stays named rather than papered over. Raising a
+//! `planning_maximum_whole_units` ceiling, or a `margin_reserve`, above the
+//! values this path needs still moves the identity without moving the delivered
+//! bytes, because the whole-unit allocation algorithm and the margin figure are
+//! #1725's and the Context-budget owner's, not this contract's. What is now
+//! enforced is the direction that was not enforced at all: LOWERING either value
+//! below what the independent governing floor requires refuses, so neither can be
+//! used to weaken a floor while moving the identity.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -201,7 +257,50 @@ pub const CONTEXT_RECIPE_POLICY_SCHEMA_VERSION: u32 = 1;
 /// covers the compilation binding. One digest cannot be both a reusable policy
 /// identity and a per-compilation instance identity, and the existing domain is
 /// left exactly as it was.
-pub const CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN: &str = "eliot.smart.context.recipe-policy.v1";
+///
+/// #1724 A2 moved this from `.v1` to `.v2` because the covered byte stream
+/// changed: `v1` digested the whole policy struct, which certified
+/// [`RecipeAdmissionPolicy::admission_rule`] — a member no execution path in the
+/// workspace reads — as if approving it changed compilation behaviour. `v2`
+/// digests the explicitly enumerated domain in
+/// [`EXCLUDED_FROM_POLICY_DIGEST_DOMAIN`]. The wire shape did not change, so
+/// [`CONTEXT_RECIPE_POLICY_SCHEMA_VERSION`] is untouched; the domain is where a
+/// change in what a digest covers belongs. The version is inside the hashed
+/// input, so a `v1` digest can never be read as a `v2` one.
+pub const CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN: &str = "eliot.smart.context.recipe-policy.v2";
+
+/// The members of a policy that are deliberately OUTSIDE the certified digest
+/// domain, by name, and why each one is there.
+///
+/// #1724 A2. [`ContextRecipePolicy::policy_sha256`] may only cover content the
+/// publication and execution path reads, or it certifies a setting that changes
+/// nothing. Exactly one member is excluded:
+///
+/// * `admission.admission_rule` ([`RecipeAdmissionPolicy::admission_rule`]) — the
+///   owner admission rule this revision was issued under. It is an owner
+///   reference, not a copy: the rule keeps its own record at its own owner, and
+///   no record of that rule exists in this crate or in any crate that depends on
+///   it, so nothing here can resolve it. The one binding that IS available for
+///   the sibling member [`RecipeAdmissionPolicy::safety_floor`] is compared in
+///   [`GoverningContextRequirements::authorize`], because the governing
+///   requirements hold the floor record. There is no equivalent denominator for
+///   the admission rule.
+///
+/// Effect on identity, stated exactly: two approved revisions that differ ONLY in
+/// their declared admission rule produce the same `policy_sha256`. Re-pointing a
+/// revision at a different owner admission rule therefore does not move the
+/// certified policy identity, which is the honest result for a reference nothing
+/// executes. Nothing is weakened by it:
+///
+/// * the member stays in the wire shape and stays validated as bounded
+///   non-empty identity text by [`RecipeAdmissionPolicy::validate`];
+/// * two candidates that shared a `policy_id`/`policy_revision` but named
+///   different rules collide on one identity and
+///   [`ApprovedRecipeCatalogue::validate`] refuses the catalogue as an identity
+///   conflict rather than serving either of them;
+/// * a revision is still only current when an owner activation decision names it,
+///   and that decision is digest-bound in its own domain.
+pub const EXCLUDED_FROM_POLICY_DIGEST_DOMAIN: &[&str] = &["admission.admission_rule"];
 
 /// The one stage the current consolidated Context execution path runs.
 ///
@@ -224,6 +323,28 @@ pub const EXECUTED_CONTEXT_STAGE: &str = "context.stage.compile-and-render.v1";
 /// not have, so it refuses rather than being digested.
 pub const EXECUTED_SECTION_DEGRADATION: BoundaryDisposition =
     BoundaryDisposition::BlockDependentDecisionOrEffect;
+
+/// The whole-unit boundary kind the current path emits for one budgeted section.
+///
+/// I12.13 `ContextSectionBudget.unit_boundary_kind` names what one whole unit of
+/// a section is, and the current assembly projection emits exactly one
+/// independently addressable `BoundaryMetadataEnvelope` of kind
+/// [`BoundaryUnitKind::Unit`] per admitted record
+/// (`eliot-context-assembly/src/boundary.rs::unit_envelope`); the `Batch`
+/// envelope it also emits is the source-less parent of the whole admitted set,
+/// not a section unit. `ContiguousExtract`, `CallResultPair` and `EvidenceEdge`
+/// describe composite units this path never builds per section, so a policy
+/// declaring one would be certifying a boundary the delivered packet does not
+/// have. [`ContextRecipePolicy::require_executable`] refuses that by name.
+///
+/// This is the contract's own statement of an executed fact, in the same
+/// standing as the three constants above. It is not a member of
+/// [`RecipeExecutionSupport`] because that record is the execution owner's, and
+/// adding a member to it is a change to a struct the owner builds; naming the
+/// fact here keeps this change inside one file. Promoting it into
+/// `RecipeExecutionSupport` is the change that would let the execution owner
+/// state the kind it emits instead of this contract asserting it.
+const EXECUTED_SECTION_UNIT_BOUNDARY: BoundaryUnitKind = BoundaryUnitKind::Unit;
 
 /// The repetition treatment the current renderer actually applies.
 ///
@@ -332,6 +453,10 @@ pub struct RecipeStage {
 #[serde(deny_unknown_fields)]
 pub struct RecipeAdmissionPolicy {
     /// Owner admission rule applied under this policy revision.
+    ///
+    /// #1724 A2: validated as bounded non-empty identity text, and deliberately
+    /// OUTSIDE `policy_sha256` — see [`EXCLUDED_FROM_POLICY_DIGEST_DOMAIN`] for
+    /// why and for the effect on identity.
     pub admission_rule: ArtifactId,
     /// Owner Decision Safety Floor this policy revision admits against.
     pub safety_floor: ArtifactId,
@@ -376,20 +501,52 @@ impl RecipeAdmissionPolicy {
 /// object, URL, source identity, tool call/result pair or evidence edge is
 /// never divided to make a budget fit. The budget algorithm itself is not here
 /// and is not reimplemented here.
+///
+/// #1724 A2 — who reads each member, and where:
+///
+/// * `unit_boundary_kind` — [`ContextRecipePolicy::require_executable`], against
+///   the kind the assembly projection actually emits. A kind this path does not
+///   emit refuses the dependent compilation by name.
+/// * `omission_or_handle_policy` — [`ContextRecipePolicy::binds_recipe`], against
+///   the compilation-bound instance's own per-role
+///   [`RoleLossRule`](crate::RoleLossRule). A policy that declares a different
+///   representation contract for a role than the instance the renderer actually
+///   applies refuses.
+/// * `minimum_required_whole_units` and `planning_maximum_whole_units` —
+///   [`GoverningContextRequirements::authorize`], against the governing
+///   [`DecisionSafetyFloor`](crate::DecisionSafetyFloor)'s own mandatory member
+///   count for this role. Each mandatory floor member is one non-droppable whole
+///   unit of that role, so a budget that may retain fewer of them than the floor
+///   requires is a floor weakening and refuses with
+///   [`ContextError::MissingFloor`]. This validation reads the amounts; the
+///   amount ceiling above the floor is a planning bound owned by #1725's
+///   whole-unit algorithm, which is deliberately not reimplemented here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSectionBudget {
     /// Semantic role this budget governs.
     pub semantic_role: SemanticRole,
     /// Whole-unit boundary kind of this section.
+    ///
+    /// Read by [`ContextRecipePolicy::require_executable`]; see the type
+    /// documentation.
     pub unit_boundary_kind: BoundaryUnitKind,
     /// Minimum complete units retained for this role.
+    ///
+    /// Read against the governing floor's mandatory member count in
+    /// [`GoverningContextRequirements::authorize`].
     pub minimum_required_whole_units: u64,
     /// Owner proof references for this section's protected floor.
     pub protected_floor_refs: Vec<ArtifactId>,
     /// Planning maximum, in the same whole units.
+    ///
+    /// Read against the governing floor's mandatory member count in
+    /// [`GoverningContextRequirements::authorize`].
     pub planning_maximum_whole_units: u64,
     /// Permitted omission/handle policy for this section.
+    ///
+    /// Read against the instance's own per-role loss rule in
+    /// [`ContextRecipePolicy::binds_recipe`].
     pub omission_or_handle_policy: LossPolicy,
     /// Whole-unit degradation applied when the section cannot be preserved.
     pub degradation_behavior: BoundaryDisposition,
@@ -399,6 +556,12 @@ pub struct ContextSectionBudget {
 
 impl ContextSectionBudget {
     fn validate(&self) -> Result<(), ContextError> {
+        // The two amounts are the only members of this struct with an internal
+        // incoherence to refuse: a section that must retain no complete unit, or
+        // that may plan for fewer units than it must retain, does not describe a
+        // budget at all. Their binding to the independent governing floor is
+        // `GoverningContextRequirements::authorize`, which is the only place that
+        // holds the floor record; see the type documentation.
         if self.minimum_required_whole_units == 0 {
             return Err(ContextError::MissingField(
                 "section_budget.minimum_required_whole_units",
@@ -438,6 +601,17 @@ pub struct ProtectedReservePolicy {
     /// Context-budget owner record of the protected reasoning/review reserve.
     pub reserves: ProtectedReserves,
     /// Protected margin reserve not covered by `reserves`.
+    ///
+    /// #1724 A2: read by [`ProtectedReservePolicy::validate`], which refuses a
+    /// declared-but-absent reserve. A margin of zero under a block whose own
+    /// documentation is "protected_reasoning_review_and_margin_reserve" is a
+    /// policy that certifies the absence of the reserve I12.13 requires it to
+    /// carry, so it refuses instead of digesting. No execution path in this
+    /// workspace measures a margin figure — the Context-budget owner records it
+    /// and the instance's own [`CapacityLimits`](crate::CapacityLimits) carries
+    /// the capacity envelope — so the certified meaning of this member is
+    /// exactly "this revision declares a protected margin reserve", and raising
+    /// it moves the identity without moving delivered bytes.
     pub margin_reserve: u64,
 }
 
@@ -446,7 +620,13 @@ impl ProtectedReservePolicy {
         validate_text(
             self.reserves.owner_ref.as_str(),
             "recipe_policy.protected_reserve.reserves.owner_ref",
-        )
+        )?;
+        if self.margin_reserve == 0 {
+            return Err(ContextError::MissingField(
+                "recipe_policy.protected_reserve.margin_reserve",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -457,6 +637,16 @@ pub struct RecipeRolePosition {
     /// Positioned role.
     pub semantic_role: SemanticRole,
     /// Zero-based layout position.
+    ///
+    /// #1724 A2: read by [`RecipeLayoutPolicy::validate`], which requires the
+    /// declared positions to be the contiguous zero-based sequence 0..n in the
+    /// order they are declared. Before that, this member was only inserted into
+    /// a set to detect a duplicate, so a set of unique but gapped or arbitrarily
+    /// large positions certified an order this path could not state. It is the
+    /// rendered order the execution path applies, so the certified value of this
+    /// member is a total order over the configured features, and the rendered
+    /// order it produces is the execution owner's cross-check (the renderer in
+    /// `eliot-context-assembly`), not a second copy of it here.
     pub position: u32,
 }
 
@@ -500,6 +690,13 @@ pub struct RecipeLayoutPolicy {
 }
 
 impl RecipeLayoutPolicy {
+    /// Validate the declared layout as a total order, not as a set of keys.
+    ///
+    /// #1724 A2. The positions must be exactly `0..role_positions.len()` in the
+    /// order they are declared, so `position` carries the rendered order this
+    /// revision was approved against. A set of unique but gapped positions is
+    /// refused because it cannot be the order of anything, and the positions are
+    /// read here as ordinals rather than only as duplicate-detection keys.
     fn validate(&self) -> Result<(), ContextError> {
         if self.role_positions.is_empty() || self.role_positions.len() > 64 {
             return Err(ContextError::Bounds {
@@ -507,15 +704,14 @@ impl RecipeLayoutPolicy {
             });
         }
         let mut roles = BTreeSet::new();
-        let mut positions = BTreeSet::new();
-        for declared in &self.role_positions {
+        for (index, declared) in self.role_positions.iter().enumerate() {
             if !roles.insert(declared.semantic_role) {
                 return Err(ContextError::Duplicate(
                     "recipe_policy.layout.role_positions.semantic_role",
                 ));
             }
-            if !positions.insert(declared.position) {
-                return Err(ContextError::Duplicate(
+            if usize::try_from(declared.position).ok() != Some(index) {
+                return Err(ContextError::InvalidField(
                     "recipe_policy.layout.role_positions.position",
                 ));
             }
@@ -650,14 +846,40 @@ pub struct RecipeCounterMetric {
     /// Owner metric identity.
     pub metric_id: ArtifactId,
     /// Direction in which the metric may not worsen.
+    ///
+    /// #1724 A2: read by
+    /// [`RecipeImprovementCandidate::covers_declared_counter_metrics`], which
+    /// requires the guardrail a candidate actually measured against the baseline
+    /// to forbid the SAME direction for the same metric. A candidate measured
+    /// against `Increase` cannot promote a revision whose guardrail is
+    /// `Decrease`, because its replay/holdout and canary evidence is then
+    /// evidence about a different guardrail than the one the revision ships.
+    /// Without that match this member was a declaration inside the certified
+    /// digest that no comparison in the workspace ever read, and flipping it
+    /// moved `policy_sha256` while changing nothing.
     pub forbidden_movement: CounterMetricMovement,
 }
 
 /// I12.13 `empirical_qualification_and_counter_metrics`.
+///
+/// #1724 A2: `qualification` is an owner evidence reference, and an unresolved
+/// owner reference inside a certified digest is a setting nothing reads. It is
+/// resolved by
+/// [`ApprovedRecipeCatalogue::validate_promotion_basis`], which requires it to be
+/// owner evidence the activating promotion decision itself cites — the baseline
+/// approval for [`RecipePromotionBasis::InitialBuiltInBaseline`], or the
+/// candidate/replay-holdout/canary evidence for
+/// [`RecipePromotionBasis::ImprovementCandidate`]. A revision therefore cannot
+/// claim qualification by an evidence reference that no owner decision ever
+/// made.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeQualification {
     /// Owner qualification evidence reference for this revision's metrics.
+    ///
+    /// Read by
+    /// [`ApprovedRecipeCatalogue::validate_promotion_basis`]; see the type
+    /// documentation.
     pub qualification: ArtifactId,
     /// Qualification state of the recorded metrics.
     pub state: RecipeQualificationState,
@@ -816,7 +1038,7 @@ impl RecipeImprovementCandidate {
     }
 
     /// Whether every counter-metric the proposed policy declares was actually
-    /// measured against the baseline.
+    /// measured against the baseline, in the same direction.
     ///
     /// This is the content comparison a positive token saving cannot pass: a
     /// candidate that measured fewer guardrails than its proposed policy declares
@@ -825,17 +1047,25 @@ impl RecipeImprovementCandidate {
     /// because no owner record of the required guardrail set exists; the residual
     /// is named in the delivery report rather than papered over with a field
     /// invented here.
+    ///
+    /// #1724 A2: the comparison is on the (metric, direction) pair, not on the
+    /// metric identity alone. A candidate measured against a guardrail that
+    /// forbids `Increase` has evidence about that guardrail, and promoting a
+    /// revision whose guardrail forbids `Decrease` for the same metric would ship
+    /// a certified direction the cited evidence never measured. `forbidden_movement`
+    /// had no reader anywhere in the tree before this, so flipping it moved
+    /// `policy_sha256` while changing nothing.
     fn covers_declared_counter_metrics(&self, policy: &ContextRecipePolicy) -> bool {
-        let measured: BTreeSet<&ArtifactId> = self
-            .counter_metrics
-            .iter()
-            .map(|metric| &metric.metric_id)
-            .collect();
         policy
             .qualification
             .counter_metrics
             .iter()
-            .all(|metric| measured.contains(&metric.metric_id))
+            .all(|declared| {
+                self.counter_metrics.iter().any(|measured| {
+                    measured.metric_id == declared.metric_id
+                        && measured.forbidden_movement == declared.forbidden_movement
+                })
+            })
     }
 }
 
@@ -1083,41 +1313,151 @@ pub struct ContextRecipePolicy {
 #[derive(Serialize)]
 struct RecipePolicyDigestInput<'a> {
     domain: &'static str,
-    policy: &'a ContextRecipePolicy,
+    /// The members deliberately outside the domain, by name.
+    ///
+    /// Naming them inside the hashed bytes means the exclusion set is itself
+    /// part of the certified domain: admitting one of them back into
+    /// [`RecipePolicyDigestContent`] changes every `policy_sha256` instead of
+    /// silently re-certifying a member nothing reads.
+    excluded: &'static [&'static str],
+    policy: &'a RecipePolicyDigestContent<'a>,
+}
+
+/// The exact domain of [`ContextRecipePolicy::policy_sha256`].
+///
+/// #1724 A2. This is the whole struct no longer: the covered content is named
+/// here member by member, so a member added to [`ContextRecipePolicy`] stops
+/// compiling until it is classified as certified or excluded by name. That is the
+/// property the previous clone-and-zero digest did not have — it certified every
+/// member by accident, including members no execution path reads. The single
+/// exclusion is [`EXCLUDED_FROM_POLICY_DIGEST_DOMAIN`].
+#[derive(Serialize)]
+struct RecipePolicyDigestContent<'a> {
+    policy_schema_version: u32,
+    policy_id: &'a ArtifactId,
+    policy_revision: PolicyRevision,
+    /// Always the zeroed sentinel, exactly as in the instance digest.
+    policy_sha256: String,
+    applicability: RecipeApplicability,
+    stages: &'a [RecipeStage],
+    candidate_features: &'a [SemanticRole],
+    admission: RecipeAdmissionDigestContent<'a>,
+    section_budgets: &'a [ContextSectionBudget],
+    protected_reserve: &'a ProtectedReservePolicy,
+    layout: RecipeLayoutDigestContent<'a>,
+    omission: RecipeOmissionPolicy,
+    blocking_dimensions: &'a [QualityDimension],
+    execution: &'a RecipeExecutionContour,
+    qualification: RecipeQualification,
+    supersession: &'a RecipeSupersession,
+}
+
+/// [`ContextRecipePolicy::admission`] inside the certified domain, minus the one
+/// excluded member.
+///
+/// `admission_rule` is absent BY NAME here, not zeroed, so a reader of the
+/// digested bytes cannot mistake an empty reference for a certified one. See
+/// [`EXCLUDED_FROM_POLICY_DIGEST_DOMAIN`] for the effect on identity.
+#[derive(Serialize)]
+struct RecipeAdmissionDigestContent<'a> {
+    safety_floor: &'a ArtifactId,
+    suppressible_roles: &'a [SemanticRole],
+}
+
+/// [`ContextRecipePolicy::layout`] inside the certified domain.
+#[derive(Serialize)]
+struct RecipeLayoutDigestContent<'a> {
+    role_positions: &'a [RecipeRolePosition],
+    repetition: RecipeRepetitionPolicy,
+}
+
+/// Sort one genuine set for the policy digest.
+///
+/// Only lists whose order carries no meaning are sorted. `stages` is not one of
+/// them: stage order is the graph order, and a stage order is not canonicalized
+/// away.
+fn canonical_set<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+    values.sort();
+    values
+}
+
+/// Section budgets in semantic-role order; the vector order carries no meaning.
+fn canonical_budgets(mut budgets: Vec<ContextSectionBudget>) -> Vec<ContextSectionBudget> {
+    budgets.sort_by_key(|budget| budget.semantic_role);
+    budgets
+}
+
+/// Declared layout positions in semantic-role order, so the certified bytes carry
+/// the role-to-ordinal mapping rather than the order the owner listed them in.
+fn canonical_role_positions(mut positions: Vec<RecipeRolePosition>) -> Vec<RecipeRolePosition> {
+    positions.sort_by_key(|declared| declared.semantic_role);
+    positions
+}
+
+/// Counter-metrics in metric-identity order.
+fn canonical_counter_metrics(mut metrics: Vec<RecipeCounterMetric>) -> Vec<RecipeCounterMetric> {
+    metrics.sort_by(|left, right| left.metric_id.cmp(&right.metric_id));
+    metrics
 }
 
 impl ContextRecipePolicy {
     /// Compute the digest expected in `policy_sha256` for this policy.
     ///
-    /// Genuine sets are sorted; `stages` is not, because stage order is
-    /// meaning and not a set. `ContextRecipe::canonical_policy_digest` is
-    /// untouched: its domain still covers the compilation binding.
+    /// The covered content is [`RecipePolicyDigestContent`], which names every
+    /// certified member; the one member that is not certified is named in
+    /// [`EXCLUDED_FROM_POLICY_DIGEST_DOMAIN`]. Genuine sets are sorted; `stages`
+    /// is not, because stage order is meaning and not a set.
+    /// `ContextRecipe::canonical_policy_digest` is untouched: its domain still
+    /// covers the compilation binding.
     pub fn canonical_policy_digest(&self) -> Result<String, ContextError> {
-        let mut canonical = self.clone();
-        canonical.policy_sha256 = "0".repeat(64);
-        canonical.applicability.task_profiles.sort();
-        canonical.applicability.route_profiles.sort();
-        canonical.applicability.impact_profiles.sort();
-        canonical.applicability.governance_profiles.sort();
-        canonical.candidate_features.sort();
-        canonical.admission.suppressible_roles.sort();
-        canonical
-            .section_budgets
-            .sort_by_key(|budget| budget.semantic_role);
-        canonical
-            .layout
-            .role_positions
-            .sort_by_key(|declared| declared.semantic_role);
-        canonical.omission.permitted_reasons.sort();
-        canonical.omission.non_recoverable_reasons.sort();
-        canonical.blocking_dimensions.sort();
-        canonical
-            .qualification
-            .counter_metrics
-            .sort_by(|left, right| left.metric_id.cmp(&right.metric_id));
+        let applicability = RecipeApplicability {
+            task_profiles: canonical_set(self.applicability.task_profiles.clone()),
+            route_profiles: canonical_set(self.applicability.route_profiles.clone()),
+            impact_profiles: canonical_set(self.applicability.impact_profiles.clone()),
+            governance_profiles: canonical_set(self.applicability.governance_profiles.clone()),
+        };
+        let candidate_features = canonical_set(self.candidate_features.clone());
+        let suppressible_roles = canonical_set(self.admission.suppressible_roles.clone());
+        let section_budgets = canonical_budgets(self.section_budgets.clone());
+        let role_positions = canonical_role_positions(self.layout.role_positions.clone());
+        let omission = RecipeOmissionPolicy {
+            permitted_reasons: canonical_set(self.omission.permitted_reasons),
+            non_recoverable_reasons: canonical_set(self.omission.non_recoverable_reasons),
+        };
+        let blocking_dimensions = canonical_set(self.blocking_dimensions.clone());
+        let qualification = RecipeQualification {
+            qualification: self.qualification.qualification.clone(),
+            state: self.qualification.state,
+            counter_metrics: canonical_counter_metrics(self.qualification.counter_metrics.clone()),
+        };
+        let content = RecipePolicyDigestContent {
+            policy_schema_version: self.policy_schema_version,
+            policy_id: &self.policy_id,
+            policy_revision: self.policy_revision,
+            policy_sha256: "0".repeat(64),
+            applicability,
+            stages: &self.stages,
+            candidate_features: &candidate_features,
+            admission: RecipeAdmissionDigestContent {
+                safety_floor: &self.admission.safety_floor,
+                suppressible_roles: &suppressible_roles,
+            },
+            section_budgets: &section_budgets,
+            protected_reserve: &self.protected_reserve,
+            layout: RecipeLayoutDigestContent {
+                role_positions: &role_positions,
+                repetition: self.layout.repetition,
+            },
+            omission,
+            blocking_dimensions: &blocking_dimensions,
+            execution: &self.execution,
+            qualification,
+            supersession: &self.supersession,
+        };
         let input = RecipePolicyDigestInput {
             domain: CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN,
-            policy: &canonical,
+            excluded: EXCLUDED_FROM_POLICY_DIGEST_DOMAIN,
+            policy: &content,
         };
         let bytes = eliot_contracts::canonical_json_bytes(&input)
             .map_err(|_| ContextError::InvalidField("recipe_policy.canonical"))?;
@@ -1147,12 +1487,28 @@ impl ContextRecipePolicy {
         self.validate_section_budgets(&features)?;
         self.protected_reserve.validate()?;
         self.layout.validate()?;
+        // #1724 A2: `role_positions` is documented as the declared position of
+        // EACH configured role, and the order it certifies is the rendered order
+        // this revision was approved against. Covering only part of the
+        // configured features would certify a partial order, so the converse of
+        // the per-declaration check below is required too.
+        let positioned: BTreeSet<SemanticRole> = self
+            .layout
+            .role_positions
+            .iter()
+            .map(|declared| declared.semantic_role)
+            .collect();
         for declared in &self.layout.role_positions {
             if !features.contains(&declared.semantic_role) {
                 return Err(ContextError::MissingField(
                     "recipe_policy.candidate_features",
                 ));
             }
+        }
+        if positioned != features {
+            return Err(ContextError::MissingField(
+                "recipe_policy.layout.role_positions",
+            ));
         }
         self.omission.validate()?;
         Self::validate_blocking_dimensions(&self.blocking_dimensions)?;
@@ -1176,6 +1532,12 @@ impl ContextRecipePolicy {
     /// not make itself applicable by dropping a mandatory role, adding a
     /// feature the policy does not configure, or declaring a mandatory role
     /// suppressible.
+    ///
+    /// #1724 A2 adds the per-role representation comparison: every budgeted
+    /// section's `omission_or_handle_policy` must equal the instance's own
+    /// per-role loss rule ([`RoleLossRule`](crate::RoleLossRule)) for that role,
+    /// and a budgeted role the instance carries no loss rule for is
+    /// [`ContextError::MissingField`].
     pub fn binds_recipe(&self, recipe: &ContextRecipe) -> Result<(), ContextError> {
         self.validate()?;
         recipe.validate()?;
@@ -1200,13 +1562,32 @@ impl ContextRecipePolicy {
                 ));
             }
         }
+        // #1724 A2: the policy's per-section omission/handle policy is compared
+        // with the instance's OWN per-role loss rule, which is the representation
+        // contract the admission and rendering path actually enforces
+        // (`RoleLossRule::validate` plus the representation kinds it admits). A
+        // policy that declared a different one for the same role was a certified
+        // setting that changed nothing: the instance's rule is what the renderer
+        // applied, and the policy's copy of it was read by no path at all.
+        for budget in &self.section_budgets {
+            let Some(rule) = recipe
+                .role_policies
+                .iter()
+                .find(|rule| rule.role == budget.semantic_role)
+            else {
+                return Err(ContextError::MissingField("recipe.role_policies"));
+            };
+            if rule.loss_policy != budget.omission_or_handle_policy {
+                return Err(ContextError::IdentityConflict);
+            }
+        }
         Ok(())
     }
 
     /// Refuse a policy that declares anything this execution path does not run.
     ///
-    /// This is #1724 W4's refusal clause. Every field of a policy is inside
-    /// `policy_sha256`, so an unsupported declaration would otherwise be
+    /// This is #1724 W4's refusal clause. Every certified field of a policy is
+    /// inside `policy_sha256`, so an unsupported declaration would otherwise be
     /// certified: a re-hashed policy with a different stage graph, a different
     /// repetition treatment, a whole-unit degradation the path never applies or
     /// a feature disable it cannot perform would pass every digest check while
@@ -1214,13 +1595,18 @@ impl ContextRecipePolicy {
     /// a policy change must move the revision/digest and the effective compiler
     /// behaviour together, or refuse.
     ///
-    /// The four comparisons are exact and one-directional — the policy must
-    /// declare exactly what this path applies. Nothing here reads a value the
-    /// policy did not declare, and no comparison is against a value derived
-    /// from the policy itself. The refusal is a typed
+    /// The comparisons are exact and one-directional — the policy must declare
+    /// exactly what this path applies. Nothing here reads a value the policy did
+    /// not declare, and no comparison is against a value derived from the policy
+    /// itself. The refusal is a typed
     /// [`RecipeResolutionRefusal::UnsupportedSetting`] naming the exact field
     /// and the identity of the revision that declares it, so a dependent
     /// compilation is blocked with a name rather than a silent degradation.
+    ///
+    /// #1724 A2 adds the whole-unit boundary kind: a section may only declare
+    /// the kind the assembly projection actually emits
+    /// ([`EXECUTED_SECTION_UNIT_BOUNDARY`]). It was previously inside the digest
+    /// with no reader anywhere, including this refusal.
     pub fn require_executable(
         &self,
         support: &RecipeExecutionSupport,
@@ -1249,6 +1635,9 @@ impl ContextRecipePolicy {
             return Err(unsupported("recipe_policy.layout.repetition"));
         }
         for budget in &self.section_budgets {
+            if budget.unit_boundary_kind != EXECUTED_SECTION_UNIT_BOUNDARY {
+                return Err(unsupported("section_budget.unit_boundary_kind"));
+            }
             if budget.degradation_behavior != support.section_degradation {
                 return Err(unsupported("section_budget.degradation_behavior"));
             }
@@ -1797,11 +2186,48 @@ impl GoverningContextRequirements {
         Ok(())
     }
 
+    /// Whether every budgeted section keeps at least the whole units the floor
+    /// makes mandatory for that role.
+    ///
+    /// #1724 A2. This is the only place in the workspace that reads
+    /// [`ContextSectionBudget::minimum_required_whole_units`] and
+    /// [`ContextSectionBudget::planning_maximum_whole_units`] against anything
+    /// outside the budget itself. Every mandatory
+    /// [`DecisionSafetyFloor`](crate::DecisionSafetyFloor) member is one
+    /// non-droppable whole unit of its role, so a section budget that may retain
+    /// fewer complete units of a role than the floor requires — or that may plan
+    /// for fewer — is a floor weakening dressed as a planning figure, and
+    /// `authorize` refuses it. Before this the two amounts were compared only with
+    /// each other inside one budget struct, so changing either moved
+    /// `policy_sha256` and moved nothing else, and lowering either below the floor
+    /// passed every check.
+    ///
+    /// The ceiling ABOVE the floor stays a planning bound: the whole-unit
+    /// allocation algorithm is #1725's and is deliberately not reimplemented
+    /// here, so there is no independent count of available units to bound it
+    /// against.
+    fn authorises_whole_unit_budgets(&self, policy: &ContextRecipePolicy) -> bool {
+        let mut mandatory_units: BTreeMap<SemanticRole, u64> = BTreeMap::new();
+        for member in &self.floor.members {
+            let count = mandatory_units.entry(member.role).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        policy.section_budgets.iter().all(|budget| {
+            mandatory_units
+                .get(&budget.semantic_role)
+                .is_none_or(|required| {
+                    budget.minimum_required_whole_units >= *required
+                        && budget.planning_maximum_whole_units >= *required
+                })
+        })
+    }
+
     /// Validate one resolved recipe against these requirements.
     ///
     /// The comparisons are set comparisons against owner requirements, so a
     /// candidate cannot make itself valid: it may not drop a role the floor
-    /// makes mandatory, shave the floor's capacity envelope, block fewer
+    /// makes mandatory, shave the floor's capacity envelope, budget fewer whole
+    /// units of a role than the floor makes mandatory, block fewer
     /// scorecard dimensions than the owner requires, drop a required omission
     /// reason, widen the non-recoverable set beyond the owner's ceiling, or
     /// serve a decision boundary whose proof ceiling exceeds its empirical
@@ -1845,6 +2271,11 @@ impl GoverningContextRequirements {
             || instance.capacity.fixed_overhead > floor_capacity.fixed_overhead
         {
             return Err(ContextError::CapacityExceeded);
+        }
+
+        // #1724 A2: the section-budget AMOUNTS are read here, against the floor.
+        if !self.authorises_whole_unit_budgets(policy) {
+            return Err(ContextError::MissingFloor);
         }
 
         let blocked: BTreeSet<QualityDimension> =
@@ -2112,16 +2543,30 @@ impl ApprovedRecipeCatalogue {
     /// values or against the candidate's own recorded values, never against a
     /// value derived from the decision being checked, so a decision cannot pass
     /// by agreeing with itself.
+    ///
+    /// #1724 A2 adds the qualification-evidence closure: the owner evidence
+    /// reference the activated revision records in
+    /// [`RecipeQualification::qualification`] must be evidence THIS decision
+    /// cites. A revision cannot claim to be qualified by a record no promotion
+    /// decision ever made, and the reference is no longer a bare text field
+    /// inside the certified digest.
     fn validate_promotion_basis(
         activation: &RecipeActivationRecord,
         activated_policy: &ContextRecipePolicy,
     ) -> Result<(), ContextError> {
+        let qualification = &activated_policy.qualification.qualification;
         match &activation.basis {
             // The built-in baseline is preserved as such: it supersedes nothing
             // and it needs no fabricated prior experimental evidence, so it is
-            // the one basis that may leave `qualification.state` unqualified.
-            RecipePromotionBasis::InitialBuiltInBaseline { .. } => {
+            // the one basis that may leave `qualification.state` unqualified. The
+            // only owner evidence such a decision carries is its own approval,
+            // so that approval is the only evidence reference its revision may
+            // name as its qualification.
+            RecipePromotionBasis::InitialBuiltInBaseline { approval } => {
                 if activation.predecessor.is_some() {
+                    return Err(ContextError::IdentityConflict);
+                }
+                if approval != qualification {
                     return Err(ContextError::IdentityConflict);
                 }
             }
@@ -2145,6 +2590,12 @@ impl ApprovedRecipeCatalogue {
                 }
                 if !candidate.covers_declared_counter_metrics(activated_policy) {
                     return Err(ContextError::QualityIncomplete);
+                }
+                if qualification != &candidate.candidate
+                    && qualification != &candidate.replay_holdout
+                    && qualification != &candidate.canary
+                {
+                    return Err(ContextError::IdentityConflict);
                 }
                 // An unqualified metric stays labelled unqualified, and a
                 // revision whose own recorded metrics are unqualified cannot be
