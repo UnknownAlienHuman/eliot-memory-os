@@ -1333,16 +1333,14 @@ pub fn advertise_exposure_history(
     let advertised =
         OwnerStageFact::supplied(permitted, decision_source.clone()).map_err(map_exposure_error)?;
     let eligible = match disposition {
-        SurfaceDisposition::Visible | SurfaceDisposition::LazyVisible => {
-            OwnerStageFact::supplied(
-                true,
-                format!(
-                    "surface-decision:{}+grant:{}",
-                    decision.task_ref, decision.grant_revision
-                ),
-            )
-            .map_err(map_exposure_error)?
-        }
+        SurfaceDisposition::Visible | SurfaceDisposition::LazyVisible => OwnerStageFact::supplied(
+            true,
+            format!(
+                "surface-decision:{}+grant:{}",
+                decision.task_ref, decision.grant_revision
+            ),
+        )
+        .map_err(map_exposure_error)?,
         SurfaceDisposition::Forbidden => {
             OwnerStageFact::supplied(false, decision_source).map_err(map_exposure_error)?
         }
