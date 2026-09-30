@@ -142,20 +142,33 @@ pub fn drive_reconnect_observed(
 /// (issue #1936 W1, I7.23): the in-crate production caller of the
 /// per-fingerprint coverage-manifest flow.
 ///
-/// The bridge reconnect sweep invokes this once per fingerprint with the run
-/// roster, the pinned allowed-manifest revision, and the caller-declared
-/// denominator plan ([`CoverageManifestRun`]) plus the transport replay
-/// callback. Observed ingest runs per fingerprint before anything is
-/// persisted, so staged-but-uncommitted facts abort with
+/// The run owner that knows the fingerprint invokes this once per fingerprint
+/// with the run roster, the pinned allowed-manifest revision, and the
+/// caller-declared denominator plan ([`CoverageManifestRun`]) plus the
+/// transport replay callback. Observed ingest runs per fingerprint before
+/// anything is persisted, so staged-but-uncommitted facts abort with
 /// [`IngestError::NotCommitted`] before any manifest is retained; every other
 /// failure is likewise typed ([`IngestError`]) and retains nothing partial.
 /// On success the retained denominator returns with the run outcome
 /// ([`FingerprintIngestRunOutcome`]) for the downstream evidence-assembly
-/// owner.
+/// owner, after this caller verifies the retained denominator still binds
+/// the run fingerprint and the pinned allowed-manifest revision: a retained
+/// manifest for another fingerprint or revision fails closed with
+/// [`IngestError::InvalidInput`] and never reaches evidence assembly as a
+/// bound outcome.
 pub fn drive_fingerprint_ingest_run(
     owner: &mut DurableHostEventJournal,
     run: &CoverageManifestRun<'_>,
     deliver: impl FnMut(&ReplayItem) -> bool,
 ) -> Result<FingerprintIngestRunOutcome, IngestError> {
-    run_ingest_for_fingerprint(owner, run, deliver)
+    let outcome = run_ingest_for_fingerprint(owner, run, deliver)?;
+    if outcome.manifest.manifest.fingerprint != *run.plan.fingerprint {
+        return Err(IngestError::InvalidInput("coverage_manifest.fingerprint"));
+    }
+    if outcome.manifest.manifest.allowed_manifest_digest != run.manifest_digest {
+        return Err(IngestError::InvalidInput(
+            "coverage_manifest.allowed_manifest_digest",
+        ));
+    }
+    Ok(outcome)
 }
