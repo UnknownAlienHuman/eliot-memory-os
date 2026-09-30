@@ -382,6 +382,21 @@ static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 2] = [
         required: true,
     },
 ];
+/// The Governor's complete catalog image is opaque here. The store only
+/// arbitrates the fixed owner address and outer revision; the Governor proves
+/// source-policy agreement and independently reads the committed image back.
+static RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "expected_module_registry_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "revision",
@@ -1232,6 +1247,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
+        NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -1260,6 +1276,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
+        b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -1426,6 +1443,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
         NamedMutationOperation::RecordFinishDecision => &RECORD_FINISH_DECISION_PARAMETERS,
         NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
+        NamedMutationOperation::RecordModuleCatalogSnapshot => {
+            &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
+        }
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,
