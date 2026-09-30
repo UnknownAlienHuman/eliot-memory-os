@@ -24,7 +24,8 @@ use super::{
     InstallerServiceRegistrationApproval, InstallerServiceRole, PHASE_B_PENDING_MARKER,
     PHASE_B_PENDING_SCM_DIGEST, PlatformAgentBridgeSecurityConvergenceReceipt,
     PlatformAgentBridgeStagePrepared, PlatformAgentBridgeStagingReceipt, PlatformHandle,
-    PreparedDestinationAdmission, ProvisionedSupervisionAuthority, ResourceGeneration,
+    PreparedDestinationAdmission, PreparedDestinationMaterialisation,
+    ProvisionedSupervisionAuthority, ResourceGeneration,
     RuntimeLaunchDescriptor, StateFence, canonical_json_bytes, handle, sha256_handle, sha256_hex,
     text,
 };
@@ -2823,6 +2824,22 @@ pub struct ApprovedGenerationRegistry {
     /// written before this one and invalidate already-staged activation intents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) prepared_isolated_destinations: Vec<PreparedDestinationAdmission>,
+    /// Destination installations this authority actually CREATED, one record
+    /// per admitted destination whose root was materialised (#958, I5.13
+    /// `restore to isolated root;`).
+    ///
+    /// A member beside `prepared_isolated_destinations` and not a field of it,
+    /// for a concrete reason rather than a stylistic one: the admission's
+    /// `admission_digest` folds in `IsolationEvidence::evidence_digest`, so a
+    /// post-creation observation folded into the same record would change the
+    /// admission's own digest between the admission write and the creation
+    /// write, and the exact-replay path this issue requires would turn into a
+    /// self-conflict. The link is a CONTENT binding instead: each record here
+    /// carries the `admission_digest` of the admission it realises, and
+    /// [`Self::validate`] compares it against the digest the retained admission
+    /// actually holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) prepared_destination_materialisations: Vec<PreparedDestinationMaterialisation>,
 }
 
 impl Default for ApprovedGenerationRegistry {
@@ -3159,6 +3176,7 @@ impl ApprovedGenerationRegistry {
             active_phase_b_rebind: None,
             committed_cutover_activation: None,
             prepared_isolated_destinations: Vec::new(),
+            prepared_destination_materialisations: Vec::new(),
         }
     }
 
@@ -3731,6 +3749,150 @@ impl ApprovedGenerationRegistry {
     #[must_use]
     pub fn prepared_isolated_destinations(&self) -> &[PreparedDestinationAdmission] {
         &self.prepared_isolated_destinations
+    }
+
+    /// Returns the retained materialisation for one operation, when this
+    /// authority holds one.
+    ///
+    /// This is the read an import-side consumer uses to learn WHICH root was
+    /// created for its operation: the record names the created root and the
+    /// identity the owner observed for it, so the destination the import targets
+    /// is the one that was admitted and created rather than a name a request
+    /// chose.
+    #[must_use]
+    pub fn prepared_destination_materialisation(
+        &self,
+        operation_id: &PlatformHandle,
+    ) -> Option<&PreparedDestinationMaterialisation> {
+        self.prepared_destination_materialisations
+            .iter()
+            .find(|record| &record.operation_id == operation_id)
+    }
+
+    /// Every materialised destination this authority currently retains.
+    #[must_use]
+    pub fn prepared_destination_materialisations(
+        &self,
+    ) -> &[PreparedDestinationMaterialisation] {
+        &self.prepared_destination_materialisations
+    }
+
+    /// Records the admission of one destination AND the fact that its root was
+    /// actually created, in one mutation.
+    ///
+    /// The two records are admitted together because they are one fact: the
+    /// materialisation carries the admission's `admission_digest`, and this
+    /// method refuses a materialisation whose digest does not equal the digest
+    /// the admission it was given actually holds. A root that was created for
+    /// some other admission, or an admission whose root nobody created, can
+    /// therefore never be recorded as a pair.
+    ///
+    /// A repeat of the SAME pair is idempotent and returns the stored record, so
+    /// a repeated request returns the same verified destination. Any other
+    /// record for the same operation, or a second operation naming the same
+    /// destination, is an [`InstallationError::IdentityConflict`] rather than a
+    /// second installation.
+    pub(crate) fn record_prepared_isolated_destination_creation_unchecked(
+        &mut self,
+        admission: &PreparedDestinationAdmission,
+        materialisation: &PreparedDestinationMaterialisation,
+    ) -> Result<PreparedDestinationMaterialisation, InstallationError> {
+        self.record_prepared_isolated_destination_unchecked(admission)?;
+        materialisation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if materialisation.admission_digest != admission.admission_digest
+            || materialisation.operation_id != admission.operation_id
+            || materialisation.destination_installation != admission.destination_installation
+            || !Self::same_windows_root_text(
+                &materialisation.destination_installation_root,
+                &admission.isolation.destination_installation_root,
+            )
+            || materialisation.isolated_area_root != admission.isolation.isolated_area_root
+            || materialisation.isolated_area_identity != admission.isolation.isolated_area_identity
+        {
+            return Err(InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: "the materialisation does not realise the admitted destination".to_owned(),
+            });
+        }
+        if let Some(held) = self.prepared_destination_materialisation(&materialisation.operation_id)
+        {
+            if held == materialisation {
+                return Ok(held.clone());
+            }
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.prepared_destination_materialisations.iter().any(|record| {
+            record.destination_installation == materialisation.destination_installation
+        }) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.prepared_destination_materialisations
+            .push(materialisation.clone());
+        self.validate()?;
+        Ok(materialisation.clone())
+    }
+
+    /// Forgets one exact materialised destination during cleanup, together with
+    /// the admission it realised.
+    ///
+    /// Only an explicitly owned, never-activated pair may be forgotten, and the
+    /// pair must match exactly: a materialisation this authority does not hold,
+    /// or one whose admission it no longer holds, is refused rather than removed
+    /// by name.
+    pub(crate) fn forget_prepared_isolated_destination_creation_unchecked(
+        &mut self,
+        admission: &PreparedDestinationAdmission,
+        materialisation: &PreparedDestinationMaterialisation,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        materialisation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if self.active_generation.as_ref() == Some(&admission.approved_target_build) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let Some(index) = self
+            .prepared_destination_materialisations
+            .iter()
+            .position(|held| held == materialisation)
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "this authority retains no materialised isolated destination for that operation"
+                    .to_owned(),
+            ));
+        };
+        if self
+            .prepared_isolated_destination(&admission.operation_id)
+            .is_none_or(|held| held != admission)
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "this authority retains no matching isolated destination admission to forget"
+                    .to_owned(),
+            ));
+        }
+        self.prepared_destination_materialisations.remove(index);
+        self.forget_prepared_isolated_destination_unchecked(admission)?;
+        self.validate()?;
+        Ok(())
+    }
+
+    /// Separator-aware equality over two already-resolved Windows path texts.
+    fn same_windows_root_text(left: &str, right: &str) -> bool {
+        left.replace('/', "\\").to_lowercase() == right.replace('/', "\\").to_lowercase()
     }
 
     /// Records one prepared, UNACTIVATED destination installation.
@@ -4857,6 +5019,57 @@ impl ApprovedGenerationRegistry {
                 generation.manifest.generation == admission.destination_installation
             }) {
                 return Err(InstallationError::IdentityConflict);
+            }
+        }
+        // A materialised destination is checked for SELF-consistency AND against
+        // the retained admission set, which is the INDEPENDENT expected set: a row
+        // whose `admission_digest` does not equal the digest of the admission this
+        // projection actually holds for that operation is refused, so a created
+        // root can never be recorded as belonging to an admission it does not
+        // realise, and an admission can never claim a root that was created for
+        // something else. Nothing here recomputes a digest to stand in for
+        // owner-issued material: the comparison is between two recorded values.
+        let mut materialised_operations = BTreeSet::new();
+        let mut materialised_destinations = BTreeSet::new();
+        for record in &self.prepared_destination_materialisations {
+            record
+                .validate()
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "registry.prepared_destination_materialisations".to_owned(),
+                    reason: error.to_string(),
+                })?;
+            if !materialised_operations.insert(record.operation_id.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "materialised isolated destination operation".to_owned(),
+                    identity: record.operation_id.as_str().to_owned(),
+                });
+            }
+            if !materialised_destinations.insert(record.destination_installation.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "materialised isolated destination installation".to_owned(),
+                    identity: record.destination_installation.as_str().to_owned(),
+                });
+            }
+            let admitted = self
+                .prepared_isolated_destination(&record.operation_id)
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "a materialised isolated destination has no retained admission for its \
+                         operation"
+                            .to_owned(),
+                    )
+                })?;
+            if admitted.admission_digest != record.admission_digest
+                || admitted.destination_installation != record.destination_installation
+                || !Self::same_windows_root_text(
+                    &admitted.isolation.destination_installation_root,
+                    &record.destination_installation_root,
+                )
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "registry.prepared_destination_materialisations".to_owned(),
+                    reason: "the materialisation does not realise the retained admission".to_owned(),
+                });
             }
         }
         let mut identities = BTreeSet::new();
