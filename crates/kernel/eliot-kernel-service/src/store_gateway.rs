@@ -6068,12 +6068,12 @@ impl KernelStoreGateway {
             // that would hide the committed Store receipt and the occurrence the
             // caller must reconcile.
             Err(
-                error @ UserAutomationExecutionError::Runtime(
+                error @ (UserAutomationExecutionError::Runtime(
                     UserAutomationRuntimeError::UnknownOutcome(_)
                     | UserAutomationRuntimeError::IdentityConflict
                     | UserAutomationRuntimeError::OutcomeSettled(_),
                 )
-                | error @ UserAutomationExecutionError::RuntimeResponseMismatch(_),
+                | UserAutomationExecutionError::RuntimeResponseMismatch(_)),
             ) => Ok((
                 wake,
                 UserAutomationExecutionPhase::UnknownOutcome {
