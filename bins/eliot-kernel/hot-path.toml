@@ -126,6 +126,51 @@ queue_id = "local_read_result"
 # in-flight item dimension is not separately enforced on main, so it is absent.
 bounds = { max_items = 64, max_bytes = 4194304, max_deadline_ms = 30000 }
 
+[[supported_operations]]
+operation = "improvement_decision_claim"
+operation_version = "1.0.0"
+owning_service = "eliot-kernel"
+entrypoint = "bins/eliot-kernel/src/hot_path_runtime.rs::claim_owner_decision"
+crate_closure = [
+  "eliot-kernel",
+  "eliot-contracts",
+  "eliot-ipc",
+  "eliot-kernel-core",
+  "eliot-protocol",
+  "eliot-runtime-contracts",
+]
+
+# No synchronous external call is declared on the claim leg. A claim is a read
+# of this composition's own bounded queue memory, so it crosses no process and
+# no network.
+synchronous_external_calls = []
+# An empty queue is a null result, not a wait, and not an error.
+fallback_or_degradation = { Unknown = {} }
+# #1734 owns profile production; no profile exists for this operation yet.
+hot_path_profile_ref = {}
+
+# The claim is bound to the session fence the owner's selection was
+# authenticated under, for the same reason `local_read_claim` is: a decision
+# admitted under one generation or authority epoch is not served to a daemon
+# sitting under another.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "session_state_fence.authority_epoch"
+revision_key = "session_state_fence.authority_epoch"
+
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "session_state_fence.resource_generation"
+revision_key = "session_state_fence.resource_generation"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "improvement_decision_claim"
+# 64 retained decisions and 8 MiB retained bytes, the same two bounds the other
+# claim leg registers: they are the values
+# `hot_path_runtime.rs::admit_owner_decision` charges against this queue's own
+# ledger. The time dimension is absent because nothing on this leg enforces a
+# deadline; a dimension whose bound is not established is left absent rather
+# than guessed.
+bounds = { max_items = 64, max_bytes = 8388608 }
+
 [[unsupported_operations]]
 operation = "eliot.query.packet"
 reason = "eliot.packet rides the same claim/result lifecycle but is served by the production campaign compiler; I2.15 places compiler and Context-compiler work in the cold path, so it is not a declared hot operation."

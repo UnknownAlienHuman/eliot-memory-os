@@ -1,6 +1,6 @@
 //! I12.14 runtime binding and bound enforcement for the Kernel hot spine.
 //!
-//! Two jobs, both at the real owner, neither a declaration:
+//! Three jobs, all at the real owner, none a declaration:
 //!
 //! 1. **Load and bind at runtime without build tooling** (I12.14 step 4).
 //!    [`KernelHotSpine::bind`] reads this crate's own `hot-path.toml` bytes once
@@ -37,9 +37,32 @@
 //! the owner received — before the expensive decode of the retained tool payload
 //! happens — and a refusal never partially acquires, so the owner is never
 //! charged for work it did not admit.
+//!
+//! 3. **Carry one authenticated owner's non-mutating decision to the daemon**
+//!    (I12.24:65, "decision owner selects reject / investigate / work item /
+//!    experiment"). A [`QueuedOwnerDecision`] is what an authenticated
+//!    `UserAutomation` operator request leaves behind when its disposition is
+//!    `reject` or `investigate`: the brief the selection was made over, the
+//!    closed disposition, the owner's note, and the principal the front-door
+//!    Session proved. The entry waits in this operation's own bounded queue and
+//!    is returned only by `KernelComposition::claim_owner_decision`, so no
+//!    other operation can read it or be attributed it.
+//!
+//!    Two limits of that claim are deliberate. It is a record and no effect:
+//!    only the two dispositions `OwnerDecisionKind::is_non_mutating` admits are
+//!    queued, and the entry names no automation, schedule, task, scope or
+//!    provider, so nothing it carries can reach an execution owner. And it is
+//!    Kernel-owned queue memory of exactly the same class as the bounded
+//!    local-read pairs above, not a durable store: the durable `Candidate`
+//!    document belongs to the improvement owner's own commit seam, and
+//!    `bins/AGENTS.md` forbids this composition root from acquiring one.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use eliot_ipc::PeerIdentity;
+use eliot_kernel_core::UserAutomationOperation;
+use eliot_protocol::RequestIdentity;
 use eliot_runtime_contracts::{
     AdmittedHotPathManifest, HotPathDegradation, HotPathQueueCapacity, RegisteredOperation,
     RegisteredQueueSettings, RunningBuildRegistration, admit_hot_path_manifest,
@@ -47,7 +70,7 @@ use eliot_runtime_contracts::{
 };
 
 use super::kernel_diagnostics::{EntrypointStage, KERNEL_DIAGNOSTICS_TARGET, bound_field};
-use super::{IpcImplementation, TransportError};
+use super::{IpcImplementation, Session, TransportError};
 
 /// The compiled-in bytes of this crate's own service-local I12.14 declaration.
 ///
@@ -71,6 +94,27 @@ const LOCAL_READ_QUEUE_ID: &str = "local_read_claim";
 /// identity: the queue identity is read back off the bind result, so the two
 /// cannot drift into checking one thing and enforcing another.
 const LOCAL_READ_OPERATION: &str = "local_read_claim";
+
+/// The declared operation an authenticated owner's non-mutating improvement
+/// decision is queued under, and the bounded queue identity it waits in.
+///
+/// One operation, one queue, one ledger: the two spellings are the same string
+/// because they are the same object, and the identity this process enforces is
+/// read back off the bind result rather than taken from the declaration.
+const OWNER_DECISION_OPERATION: &str = "improvement_decision_claim";
+const OWNER_DECISION_QUEUE_ID: &str = "improvement_decision_claim";
+
+/// The only dispositions this queue admits.
+///
+/// I12.24:65 names four. `reject` and `investigate` are the two
+/// `OwnerDecisionKind::is_non_mutating` admits and they change nothing, so a
+/// queued selection is a record and no effect. `work_item` and `experiment`
+/// reach effect only through the normal work-item/canary/rollback flow of
+/// I12.24:90-91, never through this shape, so admitting them here would make
+/// this queue an effect path it is not. They are spelled as literals for the
+/// same reason `IMPROVEMENT_BRIEF_DECISIONS` is: this crate must not acquire an
+/// `eliot-improvement` edge to name a Meta-owned enum on a Kernel boundary.
+const NON_MUTATING_OWNER_DECISIONS: [&str; 2] = ["reject", "investigate"];
 
 /// Observed hot-spine outcomes. Closed, bounded control codes — never prose,
 /// never a claim about a bound this process did not actually hit.
@@ -133,6 +177,54 @@ impl From<HotSpineError> for TransportError {
     }
 }
 
+/// One authenticated owner's non-mutating decision over an improvement brief,
+/// retained for the daemon that will commit it.
+///
+/// The entry is typed and closed: it carries the exact admitted request
+/// identity that produced it, the principal the front-door Session
+/// authenticated, the brief, the closed disposition and the owner's note. It
+/// carries nothing else — no automation identity, no schedule, no task, no
+/// scope, no provider — because there is nothing here that could start work.
+///
+/// The retained charge is the byte count this exact entry serialized to when it
+/// was admitted. It is recorded once and returned verbatim when the claim
+/// removes the entry, never recomputed, so the I12.14 ledger cannot drift away
+/// from the queue it bounds.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueuedOwnerDecision {
+    /// The exact admitted request identity that produced this entry.
+    pub identity: RequestIdentity,
+    /// The principal the front-door Session authenticated for that request.
+    pub principal: String,
+    /// Stable brief identity the owner selected a disposition over.
+    pub brief_id: String,
+    /// The closed disposition spelling the owner selected.
+    pub decision: String,
+    /// The owner's own note on the disposition.
+    pub note: String,
+    /// The exact byte count this entry's admission charged.
+    ///
+    /// This is the queue's own retained charge, not part of the payload, so it
+    /// is skipped in the serialization the charge is measured from. Measuring a
+    /// value that then changes would make the recorded charge a number the
+    /// retained entry no longer has.
+    #[serde(skip)]
+    pub held_bytes: u64,
+}
+
+/// The bounded queue one operation's owner decisions wait in.
+///
+/// This is the second enforced ledger, over its own queue identity and its own
+/// entries. Nothing else in the composition holds a reference to it, so an entry
+/// cannot be read by, completed by, or attributed to any other operation.
+struct OwnerDecisionQueue {
+    /// The I12.14 capacity this queue is admitted against.
+    capacity: HotPathQueueCapacity,
+    /// The retained entries, oldest first.
+    entries: VecDeque<QueuedOwnerDecision>,
+}
+
 /// The Kernel's live I12.14 binding plus the capacity it enforces.
 ///
 /// Construction happens once, during composition assembly, and requires the
@@ -146,6 +238,11 @@ pub(crate) struct KernelHotSpine {
     bound_operations: Vec<String>,
     /// The one capacity ledger the bounded local-read queue is admitted against.
     local_read: Mutex<HotPathQueueCapacity>,
+    /// The one capacity ledger and entry set the owner-decision queue is
+    /// admitted against. Independent of the local-read ledger above, so a
+    /// saturated query queue can never make an owner's selection unreadable and
+    /// a claimed decision can never occupy a query slot.
+    owner_decision: Mutex<OwnerDecisionQueue>,
 }
 
 impl KernelHotSpine {
@@ -205,10 +302,31 @@ impl KernelHotSpine {
             bound_queue.max_items,
             bound_queue.max_bytes,
         ));
+        // The same rule for the owner-decision ledger: a bind result without
+        // `OWNER_DECISION_OPERATION`, or with a different registered queue
+        // identity under it, refuses composition assembly rather than falling
+        // back onto a queue the bind never certified.
+        let bound_owner_queue = bound
+            .iter()
+            .find(|identity| identity.operation == OWNER_DECISION_OPERATION)
+            .map(|identity| &identity.registered_queue)
+            .ok_or(HotSpineError::DeclarationRefused)?;
+        if bound_owner_queue.queue_id != OWNER_DECISION_QUEUE_ID {
+            return Err(HotSpineError::DeclarationRefused);
+        }
+        let owner_decision = Mutex::new(OwnerDecisionQueue {
+            capacity: HotPathQueueCapacity::new(
+                &bound_owner_queue.queue_id,
+                bound_owner_queue.max_items,
+                bound_owner_queue.max_bytes,
+            ),
+            entries: VecDeque::new(),
+        });
         Ok(Self {
             admitted,
             bound_operations,
             local_read,
+            owner_decision,
         })
     }
 
@@ -330,6 +448,20 @@ fn kernel_running_registration() -> RunningBuildRegistration {
                     max_bytes: IpcImplementation::registered_frame_bytes() as u64,
                 },
             },
+            // The owner-decision claim is a claim leg, so it is registered
+            // against the same retained-item ceiling and the same in-flight
+            // queue byte bound the other claim leg registers. Those are the
+            // values `admit_owner_decision` actually enforces through its own
+            // ledger, and they are read from the constants this process
+            // enforces rather than from the declaration being checked.
+            RegisteredOperation {
+                operation: OWNER_DECISION_OPERATION.to_owned(),
+                queue: RegisteredQueueSettings {
+                    queue_id: OWNER_DECISION_QUEUE_ID.to_owned(),
+                    max_items: queued_items,
+                    max_bytes: IpcImplementation::registered_queue_bytes() as u64,
+                },
+            },
         ],
     }
 }
@@ -383,6 +515,148 @@ impl super::KernelComposition {
         );
         Ok(hot_spine)
     }
+
+    /// Admits one authenticated owner's non-mutating disposition over an
+    /// improvement brief into this operation's bounded claim queue
+    /// (I12.24:65).
+    ///
+    /// The principal is proved against the Session, not taken on trust. It must
+    /// be exactly the identity this front-door Session's authenticated peer
+    /// carries, which is what `authenticated_user_automation_principal(session)`
+    /// reads on the operator route; a request that cannot bind that identity is
+    /// refused, so a queued decision can never carry a self-declared string.
+    ///
+    /// Only `reject` and `investigate` are admitted. They are the two
+    /// dispositions `OwnerDecisionKind::is_non_mutating` admits, so the entry is
+    /// a record and no effect: I12.24:3 ("never silently rewrites code, policy
+    /// or memory authority") and I12.24:82's advisory class ("changes nothing
+    /// until owner acts") both hold. `work_item` and `experiment` are refused
+    /// rather than queued, because they reach effect only through the
+    /// work-item/canary/rollback flow of I12.24:90-91 and admitting them here
+    /// would turn this queue into an effect path it is not.
+    ///
+    /// The capacity is charged from the exact bytes this entry serializes to,
+    /// measured here and retained on the entry, so the claim returns the
+    /// recorded charge rather than a fresh measurement that could differ. A
+    /// refusal acquires nothing: nothing is queued, nothing is dropped, and
+    /// nothing is evicted.
+    pub fn admit_owner_decision(
+        &self,
+        session: &Session,
+        identity: &RequestIdentity,
+        principal: &str,
+        operation: &UserAutomationOperation,
+    ) -> Result<(), TransportError> {
+        let UserAutomationOperation::DecideImprovementBrief {
+            brief_id,
+            decision,
+            note,
+        } = operation
+        else {
+            return Err(TransportError::SessionFenced);
+        };
+        if !NON_MUTATING_OWNER_DECISIONS.contains(&decision.as_str()) {
+            return Err(TransportError::SessionFenced);
+        }
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !identity
+            .request
+            .state_fence
+            .is_compatible_with(&session.module_generation.state_fence)
+            || identity.request.state_fence.authority_epoch != session.authority_epoch
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let session_principal = match &session.peer {
+            PeerIdentity::Authenticated { user_identity, .. } => user_identity.as_str(),
+            PeerIdentity::Unavailable { .. } => {
+                return Err(TransportError::PeerIdentityUnavailable);
+            }
+        };
+        if session_principal != principal {
+            return Err(TransportError::PeerIdentityUnavailable);
+        }
+        let mut entry = QueuedOwnerDecision {
+            identity: identity.clone(),
+            principal: principal.to_owned(),
+            brief_id: brief_id.clone(),
+            decision: decision.clone(),
+            note: note.clone(),
+            held_bytes: 0,
+        };
+        let serialized = serde_json::to_vec(&entry).map_err(|_| TransportError::SessionFenced)?;
+        entry.held_bytes =
+            u64::try_from(serialized.len()).map_err(|_| TransportError::SessionFenced)?;
+        let mut queue = self
+            .hot_spine
+            .owner_decision
+            .lock()
+            .map_err(|_| HotSpineError::BoundSaturated)?;
+        queue
+            .capacity
+            .acquire(entry.held_bytes)
+            .map_err(|_| HotSpineError::BoundSaturated)?;
+        observe_hot_spine(
+            OWNER_DECISION_QUEUE_ID,
+            OUTCOME_ADMITTED,
+            queue.capacity.max_bytes(),
+            queue.capacity.held_bytes(),
+        );
+        queue.entries.push_back(entry);
+        Ok(())
+    }
+
+    /// Claims the oldest queued owner decision, or `None` when the queue is
+    /// empty.
+    ///
+    /// This is the only reader of the owner-decision queue, so an entry cannot
+    /// be returned by, or attributed to, any other operation. An entry whose
+    /// State Fence no longer admits this Session's generation, or whose
+    /// authority epoch has rotated, is skipped and left queued rather than
+    /// served stale, and the walk ends on the first entry this Session may
+    /// claim.
+    ///
+    /// The retained charge is returned as recorded at that entry's own
+    /// admission, so a claim is also the safe-release point for the slot. The
+    /// ledger's permit is not held any longer than the entry is: this queue has
+    /// one leg only, and after the claim the entry belongs to the daemon, not to
+    /// a Kernel-held result the Kernel is still waiting on.
+    pub fn claim_owner_decision(
+        &self,
+        session: &Session,
+    ) -> Result<Option<QueuedOwnerDecision>, TransportError> {
+        let mut queue = self
+            .hot_spine
+            .owner_decision
+            .lock()
+            .map_err(|_| HotSpineError::BoundSaturated)?;
+        let Some(position) = queue.entries.iter().position(|entry| {
+            entry
+                .identity
+                .request
+                .state_fence
+                .is_compatible_with(&session.module_generation.state_fence)
+                && entry.identity.request.state_fence.authority_epoch == session.authority_epoch
+        }) else {
+            // An empty queue is a null result, not a wait and not an error: the
+            // declared degradation for this operation is `Unknown`.
+            return Ok(None);
+        };
+        let entry = queue
+            .entries
+            .remove(position)
+            .ok_or(TransportError::SessionFenced)?;
+        queue.capacity.release(entry.held_bytes);
+        observe_hot_spine(
+            OWNER_DECISION_QUEUE_ID,
+            OUTCOME_RELEASED,
+            queue.capacity.max_items(),
+            queue.capacity.held_items(),
+        );
+        Ok(Some(entry))
+    }
 }
 
 #[cfg(test)]
@@ -394,7 +668,12 @@ mod tests {
         let spine = KernelHotSpine::bind().map_err(|error| format!("{error:?}"))?;
         assert_eq!(
             spine.bound_operations(),
-            ["local_read_claim", "local_read", "local_read_result"],
+            [
+                "local_read_claim",
+                "local_read",
+                "local_read_result",
+                "improvement_decision_claim",
+            ],
         );
         assert_eq!(
             spine.manifest_digest(),
