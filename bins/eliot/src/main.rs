@@ -4275,7 +4275,7 @@ fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i3
             ),
             "launch_composition": match &launch_composition {
                 Ok(composition) => {
-                    serde_json::to_value(composition).unwrap_or_else(|_| json!(null))
+                    serde_json::to_value(composition).unwrap_or(json!(null))
                 }
                 Err(error) => json!({
                     "state": "REFUSED",
