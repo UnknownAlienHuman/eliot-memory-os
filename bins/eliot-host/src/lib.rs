@@ -10863,16 +10863,14 @@ impl HostComposition {
         // `Cancelled` record plus the absent `DrainCommitRecord` prove the
         // linearization point has not passed, so this attempt is the
         // norm-mandated revalidation, not a second admission.
-        let cancelled_drain_awaits_revalidation =
-            activation.state == ActivationState::Draining
-                && snapshot.drain_commit.is_none()
-                && snapshot
-                    .drain
-                    .as_ref()
-                    .is_some_and(|drain| drain.state == DrainState::Cancelled);
+        let cancelled_drain_awaits_revalidation = activation.state == ActivationState::Draining
+            && snapshot.drain_commit.is_none()
+            && snapshot
+                .drain
+                .as_ref()
+                .is_some_and(|drain| drain.state == DrainState::Cancelled);
         if activation.fence.activation_generation != self.activation_generation
-            || !(activation.state == ActivationState::Active
-                || cancelled_drain_awaits_revalidation)
+            || !(activation.state == ActivationState::Active || cancelled_drain_awaits_revalidation)
         {
             self.readiness_gate.fail(
                 None,
