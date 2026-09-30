@@ -43,13 +43,19 @@ pub struct PoolCacheKey {
     pub artifact: Sha256Digest,
     /// Digest of the component configuration bound at build.
     pub component_configuration: Sha256Digest,
-    /// Digest of the pooled engine settings (naming pool capacity).
+    /// Digest of the pooled engine settings (naming pool capacity and the
+    /// full admitted invocation policy).
     pub engine_configuration: Sha256Digest,
 }
 
 /// Instance-pool capacity derived from the admitted limit envelope. Every
 /// capacity knob mirrors one admitted Store ceiling one for one; structural
-/// per-module knobs are not limits and keep wasmtime defaults.
+/// per-module knobs are not limits and keep wasmtime defaults. The full
+/// admitted envelope is additionally bound by digest (see `policy`): pool
+/// capacity alone does not identify the execution policy, so two envelopes
+/// that agree on capacity but differ on fuel, input/output, stack,
+/// deadline, epoch, host-call, or artifact-access ceilings never share a
+/// cache identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstancePoolConfig {
     /// Pool slots per engine: component/core instances, memories, and
@@ -61,19 +67,27 @@ pub struct InstancePoolConfig {
     pub max_memory_bytes: u64,
     /// Pool table elements per table. Mirrors `max_table_elements`.
     pub max_table_elements: u32,
+    /// Canonical digest of the full admitted [`InvocationLimits`] envelope
+    /// this capacity was derived from. Private by construction: the only
+    /// minting path is [`InstancePoolConfig::from_limits`], so no caller
+    /// can substitute a foreign policy digest and bypass cache identity.
+    policy: Sha256Digest,
 }
 
 impl InstancePoolConfig {
     /// Derives pool capacity from the admitted per-invocation limits. The
     /// limits arrive from the Governor-admitted envelope (manifest limits
     /// through the staged child argv); the pool interprets them as capacity,
-    /// never as authority.
+    /// never as authority. The whole envelope is digest-bound into the
+    /// pooled-configuration digest, so the cache key changes if and only if
+    /// the admitted policy changes.
     #[must_use]
     pub fn from_limits(limits: &InvocationLimits) -> Self {
         Self {
             total_instances: limits.max_instances,
             max_memory_bytes: limits.max_memory_bytes,
             max_table_elements: limits.max_table_elements,
+            policy: policy_digest(limits),
         }
     }
 
@@ -99,21 +113,65 @@ impl InstancePoolConfig {
 }
 
 /// Returns the canonical digest of the exact pooled engine settings for one
-/// pool capacity. The digest names the pinned Wasmtime generation, the host
-/// compilation target, the guest ABI world and its WIT digest, the fixed
-/// provider settings, and the capacity numbers; it changes if and only if
-/// those settings change. Structural knobs are recorded as wasmtime
+/// pool capacity and its admitted policy envelope. The digest names the
+/// pinned Wasmtime generation, the host compilation target, the guest ABI
+/// world and its WIT digest, the fixed provider settings, the capacity
+/// numbers, and the full admitted invocation policy; it changes if and only
+/// if those settings change. Structural knobs are recorded as wasmtime
 /// defaults, never silently absorbed.
 #[must_use]
 pub fn pooled_configuration_digest(pool: &InstancePoolConfig) -> Sha256Digest {
     Sha256Digest::of_bytes(pooled_configuration_descriptor(pool).as_bytes())
 }
 
+/// Canonical digest of the full admitted invocation-policy envelope.
+///
+/// Mirrors the key-sorting canonicalization of
+/// `eliot_wasm_runtime::types::canonical_digest` (which stays crate-private
+/// there, so the pool owns this copy): object keys sort before hashing, so
+/// the digest changes if and only if the admitted policy changes. New limit
+/// fields are picked up automatically through `Serialize`; a
+/// hand-written field list could silently drop a new ceiling out of the
+/// cache identity. Serialization of this closed envelope is infallible in
+/// practice; the deterministic failure marker keeps the function total
+/// without panicking, and it still binds mint and recheck to one digest, so
+/// it can never serve as a bypass.
+fn policy_digest(limits: &InvocationLimits) -> Sha256Digest {
+    let bytes = serde_json::to_value(limits)
+        .ok()
+        .map(canonical_json)
+        .and_then(|value| serde_json::to_vec(&value).ok());
+    match bytes {
+        Some(bytes) => Sha256Digest::of_bytes(&bytes),
+        None => Sha256Digest::of_bytes("eliot-wasm-host/policy-digest-unreachable".as_bytes()),
+    }
+}
+
+/// Recursively sorts JSON object keys so structurally equal policies hash
+/// equally regardless of serialization order.
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<_> = object.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut sorted = serde_json::Map::new();
+            for (key, value) in entries {
+                sorted.insert(key, canonical_json(value));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        scalar => scalar,
+    }
+}
+
 /// Canonical pooled-settings descriptor. Written out (not hashed incrementally)
 /// so the bound settings stay inspectable in receipts and reviews.
 fn pooled_configuration_descriptor(pool: &InstancePoolConfig) -> String {
     format!(
-        "wasmtime={PINNED_WASMTIME_VERSION};target={os}/{arch};component_model=true;typed_abi=guest.run;abi_digest={abi};max_wasm_stack={};max_epoch_deadline_ticks={MAX_EPOCH_DEADLINE_TICKS};allocation=pooling;pool_total_instances={};pool_max_memory_bytes={};pool_table_elements={};pool_structural=wasmtime-default;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true",
+        "wasmtime={PINNED_WASMTIME_VERSION};target={os}/{arch};component_model=true;typed_abi=guest.run;abi_digest={abi};max_wasm_stack={};max_epoch_deadline_ticks={MAX_EPOCH_DEADLINE_TICKS};allocation=pooling;pool_total_instances={};pool_max_memory_bytes={};pool_table_elements={};policy_digest={policy};pool_structural=wasmtime-default;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true",
         PROVIDER_STACK_SIZE,
         pool.total_instances,
         pool.max_memory_bytes,
@@ -121,6 +179,7 @@ fn pooled_configuration_descriptor(pool: &InstancePoolConfig) -> String {
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         abi = Sha256Digest::of_bytes(include_bytes!("../wit/guest.wit")).as_str(),
+        policy = pool.policy.as_str(),
     )
 }
 
@@ -165,9 +224,10 @@ impl ComponentPool {
     /// the digest-keyed cache. The presented artifact bytes and component
     /// configuration bytes are re-hashed against the key on every call, and
     /// the key's engine configuration is re-checked against this pool's own
-    /// settings: a key naming different bytes or settings is denied instead
-    /// of serving a foreign cached component, so the key can never bypass
-    /// identity. A hit returns the previously compiled pair without
+    /// settings (which bind the full admitted invocation policy, not just
+    /// pool capacity): a key naming different bytes, policy, or settings is
+    /// denied instead of serving a foreign cached component, so the key can
+    /// never bypass identity. A hit returns the previously compiled pair without
     /// recompiling; a miss compiles, inserts under the exact key, and
     /// returns the fresh pair.
     pub fn compile(
