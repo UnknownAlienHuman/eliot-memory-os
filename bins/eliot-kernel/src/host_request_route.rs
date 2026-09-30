@@ -6119,7 +6119,7 @@ impl KernelComposition {
                 // `with_live_bridge_application_binding`; without it there is
                 // no Governor-resolved scope to stage under.
                 let binding = retained.ok_or(TransportError::SessionFenced)?;
-                self.stage_bridge_event_durable(StageBridgeEventDurable {
+                self.stage_bridge_event_durable(&StageBridgeEventDurable {
                     session,
                     event,
                     evidence: &evidence,
@@ -6322,6 +6322,66 @@ impl KernelComposition {
         })
     }
 
+    /// Builds the staged ORS document for one durable/control bridge event:
+    /// envelope identity, the Governor-resolved owner binding refs, the
+    /// pre-persistence privacy verdict legs, and ingest provenance. Pure
+    /// projection of the staged inputs — no durable write.
+    fn stage_bridge_event_document(
+        args: &StageBridgeEventDurable<'_>,
+        legs: &BridgeEventPrivacyLegs<'_>,
+    ) -> Result<serde_json::Value, TransportError> {
+        let StageBridgeEventDurable {
+            session,
+            event,
+            evidence,
+            envelope_sha,
+            binding,
+            ..
+        } = *args;
+        Ok(serde_json::json!({
+            "stream_id": event.stream_id,
+            "event_id": event.event_id,
+            "sequence": event.sequence,
+            "producer_id": event.producer_id,
+            "producer_generation": event.producer_generation.value(),
+            "authority_epoch": bridge_epoch_text(&event.authority_epoch),
+            "envelope": serde_json::to_value(event)
+                .map_err(|_| TransportError::SessionFenced)?,
+            "envelope_sha256": envelope_sha,
+            "staging_connection": session.connection_id,
+            // Issue #1934: the Governor-resolved scope and the exact owner
+            // decision refs travel as separate staged legs beside the
+            // verdict, so the ORS stage entry can resolve the scope and the
+            // owner revision from its own durable activation row instead of
+            // trusting the verdict's own scope claim.
+            "work_scope_id": binding.work_scope_id,
+            "activation_ticket_id": binding.activation_ticket_id,
+            "activation_result_sha256": binding.resolution_result_sha256,
+            "privacy_disposition": legs.disposition,
+            "redacted_classes": legs.classes,
+            "redaction_reason": legs.reason,
+            // Issue #1934: the owner authorization travels with the decision so
+            // the ORS stage entry can re-verify that the verdict was reached
+            // over exactly these bytes, inside the scope it is about to bind,
+            // at the policy revision it names. Without it persistence is
+            // refused, never inferred.
+            "privacy_authorization": legs.authorization,
+            // Issue #1934: the ingest provenance travels with the decision so
+            // the ORS row answers the I7.23 storage list after restart. The
+            // requested route is the closed wire operation that reached this
+            // entry — the only forward operation that can — and the adapter
+            // version is this adapter's own revision, never a producer-side
+            // version this Kernel cannot observe.
+            "adapter_version": BRIDGE_EVENT_ADAPTER_VERSION,
+            "requested_route": AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
+            "owner_principal": evidence.principal,
+            "owner_authority_lineage": evidence.authority_lineage,
+            "owner_connection": evidence.connection,
+            "owner_launch_nonce": evidence.launch_nonce,
+            "owner_session_epoch": evidence.session_epoch,
+        }))
+    }
+
     /// Stages one durable/control event with its pre-persistence privacy
     /// decision and records the Governor-intake handoff (Implements #2561,
     /// I7.23 + I5(i)).
@@ -6342,7 +6402,7 @@ impl KernelComposition {
     /// safe-to-resubmit answer.
     fn stage_bridge_event_durable(
         &self,
-        args: StageBridgeEventDurable<'_>,
+        args: &StageBridgeEventDurable<'_>,
     ) -> Result<serde_json::Value, TransportError> {
         let StageBridgeEventDurable {
             session,
@@ -6351,51 +6411,10 @@ impl KernelComposition {
             envelope_sha,
             privacy,
             expired,
-            binding,
-        } = args;
+            ..
+        } = *args;
         let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
-        let staged = serde_json::json!({
-            "stream_id": event.stream_id,
-            "event_id": event.event_id,
-            "sequence": event.sequence,
-            "producer_id": event.producer_id,
-            "producer_generation": event.producer_generation.value(),
-            "authority_epoch": bridge_epoch_text(&event.authority_epoch),
-            "envelope": serde_json::to_value(event)
-                .map_err(|_| TransportError::SessionFenced)?,
-            "envelope_sha256": envelope_sha,
-            "staging_connection": session.connection_id,
-            // Issue #1934: the Governor-resolved scope and the exact owner
-            // decision refs travel as separate staged legs beside the
-            // verdict, so the ORS stage entry can resolve the scope and the
-            // owner revision from its own durable activation row instead of
-            // trusting the verdict's own scope claim.
-            "work_scope_id": binding.work_scope_id,
-            "activation_ticket_id": binding.activation_ticket_id,
-            "activation_result_sha256": binding.resolution_result_sha256,
-            "privacy_disposition": privacy_legs.disposition,
-            "redacted_classes": privacy_legs.classes,
-            "redaction_reason": privacy_legs.reason,
-            // Issue #1934: the owner authorization travels with the decision so
-            // the ORS stage entry can re-verify that the verdict was reached
-            // over exactly these bytes, inside the scope it is about to bind,
-            // at the policy revision it names. Without it persistence is
-            // refused, never inferred.
-            "privacy_authorization": privacy_legs.authorization,
-            // Issue #1934: the ingest provenance travels with the decision so
-            // the ORS row answers the I7.23 storage list after restart. The
-            // requested route is the closed wire operation that reached this
-            // entry — the only forward operation that can — and the adapter
-            // version is this adapter's own revision, never a producer-side
-            // version this Kernel cannot observe.
-            "adapter_version": BRIDGE_EVENT_ADAPTER_VERSION,
-            "requested_route": AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
-            "owner_principal": evidence.principal,
-            "owner_authority_lineage": evidence.authority_lineage,
-            "owner_connection": evidence.connection,
-            "owner_launch_nonce": evidence.launch_nonce,
-            "owner_session_epoch": evidence.session_epoch,
-        });
+        let staged = Self::stage_bridge_event_document(args, &privacy_legs)?;
         let outcome = match self
             .generation_gateway
             .ors
