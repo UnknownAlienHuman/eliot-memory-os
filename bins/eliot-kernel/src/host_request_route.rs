@@ -4590,6 +4590,17 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        if stored.capability_ref.as_str() != OBSERVE_CAPABILITY {
+            // Issue #1739 W3: the observe result leg serves only the
+            // admitted `eliot.observe` lane — the same lane join the shared
+            // submit leg enforces. A stored capability outside the serving
+            // lane is a requested-versus-actual route divergence, never a
+            // silent fence.
+            self.audit_observe(AuditEventDraft::route_mismatch_submit(
+                session, &stored, lane,
+            ));
+            return Err(TransportError::SessionFenced);
+        }
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
         // canonical readback rather than a second completion.
@@ -4605,6 +4616,12 @@ impl KernelComposition {
         self.audit_observe(AuditEventDraft::result_native_raw_appended(
             session, body, &stored, None, lane,
         ));
+        // Issue #1739 W3: a submission must carry the current wire version
+        // and the governed attempt — the same submission join the shared
+        // submit leg enforces. Legacy readback versions stay readable
+        // through the replay path above but can never complete an operation.
+        body.validate_for_submission()
+            .map_err(|_| TransportError::SessionFenced)?;
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return self.expired_claim_timeout(ExpiredClaimObservation {
                 session: Some(session),
