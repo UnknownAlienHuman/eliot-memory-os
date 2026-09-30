@@ -2880,10 +2880,15 @@ impl BridgeRecoveryReadBudget {
 /// the admitted producer, the local stream (or the explicit unbound marker
 /// for connection-level gaps), the stream incarnation, and the creating
 /// session occurrence. The last-staging connection is observation metadata
-/// on the cursor/event rows, never scope material here. Rows are immutable
-/// once written in this scope: incarnation and revision are assigned by
-/// the store, never by the caller, so an expected-owner/revision check
-/// detects any owner change between resolution and commit.
+/// on the cursor/event rows, never scope material here. The creating
+/// binding is immutable once written; the revision is the store-assigned
+/// capability/session/grant revision and advances on every acknowledgement
+/// commit that moves the namespace's acked frontier, so an
+/// expected-owner/revision check inside the acknowledgement transaction
+/// detects any grant change — revocation or concurrent acknowledgement —
+/// between resolution and commit. Incarnation is assigned once at first
+/// bind; re-creation under a new incarnation belongs to retention
+/// (#2731), which owns no writer here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeStreamOwnerRow {
@@ -2968,10 +2973,10 @@ impl BridgeStreamOwnerRow {
                 reason: "bridge stream owner incarnation is store-assigned at first bind",
             });
         }
-        if self.revision != BRIDGE_STREAM_OWNER_INITIAL_REVISION {
+        if self.revision == 0 {
             return Err(OrsError::InvalidField {
                 field: "revision",
-                reason: "bridge stream owner revision is store-assigned at first bind",
+                reason: "bridge stream owner revision is a nonzero store-assigned grant revision",
             });
         }
         Ok(())
@@ -3045,9 +3050,13 @@ struct BridgeOwnerEvidence {
 }
 
 /// One parsed acknowledgement-batch item: the resolved namespace with
-/// its expected owner revision/incarnation, the presenter's lineage and
-/// principal for the in-transaction equality recheck, and the requested
-/// sequence.
+/// its expected owner revision/incarnation, the presenter's lineage,
+/// principal, installation, and live session occurrence for the
+/// in-transaction rights recheck, optional owner-issued continuity
+/// evidence for an authenticated reconnect, and the requested sequence.
+/// The logical identity (namespace) only selects the row; the
+/// acknowledgement right is re-proved from this evidence inside the
+/// commit transaction.
 struct BridgeAckItem {
     namespace: String,
     expected_revision: u64,
@@ -3055,6 +3064,43 @@ struct BridgeAckItem {
     sequence: u64,
     lineage: String,
     principal: String,
+    installation_id: String,
+    connection: String,
+    launch_nonce: String,
+    session_epoch: u64,
+    continuity: Option<(String, String, u64)>,
+}
+
+impl BridgeAckItem {
+    /// Rebuilds the presenter's owner-evidence object for the
+    /// in-transaction rights recheck (issue #2729, AUD3). The fields
+    /// were validated at parse time; this only reframes them.
+    fn presenter(&self) -> serde_json::Value {
+        let mut presenter = serde_json::json!({
+            "owner_authority_lineage": &self.lineage,
+            "owner_principal": &self.principal,
+            "owner_installation_id": &self.installation_id,
+            "owner_connection": &self.connection,
+            "owner_launch_nonce": &self.launch_nonce,
+            "owner_session_epoch": self.session_epoch,
+        });
+        if let Some((connection, launch_nonce, session_epoch)) = &self.continuity {
+            let object = presenter.as_object_mut().expect("presenter is an object");
+            object.insert(
+                "owner_continuity_connection".to_owned(),
+                serde_json::Value::String(connection.clone()),
+            );
+            object.insert(
+                "owner_continuity_launch_nonce".to_owned(),
+                serde_json::Value::String(launch_nonce.clone()),
+            );
+            object.insert(
+                "owner_continuity_session_epoch".to_owned(),
+                serde_json::Value::from(*session_epoch),
+            );
+        }
+        presenter
+    }
 }
 
 /// Parsed inputs for one owner-checked stage (issue #2729): the bound
@@ -13185,6 +13231,70 @@ impl RedbRecoveryStore {
         Ok(connection)
     }
 
+    /// Extracts the presenter's live session occurrence from Kernel-derived
+    /// owner evidence (issue #2729, AUD2): the installation plus the
+    /// connection, launch nonce, and session epoch of the currently admitted
+    /// transport session. All four fields are required and validated like
+    /// the stage evidence; a presenter without a full occurrence proves no
+    /// right.
+    fn bridge_owner_occurrence_from(
+        value: &serde_json::Value,
+    ) -> Result<(String, String, String, u64), OrsError> {
+        Ok((
+            Self::bridge_owner_field(value, "owner_installation_id")?,
+            bridge_text(value, "owner_connection")?,
+            bridge_text(value, "owner_launch_nonce")?,
+            Self::bridge_owner_epoch(value)?,
+        ))
+    }
+
+    /// Extracts owner-issued continuity evidence from Kernel-derived owner
+    /// evidence (issue #2729, AUD2): the creating connection, launch nonce,
+    /// and session epoch the admitted creator retained from its bind,
+    /// presented by an authenticated reconnect whose live session differs.
+    /// All three continuity fields must be present together or all absent:
+    /// a half-supplied continuity claim fails closed. Absent continuity is
+    /// `Ok(None)` — the live occurrence alone decides.
+    fn bridge_owner_continuity_from(
+        value: &serde_json::Value,
+    ) -> Result<Option<(String, String, u64)>, OrsError> {
+        let connection = value.get("owner_continuity_connection");
+        let launch_nonce = value.get("owner_continuity_launch_nonce");
+        let session_epoch = value.get("owner_continuity_session_epoch");
+        if connection.is_none() && launch_nonce.is_none() && session_epoch.is_none() {
+            return Ok(None);
+        }
+        let connection = value
+            .get("owner_continuity_connection")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: "owner_continuity_connection",
+                reason: "continuity evidence must carry the creating connection, launch nonce, and session epoch together",
+            })?;
+        bridge_owner_component(connection, "owner_continuity_connection")?;
+        let launch_nonce = value
+            .get("owner_continuity_launch_nonce")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: "owner_continuity_launch_nonce",
+                reason: "continuity evidence must carry the creating connection, launch nonce, and session epoch together",
+            })?;
+        bridge_owner_component(launch_nonce, "owner_continuity_launch_nonce")?;
+        let session_epoch = value
+            .get("owner_continuity_session_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|epoch| *epoch != 0)
+            .ok_or(OrsError::InvalidField {
+                field: "owner_continuity_session_epoch",
+                reason: "continuity evidence must carry the creating connection, launch nonce, and session epoch together",
+            })?;
+        Ok(Some((
+            connection.to_owned(),
+            launch_nonce.to_owned(),
+            session_epoch,
+        )))
+    }
+
     /// Computes the versioned owner-namespace digest for one admitted
     /// stream (issue #2729). The digest binds the namespace literal, the
     /// authority lineage, the principal, the producer, and the local
@@ -15969,6 +16079,109 @@ impl RedbRecoveryStore {
         Ok(row)
     }
 
+    /// Records a new capability/session/grant revision on one stream owner
+    /// row after an acknowledgement advance committed under a proved grant
+    /// (issue #2729, AUD3/AUD6). The creating binding — lineage,
+    /// principal, producer, local scope, installation, and creating
+    /// occurrence — is never rewritten; only the grant revision advances,
+    /// so history is preserved while concurrent batches resolved under the
+    /// old grant fail with [`OrsError::StaleWriterEpoch`]. The namespace's
+    /// cursor scans are carried forward to the new revision (same owner,
+    /// same incarnation, same positions) instead of restarting at zero.
+    /// Overflow fails closed with [`OrsError::ProjectionLimitExceeded`].
+    fn revise_bridge_stream_owner_on_ack_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+        expected_revision: u64,
+        expected_incarnation: u64,
+    ) -> Result<u64, OrsError> {
+        let mut row = Self::load_bridge_owner_row_in(write, namespace)?;
+        if row.kind != BRIDGE_STREAM_OWNER_KIND_STREAM {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        if row.revision != expected_revision || row.incarnation != expected_incarnation {
+            return Err(OrsError::StaleWriterEpoch);
+        }
+        let revised = row
+            .revision
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        row.revision = revised;
+        row.validate()?;
+        {
+            let mut owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+            owners
+                .insert(namespace, encode(&row)?.as_str())
+                .map_err(storage)?;
+        }
+        if let Some(mut cursor) = Self::load_bridge_cursor_row_in(write, namespace)? {
+            cursor.validate()?;
+            if cursor.owner_namespace != namespace {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_cursor",
+                    reason: "checked cursor row carries a foreign owner namespace".to_owned(),
+                });
+            }
+            Self::carry_bridge_scan_grant_forward(
+                cursor.handoff_repair_scan.as_mut(),
+                expected_revision,
+                expected_incarnation,
+                revised,
+            );
+            Self::carry_bridge_scan_grant_forward(
+                cursor.handoff_retirement_scan.as_mut(),
+                expected_revision,
+                expected_incarnation,
+                revised,
+            );
+            Self::carry_bridge_scan_grant_forward(
+                cursor.handoff_reconcile_scan.as_mut(),
+                expected_revision,
+                expected_incarnation,
+                revised,
+            );
+            Self::carry_bridge_scan_grant_forward(
+                cursor.position_drain_scan.as_mut(),
+                expected_revision,
+                expected_incarnation,
+                revised,
+            );
+            if let Some(complete) = cursor.handoff_reconcile_complete.as_mut() {
+                if complete.owner_revision == expected_revision
+                    && complete.owner_incarnation == expected_incarnation
+                {
+                    complete.owner_revision = revised;
+                }
+            }
+            cursor.validate()?;
+            let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            cursors
+                .insert(namespace, encode(&cursor)?.as_str())
+                .map_err(storage)?;
+        }
+        Ok(revised)
+    }
+
+    /// Carries one handoff scan cursor forward across a grant revision
+    /// advance (issue #2729, AUD6): the scan keeps its position and
+    /// recovery view because the owner, incarnation, and positions did not
+    /// change — only the grant revision did. A scan bound to any other
+    /// revision is left alone; its own recheck fails it closed.
+    fn carry_bridge_scan_grant_forward(
+        scan: Option<&mut BridgeEventHandoffScanCursor>,
+        expected_revision: u64,
+        expected_incarnation: u64,
+        revised: u64,
+    ) {
+        if let Some(scan) = scan {
+            if scan.owner_revision == expected_revision
+                && scan.owner_incarnation == expected_incarnation
+            {
+                scan.owner_revision = revised;
+            }
+        }
+    }
+
     /// Verifies the presented expected revision/incarnation against the
     /// stored owner row and returns the checked access object (issue
     /// #2729). A mismatch is [`OrsError::StaleWriterEpoch`]: ownership
@@ -15987,6 +16200,70 @@ impl RedbRecoveryStore {
             namespace: row.namespace.clone(),
             right,
         })
+    }
+
+    /// Proves the requested right from current Session/continuity evidence
+    /// instead of the calling store method selecting it (issue #2729,
+    /// AUD2/AUD3). The logical stream identity (namespace) only selects the
+    /// retained row; the right is granted only when the presenter's live
+    /// session occurrence equals the row's creating occurrence — the
+    /// current producer/session grant — or when the presenter supplies
+    /// owner-issued continuity evidence (the retained creating occurrence)
+    /// for a read/recover or acknowledge right. Continuity never grants
+    /// append or gap publication: fresh events and new gaps require the
+    /// live session. The expected revision/incarnation must equal the
+    /// stored row — a mismatch is [`OrsError::StaleWriterEpoch`], so a
+    /// grant change between resolution and commit fails the batch with
+    /// nothing mutated. Anything else is
+    /// [`OrsError::RecoveryOwnerMismatch`].
+    fn check_bridge_stream_access_presented(
+        row: &BridgeStreamOwnerRow,
+        expected_revision: u64,
+        expected_incarnation: u64,
+        right: BridgeStreamRight,
+        presenter: &serde_json::Value,
+    ) -> Result<BridgeStreamAccess, OrsError> {
+        if row.revision != expected_revision || row.incarnation != expected_incarnation {
+            return Err(OrsError::StaleWriterEpoch);
+        }
+        let (lineage, principal) = Self::bridge_owner_presenter_from(presenter)?;
+        let (installation, connection, launch_nonce, session_epoch) =
+            Self::bridge_owner_occurrence_from(presenter)?;
+        if row.authority_lineage != lineage || row.principal != principal {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        if row.owner_version == BRIDGE_STREAM_OWNER_VERSION
+            && row.installation_id != installation
+        {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let live_grant = row.creating_connection == connection
+            && row.creating_launch_nonce == launch_nonce
+            && row.creating_session_epoch == session_epoch;
+        if live_grant {
+            return Ok(BridgeStreamAccess {
+                namespace: row.namespace.clone(),
+                right,
+            });
+        }
+        if matches!(
+            right,
+            BridgeStreamRight::ReadRecover | BridgeStreamRight::Acknowledge
+        ) {
+            let continuity = Self::bridge_owner_continuity_from(presenter)?;
+            if let Some((continuity_connection, continuity_nonce, continuity_epoch)) = continuity {
+                if row.creating_connection == continuity_connection
+                    && row.creating_launch_nonce == continuity_nonce
+                    && row.creating_session_epoch == continuity_epoch
+                {
+                    return Ok(BridgeStreamAccess {
+                        namespace: row.namespace.clone(),
+                        right,
+                    });
+                }
+            }
+        }
+        Err(OrsError::RecoveryOwnerMismatch)
     }
 
     /// Reads the per-namespace durable/acked cursors inside a write
@@ -17093,10 +17370,17 @@ impl RedbRecoveryStore {
                 &stage.namespace,
                 now_ms,
             )?;
+            // The bind just proved the full creating binding — lineage,
+            // principal, producer, local scope, installation, and creating
+            // occurrence — against the retained row, which is the current
+            // producer/session grant for fresh append. The expected
+            // revision is the row's own current grant revision: it
+            // advances on acknowledgement, so a fixed initial constant
+            // would reject every stage after the first acknowledgement.
             let access = Self::check_bridge_stream_access(
                 &owner,
-                BRIDGE_STREAM_OWNER_INITIAL_REVISION,
-                BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
+                owner.revision,
+                owner.incarnation,
                 BridgeStreamRight::Append,
             )?;
             match Self::check_bridge_retained_replay_in(
@@ -17941,15 +18225,20 @@ impl RedbRecoveryStore {
         }))
     }
 
-    /// Finds the stream owner rows matching one presenter and local name
-    /// inside a write transaction (issue #2729). Used where the presented
-    /// entry names no producer (acknowledgement frontier, scoped gap):
-    /// exactly one match resolves; zero or several fail closed with
-    /// [`OrsError::RecoveryOwnerMismatch`] instead of guessing.
+    /// Finds the stream owner rows matching one presenter, installation, and
+    /// local name inside a write transaction (issue #2729, AUD2). Used
+    /// where the presented entry names no producer (acknowledgement
+    /// frontier, scoped gap): exactly one match resolves; zero or several
+    /// fail closed with [`OrsError::RecoveryOwnerMismatch`] instead of
+    /// guessing. The installation narrows selection so one OS principal
+    /// never authorizes across installations; legacy rows predating the
+    /// installation binding stay selectable but still face the occurrence
+    /// proof at the access check, never silent adoption.
     fn find_stream_owners_in(
         write: &redb::WriteTransaction,
         lineage: &str,
         principal: &str,
+        installation_id: &str,
         local: &str,
     ) -> Result<Vec<BridgeStreamOwnerRow>, OrsError> {
         let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
@@ -17961,6 +18250,8 @@ impl RedbRecoveryStore {
             if row.kind == BRIDGE_STREAM_OWNER_KIND_STREAM
                 && row.authority_lineage == lineage
                 && row.principal == principal
+                && (row.installation_id == installation_id
+                    || row.owner_version == BRIDGE_STREAM_OWNER_LEGACY_VERSION)
                 && row.local_stream == local
             {
                 matched.push(row);
@@ -17969,13 +18260,15 @@ impl RedbRecoveryStore {
         Ok(matched)
     }
 
-    /// Finds the stream owner rows matching one presenter and local name
-    /// under a read transaction (issue #2729). Read-only counterpart of
-    /// [`Self::find_stream_owners_in`] for the pre-commit resolution step.
+    /// Finds the stream owner rows matching one presenter, installation,
+    /// and local name under a read transaction (issue #2729, AUD2).
+    /// Read-only counterpart of [`Self::find_stream_owners_in`] for the
+    /// pre-commit resolution step.
     fn find_stream_owners_for(
         database: &Database,
         lineage: &str,
         principal: &str,
+        installation_id: &str,
         local: &str,
     ) -> Result<Vec<BridgeStreamOwnerRow>, OrsError> {
         let read = database.begin_read().map_err(storage)?;
@@ -17988,6 +18281,8 @@ impl RedbRecoveryStore {
             if row.kind == BRIDGE_STREAM_OWNER_KIND_STREAM
                 && row.authority_lineage == lineage
                 && row.principal == principal
+                && (row.installation_id == installation_id
+                    || row.owner_version == BRIDGE_STREAM_OWNER_LEGACY_VERSION)
                 && row.local_stream == local
             {
                 matched.push(row);
@@ -17997,23 +18292,41 @@ impl RedbRecoveryStore {
     }
 
     /// Resolves one acknowledgement-frontier entry to its admitted owner
-    /// namespace without mutating anything (issue #2729, item 3). The
-    /// evidence carries the presenter's lineage and principal plus the
-    /// local stream; the producer comes from the retained binding, never
-    /// from the entry. Zero or ambiguous matches fail the whole batch
-    /// closed at the route: a foreign or stale item changes no cursor.
+    /// namespace without mutating anything (issue #2729, item 3, AUD2).
+    /// The evidence carries the presenter's lineage, principal,
+    /// installation, and live session occurrence plus the local stream;
+    /// the producer and its continuity come from the retained binding,
+    /// never from the entry. Selection narrows by installation, then the
+    /// acknowledge right is proved from the presented occurrence — the
+    /// live session or owner-issued continuity evidence — against the
+    /// retained creating occurrence. Zero matches, ambiguous matches, or
+    /// an unproven presenter fail the whole batch closed at the route: a
+    /// foreign or stale item changes no cursor.
     pub fn resolve_bridge_ack_item(
         &self,
         evidence: &serde_json::Value,
         local_stream: &str,
     ) -> Result<serde_json::Value, OrsError> {
         let (lineage, principal) = Self::bridge_owner_presenter_from(evidence)?;
+        let (installation, _, _, _) = Self::bridge_owner_occurrence_from(evidence)?;
         bridge_identity_text(local_stream, "stream_id")?;
-        let matched =
-            Self::find_stream_owners_for(&self.database, &lineage, &principal, local_stream)?;
+        let matched = Self::find_stream_owners_for(
+            &self.database,
+            &lineage,
+            &principal,
+            &installation,
+            local_stream,
+        )?;
         let [row] = matched.as_slice() else {
             return Err(OrsError::RecoveryOwnerMismatch);
         };
+        Self::check_bridge_stream_access_presented(
+            row,
+            row.revision,
+            row.incarnation,
+            BridgeStreamRight::Acknowledge,
+            evidence,
+        )?;
         Ok(json!({
             "namespace": row.namespace,
             "incarnation": row.incarnation,
@@ -18022,22 +18335,31 @@ impl RedbRecoveryStore {
     }
 
     /// Applies one accepted acknowledgement batch atomically (issue #2729,
-    /// item 3). Every item carries the resolved namespace with its
-    /// expected revision/incarnation plus the presenter's lineage and
-    /// principal and the requested sequence. The single write transaction
-    /// first validates every item — shape, contradictory duplicates,
-    /// stored binding, expected revision/incarnation, lineage/principal
-    /// equality, and phase/frontier — and only then advances the cursors.
-    /// Producer acknowledgement does not compact retained payloads or
-    /// projections; those remain pending until receiver-owned terminal
-    /// evidence exists. Any failure aborts the transaction, so a foreign or
-    /// stale item changes no batch cursor or retained payload. The commit
-    /// is the last fallible operation: after it, only infallible JSON
-    /// assembly remains, so a storage/response failure past the commit is
-    /// an unknown/replayable result, never evidence that nothing
-    /// happened. No atomicity with the separate Governor store is
-    /// claimed: handoff reconciliation stays a separate step owned by the
-    /// route.
+    /// item 3, AUD3/AUD6). Every item carries the resolved namespace with
+    /// its expected revision/incarnation plus the presenter's lineage,
+    /// principal, installation, live session occurrence, optional
+    /// continuity evidence, and the requested sequence. The single write
+    /// transaction first validates every item — shape, contradictory
+    /// duplicates, stored binding, expected revision/incarnation proved
+    /// against the CURRENT row, lineage/principal/installation equality,
+    /// live-or-continuity occurrence proof, and phase/frontier — and only
+    /// then advances the cursors. Each frontier advance records a new
+    /// store-assigned grant revision on the owner row, so a grant change
+    /// between resolution and commit fails a concurrent batch with
+    /// [`OrsError::StaleWriterEpoch`]. Producer acknowledgement does not
+    /// compact retained payloads or projections; those remain pending
+    /// until receiver-owned terminal evidence exists. Any failure aborts
+    /// the transaction, so a foreign or stale item changes no batch cursor
+    /// or retained payload. The commit is the last fallible operation:
+    /// after it, only infallible JSON assembly remains, so a
+    /// storage/response failure past the commit is an unknown/replayable
+    /// result, never evidence that nothing happened. No atomicity with the
+    /// separate Governor store is claimed: handoff reconciliation stays a
+    /// separate step owned by the route.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "atomic ack keeps per-item validation, rights re-proof, cursor advance, and grant revision in one reviewable transaction"
+    )]
     pub fn acknowledge_bridge_event_batch(
         &self,
         batch: &serde_json::Value,
@@ -18060,17 +18382,20 @@ impl RedbRecoveryStore {
         let mut outcomes = Vec::with_capacity(parsed.len());
         for item in &parsed {
             let owner = Self::load_bridge_owner_row_in(&write, &item.namespace)?;
-            if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
-                || owner.authority_lineage != item.lineage
-                || owner.principal != item.principal
-            {
+            if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
-            let access = Self::check_bridge_stream_access(
+            // The acknowledgement right is re-proved here, inside the
+            // commit transaction, from the presenter's current
+            // Session/continuity evidence — never selected by the caller.
+            // A grant change between resolution and commit fails closed.
+            let presenter = item.presenter();
+            let access = Self::check_bridge_stream_access_presented(
                 &owner,
                 item.expected_revision,
                 item.expected_incarnation,
                 BridgeStreamRight::Acknowledge,
+                &presenter,
             )?;
             let (durable, mut acked) = Self::bridge_cursors_in_checked(&write, &access)?;
             let prior_acked = acked;
@@ -18097,6 +18422,16 @@ impl RedbRecoveryStore {
             }
             let pruned = 0_u64;
             if acked > prior_acked {
+                // The frontier moved under a proved grant: record the new
+                // grant revision before the recovery rebind below, so the
+                // rebind observes the current owner and carries the scans
+                // forward instead of restarting them.
+                Self::revise_bridge_stream_owner_on_ack_in(
+                    &write,
+                    &access.namespace,
+                    item.expected_revision,
+                    item.expected_incarnation,
+                )?;
                 let previous_revision =
                     prior_recovery_revision.ok_or(OrsError::IntegrityProblem {
                         record_type: "bridge_event_recovery_revision",
@@ -18127,8 +18462,9 @@ impl RedbRecoveryStore {
 
     /// Parses and deduplicates one acknowledgement batch (issue #2729).
     /// Contradictory duplicate entries — the same namespace twice with a
-    /// different sequence, lineage, principal, or expectation — fail the
-    /// whole batch; exact duplicates collapse to one item.
+    /// different sequence, lineage, principal, installation, occurrence,
+    /// continuity, or expectation — fail the whole batch; exact duplicates
+    /// collapse to one item.
     fn parse_bridge_ack_batch(items: &[serde_json::Value]) -> Result<Vec<BridgeAckItem>, OrsError> {
         let mut parsed: Vec<BridgeAckItem> = Vec::with_capacity(items.len());
         for item in items {
@@ -18168,6 +18504,9 @@ impl RedbRecoveryStore {
                 });
             }
             let (lineage, principal) = Self::bridge_owner_presenter_from(item)?;
+            let (installation_id, connection, launch_nonce, session_epoch) =
+                Self::bridge_owner_occurrence_from(item)?;
+            let continuity = Self::bridge_owner_continuity_from(item)?;
             let candidate = BridgeAckItem {
                 namespace,
                 expected_revision,
@@ -18175,6 +18514,11 @@ impl RedbRecoveryStore {
                 sequence,
                 lineage,
                 principal,
+                installation_id,
+                connection,
+                launch_nonce,
+                session_epoch,
+                continuity,
             };
             if let Some(prior) = parsed
                 .iter()
@@ -18185,6 +18529,11 @@ impl RedbRecoveryStore {
                     || prior.expected_incarnation != candidate.expected_incarnation
                     || prior.lineage != candidate.lineage
                     || prior.principal != candidate.principal
+                    || prior.installation_id != candidate.installation_id
+                    || prior.connection != candidate.connection
+                    || prior.launch_nonce != candidate.launch_nonce
+                    || prior.session_epoch != candidate.session_epoch
+                    || prior.continuity != candidate.continuity
                 {
                     return Err(OrsError::InvalidField {
                         field: "ack_batch",
@@ -18753,16 +19102,30 @@ impl RedbRecoveryStore {
             write,
             &parsed.lineage,
             &parsed.principal,
+            &parsed.installation_id,
             &parsed.stream_id,
         )?;
         let [owner] = matched.as_slice() else {
             return Err(OrsError::RecoveryOwnerMismatch);
         };
-        let access = Self::check_bridge_stream_access(
+        // Scoped gaps ride the stream's retained owner: the publish right
+        // is proved from the reporter's live session occurrence, never
+        // from lineage and principal alone. Continuity evidence cannot
+        // publish — a new gap requires the live session.
+        let presenter = serde_json::json!({
+            "owner_authority_lineage": &parsed.lineage,
+            "owner_principal": &parsed.principal,
+            "owner_installation_id": &parsed.installation_id,
+            "owner_connection": &parsed.connection,
+            "owner_launch_nonce": &parsed.launch_nonce,
+            "owner_session_epoch": parsed.session_epoch,
+        });
+        let access = Self::check_bridge_stream_access_presented(
             owner,
             owner.revision,
             owner.incarnation,
             BridgeStreamRight::PublishGap,
+            &presenter,
         )?;
         let key = format!("{}::{gap}", access.namespace, gap = parsed.gap_id);
         Ok((access.namespace, key))
