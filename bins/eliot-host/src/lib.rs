@@ -12019,6 +12019,20 @@ impl HostComposition {
                 }
             }
             #[cfg(windows)]
+            if !degraded_recovery_stop {
+                // I14.23/I1.5 #1686 item 6: the persisted DrainCommit is the
+                // linearization point, not the retirement proof. While the
+                // committed generation still names live lease references, the
+                // Kernel/ORS owner barrier must prove no live obligation
+                // remains before Store/Kernel processes are retired; its
+                // refusal keeps both running as explicit incomplete recovery
+                // instead of becoming a clean shutdown.
+                if let Err(error) = self.require_committed_drain_retirement_barrier() {
+                    self.shutdown_failed = true;
+                    return Err(error);
+                }
+            }
+            #[cfg(windows)]
             {
                 let store = self.jobs.terminate_store();
                 let kernel = self.jobs.terminate_kernel();

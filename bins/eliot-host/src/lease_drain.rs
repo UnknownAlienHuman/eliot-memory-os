@@ -450,4 +450,77 @@ impl HostComposition {
             kernel_process_start_time_100ns: kernel_process.start_time_100ns,
         })
     }
+
+    /// Requires the Kernel/ORS owner retirement proof before Host irreversibly
+    /// retires a committed drain generation (I14.23, I1.5 idle-drain steps
+    /// 5-8; #1686 item 6).
+    ///
+    /// The caller is the Host stop path, immediately before Store/Kernel
+    /// process termination: a `DrainCommit` persisted through the installation
+    /// serialization is the linearization point, not the retirement proof,
+    /// because the commit fences obligations without proving them
+    /// dispositioned. When the committed generation still names live lease
+    /// references, the exact generation retirement barrier
+    /// ([`Self::require_generation_retirement_barrier`]: the Kernel
+    /// closed-admission acknowledgement plus the exact-fence canonical ORS
+    /// census) must prove no live owner obligation remains; its refusal keeps
+    /// Kernel and Store running and surfaces as explicit incomplete recovery
+    /// with the exact residual. A commit that names no lease reference needs
+    /// no barrier: references lapse only after their owners prove no live
+    /// obligation, and the clean-marker gate still refuses on any open
+    /// store-rebind or unfenced lease. Runtime references without the
+    /// supervision-keyed census identity the barrier queries by fail closed
+    /// here rather than terminating under unproven authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable state cannot be read, the commit is
+    /// bound outside the current activation fence, runtime obligations remain
+    /// without a census identity, or the owner barrier refuses retirement.
+    pub fn require_committed_drain_retirement_barrier(&mut self) -> Result<(), HostError> {
+        let state = self.journal.snapshot()?;
+        let activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "drain retirement barrier has no durable Host activation".to_owned(),
+            )
+        })?;
+        let commit = match state.drain_commit.as_ref() {
+            Some(commit) => commit,
+            None => return Ok(()),
+        };
+        if commit.fence != activation.fence {
+            return Err(HostError::RecoveryRequired(
+                "drain retirement barrier found a DrainCommit outside the current activation fence; reconcile the current generation before retiring it"
+                    .to_owned(),
+            ));
+        }
+        let runtime_named = !activation.runtime_lease_refs.is_empty();
+        let supervision_named = !activation.supervision_lease_refs.is_empty();
+        if !runtime_named && !supervision_named {
+            return Ok(());
+        }
+        if !supervision_named {
+            return Err(HostError::RecoveryRequired(
+                "committed drain still names runtime obligations without a supervision-keyed owner census identity; reconcile the runtime leases through their owner before retiring the generation"
+                    .to_owned(),
+            ));
+        }
+        let expected = GenerationRetirementFence {
+            activation_id: activation.activation_id.clone(),
+            activation_generation: activation.fence.activation_generation.clone(),
+            state_fence: {
+                let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+                    HostError::ProcessContour(
+                        "generation retirement has no current approved Kernel launch".to_owned(),
+                    )
+                })?;
+                StateFence::new(
+                    activation.lineage.kernel_epoch.clone(),
+                    launch.authority_generation,
+                )
+            },
+        };
+        self.require_generation_retirement_barrier(&expected)?;
+        Ok(())
+    }
 }
