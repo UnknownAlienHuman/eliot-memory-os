@@ -73,6 +73,7 @@ use eliot_agent_coordinator::{
 use eliot_agent_coordinator::{OwnerCurrentness, PresentedClaimMaterial};
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
+use eliot_store_api::{StoreError, SwarmOwnerRevision, WriteReceipt, WriteReceiptStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1138,6 +1139,12 @@ pub enum FabricError {
     /// The definition/admission/execution ownership join is broken.
     #[error("fabric broken ownership link: {0}")]
     BrokenOwnershipLink(String),
+    /// A revision was presented for reporting as current without the canonical
+    /// Store transaction that durably persists it. The typed Store refusal
+    /// rides unchanged; the revision is never published from an uncommitted or
+    /// unknown write (issue #1702 W2, I1.8 canonical write path).
+    #[error("fabric revision not durable: {0}")]
+    RevisionNotDurable(StoreError),
     /// Cancellation was requested but its terminal reconciliation has not been
     /// observed; the two remain distinct.
     #[error("fabric cancellation requested: {0}")]
@@ -1183,6 +1190,95 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
         }
         other => FabricError::Contract(format!("semantic contract: {other}")),
     }
+}
+
+/// Requires the canonical Store transaction that durably persists one
+/// owner-separated revision, before that revision may be published as current
+/// (issue #1702 W2, I1.8 canonical write path).
+///
+/// The in-memory owner maps this module reports through
+/// [`AgentFabric::semantic_join_view`] and [`AgentFabric::snapshot`] are a
+/// projection, not an authority: publishing into them is the "report as
+/// current" step, so the durable write has to be complete first. This gate is
+/// what makes the ordering non-invertible — the caller cannot obtain the
+/// [`WriteReceipt`] without the Store having committed the record, its
+/// compare-and-set head and the outbox row in one transaction, and a revision
+/// with no such receipt is refused rather than published. A crash between the
+/// commit and the publish leaves the durable record present and the projection
+/// merely absent, which recovery reconstructs; the reverse order would leave a
+/// reader believing in a revision that does not exist.
+///
+/// The binding is the receipt's own ordering head, not a caller label: the
+/// receipt must be `Committed` under
+/// [`eliot_store_api::TransitionClass::TaskControl`] and must carry the head
+/// for exactly this owner stream at exactly this revision, so a receipt for
+/// another owner or an earlier revision of this one cannot authorize a
+/// different record. The record's own bytes, digest and expected-predecessor
+/// progression are re-checked through [`SwarmOwnerRevision::validate`], the
+/// existing Store contract — never re-derived here.
+///
+/// `record` is the semantic record the caller wants published, as its JSON
+/// value. [`SwarmOwnerRevision::validate`] has already established that
+/// `record_json` is the canonical encoding and that `content_digest` binds
+/// those exact bytes, so comparing the decoded value here is an exact
+/// comparison of the committed content: the published revision is the revision
+/// the Store holds, not one that merely shares its identity and revision
+/// number.
+///
+/// # Errors
+///
+/// Returns [`FabricError::RevisionNotDurable`] carrying the typed
+/// [`StoreError`] when the owner revision is malformed, when it does not carry
+/// `record` verbatim, or when the receipt is absent, non-committed, of another
+/// transition class, or bound to another owner stream or revision.
+fn require_durable_owner_revision(
+    owner_revision: &SwarmOwnerRevision,
+    receipt: &WriteReceipt,
+    record: &serde_json::Value,
+) -> Result<(), FabricError> {
+    owner_revision
+        .validate()
+        .map_err(FabricError::RevisionNotDurable)?;
+    if serde_json::from_str::<serde_json::Value>(&owner_revision.record_json)
+        .ok()
+        .as_ref()
+        != Some(record)
+    {
+        return Err(FabricError::RevisionNotDurable(StoreError::InvalidField {
+            field: "swarm.record_json",
+            reason: "committed owner record does not bind the presented revision bytes",
+        }));
+    }
+    receipt
+        .validate()
+        .map_err(FabricError::RevisionNotDurable)?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(FabricError::RevisionNotDurable(StoreError::InvalidReceipt));
+    }
+    if receipt.transition_class != eliot_store_api::TransitionClass::TaskControl {
+        return Err(FabricError::RevisionNotDurable(StoreError::InvalidField {
+            field: "swarm.receipt.transition_class",
+            reason: "owner revisions commit under the task-control class",
+        }));
+    }
+    let scope = owner_revision
+        .ordering_scope()
+        .map_err(FabricError::RevisionNotDurable)?;
+    let head = receipt
+        .ordering_sequences
+        .iter()
+        .find(|head| head.scope == scope)
+        .ok_or(FabricError::RevisionNotDurable(StoreError::InvalidField {
+            field: "swarm.receipt.ordering_sequences",
+            reason: "receipt does not carry the presented owner stream",
+        }))?;
+    if head.sequence != owner_revision.revision {
+        return Err(FabricError::RevisionNotDurable(StoreError::InvalidField {
+            field: "swarm.receipt.ordering_sequences",
+            reason: "receipt commits another revision of the presented owner stream",
+        }));
+    }
+    Ok(())
 }
 
 /// Maps a staffing-policy rejection onto the fabric vocabulary (issue #1963).
@@ -2268,10 +2364,19 @@ impl AgentFabric {
     /// Freezing (`DRAFT → FROZEN` with otherwise identical content) replaces
     /// the stored draft; any other same-identity change is a conflict.
     ///
+    /// The revision is published as current only after the canonical Store
+    /// transaction that durably persists it committed: `owner_revision` and
+    /// `receipt` are that transaction's owner record and its receipt, checked
+    /// by [`require_durable_owner_revision`] before anything enters the
+    /// in-memory owner map. Publishing first and persisting afterwards would
+    /// let a reader observe a revision no Store holds.
+    ///
     /// # Errors
     ///
     /// Returns the semantic contract rejection,
-    /// [`FabricError::StaleOwnerLease`] for a foreign or stale controller, or
+    /// [`FabricError::StaleOwnerLease`] for a foreign or stale controller,
+    /// [`FabricError::RevisionNotDurable`] when the durable commit is absent or
+    /// does not bind this exact owner stream and revision, or
     /// [`FabricError::DefinitionConflict`] for changed content under a live
     /// identity.
     pub fn register_semantic_definition(
@@ -2279,10 +2384,16 @@ impl AgentFabric {
         definition: SwarmPlanDefinition,
         controller_holder: &str,
         controller_epoch: u64,
+        owner_revision: &SwarmOwnerRevision,
+        receipt: &WriteReceipt,
     ) -> Result<(), FabricError> {
         definition.validate().map_err(contract_rejection)?;
         check_definition_author(&definition, controller_holder, controller_epoch)
             .map_err(contract_rejection)?;
+        let record = serde_json::to_value(&definition).map_err(|error| {
+            FabricError::Contract(format!("semantic definition encode: {error}"))
+        })?;
+        require_durable_owner_revision(owner_revision, receipt, &record)?;
         if !matches!(
             definition.lifecycle,
             SwarmPlanDefinitionLifecycle::Draft | SwarmPlanDefinitionLifecycle::Frozen
@@ -2324,19 +2435,32 @@ impl AgentFabric {
     /// for one definition conflicts, so a new definition revision always
     /// yields a distinct admission.
     ///
+    /// The admission is published as current only after the canonical Store
+    /// transaction that durably persists it committed; see
+    /// [`AgentFabric::register_semantic_definition`] for the ordering this
+    /// preserves.
+    ///
     /// # Errors
     ///
     /// Returns the semantic contract rejection,
     /// [`FabricError::BrokenOwnershipLink`] when the definition is unknown,
     /// not frozen, or not bound exactly, [`FabricError::SemanticDrift`] when
-    /// admitted ceilings widen the definition, or
+    /// admitted ceilings widen the definition,
+    /// [`FabricError::RevisionNotDurable`] when the durable commit is absent or
+    /// does not bind this exact owner stream and revision, or
     /// [`FabricError::DefinitionConflict`] for a second admission identity on
     /// one definition.
     pub fn bind_semantic_admission(
         &mut self,
         admission: SwarmPlanAdmission,
+        owner_revision: &SwarmOwnerRevision,
+        receipt: &WriteReceipt,
     ) -> Result<(), FabricError> {
         admission.validate().map_err(contract_rejection)?;
+        let record = serde_json::to_value(&admission).map_err(|error| {
+            FabricError::Contract(format!("semantic admission encode: {error}"))
+        })?;
+        require_durable_owner_revision(owner_revision, receipt, &record)?;
         let definition_key = admission.definition_id.as_str().to_owned();
         let definition = self
             .semantic_definitions
@@ -2404,14 +2528,23 @@ impl AgentFabric {
     /// crash commits nothing twice); a different disposition must still pass
     /// the lifecycle.
     ///
+    /// The new disposition is published as current only after the canonical
+    /// Store transaction that durably persists it committed; see
+    /// [`AgentFabric::register_semantic_definition`] for the ordering this
+    /// preserves.
+    ///
     /// # Errors
     ///
-    /// Returns [`FabricError::Contract`] for an unknown admission, or the
-    /// semantic contract rejection for an illegal disposition transition.
+    /// Returns [`FabricError::Contract`] for an unknown admission,
+    /// [`FabricError::RevisionNotDurable`] when the durable commit is absent or
+    /// does not bind this exact owner stream and revision, or the semantic
+    /// contract rejection for an illegal disposition transition.
     pub fn note_semantic_admission_disposition(
         &mut self,
         admission_id: &SwarmAdmissionId,
         disposition: SwarmPlanAdmissionDisposition,
+        owner_revision: &SwarmOwnerRevision,
+        receipt: &WriteReceipt,
     ) -> Result<(), FabricError> {
         let key = admission_id.as_str().to_owned();
         let stored =
@@ -2428,6 +2561,10 @@ impl AgentFabric {
             .decide(disposition)
             .map_err(contract_rejection)?;
         admission.validate().map_err(contract_rejection)?;
+        let record = serde_json::to_value(&admission).map_err(|error| {
+            FabricError::Contract(format!("semantic admission encode: {error}"))
+        })?;
+        require_durable_owner_revision(owner_revision, receipt, &record)?;
         self.semantic_admissions.insert(key.clone(), admission);
         self.record("semantic_admission_disposition_noted", &key);
         Ok(())
@@ -2448,21 +2585,34 @@ impl AgentFabric {
     /// Terminal states are retained verbatim: history is never rewritten and
     /// `UNKNOWN_OUTCOME` never becomes a clean failure here.
     ///
+    /// The execution revision is published as current only after the canonical
+    /// Store transaction that durably persists it committed; see
+    /// [`AgentFabric::register_semantic_definition`] for the ordering this
+    /// preserves.
+    ///
     /// # Errors
     ///
     /// Returns [`FabricError::Contract`] when the definition or admission is
     /// unknown, [`FabricError::StaleOwnerLease`] for a stale or foreign
     /// coordinator, [`FabricError::Superseded`] for a new identity under a
-    /// superseded definition, the semantic contract rejection for a broken
-    /// join, or [`FabricError::DefinitionConflict`] for changed content under
-    /// a live execution identity.
+    /// superseded definition, [`FabricError::RevisionNotDurable`] when the
+    /// durable commit is absent or does not bind this exact owner stream and
+    /// revision, the semantic contract rejection for a broken join, or
+    /// [`FabricError::DefinitionConflict`] for changed content under a live
+    /// execution identity.
     pub fn record_semantic_execution(
         &mut self,
         execution: SwarmExecutionRevision,
         coordinator_holder: &str,
         coordinator_epoch: u64,
+        owner_revision: &SwarmOwnerRevision,
+        receipt: &WriteReceipt,
     ) -> Result<(), FabricError> {
         execution.validate().map_err(contract_rejection)?;
+        let record = serde_json::to_value(&execution).map_err(|error| {
+            FabricError::Contract(format!("semantic execution encode: {error}"))
+        })?;
+        require_durable_owner_revision(owner_revision, receipt, &record)?;
         if !execution
             .coordinator
             .authorizes(coordinator_holder, coordinator_epoch)
@@ -2527,18 +2677,28 @@ impl AgentFabric {
     /// replays exactly; presenting a stale epoch or a foreign holder fails
     /// with [`FabricError::StaleOwnerLease`].
     ///
+    /// The rebound execution revision is published as current only after the
+    /// canonical Store transaction that durably persists it committed; see
+    /// [`AgentFabric::register_semantic_definition`] for the ordering this
+    /// preserves. Retained effects and coverage are never rewritten by the
+    /// rebind, so the durable record and the published revision stay the same
+    /// bytes.
+    ///
     /// # Errors
     ///
     /// Returns [`FabricError::Contract`] for an unknown execution,
     /// [`FabricError::StaleOwnerLease`] for a presenter outside the incoming
-    /// lease or a non-advancing epoch, or the mapped semantic rejection
-    /// otherwise.
+    /// lease or a non-advancing epoch, [`FabricError::RevisionNotDurable`]
+    /// when the durable commit is absent or does not bind this exact owner
+    /// stream and revision, or the mapped semantic rejection otherwise.
     pub fn reassign_semantic_coordinator(
         &mut self,
         execution_id: &SwarmExecutionId,
         new_coordinator: &SwarmCoordinatorLease,
         presenter_holder: &str,
         presenter_epoch: u64,
+        owner_revision: &SwarmOwnerRevision,
+        receipt: &WriteReceipt,
     ) -> Result<(), FabricError> {
         if !new_coordinator.authorizes(presenter_holder, presenter_epoch) {
             return Err(FabricError::StaleOwnerLease("swarm coordinator".to_owned()));
@@ -2553,6 +2713,10 @@ impl AgentFabric {
             return Ok(());
         }
         let next = reassign_coordinator(&stored, new_coordinator).map_err(contract_rejection)?;
+        let record = serde_json::to_value(&next).map_err(|error| {
+            FabricError::Contract(format!("semantic execution encode: {error}"))
+        })?;
+        require_durable_owner_revision(owner_revision, receipt, &record)?;
         self.semantic_executions.insert(key.clone(), next);
         self.record("semantic_coordinator_reassigned", &key);
         Ok(())
@@ -2647,9 +2811,17 @@ impl AgentFabric {
     /// Controller acknowledgement after a crash records no duplicate
     /// revision); any other reuse of the replacement identity conflicts.
     ///
+    /// The replacement revision and its supersession link are published as
+    /// current only after the canonical Store transaction that durably persists
+    /// them committed; see [`AgentFabric::register_semantic_definition`] for
+    /// the ordering this preserves. The prior frozen record stays verbatim, so
+    /// the durable history and the published history are the same bytes.
+    ///
     /// # Errors
     ///
-    /// Returns the semantic contract rejection, or
+    /// Returns the semantic contract rejection,
+    /// [`FabricError::RevisionNotDurable`] when the durable commit is absent or
+    /// does not bind this exact owner stream and revision, or
     /// [`FabricError::DefinitionConflict`] when the replacement identity is
     /// already registered with different bytes.
     pub fn supersede_semantic_definition(
@@ -2657,8 +2829,14 @@ impl AgentFabric {
         next: SwarmPlanDefinition,
         controller_holder: &str,
         controller_epoch: u64,
+        owner_revision: &SwarmOwnerRevision,
+        receipt: &WriteReceipt,
     ) -> Result<(), FabricError> {
         next.validate().map_err(contract_rejection)?;
+        let record = serde_json::to_value(&next).map_err(|error| {
+            FabricError::Contract(format!("semantic definition encode: {error}"))
+        })?;
+        require_durable_owner_revision(owner_revision, receipt, &record)?;
         let link = next.supersedes.clone().ok_or_else(|| {
             FabricError::BrokenOwnershipLink("replacement without supersedes link".to_owned())
         })?;
