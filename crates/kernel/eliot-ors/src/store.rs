@@ -71,7 +71,8 @@ use crate::{
     AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
-    BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
+    BackupVerificationDisposition, BackupVerificationResultRecord, BridgeEventOwnerNamespace,
+    BridgeEventOwnerResource, BridgeEventOwnerScope, CanonicalDisposition,
     CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
     CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
     CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
@@ -795,7 +796,13 @@ const BRIDGE_STREAM_OWNER_NAMESPACE: &str = "eliot.bridge-event.stream-owner.v1"
 /// establish reconnect rights.
 const BRIDGE_GAP_OWNER_NAMESPACE: &str = "eliot.bridge-event.gap-owner.v2";
 /// Version of the bridge-stream owner binding carried by every owner row.
-const BRIDGE_STREAM_OWNER_VERSION: u16 = 1;
+/// Version 2 rows additionally bind the installation identity and the
+/// explicit owner scope (application session/attempt or unbound observation)
+/// compared on every reuse; version 1 rows predate that binding and remain
+/// readable under their original keys without migration.
+const BRIDGE_STREAM_OWNER_VERSION: u16 = 2;
+/// Row version predating the installation/scope binding (issue #2729).
+const BRIDGE_STREAM_OWNER_LEGACY_VERSION: u16 = 1;
 /// Incarnation assigned at the first admitted bind of a stream namespace.
 /// Re-creation under a new incarnation belongs to retention/recreation
 /// (#2731), which owns no writer here: the store assigns this value, never
@@ -2830,6 +2837,19 @@ struct BridgeStreamOwnerRow {
     authority_lineage: String,
     principal: String,
     producer: String,
+    /// Installation identity bound at first bind (issue #2729). Absent on
+    /// legacy version 1 rows, which predate the binding.
+    #[serde(default)]
+    installation_id: String,
+    /// Application-session owner scope for version 2 rows; exactly one of
+    /// the session scope and the unbound observation scope is present.
+    /// All absent on legacy version 1 rows.
+    #[serde(default)]
+    owner_session_id: Option<String>,
+    #[serde(default)]
+    owner_attempt_id: Option<String>,
+    #[serde(default)]
+    owner_observation_scope_id: Option<String>,
     creating_connection: String,
     creating_launch_nonce: String,
     creating_session_epoch: u64,
@@ -2843,10 +2863,12 @@ impl BridgeStreamOwnerRow {
         if self.contract_version != crate::CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
         }
-        if self.owner_version != BRIDGE_STREAM_OWNER_VERSION {
+        if self.owner_version != BRIDGE_STREAM_OWNER_VERSION
+            && self.owner_version != BRIDGE_STREAM_OWNER_LEGACY_VERSION
+        {
             return Err(OrsError::InvalidField {
                 field: "owner_version",
-                reason: "bridge stream owner binding carries the current owner version",
+                reason: "bridge stream owner binding carries a known owner version",
             });
         }
         crate::model::validate_digest(&self.namespace, "owner_namespace")?;
@@ -2879,6 +2901,14 @@ impl BridgeStreamOwnerRow {
             }
         } else {
             bridge_owner_component(&self.producer, "producer")?;
+        }
+        if self.owner_version == BRIDGE_STREAM_OWNER_VERSION {
+            bridge_owner_component(&self.installation_id, "installation_id")?;
+            let _scope = bridge_owner_scope_from_parts(
+                self.owner_session_id.as_deref(),
+                self.owner_attempt_id.as_deref(),
+                self.owner_observation_scope_id.as_deref(),
+            )?;
         }
         crate::model::validate_text(&self.creating_connection, "creating_connection")?;
         crate::model::validate_text(&self.creating_launch_nonce, "creating_launch_nonce")?;
@@ -2955,15 +2985,70 @@ impl BridgeStreamAccess {
 /// fence only — never from bridge-authored session text. The store treats
 /// every field as an untrusted input to the namespace digest and the
 /// stored-row equality check, never as authority: a forged digest selects
-/// at most another row, which then fails the field-equality check.
+/// at most another row, which then fails the field-equality check. The
+/// installation and the owner scope (application session/attempt or an
+/// explicitly unbound observation scope) enter the versioned namespace
+/// digest and the stored-row equality check; the last-staging connection
+/// stays observation metadata only.
 struct BridgeOwnerEvidence {
     lineage: String,
     principal: String,
     producer: String,
     local: String,
+    installation_id: String,
+    session_id: Option<String>,
+    attempt_id: Option<String>,
+    observation_scope_id: Option<String>,
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
+}
+
+impl BridgeOwnerEvidence {
+    /// Projects the typed versioned owner scope for the namespace digest.
+    fn owner_scope(&self) -> Result<BridgeEventOwnerScope, OrsError> {
+        bridge_owner_scope_from_parts(
+            self.session_id.as_deref(),
+            self.attempt_id.as_deref(),
+            self.observation_scope_id.as_deref(),
+        )
+    }
+}
+
+/// Projects the typed versioned owner scope from its staged parts (issue
+/// #2729): exactly one of an application session (optionally narrowed to
+/// one attempt) and an explicitly unbound observation scope must be
+/// present. An absent scope fails closed — it is never defaulted — and an
+/// attempt without its session is contradictory.
+fn bridge_owner_scope_from_parts(
+    session_id: Option<&str>,
+    attempt_id: Option<&str>,
+    observation_scope_id: Option<&str>,
+) -> Result<BridgeEventOwnerScope, OrsError> {
+    match (session_id, attempt_id, observation_scope_id) {
+        (Some(session_id), attempt_id, None) => {
+            bridge_owner_component(session_id, "owner_session_id")?;
+            if let Some(attempt_id) = attempt_id {
+                bridge_owner_component(attempt_id, "owner_attempt_id")?;
+            }
+            Ok(BridgeEventOwnerScope::ApplicationSession {
+                session_id: OpaqueLabel::new(session_id.to_owned())?,
+                attempt_id: attempt_id
+                    .map(|attempt_id| OpaqueLabel::new(attempt_id.to_owned()))
+                    .transpose()?,
+            })
+        }
+        (None, None, Some(observation_scope_id)) => {
+            bridge_owner_component(observation_scope_id, "owner_observation_scope_id")?;
+            Ok(BridgeEventOwnerScope::UnboundObservation {
+                observation_scope_id: OpaqueLabel::new(observation_scope_id.to_owned())?,
+            })
+        }
+        _ => Err(OrsError::InvalidField {
+            field: "owner_session_id",
+            reason: "bridge event owner evidence binds exactly one application session or one explicit unbound observation scope",
+        }),
+    }
 }
 
 /// One parsed acknowledgement-batch item: the resolved namespace with
@@ -3007,6 +3092,10 @@ struct BridgeCheckedGap {
     staging_connection: String,
     lineage: String,
     principal: String,
+    installation_id: String,
+    session_id: Option<String>,
+    attempt_id: Option<String>,
+    observation_scope_id: Option<String>,
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
@@ -11420,14 +11509,22 @@ impl RedbRecoveryStore {
     /// ([`Self::bridge_event_privacy_staging`]) is against the identical
     /// value it records as `admitted_scope`.
     pub fn bridge_event_privacy_scope(
+        installation_id: &str,
         authority_lineage: &str,
         principal: &str,
         producer_id: &str,
         stream_id: &str,
+        owner_scope: &BridgeEventOwnerScope,
         work_scope_id: &str,
     ) -> Result<String, OrsError> {
-        let namespace =
-            Self::bridge_stream_owner_digest(authority_lineage, principal, producer_id, stream_id)?;
+        let namespace = Self::bridge_stream_owner_digest(
+            installation_id,
+            authority_lineage,
+            principal,
+            producer_id,
+            stream_id,
+            owner_scope,
+        )?;
         Self::bridge_event_privacy_scope_for(&namespace, work_scope_id)
     }
 
@@ -12992,6 +13089,27 @@ impl RedbRecoveryStore {
         Ok(text.to_owned())
     }
 
+    /// Extracts one optional owner text component from a staged JSON
+    /// object. An absent or null field is no evidence; a present field is
+    /// validated exactly like a required owner component.
+    fn bridge_owner_optional_field(
+        value: &serde_json::Value,
+        field: &'static str,
+    ) -> Result<Option<String>, OrsError> {
+        let Some(field_value) = value.get(field) else {
+            return Ok(None);
+        };
+        if field_value.is_null() {
+            return Ok(None);
+        }
+        let text = field_value.as_str().ok_or(OrsError::InvalidField {
+            field,
+            reason: "bridge event owner evidence must carry text",
+        })?;
+        bridge_owner_component(text, field)?;
+        Ok(Some(text.to_owned()))
+    }
+
     /// Extracts the creating session epoch from a staged JSON object.
     fn bridge_owner_epoch(value: &serde_json::Value) -> Result<u64, OrsError> {
         let epoch = value
@@ -13012,9 +13130,10 @@ impl RedbRecoveryStore {
 
     /// Extracts the Kernel-derived stream owner evidence from a staged
     /// JSON object (issue #2729). The producer and local stream ride the
-    /// top-level identity fields; the lineage, principal, and creating
-    /// occurrence ride the `owner_*` fields the Kernel route derived from
-    /// the retained Session and the presenting fence.
+    /// top-level identity fields; the lineage, principal, installation,
+    /// owner scope, and creating occurrence ride the `owner_*` fields the
+    /// Kernel route derived from the retained Session and the presenting
+    /// fence.
     fn bridge_stream_evidence_from(
         staged: &serde_json::Value,
     ) -> Result<BridgeOwnerEvidence, OrsError> {
@@ -13037,6 +13156,13 @@ impl RedbRecoveryStore {
             principal: Self::bridge_owner_field(staged, "owner_principal")?,
             producer,
             local,
+            installation_id: Self::bridge_owner_field(staged, "owner_installation_id")?,
+            session_id: Self::bridge_owner_optional_field(staged, "owner_session_id")?,
+            attempt_id: Self::bridge_owner_optional_field(staged, "owner_attempt_id")?,
+            observation_scope_id: Self::bridge_owner_optional_field(
+                staged,
+                "owner_observation_scope_id",
+            )?,
             connection: bridge_text(staged, "owner_connection")?,
             launch_nonce: bridge_text(staged, "owner_launch_nonce")?,
             session_epoch: Self::bridge_owner_epoch(staged)?,
@@ -13063,25 +13189,34 @@ impl RedbRecoveryStore {
     }
 
     /// Computes the versioned owner-namespace digest for one admitted
-    /// stream (issue #2729). The digest binds the namespace literal, the
-    /// authority lineage, the principal, the producer, and the local
-    /// stream as labeled `\x1f`-separated components — the same unambiguous
-    /// encoding as the #2571 logical key — so distinct admitted producers
-    /// using the same local name remain distinct namespaces.
+    /// stream (issue #2729). The digest is the canonical v3 digest of the
+    /// typed [`BridgeEventOwnerNamespace`]: installation, authority
+    /// lineage, principal, producer, explicit owner scope
+    /// (application session/attempt or unbound observation), and local
+    /// stream at the store-assigned incarnation — so distinct admitted
+    /// producers using the same local stream name remain distinct
+    /// namespaces. Key-separator validation is enforced by the typed
+    /// namespace itself, never by delimiter-joined key construction.
     fn bridge_stream_owner_digest(
+        installation_id: &str,
         lineage: &str,
         principal: &str,
         producer: &str,
         local: &str,
+        owner_scope: &BridgeEventOwnerScope,
     ) -> Result<String, OrsError> {
-        bridge_owner_component(lineage, "owner_authority_lineage")?;
-        bridge_owner_component(principal, "owner_principal")?;
-        bridge_owner_component(producer, "producer_id")?;
-        bridge_owner_component(local, "stream_id")?;
-        let text = format!(
-            "{BRIDGE_STREAM_OWNER_NAMESPACE}\x1flineage={lineage}\x1fprincipal={principal}\x1fproducer={producer}\x1fstream={local}"
-        );
-        Ok(crate::model::sha256_hex(text.as_bytes()))
+        let namespace = BridgeEventOwnerNamespace {
+            installation_id: OpaqueLabel::new(installation_id.to_owned())?,
+            authority_lineage: OpaqueLabel::new(lineage.to_owned())?,
+            principal: OpaqueLabel::new(principal.to_owned())?,
+            producer_id: OpaqueLabel::new(producer.to_owned())?,
+            owner_scope: owner_scope.clone(),
+            resource: BridgeEventOwnerResource::Stream {
+                local_stream: OpaqueLabel::new(local.to_owned())?,
+                incarnation: BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
+            },
+        };
+        namespace.namespace_digest()
     }
 
     /// Computes the v2 owner-namespace digest for one connection-level gap
@@ -15771,10 +15906,13 @@ impl RedbRecoveryStore {
     /// #2729): the first admitted bind durably retains the binding with
     /// its store-assigned incarnation and revision, while a later bind
     /// under the same namespace must present the identical binding —
-    /// changed lineage, principal, producer, local scope, or creating
-    /// connection/launch-nonce/session-epoch occurrence fails with
-    /// [`OrsError::DuplicateConflict`] and never overwrites the retained
-    /// owner. Enforces the owner-table bound for fresh namespaces.
+    /// changed lineage, principal, producer, local scope, installation,
+    /// owner scope, or creating connection/launch-nonce/session-epoch
+    /// occurrence fails with [`OrsError::DuplicateConflict`] and never
+    /// overwrites the retained owner. The namespace key already binds the
+    /// versioned identity; the field comparison keeps a stored row honest
+    /// against its key. Enforces the owner-table bound for fresh
+    /// namespaces.
     fn bind_bridge_stream_owner_in(
         write: &redb::WriteTransaction,
         evidence: &BridgeOwnerEvidence,
@@ -15801,6 +15939,11 @@ impl RedbRecoveryStore {
                 || row.principal != evidence.principal
                 || row.producer != evidence.producer
                 || row.local_stream != evidence.local
+                || row.installation_id != evidence.installation_id
+                || row.owner_session_id.as_deref() != evidence.session_id.as_deref()
+                || row.owner_attempt_id.as_deref() != evidence.attempt_id.as_deref()
+                || row.owner_observation_scope_id.as_deref()
+                    != evidence.observation_scope_id.as_deref()
                 || row.creating_connection != evidence.connection
                 || row.creating_launch_nonce != evidence.launch_nonce
                 || row.creating_session_epoch != evidence.session_epoch
@@ -15819,6 +15962,10 @@ impl RedbRecoveryStore {
             authority_lineage: evidence.lineage.clone(),
             principal: evidence.principal.clone(),
             producer: evidence.producer.clone(),
+            installation_id: evidence.installation_id.clone(),
+            owner_session_id: evidence.session_id.clone(),
+            owner_attempt_id: evidence.attempt_id.clone(),
+            owner_observation_scope_id: evidence.observation_scope_id.clone(),
             creating_connection: evidence.connection.clone(),
             creating_launch_nonce: evidence.launch_nonce.clone(),
             creating_session_epoch: evidence.session_epoch,
@@ -17179,11 +17326,14 @@ impl RedbRecoveryStore {
         if crate::model::sha256_hex(&envelope_bytes) != presented_sha {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
+        let owner_scope = evidence.owner_scope()?;
         let namespace = Self::bridge_stream_owner_digest(
+            &evidence.installation_id,
             &evidence.lineage,
             &evidence.principal,
             &evidence.producer,
             &evidence.local,
+            &owner_scope,
         )?;
         // The privacy owner's verdict is enforced against the namespace this
         // entry is about to bind, so the owner can only have authorized these
@@ -17616,8 +17766,9 @@ impl RedbRecoveryStore {
     }
 
     /// Loads the conflict view for one owner-checked identity (issue
-    /// #2729, item 4). The query carries the presenter's owner evidence
-    /// plus the presented producer, local stream, and event: the store
+    /// #2729, item 4). The query carries the presenter's owner evidence —
+    /// lineage, principal, installation, and owner scope — plus the
+    /// presented producer, local stream, and event: the store
     /// derives the candidate namespace internally, then returns the stored
     /// facts only when the row exists under exactly that namespace. A
     /// foreign or unknown identity returns `Ok(None)` — indistinguishable
@@ -17641,7 +17792,24 @@ impl RedbRecoveryStore {
         let producer = bridge_key_text(query, "producer_id")?;
         let local = bridge_key_text(query, "stream_id")?;
         let event_id = bridge_key_text(query, "event_id")?;
-        let namespace = Self::bridge_stream_owner_digest(&lineage, &principal, &producer, &local)?;
+        let installation_id = Self::bridge_owner_field(query, "owner_installation_id")?;
+        let session_id = Self::bridge_owner_optional_field(query, "owner_session_id")?;
+        let attempt_id = Self::bridge_owner_optional_field(query, "owner_attempt_id")?;
+        let observation_scope_id =
+            Self::bridge_owner_optional_field(query, "owner_observation_scope_id")?;
+        let owner_scope = bridge_owner_scope_from_parts(
+            session_id.as_deref(),
+            attempt_id.as_deref(),
+            observation_scope_id.as_deref(),
+        )?;
+        let namespace = Self::bridge_stream_owner_digest(
+            &installation_id,
+            &lineage,
+            &principal,
+            &producer,
+            &local,
+            &owner_scope,
+        )?;
         let read = self.database.begin_read().map_err(storage)?;
         let key = format!("{namespace}::{event_id}");
         let row: Option<BridgeEventRow> = {
@@ -18551,7 +18719,7 @@ impl RedbRecoveryStore {
 
     /// Parses and validates one owner-checked gap request (issue #2729):
     /// the gap identity and interval with the presenter's lineage,
-    /// principal, and creating occurrence.
+    /// principal, installation, owner scope, and creating occurrence.
     fn parse_bridge_gap_checked(gap: &serde_json::Value) -> Result<BridgeCheckedGap, OrsError> {
         let start_sequence = bridge_sequence(gap, "start_sequence")?;
         let end_sequence = bridge_sequence(gap, "end_sequence")?;
@@ -18571,6 +18739,13 @@ impl RedbRecoveryStore {
             staging_connection: bridge_text(gap, "staging_connection")?,
             lineage,
             principal,
+            installation_id: Self::bridge_owner_field(gap, "owner_installation_id")?,
+            session_id: Self::bridge_owner_optional_field(gap, "owner_session_id")?,
+            attempt_id: Self::bridge_owner_optional_field(gap, "owner_attempt_id")?,
+            observation_scope_id: Self::bridge_owner_optional_field(
+                gap,
+                "owner_observation_scope_id",
+            )?,
             connection: bridge_text(gap, "owner_connection")?,
             launch_nonce: bridge_text(gap, "owner_launch_nonce")?,
             session_epoch: Self::bridge_owner_epoch(gap)?,
@@ -18600,6 +18775,10 @@ impl RedbRecoveryStore {
                 principal: parsed.principal.clone(),
                 producer: HOST_REQUEST_UNBOUND_MARKER.to_owned(),
                 local: HOST_REQUEST_UNBOUND_MARKER.to_owned(),
+                installation_id: parsed.installation_id.clone(),
+                session_id: parsed.session_id.clone(),
+                attempt_id: parsed.attempt_id.clone(),
+                observation_scope_id: parsed.observation_scope_id.clone(),
                 connection: parsed.connection.clone(),
                 launch_nonce: parsed.launch_nonce.clone(),
                 session_epoch: parsed.session_epoch,
