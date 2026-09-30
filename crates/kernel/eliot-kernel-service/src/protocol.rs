@@ -708,12 +708,17 @@ impl EliotdLaunchDescriptor {
         // the first failed restart. An absent declaration stays absent and
         // withholds automatic restart; it is never widened into an unlimited
         // budget.
+        //
+        // `reason` is a STABLE code, so the validator's own prose is not
+        // forwarded here: it is owned by `RestartPolicyV1::validate` and is not
+        // part of this error's contract. Both refusal modes below therefore
+        // carry their own stable code and name the field they refuse.
         if let Some(policy) = &self.restart_policy {
             policy
                 .validate()
-                .map_err(|error| KernelServiceError::InvalidField {
+                .map_err(|_| KernelServiceError::InvalidField {
                     field: "eliotd.restart_policy",
-                    reason: error.to_string(),
+                    reason: "admitted restart policy is refused by the shared restart policy contract",
                 })?;
             if policy.subject_id != ELIOTD_RESTART_POLICY_SUBJECT_ID {
                 return Err(KernelServiceError::InvalidField {
