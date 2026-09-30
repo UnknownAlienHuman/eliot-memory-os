@@ -143,7 +143,7 @@ pub use canonical_projections::{
     GOVERNOR_PROJECTIONS_SCHEMA_VERSION, GovernorAffordanceProjection,
     GovernorContinuityProjection, GovernorProjectionError, GovernorProjectionSet,
     GovernorSafetyProjection, GovernorTaskProjection, ProjectionOmission,
-    compose_canonical_projections,
+    compose_canonical_projections, emit_canonical_projection_set,
 };
 pub use capability_evidence::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,

@@ -8,11 +8,34 @@
 //! explicit [`ProjectionOmission`] records. It opens no store, touches no
 //! Kernel port, and defines no new port: the output is data for the Smart
 //! contract set, never an effect.
+//!
+//! Two pure producers sit here, in this order, and both are owner-neutral data
+//! out of one owner:
+//!
+//! 1. [`compose_canonical_projections`] computes the Governor's own
+//!    [`GovernorProjectionSet`] from canonical snapshots, with absent members
+//!    recorded as [`ProjectionOmission`]s.
+//! 2. [`emit_canonical_projection_set`] emits the Smart contract's
+//!    [`CanonicalProjectionSet`] that the consumed value must present, under
+//!    the shared [`ContextBinding`] the runtime already holds. It is reached in
+//!    production through
+//!    [`GovernorComposition::canonical_projections`](crate::GovernorComposition::canonical_projections),
+//!    which feeds both producers this composition's own retained owners.
+//!
+//! The second step never mints the shared binding: `attempt_id` and
+//! `decision_id` belong to the attempt and decision owners, so the binding
+//! arrives as the caller parameter exactly as the Governor's own Context
+//! composition receives it. Nothing here invents canonical state, role prose, or
+//! an omission the Governor does not own.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
 
+use eliot_context_contracts::{
+    AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
+    ContextBinding, ContextError, ContinuityProjection, SafetyProjection, TaskProjection,
+};
 use eliot_contracts::{StateFence, TaskId, fences_match_exact};
 use eliot_observation::{ObservationAdmissionResult, ObservationJournalEntry};
 use eliot_session::SessionLifecycleSnapshot;
@@ -51,6 +74,29 @@ pub enum GovernorProjectionError {
     /// A repeated field exceeds its bound or carries duplicates.
     #[error("governor projection bound exceeded: {0}")]
     Bounds(&'static str),
+    /// One composed member is absent under this fence, so the contract set
+    /// that requires it cannot be emitted.
+    ///
+    /// The consumer contract carries all four projections as mandatory members
+    /// and its `omissions` field holds Context-compilation omission records
+    /// (an atom identity, a source identity, a decision revision, and a
+    /// reversal handle) that this owner cannot mint from canonical task, plan,
+    /// safety, or scope state. An absent member therefore stays absent: the
+    /// exact owner reason stays readable in the emitted side's
+    /// [`ProjectionOmission`] list and this typed refusal carries only which
+    /// member is missing.
+    #[error("governor projection member is absent: {0}")]
+    MemberOmitted(&'static str),
+    /// The emitted value failed the consumer contract's own validation.
+    ///
+    /// The contract error is carried verbatim instead of being flattened to a
+    /// field name, so the exact cause a consumer would raise stays readable at
+    /// this boundary. That includes the contract's own
+    /// [`ContextError::MissingField`] for an empty `affordances` list, which is
+    /// the reason an authorized-but-empty affordance projection cannot be
+    /// emitted rather than filled.
+    #[error("canonical projection set is not admitted: {0}")]
+    Contract(ContextError),
 }
 
 fn check_text(value: &str, field: &'static str) -> Result<(), GovernorProjectionError> {
@@ -523,4 +569,147 @@ pub fn compose_canonical_projections(
     };
     set.validate()?;
     Ok(set)
+}
+
+/// Emits the owner-neutral CC-004 projection set a consumer must present.
+///
+/// [`compose_canonical_projections`] proves the composed set first (versions,
+/// exact fence, member validation, and the present/omitted closure of its
+/// omissions), then this function re-proves the same exact fence against the
+/// caller's [`ContextBinding`] with [`fences_match_exact`] before emitting. The
+/// binding is a parameter and is never minted: `attempt_id` and `decision_id`
+/// belong to the attempt and decision owners, exactly as the Governor's own
+/// Context composition receives a binding rather than deriving one. The shared
+/// binding is copied verbatim onto all four members, which is what the contract
+/// set's own [`CanonicalProjectionSet::validate`] then requires to be equal and
+/// to share one exact fence.
+///
+/// Prose discipline: `goal`, `plan_state`, `safety_note`, and every
+/// `negative_memory_triggers`/`affordances` entry are the verbatim
+/// Governor-computed values. The one composed field is `continuity_note`,
+/// because the Governor holds the resume edge only as counts; it is the same
+/// mechanical wire shape [`project_continuity`] already composes for
+/// `plan_state` (`<STATE-WIRE>:rev<N>:<K>-open:<seq>`), not narrative text. An
+/// absent member is never filled: it returns
+/// [`GovernorProjectionError::MemberOmitted`] naming the member while the exact
+/// owner reason stays readable in the composed set's own omissions.
+///
+/// `omissions` travels empty on the emitted value, which is what completeness
+/// means here rather than a dropped field: all four members are present, so the
+/// composed set's own present/omitted closure already proved it carries no
+/// omission, and the contract's `omissions` holds Context-compilation records
+/// this owner does not mint.
+///
+/// # Errors
+///
+/// Returns [`GovernorProjectionError::MemberOmitted`] when a member is absent
+/// under this fence, [`GovernorProjectionError::FenceMismatch`] when the
+/// composed fence and the supplied binding disagree,
+/// [`GovernorProjectionError::InvalidField`] when the binding is itself
+/// invalid or names another task, and [`GovernorProjectionError::Contract`]
+/// carrying the consumer's own error when the emitted set fails the contract's
+/// validation. No value is emitted that the consumer's `validate()` would not
+/// accept.
+pub fn emit_canonical_projection_set(
+    binding: &ContextBinding,
+    set: &GovernorProjectionSet,
+) -> Result<CanonicalProjectionSet, GovernorProjectionError> {
+    set.validate()?;
+    if !fences_match_exact(&set.fence, &binding.state_fence) {
+        return Err(GovernorProjectionError::FenceMismatch);
+    }
+    // A fence match alone does not make this set the binding's set: two tasks can
+    // share one epoch and generation. Carrying one task's goal under another
+    // task's binding would pass every contract validation while answering a
+    // different question, so the task identity is compared before emission.
+    if set.task_id != binding.task_id {
+        return Err(GovernorProjectionError::InvalidField(
+            "context binding.task_id",
+        ));
+    }
+    binding
+        .validate()
+        .map_err(|_| GovernorProjectionError::InvalidField("context binding"))?;
+
+    let task = match &set.task {
+        Some(task) => TaskProjection {
+            schema_version: CANONICAL_PROJECTIONS_SCHEMA_VERSION,
+            binding: binding.clone(),
+            goal: task.goal.clone(),
+            // The Governor computes the goal and its revision, not a
+            // commitment list; the contract admits an empty one and inventing
+            // commitments would be fabricated role prose.
+            commitments: Vec::new(),
+        },
+        None => return Err(omitted_member(set, "task")),
+    };
+    let continuity = match &set.continuity {
+        Some(continuity) => ContinuityProjection {
+            schema_version: CANONICAL_PROJECTIONS_SCHEMA_VERSION,
+            binding: binding.clone(),
+            plan_state: continuity.plan_state.clone(),
+            continuity_note: std::format!(
+                "{}:{}-open:{}",
+                continuity.plan_state,
+                continuity.open_sessions,
+                continuity.last_sequence
+            ),
+        },
+        None => return Err(omitted_member(set, "continuity")),
+    };
+    let safety = match &set.safety {
+        Some(safety) => SafetyProjection {
+            schema_version: CANONICAL_PROJECTIONS_SCHEMA_VERSION,
+            binding: binding.clone(),
+            safety_note: safety.safety_note.clone(),
+            negative_memory_triggers: safety.negative_memory_triggers.clone(),
+        },
+        None => return Err(omitted_member(set, "safety")),
+    };
+    let affordance = match &set.affordance {
+        Some(affordance) => AffordanceProjection {
+            schema_version: CANONICAL_PROJECTIONS_SCHEMA_VERSION,
+            binding: binding.clone(),
+            affordances: affordance.affordances.clone(),
+        },
+        None => return Err(omitted_member(set, "affordance")),
+    };
+
+    let emitted = CanonicalProjectionSet {
+        binding: binding.clone(),
+        task,
+        continuity,
+        safety,
+        affordance,
+        omissions: Vec::new(),
+    };
+    // The contract's own `validate` is the admission gate, and its error is
+    // carried verbatim. An empty `affordances` list therefore surfaces here as
+    // the contract's `ContextError::MissingField("affordance.affordances")`
+    // rather than as a Governor-side field name, because the Governor does not
+    // own that rule and must not restate it.
+    emitted
+        .validate()
+        .map_err(GovernorProjectionError::Contract)?;
+    Ok(emitted)
+}
+
+/// Maps one absent member to its typed omission refusal.
+///
+/// The member must already appear in the composed set's own omission list —
+/// [`GovernorProjectionSet::validate`] proved the present/omitted closure
+/// above, so an absent member always does. The check is re-stated here because
+/// this function is the boundary a caller reads: a member absent with no owner
+/// reason to show is an owner defect, and it must not be reported as a covered
+/// omission.
+fn omitted_member(set: &GovernorProjectionSet, member: &'static str) -> GovernorProjectionError {
+    if set
+        .omissions
+        .iter()
+        .any(|omission| omission.missing == member)
+    {
+        GovernorProjectionError::MemberOmitted(member)
+    } else {
+        GovernorProjectionError::InvalidField("projections.omissions")
+    }
 }

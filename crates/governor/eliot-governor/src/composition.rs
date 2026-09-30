@@ -15,6 +15,9 @@ use crate::activation_outcome::{
     GovernorActivationOutcome, GovernorCandidateCoverage, GovernorRetryDirective,
     GovernorSelectionDirective,
 };
+use crate::canonical_projections::{
+    GovernorProjectionError, compose_canonical_projections, emit_canonical_projection_set,
+};
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
@@ -55,6 +58,7 @@ use eliot_canonical::{
 };
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
+use eliot_context_contracts::{CanonicalProjectionSet, ContextBinding};
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, fences_match_exact,
@@ -5390,6 +5394,66 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             observation_receipt_digest: &observation_receipt,
         })
         .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Composes this ready composition's owner-neutral canonical projection set
+    /// for one task, from its own live owners.
+    ///
+    /// This is the Governor's producer boundary for the value an orientation
+    /// consumer presents. The four inputs are the composition's own retained
+    /// owners — the `task` and `session` lifecycle snapshots, the admitted
+    /// `work_scope` binding read at the retained fence, and the `observation`
+    /// journal's deterministic entries — under the one admitted
+    /// [`StateFence`]. The pure composer returns the Governor's own
+    /// [`GovernorProjectionSet`](crate::GovernorProjectionSet) first, with every
+    /// absent member recorded as a
+    /// [`ProjectionOmission`](crate::ProjectionOmission) rather than filler,
+    /// and the emitted
+    /// [`CanonicalProjectionSet`] is produced only when all four records
+    /// exist; an absent member is a typed
+    /// [`GovernorProjectionError::MemberOmitted`] naming which one.
+    ///
+    /// Only a fully admitted composition composes, matching
+    /// [`Self::controlboard_snapshot`]: a degraded or recovering composition
+    /// fails closed rather than projecting from a partially hydrated owner.
+    ///
+    /// The `work_scope` owner is optional by construction (the Kernel may not
+    /// yet serve the binding); its absence is the same fail-closed refusal here,
+    /// because an affordance projection authorized for no admitted scope is
+    /// exactly the empty-affordance case the consumer contract rejects.
+    pub fn canonical_projections(
+        &self,
+        binding: &ContextBinding,
+        task_id: &TaskId,
+    ) -> Result<CanonicalProjectionSet, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        if !fences_match_exact(&binding.state_fence, &fence) {
+            return Err(CompositionError::Owner(
+                GovernorProjectionError::FenceMismatch.to_string(),
+            ));
+        }
+        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Owner(
+                GovernorProjectionError::MemberOmitted("affordance").to_string(),
+            )
+        })?;
+        let scope_snapshot = scope_owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let set = compose_canonical_projections(
+            &self.owners.task.snapshot(),
+            &self.owners.session.snapshot(),
+            &scope_snapshot,
+            &self.owners.observation.snapshot(),
+            task_id,
+            &fence,
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        emit_canonical_projection_set(binding, &set)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
     /// Borrows the single Skill lifecycle owner as a canonical
