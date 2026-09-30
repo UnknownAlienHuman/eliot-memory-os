@@ -30,7 +30,9 @@ use eliot_installation::InstallationProfile;
 #[cfg(windows)]
 use eliot_kernel_core::user_automation::{UserAutomationTrigger, UserAutomationTriggerOrigin};
 #[cfg(windows)]
-use eliot_kernel_service::{UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest};
+use eliot_kernel_service::{
+    UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
+};
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
@@ -1785,7 +1787,10 @@ fn process_user_automation_owner_requests(
         triggers
     };
     for (trigger, evidence) in &triggers {
-        if idle_drain.note_observable_use(host, *trigger, evidence).is_err() {
+        if idle_drain
+            .note_observable_use(host, *trigger, evidence)
+            .is_err()
+        {
             let _ = writeln!(
                 io::stderr().lock(),
                 "eliot-host: UserAutomation owner queue drain skipped: the observable-use admission failed and the envelopes stay queued"
@@ -1889,7 +1894,10 @@ fn execution_proves_scheduled_wake(execution: &UserAutomationHostExecutionReques
     match &execution.operation {
         UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
             request.invocation.trigger_origin == UserAutomationTriggerOrigin::ScheduledWake
-                && matches!(request.invocation.trigger, UserAutomationTrigger::Scheduled { .. })
+                && matches!(
+                    request.invocation.trigger,
+                    UserAutomationTrigger::Scheduled { .. }
+                )
                 && request.invocation.child_depth == 0
         }
         _ => false,
