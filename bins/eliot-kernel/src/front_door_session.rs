@@ -1375,9 +1375,8 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let only_registration_capability = |capabilities: &[String]| {
-            capabilities.len() == 1 && capabilities[0] == REGISTER
-        };
+        let only_registration_capability =
+            |capabilities: &[String]| capabilities.len() == 1 && capabilities[0] == REGISTER;
         if !only_registration_capability(&client.capabilities)
             || !only_registration_capability(&client.module_contract.required_capabilities)
         {

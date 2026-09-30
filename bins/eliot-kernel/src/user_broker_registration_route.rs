@@ -11,13 +11,15 @@ use sha2::{Digest, Sha256};
 
 use eliot_contracts::{EpochId, StateFence};
 use eliot_ors::{
-    EpochIdentity, EpochLineage, OperationalPhase, OperationalRecordContext,
-    OperationalRecordInput, OperationalRecoveryStore, OperationIdentity, StateFenceSnapshot,
-    UserBrokerFence, UserBrokerRegistration,
+    EpochIdentity, EpochLineage, OperationIdentity, OperationalPhase, OperationalRecordContext,
+    OperationalRecordInput, OperationalRecoveryStore, StateFenceSnapshot, UserBrokerFence,
+    UserBrokerRegistration,
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{Frame, ProtocolPayload, RequestIdentity};
-use eliot_user_broker_core::{RegistrationGrant, RegistrationReceipt, RegistrationRequest, RegistrationStatus};
+use eliot_user_broker_core::{
+    RegistrationGrant, RegistrationReceipt, RegistrationRequest, RegistrationStatus,
+};
 
 use super::user_broker_registration_authority::{
     LiveUserBrokerRegistration, UserBrokerSessionBinding,
@@ -62,8 +64,8 @@ fn peer_claims_registration(
         return Err(TransportError::SessionFenced);
     };
     let metadata = &identity.request.metadata;
-    let identity_clock = i64::try_from(request.observed_at)
-        .map_err(|_| TransportError::SessionFenced)?;
+    let identity_clock =
+        i64::try_from(request.observed_at).map_err(|_| TransportError::SessionFenced)?;
     let peer_binding = session
         .peer
         .process_binding()
@@ -74,7 +76,11 @@ fn peer_claims_registration(
             user_identity,
             session_identity,
             ..
-        } => (*process_id, user_identity.as_str(), session_identity.as_str()),
+        } => (
+            *process_id,
+            user_identity.as_str(),
+            session_identity.as_str(),
+        ),
         eliot_ipc::PeerIdentity::Unavailable { .. } => {
             return Err(TransportError::PeerIdentityUnavailable);
         }
@@ -120,7 +126,11 @@ fn peer_claims_registration(
     {
         return Err(TransportError::SessionFenced);
     }
-    Ok((request.installation_id.clone(), policy.module_generation.state_fence, session.authority_epoch.clone()))
+    Ok((
+        request.installation_id.clone(),
+        policy.module_generation.state_fence,
+        session.authority_epoch.clone(),
+    ))
 }
 
 fn ors_epoch_lineage(
@@ -156,22 +166,18 @@ fn registration_record(
         &grant.authority_epoch,
         &grant.fence_id,
     ))?;
-    let record_id = OperationIdentity::new(format!(
-        "user-broker-registration:{}",
-        registration_digest
-    ))
-    .map_err(|_| TransportError::SessionFenced)?;
+    let record_id =
+        OperationIdentity::new(format!("user-broker-registration:{}", registration_digest))
+            .map_err(|_| TransportError::SessionFenced)?;
     let authority_epoch = ors_epoch_lineage(&grant.authority_epoch, previous_epoch)?;
-    let state_fence_snapshot = StateFenceSnapshot::capture(
-        state_fence,
-        grant.authority_epoch.sequence.get(),
-    )
-    .map_err(|_| TransportError::SessionFenced)?;
+    let state_fence_snapshot =
+        StateFenceSnapshot::capture(state_fence, grant.authority_epoch.sequence.get())
+            .map_err(|_| TransportError::SessionFenced)?;
     state_fence_snapshot
         .validate_against_epoch(&grant.authority_epoch)
         .map_err(|_| TransportError::SessionFenced)?;
-    let payload_bytes = serde_json::to_vec(&(request, grant))
-        .map_err(|_| TransportError::SessionFenced)?;
+    let payload_bytes =
+        serde_json::to_vec(&(request, grant)).map_err(|_| TransportError::SessionFenced)?;
     let payload_length =
         u64::try_from(payload_bytes.len()).map_err(|_| TransportError::SessionFenced)?;
     let locator = PlatformHandle::new(format!(
@@ -227,8 +233,8 @@ impl KernelComposition {
         if operation != USER_BROKER_REGISTER_OPERATION {
             return Err(TransportError::SessionFenced);
         }
-        let request: RegistrationRequest = serde_json::from_value(payload.clone())
-            .map_err(|_| TransportError::SessionFenced)?;
+        let request: RegistrationRequest =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
         let now = super::unix_ms();
         let (installation_id, state_fence, authority_epoch) =
             peer_claims_registration(self, session, &request, identity, frame, now)?;
@@ -281,11 +287,7 @@ impl KernelComposition {
         };
         let fence_id = format!(
             "user-broker-fence-{}",
-            broker_digest(&(
-                &request,
-                &authority_epoch,
-                user_broker_epoch,
-            ))?
+            broker_digest(&(&request, &authority_epoch, user_broker_epoch,))?
         );
         let grant_digest = broker_digest(&(
             &request,
@@ -327,8 +329,8 @@ impl KernelComposition {
             previous_epoch,
             &state_fence,
         )?;
-        let ors_registration =
-            UserBrokerRegistration::new(input.clone()).map_err(|_| TransportError::SessionFenced)?;
+        let ors_registration = UserBrokerRegistration::new(input.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
         let snapshot = self
             .p07_ors
             .register_user_broker(ors_registration, expected)
@@ -391,10 +393,9 @@ impl KernelComposition {
             .get("operation")
             .and_then(Value::as_str)
             .ok_or(TransportError::SessionFenced)?;
-        let payload = object
-            .get("payload")
-            .ok_or(TransportError::SessionFenced)?;
-        let value = self.dispatch_user_broker_operation(session, frame, operation, payload, identity)?;
+        let payload = object.get("payload").ok_or(TransportError::SessionFenced)?;
+        let value =
+            self.dispatch_user_broker_operation(session, frame, operation, payload, identity)?;
         let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
         reply.request_id = Some(request_id.clone());
         Ok(KernelFrameAction::Reply(reply))

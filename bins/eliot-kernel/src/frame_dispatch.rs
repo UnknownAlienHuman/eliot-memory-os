@@ -25,8 +25,8 @@ use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, GENERATION_CUTOVER_OPERATION,
 };
 use super::native_worker_lifecycle_route::is_native_worker_operation;
-use super::user_broker_registration_route::USER_BROKER_MODULE_ID;
 use super::request_dispatch::is_backup_operation;
+use super::user_broker_registration_route::USER_BROKER_MODULE_ID;
 use super::wasm_runtime_port_grant::{
     HandlerSession, HostBinaryFacts, KernelObservedGrantFacts, WASM_GRANT_REQUEST_WIRE_ID,
     WASM_GRANT_REQUEST_WIRE_VERSION, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,

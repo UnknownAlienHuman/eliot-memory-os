@@ -545,19 +545,15 @@ async fn serve_user_broker_connection(
             return Ok(());
         }
     };
-    let handshake = match kernel.bind_user_broker_session(
-        connection_id.clone(),
-        peer,
-        &selection,
-        &client,
-    ) {
-        Ok(handshake) => handshake,
-        Err(error) => {
-            let rejection = handshake_rejection_frame(&connection_id, error.to_string())?;
-            send_checked(&mut front_door, &rejection, limits).await?;
-            return Ok(());
-        }
-    };
+    let handshake =
+        match kernel.bind_user_broker_session(connection_id.clone(), peer, &selection, &client) {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                let rejection = handshake_rejection_frame(&connection_id, error.to_string())?;
+                send_checked(&mut front_door, &rejection, limits).await?;
+                return Ok(());
+            }
+        };
     let mut session = handshake.session;
     let server_frame = match server_hello_frame(&connection_id, &handshake.server_hello) {
         Ok(frame) => frame,
