@@ -673,6 +673,8 @@ const PRODUCTION_MANIFEST_NAME: &str = "eliot.storage.store-surreal-adapter";
 /// Governor ordering scope carried on every envelope (the store enforces the
 /// live sequence; the expectation shape mirrors the T1.5 lifecycle path).
 const GOVERNOR_ORDERING_SCOPE: &str = "scope:governor";
+/// Governor's canonical write scope, retained for legacy observation families.
+const GOVERNOR_SCOPE_ID: &str = "governor";
 /// Governor canonical scope addressed by both envelopes.
 
 #[derive(Deserialize)]
@@ -720,20 +722,13 @@ fn mcp_observation_envelope(
     expected_ordering_sequence: u64,
     task_selection: Option<&TaskSelectionAdmissionBinding>,
 ) -> Result<CanonicalWriteEnvelope, CompositionError> {
-    let request_digest = submission
-        .request_digest()
-        .map_err(|error| owner_refused(error.to_string()))?;
     let submission_value = serde_json::to_value(submission)
         .map_err(|error| owner_refused(error.to_string()))?;
     let mut parameters = BTreeMap::new();
-    for (name, value) in [
-        ("subject", submission.record.record_id.clone()),
-        ("request_digest", request_digest),
-        ("operation_id", submission.operation_id.clone()),
-        ("idempotency_key", submission.idempotency_key.clone()),
-    ] {
-        parameters.insert(name.to_owned(), serde_json::Value::String(value));
-    }
+    parameters.insert(
+        "subject".to_owned(),
+        serde_json::Value::String(submission.record.record_id.clone()),
+    );
     parameters.insert("observation_submission".to_owned(), submission_value);
     let fence = &identity.request.metadata.state_fence;
     let mut envelope = CanonicalWriteEnvelope {
