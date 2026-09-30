@@ -19,11 +19,14 @@ use super::{
     InstallationServiceStartProof, InstallationStepOutcome, InstallerEffectPlan,
     InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
     InstallerServiceRole, ManagedEnvironmentChangeRequest, PlannedChange, PlatformHandle,
-    RetainedGuardRevert, RuntimeStateRoots, SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt,
-    StoreCredentialLifecycle, StoreCredentialProgress, candidate_manifest_digest, handle, handles,
-    ownership_secret_absence_evidence, phase_b_scm_digest, sha256_handle, sha256_hex,
+    ProfileGovernedRoots, ProfileSelectionResolution, RetainedGuardRevert, RuntimeStateRoots,
+    SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
+    StoreCredentialProgress, candidate_manifest_digest, handle, handles,
+    ownership_secret_absence_evidence, phase_b_scm_digest,
+    prove_no_service_profile_authority_dependency, sha256_handle, sha256_hex,
     validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
     validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
+    validate_user_mode_authority_effect_bindings,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -356,6 +359,19 @@ pub enum InstallationEffectProgressState {
         /// Stable evidence/reference requiring recovery.
         pending_ref: PlatformHandle,
     },
+    /// The original committed `UserMode` authority intent was authoritatively
+    /// absent after a restart. This effect is terminal for this transaction:
+    /// its lost in-memory seed is never regenerated under the same identity.
+    NoEffectAborted {
+        /// Non-zero attempt whose receipt was committed before the write.
+        attempt: u32,
+        /// Exact intent digest retained before the one permitted write.
+        intent_digest: PlatformHandle,
+        /// Exact typed absence snapshot digest observed during reconciliation.
+        absence_digest: PlatformHandle,
+        /// Provider evidence for the known-absent target.
+        evidence: Vec<PlatformHandle>,
+    },
 }
 
 /// One-to-one durable progress entry bound to an installer effect identity.
@@ -394,6 +410,11 @@ pub struct InstallationEffectProgress {
     /// Complete typed Host Phase-B receipt, present only for
     /// `MaterializePhaseB`.
     pub phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
+    /// Original pre-write current-user `UserMode` authority receipt. It is
+    /// committed with the intent and is never reconstructed from a later
+    /// Credential Manager observation.
+    pub user_mode_authority_receipt:
+        Option<eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt>,
     /// Current durable effect state.
     pub state: InstallationEffectProgressState,
 }
@@ -434,11 +455,11 @@ pub struct InstallationTransaction {
     pub profile: InstallationProfile,
     /// Versioned I3.1 four-root binding resolved for `profile`.
     ///
-    /// `Some` only when the transaction was planned through the
-    /// profile-governed selector; legacy ungoverned plans carry `None` and are
-    /// never defaulted into a binding. The registry store persists this exact
-    /// binding with the transaction, and restart rehydration revalidates it in
-    /// [`InstallationTransaction::validate`].
+    /// `None` is permitted only while a fresh in-memory planner constructor is
+    /// assembling the transaction. Every executable, persisted, decoded, or
+    /// reopened current-wire transaction must carry the exact selected roots;
+    /// validation rehydrates this original binding and never resolves a new
+    /// layout from ambient paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_governed_roots: Option<InstallationRoots>,
     /// Governing request identity.
@@ -520,6 +541,72 @@ impl PartialEq for PlannerConstructionProof {
 impl Eq for PlannerConstructionProof {}
 
 impl InstallationTransaction {
+    /// Returns the recorded I3.1 root binding this installation was planned
+    /// with, revalidated against the transaction's own recorded profile and
+    /// recorded runtime roots.
+    ///
+    /// This is the restart rehydration seam. It returns the value the
+    /// durable wire actually carries — the ORIGINAL recorded binding — and
+    /// never re-derives a layout from today's environment. A transaction
+    /// carrying no profile-governed binding, or one whose recorded binding
+    /// disagrees with its recorded profile or candidate runtime roots, is a
+    /// typed refusal rather than a fresh resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::MigrationRequired`] when the transaction
+    /// predates profile-governed planning, and
+    /// [`InstallationError::ProfileViolation`] when the recorded binding
+    /// disagrees with the recorded profile or retained roots.
+    pub fn rehydrate_profile_binding(
+        &self,
+    ) -> Result<ProfileSelectionResolution, InstallationError> {
+        let binding = self.profile_governed_roots.as_ref().ok_or_else(|| {
+            InstallationError::MigrationRequired {
+                reason: format!(
+                    "transaction {} carries no profile-governed root binding; its installation layout requires an explicit migration/import disposition",
+                    self.transaction_id
+                ),
+            }
+        })?;
+        binding.validate(self.profile)?;
+        if binding
+            != &self
+                .candidate_manifest
+                .runtime_launch
+                .profile_governed_roots
+        {
+            return Err(InstallationError::ProfileViolation(
+                "recorded profile-governed roots disagree with the candidate launch binding"
+                    .to_owned(),
+            ));
+        }
+        let governed = ProfileGovernedRoots {
+            profile: self.profile,
+            immutable_binaries: binding.immutable_binaries.clone(),
+            durable_data: binding.durable_data.clone(),
+            user_config: binding.user_config.clone(),
+            user_cache: binding.user_cache.clone(),
+        };
+        let launch = &self.candidate_manifest.runtime_launch;
+        let no_service_authority_proof = if self.profile.requires_admin() {
+            None
+        } else {
+            Some(prove_no_service_profile_authority_dependency(
+                &governed,
+                &binding.runtime_state_roots,
+                launch.profile_component.as_str(),
+                launch.profile_version.as_str(),
+                Some(launch.generation.as_str()),
+            )?)
+        };
+        Ok(ProfileSelectionResolution {
+            roots: binding.clone(),
+            governance: governed.governance_report(),
+            no_service_authority_proof,
+        })
+    }
+
     /// Creates a validated immutable plan at `PLANNED`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -701,15 +788,30 @@ impl InstallationTransaction {
                 store_credential: None,
                 staging_receipt: None,
                 phase_b_receipt: None,
+                user_mode_authority_receipt: None,
                 state: InstallationEffectProgressState::Pending,
             })
             .collect();
+        // Unit tests historically use constructor-produced synthetic plans.
+        // Give those fixtures the exact root binding already present in the
+        // validated launch descriptor; production constructors leave the
+        // field unset until the published-selection planner binds it below.
+        let profile_governed_roots = if cfg!(test) {
+            Some(
+                candidate_manifest
+                    .runtime_launch
+                    .profile_governed_roots
+                    .clone(),
+            )
+        } else {
+            None
+        };
         Ok(Self {
             transaction_wire_version: INSTALLATION_TRANSACTION_WIRE_VERSION,
             transaction_id,
             installation_epoch,
             profile,
-            profile_governed_roots: None,
+            profile_governed_roots,
             request,
             current_active_manifest,
             candidate_manifest,
@@ -977,6 +1079,12 @@ impl InstallationTransaction {
                         "timeout recovery refuses a converged service start".to_owned(),
                     ));
                 }
+                InstallationEffectProgressState::NoEffectAborted { .. } => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "timeout recovery refuses a terminal no-effect authority outcome"
+                            .to_owned(),
+                    ));
+                }
             }
             start_roles.push(*role);
             cursor += 1;
@@ -1027,7 +1135,8 @@ impl InstallationTransaction {
                     } => Some(external_identity.clone()),
                     InstallationEffectProgressState::Pending
                     | InstallationEffectProgressState::IntentCommitted { .. }
-                    | InstallationEffectProgressState::Unknown { .. } => None,
+                    | InstallationEffectProgressState::Unknown { .. }
+                    | InstallationEffectProgressState::NoEffectAborted { .. } => None,
                 },
                 _ => None,
             });
@@ -1205,6 +1314,12 @@ impl InstallationTransaction {
                         "service registration effect requires reconciliation".to_owned(),
                     ));
                 }
+                InstallationEffectProgressState::NoEffectAborted { .. } => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "service registration cannot complete from a no-effect authority outcome"
+                            .to_owned(),
+                    ));
+                }
             };
             if !roles.insert(*role) {
                 return Err(InstallationError::Duplicate {
@@ -1328,17 +1443,12 @@ impl InstallationTransaction {
                 "transaction profile must equal the candidate runtime launch profile".to_owned(),
             ));
         }
-        if let Some(binding) = &self.profile_governed_roots {
-            if binding.runtime_state_roots
-                != self.candidate_manifest.runtime_launch.runtime_state_roots
-            {
-                return Err(InstallationError::ProfileViolation(
-                    "profile-governed root binding must agree with the candidate runtime roots"
-                        .to_owned(),
-                ));
-            }
-            binding.validate(self.profile)?;
-        }
+        // Reopen and every later state-machine operation revalidate the exact
+        // original root binding, including its agreement with the candidate
+        // launch descriptor. This does not select replacement roots from the
+        // current environment. `None` is never valid at this boundary; only
+        // the crate-private planner constructor may hold it before binding.
+        self.rehydrate_profile_binding()?;
         if self.candidate_manifest.runtime_launch.installation_epoch != self.installation_epoch {
             return Err(InstallationError::InvalidField {
                 field: "candidate_manifest.runtime_launch.installation_epoch".to_owned(),
@@ -1368,6 +1478,14 @@ impl InstallationTransaction {
             &self.installer_effects,
         )?;
         validate_phase_b_effect_bindings(&self.candidate_manifest, &self.installer_effects)?;
+        validate_user_mode_authority_effect_bindings(
+            &self.transaction_id,
+            &self.candidate_manifest,
+            self.profile_governed_roots
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?,
+            &self.installer_effects,
+        )?;
         validate_package_binding(
             &self.candidate_manifest,
             &self.staging_root,
@@ -1498,7 +1616,12 @@ impl InstallationTransaction {
             return Err(InstallationError::IdentityConflict);
         }
         let mut unsettled_seen = false;
-        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
+        for (index, (effect, progress)) in self
+            .installer_effects
+            .iter()
+            .zip(&self.effect_progress)
+            .enumerate()
+        {
             if progress.effect_id != *effect.effect_id() {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -1508,6 +1631,12 @@ impl InstallationTransaction {
                     InstallerEffectPlan::ProvisionStoreCredential { .. } => {
                         precondition.credential_snapshot.is_some()
                             && precondition.os_snapshot.is_none()
+                    }
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
+                        precondition.user_mode_authority_snapshot.is_some()
+                            && precondition.os_snapshot.is_none()
+                            && precondition.credential_snapshot.is_none()
+                            && precondition.package_snapshot.is_none()
                     }
                     InstallerEffectPlan::StagePackage { .. }
                     | InstallerEffectPlan::MaterializePhaseB { .. } => {
@@ -1558,6 +1687,63 @@ impl InstallationTransaction {
                         });
                     }
                 }
+            }
+            if let Some(receipt) = &progress.user_mode_authority_receipt {
+                let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+                    provision, ..
+                } = effect
+                else {
+                    return Err(InstallationError::IdentityConflict);
+                };
+                receipt
+                    .validate()
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "effect_progress.user_mode_authority_receipt".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                if receipt.request.transaction_id != self.transaction_id.as_str()
+                    || receipt.request.effect_id != progress.effect_id.as_str()
+                    || receipt.request.installation_id != provision.installation_id.as_str()
+                    || receipt.target != provision.target
+                    || receipt.request.candidate_generation
+                        != provision.candidate_generation.as_str()
+                    || receipt.request.authority_generation != provision.authority_generation
+                    || receipt.request.supervision_lease_scope_id
+                        != provision.supervision_lease_scope_id.as_str()
+                    || receipt.request.signer_id != provision.signer_id.as_str()
+                    || receipt.request.key_id != provision.key_id.as_str()
+                    || receipt.request.owner_sid != provision.owner_sid.as_str()
+                    || progress
+                        .admitted_precondition
+                        .as_ref()
+                        .and_then(|precondition| precondition.user_mode_authority_snapshot.as_ref())
+                        .is_none_or(|snapshot| {
+                            snapshot.owner_sid != provision.owner_sid
+                                || snapshot.target != receipt.target
+                        })
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            } else if matches!(
+                (&progress.state, effect),
+                (
+                    InstallationEffectProgressState::IntentCommitted { .. }
+                        | InstallationEffectProgressState::NoEffectAborted { .. }
+                        | InstallationEffectProgressState::Applied { .. },
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                )
+            ) || (matches!(
+                (&progress.state, effect),
+                (
+                    InstallationEffectProgressState::Unknown { .. },
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                )
+            ) && progress.admitted_precondition.is_some())
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "committed UserMode authority effect requires its original key receipt"
+                        .to_owned(),
+                ));
             }
             if let Some(nonce) = &progress.registration_nonce {
                 if !matches!(
@@ -1925,6 +2111,19 @@ impl InstallationTransaction {
                     None,
                 ) => {}
                 (
+                    InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Unknown { .. }
+                    | InstallationEffectProgressState::NoEffectAborted { .. }
+                    | InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    },
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. },
+                    Some(precondition),
+                    None,
+                ) if precondition.user_mode_authority_snapshot.is_some()
+                    && progress.user_mode_authority_receipt.is_some() => {}
+                (
                     InstallationEffectProgressState::Applied {
                         disposition: InstallationEffectDisposition::PreexistingMatching,
                         ..
@@ -1977,6 +2176,7 @@ impl InstallationTransaction {
                                 | InstallerEffectPlan::StartService { .. }
                                 | InstallerEffectPlan::StagePackage { .. }
                                 | InstallerEffectPlan::MaterializePhaseB { .. }
+                                | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                         )
                         && progress.ownership_secret.as_ref().is_none_or(|ownership| {
                             ownership.create_disposition != InstallationCreateDisposition::Created
@@ -2035,6 +2235,16 @@ impl InstallationTransaction {
                             reason: "applied package effect requires a durable receipt".to_owned(),
                         });
                     }
+                    if matches!(
+                        effect,
+                        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                    ) && progress.user_mode_authority_receipt.is_none()
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "applied UserMode authority effect requires the original key receipt"
+                                .to_owned(),
+                        ));
+                    }
                 }
                 InstallationEffectProgressState::Pending => unsettled_seen = true,
                 InstallationEffectProgressState::IntentCommitted {
@@ -2054,9 +2264,54 @@ impl InstallationTransaction {
                     handle(pending_ref, "effect_progress.pending_ref")?;
                     unsettled_seen = true;
                 }
+                InstallationEffectProgressState::NoEffectAborted {
+                    attempt,
+                    intent_digest,
+                    absence_digest,
+                    evidence,
+                } if !unsettled_seen => {
+                    if !matches!(
+                        effect,
+                        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                    ) {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    sha256_handle(intent_digest, "effect_progress.no_effect.intent_digest")?;
+                    sha256_handle(absence_digest, "effect_progress.no_effect.absence_digest")?;
+                    handles(evidence, "effect_progress.no_effect.evidence", true)?;
+                    if *attempt == 0
+                        || progress
+                            .admitted_precondition
+                            .as_ref()
+                            .is_none_or(|precondition| precondition.digest != *absence_digest)
+                        || super::effect_request(
+                            self,
+                            index,
+                            *attempt,
+                            super::InstallationEffectAction::Apply,
+                            None,
+                        )?
+                        .intent_digest()?
+                            != *intent_digest
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    if !matches!(
+                        self.stage,
+                        InstallationStage::RollbackRequired | InstallationStage::RolledBack
+                    ) {
+                        return Err(InstallationError::InvalidField {
+                            field: "effect_progress.no_effect".to_owned(),
+                            reason: "known-absent effect is terminal only during rollback"
+                                .to_owned(),
+                        });
+                    }
+                    unsettled_seen = true;
+                }
                 InstallationEffectProgressState::Applied { .. }
                 | InstallationEffectProgressState::IntentCommitted { .. }
-                | InstallationEffectProgressState::Unknown { .. } => {
+                | InstallationEffectProgressState::Unknown { .. }
+                | InstallationEffectProgressState::NoEffectAborted { .. } => {
                     return Err(InstallationError::InvalidField {
                         field: "effect_progress".to_owned(),
                         reason: "progress must be an applied prefix followed by at most one active state and a pending suffix".to_owned(),
@@ -2123,6 +2378,7 @@ impl InstallationTransaction {
             self.planner_construction_proof,
             PlannerConstructionProof::Bound
         ) && self.transaction_wire_version == INSTALLATION_TRANSACTION_WIRE_VERSION
+            && self.profile_governed_roots.is_some()
             && self.stage == InstallationStage::Planned
             && self.revision == 1
             && self.completed_stage_refs.is_empty()
@@ -2651,8 +2907,10 @@ struct InstallationTransactionWire {
     transaction_id: PlatformHandle,
     installation_epoch: InstallationEpoch,
     profile: InstallationProfile,
-    #[serde(default)]
-    profile_governed_roots: Option<InstallationRoots>,
+    // Current durable wire records are never in the constructor-only
+    // unbound state. A non-optional wire field rejects both an omitted member
+    // and an explicit JSON null before the in-memory transaction is rebuilt.
+    profile_governed_roots: InstallationRoots,
     request: ManagedEnvironmentChangeRequest,
     current_active_manifest: Option<CandidateManifest>,
     candidate_manifest: CandidateManifest,
@@ -2685,7 +2943,7 @@ impl InstallationTransactionWire {
             transaction_id: self.transaction_id,
             installation_epoch: self.installation_epoch,
             profile: self.profile,
-            profile_governed_roots: self.profile_governed_roots,
+            profile_governed_roots: Some(self.profile_governed_roots),
             request: self.request,
             current_active_manifest: self.current_active_manifest,
             candidate_manifest: self.candidate_manifest,
@@ -2714,7 +2972,7 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v24 records are
+/// transaction authority object to another crate. Pre-v26 records are
 /// classified as an explicit migration requirement rather than synthesizing
 /// missing progress.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
@@ -2744,6 +3002,10 @@ pub(super) fn decode_installation_transaction_json_from_store(
     decode_installation_transaction_json_with_policy(bytes, true)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "every current transaction progress member is checked in one wire gate"
+)]
 fn validate_current_transaction_progress(
     value: &serde_json::Value,
 ) -> Result<(), InstallationError> {
@@ -2767,11 +3029,31 @@ fn validate_current_transaction_progress(
             ("registration_nonce", "registration nonce"),
             ("service_start_deadline_ms", "service start deadline"),
             ("service_start_proof", "service start proof"),
+            ("user_mode_authority_receipt", "UserMode authority receipt"),
         ] {
             if !progress.contains_key(field) {
                 return Err(InstallationError::CorruptRegistry {
                     reason: format!(
                         "installation transaction effect progress entry {index} is missing mandatory {label} member"
+                    ),
+                });
+            }
+        }
+        if let Some(precondition) = progress
+            .get("admitted_precondition")
+            .filter(|precondition| !precondition.is_null())
+        {
+            let precondition = precondition
+                .as_object()
+                .ok_or_else(|| InstallationError::CorruptRegistry {
+                    reason: format!(
+                        "installation transaction effect progress entry {index} precondition is not an object"
+                    ),
+                })?;
+            if !precondition.contains_key("user_mode_authority_snapshot") {
+                return Err(InstallationError::MigrationRequired {
+                    reason: format!(
+                        "installation transaction effect progress entry {index} is missing the v26 UserMode authority snapshot member"
                     ),
                 });
             }
@@ -2825,7 +3107,7 @@ fn validate_current_transaction_progress(
                 if !object.contains_key(field) {
                     return Err(InstallationError::MigrationRequired {
                         reason: format!(
-                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v24 is required"
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v26 is required"
                         ),
                     });
                 }
@@ -2864,7 +3146,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v24 discriminator".to_owned(),
+            reason: "installation transaction predates the required v26 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {

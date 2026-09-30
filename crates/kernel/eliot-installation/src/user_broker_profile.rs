@@ -17,7 +17,7 @@
 //! `validate()` is bound to the `eliot-agent-bridge` module identity, so no
 //! broker-side declaration could be produced at all.
 
-use std::path::{Component, Path};
+use std::path::Path;
 
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion, canonical_json_bytes, sha256_hex};
 use eliot_protocol::{
@@ -32,8 +32,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    InstallationError, PlatformHandle, RuntimeLaunchDescriptor, approved_path, handle,
-    sha256_handle, text,
+    InstallationError, PlatformHandle, RuntimeLaunchDescriptor, approved_path,
+    canonical_profile_unsigned_bytes, compute_profile_digest, handle, sha256_handle, text,
+    validate_absolute_root,
 };
 
 /// Stable wire identity of the User Broker installation profile record.
@@ -161,32 +162,12 @@ impl UserBrokerInstallationProfile {
 
     /// Returns canonical bytes covered by `profile_sha256`.
     pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
-        let mut unsigned =
-            serde_json::to_value(self).map_err(|error| InstallationError::InvalidField {
-                field: "user_broker.profile_sha256".to_owned(),
-                reason: error.to_string(),
-            })?;
-        unsigned
-            .as_object_mut()
-            .ok_or_else(|| InstallationError::InvalidField {
-                field: "user_broker.profile_sha256".to_owned(),
-                reason: "profile projection is not an object".to_owned(),
-            })?
-            .remove("profile_sha256")
-            .ok_or_else(|| InstallationError::InvalidField {
-                field: "user_broker.profile_sha256".to_owned(),
-                reason: "profile digest field is missing".to_owned(),
-            })?;
-        canonical_json_bytes(&unsigned).map_err(|error| InstallationError::InvalidField {
-            field: "user_broker.profile_sha256".to_owned(),
-            reason: error.to_string(),
-        })
+        canonical_profile_unsigned_bytes(self, "profile_sha256", "user_broker.profile_sha256")
     }
 
     /// Computes the lowercase SHA-256 profile digest.
     pub fn compute_digest(&self) -> Result<PlatformHandle, InstallationError> {
-        PlatformHandle::new(sha256_hex(&self.canonical_unsigned_bytes()?))
-            .map_err(|error| InstallationError::Platform(error.to_string()))
+        compute_profile_digest(&self.canonical_unsigned_bytes()?)
     }
 
     /// Validates the complete immutable profile and all derived bindings.
@@ -463,18 +444,4 @@ fn user_broker_client_declaration(
         max_frame: USER_BROKER_MAX_FRAME_BYTES,
         declaration_sha256: String::new(),
     })
-}
-
-fn validate_absolute_root(root: &Path, field: &str) -> Result<(), InstallationError> {
-    if !root.is_absolute()
-        || root
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-    {
-        return Err(InstallationError::InvalidField {
-            field: field.to_owned(),
-            reason: "must be an absolute normalized protected root".to_owned(),
-        });
-    }
-    Ok(())
 }

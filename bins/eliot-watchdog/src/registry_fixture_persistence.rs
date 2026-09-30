@@ -610,8 +610,21 @@ impl RegistryFixture {
         let wasm_host_digest = Self::artifact_digest(&wasm_host_path);
         let user_broker_digest = Self::artifact_digest(&user_broker_path);
         let config_handle = path_handle(&config_path);
+        let installer_user_root = r"C:\Users\eliot-installer\AppData\Local\Eliot";
+        let profile_governed_roots = eliot_installation::InstallationRoots {
+            binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
+            durable_data: roots.installation_root.as_str().to_owned(),
+            user_config: installer_user_root.to_owned(),
+            user_cache: installer_user_root.to_owned(),
+            runtime_state_roots: roots.clone(),
+        };
         let mut runtime_launch = RuntimeLaunchDescriptor {
             profile: InstallationProfile::SystemService,
+            profile_component: handle("eliot"),
+            profile_version: handle("test-version"),
+            profile_installation_key: Some(handle(self.installation_key.clone())),
+            profile_governed_roots,
             portable_root: None,
             installation_epoch: InstallationEpoch {
                 installation: handle(self.installation_key.clone()),

@@ -1566,8 +1566,37 @@ fn live_receipt_manifest(
     let store_bridge_artifact_digest = handle("1".repeat(64));
     let canonical_store_artifact_digest = handle("5".repeat(64));
     let host_artifact_digest = handle("8".repeat(64));
+    let profile_governed_roots = eliot_installation::InstallationRoots {
+        binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+        immutable_binaries: root
+            .join("target")
+            .join("eliot-dev")
+            .join(generation.as_str())
+            .to_string_lossy()
+            .into_owned(),
+        durable_data: root
+            .join(".eliot-dev")
+            .join("state")
+            .to_string_lossy()
+            .into_owned(),
+        user_config: root
+            .join(".eliot-dev")
+            .join("config")
+            .to_string_lossy()
+            .into_owned(),
+        user_cache: root
+            .join(".eliot-dev")
+            .join("cache")
+            .to_string_lossy()
+            .into_owned(),
+        runtime_state_roots: roots.clone(),
+    };
     let mut runtime_launch = eliot_installation::RuntimeLaunchDescriptor {
         profile: eliot_installation::InstallationProfile::PortableDev,
+        profile_component: handle("eliot".to_owned()),
+        profile_version: handle("test-version".to_owned()),
+        profile_installation_key: None,
+        profile_governed_roots,
         portable_root: Some(handle(root.to_string_lossy().into_owned())),
         installation_epoch,
         generation: generation.clone(),
@@ -4173,8 +4202,10 @@ fn physical_supervision_signer_unseals_only_with_exact_eliot_host_service_sid_to
     )
     .expect("resolve exact EliotHost service SID");
     assert_eq!(live_sid, authority.key_reference.host_service_sid);
-    let signer = ProtectedSupervisionLeaseSigner::new(
+    let signer = ProtectedSupervisionLeaseSigner::new_for_profile(
         kernel_root,
+        eliot_installation::InstallationProfile::SystemService,
+        None,
         &SupervisionLeaseAuthorityConfig { authority },
     )
     .expect("exact EliotHost service token must unseal the provisioned key");

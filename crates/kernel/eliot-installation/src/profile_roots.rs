@@ -2,7 +2,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
-use super::{InstallationError, WindowsPathIdentity, text};
+use super::{
+    InstallationError, ProfileGovernedRoots, WindowsPathIdentity, joined_windows_path, text,
+};
 
 /// Breaking revision of the persisted four-root installation binding.
 ///
@@ -14,11 +16,11 @@ pub const INSTALLATION_ROOT_BINDING_VERSION: u32 = 1;
 
 /// Installation/package roots plus the typed mutable runtime topology.
 ///
-/// The binding carries the complete I3.1 four-root set: immutable versioned
-/// binaries, durable service/installation state, and the separate user
-/// configuration and user cache roots the `user_mode` and `portable_dev`
-/// profiles require. For `system_service`, whose I3.1 user root is a single
-/// `%LocalAppData%\Eliot`, configuration and cache name that same root.
+/// The binding carries the complete I3.1 four-role set: immutable versioned
+/// binaries, durable service/installation state, and user configuration/cache
+/// roles. `user_mode` and `portable_dev` use separate config/cache roots;
+/// `system_service` retains the single `%LocalAppData%\Eliot` user root in both
+/// role fields, as I3.1 specifies.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallationRoots {
@@ -30,7 +32,8 @@ pub struct InstallationRoots {
     pub durable_data: String,
     /// User configuration root.
     pub user_config: String,
-    /// User cache root, persisted separately from configuration.
+    /// User cache root. It is separate from configuration for `user_mode` and
+    /// `portable_dev`, and equals it for the single `system_service` user root.
     pub user_cache: String,
     /// Explicit digest-bound runtime state topology.
     pub runtime_state_roots: RuntimeStateRoots,
@@ -78,10 +81,8 @@ impl InstallationRoots {
             text(value, field)?;
             parsed_roots.push((field, WindowsPathIdentity::parse_root(value, field)?));
         }
-        // Immutable, durable and configuration roots must never alias or
-        // overlap; the cache root must never alias the immutable or durable
-        // roots. Configuration and cache aliasing is governed by the profile
-        // below: only `system_service` names one shared user root.
+        // Every role has its own identity. Configuration and cache may be
+        // siblings, but neither may alias or contain the other role.
         for left in 0..3 {
             for right in left + 1..3 {
                 if parsed_roots[left]
@@ -107,21 +108,21 @@ impl InstallationRoots {
             }
         }
         match profile {
-            InstallationProfile::SystemService => {
-                if parsed_roots[2].1 != parsed_roots[3].1 {
-                    return Err(InstallationError::ProfileViolation(
-                        "system_service names one shared user configuration and cache root"
-                            .to_owned(),
-                    ));
-                }
+            InstallationProfile::SystemService if parsed_roots[2].1 != parsed_roots[3].1 => {
+                return Err(InstallationError::ProfileViolation(
+                    "system_service must retain one shared user configuration and cache root"
+                        .to_owned(),
+                ));
             }
-            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
-                if parsed_roots[2].1.aliases_or_overlaps(&parsed_roots[3].1) {
-                    return Err(InstallationError::ProfileViolation(
-                        "user configuration and cache roots must be separate".to_owned(),
-                    ));
-                }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev
+                if parsed_roots[2].1.aliases_or_overlaps(&parsed_roots[3].1) =>
+            {
+                return Err(InstallationError::ProfileViolation(
+                    "user configuration and cache roots must be separate for this profile"
+                        .to_owned(),
+                ));
             }
+            _ => {}
         }
         if !profile.is_disposable()
             && self
@@ -142,13 +143,59 @@ impl InstallationRoots {
         Ok(())
     }
 
+    /// Admits an additional mutable output against this selected profile's
+    /// immutable binaries binding.
+    ///
+    /// Callers use this for outputs that are not represented by an installation
+    /// effect, such as a diagnostic file or transaction-store location. The
+    /// binding is validated against its retained runtime profile before the
+    /// existing profile-governed write rule is applied.
+    pub fn admits_write_target(&self, target: &str) -> Result<(), InstallationError> {
+        let profile = self.runtime_state_roots.profile;
+        self.validate(profile)?;
+        ProfileGovernedRoots {
+            profile,
+            immutable_binaries: self.immutable_binaries.clone(),
+            durable_data: self.durable_data.clone(),
+            user_config: self.user_config.clone(),
+            user_cache: self.user_cache.clone(),
+        }
+        .admits_write_target(target)
+    }
+
+    /// Refuses a source bundle that overlaps the selected immutable binaries
+    /// root. Source publication must remain separate from the final package
+    /// destination so only the planned `StagePackage` effect can write there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::InvalidField`] for a malformed source path
+    /// and [`InstallationError::ProfileViolation`] when its Windows path
+    /// identity equals, contains, or is contained by the immutable root.
+    pub fn validate_source_bundle_root(
+        &self,
+        source_bundle_root: &str,
+    ) -> Result<(), InstallationError> {
+        let source = WindowsPathIdentity::parse_root(source_bundle_root, "source_bundle_root")?;
+        let immutable =
+            WindowsPathIdentity::parse_root(&self.immutable_binaries, "immutable_binaries")?;
+        if source.aliases_or_overlaps(&immutable) {
+            return Err(InstallationError::ProfileViolation(
+                "source bundle root must be disjoint from the final immutable binaries root"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Binds the I3.1 durable root to the proved runtime topology.
     ///
-    /// `system_service` names the runtime profile root itself as durable
-    /// state; `user_mode` refines that contour into per-role children, so each
-    /// of its durable, configuration and cache roots must sit strictly below
-    /// it. `portable_dev` is explicitly disposable, so profile agreement and
-    /// root separation above are its complete join.
+    /// `system_service` and `user_mode` retain the I3.1 durable-data root as
+    /// their top-level state contour and refine it into per-installation
+    /// runtime directories. `UserMode`'s data, config, and cache roles are
+    /// checked against the exact sibling layout derived from its retained
+    /// `LocalAppData` anchor. `portable_dev` is explicitly disposable, so
+    /// profile agreement and root separation above are its complete join.
     fn validate_durable_runtime_join(
         &self,
         profile: InstallationProfile,
@@ -161,26 +208,53 @@ impl InstallationRoots {
         let durable = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
         match profile {
             InstallationProfile::SystemService => {
-                if durable != profile_root {
+                let expected_durable = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(
+                        self.runtime_state_roots.profile_anchor_root.as_str(),
+                        "Eliot",
+                    ),
+                    "durable_data",
+                )?;
+                if durable != expected_durable
+                    || durable == profile_root
+                    || !durable.contains(&profile_root)
+                {
                     return Err(InstallationError::ProfileViolation(
-                        "durable installation root must equal the runtime profile root".to_owned(),
+                        "runtime installation root must sit strictly below the I3.1 durable-data root"
+                            .to_owned(),
                     ));
                 }
             }
             InstallationProfile::UserMode => {
+                let user_root = joined_windows_path(
+                    self.runtime_state_roots.profile_anchor_root.as_str(),
+                    "Eliot",
+                );
+                let expected_data = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(&user_root, "data"),
+                    "durable_data",
+                )?;
+                let expected_config = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(&user_root, "config"),
+                    "user_config",
+                )?;
+                let expected_cache = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(&user_root, "cache"),
+                    "user_cache",
+                )?;
                 let user_config =
                     WindowsPathIdentity::parse_root(&self.user_config, "user_config")?;
                 let user_cache = WindowsPathIdentity::parse_root(&self.user_cache, "user_cache")?;
-                for (field, root) in [
-                    ("durable_data", &durable),
-                    ("user_config", &user_config),
-                    ("user_cache", &user_cache),
-                ] {
-                    if !profile_root.contains(root) || profile_root == *root {
-                        return Err(InstallationError::ProfileViolation(format!(
-                            "{field} must sit strictly below the runtime profile root"
-                        )));
-                    }
+                if durable != expected_data
+                    || user_config != expected_config
+                    || user_cache != expected_cache
+                    || durable == profile_root
+                    || !durable.contains(&profile_root)
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "UserMode data, config, cache, and runtime roots must preserve the I3.1 sibling layout"
+                            .to_owned(),
+                    ));
                 }
             }
             InstallationProfile::PortableDev => {}
