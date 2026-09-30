@@ -336,9 +336,7 @@ impl AdmittedRequestPort {
             artifact_root,
             EnvironmentProjection::default(),
             ResourceLimits::new(
-                u64::try_from(admission.deadline_ms()).map_err(|_| {
-                    ResearchAuthorityError::Invalid("admitted deadline is out of range".to_owned())
-                })?,
+                remaining_admitted_ms(admission, self.now_unix_ms),
                 Some(1_000),
                 Some(512_000_000),
                 65_536,
@@ -361,6 +359,35 @@ impl AdmittedRequestPort {
         }
         Ok(intent)
     }
+}
+
+/// Milliseconds of the admitted deadline that remain at `now_unix_ms`.
+///
+/// The Kernel-issued deadline is an **absolute** Unix-millisecond instant, not a
+/// duration: `PermitIssuance` names its field `expires_at_unix_ms` and refuses
+/// any issuance whose expiry does not strictly follow the issue time, the
+/// authenticated client carries the same value as `deadline_unix_ms`, and the
+/// test material is a 2027 timestamp. Passing that instant straight into
+/// [`ResourceLimits::new`] as a *relative* wall-clock budget gave the Job Object
+/// a timeout of roughly fifty-seven years, so the admitted deadline was
+/// compared and receipted while the executor's own wall-clock kill could never
+/// fire. The shared `ProcessExecutor` contract takes `wall_timeout_ms` as a
+/// relative duration, so the remaining budget is derived here from the two values
+/// this process actually holds: the owner-issued instant and the observed clock.
+///
+/// An already-expired deadline yields `0`. `ResourceLimits::new` refuses a zero
+/// wall timeout, so such a dispatch is refused at mint rather than launched
+/// with an unbounded ceiling — the failure stays typed and local instead of
+/// being silently widened.
+///
+/// The same helper is the single place the admitted instant becomes a duration,
+/// so the executor's Job Object wall limit and this crate's own terminal wait
+/// cannot drift apart.
+pub(crate) fn remaining_admitted_ms(admission: &ProviderAdmission, now_unix_ms: u64) -> u64 {
+    u64::try_from(admission.deadline_ms())
+        .ok()
+        .and_then(|deadline| deadline.checked_sub(now_unix_ms))
+        .unwrap_or(0)
 }
 
 /// Canonical generation-addressed artifact root of one admitted module

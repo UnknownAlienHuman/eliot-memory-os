@@ -63,7 +63,11 @@ impl AdmissionRefusal {
 /// - `module_id` / `module_generation_id` are Module/Capability Registry
 ///   evidence *references* (cf. `EliotdLiveSupervisionEvidence`): they
 ///   correlate the operation with a catalogued generation without granting
-///   authority or re-issuing admission.
+///   authority or re-issuing admission. They are compared by value against the
+///   Kernel's own attested dispatch content, which is what makes them
+///   trustworthy as references; they are **not** yet resolved through a
+///   `CapabilityCellRegistry` record, because none naming the research-provider
+///   cell exists. See the ASSUMPTION note on [`ProviderAdmission::module_id`].
 /// - `inquiry_digest` / `denominator_digest` bind the frozen Researcher
 ///   inquiry and its exact source-role portfolio / coverage denominator. A
 ///   coverage or absence claim must name its scope, revision, and the method
@@ -204,12 +208,36 @@ impl ProviderAdmission {
     }
 
     /// Returns the Module Registry evidence reference.
+    ///
+    /// ASSUMPTION (named gap, W2): this is a Kernel-issued **reference** whose
+    /// content is re-proved against the live authority, but it is not yet
+    /// resolved through a Module/Capability Registry. The `CapabilityCellRegistry`
+    /// type and its fail-closed validator exist in `eliot-contracts`, and
+    /// `eliot-runtime-status` has the `resolve_generation_via_registry`
+    /// readback, but **no generated registry record names the research-provider
+    /// cell**: the only registry record compiled into the tree is the generated
+    /// native-worker cell in `bins/eliot-kernel/src/composition_bootstrap.rs`,
+    /// and `workstreams/core-daemons/capability-cell-registry.contract.toml`
+    /// lists `research_provider` only as an `[[inventory_family]]` (a process
+    /// name and its source paths) while the same file's `[confirmed_gap]`
+    /// states the executable registry is still missing. `git grep
+    /// capability_cell -- bins/eliot-mod-research` returns nothing.
+    ///
+    /// The owner that must supply it is #13 (the generated current-pair
+    /// `CapabilityCellRegistry` and its research-provider cell record). Binding
+    /// this field to a registry that does not exist would mean inventing the
+    /// authority it is supposed to prove, so the reference stays exactly as
+    /// strong as the evidence behind it and no stronger.
     #[must_use]
     pub fn module_id(&self) -> &str {
         &self.module_id
     }
 
     /// Returns the Module generation evidence reference.
+    ///
+    /// Carries the same named gap as [`ProviderAdmission::module_id`]: bound by
+    /// value against the Kernel's own attested dispatch content, not yet
+    /// resolved through a Module/Capability Registry record.
     #[must_use]
     pub fn module_generation_id(&self) -> &str {
         &self.module_generation_id
