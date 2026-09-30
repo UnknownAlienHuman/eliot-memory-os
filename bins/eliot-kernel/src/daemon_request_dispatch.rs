@@ -7337,14 +7337,14 @@ impl KernelComposition {
         // one occurrence. An empty requested set here would be a claim that the
         // revision is finished, which this contour does not decide.
         match UserAutomationWakePort::publish_wake_horizon(client, publication.clone()).await {
-            Ok(acknowledgement) => UserAutomationHorizonAdvance::Answered(
-                Self::user_automation_acknowledged_horizon(
+            Ok(acknowledgement) => {
+                UserAutomationHorizonAdvance::Answered(Self::user_automation_acknowledged_horizon(
                     resolution,
                     &publication,
                     &requested_occurrence_ids,
                     &acknowledgement,
-                ),
-            ),
+                ))
+            }
             Err(error) => {
                 let reason = error.to_string();
                 let unknown = !matches!(error, UserAutomationRuntimeError::Unavailable(_));
