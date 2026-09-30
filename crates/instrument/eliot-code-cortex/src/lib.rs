@@ -14,8 +14,9 @@ use eliot_graph_api::{
 };
 use eliot_instrument_api::{EvidenceAxes, EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
 use eliot_lsp_bridge::{
-    Coverage as LspCoverage, DiagnosticSeverity, FailureDisposition, LspRawOutputKind,
-    NormalizedResult, RetainedLspObservationV1, SemanticOperation, adopt_retained_observation,
+    Coverage as LspCoverage, DiagnosticSeverity, FailureDisposition, Freshness as LspFreshness,
+    LspAdoptionProjection, LspRawOutputKind, NormalizedResult, RetainedLspObservationV1,
+    SemanticOperation, adopt_retained_observation,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -159,9 +160,10 @@ pub struct SemanticIndex {
 #[derive(Clone, Debug)]
 struct RetainedLspProjection {
     workspace_root: String,
-    source_handle: String,
+    observation_identity: String,
     raw_handles: Vec<String>,
     result: NormalizedResult,
+    currentness: LspFreshness,
 }
 
 impl SemanticIndex {
@@ -227,10 +229,63 @@ impl SemanticIndex {
     /// the observation stale because the current source and process owners are
     /// not supplied here. The index retains the normalized result's actual
     /// items and projects them as stale nodes during composition; it never
-    /// launches an analyzer or creates an observation receipt.
+    /// launches an analyzer or creates an observation receipt. Live callers
+    /// should use [`Self::admit_lsp_adoption_projection`] when they have the
+    /// original owner-adopted projection.
     pub fn admit_retained_lsp_observation(
         &mut self,
         record: RetainedLspObservationV1,
+    ) -> Result<GraphRevision, CodeCortexError> {
+        let observation_identity = record
+            .binding_sha256()
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        let result = adopt_retained_observation(record.clone())
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        self.admit_lsp_observation(
+            record,
+            result,
+            observation_identity,
+            LspFreshness::Stale {
+                reason: "retained envelope supplied without live source-owner adoption".to_owned(),
+            },
+        )
+    }
+
+    /// Admits an original LSP observation together with the separate
+    /// currentness projection produced by its live process/source owners.
+    /// The projection is bound to this exact retained envelope, and the
+    /// bridge revalidates the original raw bytes before CodeCortex indexes
+    /// the unchanged normalized result.
+    pub fn admit_lsp_adoption_projection(
+        &mut self,
+        record: RetainedLspObservationV1,
+        projection: &LspAdoptionProjection,
+    ) -> Result<GraphRevision, CodeCortexError> {
+        let observation_identity = projection
+            .validate_retained_observation(&record)
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        let result = adopt_retained_observation(record.clone())
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        if projection.observation() != &result {
+            return Err(CodeCortexError::InvalidEvidence(
+                "LSP adoption projection changed the bridge-validated normalized result"
+                    .to_owned(),
+            ));
+        }
+        self.admit_lsp_observation(
+            record,
+            result,
+            observation_identity,
+            projection.currentness().clone(),
+        )
+    }
+
+    fn admit_lsp_observation(
+        &mut self,
+        record: RetainedLspObservationV1,
+        result: NormalizedResult,
+        observation_identity: String,
+        currentness: LspFreshness,
     ) -> Result<GraphRevision, CodeCortexError> {
         if self.retained_lsp.len() >= MAX_RETAINED_LSP_OBSERVATIONS {
             return Err(CodeCortexError::InvalidLimit);
@@ -255,7 +310,6 @@ impl SemanticIndex {
                 )
             })?;
         let raw_artifact_id = raw.evidence.artifact_id.clone();
-        let evidence_id = raw_artifact_id.to_string();
         let raw_handles = record
             .raw_outputs
             .iter()
@@ -276,55 +330,77 @@ impl SemanticIndex {
                 })
             })
             .collect::<Vec<_>>();
-        let result = adopt_retained_observation(record)
-            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
         if !matches!(
             &result.receipt().freshness,
-            eliot_lsp_bridge::Freshness::Stale { .. }
+            LspFreshness::Stale { .. }
         ) {
             return Err(CodeCortexError::InvalidEvidence(
-                "historical LSP adoption did not preserve stale freshness".to_owned(),
+                "LSP adoption did not preserve the original stale observation receipt".to_owned(),
             ));
         }
-        let coverage = match &result.receipt().coverage {
-            LspCoverage::ProbeOnly => EvidenceCoverage::NotApplicable,
-            _ if matches!(
-                &result.receipt().disposition,
-                FailureDisposition::Success
-            ) => {
+        let coverage = match (&result.receipt().coverage, &result.receipt().disposition) {
+            (LspCoverage::ProbeOnly, _) => EvidenceCoverage::NotApplicable,
+            (LspCoverage::Workspace { .. }, FailureDisposition::Success) => {
                 EvidenceCoverage::CompleteForScope
             }
             _ => EvidenceCoverage::PartialForScope,
         };
         let value = serde_json::json!({
             "receipt_kind": eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND,
+            "operation": &record.operation,
+            "config": &record.config,
+            "source_candidate": &record.source_candidate,
+            "instrument_invocation": &record.instrument_invocation,
+            "process_intent": &record.process_intent,
+            "invocation_digest": &record.invocation_digest,
+            "resolved_executable": &record.resolved_executable,
+            "instrument_spec": &record.instrument_spec,
+            "registry_identity": &record.registry_identity,
+            "process_evidence": &record.process_evidence,
+            "adoption_currentness": &currentness,
             "result": &result,
             "raw_outputs": raw_metadata,
         });
         let evidence = NormalizedEvidence {
-            evidence_id: raw_artifact_id.clone(),
+            evidence_id: observation_identity.clone(),
             raw_artifact_id,
             normalizer,
             kind: LSP_NORMALIZED_EVIDENCE_KIND.to_owned(),
-            summary: "bridge-validated historical LSP observation; stale freshness retained"
-                .to_owned(),
+            summary: match &currentness {
+                LspFreshness::Current => {
+                    "bridge-validated LSP observation with live source-owner currentness".to_owned()
+                }
+                LspFreshness::Stale { .. } => {
+                    "bridge-validated LSP observation with stale or unavailable currentness"
+                        .to_owned()
+                }
+            },
             value,
             axes: EvidenceAxes::observed(),
-            freshness: EvidenceFreshness::Stale,
+            freshness: match &currentness {
+                LspFreshness::Current => EvidenceFreshness::ExactCandidate,
+                LspFreshness::Stale { .. } => EvidenceFreshness::Stale,
+            },
             coverage,
         };
         evidence
             .validate()
             .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
-        let key = format!("{}:{}", evidence_id, self.retained_lsp.len());
+        if self.retained_lsp.contains_key(&observation_identity) {
+            return Err(CodeCortexError::InvalidEvidence(
+                "the same retained LSP observation was admitted more than once".to_owned(),
+            ));
+        }
+        let key = observation_identity.clone();
         self.evidence.insert(key.clone(), evidence);
         self.retained_lsp.insert(
             key,
             RetainedLspProjection {
                 workspace_root,
-                source_handle: evidence_id,
+                observation_identity,
                 raw_handles,
                 result,
+                currentness,
             },
         );
         self.bump()
@@ -386,6 +462,23 @@ impl CodeCortexService {
         let mut index = SemanticIndex::new();
         for record in records {
             index.admit_retained_lsp_observation(record)?;
+        }
+        Ok(Self { index })
+    }
+
+    /// Builds a service from original bridge observations paired with the
+    /// separate currentness result established by their live source/process
+    /// owners. Each pair is checked against the exact retained envelope
+    /// before its unchanged semantic result is indexed.
+    pub fn with_lsp_adoption_projections(
+        observations: Vec<(RetainedLspObservationV1, LspAdoptionProjection)>,
+    ) -> Result<Self, CodeCortexError> {
+        if observations.len() > MAX_RETAINED_LSP_OBSERVATIONS {
+            return Err(CodeCortexError::InvalidLimit);
+        }
+        let mut index = SemanticIndex::new();
+        for (record, projection) in observations {
+            index.admit_lsp_adoption_projection(record, &projection)?;
         }
         Ok(Self { index })
     }
@@ -537,21 +630,67 @@ fn project_retained_lsp_observations(
             });
             continue;
         }
+        let observation_is_current = matches!(&observation.currentness, LspFreshness::Current);
+        let node_freshness = if observation_is_current {
+            "current"
+        } else {
+            "stale"
+        };
+        let relation_freshness = if observation_is_current {
+            RelationFreshness::Current
+        } else {
+            RelationFreshness::Stale
+        };
         for handle in &observation.raw_handles {
             if !report.evidence_handles.contains(handle) {
                 report.evidence_handles.push(handle.clone());
             }
         }
-        report.coverage_gaps.push(CoverageGap {
-            scope: request.scope.clone(),
-            reason: format!(
-                "retained LSP evidence {evidence_id} is historical and stale; source and process-owner state were not revalidated"
-            ),
-            cheapest_probe: Some(
-                "obtain a current source-bound observation through the owning process path"
-                    .to_owned(),
-            ),
-        });
+        if !report
+            .evidence_handles
+            .contains(&observation.observation_identity)
+        {
+            report
+                .evidence_handles
+                .push(observation.observation_identity.clone());
+        }
+        let receipt = observation.result.receipt();
+        let workspace_complete = matches!(
+            &receipt.coverage,
+            LspCoverage::Workspace { .. }
+        ) && matches!(&receipt.disposition, FailureDisposition::Success);
+        if let LspFreshness::Stale { reason } = &observation.currentness {
+            report.coverage_gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: format!(
+                    "LSP evidence {evidence_id} is stale at owner adoption: {reason}"
+                ),
+                cheapest_probe: Some(
+                    "obtain a current source-bound observation through the owning process path"
+                        .to_owned(),
+                ),
+            });
+        } else if !workspace_complete {
+            report.coverage_gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: format!(
+                    "current LSP evidence {evidence_id} covers only its declared operation scope, not the requested workspace scope"
+                ),
+                cheapest_probe: Some(
+                    "obtain a successful workspace-scoped observation for workspace coverage"
+                        .to_owned(),
+                ),
+            });
+        }
+        if has_empty_lookup_result(&observation.result) {
+            report.coverage_gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: format!(
+                    "empty LSP lookup evidence {evidence_id} is not a qualified absence result; #1815 owns absence qualification"
+                ),
+                cheapest_probe: None,
+            });
+        }
 
         let mut node_limit_reached = false;
         let mut relation_limit_reached = false;
@@ -570,16 +709,16 @@ fn project_retained_lsp_observations(
                         request,
                         report,
                         symbol.clone(),
-                        "stale_lsp_symbol_observation",
+                        format!("{node_freshness}_lsp_symbol_observation"),
                         Some(item.symbol.clone()),
-                        &observation.source_handle,
+                        &observation.observation_identity,
                     )? || !admit_lsp_node(
                         request,
                         report,
                         location.clone(),
-                        "stale_lsp_definition_observation",
+                        format!("{node_freshness}_lsp_definition_observation"),
                         Some(item.symbol.clone()),
-                        &observation.source_handle,
+                        &observation.observation_identity,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -590,7 +729,8 @@ fn project_retained_lsp_observations(
                         symbol,
                         location,
                         "lsp_definition_observed",
-                        &observation.source_handle,
+                        &observation.observation_identity,
+                        relation_freshness,
                     ) {
                         relation_limit_reached = true;
                         break;
@@ -611,16 +751,16 @@ fn project_retained_lsp_observations(
                         request,
                         report,
                         symbol.clone(),
-                        "stale_lsp_symbol_observation",
+                        format!("{node_freshness}_lsp_symbol_observation"),
                         Some(item.symbol.clone()),
-                        &observation.source_handle,
+                        &observation.observation_identity,
                     )? || !admit_lsp_node(
                         request,
                         report,
                         location.clone(),
-                        "stale_lsp_reference_observation",
+                        format!("{node_freshness}_lsp_reference_observation"),
                         Some(item.symbol.clone()),
-                        &observation.source_handle,
+                        &observation.observation_identity,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -631,7 +771,8 @@ fn project_retained_lsp_observations(
                         symbol,
                         location,
                         "lsp_reference_observed",
-                        &observation.source_handle,
+                        &observation.observation_identity,
+                        relation_freshness,
                     ) {
                         relation_limit_reached = true;
                         break;
@@ -658,9 +799,9 @@ fn project_retained_lsp_observations(
                         request,
                         report,
                         coordinate,
-                        format!("stale_lsp_symbol_kind_{}", item.kind),
+                        format!("{node_freshness}_lsp_symbol_kind_{}", item.kind),
                         item.display_name.clone(),
-                        &observation.source_handle,
+                        &observation.observation_identity,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -686,9 +827,9 @@ fn project_retained_lsp_observations(
                             item.line,
                             item.column,
                         ),
-                        format!("stale_lsp_diagnostic_{severity}"),
+                        format!("{node_freshness}_lsp_diagnostic_{severity}"),
                         Some(item.code.clone()),
-                        &observation.source_handle,
+                        &observation.observation_identity,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -706,9 +847,9 @@ fn project_retained_lsp_observations(
                     request,
                     report,
                     symbol.clone(),
-                    "stale_lsp_symbol_observation",
+                    format!("{node_freshness}_lsp_symbol_observation"),
                     Some(candidate.symbol.clone()),
-                    &observation.source_handle,
+                    &observation.observation_identity,
                 )? {
                     node_limit_reached = true;
                 }
@@ -727,9 +868,9 @@ fn project_retained_lsp_observations(
                         request,
                         report,
                         location.clone(),
-                        "stale_lsp_unapplied_rename_candidate",
+                        format!("{node_freshness}_lsp_unapplied_rename_candidate"),
                         Some(candidate.new_name.clone()),
-                        &observation.source_handle,
+                        &observation.observation_identity,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -740,7 +881,8 @@ fn project_retained_lsp_observations(
                         symbol.clone(),
                         location,
                         "lsp_rename_candidate_observed",
-                        &observation.source_handle,
+                        &observation.observation_identity,
+                        relation_freshness,
                     ) {
                         relation_limit_reached = true;
                         break;
@@ -769,6 +911,16 @@ fn project_retained_lsp_observations(
         }
     }
     Ok(())
+}
+
+fn has_empty_lookup_result(result: &NormalizedResult) -> bool {
+    match result {
+        NormalizedResult::Definitions { items, .. }
+        | NormalizedResult::References { items, .. }
+        | NormalizedResult::Symbols { items, .. } => items.is_empty(),
+        NormalizedResult::Diagnostics { observations, .. } => observations.is_empty(),
+        NormalizedResult::Rename { .. } | NormalizedResult::Version { .. } => false,
+    }
 }
 
 fn lsp_symbol_coordinate(workspace_root: &str, symbol: &str) -> GraphCoordinate {
@@ -809,31 +961,34 @@ fn admit_lsp_relation(
     to: GraphCoordinate,
     kind: &str,
     evidence_id: &str,
+    freshness: RelationFreshness,
 ) -> bool {
     let from = from.to_string();
     let to = to.to_string();
-    if let Some(existing) = report.relations.iter_mut().find(|relation| {
+    if report.relations.iter().any(|relation| {
         relation.from == from
             && relation.to == to
             && relation.kind == kind
             && relation.authority == RelationAuthority::InstrumentObservation
+            && relation.freshness == freshness
+            && relation.source_handles.iter().any(|handle| handle == evidence_id)
     }) {
-        if !existing.source_handles.iter().any(|handle| handle == evidence_id) {
-            existing.source_handles.push(evidence_id.to_owned());
-        }
         return true;
     }
     if report.relations.len() >= request.max_relations {
         return false;
     }
     if report.relations.iter().any(|relation| {
-        relation.from == from && relation.to == to && relation.kind == kind
+        relation.from == from
+            && relation.to == to
+            && relation.kind == kind
+            && relation.authority != RelationAuthority::InstrumentObservation
     }) {
         report.conflicts.push(SemanticConflict {
             subject: format!("{from}|{kind}|{to}"),
             alternatives: vec![
                 "exact graph relation".to_owned(),
-                "historical LSP instrument observation".to_owned(),
+                "LSP instrument observation".to_owned(),
             ],
             source_handles: vec![evidence_id.to_owned()],
         });
@@ -843,7 +998,7 @@ fn admit_lsp_relation(
         to,
         kind: kind.to_owned(),
         authority: RelationAuthority::InstrumentObservation,
-        freshness: RelationFreshness::Stale,
+        freshness,
         coverage: RelationCoverage::Partial,
         source_handles: vec![evidence_id.to_owned()],
         dependencies: Vec::new(),
@@ -877,40 +1032,72 @@ fn add_lsp_node(
 ) -> Result<bool, CodeCortexError> {
     node.validate()
         .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+    let coordinate_handle = node.coordinate.to_string();
     if let Some(existing) = report
         .nodes
         .iter()
         .find(|existing| existing.coordinate == node.coordinate)
     {
-        if existing.kind != node.kind || existing.label != node.label {
-            report.conflicts.push(SemanticConflict {
-                subject: node.coordinate.to_string(),
-                alternatives: vec![
-                    format!("existing graph node: {}", existing.kind),
-                    format!("LSP observation node: {}", node.kind),
-                ],
-                source_handles: vec![evidence_id.to_owned()],
-            });
+        let existing_is_current = existing.kind.starts_with("current_lsp_");
+        let incoming_is_current = node.kind.starts_with("current_lsp_");
+        let existing_is_stale = existing.kind.starts_with("stale_lsp_");
+        let incoming_is_stale = node.kind.starts_with("stale_lsp_");
+        if (existing_is_stale && incoming_is_current)
+            || (existing_is_current && incoming_is_stale)
+        {
+            if report.nodes.len() >= request.max_nodes {
+                return Ok(false);
+            }
+            add_lsp_anchor(report, &node, &coordinate_handle, evidence_id);
+            report.nodes.push(node);
+            return Ok(true);
         }
+        if existing.kind == node.kind && existing.label == node.label {
+            add_lsp_anchor(report, &node, &coordinate_handle, evidence_id);
+            return Ok(true);
+        }
+        let mut source_handles = report
+            .entrypoints
+            .iter()
+            .filter(|anchor| anchor.handle == coordinate_handle)
+            .map(|anchor| anchor.source_handle.clone())
+            .collect::<BTreeSet<_>>();
+        source_handles.insert(evidence_id.to_owned());
+        report.conflicts.push(SemanticConflict {
+            subject: coordinate_handle.clone(),
+            alternatives: vec![
+                format!("existing graph node: {}", existing.kind),
+                format!("LSP observation node: {}", node.kind),
+            ],
+            source_handles: source_handles.into_iter().collect(),
+        });
+        add_lsp_anchor(report, &node, &coordinate_handle, evidence_id);
         return Ok(true);
     }
     if report.nodes.len() >= request.max_nodes {
         return Ok(false);
     }
-    let handle = node.coordinate.to_string();
-    let source_handle = node
-        .coordinate
-        .path
-        .clone()
-        .unwrap_or_else(|| node.coordinate.package.clone());
-    let label = node.label.clone().unwrap_or_else(|| node.kind.clone());
-    report.entrypoints.push(SemanticAnchor {
-        handle,
-        label,
-        source_handle,
-    });
+    add_lsp_anchor(report, &node, &coordinate_handle, evidence_id);
     report.nodes.push(node);
     Ok(true)
+}
+
+fn add_lsp_anchor(
+    report: &mut CodeCortexReport,
+    node: &GraphNode,
+    coordinate_handle: &str,
+    evidence_id: &str,
+) {
+    if report.entrypoints.iter().any(|anchor| {
+        anchor.handle == coordinate_handle && anchor.source_handle == evidence_id
+    }) {
+        return;
+    }
+    report.entrypoints.push(SemanticAnchor {
+        handle: coordinate_handle.to_owned(),
+        label: node.label.clone().unwrap_or_else(|| node.kind.clone()),
+        source_handle: evidence_id.to_owned(),
+    });
 }
 
 fn add_edge(
