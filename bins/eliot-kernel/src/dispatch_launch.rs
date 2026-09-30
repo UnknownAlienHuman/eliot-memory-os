@@ -5457,7 +5457,7 @@ pub fn reconcile_launched_native_worker_attempt(
 /// composition-pinned.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 pub struct DreamerLaunchMaterial<'a> {
     /// Job/attempt lookup keys; must be answered by `queued`.
@@ -5474,7 +5474,7 @@ pub struct DreamerLaunchMaterial<'a> {
 /// Why a prepared Dreamer launch produced no child.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DreamerLaunchSkip {
@@ -5487,7 +5487,7 @@ pub enum DreamerLaunchSkip {
 /// written to the protected dispatch file, ready to spawn.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 #[allow(
     clippy::large_enum_variant,
@@ -5519,7 +5519,7 @@ pub enum PreparedDreamerLaunch {
 /// dispatch file carries exactly what the child reader validates.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 pub struct ReadyDreamerLaunch {
     /// Exact queued job identity (lineage key for spawn settle).
@@ -5547,7 +5547,7 @@ pub struct ReadyDreamerLaunch {
 /// Outcome of one Dreamer admit-then-launch call.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 pub enum DreamerLaunchOutcome {
     /// The child was spawned through the admitted executor.
@@ -5590,7 +5590,7 @@ pub enum DreamerLaunchOutcome {
 /// defects stay `InvalidMaterial`, everything else fails closed as `Gate`.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 fn dreamer_launch_error(error: DispatchLaunchError) -> DreamerMaterialError {
     match error {
@@ -5618,7 +5618,7 @@ fn dreamer_launch_error(error: DispatchLaunchError) -> DreamerMaterialError {
 /// [`ReadyDreamerLaunch`] through the admitted executor.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 #[allow(
     clippy::too_many_lines,
@@ -5819,7 +5819,7 @@ pub fn prepare_dreamer_launch(
 /// best-effort so a stale presentation never lingers.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 pub async fn start_ready_dreamer_launch(
     kernel: &KernelComposition,
@@ -5868,7 +5868,7 @@ pub async fn start_ready_dreamer_launch(
 /// [`reconcile_launched_dreamer_attempt`].
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 pub async fn launch_admitted_dreamer_attempt(
     kernel: &KernelComposition,
@@ -5940,7 +5940,7 @@ pub async fn launch_admitted_dreamer_attempt(
 /// shape as the testd arm.
 #[allow(
     dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
 )]
 pub fn reconcile_launched_dreamer_attempt(
     kernel: &KernelComposition,
