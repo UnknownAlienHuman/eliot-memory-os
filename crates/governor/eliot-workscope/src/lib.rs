@@ -62,12 +62,12 @@ pub use resolver::{
 };
 pub use scanner::{
     AdapterEvidence, ArtifactDirEvidence, BootstrapDiscoveryInputs, BootstrapScanEvidence,
-    GoverningSourceCandidateEvidence,
     BootstrapScanOutcome, BootstrapScanner, ChangeSummary, DiscoveryLeaseKey,
     DiscoveryLeaseRequest, DiscoveryOperation, EditorWorkspaceEvidence, ExistingRecordEvidence,
-    FileTypeCount, ForbiddenScanClass, LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX,
-    LooseScanQuarantine, MAX_DISCOVERY_CONSUMPTION, ManifestEvidence, OnboardingRecommendation,
-    PrivacyBoundary, ProvisionalScopeProfile, RegisteredBuildProfile, RootServiceEvidence,
+    FileTypeCount, ForbiddenScanClass, GoverningSourceCandidateEvidence,
+    LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX, LooseScanQuarantine,
+    MAX_DISCOVERY_CONSUMPTION, ManifestEvidence, OnboardingRecommendation, PrivacyBoundary,
+    ProvisionalScopeProfile, RegisteredBuildProfile, RootServiceEvidence,
     SCAN_DISCLOSURE_OPERATION_DOMAIN, SCAN_DISCLOSURE_SCHEMA_VERSION,
     SCAN_PRIVACY_BOUNDARY_REQUIRED, ScanDisclosureOwnerBinding, ScanDisclosureReceipt,
     ScanDisclosureStore, ScanReceiptDiagnosticView, ScanReceiptHandle, ScanReceiptRetention,
