@@ -521,13 +521,14 @@ fn rebuild_from_snapshot(
         else {
             continue;
         };
-        entry.confirmation = match ledger.unknown.get(&change_id) {
-            Some(unknown) => Some(HintConfirmation::MaterialRecorded {
-                change_id,
-                reconciled: unknown.reconciled,
-            }),
-            None => None,
-        };
+        entry.confirmation =
+            ledger
+                .unknown
+                .get(&change_id)
+                .map(|unknown| HintConfirmation::MaterialRecorded {
+                    change_id,
+                    reconciled: unknown.reconciled,
+                });
     }
     Ok(ledger)
 }
@@ -608,10 +609,10 @@ fn validate_snapshot_unknown_record(
     if !is_sha256_hex(after_digest) {
         return Err(ChangeMonitorError::InvalidSnapshot);
     }
-    if let Some(before_digest) = unknown.before_digest.as_deref() {
-        if !is_sha256_hex(before_digest) || before_digest == after_digest {
-            return Err(ChangeMonitorError::InvalidSnapshot);
-        }
+    if let Some(before_digest) = unknown.before_digest.as_deref()
+        && (!is_sha256_hex(before_digest) || before_digest == after_digest)
+    {
+        return Err(ChangeMonitorError::InvalidSnapshot);
     }
     let rest = change_id.strip_prefix("cmu:").ok_or_else(invalid)?;
     let (owner, transition) = rest.rsplit_once(':').ok_or_else(invalid)?;
@@ -637,9 +638,8 @@ fn load_persisted_ledger() -> KernelChangeLedger {
     let Some(path) = snapshot_path() else {
         return KernelChangeLedger::default();
     };
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return KernelChangeLedger::default(),
+    let Ok(bytes) = std::fs::read(&path) else {
+        return KernelChangeLedger::default();
     };
     match serde_json::from_slice::<ChangeMonitorSnapshot>(&bytes) {
         Ok(snapshot) => match rebuild_from_snapshot(&snapshot) {
@@ -811,12 +811,11 @@ pub(crate) fn observe_unbaselined_external_transition(
         origin_ref: origin_ref.map(str::to_owned),
     };
     match ingest_hint(hint) {
-        Ok(_) => {}
         // Same transition identity, attribution-only difference: the hint
         // identity already binds resource, path, artifact, and after
         // digest, so confirmation below is deterministic for either
         // attribution ref.
-        Err(ChangeMonitorError::HintConflict) => {}
+        Ok(_) | Err(ChangeMonitorError::HintConflict) => {}
         Err(error) => return Err(error),
     }
     let verification = HintVerification {
