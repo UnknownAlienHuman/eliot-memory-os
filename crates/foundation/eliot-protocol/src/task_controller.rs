@@ -134,7 +134,7 @@ pub struct TaskControllerOrientationMaterialBudget {
     pub max_source_bytes: u64,
 }
 
-/// Exact OutputSchema recipe identity admitted by the original job source.
+/// Exact `OutputSchema` recipe identity admitted by the original job source.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskControllerOrientationOutputSchemaRecipe {
@@ -161,13 +161,17 @@ pub struct TaskControllerOrientationInput {
     /// is compared with the claim-channel value and never reconstructed from
     /// task/job/attempt labels.
     pub native_worker_claim_id: String,
-    /// Exact owner-authenticated result of the original ContextReconstruction
+    /// Exact owner-authenticated result of the original `ContextReconstruction`
     /// query. Its response retains the selector-complete owner publication,
     /// including the original `evidence_subject` and named-read receipts.
     pub context_reconstruction_result: crate::HostRequestResultBody,
-    /// Distinct named-read claim for the semantic DreamJobInput publication.
+    /// Original versioned Context compiler supplier input, separately
+    /// authenticated by this Task Controller invocation and copied into the
+    /// durable runtime publication without deriving it from `ContextInput`.
+    pub context_compilation_input: Value,
+    /// Distinct named-read claim for the semantic `DreamJobInput` publication.
     pub semantic_source: TaskControllerOrientationSourceClaim,
-    /// Exact original OutputSchema role declaration from the job recipe.
+    /// Exact original `OutputSchema` role declaration from the job recipe.
     pub output_schema_recipe: TaskControllerOrientationOutputSchemaRecipe,
     /// Owner-admitted named-read claim for the original schema artifact bytes.
     pub schema_source: TaskControllerOrientationSourceClaim,
@@ -182,6 +186,11 @@ impl TaskControllerOrientationInput {
     /// admission. The daemon performs task, scope, fence, readback and owner
     /// checks against the authenticated claim before queue submission.
     pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.validate_original_request_binding()?;
+        self.validate_source_claims_and_budget()
+    }
+
+    fn validate_original_request_binding(&self) -> Result<(), ProtocolError> {
         self.request
             .validate()
             .map_err(|_| ProtocolError::InvalidField {
@@ -214,10 +223,16 @@ impl TaskControllerOrientationInput {
             })?;
         self.context_reconstruction_result
             .validate_local_read_submission()?;
+        structured_object(
+            &self.context_compilation_input,
+            "task_controller_invocation.orientation.context_compilation_input",
+        )?;
         if runtime_input.semantic_source != self.semantic_source
             || runtime_input.native_worker_claim_id != self.native_worker_claim_id
             || runtime_input.output_contract != submission.output_contract
-            || runtime_input.context_reconstruction_result != self.context_reconstruction_result
+            || runtime_input.context_reconstruction_result
+                != self.context_reconstruction_result
+            || runtime_input.context_compilation_input != self.context_compilation_input
             || runtime_input.output_schema_recipe != self.output_schema_recipe
             || runtime_input.schema_source != self.schema_source
             || runtime_input.materials != self.materials
@@ -251,6 +266,10 @@ impl TaskControllerOrientationInput {
                 reason: "must bind the original output-contract artifact and schema source",
             });
         }
+        Ok(())
+    }
+
+    fn validate_source_claims_and_budget(&self) -> Result<(), ProtocolError> {
         for claim in std::iter::once(&self.semantic_source).chain(self.materials.iter()) {
             if claim.source_handle.trim().is_empty()
                 || claim.source_handle.chars().any(char::is_control)
@@ -335,7 +354,7 @@ pub struct TaskControllerCampaignOwnerMaterials {
 ///
 /// Domain objects remain JSON at the protocol layer to avoid a dependency from
 /// foundation protocol into governor, smart-context, or learning contracts.
-/// The daemon decodes `task_input` as the action-specific native Task object,
+/// The daemon decodes `task_input` as the action-specific native `Task` object,
 /// `learning_state_view_recipe` as the native learning recipe,
 /// `context_campaign_recipe_catalogue` as the native
 /// `ApprovedRecipeCatalogue` owner configuration,
@@ -383,6 +402,12 @@ impl TaskControllerInvocation {
     /// Validates the transport envelope and bounded JSON object fields.
     /// Semantic field/identity validation remains with the daemon owners.
     pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.validate_wire_and_common_fields()?;
+        self.validate_orientation_payload()?;
+        self.validate_campaign_owner_materials()
+    }
+
+    fn validate_wire_and_common_fields(&self) -> Result<(), ProtocolError> {
         let version_supported = match self.action {
             TaskControllerAction::Propose | TaskControllerAction::Apply => {
                 self.wire_version == TASK_CONTROLLER_INVOCATION_LEGACY_WIRE_VERSION
@@ -424,6 +449,10 @@ impl TaskControllerInvocation {
         ] {
             structured_object(value, field)?;
         }
+        Ok(())
+    }
+
+    fn validate_orientation_payload(&self) -> Result<(), ProtocolError> {
         if self.action == TaskControllerAction::DreamerOrientation {
             let orientation: TaskControllerOrientationInput =
                 serde_json::from_value(self.task_input.clone()).map_err(|_| {
@@ -460,6 +489,10 @@ impl TaskControllerInvocation {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_campaign_owner_materials(&self) -> Result<(), ProtocolError> {
         if let Some(selector) = &self.prior_delivery_selector {
             structured_object(
                 selector,
