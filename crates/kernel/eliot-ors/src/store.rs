@@ -11542,8 +11542,7 @@ impl RedbRecoveryStore {
                     if grant.scope != expected {
                         return Err(OrsError::InvalidField {
                             field: "privacy_authorization",
-                            reason:
-                                "bridge event privacy owner verdict must bind the admitted scope",
+                            reason: "bridge event privacy owner verdict must bind the admitted scope",
                         });
                     }
                 }
