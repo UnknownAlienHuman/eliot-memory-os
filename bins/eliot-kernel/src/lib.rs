@@ -4904,12 +4904,11 @@ impl KernelComposition {
                 DRAIN_RECEIPT_DEADLINE,
                 ReceiptOwnerFamily::CutoverFlush,
                 |remaining| {
-                    self.pending_cutover_flush_receipts(remaining).map(
-                        |(observation, summary)| {
+                    self.pending_cutover_flush_receipts(remaining)
+                        .map(|(observation, summary)| {
                             flush_ack = summary;
                             observation
-                        },
-                    )
+                        })
                 },
             )
             .await
