@@ -426,6 +426,7 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         authority_epoch: request.authority_epoch.clone(),
         state_fence: request.state_fence.clone(),
         canonical_admission_receipt: None,
+        canonical_admission: None,
         activation_receipt: None,
         expires_at_ms: request.expires_at_ms,
         state: AdmissionReservationState::StagedInactive,
@@ -463,6 +464,8 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         || staged.record().proposed_attempt_id != candidate.proposed_attempt_id
         || staged.record().operation_id != candidate.operation_id
         || staged.record().expires_at_ms != candidate.expires_at_ms
+        || staged.record().canonical_admission.is_some()
+        || staged.record().canonical_admission_receipt.is_some()
     {
         return Err(OrsError::IntegrityProblem {
             record_type: "admission_reservation",
@@ -709,6 +712,7 @@ pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecovery
             operation_id: request.operation_id.clone(),
             claims: request.claims.clone(),
             canonical_admission_receipt: request.canonical_admission_receipt.clone(),
+            canonical_admission: request.canonical_admission.clone(),
             activation_receipt: request.activation_receipt.clone(),
             expected_current_receipt: request.expected_current_receipt.clone(),
             authority_epoch: request.authority_epoch.clone(),
