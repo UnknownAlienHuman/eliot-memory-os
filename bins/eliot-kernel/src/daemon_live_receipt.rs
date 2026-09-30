@@ -21,7 +21,7 @@ use super::{
     EliotdLiveReadyEvidence, EliotdLiveReceipt, EliotdLiveReceiptDisposition, HealthVector,
     ProcessObservation, ProtectedRootLease, ProtectedRuntimePathLease, PublicationOutcome,
     PublicationPrecondition, StateFence, SupervisionLeaseSnapshot,
-    classify_eliotd_live_receipt_transition, publish_atomic_owned_runtime_receipt,
+    classify_eliotd_live_receipt_transition_in_context, publish_atomic_owned_runtime_receipt,
     windows_paths_equal,
 };
 use sha2::{Digest as _, Sha256};
@@ -29,21 +29,55 @@ use std::path::Path;
 
 /// F-LOG-KERNEL-3 (#901): live-receipt boundary observations.
 ///
-/// Observation only, via #895's facade: fixed `kernel.live_receipt.*`
-/// event names plus a bounded stable outcome. Never carries receipt roots,
-/// artifact digests, process bindings, evidence material, or owner error
-/// strings (I15.4, I07.20).
+/// Observation only, via #895's facade: fixed `kernel.live_receipt.*` event
+/// names plus a bounded stable outcome. The shared parent span carries only
+/// screened operation/generation/fence/process-tree/lease/receipt
+/// correlation; no receipt roots, artifact/evidence material, or owner error
+/// strings are attached (I15.4, I07.20).
 #[cfg(windows)]
-fn observe_live_receipt(event: &'static str, outcome: &'static str) {
+fn observe_live_receipt(
+    event: &'static str,
+    outcome: &'static str,
+    context: &tracing::Span,
+) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
+        parent: context,
         target: KERNEL_DIAGNOSTICS_TARGET,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "daemon live receipt observation"
     );
+}
+
+/// Records one validated correlation identity on the shared live-receipt
+/// span after screening it through the Kernel diagnostics policy.
+#[cfg(windows)]
+fn record_live_receipt_context_field(
+    context: &tracing::Span,
+    field: &'static str,
+    original: &str,
+) {
+    let value = super::kernel_diagnostics::bound_field(original);
+    context.record(field, value.text());
+}
+
+/// Builds a live-receipt context from the exact process receipt binding.
+#[cfg(windows)]
+fn process_receipt_context(process: &ProcessStartReceipt) -> tracing::Span {
+    let generation = process.accepted_generation().value().to_string();
+    let epoch_digest = process
+        .binding()
+        .state_fence()
+        .canonical_epoch_digest();
+    super::kernel_diagnostics::operation_context(
+        Some(process.operation_id().as_str()),
+        Some(&generation),
+        epoch_digest.as_deref(),
+        epoch_digest.as_deref(),
+    )
 }
 
 /// Maps one live-receipt/readiness failure to its stable diagnostic code.
@@ -96,20 +130,30 @@ impl KernelComposition {
         supervision_contour: &DaemonSupervisionContour,
         supervision_successor: Option<&SupervisionLeaseSnapshot>,
     ) -> Result<EliotdLiveReceipt, KernelServiceError> {
+        let context = process_receipt_context(process);
         // F-LOG-KERNEL-3 (#901): receipt publication boundary. Requested,
         // published, and validated stay distinct; an exact replay is read
         // back, not republished; exactly one terminal is emitted per failed
-        // publication and no receipt material is logged.
-        observe_live_receipt("kernel.live_receipt.publication_requested", "attempt");
+        // publication and no raw receipt material is logged.
+        observe_live_receipt(
+            "kernel.live_receipt.publication_requested",
+            "attempt",
+            &context,
+        );
         match self.publish_eliotd_live_receipt_inner(
             launch,
             process,
             ready,
             supervision_contour,
             supervision_successor,
+            &context,
         ) {
             Ok(receipt) => {
-                observe_live_receipt("kernel.live_receipt.published", "success");
+                observe_live_receipt(
+                    "kernel.live_receipt.published",
+                    "success",
+                    &context,
+                );
                 // Issue #1837: durable audit evidence for receipt issuance.
                 self.audit_observe(AuditEventDraft::receipt_live_published(
                     process,
@@ -121,10 +165,15 @@ impl KernelComposition {
                 Ok(receipt)
             }
             Err(error) => {
-                observe_live_receipt("kernel.live_receipt.publication_rejected", "fenced");
-                super::kernel_diagnostics::observe_terminal_error(live_receipt_terminal_code(
-                    &error,
-                ));
+                observe_live_receipt(
+                    "kernel.live_receipt.publication_rejected",
+                    "fenced",
+                    &context,
+                );
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    live_receipt_terminal_code(&error),
+                    &context,
+                );
                 Err(error)
             }
         }
@@ -139,6 +188,7 @@ impl KernelComposition {
         ready: &EliotdLiveReadyEvidence,
         supervision_contour: &DaemonSupervisionContour,
         supervision_successor: Option<&SupervisionLeaseSnapshot>,
+        context: &tracing::Span,
     ) -> Result<EliotdLiveReceipt, KernelServiceError> {
         let runtime_binding = self
             .eliotd_receipt_binding
@@ -216,6 +266,13 @@ impl KernelComposition {
         receipt
             .validate()
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        record_live_receipt_context_field(
+            context,
+            "process_tree",
+            receipt.process.binding().process_tree_id().as_str(),
+        );
+        record_live_receipt_context_field(context, "lease", receipt.supervision.lease_id.as_str());
+        record_live_receipt_context_field(context, "receipt", receipt.receipt_sha256());
         let bytes = eliot_contracts::canonical_json_bytes(&receipt)
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         let path = canonical_root.join("eliotd-receipt.json");
@@ -298,7 +355,8 @@ impl KernelComposition {
         let existing_disposition = if let Some((old_bytes, _)) = &existing {
             let old: EliotdLiveReceipt = serde_json::from_slice(old_bytes)
                 .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-            Some(classify_eliotd_live_receipt_transition(
+            Some(classify_eliotd_live_receipt_transition_in_context(
+                context,
                 &old,
                 &receipt,
                 status_is_ready,
@@ -456,22 +514,36 @@ impl KernelComposition {
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
     ) -> Result<(), KernelServiceError> {
+        let context = process_receipt_context(receipt);
         // F-LOG-KERNEL-3 (#901): readiness boundary. A live OS handle is not
         // readiness; exactly one terminal is emitted per failed validation.
-        observe_live_receipt("kernel.live_receipt.readiness_requested", "attempt");
+        observe_live_receipt(
+            "kernel.live_receipt.readiness_requested",
+            "attempt",
+            &context,
+        );
         match self
-            .validate_daemon_process_readiness_inner(launch, receipt)
+            .validate_daemon_process_readiness_inner(launch, receipt, &context)
             .await
         {
             Ok(()) => {
-                observe_live_receipt("kernel.live_receipt.readiness_proven", "success");
+                observe_live_receipt(
+                    "kernel.live_receipt.readiness_proven",
+                    "success",
+                    &context,
+                );
                 Ok(())
             }
             Err(error) => {
-                observe_live_receipt("kernel.live_receipt.readiness_rejected", "fenced");
-                super::kernel_diagnostics::observe_terminal_error(live_receipt_terminal_code(
-                    &error,
-                ));
+                observe_live_receipt(
+                    "kernel.live_receipt.readiness_rejected",
+                    "fenced",
+                    &context,
+                );
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    live_receipt_terminal_code(&error),
+                    &context,
+                );
                 Err(error)
             }
         }
@@ -482,6 +554,7 @@ impl KernelComposition {
         &self,
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
+        context: &tracing::Span,
     ) -> Result<(), KernelServiceError> {
         let Some(gateway) = self.process_gateway.as_ref() else {
             return Err(self.reject_daemon_process_readiness(
@@ -489,7 +562,7 @@ impl KernelComposition {
             ));
         };
         if gateway
-            .inspect_exact_running_receipt(receipt)
+            .inspect_exact_running_receipt_in_context(receipt, context)
             .await
             .is_err()
         {
@@ -547,10 +620,11 @@ impl KernelComposition {
         clippy::too_many_lines,
         reason = "ordered live process, Job, authority, configuration, and Store proof remains explicit"
     )]
-    pub(crate) async fn self_authored_ready_receipt(
+    pub(crate) async fn self_authored_ready_receipt_in_context(
         &self,
         request: &KernelControlRequest,
         peer: &PeerIdentity,
+        context: &tracing::Span,
     ) -> Result<KernelReadyReceipt, KernelServiceError> {
         let candidate: &HostKernelCandidateBinding = &request.candidate;
         let observed_peer = peer.process_binding().ok_or(KernelServiceError::Platform(
@@ -703,6 +777,7 @@ impl KernelComposition {
                     observe_live_receipt(
                         "kernel.live_receipt.store_availability_refused",
                         "store_rebind_effect_unresolved",
+                        context,
                     );
                     return Err(KernelServiceError::ReadinessNotProven);
                 }
@@ -775,6 +850,7 @@ impl KernelComposition {
                 observe_live_receipt(
                     "kernel.live_receipt.store_availability_refused",
                     refusal.owner().as_str(),
+                    context,
                 );
                 refusal.kernel_service_error()
             })?;
