@@ -22,6 +22,15 @@
 //! fabricates no fence member, parses no provider row into domain semantics, and
 //! re-derives no digest: the only thing it forwards is the owner's own verdict.
 //!
+//! That capture is the whole of this store's evidence, which is why the export
+//! cannot complete here. The vendor census captures no blob-residency member
+//! class and no purge-ledger class, and the store bridge observes neither the
+//! externally sealed Architecture and `NormativePair` identities nor a durable
+//! source-side export receipt, so both the coherent view and the independent
+//! blob-reachability read refuse rather than fill a fence member in with a
+//! default. Both refusals are the store owner's own verdict read out of its
+//! census, not this module's judgement.
+//!
 //! The `ECXF/1` package layout, the `ExportFence` and every residency,
 //! checksum and integrity proof belong to `eliot-ecxf` and to the
 //! `eliot-backup` exporter; neither is reimplemented, defaulted, pre-checked
@@ -38,9 +47,10 @@
 //! `NormativePair` identities, and a source-side export receipt. The owner states
 //! that in its own capture as a derived `missing_evidence` list, so the port
 //! returns the typed [`BackupError::UnobservedSourceMember`] refusal naming the
-//! first member the owner did not observe. Nothing is defaulted, no fence member
-//! is filled in, and no package is written. This command reports that refusal
-//! and exits nonzero; it never reports success over an incomplete view.
+//! first member the owner did not observe, and the separate blob-reachability
+//! read refuses on its own census. Nothing is defaulted, no fence member is
+//! filled in, and no package is written. This command reports that refusal and
+//! exits nonzero; it never reports success over an incomplete view.
 
 use std::path::{Path, PathBuf};
 
@@ -172,7 +182,6 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
                 last_sequence: capture.events.last().map(|event| event.event_ordinal),
                 count: capture.events.len() as u64,
             },
-            reachable_blob_residency_keys: Vec::new(),
             events: capture
                 .events
                 .iter()
@@ -192,6 +201,57 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
                 .map(|gap| format!("{gap:?}"))
                 .collect(),
         })
+    }
+
+    /// Reads the source Store's own reachable residency-key set for this export.
+    ///
+    /// Issue #1871, A2 requires the fence's blob-reachability value to be
+    /// checkable against the source Store. The only comparison available to the
+    /// exporter is the one between what the Store says is reachable and what
+    /// the delivered package carries, so this is a second store read rather
+    /// than a field of the view that also carries the blobs: reading the
+    /// residency keys out of the blobs being exported would make the export
+    /// vouch for itself.
+    ///
+    /// The admitted vendor edge answers from the store's own census, and that
+    /// census is what decides this. When it declares
+    /// [`EcxfCaptureGap::BlobStoreEvidenceUnavailable`] no blob-residency member
+    /// class is captured, so the store has no residency record to declare
+    /// reachable and this refuses. When it declares none, a blob member class
+    /// *is* captured but this module has no admitted decoder that projects such
+    /// a row onto a residency-key digest — it parses no provider row into domain
+    /// semantics — so it still refuses rather than deriving a digest here.
+    ///
+    /// Both outcomes are refusals derived from a real read of this store's own
+    /// census, and neither returns a set. An empty set is not an honest answer:
+    /// "no blob is reachable" and "this store cannot say" are different facts,
+    /// and only the store owner can tell them apart. Returning an empty vector
+    /// here would let a package ship a fence that declares an empty reachability
+    /// set purely because nobody asked.
+    async fn reachable_residency_keys(
+        &self,
+        request: &EcxfExportRequest,
+    ) -> Result<Vec<String>, BackupError> {
+        // One real read of this store's own capture census. Only the gap list is
+        // consulted; no fence value is ever taken from this capture, so a second
+        // consistent-read point cannot contribute to a published fence.
+        let capture = capture_ecxf_source(self.adapter, request)
+            .await
+            .map_err(BackupError::Store)?;
+        if capture
+            .missing_evidence
+            .contains(&EcxfCaptureGap::BlobStoreEvidenceUnavailable)
+        {
+            return Err(BackupError::UnobservedSourceMember {
+                member: "reachable_blob_residency_keys",
+            });
+        }
+        Err(BackupError::Interchange(
+            "the admitted store census captures no blob-residency member class that this module \
+             can project onto a residency-key digest, so the source Store cannot declare blob \
+             reachability (I05-12, I05-13)"
+                .to_owned(),
+        ))
     }
 }
 
@@ -236,13 +296,20 @@ fn projection_record(
 ///
 /// The vocabulary is the adapter's own `EcxfCaptureGap`
 /// (`crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`); this
+<<<<<<< HEAD
 /// maps each gap onto the static name of the already-existing
 /// [`CoherentSourceExport`] field it leaves unobserved, and adds no second gap
-/// type. Only `scope_id` is also an `ExportFence` member under that name; the
-/// rest are source-view and manifest members (`purge_ledger`,
-/// `reachable_blob_residency_keys`, `architecture_source_digest`,
-/// `export_receipt`), which is why they are named after the field the source view
-/// would have had to supply.
+/// type. Only `scope_id`, `store_generation`, `source_adapter` and `compression`
+/// are also source-view or manifest members under those names; the rest are
+/// named after the field the source view would have had to supply.
+/// `BlobStoreEvidenceUnavailable` names `reachable_blob_residency_keys`, which
+/// since issue #1871 A2 is no longer a source-view field at all: reachability is
+/// read through its own port call, so the name identifies the member that read
+/// cannot supply. That read refuses on the same gap under its own arm, and this
+/// arm stays because the coherent view is refused before that read is reached.
+/// `StoreResourceGenerationUnavailable` names `store_generation` rather than
+/// `state_fence.resource_generation` because the fence's resource generation is
+/// the generation relevant to one decision, not the store's own.
 fn unobserved_member(capture: &EcxfSourceCapture) -> Option<&'static str> {
     match capture.missing_evidence.first() {
         Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => Some("scope_id"),
