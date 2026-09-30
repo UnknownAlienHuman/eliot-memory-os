@@ -665,8 +665,8 @@ fn mcp_observation_envelope(
     let request_digest = submission
         .request_digest()
         .map_err(|error| owner_refused(error.to_string()))?;
-    let submission_value = serde_json::to_value(submission)
-        .map_err(|error| owner_refused(error.to_string()))?;
+    let submission_value =
+        serde_json::to_value(submission).map_err(|error| owner_refused(error.to_string()))?;
     let mut parameters = BTreeMap::new();
     for (name, value) in [
         ("subject", submission.record.record_id.clone()),
@@ -843,7 +843,9 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
         })?;
         if session.status != SessionState::Active
             || session.state_fence != *fence
-            || !session.authority_epoch.is_same_authority(&fence.authority_epoch)
+            || !session
+                .authority_epoch
+                .is_same_authority(&fence.authority_epoch)
             || input
                 .identity
                 .request
@@ -904,8 +906,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                     || selection.principal_ref() != input.authenticated_principal_ref
                     || selection.state_fence() != fence
                     || selection.work_scope() != &current_scope
-                        || selection.evidence().work_scope_ref
-                            != current_scope.binding.scope.scope_ref
+                    || selection.evidence().work_scope_ref != current_scope.binding.scope.scope_ref
                 {
                     return Err(CompositionError::Kernel(
                         KernelPortError::TaskScopeIncompatible,
@@ -1039,15 +1040,12 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             ordering_head.sequence,
             input.task_selection.as_ref(),
         )?;
-        let exchange = crate::finish_attempt::prepare_exchange(
-            self.canonical,
-            &input.identity,
-            envelope,
-        )
-        .map_err(|error| match error {
-            FinishAttemptError::Composition(error) => error,
-            other => owner_refused(other.to_string()),
-        })?;
+        let exchange =
+            crate::finish_attempt::prepare_exchange(self.canonical, &input.identity, envelope)
+                .map_err(|error| match error {
+                    FinishAttemptError::Composition(error) => error,
+                    other => owner_refused(other.to_string()),
+                })?;
         let access = ObservationCaptureAccess {
             privacy: current_scope.binding.privacy_class,
             visibility: ObservationCaptureVisibility::LocalOnly,
