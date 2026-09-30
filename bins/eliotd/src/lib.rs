@@ -1166,6 +1166,31 @@ impl DaemonComposition {
                 "cold unbound observation candidate admitted at the daemon edge: durably retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
             );
         }
+        // Issue #1746, W6/A5: revalidate the sealed task-bound identity at the
+        // pre-commit effect gate, between the `ColdUnbound` admission
+        // projection above and the scope-sensitive trigger below. The carried
+        // binding joins the exact admitted evidence, request task, envelope
+        // scope, and presented fence; the live Governor kernel-snapshot fence
+        // rejoins it here, so a task/scope/generation change between bootstrap
+        // admission and dispatch commit fails closed with
+        // `TASK_SCOPE_INCOMPATIBLE` for conflict/rebind. The old operation is
+        // never rewritten to a new task under its identity, never duplicated,
+        // and already-possible effects keep their original identity for
+        // reconciliation. The wider live-owner legs stay with
+        // `revalidate_dispatched_binding`: their live task/scope,
+        // retained-binding, principal/session, and receipt/profile-revision
+        // inputs have no reader at this gate, and passing claimed halves back
+        // as live would make those legs tautological.
+        if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) = &admission
+        {
+            crate::task_binding_admission::revalidate_task_bound_for_effect(
+                &binding.evidence,
+                Some(binding.admitted_task_ref.as_str()),
+                envelope.scope_id.as_str(),
+                &binding.presented_fence,
+                &self.governor.kernel_snapshot().state_fence(),
+            )?;
+        }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
         // any commit. The caller must supply the actual observed `WorkScope` and
         // source closure; the Governor never reconstructs identity from the
