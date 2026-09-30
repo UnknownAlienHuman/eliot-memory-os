@@ -2065,7 +2065,7 @@ fn matches_stream(
 /// read-only open would refuse on the pinned `x86_64-pc-windows-msvc` target and
 /// no journal row would ever be committed. A failed body flush is a refusal:
 /// the durable claim for a sealed record rests on this call.
-fn sync_file(path: &Path) -> Result<(), BackupError> {
+pub(crate) fn sync_file(path: &Path) -> Result<(), BackupError> {
     std::fs::OpenOptions::new()
         .write(true)
         .open(path)
@@ -2085,14 +2085,14 @@ fn sync_file(path: &Path) -> Result<(), BackupError> {
 /// is flushed unconditionally by [`sync_file`] before the ORS row is committed,
 /// so the durability claim does not depend on this call.
 #[cfg(unix)]
-fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
+pub(crate) fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
     std::fs::File::open(directory)
         .and_then(|handle| handle.sync_all())
         .map_err(|error| BackupError::Target(error.to_string()))
 }
 
 #[cfg(windows)]
-fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
+pub(crate) fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -2111,7 +2111,7 @@ fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn sync_parent_directory(_directory: &Path) -> Result<(), BackupError> {
+pub(crate) fn sync_parent_directory(_directory: &Path) -> Result<(), BackupError> {
     Ok(())
 }
 

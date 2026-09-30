@@ -2249,7 +2249,6 @@ impl<'a> KernelRestoreTarget<'a> {
     /// with what it names already is. An unreadable path is a
     /// [`BackupError::Target`], never an absence.
     fn check_attested_material(
-        &self,
         material: &PhaseMaterial,
         evidence_sha256: &str,
     ) -> Result<(), BackupError> {
@@ -2314,7 +2313,7 @@ impl<'a> KernelRestoreTarget<'a> {
         }
         // A receipt is a description of an effect, not the effect: it is only
         // evidence of a phase that ran if the material it names is still there.
-        self.check_attested_material(
+        Self::check_attested_material(
             &self.phase_material(&intent.phase)?,
             &applied.receipt.evidence_sha256,
         )?;
