@@ -521,7 +521,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
     }
 }
 
-/// Resolves the admitted TaskContract acceptance denominator through the
+/// Resolves the admitted `TaskContract` acceptance denominator through the
 /// existing canonical plan owner at the exact task revision (issue #325 P1,
 /// I7.9).
 ///
@@ -536,10 +536,10 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
 /// verifier-bound so absent coverage fails closed downstream.
 ///
 /// Residual seam, named exactly: the correspondence between this plan-bound
-/// denominator and the admitted TaskContract acceptance set is published by
+/// denominator and the admitted `TaskContract` acceptance set is published by
 /// the canonical plan owner in `composition.rs` (plan publication, issue
-/// #1115; TaskContract acceptance rehydration, issue #1741). The task owner
-/// here exposes opaque `Frame` references only, so TaskContract content
+/// #1115; `TaskContract` acceptance rehydration, issue #1741). The task owner
+/// here exposes opaque `Frame` references only, so `TaskContract` content
 /// itself is resolved beyond this seam, not in it. What this seam
 /// guarantees instead is denominator-first joining with typed fail-closed
 /// coverage: every required item is enumerated before any executed run,
