@@ -1708,6 +1708,12 @@ fn rebuild_admission_by_definition(
 /// process never restores a lease, and the caller re-resolves live authority
 /// from its own owner after this returns the retained history.
 ///
+/// The returned set is the record set a restart adopts, not just a verification
+/// result: the restore paths install these records as the fabric's own
+/// owner-separated maps through [`resolve_owner_separated_image`], so a replay
+/// after restart resolves against what was actually committed rather than
+/// against a caller's projection of it.
+///
 /// # Errors
 ///
 /// Returns [`FabricError::SemanticRecoveryBlocked`] when the store cannot be
@@ -1754,6 +1760,55 @@ pub fn recover_semantic_revisions(
         }
     }
     Ok(recovered)
+}
+
+/// Resolves the owner-separated record set a restart adopts (issue #1702).
+///
+/// The durable store is the commit point for the owner-separated image: a
+/// revision becomes readable as current only after that write commits, so the
+/// committed bytes are what a reopened daemon must carry. The supplied
+/// snapshot's four semantic maps are a PROJECTION of the same image, never an
+/// independent truth, so once the committed image is verified this returns it
+/// rather than the caller's copy.
+///
+/// Three cases stay deliberately distinct:
+///
+/// * A store holding a committed image is read through
+///   [`recover_semantic_revisions`], which re-verifies every record and
+///   cross-record link and refuses a snapshot that contradicts the image with
+///   [`FabricError::SemanticRecoveryBlocked`]. The recovered records are then
+///   what the fabric adopts.
+/// * No store, or a store that has never committed an image, is the honest
+///   empty start: this daemon has published no owner-separated revision, so
+///   nothing was lost and the verified snapshot maps are the whole record set.
+/// * A store whose image exists but cannot be read, decoded or verified never
+///   reaches the second case — it fails inside
+///   [`recover_semantic_revisions`], so a torn persistence boundary stays
+///   BLOCKED instead of silently restoring an older projection.
+///
+/// Both branches therefore pass the same record verification: the image branch
+/// through [`verify_semantic_record_set`] over the recovered records, the empty
+/// start through the [`verify_snapshot_semantics`] the restore already ran over
+/// the snapshot. Neither adds an acceptance path of its own.
+///
+/// # Errors
+///
+/// Returns [`FabricError::SemanticRecoveryBlocked`] when the committed image
+/// cannot be rehydrated, fails strict recovery verification, or contradicts the
+/// supplied snapshot.
+fn resolve_owner_separated_image(
+    semantic_revisions: Option<&SemanticRevisionStore>,
+    snapshot: &FabricSnapshot,
+) -> Result<RecoveredSemanticRevisions, FabricError> {
+    let Some(store) = semantic_revisions.filter(|store| store.has_committed_image()) else {
+        return Ok(RecoveredSemanticRevisions {
+            definitions: snapshot.semantic_definitions.clone(),
+            admissions: snapshot.semantic_admissions.clone(),
+            executions: snapshot.semantic_executions.clone(),
+            supersessions: snapshot.semantic_supersessions.clone(),
+        });
+    };
+    recover_semantic_revisions(store, snapshot)
 }
 
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
@@ -4105,6 +4160,14 @@ impl AgentFabric {
     /// reported current. `None` restores the historical plan-only behaviour:
     /// retained semantic records stay readable history, but publishing a new
     /// one is refused typed until a store is attached.
+    ///
+    /// Issue #1702: the owner-separated maps this fabric adopts come from the
+    /// verified committed durable image whenever the store holds one, not from
+    /// the caller's snapshot, because that image is the commit point for those
+    /// revisions. A store that cannot rehydrate, verify or agree with the
+    /// supplied snapshot returns [`FabricError::SemanticRecoveryBlocked`] and
+    /// the restore fails closed; only a store that has never committed an image
+    /// falls back to the snapshot's own already-verified maps.
     pub fn restore(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -4130,19 +4193,18 @@ impl AgentFabric {
         // Issue #1702 W6/A5: when real storage holds a committed owner-separated
         // image, recovery must be as strict as fresh admission. The supplied
         // snapshot is a PROJECTION and cannot be trusted to describe the durable
-        // image, so the two are compared and the durable record set is
-        // re-verified through the same single gate the snapshot path uses.
+        // image, so the durable record set is re-verified through the same single
+        // gate the snapshot path uses and is then ADOPTED as the fabric's own
+        // owner-separated maps. Adopting it is what makes a post-restart replay
+        // resolve against the committed revision instead of reaching the insert
+        // path a second time.
         //
         // The presence probe is what keeps "never committed" and "committed but
         // unreadable" apart: a fabric that has published no owner revision yet
         // is an honest empty start, while a store that cannot be read, decoded
         // or verified leaves recovery explicitly BLOCKED instead of starting
         // over on empty maps.
-        if let Some(store) = semantic_revisions
-            && store.has_committed_image()
-        {
-            recover_semantic_revisions(store, &snapshot)?;
-        }
+        let recovered = resolve_owner_separated_image(semantic_revisions, &snapshot)?;
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
@@ -4181,10 +4243,14 @@ impl AgentFabric {
             intent_by_operation,
             attempt_states: snapshot.attempt_states,
             cancellations: snapshot.cancellations,
-            semantic_definitions: snapshot.semantic_definitions,
-            semantic_admissions: snapshot.semantic_admissions,
-            semantic_executions: snapshot.semantic_executions,
-            semantic_supersessions: snapshot.semantic_supersessions,
+            // #1702: the verified committed image is the owner-separated
+            // record set this fabric adopts, not the caller's projection of
+            // it, so a replay after restart resolves against the revision that
+            // was actually committed.
+            semantic_definitions: recovered.definitions,
+            semantic_admissions: recovered.admissions,
+            semantic_executions: recovered.executions,
+            semantic_supersessions: recovered.supersessions,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
             provider_frames: snapshot.provider_frames,
@@ -4214,6 +4280,12 @@ impl AgentFabric {
     ///
     /// Returns the coordinator owner restore rejection, a stale-config
     /// conflict, or a stale/revoked binding rejection unchanged.
+    ///
+    /// Issue #1702: as in [`AgentFabric::restore`], the owner-separated maps
+    /// this fabric adopts come from the verified committed durable image
+    /// whenever the store holds one, and a store that cannot rehydrate, verify
+    /// or agree with the supplied snapshot returns
+    /// [`FabricError::SemanticRecoveryBlocked`] and the restore fails closed.
     pub fn restore_with_admitted_provider(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -4234,19 +4306,18 @@ impl AgentFabric {
         // Issue #1702 W6/A5: when real storage holds a committed owner-separated
         // image, recovery must be as strict as fresh admission. The supplied
         // snapshot is a PROJECTION and cannot be trusted to describe the durable
-        // image, so the two are compared and the durable record set is
-        // re-verified through the same single gate the snapshot path uses.
+        // image, so the durable record set is re-verified through the same single
+        // gate the snapshot path uses and is then ADOPTED as the fabric's own
+        // owner-separated maps. Adopting it is what makes a post-restart replay
+        // resolve against the committed revision instead of reaching the insert
+        // path a second time.
         //
         // The presence probe is what keeps "never committed" and "committed but
         // unreadable" apart: a fabric that has published no owner revision yet
         // is an honest empty start, while a store that cannot be read, decoded
         // or verified leaves recovery explicitly BLOCKED instead of starting
         // over on empty maps.
-        if let Some(store) = semantic_revisions
-            && store.has_committed_image()
-        {
-            recover_semantic_revisions(store, &snapshot)?;
-        }
+        let recovered = resolve_owner_separated_image(semantic_revisions, &snapshot)?;
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
@@ -4283,10 +4354,14 @@ impl AgentFabric {
             intent_by_operation,
             attempt_states: snapshot.attempt_states,
             cancellations: snapshot.cancellations,
-            semantic_definitions: snapshot.semantic_definitions,
-            semantic_admissions: snapshot.semantic_admissions,
-            semantic_executions: snapshot.semantic_executions,
-            semantic_supersessions: snapshot.semantic_supersessions,
+            // #1702: the verified committed image is the owner-separated
+            // record set this fabric adopts, not the caller's projection of
+            // it, so a replay after restart resolves against the revision that
+            // was actually committed.
+            semantic_definitions: recovered.definitions,
+            semantic_admissions: recovered.admissions,
+            semantic_executions: recovered.executions,
+            semantic_supersessions: recovered.supersessions,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
             provider_frames: snapshot.provider_frames,
