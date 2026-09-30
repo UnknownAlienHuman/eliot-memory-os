@@ -165,6 +165,9 @@ pub use native_worker_binding::{
     NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
 };
 
+#[path = "composition/source_artifact_read_admission.rs"]
+mod source_artifact_read_admission;
+
 /// Canonical write result kept together with the negative-memory decision
 /// that admitted that exact request.
 ///
