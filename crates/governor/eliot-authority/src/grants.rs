@@ -1525,7 +1525,10 @@ impl GrantGraph {
         prior: Option<&PreparedRevocationTransition>,
     ) -> Result<PreparedRevocationTransition, AuthorityError> {
         validate_text(&request.operation_id, "revocation_transition.operation_id")?;
-        validate_text(&request.idempotency_key, "revocation_transition.idempotency_key")?;
+        validate_text(
+            &request.idempotency_key,
+            "revocation_transition.idempotency_key",
+        )?;
         request
             .state_fence
             .validate()
@@ -1621,7 +1624,7 @@ impl GrantGraph {
         let mut affected = BTreeSet::new();
         for member in &denominator.members {
             let grant_id = GrantId::new(member.as_str())?;
-            let Some(grant) = self.grant(&grant_id) else {
+            let Some(grant) = self.grant(grant_id.as_str()) else {
                 return Err(AuthorityError::MissingParent(grant_id));
             };
             if grant.binding.state_fence != *fence {
@@ -1655,23 +1658,19 @@ impl GrantGraph {
             Ok(BoundRevocationOrigin::Bound(bound)) if bound == *origin
         ) {
             return Err(map_bounded_revocation_error(
-                eliot_influence::InfluenceError::UnverifiedRecovery(
-                    "revocation_transition.origin",
-                ),
+                eliot_influence::InfluenceError::UnverifiedRecovery("revocation_transition.origin"),
             ));
         }
         let namespace = match origin {
             RevocationOrigin::Grant(grant_id) => self
-                .grant(grant_id)
+                .grant(grant_id.as_str())
                 .map(|grant| grant.authority_root_ref.clone())
                 .ok_or_else(|| AuthorityError::MissingParent(grant_id.clone()))?,
             RevocationOrigin::AuthorityRoot(root_ref) => root_ref.as_str().to_owned(),
         };
         self.owned_authority_root(namespace.as_str())
             .map(|owned| owned.as_str().to_owned())
-            .map_err(|_| {
-                AuthorityError::InvalidField("revocation_transition.owner_namespace")
-            })
+            .map_err(|_| AuthorityError::InvalidField("revocation_transition.owner_namespace"))
     }
 }
 
@@ -1715,16 +1714,12 @@ fn require_forward_only_disposition(
         {
             Ok(())
         }
-        RevocationTransitionDisposition::UnknownOutcome => {
-            Err(AuthorityError::UnreconciledTransitionEvidence(
-                "revocation_transition.outcome_unknown",
-            ))
-        }
-        RevocationTransitionDisposition::Committed => {
-            Err(AuthorityError::StaleTransitionEvidence(
-                "revocation_transition.committed_downgrade",
-            ))
-        }
+        RevocationTransitionDisposition::UnknownOutcome => Err(
+            AuthorityError::UnreconciledTransitionEvidence("revocation_transition.outcome_unknown"),
+        ),
+        RevocationTransitionDisposition::Committed => Err(AuthorityError::StaleTransitionEvidence(
+            "revocation_transition.committed_downgrade",
+        )),
     }
 }
 
@@ -2082,7 +2077,8 @@ impl GrantGraph {
     ) -> Result<RevocationDenominator, AuthorityError> {
         match origin {
             RevocationOrigin::Grant(grant_id) => {
-                let verdict = self.revocation_closure_verdict(grant_id, fence, bounds, operation)?;
+                let verdict =
+                    self.revocation_closure_verdict(grant_id, fence, bounds, operation)?;
                 self.denominator_from_verdicts(origin, fence, bounds, [verdict])
             }
             RevocationOrigin::AuthorityRoot(root_ref) => {
@@ -2394,9 +2390,11 @@ impl GrantGraph {
         // left exactly as the snapshot carried it.
         let mut admitted: Vec<AdmittedRevocationClosure> = Vec::with_capacity(closures.len());
         for closure in &closures {
-            admitted.push(
-                graph.admit_origin_bound_closure(closure, &evidence.state_fence, operation)?,
-            );
+            admitted.push(graph.admit_origin_bound_closure(
+                closure,
+                &evidence.state_fence,
+                operation,
+            )?);
         }
         let suppressed = derive_suppressions(&graph, &admitted);
         for entry in &suppressed {

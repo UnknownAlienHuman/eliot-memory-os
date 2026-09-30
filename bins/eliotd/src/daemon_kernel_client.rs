@@ -2047,11 +2047,8 @@ impl DaemonKernelClient {
         let operation = canonical_request.operation;
         let digest = canonical_kernel_request_digest(canonical_request)
             .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-        let request_id = RequestId::new(format!(
-            "{}:{}:{}",
-            self.connection_id, operation, digest
-        ))
-        .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let request_id = RequestId::new(format!("{}:{}:{}", self.connection_id, operation, digest))
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
         let fence = self.snapshot.state_fence();
         let metadata = RequestMetadata {
             request_id: request_id.clone(),

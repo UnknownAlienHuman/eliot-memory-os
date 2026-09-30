@@ -43,9 +43,9 @@ pub use grants::{
     GRANT_GRAPH_RECOVERY_SCHEMA, GRANT_GRAPH_RECOVERY_VERSION, GrantClosureDelegation,
     GrantClosureMemberRef, GrantGraph, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord,
     GrantStatus, IntroductionId, IntroductionStatus, LEGACY_GRANT_GRAPH_RECOVERY_VERSION,
-    LogicalTime, PrincipalRef, PreparedRevocationTransition, QuarantinedCrossRootRecord,
-    QuarantinedCrossRootRelation, QuarantinedFrontierMember, ReceiptObligation,
-    REVOCATION_TRANSITION_OPERATION_KIND, RevocationClosureState, RevocationClosureVerdict,
+    LogicalTime, PreparedRevocationTransition, PrincipalRef, QuarantinedCrossRootRecord,
+    QuarantinedCrossRootRelation, QuarantinedFrontierMember, REVOCATION_TRANSITION_OPERATION_KIND,
+    ReceiptObligation, RevocationClosureState, RevocationClosureVerdict,
     RevocationOperationIdentity, RevocationTransitionDisposition, RevocationTransitionRequest,
     RevocationWriteReceipt, SnapshotId,
 };
