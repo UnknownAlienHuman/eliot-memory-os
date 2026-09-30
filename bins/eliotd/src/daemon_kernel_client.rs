@@ -6,6 +6,31 @@
 //! I2.23 (typed contract payloads).
 //! This module owns only the EBP transport/session proof; Kernel remains the
 //! sole process, Store, and canonical authority owner.
+//!
+//! Issue #1742 W4/W6 (caller STITCH, no fake consumer): this client owns one
+//! live claim/submit pair per lane — agent-activation, local-read,
+//! campaign-packet, task-controller, observe, finish — and there is no act
+//! claim pair and no retained-checkpoint resume pair, so neither gate below
+//! has a daemon-side call site yet:
+//!
+//! - W4: the daemon-side `eliot-context-admission::admit_material_decision`
+//!   invocation over Governor owner-resolved inputs, with the dispatch
+//!   binding (`bind_material_dispatch`) and dispatch-time revalidation
+//!   (`revalidate_material_dispatch`) through a live act claim/flight, runs
+//!   at the Governor owner's future live act claim, never here. The Kernel
+//!   submit arm owns only the mechanical binding
+//!   (`bins/eliot-kernel/src/host_request_route.rs::check_act_submit_binding`)
+//!   and the bridge owns only linkage revalidation
+//!   (`bins/eliot-agent-bridge/src/kernel_host_request_client.rs::revalidate_act_dispatch`);
+//!   both live in sibling-writer files and are not touched here. Refusals
+//!   stay typed (`DECISION_CONTEXT_INCOMPLETE` / `MaterialDecisionRefusal`).
+//! - W6: the resume-dispatch `admit_material_resume` invocation over #1730's
+//!   retained checkpoint runs at the resume owner's join, never here: no
+//!   `RetainedHandoffCheckpoint` consumer exists under `bins/`, so there is
+//!   no resume path to weaken — unavailable/erased originals stay explicit
+//!   and derived summaries never replace originals by construction. That
+//!   call site is the resume owner's to write, and is named here rather than
+//!   faked with a consumer in this crate.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
