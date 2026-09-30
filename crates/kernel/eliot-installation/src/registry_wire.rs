@@ -766,6 +766,16 @@ pub(super) fn decode_registry_bytes(
         });
     }
     let legacy_identity_version = if declared_major == Some(17) {
+        let source_version = value
+            .get("registry_wire_version")
+            .cloned()
+            .and_then(|version| serde_json::from_value::<ContractVersion>(version).ok());
+        if source_version != Some(ContractVersion::new(17, 0, 0)) {
+            return Err(InstallationError::MigrationRequired {
+                reason: "only the exact v17.0.0 installation registry shape has a v19 migration"
+                    .to_owned(),
+            });
+        }
         if value
             .as_object()
             .is_some_and(|object| {

@@ -2588,7 +2588,7 @@ impl ApprovedGeneration {
     }
 }
 
-/// Exact retained registration and one-shot `RunEx` intent for a UserMode
+/// Exact retained registration and one-shot `RunEx` intent for a `UserMode`
 /// Host task. This is an intent projection only; it does not prove that Task
 /// Scheduler accepted `RunEx` or that the Host became ready.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -2620,6 +2620,10 @@ impl UserModeTaskRunIntentProjection {
     /// # Errors
     /// Returns `IdentityConflict` or a typed invalid-field error when the
     /// registration, request digest, original selection, or run intent differs.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "task receipt, original selection, and RunEx intent form one identity boundary"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         let receipt = &self.task_receipt;
         let request = &receipt.request;
@@ -2730,14 +2734,14 @@ impl UserModeTaskRunIntentProjection {
 
 /// Inert process and kernel-readiness evidence copied from Host's validated
 /// authenticated readiness handshake. The launch markers bind the evidence
-/// to the exact staged UserMode operation; these fields do not represent a
+/// to the exact staged `UserMode` operation; these fields do not represent a
 /// Task Scheduler engine PID.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserModeTaskRunHostReadinessEvidence {
-    /// Transaction ID parsed from the Host process's RunEx dynamic arguments.
+    /// Transaction ID parsed from the Host process's `RunEx` dynamic arguments.
     pub launch_transaction_id: String,
-    /// Effect ID parsed from the Host process's RunEx dynamic arguments.
+    /// Effect ID parsed from the Host process's `RunEx` dynamic arguments.
     pub launch_effect_id: String,
     /// PID of the Host process proven by the readiness handshake.
     pub host_process_id: u32,
@@ -2815,7 +2819,7 @@ impl UserModeTaskRunHostReadinessEvidence {
     }
 }
 
-/// Exact Host readiness acknowledgement for one staged UserMode task run.
+/// Exact Host readiness acknowledgement for one staged `UserMode` task run.
 /// It proves readiness for the embedded transaction/effect identity and does
 /// not substitute for a Task Scheduler `RunEx` acceptance receipt.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -2851,7 +2855,7 @@ impl UserModeTaskRunHostAck {
     }
 }
 
-/// Durable state of the single current UserMode task-run projection.
+/// Durable state of the single current `UserMode` task-run projection.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserModeTaskRunRecordState {
@@ -2862,7 +2866,7 @@ pub enum UserModeTaskRunRecordState {
     HostReadinessAcknowledged,
 }
 
-/// The latest durable operation-bound UserMode task-run projection.
+/// The latest durable operation-bound `UserMode` task-run projection.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserModeTaskRunRecord {
@@ -3033,7 +3037,7 @@ pub struct ApprovedGenerationRegistry {
     /// absent preserves the pre-#2737 shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) committed_cutover_activation: Option<CommittedCutoverActivation>,
-    /// Exact UserMode current-user task registration and one-shot `RunEx`
+    /// Exact `UserMode` current-user task registration and one-shot `RunEx`
     /// projection. This is mandatory on the v19 wire (explicit `null` when no
     /// task run is projected).
     pub(crate) user_mode_task_run_record: Option<UserModeTaskRunRecord>,
@@ -3177,7 +3181,7 @@ impl<'a> LegacyRegistryProjectionIdentityV17<'a> {
 
 /// The v18 serialization shape used to preserve the activation identity of a
 /// registry migrated in memory to v19. Its fields mirror the exact durable
-/// v18 projection and omit the v19 UserMode task-run member.
+/// v18 projection and omit the v19 `UserMode` task-run member.
 #[derive(Serialize)]
 struct LegacyRegistryProjectionIdentityV18<'a> {
     registry_wire_version: ContractVersion,
@@ -3546,13 +3550,13 @@ impl ApprovedGenerationRegistry {
         self.revision
     }
 
-    /// Returns the latest durable UserMode task-run projection, if present.
+    /// Returns the latest durable `UserMode` task-run projection, if present.
     #[must_use]
     pub const fn user_mode_task_run_record(&self) -> Option<&UserModeTaskRunRecord> {
         self.user_mode_task_run_record.as_ref()
     }
 
-    /// Validates an intent against the current active UserMode generation and
+    /// Validates an intent against the current active `UserMode` generation and
     /// its exact original profile-selection receipt. Stage and ack call this
     /// at their CAS boundary; ordinary registry validation permits an older
     /// acknowledged record to remain as operation history after cutover.

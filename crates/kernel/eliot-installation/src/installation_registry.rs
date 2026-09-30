@@ -673,6 +673,32 @@ impl RedbInstallationRegistry {
         Ok(())
     }
 
+    fn validate_user_mode_task_run_host_ack_binding(
+        &self,
+        registry: &ApprovedGenerationRegistry,
+        host: &HostOwnerEpochCapability,
+        ack: &UserModeTaskRunHostAck,
+    ) -> Result<(), InstallationError> {
+        let active = registry.validate_active_user_mode_task_run_intent(&ack.intent)?;
+        if ack.evidence.host_process_id != std::process::id()
+            || !eliot_platform_windows::windows_paths_equal(
+                Path::new(&ack.evidence.host_process_image_path),
+                Path::new(active.manifest.host_executable_path.as_str()),
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.validate_host_owner_binding_for_identity(
+            host,
+            &active.manifest.runtime_launch.installation_epoch.installation,
+            &active
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root,
+        )
+    }
+
     fn validate_host_owner_binding(
         &self,
         host: &HostOwnerEpochCapability,
@@ -789,7 +815,7 @@ impl RedbInstallationRegistry {
             .read_committed_activation_receipt(transaction_id, plan_digest, generation)
     }
 
-    /// Stages the exact UserMode task registration and `RunEx` intent before
+    /// Stages the exact `UserMode` task registration and `RunEx` intent before
     /// the caller invokes Task Scheduler. The record remains explicitly
     /// unresolved until Host commits readiness evidence; staging never implies
     /// that `RunEx` was accepted.
@@ -802,12 +828,12 @@ impl RedbInstallationRegistry {
     pub fn stage_user_mode_task_run_intent(
         &self,
         expected_revision: u64,
-        intent: UserModeTaskRunIntentProjection,
+        intent: &UserModeTaskRunIntentProjection,
     ) -> Result<UserModeTaskRunRecord, InstallationError> {
         let current = self.load()?;
-        current.validate_active_user_mode_task_run_intent(&intent)?;
+        current.validate_active_user_mode_task_run_intent(intent)?;
         if let Some(record) = current.user_mode_task_run_record()
-            && record.intent() == &intent
+            && record.intent() == intent
         {
             return Ok(record.clone());
         }
@@ -829,7 +855,7 @@ impl RedbInstallationRegistry {
                 actual: current.revision(),
             });
         }
-        let staged_intent = intent.clone();
+        let staged_intent = (*intent).clone();
         match self.mutate_atomic(expected_revision, |registry| {
             registry.validate_active_user_mode_task_run_intent(&staged_intent)?;
             if let Some(existing) = registry.user_mode_task_run_record()
@@ -857,9 +883,9 @@ impl RedbInstallationRegistry {
             Ok(record) => Ok(record),
             Err(conflict @ InstallationError::CompareAndSaveConflict { .. }) => {
                 let latest = self.load()?;
-                latest.validate_active_user_mode_task_run_intent(&intent)?;
+                latest.validate_active_user_mode_task_run_intent(intent)?;
                 match latest.user_mode_task_run_record() {
-                    Some(record) if record.intent() == &intent => Ok(record.clone()),
+                    Some(record) if record.intent() == intent => Ok(record.clone()),
                     _ => Err(conflict),
                 }
             }
@@ -884,7 +910,7 @@ impl RedbInstallationRegistry {
             .cloned())
     }
 
-    /// Commits authenticated Host readiness for one exact staged UserMode
+    /// Commits authenticated Host readiness for one exact staged `UserMode`
     /// task-run intent. The Host launch markers must equal the original
     /// transaction/effect IDs, and the current active generation, original
     /// root receipt and Host-owner capability must still agree.
@@ -895,7 +921,7 @@ impl RedbInstallationRegistry {
         &self,
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
-        ack: UserModeTaskRunHostAck,
+        ack: &UserModeTaskRunHostAck,
     ) -> Result<UserModeTaskRunRecord, InstallationError> {
         let _guard = host
             .live_guard()
@@ -909,25 +935,8 @@ impl RedbInstallationRegistry {
         if existing.intent() != &ack.intent {
             return Err(InstallationError::IdentityConflict);
         }
-        let active = current.validate_active_user_mode_task_run_intent(&ack.intent)?;
-        if ack.evidence.host_process_id != std::process::id()
-            || !eliot_platform_windows::windows_paths_equal(
-                Path::new(&ack.evidence.host_process_image_path),
-                Path::new(active.manifest.host_executable_path.as_str()),
-            )
-        {
-            return Err(InstallationError::IdentityConflict);
-        }
-        self.validate_host_owner_binding_for_identity(
-            host,
-            &active.manifest.runtime_launch.installation_epoch.installation,
-            &active
-                .manifest
-                .runtime_launch
-                .runtime_state_roots
-                .host_state_root,
-        )?;
-        if existing.host_ack() == Some(&ack) {
+        self.validate_user_mode_task_run_host_ack_binding(&current, host, ack)?;
+        if existing.host_ack() == Some(ack) {
             return Ok(existing.clone());
         }
         if current.revision() != expected_revision {
@@ -936,26 +945,9 @@ impl RedbInstallationRegistry {
                 actual: current.revision(),
             });
         }
-        let staged_ack = ack.clone();
+        let staged_ack = (*ack).clone();
         match self.mutate_atomic(expected_revision, |registry| {
-            let active = registry.validate_active_user_mode_task_run_intent(&staged_ack.intent)?;
-            if staged_ack.evidence.host_process_id != std::process::id()
-                || !eliot_platform_windows::windows_paths_equal(
-                    Path::new(&staged_ack.evidence.host_process_image_path),
-                    Path::new(active.manifest.host_executable_path.as_str()),
-                )
-            {
-                return Err(InstallationError::IdentityConflict);
-            }
-            self.validate_host_owner_binding_for_identity(
-                host,
-                &active.manifest.runtime_launch.installation_epoch.installation,
-                &active
-                    .manifest
-                    .runtime_launch
-                    .runtime_state_roots
-                    .host_state_root,
-            )?;
+            self.validate_user_mode_task_run_host_ack_binding(registry, host, &staged_ack)?;
             let record = registry
                 .user_mode_task_run_record()
                 .ok_or_else(|| {
@@ -974,26 +966,9 @@ impl RedbInstallationRegistry {
             Ok(record) => Ok(record),
             Err(conflict @ InstallationError::CompareAndSaveConflict { .. }) => {
                 let latest = self.load()?;
-                let active = latest.validate_active_user_mode_task_run_intent(&ack.intent)?;
-                if ack.evidence.host_process_id != std::process::id()
-                    || !eliot_platform_windows::windows_paths_equal(
-                        Path::new(&ack.evidence.host_process_image_path),
-                        Path::new(active.manifest.host_executable_path.as_str()),
-                    )
-                {
-                    return Err(InstallationError::IdentityConflict);
-                }
-                self.validate_host_owner_binding_for_identity(
-                    host,
-                    &active.manifest.runtime_launch.installation_epoch.installation,
-                    &active
-                        .manifest
-                        .runtime_launch
-                        .runtime_state_roots
-                        .host_state_root,
-                )?;
+                self.validate_user_mode_task_run_host_ack_binding(&latest, host, ack)?;
                 match latest.user_mode_task_run_record() {
-                    Some(record) if record.host_ack() == Some(&ack) => Ok(record.clone()),
+                    Some(record) if record.host_ack() == Some(ack) => Ok(record.clone()),
                     _ => Err(conflict),
                 }
             }
