@@ -3173,6 +3173,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
+ "eliot-contracts",
  "eliot-runtime-contracts",
  "eliot-types",
  "eliot-windows-ipc",
