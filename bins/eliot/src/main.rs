@@ -5091,14 +5091,14 @@ fn run_installation_effect(
         }
     };
     drop(coordinator);
-    if let Some(preflight_guard) = preflight_guard {
-        if let Err(error) = preflight_guard.revalidate(&preflight_transaction) {
-            write_installation_error(
-                "POST_EFFECT_RUNTIME_GUARD_UNKNOWN",
-                &format!("post-coordinator runtime lease revalidation failed: {error}"),
-            );
-            return Ok(UNKNOWN_OUTCOME_EXIT);
-        }
+    if let Some(preflight_guard) = preflight_guard
+        && let Err(error) = preflight_guard.revalidate(&preflight_transaction)
+    {
+        write_installation_error(
+            "POST_EFFECT_RUNTIME_GUARD_UNKNOWN",
+            &format!("post-coordinator runtime lease revalidation failed: {error}"),
+        );
+        return Ok(UNKNOWN_OUTCOME_EXIT);
     }
     let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path) {
         Ok(store) => store,

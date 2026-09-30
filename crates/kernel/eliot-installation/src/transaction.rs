@@ -1080,7 +1080,7 @@ impl InstallationTransaction {
         Ok(())
     }
 
-    /// Captures the original Host-root receipt from a CreateRoot readback in
+    /// Captures the original Host-root receipt from a `CreateRoot` readback in
     /// the caller's existing effect compare-and-save. The observation's
     /// identity came from the MAC-verified ownership marker; the live lease
     /// comparison prevents a changed path from being adopted before the

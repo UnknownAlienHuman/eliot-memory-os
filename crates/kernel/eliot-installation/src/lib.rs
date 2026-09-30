@@ -11030,7 +11030,7 @@ where
                     credential_receipt,
                     staging_receipt,
                     phase_b_receipt.map(|receipt| *receipt),
-                    system_service_host_root_receipt,
+                    system_service_host_root_receipt.as_ref(),
                 )
             }
             InstallationEffectObservation::Mismatch { pending_ref } => {
@@ -12032,7 +12032,7 @@ where
                                 credential_receipt,
                                 staging_receipt,
                                 phase_b_receipt.map(|receipt| *receipt),
-                                system_service_host_root_receipt,
+                                system_service_host_root_receipt.as_ref(),
                             )
                         } else {
                             self.persist_unknown(
@@ -12618,7 +12618,7 @@ where
         credential_receipt: Option<CredentialAccessReceipt>,
         staging_receipt: Option<StagingReceipt>,
         phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
-        system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
+        system_service_host_root_receipt: Option<&SystemServiceHostRootReceipt>,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
         let mut host_root_receipt_fallback = None;
@@ -12632,7 +12632,7 @@ where
                 )?;
                 return self.persist_unknown(transaction, index, pending_ref);
             }
-            let Some(receipt) = system_service_host_root_receipt.as_ref() else {
+            let Some(receipt) = system_service_host_root_receipt else {
                 let pending_ref = system_service_host_root_receipt_unknown_reference(
                     &transaction,
                     index,
@@ -12650,16 +12650,13 @@ where
                 )?;
                 return self.persist_unknown(transaction, index, pending_ref);
             };
-            let host_root = match ProtectedRootLease::open_existing(Path::new(root.as_str())) {
-                Ok(root) => root,
-                Err(_) => {
-                    let pending_ref = system_service_host_root_receipt_unknown_reference(
-                        &transaction,
-                        index,
-                        "host-root-receipt:retained-root-unavailable",
-                    )?;
-                    return self.persist_unknown(transaction, index, pending_ref);
-                }
+            let Ok(host_root) = ProtectedRootLease::open_existing(Path::new(root.as_str())) else {
+                let pending_ref = system_service_host_root_receipt_unknown_reference(
+                    &transaction,
+                    index,
+                    "host-root-receipt:retained-root-unavailable",
+                )?;
+                return self.persist_unknown(transaction, index, pending_ref);
             };
             if transaction
                 .record_system_service_host_root_receipt_from_created_effect(receipt, &host_root)
