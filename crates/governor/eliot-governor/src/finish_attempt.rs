@@ -242,7 +242,7 @@ impl PreparedKernelExchange {
     pub async fn exchange_with_original_submission<P: KernelTransitionPort + ?Sized>(
         &self,
         port: &P,
-    ) -> Result<WriteReceipt, FinishAttemptError> {
+    ) -> Result<eliot_store_api::PreparedWriteOutcome, FinishAttemptError> {
         let source = self.original_write_submission.clone().ok_or_else(|| {
             FinishAttemptError::Kernel(KernelPortError::NotAdmitted(
                 "prepared exchange has no original versioned write source".to_owned(),
@@ -256,7 +256,7 @@ impl PreparedKernelExchange {
                 "versioned original-write exchange has no prepared transition".to_owned(),
             ))
         })?;
-        let committed = match port
+        let outcome = match port
             .apply_prepared_with_original_submission(
                 &self.identity,
                 transition.clone(),
@@ -266,12 +266,35 @@ impl PreparedKernelExchange {
             )
             .await
         {
-            Ok(receipt) => receipt,
-            Err(KernelPortError::Unknown(_)) => return self.reconcile_receipt(port).await,
+            Ok(outcome) => outcome,
+            Err(KernelPortError::Unknown(_)) => {
+                let receipt = self.reconcile_receipt(port).await?;
+                eliot_store_api::PreparedWriteOutcome::Receipt(Box::new(receipt))
+            }
             Err(error) => return Err(error.into()),
         };
-        self.validate_receipt(&committed)?;
-        Ok(committed)
+        outcome
+            .validate()
+            .map_err(|error| FinishAttemptError::Kernel(KernelPortError::Contract(error.to_string())))?;
+        match &outcome {
+            eliot_store_api::PreparedWriteOutcome::Staged(submission) => {
+                if submission.operation_id != self.operation_id
+                    || self.transition.as_ref().is_none_or(|transition| {
+                        submission.request_hash != transition.identity.canonical_request_hash
+                    })
+                {
+                    return Err(KernelPortError::Contract(
+                        "staged submission does not match the exact prepared operation and request"
+                            .to_owned(),
+                    )
+                    .into());
+                }
+            }
+            eliot_store_api::PreparedWriteOutcome::Receipt(receipt) => {
+                self.validate_receipt(receipt)?;
+            }
+        }
+        Ok(outcome)
     }
 
     /// Reads back the committed receipt for this exact operation.
