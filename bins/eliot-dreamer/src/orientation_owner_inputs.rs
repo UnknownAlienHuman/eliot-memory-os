@@ -215,7 +215,7 @@ impl StageOutputSet {
                 if !retain_rival_semantics(self, &output) {
                     return false;
                 }
-                self.rivals = Some(output);
+                self.rivals = Some(*output);
             }
             StageOwnerOutput::Conflict(output) => {
                 if !retain_conflict_semantics(self, &output) {
