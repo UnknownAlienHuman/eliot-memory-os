@@ -5061,11 +5061,10 @@ fn claim_time_version(record: &SourceRecord) -> String {
 /// denominator its run was admitted under.
 ///
 /// The denominator is the Kernel-admitted digest — the same value the run's own
-/// [`crate::evidence_portfolio::AuthorizedManifest`] is frozen with, so the
-/// claim cannot be measured against a denominator its audit was not authorized
-/// for. The unit is the coverage account's own declared member count and
-/// account digest, so "measured in" names a countable population rather than
-/// asserting one.
+/// [`AuthorizedManifest`] is frozen with, so the claim cannot be measured
+/// against a denominator its audit was not authorized for. The unit is the
+/// coverage account's own declared member count and account digest, so "measured
+/// in" names a countable population rather than asserting one.
 fn claim_definition_unit_denominator(
     admitted_denominator_digest: &str,
     account: &CoverageAccount,
