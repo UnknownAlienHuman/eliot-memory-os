@@ -468,18 +468,36 @@ def _read_inventory_artifact(
     # schema/aggregate validation are translated here.
     try:
         artifact = producer._parse_toml(raw, source=INVENTORY_REL)
-        header, rows, worksets = producer._validate_artifact(artifact)
+        # The producer's own `check` measures the declared test paths BEFORE
+        # validating, because a split's accounting is checked against the real
+        # files rather than against a stated number. The oracle reuses that exact
+        # sequence, so it inherits the producer's notion of what the artifact
+        # claims rather than inventing a looser one.
+        declared_worksets = artifact.get("consumer_worksets")
+        if not isinstance(declared_worksets, list):
+            raise OracleError(
+                "INVENTORY_MALFORMED",
+                f"consumer_worksets must be a list in {INVENTORY_REL}",
+            )
+        test_bytes = producer._measure_test_paths(root, declared_worksets)
+        header, rows, worksets, splits = producer._validate_artifact(artifact, test_bytes)
     except producer.InventoryError as exc:
         raise OracleError(
             "INVENTORY_MALFORMED",
             f"the inventory artifact is malformed or internally inconsistent: {exc.code}: {exc.detail}",
         ) from exc
+    # A split table that survives the producer's own validation is carried to the
+    # caller, so the split check reads the producer's RESOLVED proposals rather
+    # than re-parsing the artifact. It is returned, not dropped: an unused
+    # binding here would be a dead binding, and the producer measures every
+    # declared test path precisely so a split cannot be trusted on a stated
+    # number.
     if not isinstance(artifact.get("inventory_digest"), str):
         raise OracleError(
             "INVENTORY_MALFORMED",
             f"the inventory artifact declares no string inventory_digest: {INVENTORY_REL}",
         )
-    return header, rows, worksets, str(artifact["inventory_digest"]), raw
+    return header, rows, worksets, splits, str(artifact["inventory_digest"]), raw
 
 
 def _declared_universe(rows: list[dict[str, Any]]) -> tuple[tuple[str, str, str, str], ...]:
@@ -547,7 +565,16 @@ def _producer_check(
     # never to trust a stored digest blindly.
     try:
         artifact = producer._parse_toml(raw, source=INVENTORY_REL)
-        header, rows, worksets = producer._validate_artifact(artifact)
+        # Same sequence as the producer's own `check`: measure the declared test
+        # paths, then validate. Re-deriving the measurement here rather than
+        # trusting a recorded size is what keeps a split from being believed on a
+        # stated number.
+        _wsets = artifact.get("consumer_worksets")
+        if not isinstance(_wsets, list):
+            return "error", "consumer_worksets must be a list in the inventory artifact"
+        header, rows, worksets, _splits = producer._validate_artifact(
+            artifact, producer._measure_test_paths(root, _wsets)
+        )
     except producer.InventoryError as exc:
         return "error", f"{exc.code}: {exc.detail}"
     recorded_inventory_digest = str(artifact.get("inventory_digest", ""))
@@ -989,7 +1016,7 @@ def evaluate(root: Path) -> OwnershipResult:
     # ``_producer_check`` -- never left unused, and never replaced by a
     # recorded digest value that would have to be taken on trust.
     try:
-        header, rows, worksets, inventory_digest, raw = _read_inventory_artifact(
+        header, rows, worksets, splits, inventory_digest, raw = _read_inventory_artifact(
             root, producer
         )
     except OracleError as exc:
