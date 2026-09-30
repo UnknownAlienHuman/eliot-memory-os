@@ -18,7 +18,7 @@
 //! named operations stay with their catalogue owners (MGR04, #19).
 
 use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_read::{LocalReadPort, ReadError};
+use eliot_read::{LocalReadPort, QueryResult, ReadError};
 use eliot_store_api::ScopeId;
 use serde::Serialize;
 use thiserror::Error;
@@ -115,6 +115,25 @@ pub struct AdmittedSourceClaim {
     pub privacy_class: String,
     /// Closed route membership; see [`ORIENTATION_MATERIAL_ROUTE_ADMITTED`].
     pub route_class: String,
+}
+
+/// Original named-read result and the exact canonical payload bytes verified for one source.
+///
+/// This preserves the read boundary's owner result without treating the caller-supplied claim as
+/// authority. `source_read` is the unmodified `QueryResult` returned by `LocalReadPort`; that
+/// boundary does not expose the underlying `ReadIdentity`, so this value does not invent one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedOrientationSource {
+    /// Caller-supplied claim whose expected length and digest were verified against this read.
+    pub claim: AdmittedSourceClaim,
+    /// Exact request metadata supplied to the named-read boundary.
+    pub request_metadata: RequestMetadata,
+    /// Exact scope supplied to the named-read boundary.
+    pub scope_id: ScopeId,
+    /// Unmodified result returned by the existing Governor named-read operation.
+    pub source_read: QueryResult,
+    /// Canonical JSON bytes of `source_read.payload`, checked against `claim`.
+    pub canonical_payload: Vec<u8>,
 }
 
 impl AdmittedSourceClaim {
@@ -338,6 +357,24 @@ pub async fn resolve_source_claim(
     scope: &ScopeId,
     claim: &AdmittedSourceClaim,
 ) -> Result<Vec<u8>, DreamerMaterialsError> {
+    Ok(
+        resolve_source_claim_with_readback(reads, ctx, scope, claim)
+            .await?
+            .canonical_payload,
+    )
+}
+
+/// Resolves and retains the original named-read result together with the exact verified bytes.
+///
+/// This is the same live read, fence check, canonicalization, and claim verification as
+/// [`resolve_source_claim`]. Callers that need source provenance should retain this value instead
+/// of resolving the claim again or reconstructing metadata from its payload.
+pub async fn resolve_source_claim_with_readback(
+    reads: &impl LocalReadPort,
+    ctx: &RequestMetadata,
+    scope: &ScopeId,
+    claim: &AdmittedSourceClaim,
+) -> Result<ResolvedOrientationSource, DreamerMaterialsError> {
     claim.validate()?;
     let result = reads
         .evidence_query(
@@ -353,7 +390,13 @@ pub async fn resolve_source_claim(
     let bytes = canonical_json_bytes(&result.payload)
         .map_err(|_| DreamerMaterialsError::ManifestEncoding)?;
     verify_resolved_bytes(claim, &bytes)?;
-    Ok(bytes)
+    Ok(ResolvedOrientationSource {
+        claim: claim.clone(),
+        request_metadata: ctx.clone(),
+        scope_id: scope.clone(),
+        source_read: result,
+        canonical_payload: bytes,
+    })
 }
 
 fn validate_scope(value: &str) -> Result<(), DreamerMaterialsError> {
