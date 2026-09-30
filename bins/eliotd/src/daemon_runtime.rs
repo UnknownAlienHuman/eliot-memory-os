@@ -6511,13 +6511,17 @@ async fn retain_accepted_activation_workspace_locator(
     result: &AgentActivationResolutionResult,
     owner_readback: Option<&eliot_protocol::AgentActivationOwnerReadback>,
 ) {
-    if !matches!(result.disposition, AgentActivationResolutionDisposition::Resolved { .. }) {
+    if !matches!(
+        result.disposition,
+        AgentActivationResolutionDisposition::Resolved { .. }
+    ) {
         return;
     }
-    let outcome = composition
-        .lock()
-        .await
-        .note_activation_workspace_locator(ticket, result, owner_readback);
+    let outcome =
+        composition
+            .lock()
+            .await
+            .note_activation_workspace_locator(ticket, result, owner_readback);
     if let Err(error) = outcome {
         tracing::warn!(
             ticket = %eliotd::diagnostics::sanitize_identity(&ticket.ticket_id),

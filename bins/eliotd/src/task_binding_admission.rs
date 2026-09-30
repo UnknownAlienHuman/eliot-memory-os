@@ -129,7 +129,7 @@ use eliot_workscope::{
     DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
     ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
     ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
-    WorkScopeBindingSnapshot, issue_discovery_lease, task_selection_required,
+    issue_discovery_lease, task_selection_required,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -873,14 +873,14 @@ pub struct TaskBindingError {
 }
 
 impl TaskBindingError {
-    fn selection_required(detail: impl Into<String>) -> Self {
+    pub(crate) fn selection_required(detail: impl Into<String>) -> Self {
         Self {
             code: TASK_SELECTION_REQUIRED,
             detail: detail.into(),
         }
     }
 
-    fn scope_incompatible(detail: impl Into<String>) -> Self {
+    pub(crate) fn scope_incompatible(detail: impl Into<String>) -> Self {
         Self {
             code: TASK_SCOPE_INCOMPATIBLE,
             detail: detail.into(),
