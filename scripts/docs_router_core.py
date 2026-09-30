@@ -35,6 +35,11 @@ LEGACY_BOOKS = {
 }
 SKIP_PARTS = {".git", "target", ".idea", ".vscode", "node_modules", "bin", "obj"}
 COVERAGE_KEYS = ("path", "topic", "expect_routes", "expect_required_handles", "expect_absent_routes")
+# Topic text is matched as whole alphanumeric tokens, never as an arbitrary
+# substring. Punctuation, whitespace, and symbol boundaries all separate
+# tokens, so a multiword keyword such as "source code" matches "source-code",
+# "source_code", and "source code" alike (#4606).
+TOPIC_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 class RouteError(RuntimeError):
@@ -270,9 +275,33 @@ def path_matches(path: str, pattern: str) -> bool:
     return False
 
 
+def topic_tokens(text: str) -> list[str]:
+    """Split topic text into case-insensitive alphanumeric tokens."""
+    return TOPIC_TOKEN_RE.findall(text.casefold())
+
+
+def keyword_token_hit(topic_token_list: Sequence[str], keyword: str) -> bool:
+    """Match one casefolded keyword against tokenized topic text.
+
+    A single-word keyword matches only a whole topic token; a multiword
+    keyword matches only a contiguous token run. Fragments inside a longer
+    token (``ors`` in ``errors``, ``cli`` in ``clippy``) never match.
+    Legitimate inflections must be listed as explicit keyword variants in
+    the route configuration.
+    """
+    wanted = TOPIC_TOKEN_RE.findall(keyword)
+    if not wanted:
+        return False
+    width = len(wanted)
+    return any(
+        list(topic_token_list[offset:offset + width]) == wanted
+        for offset in range(len(topic_token_list) - width + 1)
+    )
+
+
 def matched_routes(config: Config, paths: Sequence[str], topic: str) -> list[RouteRule]:
     normalized = tuple(normalize_repo_path(path) for path in paths)
-    topic_folded = topic.casefold()
+    tokens = topic_tokens(topic)
     matched: list[RouteRule] = []
     for route in config.routes:
         path_hit = any(
@@ -280,7 +309,9 @@ def matched_routes(config: Config, paths: Sequence[str], topic: str) -> list[Rou
             for path in normalized
             for pattern in route.path_globs
         )
-        topic_hit = any(keyword in topic_folded for keyword in route.topic_keywords)
+        topic_hit = bool(tokens) and any(
+            keyword_token_hit(tokens, keyword) for keyword in route.topic_keywords
+        )
         if path_hit or topic_hit:
             matched.append(route)
     return matched
