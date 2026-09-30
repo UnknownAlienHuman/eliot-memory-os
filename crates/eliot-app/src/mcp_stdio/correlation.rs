@@ -32,8 +32,8 @@ use anyhow::Context as _;
 use eliot_agent_bridge_core::{
     AssessmentInputs, CorrelationIdentity, CorrelationIdentityParts, CorrelationStage,
     EliotEmissionObservation, EmissionCause, HandlerOutcome, HostTerminalObservation,
-    ObservationWindow, OperationIdentity, OwnerValidatedOperationBinding, StdioEmissionReceipt,
-    assess_correlation,
+    ObservationWindow, OperationIdentity, OwnerStaleUiNote, OwnerValidatedOperationBinding,
+    StdioEmissionReceipt, assess_correlation,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -385,7 +385,15 @@ impl McpInvocationCorrelation {
             transport_edge: None,
             operation_binding: self.operation_binding.as_ref(),
             canonical: &canonical,
-            ui_confirmed_stale: false,
+            // This facade holds no event owner: it owns no bridge and must not
+            // mint a second journal (see `mcp_bridge_join`'s module contract),
+            // so it has no stale UI/CLI record to read and therefore has none to
+            // report. `NOT_RECORDED` is absence, not a claim that the Desktop
+            // view is current, and it is the exact value this site passed as a
+            // literal `false` before — so nothing about the assessment it emits
+            // changes. It could not have passed `true` even before this type
+            // existed, and now it cannot pass a confirmation at all.
+            owner_stale_ui: OwnerStaleUiNote::NOT_RECORDED,
         };
         let assessment = assess_correlation(&inputs);
         let digest = observation.identity.identity_digest.clone();

@@ -13,7 +13,8 @@
 //! owning process calls with its live bridge:
 //!
 //! - [`submit_derived_fault`] files one derived transport edge;
-//! - [`read_host_coverage`] projects the owner's coverage denominator;
+//! - [`read_host_coverage`] projects the owner's coverage denominator and the
+//!   owner's own stale-UI/CLI display note, as [`OwnerStaleUiNote`];
 //! - [`reconcile_terminal_event`] joins a nominated host event onto the live
 //!   journal by exact identity, position, content, and generation, checks it
 //!   against the evidence this correlation already accepted, and only then
@@ -29,6 +30,25 @@
 //! own retained revisions. Comparing two values the caller supplied, or
 //! recomputing a fresh digest over what the join already holds, could only
 //! prove that the caller agrees with itself.
+//!
+//! Desktop-visible terminal state is read the same way. The owner's stale
+//! UI/CLI display note is the owner's own retained record — it is set only by
+//! [`AgentBridgeCore::note_stale_ui_disposition`], survives in
+//! [`crate::TerminalReductionInputs`] and is projected here as
+//! [`BridgeHostCoverage::stale_ui_noted`]. It is absent from *every* request
+//! type in this module and from
+//! [`crate::mcp_correlation::AssessmentInputs`], on purpose: a bare `bool` on
+//! either would let any caller assert "the host says the UI is current" (or its
+//! opposite) with no observation behind it, and would decide whether a healthy
+//! completion offers a refresh. That is a proof claim.
+//!
+//! [`OwnerStaleUiNote`] is what makes it enforced rather than conventional. It
+//! has a private field and no `Default`, no `From<bool>`, no `Deserialize` and
+//! no public constructor that can admit a confirmation; the only value a caller
+//! outside this crate can name is [`OwnerStaleUiNote::NOT_RECORDED`], which is
+//! absence. `true` is reachable only through [`read_host_coverage`], from the
+//! owner's own projection — so the confirmation cannot be reconstructed by
+//! whoever performs the reconciliation.
 //!
 //! The correlation identity is deliberately NOT an input to this join. A
 //! correlation's recorded digest names the correlation; it says nothing about
@@ -66,8 +86,8 @@
 use crate::mcp_correlation::{
     Assessment, AssessmentInputs, AssessmentLog, AssessmentRevision, CanonicalDisposition,
     CoverageIndeterminacy, CoverageProof, EliotEmissionObservation, HostTerminalObservation,
-    ObservationWindow, OwnerValidatedOperationBinding, PartialObservation, assess_correlation,
-    sha256_hex,
+    ObservationWindow, OwnerStaleUiNote, OwnerValidatedOperationBinding, PartialObservation,
+    assess_correlation, sha256_hex,
 };
 use crate::mcp_host_observation::{
     HostEventJoinKeys, HostObservationReject, HostOwnerBinding, RecordedInvocation,
@@ -155,7 +175,15 @@ pub struct BridgeHostCoverage {
     /// Journaled host events observed.
     pub history_len: usize,
     /// Whether the owner noted a stale UI disposition.
-    pub stale_ui_noted: bool,
+    ///
+    /// Typed as [`OwnerStaleUiNote`] rather than `bool` for the same reason
+    /// [`crate::mcp_correlation::AssessmentInputs::owner_stale_ui`] is: a
+    /// publicly writable `bool` here would be a caller-authored claim about the
+    /// Desktop surface. This function is the only producer of that value
+    /// anywhere in the workspace, and it produces it by reading the owner's own
+    /// retained note, so the field is a projection of owner state rather than a
+    /// request. See [`OwnerStaleUiNote`] for the full provenance argument.
+    pub stale_ui_noted: OwnerStaleUiNote,
 }
 
 /// Projects the host-event coverage denominator from the live owner journal.
@@ -187,11 +215,19 @@ pub fn read_host_coverage(bridge: &AgentBridgeCore) -> BridgeHostCoverage {
                 cause: CoverageIndeterminacy::OwnerUnattached,
             },
             history_len: 0,
-            stale_ui_noted: false,
+            stale_ui_noted: OwnerStaleUiNote::NOT_RECORDED,
         };
     };
     let history = inputs.history();
-    let stale_ui_noted = inputs.stale_ui_disposition().is_some();
+    // THE construction site for `OwnerStaleUiNote`, and the only one in the
+    // workspace. It sits immediately after the owner's own projection read
+    // (`AgentBridgeCore::terminal_reduction_inputs`) and takes that read's
+    // result directly: `true` here is "the owner itself retained a stale
+    // UI/CLI display", and it is reachable only because this crate read the
+    // owner's record. There is no arm that accepts a caller's answer, so the
+    // confirmation cannot be reconstructed by whoever calls the assessment.
+    let stale_ui_noted =
+        OwnerStaleUiNote::admit_owner_record(inputs.stale_ui_disposition().is_some());
     if history.is_empty() {
         return BridgeHostCoverage {
             coverage: CoverageProof::NoEventYet,
@@ -318,6 +354,13 @@ impl std::error::Error for ReconcileError {
 }
 
 /// Owner request to reconcile one nominated terminal host event.
+///
+/// Desktop-visible terminal state is deliberately NOT a field. It is read from
+/// the owner's own stale UI/CLI record inside this module, as
+/// [`OwnerStaleUiNote`], because a caller-supplied `bool` here would be the
+/// caller's assertion rather than an observation, and it is what decides
+/// whether a healthy host completion also offers
+/// [`RecoveryAction::RefreshDesktopView`](crate::mcp_correlation::RecoveryAction::RefreshDesktopView).
 pub struct TerminalReconcileRequest<'a> {
     /// Immutable ELIOT-side emission observation being reconciled.
     pub emission: &'a EliotEmissionObservation,
@@ -337,8 +380,6 @@ pub struct TerminalReconcileRequest<'a> {
     pub operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical disposition from canonical evidence only.
     pub canonical: &'a CanonicalDisposition,
-    /// Whether the owner confirms a stale UI for this invocation.
-    pub ui_confirmed_stale: bool,
     /// Owner clock at assessment time, when the owner supplied one.
     pub now_unix_ms: Option<u64>,
 }
@@ -417,6 +458,14 @@ pub fn reconcile_terminal_event(
         });
     }
     let coverage = read_host_coverage(bridge);
+    // Desktop-visible terminal state is read out of the owner's own retained
+    // stale UI/CLI record, from the same owner projection the coverage
+    // denominator comes from, and before `coverage.coverage` is moved into the
+    // window below. The owner sets that record only through
+    // `AgentBridgeCore::note_stale_ui_disposition`, so a confirmed note here is
+    // something the owner recorded; an absent note is absence, never a claim
+    // that the Desktop view is current.
+    let owner_stale_ui = coverage.stale_ui_noted;
     let window = ObservationWindow {
         deadline_unix_ms: request.keys.deadline_unix_ms,
         now_unix_ms: request.now_unix_ms,
@@ -435,7 +484,7 @@ pub fn reconcile_terminal_event(
         transport_edge,
         operation_binding: request.operation_binding,
         canonical: request.canonical,
-        ui_confirmed_stale: request.ui_confirmed_stale,
+        owner_stale_ui,
     };
     Ok(assess_correlation(&assessment_inputs))
 }
@@ -549,6 +598,14 @@ pub fn reconcile_deadline_sweep(
     request: &DeadlineSweepRequest<'_>,
 ) -> Assessment {
     let coverage = read_host_coverage(bridge);
+    // The same owner-read note the terminal-event join uses, taken from the
+    // same owner projection. Here it cannot change any outcome: with no
+    // terminal event the host observation is `PartialUnknown`, so
+    // `assess_correlation` cannot reach the `HostCompleted` arm that is the
+    // only reader of the confirmation. It is read from the owner rather than
+    // written as a literal so that no seam in this module states "the Desktop
+    // view is current" without an owner record behind it.
+    let owner_stale_ui = coverage.stale_ui_noted;
     let window = ObservationWindow {
         deadline_unix_ms: request.deadline_unix_ms,
         now_unix_ms: request.now_unix_ms,
@@ -563,7 +620,7 @@ pub fn reconcile_deadline_sweep(
         transport_edge: None,
         operation_binding: request.operation_binding,
         canonical: request.canonical,
-        ui_confirmed_stale: false,
+        owner_stale_ui,
     };
     assess_correlation(&assessment_inputs)
 }

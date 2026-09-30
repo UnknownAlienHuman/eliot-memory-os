@@ -93,7 +93,8 @@ pub use mcp_correlation::{
     EliotEmissionObservation, EmissionCause, HandlerOutcome, HostObservationEvidence,
     HostTerminalObservation, HostTerminalState, MAX_ASSESSMENT_REVISIONS, MAX_SUMMARY_EVIDENCE,
     ObservationWindow, OperationEffectClass, OperationIdentity, OwnerBindingError,
-    OwnerValidatedOperationBinding, PartialObservation, RecoveryAction, RouteDegradation,
+    OwnerValidatedOperationBinding, OwnerStaleUiNote, PartialObservation, RecoveryAction,
+    RouteDegradation,
     RouteDegradationCode, StdioEmissionReceipt, assess_correlation, derive_recovery, sha256_hex,
 };
 // `mcp_correlation::CoverageGap` and `mcp_correlation::RecoveryDirective` are

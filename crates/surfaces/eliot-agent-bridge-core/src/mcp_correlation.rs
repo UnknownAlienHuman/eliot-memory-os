@@ -1039,6 +1039,78 @@ pub struct AssessmentEvidence {
     pub transport_edge: Option<TransportEdgeKind>,
 }
 
+/// The owner's own record that the Desktop/CLI surface showed a stale terminal
+/// display while the host completed the invocation.
+///
+/// This is the Desktop-visible terminal state an assessment is allowed to
+/// consult, and it is deliberately NOT a `bool`. A bare `bool` here was a
+/// caller's *claim*: any holder of this publicly re-exported struct could write
+/// `true` (or `false`) into it, and that value alone decided whether a healthy
+/// host completion also offered [`RecoveryAction::RefreshDesktopView`]. A
+/// caller reconstructing the value could satisfy any check made against it,
+/// because the check and the value came from the same untrusted place. Making
+/// the value a type is what turns "reconcile against the owner" from a
+/// convention into an enforced property.
+///
+/// The field is private, and there is no `Default`, no `From<bool>`, no
+/// `Deserialize` and no public constructor, so no caller outside this crate can
+/// build one at all — let alone build a `true`. The only production construction
+/// site is [`OwnerStaleUiNote::admit_owner_record`], which is reached from
+/// exactly one place: [`crate::mcp_bridge_join::read_host_coverage`], which
+/// reads `AgentBridgeCore::terminal_reduction_inputs()`, the owner's own
+/// retained note. `true` is therefore only ever the owner's own record, and the
+/// absence of a record is absence — never a claim that the Desktop view is
+/// current (issue #7 W2; I07-23 "Missing host coverage is `TAINTED/UNKNOWN`,
+/// never a self-reported PASS").
+///
+/// The note is the owner's verbatim string, so a `true` here still carries no
+/// per-invocation identity: it is the owner's process-wide record, not a
+/// digest bound to this correlation. That limit is the owner's, and is stated
+/// rather than papered over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerStaleUiNote {
+    /// Private on purpose: an accessible field would restore the very bypass
+    /// this type exists to close, because a caller could then write into it.
+    confirmed: bool,
+}
+
+impl OwnerStaleUiNote {
+    /// The one constructor that can admit a confirmation, and it is
+    /// crate-private on purpose.
+    ///
+    /// Its single production caller is
+    /// [`crate::mcp_bridge_join::read_host_coverage`], which supplies the
+    /// owner's own projection result. Nothing in this crate builds this value
+    /// from a literal, and nothing outside this crate can build it at all.
+    pub(crate) const fn admit_owner_record(confirmed: bool) -> Self {
+        Self { confirmed }
+    }
+
+    /// The owner's record was not consulted: no stale UI/CLI display was noted.
+    ///
+    /// This is the ONLY value a caller outside this crate can obtain, and it is
+    /// deliberately the absence value. It exists for the one legitimate case —
+    /// a caller that holds no event owner at all and therefore has no record to
+    /// read — and it is the value every such call site already passed as a
+    /// literal `false`, so adopting it changes no existing behavior.
+    ///
+    /// It is a constant precisely because the harmful direction is unavailable:
+    /// a caller outside this crate can state "nothing was recorded" and cannot
+    /// state "a stale display was confirmed". A confirmation reachable only from
+    /// the owner's own projection is what makes this value provenance rather
+    /// than assertion; publishing a general `from_bool` here would hand back the
+    /// bypass this type exists to close.
+    pub const NOT_RECORDED: Self = Self { confirmed: false };
+
+    /// Whether the owner itself recorded a stale UI/CLI display.
+    ///
+    /// `false` means the owner recorded nothing, which is absence of evidence
+    /// and never evidence that the surface is current.
+    pub const fn is_confirmed(self) -> bool {
+        self.confirmed
+    }
+}
+
 /// Inputs to one correlation assessment.
 ///
 /// Every input is either ELIOT-observed, owner-proven, or explicitly absent.
@@ -1056,8 +1128,15 @@ pub struct AssessmentInputs<'a> {
     pub operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical operation disposition from canonical evidence only.
     pub canonical: &'a CanonicalDisposition,
-    /// Whether the owner confirmed a stale UI while the host completed.
-    pub ui_confirmed_stale: bool,
+    /// The owner's own stale-UI/CLI record for this process.
+    ///
+    /// Typed as [`OwnerStaleUiNote`] rather than `bool` so a caller cannot
+    /// author it: the only way to obtain one is to read it out of the event
+    /// owner, and the only way to read it is
+    /// [`read_host_coverage`](crate::mcp_bridge_join::read_host_coverage), which
+    /// every caller of this struct in this crate already calls. See that type's
+    /// documentation for the full provenance argument.
+    pub owner_stale_ui: OwnerStaleUiNote,
 }
 
 /// One derived route assessment: explicit state plus bounded recovery.
@@ -1117,7 +1196,7 @@ pub fn assess_correlation(inputs: &AssessmentInputs<'_>) -> Assessment {
                         state,
                         inputs.operation_binding,
                         inputs.canonical,
-                        inputs.ui_confirmed_stale,
+                        inputs.owner_stale_ui,
                     ),
                     evidence,
                 }
@@ -1138,7 +1217,7 @@ pub fn assess_correlation(inputs: &AssessmentInputs<'_>) -> Assessment {
                 state,
                 inputs.operation_binding,
                 inputs.canonical,
-                inputs.ui_confirmed_stale,
+                inputs.owner_stale_ui,
             ),
             evidence,
         };
@@ -1156,7 +1235,7 @@ pub fn assess_correlation(inputs: &AssessmentInputs<'_>) -> Assessment {
                 state,
                 inputs.operation_binding,
                 inputs.canonical,
-                inputs.ui_confirmed_stale,
+                inputs.owner_stale_ui,
             ),
             evidence,
         };
@@ -1208,7 +1287,7 @@ fn assess_host_error(inputs: &AssessmentInputs<'_>, evidence: AssessmentEvidence
                 state,
                 inputs.operation_binding,
                 inputs.canonical,
-                inputs.ui_confirmed_stale,
+                inputs.owner_stale_ui,
             ),
             evidence,
         }
@@ -1257,13 +1336,13 @@ pub fn derive_recovery(
     state: CorrelationAssessmentState,
     operation_binding: Option<&OwnerValidatedOperationBinding>,
     canonical: &CanonicalDisposition,
-    ui_confirmed_stale: bool,
+    owner_stale_ui: OwnerStaleUiNote,
 ) -> Option<RecoveryDirective> {
     let resubmit_allowed = operation_binding
         .is_some_and(|binding| binding.allows(RecoveryAction::ResubmitSameOperationIdentity));
     let mut actions = match state {
         CorrelationAssessmentState::HostCompleted => {
-            if ui_confirmed_stale {
+            if owner_stale_ui.is_confirmed() {
                 vec![RecoveryAction::RefreshDesktopView]
             } else {
                 return None;
