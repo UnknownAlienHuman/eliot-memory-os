@@ -923,9 +923,7 @@ impl OrsPermitFate {
                     Some(Self::IssuedHeld),
                 )
                 | (
-                    Self::Released
-                        | Self::LeakedOrUnknown
-                        | Self::StaleOwnerReconciliationRequired,
+                    Self::Released | Self::LeakedOrUnknown | Self::StaleOwnerReconciliationRequired,
                     Some(Self::ReleaseRequested),
                 )
                 | (
@@ -1284,7 +1282,10 @@ pub fn reconcile_permit_fate_readback(
         let Some(evidence) = decode_permit_fate_entry(entry)? else {
             continue;
         };
-        histories.entry(evidence.permit_id.clone()).or_default().push(evidence);
+        histories
+            .entry(evidence.permit_id.clone())
+            .or_default()
+            .push(evidence);
     }
     let mut dispositions = Vec::with_capacity(histories.len());
     for history in histories.values() {
