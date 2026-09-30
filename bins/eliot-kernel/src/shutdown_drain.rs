@@ -1485,10 +1485,22 @@ impl ShutdownDrainCoordinator {
     /// never mutates the durable drain state: a diagnostic projection must not
     /// cancel a drain, and a reported disposition must be the one already
     /// recorded, not one produced by looking.
+    ///
+    /// The two terminals are reported distinctly, and a *persisted* incomplete
+    /// terminal in particular. I14.23 requires that deadline expiry "produces
+    /// visible incomplete-shutdown recovery state; it does not silently discard
+    /// pending work", and this projection is the production reader
+    /// ([`crate::health_view::KernelComposition::activation_operational_view`])
+    /// that survives into the next process: collapsing both terminals into one
+    /// `"terminated"` code made an interrupted-then-incomplete drain
+    /// indistinguishable from a clean intentional stop to anyone reading the
+    /// live view, which is the absence the requirement forbids.
     pub(crate) fn drain_disposition(&self) -> &'static str {
         let state = self.lock();
-        if state.terminal.is_some() {
-            return "terminated";
+        match &state.terminal {
+            Some(ShutdownTerminal::Intentional) => return "terminated-intentional",
+            Some(ShutdownTerminal::Incomplete { .. }) => return "terminated-incomplete",
+            None => {}
         }
         if state.committed.is_some() {
             return "queue-next-generation";
