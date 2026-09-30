@@ -439,9 +439,9 @@ impl KernelGovernedProcessEffectPort {
     /// `Absent` confirmation evidence.
     fn record_absent_transition(
         operation: &str,
-        baseline: GovernedProcessEffectBaseline,
+        baseline: &GovernedProcessEffectBaseline,
         before_digest: String,
-        terminal_fence: FencingToken,
+        terminal_fence: &FencingToken,
     ) -> (Option<String>, change_monitor::HintVerification) {
         let (_, transition) =
             change_monitor::material_transition_ids(operation, Some(before_digest.as_str()), None);
@@ -451,16 +451,16 @@ impl KernelGovernedProcessEffectPort {
             path: baseline.lane_path.clone(),
             before_path: None,
             before_revision: Some(before_digest.clone()),
-            before_bytes: baseline.before_bytes,
+            before_bytes: baseline.before_bytes.clone(),
             after_revision: None,
             after_bytes: None,
             session: baseline.binding.session_id.as_str().to_owned(),
             action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
             operation: operation.to_owned(),
-            attempt_receipt: baseline.effect_digest,
+            attempt_receipt: baseline.effect_digest.clone(),
             diff_handle: transition.clone(),
             fence_generation: terminal_fence.generation().get(),
-            fence_invalidated: terminal_fence != baseline.capture_fence,
+            fence_invalidated: terminal_fence != &baseline.capture_fence,
         };
         let mut recorded_transition: Option<String> = None;
         match change_monitor::record_governed_tool_change(&change) {
@@ -489,7 +489,7 @@ impl KernelGovernedProcessEffectPort {
     fn confirm_effect_transition(
         hint_id: &str,
         verification: &change_monitor::HintVerification,
-        recorded_transition: Option<String>,
+        recorded_transition: Option<&str>,
     ) {
         match change_monitor::confirm_hint(hint_id, verification) {
             Ok(change_monitor::HintConfirmation::VerifiedImmaterial) => {
@@ -501,7 +501,7 @@ impl KernelGovernedProcessEffectPort {
             }) => {
                 let mut outcome = if reconciled { "reconciled" } else { "material" };
                 if !reconciled
-                    && let Some(transition) = recorded_transition.as_deref()
+                    && let Some(transition) = recorded_transition
                     && change_monitor::reconcile_unknown_change(&unknown_id, transition).is_ok()
                 {
                     outcome = "reconciled";
@@ -706,7 +706,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             observe_process("kernel.process.effect_observed", "unobserved");
             return Ok(());
         }
-        let Some(before_digest) = baseline.before_digest else {
+        let Some(before_digest) = baseline.before_digest.clone() else {
             observe_process("kernel.process.effect_observed", "unobserved");
             return Ok(());
         };
@@ -725,9 +725,9 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             // `record_absent_transition`).
             let (recorded, verification) = Self::record_absent_transition(
                 &operation,
-                baseline,
+                &baseline,
                 before_digest,
-                receipt.terminal_fence,
+                &receipt.terminal_fence,
             );
             recorded_transition = recorded;
             verification
@@ -782,7 +782,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 git: None,
             }
         };
-        Self::confirm_effect_transition(&hint_id, &verification, recorded_transition);
+        Self::confirm_effect_transition(&hint_id, &verification, recorded_transition.as_deref());
         Ok(())
     }
 }
