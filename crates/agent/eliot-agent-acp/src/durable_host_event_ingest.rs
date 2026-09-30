@@ -40,6 +40,35 @@
 //! Per-stream cursors ([`StreamCursorState`]) are separate from logical turn
 //! state and process state, which live with their own owners and never enter
 //! this journal.
+//!
+//! Execution-unit driver stitch (issue #2645 AUD-W13): no production path
+//! stages execution-unit events into this journal yet.
+//!
+//! The only production staging callers are the bridge producer entry points
+//! in `host_event_producer`: `produce_allowed`/`produce_redacted` keep the
+//! session-only struct-literal `None` shape (no binding, no admission, no
+//! observation, no caller digests), and that path stays valid. The
+//! designated execution-unit entry points —
+//! `produce_execution_unit_allowed`/`produce_execution_unit_redacted` over
+//! `StageAllowed::execution_unit`/`StageRedacted::execution_unit` — derive
+//! every route digest from the recorded #361 binding, the governing #369
+//! admission, and the applicable #369 physical observation (or its explicit
+//! absence for a valid pre-observation event), and the staging guard
+//! re-verifies all of it before any mutation. Those entry points have no
+//! live production caller: the running host-event ingress
+//! (`HostEventSubmission` through the bridge `forward_event` route into
+//! kernel/ORS durability) carries only the normalized envelope JSON plus
+//! digests — no binding, no admission, no physical observation — so it
+//! cannot supply execution-unit owner material. Validated observation
+//! material does exist at the adapters (the OpenCode seal-time route
+//! disposition retained on the admitted-attempt candidate; minted
+//! codex/claude physical observations), but none of it is routed into this
+//! journal. A future execution-unit driver must supply the exact owner
+//! material through the `execution_unit` constructors, never a struct
+//! literal with caller digests; until such a driver lands, the
+//! `Some(observation)` staging branch stays reachable only through those
+//! designated entry points, and no unrelated existing call may be mistaken
+//! for that driver.
 
 use std::collections::BTreeMap;
 
