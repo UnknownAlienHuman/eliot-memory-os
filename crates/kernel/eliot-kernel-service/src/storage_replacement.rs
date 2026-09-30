@@ -116,23 +116,6 @@
 //!   any composition path, but it is not a writer or a reader of the canonical
 //!   store, so the incumbent is served by nobody while the `I5.11` stage-10
 //!   window is open, and only another committed cutover can serve it again.
-//! - **Before** any cutover is committed, the durable owner still names one
-//!   generation. The composition root establishes that owner once, through
-//!   [`establish_canonical_store_route_owner`], before any Store gateway
-//!   exists, so the initial state of every installation means "only the
-//!   recorded initial generation" rather than "anything goes". That is what
-//!   closes the configuration and restart legs of the negative in the
-//!   pre-first-commit window: once the row exists, an operator who installs and
-//!   activates an approved package generation carrying a NEW store bridge still
-//!   reaches a gateway whose generation the durable owner does not name, and it
-//!   is refused canonical reads and writes by the same gate that refuses a
-//!   cut-over incumbent. Be precise about the one step in front of that: the
-//!   writer is only reached when the durable owner answers `None`, so on an
-//!   installation whose ORS predates this record the first composition writes
-//!   whatever generation the Host descriptor then names. There is no earlier
-//!   durable evidence to migrate that answer from, and the writer is
-//!   write-once, so from the second composition onward the recorded name is the
-//!   only one that can serve.
 //!
 //! **Not** established by this module, and stated here so no reader mistakes
 //! this file for a safety net it is not:
@@ -146,7 +129,7 @@
 //!   not name is refused every read and write, so neither a direct construction
 //!   nor a rebind to a candidate that has no committed cutover can serve as a
 //!   second canonical writer. What it does **not** do is stop such a gateway
-//!   from being constructed. The row that names the owner after a cutover is
+//!   from being constructed; the row that names the owner after a cutover is
 //!   written by the Kernel Generation Registry ingress
 //!   (`bins/eliot-kernel/src/generation_control.rs::apply_authenticated_generation_cutover`)
 //!   for exactly a completed replacement this coordinator re-derives through
@@ -154,7 +137,11 @@
 //!   receipt from through [`StorageReplacement::commit_canonical_store_route_cutover`].
 //!   The owner a composition establishes before that first cutover names no
 //!   stage, no epoch transition and no receipt, and is replaced by that cutover
-//!   and by nothing else.
+//!   and by nothing else. Because that owner row always names one generation,
+//!   "no committed cutover for this scope" is never the answer the writer and the
+//!   per-operation gate see; [`canonical_store_writer_admission`] therefore has
+//!   no separate pre-first-cutover case to decide, and its `Unswitched` arm is
+//!   reachable only when the route has genuinely never switched.
 //! - A cutover is still *committed* by the Kernel Generation Registry's owner,
 //!   which writes the ORS `CUTOVER_OWNERSHIP` row — for this route, that owner is
 //!   the admitted cutover ingress
@@ -165,9 +152,16 @@
 //! - The read-only rollback window (stage 10) is enforced on the Kernel side:
 //!   once the cutover is committed the incumbent generation is not the active
 //!   `canonical_store` generation, so the governed Store path admits nothing
-//!   against it. What this module does not do is stop the Host or the retired
-//!   Store process from serving that generation to a reader outside the Kernel
-//!   gateway; `I5.11` names no mechanism for that, so it is not invented here.
+//!   against it and no composition may build a writer for it at all (see
+//!   [`canonical_store_writer_admission`] above). The Host leg of the same
+//!   question is closed by measurement rather than by a new mechanism: an
+//!   exhaustive search of `bins/eliot-host/src/**` finds no `CanonicalStoreClient`,
+//!   no `EbpCanonicalStoreClient::connect` and no `KernelStoreGateway`, so the
+//!   Host activation chain never opens a Store generation and never dials a
+//!   Store pipe - it dials the Kernel front door. What remains is the retired
+//!   Store *process*: `I5.11` names no mechanism for fencing another process's
+//!   reader of it, so it is not invented here, and the kernel-side reading
+//!   implemented is the strictest one the Kernel can enforce on its own path.
 //! - A stage's evidence is bounded opaque text, plus the transfer record for the
 //!   two transferring stages. This module orders and records stages; it does not
 //!   perform the import, verification, shadow read, tail, reconciliation, canary
@@ -326,6 +320,150 @@ pub fn active_canonical_store_generation(
         .map_err(|error| ors_refusal(&error))?
         .entry(&scope.route_scope_hash)
         .map(|entry| entry.active_generation))
+}
+
+/// Why a composition may not build a canonical-Store writer for the
+/// generation it presented.
+///
+/// This is a single class today because it has a single cause: a committed
+/// `I5.11` stage-8 cutover owns this route scope with a different generation.
+/// It is not merged with "no cutover has ever committed" (which is
+/// [`CanonicalStoreWriterAdmission::Unswitched`], a different fact entirely) and
+/// it is not merged with "the durable owner could not be read" (which is the
+/// `Err` arm, and carries the typed ORS class). Three different facts stay three
+/// different answers so a caller cannot read "the rollback window is open" where
+/// only "the window is not yet proven" holds, or the reverse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalStoreWriterRefusal {
+    /// A committed `I5.11` stage-8 cutover owns this route scope with a
+    /// different generation, so the generation presented here is either the
+    /// cut-over incumbent (whose store is inside the stage-10 read-only
+    /// rollback window) or a candidate that was never cut over to.
+    NotRouteOwner {
+        /// The generation the committed `GenerationCutoverOwnership` row
+        /// leaves owning this route scope.
+        owner: ResourceGeneration,
+    },
+}
+
+impl fmt::Display for CanonicalStoreWriterRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRouteOwner { owner } => write!(
+                formatter,
+                "the durable canonical_store route is owned by generation {}",
+                owner.value()
+            ),
+        }
+    }
+}
+
+/// The durable answer to "may a composition build a canonical-Store writer for
+/// this generation?".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalStoreWriterAdmission {
+    /// The durable `canonical_store` route owner names exactly the presented
+    /// generation, so a writer built for it is the governed path's own writer
+    /// and not a second one.
+    Admitted {
+        /// The generation the committed `GenerationCutoverOwnership` row leaves
+        /// owning this route scope.
+        owner: ResourceGeneration,
+    },
+    /// The stage-10 rollback window is not open for this scope: no committed
+    /// `I5.11` stage-8 cutover has ever switched it.
+    ///
+    /// This is deliberately not a permission derived from the absence of
+    /// evidence about *this* generation. It is the statement that there is no
+    /// window to be a second writer inside, and the state it leaves undecided —
+    /// which generation an un-cut-over route may serve — belongs to the
+    /// per-operation gate and its own owner record, not to this construction-time
+    /// question.
+    Unswitched,
+    /// Refused, with the class of refusal preserved.
+    Refused(CanonicalStoreWriterRefusal),
+}
+
+impl CanonicalStoreWriterAdmission {
+    /// Narrows the answer to the decision the composition needs.
+    ///
+    /// The `Ok` payload is the committed cutover's owner generation when the
+    /// window is open, and `None` when it is not, so a caller can never read the
+    /// absence of an owner as a permission it did not get from durable state.
+    #[must_use]
+    pub const fn admitted(self) -> Result<Option<ResourceGeneration>, CanonicalStoreWriterRefusal> {
+        match self {
+            Self::Admitted { owner } => Ok(Some(owner)),
+            Self::Unswitched => Ok(None),
+            Self::Refused(refusal) => Err(refusal),
+        }
+    }
+}
+
+/// Decides, from owner-issued durable state alone, whether a composition may
+/// build a canonical-Store writer for `presented`.
+///
+/// This is the composition-boundary half of the `I5.11` stage-10 guarantee, and
+/// it is deliberately separate from
+/// `KernelStoreGateway::require_active_store_generation`. That gate refuses a
+/// Store *operation* per call, so a writer object for a non-owner generation can
+/// still be built, retained, swapped into the process authority and handed
+/// around; nothing about that object writes, but the Store has already been
+/// reached by the client that was built beside it. Answering the same question
+/// here, at the point the writer is constructed, means the
+/// `A12.3`-forbidden second writer never reaches a Store at all.
+///
+/// Each side of the comparison is owner-issued. On the durable side it is the
+/// committed `GenerationCutoverOwnership` rows for this exact route-scope hash,
+/// read through the same [`CutoverRouteSnapshot::rebuild`] the Kernel's own
+/// recovery performs, so the strictly newest committed epoch wins and a
+/// pre-commit `Armed` candidate cannot appear. On the presented side it is the
+/// generation the composition's own approved bootstrap descriptor names. The two
+/// are compared by equality of the generation itself, never by the existence of
+/// a route, a route name, or a descriptor shape.
+///
+/// [`CanonicalStoreWriterAdmission::Refused`] is the answer whenever a committed
+/// cutover proves the durable owner to be some *other* generation. It is
+/// deliberately NOT also the answer when no cutover has ever committed: that is
+/// [`CanonicalStoreWriterAdmission::Unswitched`], and conflating the two would
+/// either refuse every installation before its first governed replacement —
+/// which would be a liveness break, not a guarantee — or admit a second writer
+/// while the window is open. The refused case is scoped to the window, which is
+/// what the guarantee is about, and the pre-first-cutover state is left to
+/// `KernelStoreGateway::require_active_store_generation`, which reads the same
+/// durable table on every operation.
+///
+/// `A12.3` is about a second writer for the *live* store, so the composition
+/// also keeps its own single-writer boundary
+/// (`bins/eliot-kernel/src/canonical_store_runtime.rs::attach_then_retain_canonical_store`,
+/// `KernelBuildError::StoreAlreadyConnected`) and this function does not replace
+/// it; it is the generation half, and the retained-slot half stays where
+/// `I15.3` put it.
+///
+/// A read-only archival path that must survive the window is not implemented
+/// here and is not blocked by this function: no production path needs one, and
+/// `I5.11` names none. If one is ever added it must be a distinct contour that
+/// presents its own owner-issued read grant, because a writer gate has no
+/// read-only arm to relax.
+pub fn canonical_store_writer_admission(
+    ors: &RedbRecoveryStore,
+    presented: ResourceGeneration,
+) -> Result<CanonicalStoreWriterAdmission, KernelServiceError> {
+    match active_canonical_store_generation(ors)? {
+        // A committed stage-8 cutover exists for this scope, so the rollback
+        // window state is proven: only the generation that cutover left owning
+        // the route may be written, and any other generation reaching this is
+        // refused rather than admitted against an absent table.
+        Some(owner) if owner == presented => Ok(CanonicalStoreWriterAdmission::Admitted { owner }),
+        Some(owner) => Ok(CanonicalStoreWriterAdmission::Refused(
+            CanonicalStoreWriterRefusal::NotRouteOwner { owner },
+        )),
+        // No committed cutover has ever switched this scope, so the stage-10
+        // window is not open and there is no second writer *relative to a
+        // window*. The pre-first-cutover state is the per-operation gate's
+        // question, not this one's.
+        None => Ok(CanonicalStoreWriterAdmission::Unswitched),
+    }
 }
 
 /// Committed cutover ownership rows that belong to exactly the pinned

@@ -2076,6 +2076,31 @@ impl KernelComposition {
                 "Store rebind requirement is not the immutable bootstrap descriptor".to_owned(),
             ));
         }
+        // #1872 / I5.11 stages 8 and 10. A rebind is a second construction of a
+        // canonical-Store writer, and it is the one this composition root's own
+        // route checks below cannot close: the `store_bridge` route it resolves
+        // is registered from the same Host descriptor as the handoff, so
+        // `route.active_generation() != requirement.store_generation` is
+        // tautological here exactly as it is on the initial connect. The rebind's
+        // own `StoreRebindReceipt` and its immutable-bootstrap-identity check say
+        // "this generation re-attached to its own Store"; neither says the
+        // generation owns the canonical route. So the durable owner decides, and
+        // it is asked here - before the peer, process and pipe work below - so a
+        // rebind cannot reach either Store while the `I5.11` stage-10 read-only
+        // rollback window is open. A12.3: a second writer is a security and
+        // integrity problem "regardless of how plausible the content appears".
+        if let Err(refusal) = eliot_kernel_service::canonical_store_writer_admission(
+            &self.generation_gateway.ors,
+            handoff.requirement.store_generation,
+        )
+        .map_err(|e| KernelBuildError::Service(e.to_string()))?
+        .admitted()
+        {
+            return Err(KernelBuildError::StoreRouteOwnerRefused {
+                presented: handoff.requirement.store_generation,
+                refusal,
+            });
+        }
         if request_digest.len() != 64
             || !request_digest
                 .bytes()
