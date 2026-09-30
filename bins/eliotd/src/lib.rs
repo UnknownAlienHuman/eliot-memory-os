@@ -22,8 +22,8 @@ use eliot_governor::{
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
-    AgentActivationObservationAccessBinding, AgentActivationObservationPolicyReadback,
-    AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
+    AgentActivationObservationPolicyReadback, AgentActivationOwnerEvidence,
+    AgentActivationOwnerReadback, AgentActivationResolutionResult,
     AgentActivationResolutionDisposition, AgentActivationResolutionTicket,
     AgentActivationResolvedBinding, RequestIdentity,
 };
@@ -770,17 +770,29 @@ pub struct DaemonComposition {
     swarm_attachment: eliot_governor::SwarmAttachmentComposition,
 }
 
-/// An activation's explicit Host workspace selector retained only to repeat
-/// the mechanical observation at a later task-bound ingress. This path never
-/// supplies identity by itself; every consumer re-observes it and compares
-/// the result with the current owner-issued WorkScope binding.
+/// An accepted ticket's explicit Host workspace selector retained only to
+/// repeat the mechanical observation at a later ingress. Its typed origin is
+/// either an authenticated application selection or the exact Host peer
+/// receipt. This path never supplies authority; every consumer re-observes it
+/// and compares the result with the current owner-issued WorkScope binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RetainedActivationWorkspaceLocator {
-    principal_ref: String,
-    session_ref: String,
-    task_ref: String,
+    origin: RetainedWorkspaceLocatorOrigin,
     work_scope_ref: String,
     root: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetainedWorkspaceLocatorOrigin {
+    ApplicationSelection {
+        principal_ref: String,
+        session_ref: String,
+        task_ref: String,
+    },
+    HostPeer {
+        peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt,
+        activation_request_id: String,
+    },
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -2120,57 +2132,29 @@ impl DaemonComposition {
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
+    /// Reads the current Policy and WorkScope owners for the exact Host peer
+    /// admission origin. This path deliberately has no semantic application
+    /// principal, session, or task applicability.
+    pub fn host_origin_observation_owner_binding(
+        &self,
+        receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, DaemonError> {
+        self.governor
+            .observation_capture_owner_binding_for_host_origin(receipt)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
     fn activation_observation_policy_readback(
         binding: &eliot_governor::ObservationCaptureOwnerBinding,
     ) -> Result<AgentActivationObservationPolicyReadback, DaemonError> {
         let value = binding
             .canonical_value()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        let config_policy_snapshot = serde_json::to_value(&binding.config_policy_snapshot)
+        let digest = binding
+            .canonical_digest()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        let work_scope_binding = serde_json::to_value(&binding.work_scope_binding)
-            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        let visibility = match binding.access.visibility {
-            eliot_governor::ObservationCaptureVisibility::LocalOnly => "LOCAL_ONLY",
-        };
-        let readback = AgentActivationObservationPolicyReadback {
-            wire_version: binding.wire_version,
-            authenticated_principal_ref: binding.authenticated_principal_ref.clone(),
-            authenticated_session_ref: binding.authenticated_session_ref.clone(),
-            authenticated_task_ref: binding.authenticated_task_ref.clone(),
-            authenticated_scope_ref: binding.authenticated_scope_ref.clone(),
-            state_fence: binding.state_fence.clone(),
-            policy_owner_revision: binding.policy_owner_revision,
-            policy_read_revision: binding.policy_read_revision,
-            policy_read_fence: binding.policy_read_fence.clone(),
-            policy_named_read_digest: binding.policy_named_read_digest.clone(),
-            config_policy_snapshot,
-            config_policy_snapshot_sha256: binding.config_policy_snapshot_sha256.clone(),
-            ingress_setting_key: binding.ingress_setting_key.clone(),
-            ingress_setting_value_ref: binding.ingress_setting_value_ref.clone(),
-            ingress_setting_owner_ref: binding.ingress_setting_owner_ref.clone(),
-            policy: binding.policy.clone(),
-            access: AgentActivationObservationAccessBinding {
-                privacy: binding.access.privacy,
-                visibility: visibility.to_owned(),
-                instruction_taint: binding.access.instruction_taint,
-            },
-            work_scope_owner_revision: binding.work_scope_owner_revision,
-            work_scope_read_revision: binding.work_scope_read_revision,
-            work_scope_read_fence: binding.work_scope_read_fence.clone(),
-            work_scope_canonical_read_digest: binding.work_scope_canonical_read_digest.clone(),
-            work_scope_binding,
-            work_scope_binding_sha256: binding.work_scope_binding_sha256.clone(),
-        };
-        let serialized = serde_json::to_value(&readback)
-            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        if serialized != value {
-            return Err(DaemonError::Lifecycle(
-                "Observation policy protocol readback differs from the canonical Governor binding"
-                    .to_owned(),
-            ));
-        }
-        Ok(readback)
+        AgentActivationObservationPolicyReadback::from_owner_projection(value, digest)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Single production resolver spine: resolves one Kernel-issued semantic
@@ -2513,10 +2497,113 @@ impl DaemonComposition {
             );
         }
         self.activation_workspace_locator = Some(RetainedActivationWorkspaceLocator {
-            principal_ref: binding.principal_id.clone(),
-            session_ref: binding.session_id.clone(),
-            task_ref: binding.task_id.clone(),
+            origin: RetainedWorkspaceLocatorOrigin::ApplicationSelection {
+                principal_ref: binding.principal_id.clone(),
+                session_ref: binding.session_id.clone(),
+                task_ref: binding.task_id.clone(),
+            },
             work_scope_ref: binding.work_scope_id.clone(),
+            root: root.to_path_buf(),
+        });
+        Ok(())
+    }
+
+    /// Retains the exact activation ticket's Host selector for task-free raw
+    /// capture. The peer receipt and current owner projection are the identity
+    /// joins; the path remains only a candidate for fresh Host observation.
+    pub fn note_host_origin_workspace_locator(
+        &mut self,
+        ticket: &AgentActivationResolutionTicket,
+        result: &AgentActivationResolutionResult,
+        owner_binding: &eliot_governor::ObservationCaptureOwnerBinding,
+    ) -> Result<(), crate::task_binding_admission::TaskBindingError> {
+        let receipt = ticket.peer_admission_receipt.as_ref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "activation ticket has no exact Host peer admission receipt",
+            )
+        })?;
+        receipt.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "retained Host peer receipt is invalid: {error}"
+            ))
+        })?;
+        let readback = result
+            .observation_host_policy_readback
+            .as_ref()
+            .ok_or_else(|| {
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "accepted cold result has no Host-origin owner policy readback",
+                )
+            })?;
+        let owner_value = owner_binding.canonical_value().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "current Host-origin owner projection is invalid: {error}"
+            ))
+        })?;
+        let owner_digest = owner_binding.canonical_digest().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "current Host-origin owner projection digest is invalid: {error}"
+            ))
+        })?;
+        readback.kernel_owner.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "Host-origin P-07 owner readback is invalid: {error}"
+            ))
+        })?;
+        let expected_origin = serde_json::json!({
+            "kind": "HOST_PEER",
+            "domain": "AGENT_BRIDGE",
+            "peer_admission_receipt": receipt,
+        });
+        let actual_origin = owner_value.get("origin");
+        if result.ticket_id != ticket.ticket_id
+            || result.ticket_state_fence != ticket.state_fence
+            || !matches!(
+                &result.disposition,
+                AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+                    | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+                    | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+            )
+            || receipt.receipt_sha256 != ticket.peer_admission_receipt_sha256
+            || owner_binding.state_fence != ticket.state_fence
+            || actual_origin != Some(&expected_origin)
+            || readback.owner_projection_value != owner_value
+            || readback.owner_projection_sha256 != owner_digest
+        {
+            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "Host-origin workspace locator is not bound to the accepted ticket and current owner projection",
+            ));
+        }
+        let root = ticket.workspace_selector.as_deref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "cold activation ticket has no explicit Host workspace locator",
+            )
+        })?;
+        let root = Path::new(root);
+        if !root.is_absolute() {
+            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "retained Host-origin workspace locator is not absolute",
+            ));
+        }
+        owner_binding
+            .work_scope_binding
+            .validate()
+            .map_err(|error| {
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                    "current Host-origin WorkScope is invalid: {error}"
+                ))
+            })?;
+        self.activation_workspace_locator = Some(RetainedActivationWorkspaceLocator {
+            origin: RetainedWorkspaceLocatorOrigin::HostPeer {
+                peer_admission_receipt: receipt.clone(),
+                activation_request_id: ticket.activation_request_id.as_str().to_owned(),
+            },
+            work_scope_ref: owner_binding
+                .work_scope_binding
+                .binding
+                .scope
+                .scope_ref
+                .clone(),
             root: root.to_path_buf(),
         });
         Ok(())
@@ -2533,9 +2620,17 @@ impl DaemonComposition {
                 "no accepted activation retained an explicit workspace locator",
             )
         })?;
-        if locator.principal_ref != selection.principal_ref()
-            || locator.session_ref != selection.session_ref()
-            || locator.task_ref != selection.task_ref()
+        let origin_matches = matches!(
+            &locator.origin,
+            RetainedWorkspaceLocatorOrigin::ApplicationSelection {
+                principal_ref,
+                session_ref,
+                task_ref,
+            } if principal_ref == selection.principal_ref()
+                && session_ref == selection.session_ref()
+                && task_ref == selection.task_ref()
+        );
+        if !origin_matches
             || locator.work_scope_ref != selection.work_scope().binding.scope.scope_ref
         {
             return Err(
@@ -2576,15 +2671,62 @@ impl DaemonComposition {
                 "no accepted activation retained a Host workspace locator",
             )
         })?;
-        if locator.principal_ref != principal_ref
-            || locator.session_ref != session_ref
-            || locator.work_scope_ref != work_scope.binding.scope.scope_ref
-        {
-            return Err(
-                crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                    "retained activation locator does not match the authenticated request and current WorkScope",
-                ),
-            );
+        let origin_matches = matches!(
+            &locator.origin,
+            RetainedWorkspaceLocatorOrigin::ApplicationSelection {
+                principal_ref: retained_principal,
+                session_ref: retained_session,
+                ..
+            } if retained_principal == principal_ref && retained_session == session_ref
+        );
+        if !origin_matches || locator.work_scope_ref != work_scope.binding.scope.scope_ref {
+            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "retained activation locator does not match the authenticated request and current WorkScope",
+            ));
+        }
+        Ok(locator.root.clone())
+    }
+
+    /// Returns a Host-origin locator only for the exact retained peer receipt
+    /// and current owner WorkScope snapshot. The path itself has no authority.
+    pub fn host_origin_workspace_locator_for_scope(
+        &self,
+        receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+        activation_request_id: &str,
+        work_scope: &eliot_workscope::WorkScopeBindingSnapshot,
+    ) -> Result<PathBuf, crate::task_binding_admission::TaskBindingError> {
+        receipt.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "Host peer receipt is invalid: {error}"
+            ))
+        })?;
+        work_scope.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "current WorkScope snapshot is invalid: {error}"
+            ))
+        })?;
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        if !eliot_contracts::fences_match_exact(&work_scope.state_fence, &live_fence) {
+            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "current WorkScope snapshot fence is no longer live",
+            ));
+        }
+        let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "no accepted Host-origin ticket retained a workspace locator",
+            )
+        })?;
+        let origin_matches = matches!(
+            &locator.origin,
+            RetainedWorkspaceLocatorOrigin::HostPeer {
+                peer_admission_receipt,
+                activation_request_id: retained_request_id,
+            } if peer_admission_receipt == receipt && retained_request_id == activation_request_id
+        );
+        if !origin_matches || locator.work_scope_ref != work_scope.binding.scope.scope_ref {
+            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "retained Host-origin locator does not match the peer receipt and current WorkScope",
+            ));
         }
         Ok(locator.root.clone())
     }
