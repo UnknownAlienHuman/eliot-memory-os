@@ -2401,22 +2401,22 @@ impl DaemonComposition {
         let (AgentActivationResolutionDisposition::Resolved { binding }, Some(owner_evidence)) =
             (&result.disposition, result.owner_evidence.as_ref())
         else {
-            return Err(crate::task_binding_admission::TaskBindingError::selection_required(
-                "accepted activation did not retain a resolved semantic owner binding",
-            ));
+            return Err(
+                crate::task_binding_admission::TaskBindingError::selection_required(
+                    "accepted activation did not retain a resolved semantic owner binding",
+                ),
+            );
         };
         let readback = owner_readback.ok_or_else(|| {
             crate::task_binding_admission::TaskBindingError::selection_required(
                 "accepted activation has no retained authenticated owner readback",
             )
         })?;
-        readback
-            .validate()
-            .map_err(|error| {
-                crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
-                    "retained activation owner readback is invalid: {error}"
-                ))
-            })?;
+        readback.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "retained activation owner readback is invalid: {error}"
+            ))
+        })?;
         if readback.evidence != *owner_evidence
             || readback.evidence.binding.as_ref() != binding
             || result.ticket_id != ticket.ticket_id
