@@ -2407,9 +2407,7 @@ fn retained_normalization_envelope(envelope: &ReceiptEnvelope) -> Result<Value, 
 fn automation_scope(operation: &UserAutomationOperation) -> Result<String, StoreError> {
     match operation {
         UserAutomationOperation::Create { revision }
-        | UserAutomationOperation::Edit { revision, .. } => {
-            Ok(revision.automation_id.clone())
-        }
+        | UserAutomationOperation::Edit { revision, .. } => Ok(revision.automation_id.clone()),
         UserAutomationOperation::List { .. } => Ok("list".to_owned()),
         UserAutomationOperation::Status { automation_id }
         | UserAutomationOperation::History { automation_id }
@@ -2420,9 +2418,7 @@ fn automation_scope(operation: &UserAutomationOperation) -> Result<String, Store
         | UserAutomationOperation::InspectLastFailure { automation_id } => {
             Ok(automation_id.clone())
         }
-        UserAutomationOperation::DecideImprovementBrief { .. } => {
-            Err(StoreError::UnknownOperation)
-        }
+        UserAutomationOperation::DecideImprovementBrief { .. } => Err(StoreError::UnknownOperation),
     }
 }
 

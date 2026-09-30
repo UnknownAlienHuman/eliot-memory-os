@@ -3355,12 +3355,7 @@ impl UserAutomationQuery {
 /// validates authenticated shapes. The wire vocabulary is the contract here;
 /// the owner's enum stays its typed reading on the far side, and no fifth
 /// spelling is admissible from either side.
-const IMPROVEMENT_BRIEF_DECISIONS: [&str; 4] = [
-    "reject",
-    "investigate",
-    "work_item",
-    "experiment",
-];
+const IMPROVEMENT_BRIEF_DECISIONS: [&str; 4] = ["reject", "investigate", "work_item", "experiment"];
 
 /// Closed Human/operator operation vocabulary for the UserAutomation surface.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
