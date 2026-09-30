@@ -132,6 +132,10 @@ fn pooled_configuration_descriptor(pool: &InstancePoolConfig) -> String {
 pub struct ComponentPool {
     epoch_engine: Engine,
     fuel_engine: Engine,
+    /// Digest of the exact pooled engine settings this pool was built from.
+    /// Every lookup key must name this digest; a key minted for other
+    /// settings is denied instead of serving a foreign cached component.
+    engine_configuration: Sha256Digest,
     cache: HashMap<PoolCacheKey, (Component, Component)>,
 }
 
@@ -152,24 +156,38 @@ impl ComponentPool {
         Ok(Self {
             epoch_engine: Engine::new(&pool.engine_config(false))?,
             fuel_engine: Engine::new(&pool.engine_config(true))?,
+            engine_configuration: pooled_configuration_digest(pool),
             cache: HashMap::new(),
         })
     }
 
     /// Compiles one immutable artifact under both pooled engines through
-    /// the digest-keyed cache. The presented bytes are re-hashed against
-    /// the key on every call: a key naming a different artifact than the
-    /// bytes is denied instead of serving a foreign cached component, so
-    /// the key can never bypass identity. A hit returns the previously
-    /// compiled pair without recompiling; a miss compiles, inserts under
-    /// the exact key, and returns the fresh pair.
+    /// the digest-keyed cache. The presented artifact bytes and component
+    /// configuration bytes are re-hashed against the key on every call, and
+    /// the key's engine configuration is re-checked against this pool's own
+    /// settings: a key naming different bytes or settings is denied instead
+    /// of serving a foreign cached component, so the key can never bypass
+    /// identity. A hit returns the previously compiled pair without
+    /// recompiling; a miss compiles, inserts under the exact key, and
+    /// returns the fresh pair.
     pub fn compile(
         &mut self,
         key: &PoolCacheKey,
         artifact: &[u8],
+        component_configuration: &[u8],
     ) -> Result<(Component, Component), wasmtime::Error> {
         if Sha256Digest::of_bytes(artifact) != key.artifact {
             return Err(wasmtime::Error::msg("pool cache key artifact mismatch"));
+        }
+        if Sha256Digest::of_bytes(component_configuration) != key.component_configuration {
+            return Err(wasmtime::Error::msg(
+                "pool cache key component configuration mismatch",
+            ));
+        }
+        if key.engine_configuration != self.engine_configuration {
+            return Err(wasmtime::Error::msg(
+                "pool cache key engine configuration mismatch",
+            ));
         }
         if let Some(compiled) = self.cache.get(key) {
             return Ok(compiled.clone());

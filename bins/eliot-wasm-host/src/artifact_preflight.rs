@@ -212,7 +212,10 @@ fn reject_reparse_components(path: &Path) -> Result<(), PreflightError> {
     Ok(())
 }
 
-fn reject_final_reparse_point(path: &Path) -> Result<(), PreflightError> {
+/// Rejects a final path component that is a symbolic link or reparse point
+/// without following it. Shared with the bounded guest-input path, which
+/// applies the same no-follow discipline before opening its handle.
+pub(crate) fn reject_final_reparse_point(path: &Path) -> Result<(), PreflightError> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
     if metadata_is_reparse_point(&metadata) {

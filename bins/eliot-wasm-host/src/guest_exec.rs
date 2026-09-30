@@ -27,7 +27,7 @@ use eliot_wasm_runtime::{
     Sha256Digest,
 };
 
-use crate::artifact_preflight::read_bounded_artifact;
+use crate::artifact_preflight::{read_bounded_artifact, reject_final_reparse_point};
 use crate::cli_contract::GuestExecArgs;
 use crate::wasmtime_provider::WasmtimeComponentEngine;
 
@@ -265,6 +265,15 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
     if eliot_wasm_runtime::lifecycle::enforce_guest_no_effect(&request.limits, &report).is_err() {
         return fail("GUEST_EXEC_EMISSION_DENIED", EXIT_NOT_COMPLETED);
     }
+    // Output-ceiling emission gate (issue #758 P7.3): the provider lifts
+    // the value under its own output check, but this child owns the stdout
+    // host-resource boundary, so an over-ceiling byte vector is denied here
+    // with empty stdout instead of emitted. The provider reports
+    // over-ceiling results as OutputLimit, never Completed, so this gate
+    // only fires on a provider regression — fail closed, never truncate.
+    if report.output.len() as u64 > request.limits.max_output_bytes {
+        return fail("GUEST_EXEC_OUTPUT_DENIED", EXIT_NOT_COMPLETED);
+    }
     // Measurements first: a completed run without fully observed metering
     // is unreportable — exit without stdout rather than emit output the
     // parent cannot contract-check. The metering line also precedes stdout
@@ -299,10 +308,33 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
 /// Reads one explicit local input file into a bounded buffer: the handle is
 /// the only source of input bytes and `take` bounds allocation even if the
 /// file grows after it is opened. An over-ceiling file is denied before the
-/// bytes are validated or executed, never truncated.
+/// bytes are validated or executed, never truncated. The bytes stay opaque:
+/// they are passed to the `run` export as-is and never parsed as
+/// JSON/string/tree on the host, so the outer file format is not a WIT
+/// escape around the typed per-string/per-list bounds.
 fn read_bounded_input(path: &Path) -> Result<Vec<u8>, GuestExecRejection> {
+    // Same no-follow discipline as the artifact path: a final-component
+    // link is rejected before the handle exists, so input bytes always come
+    // from the named file itself, never a swapped target.
+    match reject_final_reparse_point(path) {
+        Ok(()) => {}
+        Err(crate::artifact_preflight::PreflightError::ReparsePoint) => {
+            return Err(GuestExecRejection::BadInput("reparse-point".to_owned()));
+        }
+        Err(_) => return Err(GuestExecRejection::BadInput("unreadable".to_owned())),
+    }
     let file = std::fs::File::open(path)
         .map_err(|error| GuestExecRejection::BadInput(error.kind().to_string()))?;
+    // Declared-length precheck: an over-ceiling file is denied from its
+    // metadata before any byte is allocated; `take` below still bounds the
+    // read itself if the file grows after it is opened.
+    let declared = file
+        .metadata()
+        .map_err(|error| GuestExecRejection::BadInput(error.kind().to_string()))?
+        .len();
+    if declared > MAX_GUEST_INPUT_BYTES {
+        return Err(GuestExecRejection::BadInput("over-ceiling".to_owned()));
+    }
     let mut bytes = Vec::new();
     file.take(MAX_GUEST_INPUT_BYTES + 1)
         .read_to_end(&mut bytes)
