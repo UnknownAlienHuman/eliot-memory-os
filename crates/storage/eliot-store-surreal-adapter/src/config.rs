@@ -14,12 +14,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use eliot_contracts::ContractVersion;
 use secrecy::SecretString;
 
 use crate::error::AdapterError;
 
 /// Stable identity of this adapter surface.
 pub const ADAPTER_NAME: &str = "eliot.storage.store-surreal-adapter";
+/// Version of this adapter surface, as declared by the adapter itself.
+///
+/// I05-10 asks the manifest for the "source store adapter/version" that produced
+/// the export. This adapter is the only component that knows which adapter read
+/// the source, so it is the owner of that identity: the value is a declared
+/// property of this surface, not an observation of the store's contents and not
+/// a digest of any data. The `ECXF/1` capture therefore carries it as the
+/// adapter's own identity rather than leaving the manifest field unfilled.
+pub const ADAPTER_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// `SurrealDB` major version admitted by the pinned adapter/query surface.
 pub const PINNED_SURREALDB_MAJOR: u16 = 3;
 
