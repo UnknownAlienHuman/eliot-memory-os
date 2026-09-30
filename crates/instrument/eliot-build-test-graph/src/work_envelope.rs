@@ -615,8 +615,8 @@ impl GovernedWorkEnvelope {
     /// `CARGO_TARGET_DIR` so the invocation cannot fall back to the repository
     /// `target/` directory the way it would with the variable unset, and
     /// `CARGO_HOME` so it cannot fall back to the user-global Cargo home. The
-    /// equality is the concrete TestD `TargetRoots` policy — `cache_root ==
-    /// target_root` — and its resolver
+    /// equality is the concrete TestD `TargetRoots` policy — the
+    /// `cache_root == target_root` rule — and its resolver
     /// (`TestdProcessToolIntent::validate_for_roots`), which refuses any pair
     /// that is not the same canonical directory. Emitting one variable without
     /// the other is what maintained a second, competing cache rule: an
