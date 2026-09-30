@@ -4,7 +4,7 @@ use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextExecutionIdentity,
     ContextRecipe, DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAttempt,
     HeadroomDimension, HeadroomRefusal, HeadroomReleaseInstruction, MeasurementStatus,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard, RenderedAtom,
     SerializedContextMeasurement,
 };
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,15 @@ use thiserror::Error;
 use crate::{AssemblyError, boundary, bounds, measurement, render};
 
 /// Stable local ordering revision for the A-15 canonical rendered payload.
+///
+/// #1724 W4. This revision names the order in `render::EXECUTED_CONTEXT_ROLE_ORDER`,
+/// the single role order this crate renders under, followed by the provider and
+/// atom identity tiebreak. It is not a free-standing label: `render` consumes
+/// that order, `applied_execution_identity` stamps this revision only after
+/// checking the emitted payload against that same order, and the approved
+/// policy's declared layout is compared against it by
+/// `ContextRecipePolicy::require_executable`, so a policy declaring a
+/// different order refuses instead of being certified and ignored.
 pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
 
 /// Caller-owned immutable parameters for one A-18 projection.
@@ -343,8 +352,8 @@ fn render_and_match(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
     fence_digest: &str,
-) -> Result<(Vec<eliot_context_contracts::RenderedAtom>, String, Vec<u8>), AssemblyError> {
-    let rendered = render::render(admitted);
+) -> Result<(Vec<RenderedAtom>, String, Vec<u8>), AssemblyError> {
+    let rendered = render::render(admitted, &render::EXECUTED_CONTEXT_ROLE_ORDER)?;
     let (output_digest, bytes) = measurement::canonical_matches(
         &admitted.binding,
         &recipe.recipe_sha256,
@@ -460,7 +469,10 @@ where
     let boundaries = boundary::project_assembly_boundaries(admitted, recipe)?;
     let (rendered, output_digest, bytes) =
         render_and_match(admitted, recipe, &expected_fence_digest)?;
-    let execution = applied_execution_identity(policy);
+    // The ordering revision is stamped only against the order these rendered
+    // atoms are actually in, so the identity on the view names the execution
+    // that produced them.
+    let execution = applied_execution_identity(policy, &rendered)?;
     require_graded_output(
         &quality,
         admitted,
@@ -522,15 +534,21 @@ where
 /// The execution identity this assembly is about to stamp on its view.
 ///
 /// #1724 W4/W5. Every member is a value this assembly actually applied: the
-/// ordering revision is the one [`ASSEMBLY_ORDERING_REVISION`] names and
-/// `render_and_match` renders under, and the serializer/options/route/model
+/// ordering revision is the one [`ASSEMBLY_ORDERING_REVISION`] names, and it is
+/// stamped only after [`require_executed_render_order`] has read the emitted
+/// payload back and proved it really is in `render::EXECUTED_CONTEXT_ROLE_ORDER`,
+/// which is the order `render` consumed; the serializer/options/route/model
 /// identity is the [`AssemblyPolicy`] this assembly already required the
 /// injected measurement to match in `measurement::verify`. The view therefore
 /// cannot claim an execution it did not perform, and
 /// `ActiveUnderstandingView::validate` re-compares the stamped identity against
 /// the independently recorded measurement before the view is returned.
-fn applied_execution_identity(policy: &AssemblyPolicy) -> ContextExecutionIdentity {
-    ContextExecutionIdentity {
+fn applied_execution_identity(
+    policy: &AssemblyPolicy,
+    rendered: &[RenderedAtom],
+) -> Result<ContextExecutionIdentity, AssemblyError> {
+    require_executed_render_order(rendered)?;
+    Ok(ContextExecutionIdentity {
         ordering_revision: ASSEMBLY_ORDERING_REVISION.to_owned(),
         serializer_id: policy.serializer_id.clone(),
         serializer_version: policy.serializer_version.clone(),
@@ -538,7 +556,46 @@ fn applied_execution_identity(policy: &AssemblyPolicy) -> ContextExecutionIdenti
         route_id: policy.route_id.clone(),
         model_id: policy.model_id.clone(),
         measurement_status: policy.measurement_status,
+    })
+}
+
+/// Require that the payload about to be delivered really is in the executed
+/// order, so the ordering revision on the view describes these bytes.
+///
+/// #1724 W4. The ordering revision used to be an unconditional constant stamped
+/// onto a payload whose order was the `SemanticRole` enum's own `Ord`, so the
+/// revision named an execution nothing compared against anything. This reads the
+/// emitted `rendered` vector — the exact atoms whose ordered payload becomes
+/// `output_digest` and the bytes handed to the measurement callback — and
+/// requires that consecutive records never move backwards through
+/// `render::EXECUTED_CONTEXT_ROLE_ORDER` and that every role it emits is one
+/// that order positions. A payload emitted in any other order, or carrying a
+/// role the executed order does not position, is refused here with a typed
+/// [`ContextError`] rather than delivered under a revision that does not
+/// describe it.
+///
+/// The approved `ContextRecipePolicy`'s declared `layout.role_positions` is not
+/// reachable from this projection — assembly receives the compilation-bound
+/// `ContextRecipe` instance, which carries the approved revision's digest and
+/// not its content. That declared order is compared against this same executed
+/// order by `ContextRecipePolicy::require_executable` on the publication path,
+/// which refuses a policy declaring an order this one does not apply; the two
+/// therefore cannot disagree without a typed refusal somewhere.
+fn require_executed_render_order(rendered: &[RenderedAtom]) -> Result<(), AssemblyError> {
+    let mut previous: Option<usize> = None;
+    for atom in rendered {
+        let position = render::EXECUTED_CONTEXT_ROLE_ORDER
+            .iter()
+            .position(|declared| *declared == atom.role)
+            .ok_or(AssemblyError::Contract(ContextError::InvalidField(
+                "assembly.render.role_order",
+            )))?;
+        if previous.is_some_and(|earlier| earlier > position) {
+            return Err(AssemblyError::Contract(ContextError::IdentityConflict));
+        }
+        previous = Some(position);
     }
+    Ok(())
 }
 
 /// Require that the recipe's approved policy revision is the admitted set's.
