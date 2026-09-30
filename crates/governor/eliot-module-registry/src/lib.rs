@@ -1530,9 +1530,7 @@ fn reject_self_dependency(
 /// The walk is over the catalog's own declared edges, so the refusal is a
 /// property of what the manifests say rather than of any caller's list. The
 /// offending path is reported, so the gap is named rather than summarized.
-fn reject_required_dependency_cycle(
-    entries: &[ModuleCatalogEntry],
-) -> Result<(), ModuleError> {
+fn reject_required_dependency_cycle(entries: &[ModuleCatalogEntry]) -> Result<(), ModuleError> {
     let mut adjacency: BTreeMap<ModuleId, BTreeSet<ModuleId>> = BTreeMap::new();
     let mut nodes: BTreeSet<ModuleId> = BTreeSet::new();
     for entry in entries {
@@ -1592,10 +1590,8 @@ fn visit_required_dependency_edges(
             match color.get(provider) {
                 Some(RequiredDependencyColor::Gray) => {
                     let start = stack.iter().position(|id| id == provider).unwrap_or(0);
-                    let mut path: Vec<String> = stack[start..]
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect();
+                    let mut path: Vec<String> =
+                        stack[start..].iter().map(ToString::to_string).collect();
                     path.push(provider.to_string());
                     return Some(path.join(" -> "));
                 }
