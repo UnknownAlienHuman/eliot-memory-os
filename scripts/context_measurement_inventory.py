@@ -110,14 +110,21 @@ Frozen owner map
 ----------------
 Owner allocation is validated against an externally supplied frozen
 committed owner map (``OWNER_MAP_PATH``) with no normal-runtime GitHub
-access. This repository does not carry that map yet, so:
+access. That map is committed data, not a generated artifact, and this
+generator never invents or extends it:
 
-  * ``sync`` records its absence explicitly (``owner_map_status``) and
-    refuses to certify any consumer as dispatch-ready;
+  * every owner row is one exact file path; a prefix, glob, directory or
+    "anything under this path" scope is rejected, and one exact scope
+    belongs to exactly one owner;
+  * a candidate the map does not place under its owner's exact scope is
+    ``unresolved`` and blocks dispatch; it is never defaulted to a
+    plausible owner;
+  * when the map is absent, no candidate is ``owned``: every row stays
+    ``unresolved`` because nothing has validated it. ``sync`` records the
+    absence explicitly (``owner_map_status``) and refuses to certify any
+    consumer as dispatch-ready;
   * ``check`` REFUSES to certify anything without the map and exits
     non-zero with code OWNER_MAP_MISSING naming the file.
-
-The map is never invented here. Supplying and committing it is #787 work.
 
 Discovery/classification API reuse:
   ``discover_context_measurements`` and ``classify_context_measurement``
@@ -1092,6 +1099,7 @@ def load_owner_map(
     required input is absent; the status records that fact explicitly so
     ``sync`` can record it and ``check`` can refuse to certify.
     """
+    root = _root(root)
     target = root / OWNER_MAP_PATH
     if target.is_symlink() or not target.is_file():
         return (
@@ -1119,6 +1127,7 @@ def load_owner_map(
             f"required owner map holds no [[owners]] entries: {OWNER_MAP_PATH.as_posix()}",
         )
     mapping: dict[str, dict[str, list[str]]] = {}
+    claimed_by: dict[str, str] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             raise InventoryError("OWNER_MAP_MALFORMED", "owner map entry must be a table")
@@ -1144,7 +1153,14 @@ def load_owner_map(
                     "OWNER_MAP_MALFORMED",
                     f"owner map scope must hold exact file paths, never a wildcard: {value!r}",
                 )
+            if value in claimed_by:
+                raise InventoryError(
+                    "OWNER_MAP_OVERLAPPING_SCOPE",
+                    f"owner map scope {value!r} is claimed by both {claimed_by[value]} and "
+                    f"{issue}; one exact scope has exactly one owner",
+                )
             _read_source(root, value)
+            claimed_by[value] = issue
             declared.append(value)
         mapping[issue] = {"source_paths": declared}
     return (mapping, "SUPPLIED", digest)
@@ -1161,8 +1177,9 @@ def _owner_confirmed(
         )
     if mapping is None:
         return (
-            "owned",
-            "owner is the exact-scope allocation stated by issue #866; the frozen owner map is not supplied, so dispatch stays blocked",
+            "unresolved",
+            "the externally supplied frozen owner map is absent at "
+            f"{OWNER_MAP_PATH.as_posix()}; this candidate is unvalidated, never prose-owned",
         )
     entry = mapping.get(owner)
     if entry is None:
@@ -1430,6 +1447,7 @@ def _build_consumer_worksets(
     verify_declared: bool,
 ) -> list[dict[str, object]]:
     bytes_by_path = {str(r["path"]): int(r["bytes"]) for r in file_records}  # type: ignore[arg-type]
+    unresolved_denominator = [row for row in rows if row["status"] != "owned"]
     worksets: list[dict[str, object]] = []
     test_owner: dict[str, str] = {}
     source_owner: dict[str, str] = {}
@@ -1496,6 +1514,11 @@ def _build_consumer_worksets(
         if unresolved_rows:
             block_reasons.append(
                 f"{len(unresolved_rows)} row(s) of this consumer have no confirmed exact-scope owner"
+            )
+        if unresolved_denominator:
+            block_reasons.append(
+                f"{len(unresolved_denominator)} candidate(s) in the migration denominator have no "
+                "existing exact-scope owner; dispatch waits until every candidate is validated"
             )
         if not band_ok:
             block_reasons.append(
