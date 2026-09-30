@@ -103,10 +103,10 @@ use watchdog_publication_readback::{
 /// every call. The module itself is `pub(crate)`, so this adds no public API.
 pub(crate) use watchdog_spool::episode;
 pub use watchdog_spool::export_driver::{
-    KernelFrontDoorWatchdogIntentSink, WatchdogEntryView, WatchdogExportSink,
-    WatchdogIntentAcknowledgement, WatchdogIntentExportBatch, WatchdogIntentReconciliation,
-    WatchdogIntentSink, WatchdogIntentWindowBlock, export_once, reconcile_watchdog_intents,
-    watchdog_entry_views, watchog_entry_views,
+    KernelFrontDoorWatchdogExportSink, KernelFrontDoorWatchdogIntentSink, WatchdogEntryView,
+    WatchdogExportSink, WatchdogIntentAcknowledgement, WatchdogIntentExportBatch,
+    WatchdogIntentReconciliation, WatchdogIntentSink, WatchdogIntentWindowBlock, export_once,
+    reconcile_watchdog_intents, watchdog_entry_views, watchog_entry_views,
 };
 pub(crate) use watchdog_spool::intent::{
     GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
@@ -1436,6 +1436,34 @@ impl KernelWatchdogPort for IndependentKernelSensor {
             corpus,
         })
     }
+
+    fn export_spool(
+        self: Arc<Self>,
+        lease: VerifiedSupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, SpoolError>> + Send>> {
+        Box::pin(async move {
+            let lease_id = lease.lease().lease_id.clone();
+            let sink =
+                KernelFrontDoorWatchdogExportSink::new(lease, self.epoch_lineage.as_str());
+            tokio::task::spawn_blocking(move || {
+                // The export contour is bound to the lease this tick actually
+                // verified, never to a lease a caller could present: a sensor
+                // that admitted a different lease since fails closed here instead
+                // of exporting under a stale supervision lineage.
+                if self.verified_supervision_lease_id().as_deref() != Some(lease_id.as_str()) {
+                    return Err(SpoolError::InvalidLease(
+                        "watchdog spool export requires the currently verified supervision lease; a different lease was admitted"
+                            .to_owned(),
+                    ));
+                }
+                export_once(&self, &sink, WatchdogSpoolExportLimits::default())
+            })
+            .await
+            .map_err(|error| {
+                SpoolError::Corrupt(format!("Kernel spool export worker failed: {error}"))
+            })?
+        })
+    }
 }
 
 /// Closed observation-source label for an admission-reload rejection.
@@ -1522,6 +1550,20 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
         Box::pin(async {
             Err(SpoolError::Corrupt(
                 "KernelWatchdogPort has no Watchdog intent spool owner".to_owned(),
+            ))
+        })
+    }
+
+    /// Starts one bounded owner-spool export pass through the authenticated
+    /// Kernel front door. Implementations without the Watchdog-owned spool fail
+    /// closed; they never synthesize an acknowledgement.
+    fn export_spool(
+        self: Arc<Self>,
+        _lease: VerifiedSupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, SpoolError>> + Send>> {
+        Box::pin(async {
+            Err(SpoolError::Corrupt(
+                "KernelWatchdogPort has no Watchdog spool export owner".to_owned(),
             ))
         })
     }

@@ -673,6 +673,7 @@ impl WatchdogComposition {
                                 {
                                     let reconcile_kernel = Arc::clone(&kernel);
                                     let verified_lease = admission.lease().clone();
+                                    let export_lease = admission.lease().clone();
                                     tokio::spawn(async move {
                                         match reconcile_kernel
                                             .reconcile_intents(verified_lease)
@@ -706,6 +707,35 @@ impl WatchdogComposition {
                                                 error = %error,
                                                 "Watchdog intent reconciliation did not receive a verified Kernel acknowledgement"
                                             ),
+                                        }
+                                        // Drain one bounded owner-spool export
+                                        // window through the same authenticated
+                                        // Kernel front door in the same one-in-
+                                        // flight pass. A refusal here is honest,
+                                        // not fatal: a window the Governor has
+                                        // not canonically admitted carries a
+                                        // non-terminal disposition, so the cursor
+                                        // stays put, nothing compacts, and the
+                                        // exact same window replays on the next
+                                        // live tick.
+                                        match reconcile_kernel.export_spool(export_lease).await {
+                                            Ok(acknowledged) => tracing::info!(
+                                                event = "watchdog.spool_export_advanced",
+                                                acknowledged,
+                                                canonical_decision = "pending_governor_admission",
+                                                "one bounded Watchdog spool export window was acknowledged and compacted"
+                                            ),
+                                            Err(error) => {
+                                                let reason_code =
+                                                    crate::diagnostics::spool_error_observation(
+                                                        &error,
+                                                    );
+                                                tracing::debug!(
+                                                    event = "watchdog.spool_export_not_acknowledged",
+                                                    reason_code,
+                                                    "the bounded Watchdog spool export window was not acknowledged; the exact window stays replayable"
+                                                );
+                                            }
                                         }
                                         drop(permit);
                                     });

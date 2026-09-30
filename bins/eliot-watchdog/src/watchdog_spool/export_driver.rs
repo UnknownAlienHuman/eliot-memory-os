@@ -23,9 +23,11 @@ use eliot_contracts::{
 };
 use eliot_protocol::{
     ClientHello, EliotPipeName, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
-    ProtocolRange, ProtocolVersion, WATCHDOG_SPOOL_BATCH_ROUTE,
-    WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID, WatchdogIntentKind, WatchdogSpoolIntentBatchPayload,
-    WatchdogSpoolIntentSubmission, watchdog_intent_reconciliation_idempotency_key,
+    ProtocolRange, ProtocolVersion, WATCHDOG_SPOOL_BATCH_ROUTE, WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID,
+    WATCHDOG_SPOOL_EXPORT_ROUTE, WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID, WatchdogIntentKind,
+    WatchdogSpoolEntryKind, WatchdogSpoolExportBatchPayload, WatchdogSpoolExportSubmission,
+    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
+    watchdog_export_reconciliation_idempotency_key, watchdog_intent_reconciliation_idempotency_key,
 };
 use eliot_runtime_contracts::{
     ModuleContract, ModuleGeneration, ModuleGenerationState, VerifiedSupervisionLease,
@@ -43,6 +45,21 @@ use crate::{
 };
 
 const WATCHDOG_FRONT_DOOR_MODULE_ID: &str = "eliot-watchdog";
+
+/// Closed front-door operation carrying one Watchdog spool intent batch.
+///
+/// It is the wire vocabulary the Kernel's `watchdog_intent_submit` entry and
+/// its admitted Watchdog session capability are named by, so the two processes
+/// cannot drift into two spellings of the same closed route.
+const WATCHDOG_INTENT_SUBMIT_OPERATION: &str = "watchdog_intent_submit";
+
+/// Closed front-door operation carrying one Watchdog spool export batch.
+///
+/// It is the sibling of [`WATCHDOG_INTENT_SUBMIT_OPERATION`] for the drain
+/// window: a bounded observation intake over the retained spool, admitted
+/// through the Kernel's `watchdog_export_submit` entry and its own admitted
+/// Watchdog session capability.
+const WATCHDOG_EXPORT_SUBMIT_OPERATION: &str = "watchdog_export_submit";
 
 /// Pure admission-entry projection of one export batch, in batch order.
 ///
@@ -508,9 +525,19 @@ async fn transact_intent_batch(
     let signed = lease.lease();
     let connection_id = format!("{}:{}", SERVICE_NAME, signed.lease_id);
     let (mut transport, protocol_version) =
-        connect_watchdog_front_door(lease, &connection_id).await?;
+        connect_watchdog_front_door(lease, &connection_id, WATCHDOG_INTENT_SUBMIT_OPERATION).await?;
     let limits = TransportLimits::default();
-    let frame = watchdog_intent_request(lease, payload, &connection_id, protocol_version)?;
+    let body = serde_json::to_value(payload)
+        .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+    let frame = watchdog_spool_request(
+        lease,
+        WATCHDOG_INTENT_SUBMIT_OPERATION,
+        "intent_batch",
+        &body,
+        &payload.batch_id,
+        &connection_id,
+        protocol_version,
+    )?;
     let request_id = frame.request_id.clone().ok_or_else(|| {
         SpoolError::Corrupt("Kernel intent request omitted its request ID".to_owned())
     })?;
@@ -551,6 +578,7 @@ async fn transact_intent_batch(
 async fn connect_watchdog_front_door(
     lease: &VerifiedSupervisionLease,
     connection_id: &str,
+    capability: &str,
 ) -> Result<(eliot_ipc::NamedPipeTransport, ProtocolVersion), SpoolError> {
     use std::time::Duration;
 
@@ -589,7 +617,7 @@ async fn connect_watchdog_front_door(
         }
     }
     let limits = TransportLimits::default();
-    let hello = watchdog_client_hello(lease)?;
+    let hello = watchdog_client_hello(lease, capability)?;
     let hello_frame = eliot_ipc::client_hello_frame(connection_id, &hello)
         .map_err(|error| SpoolError::Corrupt(error.to_string()))?;
     if transport
@@ -615,28 +643,31 @@ async fn connect_watchdog_front_door(
         || !server
             .allowed_capabilities
             .iter()
-            .any(|item| item == "watchdog_intent_submit")
+            .any(|item| item == capability)
         || server.rejection_reason.is_some()
     {
         return Err(SpoolError::LeaseFenced(
-            "Kernel denied the Watchdog intent capability or lease epoch".to_owned(),
+            "Kernel denied the Watchdog observation capability or lease epoch".to_owned(),
         ));
     }
     Ok((transport, server.selected_protocol))
 }
 
 #[cfg(windows)]
-fn watchdog_intent_request(
+fn watchdog_spool_request(
     lease: &VerifiedSupervisionLease,
-    payload: &WatchdogSpoolIntentBatchPayload,
+    operation: &str,
+    payload_key: &str,
+    payload: &serde_json::Value,
+    batch_id: &str,
     connection_id: &str,
     protocol_version: ProtocolVersion,
 ) -> Result<Frame, SpoolError> {
     use std::collections::BTreeMap;
 
     let signed = lease.lease();
-    let sequence = payload.intents.first().map_or(0, |item| item.sequence);
-    let request_id = RequestId::new(format!("watchdog:{}:{sequence}", payload.batch_id))
+    let identity_text = format!("{operation}:{batch_id}");
+    let request_id = RequestId::new(identity_text.clone())
         .map_err(|error| SpoolError::Corrupt(error.to_string()))?;
     let fence = signed.state_fence.clone();
     let now_ms = crate::current_unix_ms()?.max(1);
@@ -661,9 +692,9 @@ fn watchdog_intent_request(
             metadata,
             state_fence: fence,
         },
-        idempotency_key: format!("watchdog-intent:{}:{sequence}", payload.batch_id),
+        idempotency_key: identity_text.clone(),
         deadline_unix_ms: now_ms.saturating_add(10_000),
-        cancellation_id: format!("watchdog-intent:{}:{sequence}:cancel", payload.batch_id),
+        cancellation_id: format!("{identity_text}:cancel"),
     };
     Ok(Frame {
         protocol_version,
@@ -673,12 +704,319 @@ fn watchdog_intent_request(
         kind: FrameKind::Request,
         message_type: MessageType::Execute,
         request_identity: Some(identity),
-        payload: ProtocolPayload::Json(serde_json::json!({
-            "operation": "watchdog_intent_submit",
-            "intent_batch": payload,
-        })),
+        payload: ProtocolPayload::Json(
+            serde_json::json!({ "operation": operation, payload_key: payload }),
+        ),
         trace_context: BTreeMap::new(),
     })
+}
+
+/// Closed front-door operation carrying one Watchdog spool export batch.
+#[cfg(windows)]
+async fn transact_export_batch(
+    lease: &VerifiedSupervisionLease,
+    payload: &WatchdogSpoolExportBatchPayload,
+) -> Result<WatchdogSpoolAcknowledgement, SpoolError> {
+    use eliot_ipc::{DeliveryOutcome, TransportLimits};
+
+    let signed = lease.lease();
+    let connection_id = format!("{}:{}", SERVICE_NAME, signed.lease_id);
+    let (mut transport, protocol_version) =
+        connect_watchdog_front_door(lease, &connection_id, WATCHDOG_EXPORT_SUBMIT_OPERATION)
+            .await?;
+    let limits = TransportLimits::default();
+    let body = serde_json::to_value(payload)
+        .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+    let frame = watchdog_spool_request(
+        lease,
+        WATCHDOG_EXPORT_SUBMIT_OPERATION,
+        "export_batch",
+        &body,
+        &payload.batch_id,
+        &connection_id,
+        protocol_version,
+    )?;
+    let request_id = frame.request_id.clone().ok_or_else(|| {
+        SpoolError::Corrupt("Kernel export request omitted its request ID".to_owned())
+    })?;
+    if transport
+        .send_frame(&frame, limits)
+        .await
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?
+        != DeliveryOutcome::Delivered
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel export batch delivery was not proven".to_owned(),
+        ));
+    }
+    let response = transport
+        .receive_frame(limits)
+        .await
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    if response.validate().is_err()
+        || response.connection_id != connection_id
+        || response.request_id.as_ref() != Some(&request_id)
+        || response.kind != FrameKind::Response
+        || response.message_type != MessageType::Result
+        || response.request_identity.is_some()
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel export response did not correlate to the submitted batch".to_owned(),
+        ));
+    }
+    let ProtocolPayload::Json(value) = response.payload else {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel export response was not JSON".to_owned(),
+        ));
+    };
+    acknowledgement_from_kernel_outcome(&value, payload, batch.schema_version)
+}
+
+/// Projects one owner-generated export window onto the typed Kernel payload.
+///
+/// The payload carries the real batch content: the owner-computed predecessor,
+/// full covered range, high-water, identity, digest, freshness window, and every
+/// retained entry's sequence, revision, timestamp, payload class, and two
+/// owner-computed digests. It carries no handle to anything: a downstream
+/// consumer can admit every entry from this payload alone, and every digest it
+/// reads is the Watchdog's own recorded value over its own retained bytes.
+fn export_batch_payload(
+    supervision_lease_id: &str,
+    sink_id: &str,
+    batch: &WatchdogSpoolExportBatch,
+    epoch_lineage_id: &str,
+) -> Result<WatchdogSpoolExportBatchPayload, SpoolError> {
+    let entries = batch
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok(WatchdogSpoolExportSubmission {
+                sequence: entry.sequence,
+                schema_version: entry.schema_version,
+                observed_at_ms: entry.observed_at_ms,
+                entry_kind: match entry.payload_kind {
+                    WatchdogSpoolPayloadKind::Heartbeat => WatchdogSpoolEntryKind::Heartbeat,
+                    WatchdogSpoolPayloadKind::Gap => WatchdogSpoolEntryKind::Gap,
+                    WatchdogSpoolPayloadKind::Recovery => WatchdogSpoolEntryKind::Recovery,
+                },
+                payload_digest: entry.payload_digest.clone(),
+                record_digest: entry.record_digest.clone(),
+                idempotency_key: watchdog_export_reconciliation_idempotency_key(
+                    &batch.installation_id,
+                    entry.sequence,
+                    &entry.record_digest,
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>, SpoolError>>()?;
+    WatchdogSpoolExportBatchPayload {
+        wire_id: WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID.to_owned(),
+        wire_version: WatchdogSpoolExportBatchPayload::CONTRACT_VERSION,
+        route: WATCHDOG_SPOOL_EXPORT_ROUTE.to_owned(),
+        installation_id: batch.installation_id.clone(),
+        schema_version: batch.schema_version,
+        watchdog_generation: batch.watchdog_generation,
+        watchdog_epoch: batch.watchdog_epoch,
+        watchdog_epoch_lineage_id: epoch_lineage_id.to_owned(),
+        supervision_lease_id: supervision_lease_id.to_owned(),
+        sink_id: sink_id.to_owned(),
+        predecessor_sequence: batch.predecessor_cursor.acknowledged_sequence,
+        first_sequence: batch.first_sequence,
+        last_sequence: batch.last_sequence,
+        high_water_sequence: batch.high_water_sequence,
+        created_at_ms: batch.created_at_ms,
+        expires_at_ms: batch.expires_at_ms,
+        batch_id: batch.batch_id.clone(),
+        batch_digest: batch.batch_digest.clone(),
+        byte_size: batch.byte_size,
+        entries,
+        payload_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .and_then(|payload| {
+        payload.validate()?;
+        Ok(payload)
+    })
+    .map_err(|error| SpoolError::Corrupt(format!("invalid Kernel export batch: {error}")))
+}
+
+/// Projects one Kernel export answer onto the sink-owned acknowledgement.
+///
+/// The Kernel route records one durable *pending export projection* per retained
+/// spool record and nothing more, so the only honest sink disposition is
+/// `AdmittedCandidate`: the entry is stored, it is not yet a canonical
+/// application, and the Watchdog's cursor must not advance on it. Any other
+/// durable state is refused instead of being reinterpreted, and the sink never
+/// invents a terminal outcome for an entry the Governor has not decided.
+fn acknowledgement_from_kernel_outcome(
+    outcome: &serde_json::Value,
+    payload: &WatchdogSpoolExportBatchPayload,
+    schema_version: u16,
+) -> Result<WatchdogSpoolAcknowledgement, SpoolError> {
+    use eliot_watchdog_core::{WatchdogSpoolEntryDisposition, WatchdogSpoolSinkDisposition};
+
+    if outcome.get("status").and_then(serde_json::Value::as_str) != Some("known") {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel did not return a known export outcome".to_owned(),
+        ));
+    }
+    let known = outcome.get("value").ok_or_else(|| {
+        SpoolError::LeaseFenced("Kernel known export outcome omitted its value".to_owned())
+    })?;
+    if known.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
+        || known.get("sink_id").and_then(serde_json::Value::as_str)
+            != Some(payload.sink_id.as_str())
+        || outcome.get("recovery") != Some(&serde_json::Value::Null)
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel export outcome did not affirm the bound sink and non-canonical pending projection"
+                .to_owned(),
+        ));
+    }
+    let entries = known
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            SpoolError::LeaseFenced("Kernel export outcome omitted its projections".to_owned())
+        })?;
+    if entries.len() != payload.entries.len() {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel export outcome coverage differed from submitted records".to_owned(),
+        ));
+    }
+    entries
+        .iter()
+        .zip(&payload.entries)
+        .map(|(projection, submitted)| {
+            if projection
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                != Some(submitted.sequence)
+                || projection
+                    .get("idempotency_key")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(submitted.idempotency_key.as_str())
+                || projection
+                    .get("entry_kind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(submitted.entry_kind.as_str())
+                || projection
+                    .get("record_digest")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(submitted.record_digest.as_str())
+                || projection
+                    .get("payload_digest")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(submitted.payload_digest.as_str())
+                || projection.get("state").and_then(serde_json::Value::as_str) != Some("ADMITTED")
+                || projection
+                    .get("operation_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(str::is_empty)
+                || projection
+                    .get("admitted_now")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_none()
+            {
+                return Err(SpoolError::LeaseFenced(
+                    "Kernel export projection did not bind the exact retained record".to_owned(),
+                ));
+            }
+            Ok(WatchdogSpoolEntryDisposition {
+                sequence: submitted.sequence,
+                disposition: WatchdogSpoolSinkDisposition::AdmittedCandidate,
+                record_digest: submitted.record_digest.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, SpoolError>>()
+        .map(|dispositions| WatchdogSpoolAcknowledgement {
+            schema_version,
+            batch_id: payload.batch_id.clone(),
+            batch_digest: payload.batch_digest.clone(),
+            predecessor_sequence: payload.predecessor_sequence,
+            first_sequence: payload.first_sequence,
+            last_sequence: payload.last_sequence,
+            sink_id: payload.sink_id.clone(),
+            watchdog_generation: payload.watchdog_generation,
+            watchdog_epoch: payload.watchdog_epoch,
+            installation_id: payload.installation_id.clone(),
+            dispositions,
+        })
+}
+
+/// Authenticated Kernel front-door sink for one bounded Watchdog spool export.
+///
+/// The constructor binds every connection to fields in the already verified
+/// signed lease and to this owner's own retained epoch lineage; no endpoint,
+/// peer identity, server artifact, or lineage identity is accepted from the
+/// caller. It is the production [`WatchdogExportSink`], so [`export_once`] has
+/// a real transport in production instead of a test double.
+pub struct KernelFrontDoorWatchdogExportSink {
+    lease: VerifiedSupervisionLease,
+    epoch_lineage_id: String,
+    sink_id: String,
+}
+
+impl KernelFrontDoorWatchdogExportSink {
+    /// Binds a stable sink identity, authenticated server expectation, and the
+    /// Watchdog's own epoch lineage to the exact verified supervision lease.
+    #[must_use]
+    pub fn new(lease: VerifiedSupervisionLease, epoch_lineage_id: &str) -> Self {
+        let payload = lease.lease();
+        let sink_id = format!(
+            "watchdog-kernel-frontdoor-export:{}:{}",
+            payload.installation_id,
+            payload.activation_generation.value()
+        );
+        Self {
+            lease,
+            epoch_lineage_id: epoch_lineage_id.to_owned(),
+            sink_id,
+        }
+    }
+}
+
+impl WatchdogExportSink for KernelFrontDoorWatchdogExportSink {
+    fn sink_id(&self) -> &str {
+        &self.sink_id
+    }
+
+    fn submit(
+        &self,
+        batch: &WatchdogSpoolExportBatch,
+    ) -> Result<WatchdogSpoolAcknowledgement, SpoolError> {
+        let lease_id = self.lease.lease().lease_id.clone();
+        if batch.installation_id != self.lease.lease().installation_id
+            || batch.watchdog_generation
+                != self.lease.lease().activation_generation.value()
+            || batch.watchdog_epoch != self.lease.lease().watchdog_epoch.value()
+        {
+            return Err(SpoolError::LeaseFenced(
+                "export batch does not match the signed supervision lease lineage".to_owned(),
+            ));
+        }
+        let payload = export_batch_payload(
+            &lease_id,
+            self.sink_id(),
+            batch,
+            self.epoch_lineage_id.as_str(),
+        )?;
+        #[cfg(windows)]
+        {
+            tokio::runtime::Handle::try_current()
+                .map_err(|error| {
+                    SpoolError::Corrupt(format!("Kernel export sink requires Tokio: {error}"))
+                })?
+                .block_on(transact_export_batch(&self.lease, &payload))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = payload;
+            Err(SpoolError::Corrupt(
+                "authenticated Kernel front-door transport is available only on Windows".to_owned(),
+            ))
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -764,7 +1102,10 @@ fn acknowledgements_from_kernel_outcome(
 }
 
 #[cfg(windows)]
-fn watchdog_client_hello(lease: &VerifiedSupervisionLease) -> Result<ClientHello, SpoolError> {
+fn watchdog_client_hello(
+    lease: &VerifiedSupervisionLease,
+    capability: &str,
+) -> Result<ClientHello, SpoolError> {
     let signed = lease.lease();
     let module_id = ContractId::new(WATCHDOG_FRONT_DOOR_MODULE_ID)
         .map_err(|error| SpoolError::Corrupt(error.to_string()))?;
@@ -789,7 +1130,7 @@ fn watchdog_client_hello(lease: &VerifiedSupervisionLease) -> Result<ClientHello
         module_contract: contract,
         module_generation: generation,
         launch_nonce: signed.lease_id.clone(),
-        capabilities: vec!["watchdog_intent_submit".to_owned()],
+        capabilities: vec![capability.to_owned()],
         privacy_classes: vec!["PUBLIC".to_owned()],
         max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
             .map_err(|error| SpoolError::Corrupt(error.to_string()))?,
