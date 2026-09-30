@@ -151,7 +151,35 @@
 //!   execution receipt.
 //! - every envelope's own fence must match the current item fence by exact
 //!   tuple, because the envelope contract proves a fence is well formed, not
-//!   that it is the current one.
+//!   that it is the current one; its provenance must name the current scope and
+//!   exactly the revision of the retained material it is joined to, which is the
+//!   `claim -> evidence handle -> source revision` link of I21.8 and the same
+//!   join the reactive context contracts already apply.
+//! - the competent/unqualified/absent evaluator verdict must belong to the
+//!   control owner the record names, and must be carried by an envelope that
+//!   owner issued. A verdict paired with somebody else's retained envelope is a
+//!   caller assertion with a handle on it.
+//!
+//! Three rules bound the causal ceiling, and each is read from a denominator
+//! that is independent of the others. An envelope's own recorded COVERAGE is the
+//! first: an envelope that records partial, not-applicable, or unknown coverage
+//! never qualifies, so partial valid evidence is preserved and named but cannot
+//! authorize an evidence-qualified state. The second is the retained evidence
+//! SET, whose coverage
+//! [`CausalEvidenceRecord::derived_evidence_coverage`] derives from what the
+//! envelopes themselves record rather than from a second copy of a caller list.
+//! The third is the rival/confounder denominator, which is already checked
+//! against the retained evidence. Neither set may report the other complete, and
+//! [`CausalClaimRecord::coverage`] is the weaker of the two so a caller cannot
+//! publish a complete causal cell by pointing at the complete one.
+//!
+//! The declared label and the derived assessment are separated in both
+//! directions. Nothing short of the declared state's own requirements promotes
+//! it, and an observed falsifier that came back `Inconsistent` assesses the
+//! claim [`CausalClaimState::Refuted`] whatever the source called it: a refuted
+//! prediction, structural, correlational, or causal claim is never published
+//! under the label it was declared with. Refutation reaches no leg that grants
+//! causality, so closing a claim down never mixes the states together.
 //!
 //! A claim whose position has no admitted source member is refused at
 //! admission rather than assessed against nothing. Nothing here raises a
@@ -1002,6 +1030,16 @@ impl EvidenceRecord {
     /// authority ceiling: they are preserved and may support a review, but they
     /// never promote a declaration to an evidence-qualified state. A stale,
     /// contested, superseded, or rejected envelope likewise qualifies nothing.
+    ///
+    /// The envelope's OWN recorded coverage is read here as well, which is the
+    /// fifth dimension the type documentation above already claimed was read
+    /// from the envelope and which no code path previously read. I21.6 makes
+    /// `complete_scope` the only basis on which a scoped absence may be
+    /// claimed, and I5.16 makes an absent or unestablished coverage record
+    /// `unknown` rather than unrestricted, so an envelope recording partial,
+    /// not-applicable, or unknown coverage never qualifies. This is the owner
+    /// RECORDED value carried by the envelope, not a field of this record, so
+    /// there is no caller-side value to raise it with.
     #[must_use]
     pub fn qualifies(&self) -> bool {
         matches!(
@@ -1019,6 +1057,7 @@ impl EvidenceRecord {
             self.envelope.status,
             EpistemicStatus::Supported | EpistemicStatus::Verified
         ) && self.envelope.assertability == Assertability::Assertable
+            && self.envelope.coverage == EvidenceCoverage::CompleteForScope
     }
 }
 
@@ -1228,6 +1267,16 @@ impl RivalDenominator {
 /// this cell computes. Prediction support, intervention execution, and causal
 /// attribution stay distinct: this record can carry all three and still promote
 /// only the one the declaration claims.
+///
+/// Two coverage denominators hang off this record and neither substitutes for
+/// the other: [`Self::rivals`], the rival/confounder denominator, and the
+/// retained evidence set itself, whose coverage
+/// [`Self::derived_evidence_coverage`] derives from the envelopes' own recorded
+/// coverage. Every leg this record must support — the falsifier observation,
+/// the control's evaluator result, and the intervention receipt when one is
+/// claimed — is joined to a retained envelope, the control's verdict belongs to
+/// the control owner that issued it, and no envelope may join material or
+/// receipt it does not name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CausalEvidenceRecord {
     /// Source handle holding the claim.
@@ -1331,6 +1380,24 @@ impl CausalEvidenceRecord {
                 detail: "evaluator result is not traced to retained evidence".to_owned(),
             });
         }
+        // The competent/unqualified/absent verdict is the CONTROL OWNER's own
+        // statement about a matched control, so the envelope carrying it has to
+        // be one that same owner issued. Naming an evaluator handle and pairing
+        // it with any retained envelope would otherwise make `Competent` a
+        // caller-set field with a handle attached rather than a matched control
+        // backed by a competent evaluator's own record.
+        if let Some(control_evidence) = self
+            .evidence
+            .iter()
+            .find(|record| record.evidence_id == self.control.evidence_id)
+            && control_evidence.owner != self.control.owner
+        {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.control.owner".to_owned(),
+                detail: "the evaluator result is not an envelope issued by the named control owner"
+                    .to_owned(),
+            });
+        }
         // An intervention execution is proven by the receipt that owner
         // issued, so the receipt is read as that receipt rather than as a
         // well-formed digest. A digest matching no retained envelope is the
@@ -1346,6 +1413,48 @@ impl CausalEvidenceRecord {
             });
         }
         self.rivals.validate(&evidence_ids)
+    }
+
+    /// Returns the coverage this record's own retained evidence set derives,
+    /// independent of the rival/confounder denominator.
+    ///
+    /// The expected set here is NOT a second copy of a caller-declared list: it
+    /// is the coverage the retained envelopes themselves RECORD, and the members
+    /// are the envelopes this record already had to prove. Declaring fewer or
+    /// fewer-named members therefore cannot produce a complete set, which is the
+    /// same independence [`RivalDenominator::derived_coverage`] relies on and the
+    /// same rule the comparison cell applies against the canonical eight
+    /// dimensions. The two cells stay separate: complete causal evidence with an
+    /// incomplete rival denominator is still an incomplete causal claim, and the
+    /// reverse holds too.
+    ///
+    /// An empty set is [`EvidenceCoverage::Unknown`] (I5.16: an absent coverage
+    /// record means `unknown`, not unrestricted/complete), a set that holds any
+    /// complete or partial member but is not wholly complete is
+    /// [`EvidenceCoverage::PartialForScope`], and only a set every member of
+    /// which records complete coverage is
+    /// [`EvidenceCoverage::CompleteForScope`].
+    #[must_use]
+    pub fn derived_evidence_coverage(&self) -> EvidenceCoverage {
+        if self.evidence.is_empty() {
+            return EvidenceCoverage::Unknown;
+        }
+        if self
+            .evidence
+            .iter()
+            .all(|record| record.envelope.coverage == EvidenceCoverage::CompleteForScope)
+        {
+            return EvidenceCoverage::CompleteForScope;
+        }
+        if self.evidence.iter().any(|record| {
+            matches!(
+                record.envelope.coverage,
+                EvidenceCoverage::CompleteForScope | EvidenceCoverage::PartialForScope
+            )
+        }) {
+            return EvidenceCoverage::PartialForScope;
+        }
+        EvidenceCoverage::Unknown
     }
 }
 
@@ -2076,6 +2185,13 @@ pub struct SuppliedCausalClaim {
 /// owner-issued evidence supports that exact state, and is
 /// [`CausalClaimState::Unknown`] otherwise. A declaration is never promoted
 /// past the evidence, and prose never promotes it at all.
+///
+/// The two coverage cells are reported SEPARATELY and neither stands in for the
+/// other. `evidence_coverage` is what the retained envelopes themselves record;
+/// `rival_coverage` is what the rival/confounder denominator derives. `coverage`
+/// is the weaker of the two, so a claim whose evidence set or whose rival
+/// denominator is incomplete can never be published as a complete causal cell
+/// by reporting the other one complete.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CausalClaimRecord {
     /// Source handle holding the claim.
@@ -2088,8 +2204,12 @@ pub struct CausalClaimRecord {
     pub supplement_version: SupplementVersion,
     /// Bounded reason for reduction or unverified preservation.
     pub reduction_reason: String,
-    /// Rival/confounder coverage derived from the retained evidence.
+    /// The weaker of `evidence_coverage` and `rival_coverage`.
     pub coverage: EvidenceCoverage,
+    /// Coverage derived from the retained evidence envelopes' own records.
+    pub evidence_coverage: EvidenceCoverage,
+    /// Rival/confounder coverage derived from the rival denominator.
+    pub rival_coverage: EvidenceCoverage,
     /// Owner mechanism claim identity this assessment is bound to, when any.
     pub mechanism_claim_id: Option<String>,
 }
@@ -3333,6 +3453,16 @@ fn check_mechanism_revision(
 /// that it is the CURRENT one, so a stale or mixed-fence envelope is otherwise
 /// well-formed evidence: without this comparison it would qualify a claim
 /// under a lease or epoch the analysis does not hold.
+///
+/// The envelope's own provenance is read the same way and to the same end. The
+/// I21.8 claim chain is `claim -> evidence handle -> source revision -> ...`:
+/// an envelope whose recorded revision is not the revision of the retained
+/// material it is joined to, or that was captured in another scope, is evidence
+/// about a different snapshot, and a missing revision names no snapshot at all.
+/// The exact comparison used here (revision present AND equal, scope exactly
+/// equal) is the same one the reactive context contracts already apply to an
+/// admitted owner closure, so an envelope cannot qualify a causal claim through
+/// a weaker join than the rest of the repository uses.
 fn check_evidence_joins(
     record: &CausalEvidenceRecord,
     item: &ValidatedCurationItem,
@@ -3351,6 +3481,23 @@ fn check_evidence_joins(
                 field: "causal_evidence.envelope.state_fence".to_owned(),
                 detail: "evidence was captured under a different fence than the current one"
                     .to_owned(),
+            });
+        }
+        if evidence.envelope.provenance.scope != item.scope_id {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.envelope.provenance.scope".to_owned(),
+                detail: "evidence was captured in a different scope than the current one"
+                    .to_owned(),
+            });
+        }
+        if evidence.envelope.provenance.revision.as_deref()
+            != Some(member.source_revision.as_str())
+        {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.envelope.provenance.revision".to_owned(),
+                detail:
+                    "evidence names no source revision or one other than the retained material it is joined to"
+                        .to_owned(),
             });
         }
         if evidence.receipt_digest == item.receipt.bundle_digest {
@@ -4332,7 +4479,32 @@ fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
         supplement_version: SupplementVersion::LegacyV1Unverified,
         reduction_reason,
         coverage: EvidenceCoverage::Unknown,
+        evidence_coverage: EvidenceCoverage::Unknown,
+        rival_coverage: EvidenceCoverage::Unknown,
         mechanism_claim_id: None,
+    }
+}
+
+/// Returns the weaker of two coverage values.
+///
+/// `EvidenceCoverage` ranks a scope claim rather than being a plain scale, so
+/// the ceiling a cell may report is the weaker of the two inputs: a complete
+/// evidence set and a complete rival denominator each need the other before the
+/// causal cell as a whole is complete, and an unknown on either side keeps the
+/// whole unknown rather than smoothing it away.
+fn lower_coverage(left: EvidenceCoverage, right: EvidenceCoverage) -> EvidenceCoverage {
+    let rank = |coverage: EvidenceCoverage| -> u8 {
+        match coverage {
+            EvidenceCoverage::CompleteForScope => 3,
+            EvidenceCoverage::PartialForScope => 2,
+            EvidenceCoverage::NotApplicable => 1,
+            EvidenceCoverage::Unknown => 0,
+        }
+    };
+    if rank(left) >= rank(right) {
+        left
+    } else {
+        right
     }
 }
 
@@ -4347,8 +4519,20 @@ fn blocking_causal_leg(record: &CausalEvidenceRecord) -> Option<String> {
     }
     if !record.evidence.iter().all(EvidenceRecord::qualifies) {
         return Some(
-            "an envelope retains a lower authority, freshness, or assertability ceiling".to_owned(),
+            "an envelope retains a lower authority, freshness, coverage, or assertability ceiling"
+                .to_owned(),
         );
+    }
+    // The evidence set and the rival denominator are independent denominators,
+    // so each is read on its own terms. Partial valid evidence is preserved and
+    // still blocks the qualified state; it is never read as complete because the
+    // OTHER denominator happened to be complete.
+    let evidence_coverage = record.derived_evidence_coverage();
+    if evidence_coverage != EvidenceCoverage::CompleteForScope {
+        return Some(format!(
+            "the retained evidence set is {} rather than complete",
+            coverage_spelling(evidence_coverage)
+        ));
     }
     if record.falsifier.observed == FalsifierStatus::Unobserved {
         return Some("the falsifier is specified but no status was observed".to_owned());
@@ -4379,6 +4563,13 @@ fn blocking_causal_leg(record: &CausalEvidenceRecord) -> Option<String> {
 /// either. Anything short of the declared state's own requirements stays
 /// [`CausalClaimState::Unknown`].
 ///
+/// One step goes the other way and is equally load-bearing: an observed
+/// falsifier that came back `Inconsistent` assesses the claim as
+/// [`CausalClaimState::Refuted`] whatever label the source declared, so
+/// counterevidence is carried into the assessment rather than dropped. It
+/// reaches no leg that grants causality, so this does not merge the states
+/// together.
+///
 /// Reaching [`CausalClaimState::Intervention`] additionally depends on admission
 /// having proved the execution's receipt: [`CausalEvidenceRecord::validate`]
 /// refuses a record whose `intervention.receipt_digest` is not the receipt of
@@ -4388,13 +4579,31 @@ fn derive_causal_state(record: &CausalEvidenceRecord) -> CausalClaimState {
     if blocking_causal_leg(record).is_some() {
         return CausalClaimState::Unknown;
     }
+    // The record's own observed falsifier is read against EVERY declared state
+    // it can bear on, not against a hypothesis alone. An `Inconsistent` verdict
+    // withdraws the claim whatever label the source gave it: publishing the
+    // declared label as the effective state over evidence that contradicts it
+    // is the one promotion this cell must never make, and it also drops
+    // preserved counterevidence on the way out. `Refuted` is not a promotion
+    // either — it takes the declared state away rather than granting a stronger
+    // one, and it never reaches `Intervention`, so a refuted prediction still
+    // cannot become an intervention.
+    if record.falsifier.observed == FalsifierStatus::Inconsistent
+        && matches!(
+            record.declared_state,
+            CausalClaimState::Structural
+                | CausalClaimState::Correlational
+                | CausalClaimState::CausalHypothesis
+                | CausalClaimState::Prediction
+        )
+    {
+        return CausalClaimState::Refuted;
+    }
     match record.declared_state {
-        CausalClaimState::Structural | CausalClaimState::Correlational => record.declared_state,
-        CausalClaimState::CausalHypothesis => match record.falsifier.observed {
-            FalsifierStatus::Inconsistent => CausalClaimState::Refuted,
-            _ => CausalClaimState::CausalHypothesis,
-        },
-        CausalClaimState::Prediction => CausalClaimState::Prediction,
+        CausalClaimState::Structural
+        | CausalClaimState::Correlational
+        | CausalClaimState::CausalHypothesis
+        | CausalClaimState::Prediction => record.declared_state,
         CausalClaimState::Intervention => match &record.intervention {
             Some(_) => CausalClaimState::Intervention,
             None => CausalClaimState::Unknown,
@@ -4409,16 +4618,19 @@ fn derive_causal_state(record: &CausalEvidenceRecord) -> CausalClaimState {
 
 /// Builds one causal assessment from an owner-issued evidence record.
 fn owner_causal_record(record: &CausalEvidenceRecord) -> CausalClaimRecord {
-    let coverage = record.rivals.derived_coverage();
+    let rival_coverage = record.rivals.derived_coverage();
+    let evidence_coverage = record.derived_evidence_coverage();
+    let coverage = lower_coverage(evidence_coverage, rival_coverage);
     let effective = derive_causal_state(record);
     let reduction_reason = match blocking_causal_leg(record) {
         Some(gap) => format!(
-            "declared {} stays unknown under owner records: {gap}; rival coverage is {}",
+            "declared {} stays unknown under owner records: {gap}; evidence coverage is {} and rival coverage is {}",
             record.declared_state.as_str(),
-            coverage_spelling(coverage)
+            coverage_spelling(evidence_coverage),
+            coverage_spelling(rival_coverage)
         ),
         None if effective == record.declared_state => format!(
-            "declared {} retained under owner mechanism claim {}@{} with complete rival coverage",
+            "declared {} retained under owner mechanism claim {}@{} with complete evidence and rival coverage",
             record.declared_state.as_str(),
             record.mechanism.claim_id,
             record.mechanism.source_revision
@@ -4436,6 +4648,8 @@ fn owner_causal_record(record: &CausalEvidenceRecord) -> CausalClaimRecord {
         supplement_version: SupplementVersion::OwnerRecordV2,
         reduction_reason,
         coverage,
+        evidence_coverage,
+        rival_coverage,
         mechanism_claim_id: Some(record.mechanism.claim_id.clone()),
     }
 }
@@ -5086,15 +5300,18 @@ fn owner_record_digest_parts(records: &OwnerRecords) -> Vec<String> {
 /// Builds the digest parts committing one owner-issued causal evidence record.
 fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
     let mut parts: Vec<String> = vec![format!(
-        "causal_evidence:{}:{}:{}:{}:{}:{}:{}:{}",
+        "causal_evidence:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         record.source_handle,
         record.declared_state.as_str(),
         record.mechanism.claim_id,
         record.mechanism.source_revision,
         record.mechanism.claim_digest,
         record.falsifier.observed.as_str(),
+        record.falsifier.evidence_id,
         record.control.control_id,
-        record.control.evaluator_result.as_str()
+        record.control.owner,
+        record.control.evaluator_result.as_str(),
+        record.control.evidence_id
     )];
     // `map_or` cannot unify an `&str` default with a `String` closure result,
     // and the two branches are genuinely different types, so this is an
@@ -5111,8 +5328,18 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         parts.push(format!("rival_omitted:{}:{handle}", record.source_handle));
     }
     for evidence in &record.evidence {
+        // The envelope's own coverage and provenance are bound here because
+        // admission and qualification now both read them: a preimage that
+        // omitted them would keep one candidate identity across a changed
+        // coverage ceiling or a changed capture revision.
+        let revision = evidence
+            .envelope
+            .provenance
+            .revision
+            .as_deref()
+            .unwrap_or("absent");
         parts.push(format!(
-            "causal_evidence_envelope:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}",
+            "causal_evidence_envelope:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{}:{revision}",
             record.source_handle,
             evidence.evidence_id,
             evidence.owner,
@@ -5121,7 +5348,9 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
             evidence.envelope.status,
             evidence.envelope.authority,
             evidence.envelope.freshness,
-            evidence.envelope.assertability
+            evidence.envelope.assertability,
+            evidence.envelope.coverage,
+            evidence.envelope.provenance.scope,
         ));
     }
     // The derived assessment is committed as well as the inputs it is derived
@@ -5129,15 +5358,19 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
     // produce does not bind the mapping, so a changed derived state or derived
     // coverage would otherwise keep one candidate identity. The published
     // record's own fields are read here rather than re-derived, so this part
-    // cannot disagree with the `CausalClaimRecord` the analysis emits. #2870's
+    // cannot disagree with the `CausalClaimRecord` the analysis emits. The two
+    // coverage cells are committed separately because they are separate
+    // denominators, and the weaker combined one is committed with them. #2870's
     // versioned candidate preimage is the consumer that depends on this
     // binding; it still has to read the published surfaces itself.
     let derived = owner_causal_record(record);
     parts.push(format!(
-        "causal_derived:{}:{}:{}",
+        "causal_derived:{}:{}:{}:{}:{}",
         derived.source_handle,
         derived.effective_state.as_str(),
-        coverage_spelling(derived.coverage)
+        coverage_spelling(derived.coverage),
+        coverage_spelling(derived.evidence_coverage),
+        coverage_spelling(derived.rival_coverage)
     ));
     parts
 }
