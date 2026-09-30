@@ -7082,7 +7082,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .owners
             .authority
             .snapshot()
-            .map_err(SourceArtifactAdmissionError::from)?;
+            .map_err(|error| SourceArtifactAdmissionError::OwnerComposition(Box::new(error)))?;
         if authority_snapshot.state_fence != state_fence {
             return Err(SourceArtifactAdmissionError::Owner(
                 "source-effect AuthorityOwner is stale against the current Governor fence"
