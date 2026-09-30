@@ -7,12 +7,10 @@ use crate::{
     OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
     OpenCodeObservationConversionError, OpenCodeWireRouteReceipt, PhysicalObservationBody,
     ProviderAssistantMessageObservation, ProviderCatalog, ProviderOutputObservation,
-    QuotaAvailability, ReadOnlyRunRequest,
-    RunRequestError, RunStatus,
-    SealedRouteDisposition, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
-    SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields, UsageAvailability,
-    UsageTelemetry, bound_session_identity,
-    committed_message_id, wire_receipt_evidence, wire_route_locator,
+    QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus, SealedRouteDisposition,
+    Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection, SseDecodeError,
+    SseDecoder, SseEvent, SseLimits, UnknownFields, UsageAvailability, UsageTelemetry,
+    bound_session_identity, committed_message_id, wire_receipt_evidence, wire_route_locator,
 };
 use eliot_agent_api::{
     AgentResult, EffectCeiling, EventCursor, ExecutionOutcome, ResultDisposition,
@@ -581,19 +579,14 @@ fn provider_output_observation_from_messages(
     session_id: &str,
     user_message_id: &str,
     requested: &ModelSelection,
-) -> (
-    BTreeSet<String>,
-    bool,
-    Option<ProviderOutputObservation>,
-) {
+) -> (BTreeSet<String>, bool, Option<ProviderOutputObservation>) {
     let mut assistant_ids = BTreeSet::new();
     let mut unidentified_assistant = false;
     let mut observation = None;
     for message in messages.iter().filter(|message| {
         message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
             && message.pointer("/info/sessionID").and_then(Value::as_str) == Some(session_id)
-            && message.pointer("/info/parentID").and_then(Value::as_str)
-                == Some(user_message_id)
+            && message.pointer("/info/parentID").and_then(Value::as_str) == Some(user_message_id)
     }) {
         if let Some(message_id) = message.pointer("/info/id").and_then(Value::as_str) {
             assistant_ids.insert(message_id.to_owned());
@@ -648,16 +641,16 @@ fn provider_output_observation_from_events(
                     assistant_ids.insert(assistant_id.to_owned());
                 }
                 let observed_model = attest_message_route(info, requested).ok();
-                let usage = info
-                    .get("tokens")
-                    .and_then(Value::as_object)
-                    .map(|tokens| UsageTelemetry {
-                        input_tokens: tokens.get("input").and_then(Value::as_u64),
-                        output_tokens: tokens.get("output").and_then(Value::as_u64),
-                        total_tokens: tokens.get("total").and_then(Value::as_u64),
-                        cost_usd: info.get("cost").and_then(Value::as_f64),
-                        extra: UnknownFields::new(),
-                    });
+                let usage =
+                    info.get("tokens")
+                        .and_then(Value::as_object)
+                        .map(|tokens| UsageTelemetry {
+                            input_tokens: tokens.get("input").and_then(Value::as_u64),
+                            output_tokens: tokens.get("output").and_then(Value::as_u64),
+                            total_tokens: tokens.get("total").and_then(Value::as_u64),
+                            cost_usd: info.get("cost").and_then(Value::as_f64),
+                            extra: UnknownFields::new(),
+                        });
                 assistant_messages.push(ProviderAssistantMessageObservation {
                     message_id,
                     observed_model,
@@ -1241,13 +1234,13 @@ impl OpenCodeClient {
                         Some(deadline),
                     )
                     .await
-                .map_err(|error| {
-                    AdmittedAttemptError::Run(retain_observed_output_failure(
-                        map_admitted_post_claim_error(error),
-                        observation.clone(),
-                        "a committed terminal assistant message was already observed",
-                    ))
-                })?;
+                    .map_err(|error| {
+                        AdmittedAttemptError::Run(retain_observed_output_failure(
+                            map_admitted_post_claim_error(error),
+                            observation.clone(),
+                            "a committed terminal assistant message was already observed",
+                        ))
+                    })?;
                 let (projection, statuses) = reconciled;
                 (
                     self.success_result(request, &prepared, projection, Vec::new()),
@@ -1266,13 +1259,13 @@ impl OpenCodeClient {
                         Some(deadline),
                     )
                     .await
-                .map_err(|error| {
-                    AdmittedAttemptError::Run(retain_observed_output_failure(
-                        map_admitted_post_claim_error(error),
-                        observation.clone(),
-                        "an assistant payload was already observed on the committed slot",
-                    ))
-                })?;
+                    .map_err(|error| {
+                        AdmittedAttemptError::Run(retain_observed_output_failure(
+                            map_admitted_post_claim_error(error),
+                            observation.clone(),
+                            "an assistant payload was already observed on the committed slot",
+                        ))
+                    })?;
                 let (projection, statuses) = reconciled;
                 (
                     self.success_result(request, &prepared, projection, Vec::new()),
@@ -1879,18 +1872,15 @@ impl OpenCodeClient {
             self.wait_until_idle(session_id),
         )
         .await?;
-        let messages = run_with_optional_deadline(
-            admitted_deadline,
-            "message reconciliation",
-            async {
+        let messages =
+            run_with_optional_deadline(admitted_deadline, "message reconciliation", async {
                 timeout(RECONCILIATION_CALL_TIMEOUT, self.messages(session_id))
                     .await
                     .map_err(|_| OpenCodeRunError::Timeout {
                         phase: "message reconciliation",
                     })?
-            },
-        )
-        .await?;
+            })
+            .await?;
         let (assistant_ids, unidentified_assistant, mut observed) = messages
             .as_array()
             .map(|messages| {
@@ -1933,17 +1923,13 @@ impl OpenCodeClient {
             )
         })?;
         let observation = provider_output_observation_from_projection(&projection);
-        let diff = run_with_optional_deadline(
-            admitted_deadline,
-            "diff reconciliation",
-            async {
-                timeout(RECONCILIATION_CALL_TIMEOUT, self.diff(session_id))
-                    .await
-                    .map_err(|_| OpenCodeRunError::Timeout {
-                        phase: "diff reconciliation",
-                    })?
-            },
-        )
+        let diff = run_with_optional_deadline(admitted_deadline, "diff reconciliation", async {
+            timeout(RECONCILIATION_CALL_TIMEOUT, self.diff(session_id))
+                .await
+                .map_err(|_| OpenCodeRunError::Timeout {
+                    phase: "diff reconciliation",
+                })?
+        })
         .await;
         let diff = match diff {
             Ok(diff) => diff,
@@ -3266,73 +3252,75 @@ fn inspect_messages(
         })?;
     let observation = provider_output_observation_from_message(assistant, requested);
     let projection = (|| {
-    let info = assistant
-        .get("info")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            OpenCodeRunError::Protocol("assistant message info is not an object".to_owned())
-        })?;
-    if info.get("error").is_some_and(|error| !error.is_null()) {
-        return Err(provider_error(info.get("error"), "MessageError"));
-    }
-    if info
-        .get("time")
-        .and_then(Value::as_object)
-        .and_then(|time| time.get("completed"))
-        .and_then(Value::as_u64)
-        .is_none()
-    {
-        return Err(OpenCodeRunError::Protocol(
-            "assistant message has no completion timestamp".to_owned(),
-        ));
-    }
-    let completed_at_ms = info
-        .get("time")
-        .and_then(Value::as_object)
-        .and_then(|time| time.get("completed"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            OpenCodeRunError::Protocol("assistant message has no completion timestamp".to_owned())
-        })?;
-    let observed_model = attest_message_route(info, requested)?;
-    let message_id = required_string(info.get("id"), "assistant message identity")?;
+        let info = assistant
+            .get("info")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                OpenCodeRunError::Protocol("assistant message info is not an object".to_owned())
+            })?;
+        if info.get("error").is_some_and(|error| !error.is_null()) {
+            return Err(provider_error(info.get("error"), "MessageError"));
+        }
+        if info
+            .get("time")
+            .and_then(Value::as_object)
+            .and_then(|time| time.get("completed"))
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            return Err(OpenCodeRunError::Protocol(
+                "assistant message has no completion timestamp".to_owned(),
+            ));
+        }
+        let completed_at_ms = info
+            .get("time")
+            .and_then(Value::as_object)
+            .and_then(|time| time.get("completed"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OpenCodeRunError::Protocol(
+                    "assistant message has no completion timestamp".to_owned(),
+                )
+            })?;
+        let observed_model = attest_message_route(info, requested)?;
+        let message_id = required_string(info.get("id"), "assistant message identity")?;
 
-    let parts = assistant
-        .get("parts")
-        .and_then(Value::as_array)
-        .ok_or_else(|| OpenCodeRunError::Protocol("assistant parts are missing".to_owned()))?;
-    let terminal_stop = parts.iter().any(|part| {
-        part.get("type").and_then(Value::as_str) == Some("step-finish")
-            && part.get("reason").and_then(Value::as_str) == Some("stop")
-    }) || info.get("finish").and_then(Value::as_str) == Some("stop");
-    if !terminal_stop {
-        return Err(OpenCodeRunError::Protocol(
-            "assistant message has no terminal stop attestation".to_owned(),
-        ));
-    }
-    let tokens = info.get("tokens").and_then(Value::as_object);
-    let usage = tokens.map(|tokens| UsageTelemetry {
-        input_tokens: tokens.get("input").and_then(Value::as_u64),
-        output_tokens: tokens.get("output").and_then(Value::as_u64),
-        total_tokens: tokens.get("total").and_then(Value::as_u64),
-        cost_usd: info.get("cost").and_then(Value::as_f64),
-        extra: UnknownFields::new(),
-    });
-    let (output, raw_output) = parse_text_json_output(
-        parts,
-        expected_output_schema,
-        &message_id,
-        &observed_model,
-        usage.as_ref(),
-    )?;
-    Ok(MessageProjection {
-        message_id,
-        observed_model,
-        output,
-        raw_output,
-        usage,
-        completed_at_ms,
-    })
+        let parts = assistant
+            .get("parts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| OpenCodeRunError::Protocol("assistant parts are missing".to_owned()))?;
+        let terminal_stop = parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("step-finish")
+                && part.get("reason").and_then(Value::as_str) == Some("stop")
+        }) || info.get("finish").and_then(Value::as_str) == Some("stop");
+        if !terminal_stop {
+            return Err(OpenCodeRunError::Protocol(
+                "assistant message has no terminal stop attestation".to_owned(),
+            ));
+        }
+        let tokens = info.get("tokens").and_then(Value::as_object);
+        let usage = tokens.map(|tokens| UsageTelemetry {
+            input_tokens: tokens.get("input").and_then(Value::as_u64),
+            output_tokens: tokens.get("output").and_then(Value::as_u64),
+            total_tokens: tokens.get("total").and_then(Value::as_u64),
+            cost_usd: info.get("cost").and_then(Value::as_f64),
+            extra: UnknownFields::new(),
+        });
+        let (output, raw_output) = parse_text_json_output(
+            parts,
+            expected_output_schema,
+            &message_id,
+            &observed_model,
+            usage.as_ref(),
+        )?;
+        Ok(MessageProjection {
+            message_id,
+            observed_model,
+            output,
+            raw_output,
+            usage,
+            completed_at_ms,
+        })
     })();
     projection.map_err(|error| {
         retain_observed_output_failure(

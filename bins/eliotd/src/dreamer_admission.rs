@@ -21,8 +21,7 @@
 use std::sync::Arc;
 
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-    canonical_json_bytes,
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes,
 };
 use eliot_dreamer_contracts::job::dream_job_input_contract_identity;
 use eliot_dreamer_contracts::{ContractViolation, DreamJobInput, JobClass};
@@ -110,7 +109,13 @@ impl OrientationSemanticInputPublication {
         if job.state_fence != response.scope.state_fence
             || job.state_fence != response.request_identity.operation.state_fence
             || job.state_fence != response.request_identity.request.request.state_fence
-            || job.state_fence != response.request_identity.request.request.metadata.state_fence
+            || job.state_fence
+                != response
+                    .request_identity
+                    .request
+                    .request
+                    .metadata
+                    .state_fence
         {
             return Err(OrientationSemanticInputError::FenceMismatch);
         }
@@ -178,7 +183,13 @@ impl OrientationSemanticInputPublication {
         if job.state_fence != submission.work_scope.state_fence
             || job.state_fence != request.request_identity.operation.state_fence
             || job.state_fence != request.request_identity.request.request.state_fence
-            || job.state_fence != request.request_identity.request.request.metadata.state_fence
+            || job.state_fence
+                != request
+                    .request_identity
+                    .request
+                    .request
+                    .metadata
+                    .state_fence
         {
             return Err(OrientationSemanticInputError::FenceMismatch);
         }
@@ -548,9 +559,11 @@ pub(crate) async fn submit_admitted_orientation_typed<'a>(
             .await
             .map_err(|error| OrientationSubmitError::Composition(materials_error(&error)))?;
     }
-    if input.materials.iter().any(|claim| {
-        claim.source_handle == input.semantic_input_claim.source_claim.source_handle
-    }) {
+    if input
+        .materials
+        .iter()
+        .any(|claim| claim.source_handle == input.semantic_input_claim.source_claim.source_handle)
+    {
         return Err(OrientationSemanticInputError::SourceClaimNotDistinct.into());
     }
     resolve_orientation_semantic_input(

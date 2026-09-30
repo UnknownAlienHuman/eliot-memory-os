@@ -6,13 +6,11 @@
 
 #![forbid(unsafe_code)]
 
-mod candidate_adaptation;
 mod admitted_binding;
+mod candidate_adaptation;
 pub mod lifecycle;
 
-pub use admitted_binding::{
-    AdmittedBindingError, AdmittedPositionBinding, bind_admitted_position,
-};
+pub use admitted_binding::{AdmittedBindingError, AdmittedPositionBinding, bind_admitted_position};
 pub use eliot_evidence::ObservationRecord;
 
 /// Constructs an inert observed/withheld proposal using the private resolver.

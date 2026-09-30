@@ -9,7 +9,7 @@ use eliot_epistemic_contracts::{
     EpistemicPositionCandidate, PositionAssertability, SupportResult,
 };
 use eliot_evidence::{
-    EvidenceAuthority, EvidenceFreshness, EpistemicStatus, LifecycleState, ObservationRecord,
+    EpistemicStatus, EvidenceAuthority, EvidenceFreshness, LifecycleState, ObservationRecord,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -208,8 +208,7 @@ pub fn bind_admitted_position<'a>(
         || support.temporal.is_some()
         || candidate.authority != observation.evidence.authority
         || !candidate.grade.is_unknown()
-        || candidate.proposed_assertability
-            != PositionAssertability::UnknownWithheldQuarantined
+        || candidate.proposed_assertability != PositionAssertability::UnknownWithheldQuarantined
         || candidate.unknowns != BTreeSet::from(["proposition-unverified".to_owned()])
         || candidate.verifier.is_some()
         || !candidate.rivals.is_empty()

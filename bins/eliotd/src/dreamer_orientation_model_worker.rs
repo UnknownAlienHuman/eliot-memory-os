@@ -12,8 +12,7 @@ use eliot_agent_opencode::{
 };
 use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::{
-    ContractViolation, DreamInputBundle, DreamJobAdmission, DreamJobInput,
-    ModelRouteRequestError,
+    ContractViolation, DreamInputBundle, DreamJobAdmission, DreamJobInput, ModelRouteRequestError,
 };
 use eliot_protocol::dreamer_job::{DurableJobError, OpaqueContentRef};
 use serde_json::Value;

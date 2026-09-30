@@ -325,7 +325,8 @@ impl PulseStageId {
 }
 
 /// Canonical identity of the mandatory ten-member denominator.
-pub(crate) const PULSE_DENOMINATOR_IDENTITY: &str = "orientation-pulse-denominator:v1:classification,cue_activation,epistemic_position,understanding,grounding,rivals,conflict,probes,candidates,packet";
+pub(crate) const PULSE_DENOMINATOR_IDENTITY: &str =
+    eliot_dreamer_orientation::projection::ORIENTATION_PRODUCT_DENOMINATOR;
 
 /// Explicit composition denominator: the canonical member set this crate
 /// composes against. Whether CC-002/CC-004 are mandatory is no longer a flag

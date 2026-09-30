@@ -772,8 +772,13 @@ fn validate_identity_closure(
     if inputs.projections.binding.scope_id.as_str() != inputs.scope_id {
         return Err("projection scope binding");
     }
-    if let Some(operation) = &inputs.projections.binding.operation_id
-        && operation.as_str() != inputs.operation_id
+    if inputs
+        .projections
+        .binding
+        .operation_id
+        .as_ref()
+        .map(eliot_contracts::OperationId::as_str)
+        != Some(inputs.operation_id.as_str())
     {
         return Err("projection operation binding");
     }
@@ -871,6 +876,10 @@ fn pulse_error_terminal(error: &PulseError) -> (OrientationDisposition, &'static
         PulseError::Epistemic => (
             OrientationDisposition::Blocked,
             PulseStageId::EpistemicPosition.refusal_reason(),
+        ),
+        PulseError::EpistemicBinding => (
+            OrientationDisposition::Blocked,
+            "original admitted epistemic position binding refused",
         ),
         PulseError::Understanding => (
             OrientationDisposition::Blocked,

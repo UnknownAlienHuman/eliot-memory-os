@@ -23,12 +23,11 @@ use eliot_epistemic_contracts::EpistemicPositionCandidate;
 use serde::Serialize;
 
 use crate::pulse::{
-    CandidateStage, ClassificationStage, ConflictStage, CueActivationStage, PulseError,
-    EpistemicStage, PulseStage, PulseStageId, RivalStage, StageOwnerOutput, UnderstandingStage,
-    check_model_boundary, check_projection_boundary,
-    run_candidate_stage, run_classification_stage, run_conflict_stage, run_cue_stage,
-    run_epistemic_stage, run_grounding_stage, run_probe_stage, run_rival_stage,
-    run_understanding_stage,
+    CandidateStage, ClassificationStage, ConflictStage, CueActivationStage, EpistemicStage,
+    PulseError, PulseStage, PulseStageId, RivalStage, StageOwnerOutput, UnderstandingStage,
+    check_model_boundary, check_projection_boundary, run_candidate_stage, run_classification_stage,
+    run_conflict_stage, run_cue_stage, run_epistemic_stage, run_grounding_stage, run_probe_stage,
+    run_rival_stage, run_understanding_stage,
 };
 
 pub(crate) type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;

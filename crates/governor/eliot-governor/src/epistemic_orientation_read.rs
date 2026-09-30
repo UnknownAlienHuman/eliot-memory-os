@@ -5,7 +5,9 @@ use eliot_epistemic_contracts::{
     CurrentEpistemicPosition, Currentness, EpistemicPositionCandidate,
 };
 use eliot_evidence::ObservationRecord;
-use eliot_store_api::{WriteReceipt, WriteReceiptStatus, epistemic_revision::EpistemicPositionReadback};
+use eliot_store_api::{
+    WriteReceipt, WriteReceiptStatus, epistemic_revision::EpistemicPositionReadback,
+};
 
 /// Original values retained together after Governor validates an observed
 /// proposal against its committed store readback.

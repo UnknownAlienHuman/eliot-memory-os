@@ -85,6 +85,7 @@ use crate::admitted_material::{
 use crate::controller::verify_admitted_binding;
 use crate::curation_pulse::compose_curation_pulse;
 use crate::curation_screen_stage::{CurationProtection, CurationProtectionSet, ProtectionClass};
+#[cfg(test)]
 use crate::production_orientation::OrientationSupply;
 use crate::{
     CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,

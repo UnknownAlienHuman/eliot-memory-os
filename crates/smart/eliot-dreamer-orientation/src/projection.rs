@@ -21,6 +21,20 @@ use crate::input::{
 use crate::policy::OrientationPolicy;
 
 const ORIENTATION_PACKET_SCHEMA_VERSION: u32 = 2;
+/// Independent denominator shared by the product ledger and packet provenance.
+pub const ORIENTATION_PRODUCT_DENOMINATOR: &str = "orientation-pulse-denominator:v1:classification,cue_activation,epistemic_position,understanding,grounding,rivals,conflict,probes,candidates,packet";
+
+const EXPECTED_OWNER_STAGES: [&str; 9] = [
+    "classification",
+    "cue_activation",
+    "epistemic_position",
+    "understanding",
+    "grounding",
+    "rivals",
+    "conflict",
+    "probes",
+    "candidates",
+];
 
 fn deserialize_orientation_packet_schema<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
@@ -166,6 +180,8 @@ pub struct OrientationSemanticView<'a> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationOwnerClosure {
+    /// Independent product denominator, including this packet projection.
+    pub denominator: String,
     pub model_request: eliot_dreamer_contracts::ModelRouteRequest,
     pub model_outcome: eliot_dreamer_contracts::ModelRouteOutcome,
     pub projections: CanonicalProjectionSet,
@@ -266,6 +282,12 @@ impl OrientationPacketCandidate {
             || self.input_digest.len() != 64
         {
             return Err(OrientationError::Invalid("packet identity"));
+        }
+        if let Some(closure) = &self.owner_closure {
+            if closure.denominator != ORIENTATION_PRODUCT_DENOMINATOR {
+                return Err(OrientationError::Binding("product denominator"));
+            }
+            validate_native_outputs(&closure.stage_outputs)?;
         }
         if self
             .sections
@@ -413,6 +435,7 @@ pub fn build_projection_with_owners(
     packet.input_digest = sha256_hex(
         &canonical_json_bytes(&(
             &packet.input_digest,
+            ORIENTATION_PRODUCT_DENOMINATOR,
             owners.model_request,
             owners.model_outcome,
             owners.projections,
@@ -429,6 +452,7 @@ pub fn build_projection_with_owners(
         .extend_from_slice(owners.semantics.gaps);
     packet.recommended_probes_or_next_actions = owners.semantics.probes.to_vec();
     packet.owner_closure = Some(OrientationOwnerClosure {
+        denominator: ORIENTATION_PRODUCT_DENOMINATOR.to_owned(),
         model_request: owners.model_request.clone(),
         model_outcome: owners.model_outcome.clone(),
         projections: owners.projections.clone(),
@@ -463,17 +487,6 @@ fn validate_owner_projection(
     policy: &OrientationPolicy,
     owners: &OrientationOwnerProjection<'_>,
 ) -> Result<(), OrientationError> {
-    const EXPECTED_STAGES: [&str; 9] = [
-        "classification",
-        "cue_activation",
-        "epistemic_position",
-        "understanding",
-        "grounding",
-        "rivals",
-        "conflict",
-        "probes",
-        "candidates",
-    ];
     owners
         .model_request
         .validate_binds_bundle(bundle)
@@ -483,10 +496,10 @@ fn validate_owner_projection(
         .validate_binding(owners.model_request)
         .map_err(|_| OrientationError::Binding("model owner outcome"))?;
     if owners.model_outcome.draft.as_ref() != Some(&candidate.model)
-        || owners.model_outcome.receipt.model_calls > candidate.usage.model_calls
-        || owners.model_outcome.receipt.wall_ms > candidate.usage.wall_ms
-        || owners.model_outcome.receipt.input_bytes > candidate.usage.input_bytes
-        || owners.model_outcome.receipt.output_bytes > candidate.usage.output_bytes
+        || owners.model_outcome.receipt.model_calls != candidate.usage.model_calls
+        || owners.model_outcome.receipt.wall_ms != candidate.usage.wall_ms
+        || owners.model_outcome.receipt.input_bytes != candidate.usage.input_bytes
+        || owners.model_outcome.receipt.output_bytes != candidate.usage.output_bytes
         || owners.model_request.privacy.as_str() != candidate.job.privacy_profile
     {
         return Err(OrientationError::Binding("candidate model owner content"));
@@ -507,10 +520,24 @@ fn validate_owner_projection(
     {
         return Err(OrientationError::Binding("canonical projection identity"));
     }
-    if owners.semantics.stage_outputs.len() != EXPECTED_STAGES.len() {
+    validate_native_outputs(owners.semantics.stage_outputs)?;
+    bounded_json_size(
+        &(
+            owners.model_request,
+            owners.model_outcome,
+            owners.projections,
+            &owners.semantics,
+        ),
+        policy.max_input_bytes,
+    )?;
+    Ok(())
+}
+
+fn validate_native_outputs(outputs: &[OrientationStageOutput]) -> Result<(), OrientationError> {
+    if outputs.len() != EXPECTED_OWNER_STAGES.len() {
         return Err(OrientationError::Binding("native output denominator"));
     }
-    for (output, expected) in owners.semantics.stage_outputs.iter().zip(EXPECTED_STAGES) {
+    for (output, expected) in outputs.iter().zip(EXPECTED_OWNER_STAGES) {
         if output.stage != expected
             || !eliot_dreamer_contracts::is_hex64_lower(&output.input_digest)
             || !eliot_dreamer_contracts::is_hex64_lower(&output.output_digest)
@@ -525,15 +552,6 @@ fn validate_owner_projection(
             ));
         }
     }
-    bounded_json_size(
-        &(
-            owners.model_request,
-            owners.model_outcome,
-            owners.projections,
-            &owners.semantics,
-        ),
-        policy.max_input_bytes,
-    )?;
     Ok(())
 }
 
