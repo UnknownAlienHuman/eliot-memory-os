@@ -48,12 +48,20 @@
 //! file the issue scopes to "minimal adapters to the accepted
 //! RestoreTarget/RestoreJournalPort only".
 //!
-//! [`RESTORE_JOURNAL_IDENTITY`] is load-bearing, not decorative: the Kernel
-//! coordinator refuses any production restore whose owner-issued
-//! [`RestoreJournalAdmission`] names a different journal identity, so the
-//! admission and the ORS namespace the adapter actually writes are the same
-//! owner channel. An admission is never taken as proof of durability on its
-//! own. [`PinnedDestinationAdmission`] likewise pins the rehearsal posture at
+//! [`RESTORE_JOURNAL_IDENTITY`] is load-bearing, not decorative: it is the
+//! durable restore-journal CHANNEL identity, the one fixed name every row of
+//! the ORS restore journal is filed under, and it is exactly what
+//! [`OrsRestoreJournalOwner::durable_journal_record`] reports as the
+//! admission's `journal_identity_ref` and exactly what the Kernel coordinator
+//! refuses a production restore for not naming. The admission and the ORS
+//! namespace the adapter actually writes are therefore the same owner channel.
+//! It is deliberately NOT the per-execution stream key
+//! (`sha256(plan_id, bundle_sha256)`, different for every plan/bundle pair): one
+//! field cannot carry both, so the channel is checked here against the constant
+//! and the per-execution stream is checked where it is derived, by
+//! `binds_owner_record` reading the live journal under this plan's own stream.
+//! An admission is never taken as proof of durability on its own.
+//! [`PinnedDestinationAdmission`] likewise pins the rehearsal posture at
 //! prepare, so a rehearsal cannot be re-presented as a production run and
 //! reach cutover qualification.
 //!
@@ -88,6 +96,21 @@ use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 /// Stable identity of the restore-journal stream namespace for admission
 /// bindings. Composition must place this identity in the admission it issues
 /// for the restore streams owned by the operational ORS database (#957).
+///
+/// It is also the `visibility` label every sealed restore-journal envelope this
+/// adapter writes carries, so the namespace is a durable property of the ROWS
+/// and not only a string an admission asserts about itself.
+///
+/// ## What it is not
+///
+/// It is not the per-execution stream key, which is
+/// `sha256(plan_id, bundle_sha256)` and different for every plan/bundle pair.
+/// A fixed channel name and a per-execution digest cannot occupy one field, so
+/// `journal_identity_ref` carries the CHANNEL and is compared against this
+/// constant, while the per-execution stream is proved where it is derived: by
+/// the issuer re-reading the live journal under this plan's own stream and by
+/// [`matches_stream`] comparing the persisted binding against this owner's own
+/// composition binding. Neither guarantee is traded for the other.
 pub const RESTORE_JOURNAL_IDENTITY: &str = "kernel-restore-journal-v1";
 /// Instruction taint carried on every restore-journal envelope (I5.5
 /// `instruction_taint`, I5.6 `privacy_origin_taint_metadata`).
@@ -1043,6 +1066,33 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 /// [`OrsRestoreJournal::production`] takes, and it has no constructor a
 /// request, a config value or a test fixture can reach with a value of its own.
 ///
+/// ## It also issues the stream, through the same durable owner path
+///
+/// An admission admits an EXISTING durable journal, so the row it is admitted
+/// against has to exist before admission. The only producer of that row was the
+/// engine's own genesis compare-and-swap, which runs AFTER admission: a circle
+/// in which a first run always refused and, because no first run ever succeeded,
+/// no resume could exist either. This owner therefore also answers
+/// [`RestoreJournalAdmissionOwner::issue_journal_stream`], and it establishes
+/// the stream by routing the request to the accepted
+/// [`RestoreJournalPort`] seam — the very [`OrsRestoreJournal`] built from the
+/// SAME store handle, the SAME [`OrsRestoreBinding`] and the SAME live fence
+/// this owner holds — and letting that seam's own genesis compare-and-swap call
+/// [`OrsRestoreJournal::ensure_bound`], which is the sole writer of the ORS
+/// [`RestoreJournalStreamBinding`] row.
+///
+/// Nothing here constructs that row, fabricates a durable record, defaults a
+/// missing row to an empty one, or recomputes a digest. The trait default is
+/// used unchanged and an override would be a second way to start a stream. The
+/// row written is exactly the row
+/// [`RestorePlan::execute_with_journal`](eliot_backup::RestorePlan::execute_with_journal)
+/// writes as its own first act — the same transaction, revision 0, phase
+/// `Pending`, state `Ready`, no intent, no receipt, no effect — so the engine
+/// reads that row on its way in and continues from it. A stream already holding
+/// this transaction is left exactly as it stands (the resume case, and no second
+/// bind); a stream holding another transaction is refused rather than taken
+/// over. No target effect is applied here and nothing reaches cutover.
+///
 /// ## What each admitted reference is, and where it is read
 ///
 /// Four of the six fields are read out of the ORS stream-binding row the ORS
@@ -1082,8 +1132,18 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 ///   composition fact, not a durable one: the row type has no installation
 ///   column and is not modified here.
 /// - `generation` — the live effect fence's `resource_generation`, as above.
-/// - `journal_identity_ref` — the key the durable row was read under, which is
-///   the plan-derived stream identity the issuer checks the admission against.
+/// - `journal_identity_ref` — [`RESTORE_JOURNAL_IDENTITY`], the durable ORS
+///   restore-journal CHANNEL this owner answers for. It is one fixed name for
+///   every stream behind that store, which is what makes it comparable against a
+///   Kernel-owned constant and what the coordinator's channel check in
+///   [`KernelBackupRestore::admit_restore_journal`](super::backup_restore::KernelBackupRestore::admit_restore_journal)
+///   requires. It is deliberately NOT the per-execution stream key: that key is
+///   `sha256(plan_id, bundle_sha256)`, different for every plan/bundle pair, so
+///   the two can never occupy one field. The stream this record was read under
+///   is the `journal_key` argument, and it is proved exactly by that read plus
+///   [`matches_stream`], which compares the persisted binding's source archive,
+///   class, destination, writer identity and writer fence digest against this
+///   owner's own binding — not by this field.
 /// - `admission_receipt_ref` — the transaction identity the ORS owner committed
 ///   for this stream when it admitted the stream. It is read back from the
 ///   durable row on every issue and never recomputed.
@@ -1160,6 +1220,8 @@ impl OrsRestoreJournalOwner {
 }
 
 impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
+    /// Reads the owner's durable record. It answers for the stream it was asked
+    /// about and refuses an unbound one, which is unchanged.
     fn durable_journal_record(
         &self,
         journal_key: &str,
@@ -1225,8 +1287,11 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
 ///
 /// - [`JournalStreamVerdict::Unbound`] — no binding is persisted for this
 ///   stream. The ORS owner reports a missing binding as a refusal, so this is
-///   an observation the adapter made directly, and it is what lets the engine's
-///   genesis compare-and-swap bind the stream.
+///   an observation the adapter made directly, and it is what lets the genesis
+///   compare-and-swap bind the stream — whether that compare-and-swap is the
+///   engine's own first act or the one
+///   [`RestoreJournalAdmissionOwner::issue_journal_stream`] performs to
+///   establish the stream before admitting the operation.
 /// - [`JournalStreamVerdict::KnownEmpty`] — the stream IS bound and the owner
 ///   proved an exact new journal: zero members, no retained row, no retired
 ///   phase slot and no prune fence. Zero entries is known-empty only here. Every
@@ -1409,7 +1474,7 @@ impl OrsRestoreJournal {
     ///
     /// An **unbound** stream is an exact new stream: the ORS owner reports a
     /// missing binding as absent, not as corruption, so it reads as no journal
-    /// at all and the engine's genesis compare-and-swap can bind it. Reading it
+    /// at all and the genesis compare-and-swap can bind it. Reading it
     /// as an error would strand every fresh transaction before its first append.
     ///
     /// A **bound** stream is only ever reported through the owner's
@@ -1445,7 +1510,7 @@ impl OrsRestoreJournal {
             .map_err(ors_to_backup)?;
         // An unbound stream is an exact new stream: the ORS owner reports a
         // missing binding as absent, not as corruption, so it reads as no
-        // journal and the engine's genesis compare-and-swap can bind it.
+        // journal and the genesis compare-and-swap can bind it.
         let Some(existing) = persisted else {
             return Ok(JournalStreamVerdict::Unbound);
         };
