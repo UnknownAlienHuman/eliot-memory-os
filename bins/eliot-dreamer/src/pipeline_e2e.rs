@@ -306,7 +306,13 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
 fn submit_chain_returns_orientation_packet_with_jsonl() {
     let admission = admitted_admission("job-e2e-chain-orientation");
     let job = job_with_handles("job-e2e-chain-orientation", JobClass::Orientation);
-    let result = run_admitted_pipeline(&admission, &job, None);
+    // No `OrientationSupply`: that channel is the whole Governor-published owner
+    // record set (projection set, classification, cue, epistemic, understanding,
+    // rival, conflict, probe, and candidate stages) and none of it is derivable
+    // from an admitted job, so this fixture has none to give — the same `None`
+    // production passes when no Governor source is attached. This is the honest
+    // absence, not a stand-in: the carrier is read only on the Orientation arm.
+    let result = run_admitted_pipeline(&admission, &job, None, None);
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("submit chain must project orientation, got {result:?}");
     };
@@ -351,7 +357,10 @@ fn submit_chain_threads_screen_binding_to_a31_boundary() {
         .expect("threaded binding must satisfy the real owner check");
     // The whole chain then refuses at the carrier check with the exact
     // reason — never a class refusal, never silent, never the Kernel code.
-    let refused = run_admitted_pipeline(&admission, &job, None);
+    // No `OrientationSupply`: the Curation arm returns from its own carrier check
+    // before the Orientation carrier is ever read, so this `None` cannot weaken
+    // the refusal this test asserts.
+    let refused = run_admitted_pipeline(&admission, &job, None, None);
     assert!(
         !matches!(refused, Err(DreamerError::UnsupportedJobClass(_))),
         "chain must never refuse curation by class, got {refused:?}"
@@ -398,7 +407,10 @@ fn submit_chain_curation_success_with_injected_carrier() {
         .expect("threaded binding must satisfy the real owner check");
     let harness =
         CurationTestHarness::for_screen(&binding, &admission, &job).expect("harness must build");
-    let result = run_admitted_pipeline(&admission, &job, Some(harness.carrier()));
+    // No `OrientationSupply`: the Curation arm returns from the A-31 fan-in
+    // before the Orientation carrier is read, so the A-31 route and pulse
+    // assertions below are unaffected by its absence.
+    let result = run_admitted_pipeline(&admission, &job, Some(harness.carrier()), None);
     let Ok(DreamResult::Curation {
         job_id,
         candidates,
@@ -482,8 +494,10 @@ fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
     let admission = admitted_admission("job-e2e-chain-curation-early");
     let job = job_with_handles("job-e2e-chain-curation-early", JobClass::Curation);
     // Chain level: the screen admits, then the carrier check refuses before
-    // any generic model/grounding work could run.
-    let refused = run_admitted_pipeline(&admission, &job, None);
+    // any generic model/grounding work could run. No `OrientationSupply`: the
+    // Curation arm returns from that carrier check before the Orientation
+    // carrier is read, so its absence cannot move this refusal.
+    let refused = run_admitted_pipeline(&admission, &job, None, None);
     let Err(error) = refused else {
         panic!("carrier-less curation must refuse at the carrier check");
     };

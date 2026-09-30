@@ -137,10 +137,40 @@ mod slice_8_result_tests {
     }
 
     fn curation(job_id: &str) -> DreamResult {
+        // This fixture proves the Slice-8 result-projection and JSONL boundary:
+        // it builds a `DreamResult::Curation` directly and never runs a real
+        // admitted A-20 screen or A-31 route (see `curation_pulse::fixture_pulse`,
+        // whose every protection decision is honestly `Unknown`). So the four I9.6
+        // evidence fields state that this fixture carries no owner record, rather
+        // than inventing digests, protection findings, or a routing hint the run
+        // never produced — a fabricated counterevidence or preservation report
+        // would read as real evidence in the rendered receipt while proving
+        // nothing. In production these are derived in `dispatch_stage::
+        // map_curation_set` from the pulse's finding and the A-31 member.
         let candidates = vec![CurationCandidate {
             candidate_id: format!("{job_id}-candidate-1"),
             kind: "review_required".to_owned(),
             source_handles: vec!["evidence-1".to_owned()],
+            support: "fixture: no A-20 screen result or A-31 dispatch digest exists \
+                      for this shape-only fixture; source handle evidence-1 is the \
+                      only provenance, and it is not a usage or popularity measure"
+                .to_owned(),
+            counterevidence: "fixture: no A-31 routing ran, so there is no owner \
+                              protection finding and no routing rejection hint to \
+                              report; the accompanying fixture pulse marks every \
+                              screened member Unknown"
+                .to_owned(),
+            scope_and_applicability: "fixture: applies to the scope-slice-8 \
+                                       projection fixture bounded by the receipt \
+                                       state_fence; proposed mutable target \
+                                       evidence-1; immutable evidence reference \
+                                       evidence-1"
+                .to_owned(),
+            preservation_report: "fixture: no source mutation was performed and no \
+                                  owner protection assessment exists for this \
+                                  shape-only fixture; the candidate is preserved \
+                                  verbatim for the receipt round-trip"
+                .to_owned(),
             proposed_transformation: "Inspect provenance; do not alter the source.".to_owned(),
             uncertainty: "No semantic promotion from a handle-only bundle.".to_owned(),
             rollback: "Discard the candidate.".to_owned(),
