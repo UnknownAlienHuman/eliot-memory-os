@@ -124,15 +124,27 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     // touching the pipe again, and the client holds no credential, endpoint or
     // nonce that could bypass it.
     private int _bindingLost;
-    // The broker-ADMITTED Human binding the live connection was redeemed for,
-    // held in process memory only and bound to that connection's lifecycle.
+    // The redeemed User Broker CONNECTION and the broker-ADMITTED Human binding
+    // it carries, held together in one owner so the two can never be
+    // separated: the transport the authority was admitted on is the only
+    // transport that authority is valid for.
+    //
     // It is set exactly once per establishment, from the redemption the broker
-    // vouched for, and it dies with the connection: every abort, every proven
-    // binding loss and every new establishment clears it first, so a stale
-    // token, a rotated registration or a restarted process can never revive
-    // it. It is never written to an envelope, a file, a log or a banner;
-    // state-changing sends gate on it, and only on it, before any byte.
-    private BrokerPipeClient.RedeemedOperatorBinding? _retainedBinding;
+    // vouched for, and it dies with the connection it was admitted under:
+    // every abort, every proven binding loss, every new establishment and
+    // client disposal release it, so a stale token, a rotated registration, a
+    // restarted process or a second redemption can never inherit it. It is
+    // never written to an envelope, a file, a log or a banner; state-changing
+    // sends gate on it, and only on it, before any byte.
+    private BrokerPipeClient.RedeemedOperatorConnection? _retainedConnection;
+
+    /// Releases the retained broker connection and the admitted authority it
+    /// carries, exactly once, on whichever session-ending site gets here
+    /// first. Both die together: the binding was admitted on that pipe, so
+    /// keeping either after the pipe closes would leave authority nothing can
+    /// present, and keeping the pipe would leak a handle per redemption.
+    private void ReleaseRetainedConnection() =>
+        Interlocked.Exchange(ref _retainedConnection, null)?.Dispose();
 
     /// Refuses new work once the session binding is proven lost. A fresh
     /// broker handoff arrives only with a fresh process, never in-process.
@@ -166,7 +178,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// the broker's own equality check.
     private void RequireRetainedHumanBinding(string operationId, string tool, string requiredCapability)
     {
-        var retained = _retainedBinding;
+        var retained = Volatile.Read(ref _retainedConnection)?.Binding;
         if (retained is null)
         {
             // No broker redemption completed on this connection, so the
@@ -182,7 +194,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         }
         catch (OperatorProcessIdentityException)
         {
-            _retainedBinding = null;
+            ReleaseRetainedConnection();
             throw new OperatorNotAttemptedException(
                 operationId, tool, OperatorFaultReason.ProcessIdentityUnproven, OperatorExchangeStages.Admission);
         }
@@ -193,7 +205,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             // only a fresh broker redemption under the live identity restores
             // authority. Identity comparison is ordinal and exact; the
             // invalidation names which axis diverged.
-            _retainedBinding = null;
+            ReleaseRetainedConnection();
             throw new OperatorHandoffRefusedException(
                 retained.ClientProcessId != Environment.ProcessId
                     ? OperatorHandoffInvalidation.ProcessMismatch
@@ -215,7 +227,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     private OperatorRestartRequiredException BindingLost(string reason)
     {
         Interlocked.Exchange(ref _bindingLost, 1);
-        _retainedBinding = null;
+        ReleaseRetainedConnection();
         return new OperatorRestartRequiredException(reason);
     }
 
@@ -297,30 +309,100 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// and the approval hash from whatever exact Kernel-canonicalized hash
     /// was legitimately given alongside the binding.
     ///
-    /// No such hash reaches the UI, so the request is refused here, at
-    /// admission, before any application byte: there is no Critical-action
+    /// The request travels on the connection the redemption vouched
+    /// for, so the broker admits it against the same OS-observed peer it
+    /// admitted the binding from — never against a presented tuple on a
+    /// fresh pipe. That connection is released the moment the broker
+    /// answers, because the owner serves this leg once and closes.
+    ///
+    /// No approval hash reaches the UI today, so no caller can supply one and
+    /// this method has no production caller yet: there is no Critical-action
     /// producer anywhere in the repository, the broker challenge and
     /// redemption echo carry no hash, and the Store's `canonical_request_hash`
     /// in user-automation receipts is that other operation's content hash —
     /// a shape-only correlator, not a Critical-action approval for this one.
     /// Presenting any UI-chosen 64-hex value instead would pass the broker's
     /// shape check and bind a false approval to the operation key, which the
-    /// broker then keeps against conflicting hashes; that refusal is the
-    /// correct outcome, not a failure of this path. It is reported as
-    /// `access_denied` at admission because the exact broker code has no
-    /// UI-side member and this client holds no approval to present. The send
-    /// is enabled only when a legitimate hash producer reaches the UI; the
-    /// retained-binding gate below already proves everything else the broker
-    /// will compare.
-    public Task CancelBrokerOperationAsync(
+    /// broker then keeps against conflicting hashes, so the client refuses to
+    /// mint one. This is a truthful BLOCKED-BY on the approval-hash producer,
+    /// not a defect in the transport below: the connection is held, the leg
+    /// is reachable, and every authority field except the hash is already
+    /// proved here and again by the broker.
+    public async Task<JsonElement> CancelBrokerOperationAsync(
         string operationId,
+        string approvalHash,
         CancellationToken cancellationToken = default)
     {
         OperatorIdentityFields.RequireText(operationId, "operation_id");
+        OperatorIdentityFields.RequireText(approvalHash, "approval_hash");
+        if (Volatile.Read(ref _lifecycle) != LifecycleOpen)
+        {
+            throw new OperatorNotAttemptedException(
+                operationId, BrokerCancelRoute, OperatorFaultReason.ClientClosing, OperatorExchangeStages.Admission);
+        }
         RequireLiveBinding();
-        RequireRetainedHumanBinding(operationId, BrokerCancelRoute, OperatorCapabilityNames.OperatorCommand);
-        throw new OperatorNotAttemptedException(
-            operationId, BrokerCancelRoute, OperatorFaultReason.AccessDenied, OperatorExchangeStages.Admission);
+        using var budget = new OperationBudget($"broker-cancel:{operationId}", cancellationToken, _closing.Token);
+        // One exchange at a time on this client, exactly as on the Governor
+        // pipe: the broker pipe is a single framed stream that serves this leg
+        // once, so a concurrent second write would interleave frames with the
+        // first request's answer.
+        var acquired = false;
+        try
+        {
+            await _requestGate.WaitAsync(budget.Token).ConfigureAwait(false);
+            acquired = true;
+            Interlocked.Increment(ref _gateHolders);
+        }
+        catch (OperationCanceledException)
+        {
+            throw BudgetRefusal(operationId, BrokerCancelRoute, budget, OperatorExchangeStages.Queue);
+        }
+        catch (ObjectDisposedException)
+        {
+            throw new OperatorNotAttemptedException(
+                operationId, BrokerCancelRoute, OperatorFaultReason.ClientClosing, OperatorExchangeStages.Queue);
+        }
+
+        try
+        {
+            // Re-read the gate under the gate: it discards the retained
+            // connection on an identity mismatch, and this must never write
+            // to a pipe the gate has just invalidated.
+            RequireRetainedHumanBinding(operationId, BrokerCancelRoute, OperatorCapabilityNames.OperatorCommand);
+            var connection = Volatile.Read(ref _retainedConnection)
+                ?? throw new OperatorNotAttemptedException(
+                    operationId, BrokerCancelRoute, OperatorFaultReason.HandshakeRefused, OperatorExchangeStages.Admission);
+            try
+            {
+                // The connection releases itself once it has been spent, on
+                // every outcome, because the broker serves this leg once on it.
+                // The field is dropped here for the same reason: a refusal
+                // AFTER the send spent the leg, so a later attempt must redeem
+                // a fresh connection rather than inherit this one. A refusal
+                // BEFORE the send — a queue wait that timed out, an identity
+                // mismatch — spent nothing and leaves the connection intact for
+                // the next attempt.
+                return await connection
+                    .CancelBrokerOperationAsync(operationId, approvalHash, budget.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw BudgetRefusal(
+                    operationId, BrokerCancelRoute, budget, OperatorExchangeStages.Exchange);
+            }
+            finally
+            {
+                ReleaseRetainedConnection();
+            }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _gateHolders);
+            // Only a gate this call actually acquired is released, so a repeated
+            // or cancelled acquisition can never double-release it.
+            if (acquired) _requestGate.Release();
+        }
     }
 
     public async Task<JsonElement> UserAutomationAsync(
@@ -711,10 +793,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         // Single use: the nonce is spent now, not after a successful connect.
         handoff.Consume(DateTimeOffset.UtcNow);
         // A new establishment never inherits the previous connection's
-        // redeemed authority. Only the redemption below may set it; every
-        // failure path after this point therefore leaves nothing revivable,
-        // and a restart (a new process) starts from nothing as well.
-        _retainedBinding = null;
+        // redeemed authority or its pipe. Only the redemption below may set
+        // them; every failure path after this point therefore leaves nothing
+        // revivable and no handle open, and a restart (a new process) starts
+        // from nothing as well.
+        ReleaseRetainedConnection();
 
         using var establishment = budget.OpenWindow(establishmentAllowance, OperatorExchangeStages.Establishment);
         // Exactly one Governor connection is ever built here, and it is built
@@ -730,11 +813,12 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             // Broker challenge and redemption share this establishment window
             // and finish before the Governor pipe is connected, so this client
             // never opens, publishes or holds a Governor transport it has not
-            // yet been vouched for. The admitted binding is retained in
-            // process memory only, bound to the connection built below, and
-            // cleared with it: it never reaches an envelope, a file, a log
-            // or a banner.
-            _retainedBinding = await BrokerPipeClient.RedeemOperatorHandoffAsync(
+            // yet been vouched for. The broker connection the redemption used,
+            // and the admitted binding it carries, are retained in process
+            // memory only and bound to the connection built below; both are
+            // released with it and never reach an envelope, a file, a log or a
+            // banner. If anything below fails, the catch releases them.
+            _retainedConnection = await BrokerPipeClient.RedeemOperatorHandoffAsync(
                 handoff.Endpoint,
                 clientIdentity,
                 establishment.Token).ConfigureAwait(false);
@@ -871,6 +955,19 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             }
             throw BindingLost(
                 $"{OperatorFaultReason.HandshakeShapeRefused} at broker registration generation {handoff.BrokerRegistrationEpoch}");
+        }
+        finally
+        {
+            // Establishment either returned a connection, in which case that
+            // connection now owns the retained broker transport, or it failed.
+            // On the failure paths that had no Governor connection to abort, the
+            // retained pipe and its admitted binding would otherwise survive
+            // with no owner — a handle per refused redemption. This releases
+            // them, and is a no-op on every path that already released.
+            if (attempt is null)
+            {
+                ReleaseRetainedConnection();
+            }
         }
     }
 
@@ -1015,7 +1112,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         // authority dies with the connection it was bound to, so an aborted
         // transport can never lend its token to a later one.
         Interlocked.CompareExchange(ref _connection, null, connection);
-        _retainedBinding = null;
+        ReleaseRetainedConnection();
         var aborted = connection.Abort();
         var allowance = TimeSpan.FromSeconds(TeardownAllowanceSeconds);
         var (completed, pending) = await connection.DisposeStreamsAsync(allowance).ConfigureAwait(false);
@@ -1132,6 +1229,12 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 {
                     await AbortConnectionAsync(connection, OperatorHandoffInvalidation.ReconnectRequired, OperatorExchangeStages.Dispose).ConfigureAwait(false);
                 }
+                // Disposal is the terminal owner of the retained broker pipe,
+                // released here as well as through the abort above: a client
+                // torn down with no Governor connection published must not leave
+                // the handle open. Safe at this point because this call holds
+                // the only gate count, so no cancellation can be mid-flight on it.
+                ReleaseRetainedConnection();
                 // While this call holds the only gate count, no other holder and
                 // no pending releaser exists: every earlier waiter was
                 // cancelled, and new requests are refused. Only then may the
