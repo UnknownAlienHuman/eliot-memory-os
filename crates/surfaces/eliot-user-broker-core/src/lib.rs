@@ -224,6 +224,13 @@ impl OperatorHandoffAuthority {
     /// carries no nonce, pipe name, expiry or timestamp field, so a caller
     /// cannot choose the authenticator or pre-claim an expiry. Role and
     /// capability widening fails closed through [`BrokerError::Denied`].
+    ///
+    /// Rows that can grant nothing any more — already redeemed, or past their
+    /// own expiry — are retired here rather than carried for the whole life of
+    /// this authority, so the live ledger holds at most the handoffs still
+    /// inside their TTL. Retirement introduces no capacity constant: the TTL
+    /// that already bounds how long a row is honoured is what bounds how many
+    /// rows are resident.
     pub fn issue(
         &mut self,
         request: &OperatorHandoffRequest,
@@ -252,6 +259,7 @@ impl OperatorHandoffAuthority {
                 .collect(),
         };
         endpoint.validate()?;
+        self.retire_terminal_rows(observed_at);
         if self.handoffs.contains_key(&nonce) {
             return Err(BrokerError::ReplayConflict);
         }
@@ -274,6 +282,13 @@ impl OperatorHandoffAuthority {
     /// its expiry are three distinct refusals — [`BrokerError::ReplayConflict`]
     /// and [`BrokerError::StaleLease`] — so a reconnect can never be inferred
     /// from replaying the previous endpoint.
+    ///
+    /// [`BrokerError::StaleLease`] names expiry only for a row still resident
+    /// at redemption time. A row retired by [`Self::issue`] — because it was
+    /// already redeemed, or already past expiry — reads as an unknown nonce
+    /// and is refused with [`BrokerError::ReplayConflict`]. That is a narrower
+    /// diagnostic, never a weaker refusal: both are errors, and neither grants
+    /// anything.
     pub fn consume(
         &mut self,
         endpoint: &OperatorEndpoint,
@@ -295,6 +310,23 @@ impl OperatorHandoffAuthority {
             state.consumed = true;
         }
         Ok(&self.artifact)
+    }
+
+    /// Retires every row that can no longer be honoured, at the one insert
+    /// site. A row is terminal when it is already consumed, or when
+    /// `observed_at` has reached its `expires_at` — the same comparison
+    /// [`Self::consume`] applies, on the same caller-supplied clock, so a
+    /// retired row could not have been honoured anyway.
+    ///
+    /// This bounds the resident map by the existing TTL instead of by a new
+    /// capacity: only rows still inside their 5-second window survive, and a
+    /// nonce that arrives after its window was retired returns the same
+    /// unknown-nonce refusal it would get from a ledger this authority never
+    /// issued. No token can be turned back into a valid one by retiring its
+    /// row — expiry and redemption are both irreversible refusals here.
+    fn retire_terminal_rows(&mut self, observed_at: u64) {
+        self.handoffs
+            .retain(|_, state| !state.consumed && observed_at < state.expires_at);
     }
 }
 
@@ -2454,8 +2486,13 @@ impl UserBroker {
     /// the installation-approved artifact it authenticates.
     ///
     /// A consumed nonce, an endpoint bound to another session/epoch, and an
-    /// endpoint past its expiry are refused with their own distinct
-    /// [`BrokerError`] rather than accepted as continuity.
+    /// endpoint past its expiry are refused rather than accepted as
+    /// continuity. An endpoint past its expiry is reported as
+    /// [`BrokerError::StaleLease`] while its row is still resident; once that
+    /// terminal row has been retired by a later
+    /// [`Self::issue_operator_handoff`] the same endpoint is reported as
+    /// [`BrokerError::ReplayConflict`]. Both are refusals — the error code
+    /// narrows, the guarantee does not.
     pub fn consume_operator_handoff(
         &mut self,
         endpoint: &OperatorEndpoint,
