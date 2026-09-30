@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod control_reserve;
+
 use eliot_observation_contracts::ObservationKind;
 use eliot_platform::{PortError, PortOutcome, ProviderError, ProviderErrorCode};
 use eliot_runtime_contracts::ServiceProcessState;
@@ -18,6 +20,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+
+pub use control_reserve::{
+    RUNTIME_CPU_TASK_BOTTLENECK, RUNTIME_RUNNABLE_BOTTLENECK, RuntimeDimension, RuntimePermit,
+    RuntimePermitOperation, RuntimeReserve, RuntimeReserveError,
+};
 
 const RUNNING: u8 = 0;
 const SHUTTING_DOWN: u8 = 1;
