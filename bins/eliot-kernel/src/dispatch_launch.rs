@@ -117,7 +117,7 @@ use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
     NativeWorkerClaimRecord, OperationIdentity,
 };
-use eliot_process::{Generation, OperationId, ProcessRequest};
+use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{

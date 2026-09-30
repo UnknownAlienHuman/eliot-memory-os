@@ -973,7 +973,7 @@ impl KernelComposition {
             .native_worker_cell_current_proof(
                 session,
                 operation,
-                &request_id,
+                request_id.as_str(),
                 &payload,
                 &presented_fence,
             )
