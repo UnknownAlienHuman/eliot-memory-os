@@ -41,6 +41,7 @@ mod capability_evidence;
 mod capability_evidence_commit;
 mod composition;
 mod context_inputs;
+mod coordination_owner_commit;
 mod cue_composition;
 mod epistemic_composition;
 mod experience_commit;
@@ -68,6 +69,15 @@ pub use cue_composition::{
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
+pub use coordination_owner_commit::{CommittedCoordinationResult, CoordinationCommitError};
+// The coordination owner commit entry is reached from the daemon composition
+// root, which has no `eliot-coordination` dependency edge. Re-exporting the
+// exact owner request/response types keeps that dependency graph unchanged
+// rather than adding a second edge for four already-typed parameters.
+pub use eliot_coordination::{
+    AgentResultDraft, AgentResultReceipt, RegisterSession as CoordinationRegisterSession,
+    ResultAdmissionCeiling, WorkItem as CoordinationWorkItem,
+};
 pub use finish_attempt::{
     FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, PreparedFinishDecision,
     PreparedKernelExchange,

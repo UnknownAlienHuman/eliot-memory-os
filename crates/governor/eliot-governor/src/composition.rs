@@ -852,7 +852,18 @@ pub struct GovernorRecoverySnapshot {
 }
 
 impl GovernorRecoverySnapshot {
-    fn owner_read(&self, owner: RecoveryOwner) -> Result<&KernelNamedReadReply, CompositionError> {
+    /// Returns the refresh-consistent Kernel named read for one owner.
+    ///
+    /// This is the same value `refresh_from_kernel` rehydrates from and the
+    /// same value the store arbitrates on a fenced owner write, so an
+    /// owner-image commit uses it as its compare-and-set predecessor. It is
+    /// crate-visible rather than private because the coordination owner commit
+    /// path lives in a sibling module and must read the same revision, never a
+    /// second or recomputed one.
+    pub(crate) fn owner_read(
+        &self,
+        owner: RecoveryOwner,
+    ) -> Result<&KernelNamedReadReply, CompositionError> {
         self.owner_reads
             .iter()
             .find(|read| read.owner == owner)
@@ -5146,6 +5157,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Returns the refresh-consistent recovery snapshot, so an owner-image
+    /// commit in a sibling module reads the same named reads this composition
+    /// rehydrates from rather than a second or recomputed revision.
+    #[must_use]
+    pub(crate) const fn recovery_snapshot(&self) -> &GovernorRecoverySnapshot {
+        &self.recovery
     }
 
     /// Retains one execution-evidence page in the existing Skill lifecycle
