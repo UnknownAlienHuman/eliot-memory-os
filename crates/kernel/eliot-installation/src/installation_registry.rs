@@ -526,12 +526,13 @@ impl RedbInstallationRegistry {
         let canonical_root = root
             .canonical_path()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let canonical_root_text = canonical_root.to_str().ok_or_else(|| {
-            InstallationError::InvalidField {
-                field: "installation_registry.user_owned.host_state_root".to_owned(),
-                reason: "current-user Host root cannot be represented losslessly".to_owned(),
-            }
-        })?;
+        let canonical_root_text =
+            canonical_root
+                .to_str()
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "installation_registry.user_owned.host_state_root".to_owned(),
+                    reason: "current-user Host root cannot be represented losslessly".to_owned(),
+                })?;
         if selection.owner_sid != root.current_user_sid()
             || observation.identity != root.identity()
             || !eliot_platform_windows::windows_paths_equal(
@@ -575,20 +576,16 @@ impl RedbInstallationRegistry {
         for generation in registry.generations() {
             let launch = &generation.manifest.runtime_launch;
             if launch.profile == crate::InstallationProfile::SystemService {
-                receipt.validate_against(
-                    _root,
-                    launch.runtime_state_roots.host_state_root.as_str(),
-                )?;
+                receipt
+                    .validate_against(_root, launch.runtime_state_roots.host_state_root.as_str())?;
                 validated_descriptor = true;
             }
         }
         if let Some(pending) = registry.pending_activation() {
             let launch = &pending.manifest.runtime_launch;
             if launch.profile == crate::InstallationProfile::SystemService {
-                receipt.validate_against(
-                    _root,
-                    launch.runtime_state_roots.host_state_root.as_str(),
-                )?;
+                receipt
+                    .validate_against(_root, launch.runtime_state_roots.host_state_root.as_str())?;
                 validated_descriptor = true;
             }
         }
@@ -640,13 +637,16 @@ impl RedbInstallationRegistry {
                 let canonical_root = _root
                     .canonical_path()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
-                let canonical_root_text = canonical_root.to_str().ok_or_else(|| {
-                    InstallationError::InvalidField {
-                        field: "installation_registry.owner.retained_host_state_root".to_owned(),
-                        reason: "retained current-user Host root cannot be represented losslessly"
-                            .to_owned(),
-                    }
-                })?;
+                let canonical_root_text =
+                    canonical_root
+                        .to_str()
+                        .ok_or_else(|| InstallationError::InvalidField {
+                            field: "installation_registry.owner.retained_host_state_root"
+                                .to_owned(),
+                            reason:
+                                "retained current-user Host root cannot be represented losslessly"
+                                    .to_owned(),
+                        })?;
                 WindowsPathIdentity::parse_root(
                     canonical_root_text,
                     "installation_registry.owner.retained_host_state_root",
@@ -1649,12 +1649,13 @@ pub(super) fn installation_registry_path_user_owned(
     let canonical_root = host_root
         .canonical_path()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let canonical_root_text = canonical_root.to_str().ok_or_else(|| {
-        InstallationError::InvalidField {
-            field: "installation_registry.host_root".to_owned(),
-            reason: "current-user Host root cannot be represented losslessly".to_owned(),
-        }
-    })?;
+    let canonical_root_text =
+        canonical_root
+            .to_str()
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "installation_registry.host_root".to_owned(),
+                reason: "current-user Host root cannot be represented losslessly".to_owned(),
+            })?;
     match profile {
         crate::InstallationProfile::UserMode => {
             validate_installation_host_root(Path::new(canonical_root_text))?;
