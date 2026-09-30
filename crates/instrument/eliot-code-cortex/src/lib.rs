@@ -20,7 +20,6 @@ use eliot_lsp_bridge::{
     DiagnosticSeverity, FailureDisposition, Freshness as LspFreshness, LspAdoptionProjection,
     LspRawOutputKind, NormalizedResult, RenameCandidate, RetainedLspObservationV1,
     SemanticOperation, SymbolInfo, adopt_captured_observation_from_blob_readback,
-    adopt_retained_observation,
 };
 use eliot_receipts::{CausalBinding, TaskBinding};
 use eliot_store_api::CapturedBlobPayloadRefV1;
@@ -328,51 +327,33 @@ impl SemanticIndex {
         Ok(revision)
     }
 
-    /// Validates and retains one original LSP envelope as historical evidence.
-    ///
-    /// Adoption revalidates the exact retained raw bytes and full normalized
-    /// result through the bridge's historical validator. That validator keeps
-    /// the observation stale because the current source and process owners are
-    /// not supplied here. The index retains the normalized result's actual
-    /// items and projects them as stale nodes during composition; it never
-    /// launches an analyzer or creates an observation receipt. Live callers
-    /// should use [`Self::admit_lsp_adoption_projection`] when they have the
-    /// original owner-adopted projection.
-    pub fn admit_retained_lsp_observation(
-        &mut self,
-        record: RetainedLspObservationV1,
-    ) -> Result<GraphRevision, CodeCortexError> {
-        let process_operation_id = record.process_evidence.operation_id().as_str().to_owned();
-        let result = adopt_retained_observation(record.clone())
-            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
-        self.admit_lsp_observation(
-            &record,
-            result,
-            process_operation_id,
-            LspFreshness::Stale {
-                reason: "retained envelope supplied without live source-owner adoption".to_owned(),
-            },
-        )
-    }
-
     /// Admits an original LSP observation together with the separate
     /// currentness projection produced by its live process/source owners.
-    /// The projection is bound to this exact retained envelope, and the
-    /// bridge revalidates the original raw bytes before `CodeCortex` indexes
-    /// the unchanged normalized result.
+    /// The projection is bound to the exact envelope decoded from its
+    /// original authenticated Blob readback, and the bridge validates the
+    /// original raw bytes before `CodeCortex` indexes the unchanged result.
     pub fn admit_lsp_adoption_projection(
         &mut self,
-        record: RetainedLspObservationV1,
+        observation: &CapturedLspObservation,
+        current_read_task_binding: &TaskBinding,
+        current_read_causal_binding: &CausalBinding,
         projection: &LspAdoptionProjection,
     ) -> Result<GraphRevision, CodeCortexError> {
+        validate_captured_lsp_payload_reference(&observation.reference)?;
+        let (record, result) = adopt_captured_observation_from_blob_readback(&observation.readback)
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        validate_captured_lsp_task_join(
+            observation,
+            &record,
+            current_read_task_binding,
+            current_read_causal_binding,
+        )?;
         if !projection.matches_retained_observation(&record) {
             return Err(CodeCortexError::InvalidEvidence(
                 "LSP adoption projection is bound to a different retained observation".to_owned(),
             ));
         }
         let process_operation_id = record.process_evidence.operation_id().as_str().to_owned();
-        let result = adopt_retained_observation(record.clone())
-            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
         if projection.observation() != &result {
             return Err(CodeCortexError::InvalidEvidence(
                 "LSP adoption projection changed the bridge-validated normalized result".to_owned(),
@@ -570,34 +551,27 @@ impl CodeCortexService {
         })
     }
 
-    /// Builds a service from caller-supplied original bridge observations.
-    ///
-    /// Each envelope is independently re-adopted from its retained bytes and
-    /// represented as stale evidence. This entrypoint does not accept an
-    /// already-normalized JSON value as proof of a bridge invocation.
-    pub fn with_retained_lsp_observations(
-        records: Vec<RetainedLspObservationV1>,
-    ) -> Result<Self, CodeCortexError> {
-        let mut index = SemanticIndex::new();
-        for record in records {
-            index.admit_retained_lsp_observation(record)?;
-        }
-        Ok(Self {
-            index,
-            current_task_binding: None,
-        })
-    }
-
     /// Builds a service from original bridge observations paired with the
     /// separate currentness result established by their live source/process
-    /// owners. Each pair is checked against the exact retained envelope
-    /// before its unchanged semantic result is indexed.
+    /// owners. Each authenticated readback is checked against the exact
+    /// retained envelope before its unchanged semantic result is indexed.
     pub fn with_lsp_adoption_projections(
-        observations: Vec<(RetainedLspObservationV1, LspAdoptionProjection)>,
+        current_read_task_binding: TaskBinding,
+        current_read_causal_binding: &CausalBinding,
+        observations: Vec<(CapturedLspObservation, LspAdoptionProjection)>,
     ) -> Result<Self, CodeCortexError> {
+        validate_current_read_binding(
+            &current_read_task_binding,
+            current_read_causal_binding,
+        )?;
         let mut index = SemanticIndex::new();
-        for (record, projection) in observations {
-            index.admit_lsp_adoption_projection(record, &projection)?;
+        for (observation, projection) in observations {
+            index.admit_lsp_adoption_projection(
+                &observation,
+                &current_read_task_binding,
+                current_read_causal_binding,
+                &projection,
+            )?;
         }
         Ok(Self {
             index,
