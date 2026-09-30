@@ -63,6 +63,10 @@ fn marked_candidate(context: &ContextBinding, permit_digest: &str) -> ContextCan
             provider: ProviderId::new("learning-provider").expect("provider"),
             role: SemanticRole::Optional,
         },
+        // This fixture asserts about learning provenance binding, not about a
+        // measured position inside the snapshot, so the range stays a typed
+        // unknown.
+        source_range: None,
         source: SourceSnapshot {
             source_id: eliot_contracts::SourceId::new("source-learning-1869").expect("source"),
             owner: ProviderId::new("owner-learning-1869").expect("owner"),

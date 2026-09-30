@@ -75,6 +75,10 @@ fn candidate() -> ContextCandidate {
         binding: binding(),
         atom_id: id("atom"),
         provider_role: provider_role(),
+        // This fixture asserts about the contract surface itself, not about a
+        // measured position inside the snapshot, so the range stays a typed
+        // unknown.
+        source_range: None,
         source: source_snapshot(),
         learning: None,
         representation: AtomRepresentation::Whole {

@@ -57,6 +57,10 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
             provider: ProviderId::new("provider").expect("provider"),
             role: SemanticRole::Goal,
         },
+        // This fixture asserts about admission input closure and denominator
+        // reconciliation, not about a measured position inside the snapshot, so
+        // the range stays a typed unknown.
+        source_range: None,
         source: SourceSnapshot {
             source_id: eliot_contracts::SourceId::new("source").expect("source"),
             owner: ProviderId::new("provider").expect("owner"),
