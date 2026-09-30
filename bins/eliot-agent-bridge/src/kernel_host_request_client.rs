@@ -1898,7 +1898,7 @@ fn host_request_observe_submit_frame(
 /// | `eliot.observe` | submit frame (tool bytes) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
 /// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the act dispatch binding pre-staging; the daemon-side `admit_material_decision` invocation over owner-resolved inputs with dispatch-time revalidation through a live act claim/flight is the remaining join (#1742 W4) |
-/// | `eliot.verify` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the verify dispatch binding pre-staging; the daemon-side `eliot-verifier` (`eliot.instrument.verifier`) plan/execute/verdict invocation over the admitted intent, artifact_refs and verifier_profile_ref with Partial/Unknown/not-executed evidence preserved is the remaining join |
+/// | `eliot.verify` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the verify dispatch binding pre-staging; the daemon-side `eliot-verifier` (`eliot.instrument.verifier`) plan/execute/verdict invocation over the admitted intent, `artifact_refs` and `verifier_profile_ref` with Partial/Unknown/not-executed evidence preserved is the remaining join |
 /// | `eliot.coordinate` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; execution-fabric join missing (#1740) |
 /// | `eliot.finish` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded finish decision receipt from the Governor finish owner; a simulated/stale/unbound/unknown-verifier candidate and a caller-supplied proof never yield `VERIFIED_COMPLETE` |
 /// | `eliot_user_automation` (non-hot) | submit frame (tool bytes) | `agent_host_request_submit` | operator carrier on its own leg; never a hot tool |
@@ -1939,7 +1939,7 @@ enum CanonicalDispatchEntry {
     /// Kernel submit entry revalidates the verify dispatch binding pre-staging
     /// (`check_verify_submit_binding`). The daemon-side `eliot-verifier`
     /// (`eliot.instrument.verifier`) plan/execute/verdict invocation over the
-    /// admitted intent, artifact_refs and verifier_profile_ref runs at the
+    /// admitted intent, `artifact_refs` and `verifier_profile_ref` runs at the
     /// future live verify claim/flight, not here: not-executed, partial and
     /// unknown evidence stays the verifier owner's to produce and is never
     /// upgraded to a pass at this seam. The Accepted reply stays an operation

@@ -1076,66 +1076,48 @@ fn negative_response(
             idempotency_key,
             canonical_request_sha256,
             canonical_tool_name,
-            "IDEMPOTENCY_CONFLICT",
-            AgentResponseDisposition::StaleOrConflict,
-            "IDEMPOTENCY_CONFLICT",
-            "the same idempotency identity was bound to different request bytes",
-            "reconcile the existing operation or resubmit the exact request bytes; never retry changed bytes under the same identity",
+            &IDEMPOTENCY_CONFLICT_SHAPE,
         ),
         PortFailure::LegacyCorrelationUnresolved => mechanical_negative(
             request_id,
             idempotency_key,
             canonical_request_sha256,
             canonical_tool_name,
-            "LEGACY_CORRELATION_UNRESOLVED",
-            AgentResponseDisposition::RecoveryRequired,
-            "LEGACY_CORRELATION_UNRESOLVED",
-            "a durable occurrence exists but cannot be assigned a typed owner",
-            "reconcile the existing operation; no handle is issued",
+            &LEGACY_CORRELATION_SHAPE,
         ),
         PortFailure::DeadlineExceeded => mechanical_negative(
             request_id,
             idempotency_key,
             canonical_request_sha256,
             canonical_tool_name,
-            "DEADLINE_EXCEEDED",
-            AgentResponseDisposition::UnavailableOrCapacity,
-            "DEADLINE_EXCEEDED",
-            "the request deadline was reached by the semantic owner",
-            "reconcile the exact operation before resubmitting with a later deadline",
+            &DEADLINE_EXCEEDED_SHAPE,
         ),
         PortFailure::Cancelled => mechanical_negative(
             request_id,
             idempotency_key,
             canonical_request_sha256,
             canonical_tool_name,
-            "CANCELLED",
-            AgentResponseDisposition::Failed,
-            "CANCELLED",
-            "the request was cancelled by its canonical cancellation identity",
-            "do not retry the cancelled operation; submit a new operation when the work is still required",
+            &CANCELLED_SHAPE,
         ),
         PortFailure::FenceMismatch => mechanical_negative(
             request_id,
             idempotency_key,
             canonical_request_sha256,
             canonical_tool_name,
-            "FENCE_MISMATCH",
-            AgentResponseDisposition::StaleOrConflict,
-            "STALE_STATE_FENCE",
-            "the owner rejected a stale or mismatched state fence",
-            "reconnect through the authenticated session and reconcile the exact operation before resubmitting",
+            &FENCE_MISMATCH_SHAPE,
         ),
         PortFailure::TransportBindingRejected { reason } => mechanical_negative(
             request_id,
             idempotency_key,
             canonical_request_sha256,
             canonical_tool_name,
-            "TRANSPORT_BINDING_REJECTED",
-            AgentResponseDisposition::InvalidRequest,
-            "TRANSPORT_BINDING_REJECTED",
-            reason.as_str(),
-            "correct the rejected binding and resubmit through the authenticated session",
+            &MechanicalNegativeShape {
+                code: "TRANSPORT_BINDING_REJECTED",
+                disposition: AgentResponseDisposition::InvalidRequest,
+                reason_code: "TRANSPORT_BINDING_REJECTED",
+                reason: reason.as_str(),
+                next_action: "correct the rejected binding and resubmit through the authenticated session",
+            },
         ),
     };
     bounded_response(McpResponse {
@@ -1152,6 +1134,55 @@ fn negative_response(
     })
 }
 
+/// Static wire shape for one mechanical owner negative (issue #1739 W6).
+struct MechanicalNegativeShape<'a> {
+    code: &'static str,
+    disposition: AgentResponseDisposition,
+    reason_code: &'static str,
+    reason: &'a str,
+    next_action: &'static str,
+}
+
+const IDEMPOTENCY_CONFLICT_SHAPE: MechanicalNegativeShape<'static> = MechanicalNegativeShape {
+    code: "IDEMPOTENCY_CONFLICT",
+    disposition: AgentResponseDisposition::StaleOrConflict,
+    reason_code: "IDEMPOTENCY_CONFLICT",
+    reason: "the same idempotency identity was bound to different request bytes",
+    next_action: "reconcile the existing operation or resubmit the exact request bytes; never retry changed bytes under the same identity",
+};
+
+const LEGACY_CORRELATION_SHAPE: MechanicalNegativeShape<'static> = MechanicalNegativeShape {
+    code: "LEGACY_CORRELATION_UNRESOLVED",
+    disposition: AgentResponseDisposition::RecoveryRequired,
+    reason_code: "LEGACY_CORRELATION_UNRESOLVED",
+    reason: "a durable occurrence exists but cannot be assigned a typed owner",
+    next_action: "reconcile the existing operation; no handle is issued",
+};
+
+const DEADLINE_EXCEEDED_SHAPE: MechanicalNegativeShape<'static> = MechanicalNegativeShape {
+    code: "DEADLINE_EXCEEDED",
+    disposition: AgentResponseDisposition::UnavailableOrCapacity,
+    reason_code: "DEADLINE_EXCEEDED",
+    reason: "the request deadline was reached by the semantic owner",
+    next_action: "reconcile the exact operation before resubmitting with a later deadline",
+};
+
+const CANCELLED_SHAPE: MechanicalNegativeShape<'static> = MechanicalNegativeShape {
+    code: "CANCELLED",
+    disposition: AgentResponseDisposition::Failed,
+    reason_code: "CANCELLED",
+    reason: "the request was cancelled by its canonical cancellation identity",
+    next_action: "do not retry the cancelled operation; submit a new operation when the work is still required",
+};
+
+const FENCE_MISMATCH_SHAPE: MechanicalNegativeShape<'static> = MechanicalNegativeShape {
+    code: "FENCE_MISMATCH",
+    disposition: AgentResponseDisposition::StaleOrConflict,
+    reason_code: "STALE_STATE_FENCE",
+    reason: "the owner rejected a stale or mismatched state fence",
+    next_action: "reconnect through the authenticated session and reconcile the exact operation before resubmitting",
+};
+
 /// Builds the exact MCP-visible negative for one mechanical owner failure
 /// (issue #1739 W6).
 ///
@@ -1165,30 +1196,22 @@ fn negative_response(
 /// with `isError: true` and carries no deliverable bytes, so the bridge
 /// retains no preview for it and the Kernel serves it as-is instead of
 /// converting it into a plan gap.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "W6 negative shape: the four correlation identities plus the five per-variant fields travel together from negative_response; grouping them would hide the exact wire fields"
-)]
 fn mechanical_negative(
     request_id: &str,
     idempotency_key: &str,
     canonical_request_sha256: &str,
     canonical_tool_name: &str,
-    code: &'static str,
-    disposition: AgentResponseDisposition,
-    reason_code: &str,
-    reason: &str,
-    next_action: &'static str,
+    shape: &MechanicalNegativeShape<'_>,
 ) -> (ResponseKind, Value) {
     (
         ResponseKind::OwnerRejected,
         json!({
-            "code": code,
-            "disposition": disposition.as_str(),
-            "reason_code": reason_code,
+            "code": shape.code,
+            "disposition": shape.disposition.as_str(),
+            "reason_code": shape.reason_code,
             "directive": {
-                "reason": reason,
-                "next_action": next_action,
+                "reason": shape.reason,
+                "next_action": shape.next_action,
                 "required_authority": "the authenticated session bound to this request",
                 "evidence_refs": [],
             },
