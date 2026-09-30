@@ -9,9 +9,19 @@ using Eliot.Operator.ViewModels;
 // assertion is rewritten to maintain it. The terminal receipt prints it, which
 // is what makes the executed count demonstrable — a run that executed one
 // assertion and a run that executed all of them can no longer produce
-// byte-identical output. It is a counter, not a gate: the helpers still throw
-// on the first failure, so a run that did not pass never reaches the receipt.
+// byte-identical output.
+//
+// Failing assertions no longer abort the run. They are collected and printed,
+// and the verdict is the exit code. The previous throw-on-first-failure shape
+// meant a red harness produced an unhandled-exception trace and no receipt at
+// all, so the executed count was unobservable and every later assertion was
+// unobserved: one stale expectation at the top of this file hid the entire
+// rest of the suite. A run that fails now states how many assertions it
+// executed, how many failed and exactly which ones, and still exits non-zero —
+// reporting is not passing.
 var executedAssertions = 0;
+
+var failures = new List<string>();
 
 var manifestPath = Path.Combine(AppContext.BaseDirectory, "operator-contract-v1.json");
 var manifestBytes = await File.ReadAllBytesAsync(manifestPath);
@@ -25,11 +35,30 @@ var endpoint = new OperatorEndpoint(
     @"\\.\pipe\eliot\operator\one-shot", 7, "session-1", "nonce-1",
     "human_operator", ["controlboard.read", "operator.command"]);
 RuntimeDiscoveryService.ValidateEndpoint(endpoint);
-var wrongCapabilities = endpoint with { Capabilities = ["operator.command"] };
-var wrongCapabilitiesRejected = false;
-try { RuntimeDiscoveryService.ValidateEndpoint(wrongCapabilities); }
-catch (RuntimeDiscoveryException error) when (error.Code == "endpoint_invalid") { wrongCapabilitiesRejected = true; }
-True(wrongCapabilitiesRejected, "exact Operator capability allowlist");
+// Client-side endpoint shape, not authority. I11.8 binds the UI to the "exact
+// ControlBoard/Operator capability set", and that exactness is the owner's
+// decision: eliot-user-broker-core mints the full ordered set and refuses a
+// narrowed request in OperatorEndpoint::validate and
+// OperatorHandoffAuthority::issue, and re-checks it on redemption. So this
+// client asserts only the shape it can observe - a non-empty list of distinct
+// members of the closed two-capability vocabulary - and must not pre-empt the
+// owner by refusing a narrowed grant the owner may legitimately mint (#1776).
+var clientRefusedNarrowedGrant = false;
+try { RuntimeDiscoveryService.ValidateEndpoint(endpoint with { Capabilities = ["operator.command"] }); }
+catch (RuntimeDiscoveryException error) when (error.Code == "endpoint_invalid") { clientRefusedNarrowedGrant = true; }
+True(!clientRefusedNarrowedGrant, "narrowed owner grant is left to the owner's exact check");
+True(EndpointInvalid(endpoint with { Capabilities = [] }), "empty capability set refused");
+True(
+    EndpointInvalid(endpoint with
+    {
+        Capabilities =
+        [
+            OperatorCapabilityNames.ControlboardRead,
+            OperatorCapabilityNames.ControlboardRead
+        ]
+    }),
+    "duplicated capability refused");
+True(EndpointInvalid(endpoint with { Capabilities = ["controlboard.write"] }), "unknown capability refused");
 Environment.SetEnvironmentVariable(
     RuntimeDiscoveryService.EndpointEnvironmentVariable,
     JsonSerializer.Serialize(endpoint));
@@ -250,9 +279,10 @@ True(!OperatorDiagnostics.ShouldRotate(0), "empty log does not rotate");
 // bounded to one typed line. A run that reaches here has already executed and
 // passed every assertion above; a live probe that throws must not turn that
 // into a lost terminal receipt, and it must not be able to hide a conformance
-// failure either — a failing assertion above throws and never reaches this
-// block. The live line is NOT an assertion and adds none: it reports a probe
-// outcome, and the executed count above is unchanged by it.
+// block for a red conformance verdict — a probe line is a probe outcome, never
+// the run's verdict, and the verdict is printed last, after this block. The
+// live line is NOT an assertion and adds none: it reports a probe outcome, and
+// the executed count above is unchanged by it.
 //
 // Redaction: one bounded line carrying the stage and the exception TYPE only.
 // No message, no stack trace, no endpoint, pipe name, nonce, credential or
@@ -279,23 +309,59 @@ if (args.Contains("--live", StringComparer.Ordinal))
     }
 }
 
-Console.WriteLine(
-    $"ELIOT Operator protocol, auth, paging, view-model, command, reconcile, bounds, redaction and invalidation tests passed; assertions={executedAssertions}");
+// The terminal receipt, and the last line of the run. Every failing assertion
+// is named first — the labels are harness-owned constants carrying no runtime
+// values — and then one bounded verdict line. A green run prints the same
+// single passed line it always printed, unchanged. A red run prints the same
+// receipt with an explicit failed verdict and exits non-zero: a caller reading
+// only the receipt learns the same thing either way, and a caller reading only
+// the exit code cannot mistake a red run for a green one.
+foreach (var failure in failures)
+{
+    Console.WriteLine($"ELIOT_OPERATOR_CONFORMANCE_FAILURE {failure}");
+}
 
-// The only two places the executed count moves. Both still throw on the first
-// failure: counting an assertion never weakens it, and a failing run aborts
-// before the terminal receipt instead of printing one.
+if (failures.Count == 0)
+{
+    Console.WriteLine(
+        $"ELIOT Operator protocol, auth, paging, view-model, command, reconcile, bounds, redaction and invalidation tests passed; assertions={executedAssertions}");
+}
+else
+{
+    Console.WriteLine(
+        $"ELIOT Operator conformance FAILED; assertions={executedAssertions} failed={failures.Count}");
+    Environment.ExitCode = 1;
+}
+
+// The only two places the executed count moves. Both record a failure instead
+// of throwing, so a failing run still reaches the receipt above and the
+// executed count is observable for a red run exactly as it is for a green one.
+// Recording never weakens an assertion: the label is reported verbatim either
+// way and the exit code is non-zero.
 void True(bool condition, string label)
 {
     executedAssertions++;
-    if (!condition) throw new Exception($"assertion failed: {label}");
+    if (!condition) failures.Add($"assertion failed: {label}");
 }
 
 void Equal<T>(T expected, T actual, string label)
 {
     executedAssertions++;
     if (!EqualityComparer<T>.Default.Equals(expected, actual))
-        throw new Exception($"assertion failed: {label}; expected={expected}; actual={actual}");
+        failures.Add($"assertion failed: {label}; expected={expected}; actual={actual}");
+}
+
+bool EndpointInvalid(OperatorEndpoint candidate)
+{
+    try
+    {
+        RuntimeDiscoveryService.ValidateEndpoint(candidate);
+        return false;
+    }
+    catch (RuntimeDiscoveryException error) when (error.Code == "endpoint_invalid")
+    {
+        return true;
+    }
 }
 
 sealed class FakeGovernorClient : IGovernorClient
