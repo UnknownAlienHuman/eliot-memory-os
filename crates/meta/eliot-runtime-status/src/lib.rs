@@ -1484,6 +1484,46 @@ pub fn collect_status_with_observers(
             registry
                 .validate()
                 .map_err(|e| StatusError::Invalid(format!("registry validate: {e}")))?;
+            if let Some(receipt) = registry.system_service_host_root_receipt() {
+                let expected_host_state_root = registry
+                    .active()
+                    .map(|generation| {
+                        generation
+                            .manifest
+                            .runtime_launch
+                            .runtime_state_roots
+                            .host_state_root
+                            .as_str()
+                    })
+                    .or_else(|| {
+                        registry.pending_activation().map(|pending| {
+                            pending
+                                .manifest
+                                .runtime_launch
+                                .runtime_state_roots
+                                .host_state_root
+                                .as_str()
+                        })
+                    })
+                    .or_else(|| {
+                        registry.generations().first().map(|generation| {
+                            generation
+                                .manifest
+                                .runtime_launch
+                                .runtime_state_roots
+                                .host_state_root
+                                .as_str()
+                        })
+                    })
+                    .unwrap_or(receipt.canonical_path());
+                receipt
+                    .validate_against(&retained_root, expected_host_state_root)
+                    .map_err(|error| {
+                        StatusError::Invalid(format!(
+                            "SystemService Host-root receipt: {error}"
+                        ))
+                    })?;
+            }
             for generation in registry.generations() {
                 let declared = &generation
                     .manifest
