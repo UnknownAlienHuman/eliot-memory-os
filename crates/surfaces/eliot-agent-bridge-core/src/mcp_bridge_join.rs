@@ -413,9 +413,9 @@ pub struct TerminalReconcileRequest<'a> {
 /// [`TerminalReconcileRequest`]. No refusal above is affected by it: every
 /// check that can return a [`ReconcileError`] has already run and returned by
 /// the time the note is read, and the note reaches exactly one decision inside
-/// [`assess_correlation`] — whether a `HostCompleted` outcome also offers
-/// [`RecoveryAction`](crate::mcp_correlation::RecoveryAction)::RefreshDesktopView
-/// — so it can add a recovery directive and can never withdraw one.
+/// [`assess_correlation`] - whether a `HostCompleted` outcome also offers
+/// [`RecoveryAction::RefreshDesktopView`](crate::mcp_correlation::RecoveryAction::RefreshDesktopView)
+/// - so it can add a recovery directive and can never withdraw one.
 pub fn reconcile_terminal_event(
     bridge: &AgentBridgeCore,
     request: &TerminalReconcileRequest<'_>,
