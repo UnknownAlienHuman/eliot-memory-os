@@ -320,6 +320,7 @@ mod daemon_supervision;
 mod dispatch_launch;
 mod doctor_recovery_ledger;
 mod dreamer_job_dispatch;
+mod dreamer_owner_record;
 mod frame_dispatch;
 mod front_door_listener;
 mod front_door_session;
