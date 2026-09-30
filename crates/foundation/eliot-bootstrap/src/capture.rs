@@ -848,6 +848,141 @@ pub struct WorkspaceInstanceFacts {
     pub eliot_marker_present: bool,
 }
 
+/// Name-only classification for one bounded governing-source discovery
+/// candidate. The role records the kind of document its exact path resembles;
+/// it does not admit the document or establish its authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSourceDocumentKind {
+    UserTask,
+    Architecture,
+    Implementation,
+    AgentInstruction,
+    BuildTestContract,
+    DomainPolicy,
+    SupportingReference,
+}
+
+/// One exact-root source-document path observed by name only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSourceDocumentCandidate {
+    /// Root-relative path using `/` separators; no file contents were read.
+    pub relative_path: String,
+    /// Bounded filename-based document classification, never authority.
+    pub kind: WorkspaceSourceDocumentKind,
+}
+
+const WORKSPACE_SOURCE_DOCUMENT_PATHS: [(&str, WorkspaceSourceDocumentKind); 31] = [
+    ("TASK.md", WorkspaceSourceDocumentKind::UserTask),
+    ("README.md", WorkspaceSourceDocumentKind::SupportingReference),
+    ("AGENTS.md", WorkspaceSourceDocumentKind::AgentInstruction),
+    ("CONTRIBUTING.md", WorkspaceSourceDocumentKind::AgentInstruction),
+    ("ARCHITECTURE.md", WorkspaceSourceDocumentKind::Architecture),
+    ("IMPLEMENTATION.md", WorkspaceSourceDocumentKind::Implementation),
+    ("BUILD.md", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("BUILDING.md", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("TESTING.md", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("POLICY.md", WorkspaceSourceDocumentKind::DomainPolicy),
+    ("SECURITY.md", WorkspaceSourceDocumentKind::DomainPolicy),
+    ("CHANGELOG.md", WorkspaceSourceDocumentKind::SupportingReference),
+    ("Cargo.toml", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("go.mod", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("pyproject.toml", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("package.json", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("pom.xml", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("CMakeLists.txt", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("Cargo.lock", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("package-lock.json", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("docs/README.md", WorkspaceSourceDocumentKind::SupportingReference),
+    ("docs/AGENTS.md", WorkspaceSourceDocumentKind::AgentInstruction),
+    ("docs/ARCHITECTURE.md", WorkspaceSourceDocumentKind::Architecture),
+    ("docs/IMPLEMENTATION.md", WorkspaceSourceDocumentKind::Implementation),
+    ("docs/BUILD.md", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("docs/TESTING.md", WorkspaceSourceDocumentKind::BuildTestContract),
+    ("docs/SCHEMA.md", WorkspaceSourceDocumentKind::SupportingReference),
+    ("docs/CHANGELOG.md", WorkspaceSourceDocumentKind::SupportingReference),
+    (
+        "docs/architecture/README.md",
+        WorkspaceSourceDocumentKind::Architecture,
+    ),
+    (
+        "docs/implementation/README.md",
+        WorkspaceSourceDocumentKind::Implementation,
+    ),
+    ("schemas/README.md", WorkspaceSourceDocumentKind::SupportingReference),
+];
+
+/// Observes likely governing-source documents under one explicit root.
+///
+/// This is a bounded name-only pass over a fixed set of root-relative paths.
+/// It never opens document contents, follows symlinks, traverses neighboring
+/// roots, or treats names as authority. Missing paths are valid absence.
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the root is not absolute or a filesystem
+/// observation fails for a reason other than an absent path.
+pub fn observe_workspace_source_candidates(
+    root: &Path,
+) -> Result<Vec<WorkspaceSourceDocumentCandidate>, CaptureError> {
+    if !root.is_absolute() {
+        return Err(CaptureError::RepositoryRootNotAbsolute(root.to_owned()));
+    }
+    if !root.is_dir() {
+        return Err(CaptureError::RepositoryRootMissing(root.to_owned()));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let mut candidates = Vec::new();
+    for (relative_path, kind) in WORKSPACE_SOURCE_DOCUMENT_PATHS {
+        if root_relative_regular_file(&canonical_root, Path::new(relative_path))? {
+            candidates.push(WorkspaceSourceDocumentCandidate {
+                relative_path: relative_path.to_owned(),
+                kind,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+fn root_relative_regular_file(root: &Path, relative: &Path) -> Result<bool, CaptureError> {
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Ok(false);
+    }
+    let mut current = root.to_owned();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        let final_component = index + 1 == components.len();
+        if final_component {
+            return Ok(metadata.is_file());
+        }
+        if !metadata.is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
 /// Root-level manifest names admitted as supporting evidence only.
 const WORKSPACE_MANIFEST_NAMES: [&str; 8] = [
     "Cargo.toml",

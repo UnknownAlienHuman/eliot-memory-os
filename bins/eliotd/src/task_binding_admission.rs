@@ -147,7 +147,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use eliot_bootstrap::capture::{WorkspaceInstanceFacts, observe_workspace_instance};
+use eliot_bootstrap::capture::{
+    WorkspaceInstanceFacts, WorkspaceSourceDocumentKind, observe_workspace_instance,
+    observe_workspace_source_candidates,
+};
 use eliot_contracts::sha256_hex;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
@@ -167,9 +170,10 @@ use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
     BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
-    DiscoveryRead, DiscoveryReadLease, ManifestEvidence, ObservedScopeResources, OnboardingLease,
-    OnboardingReadinessReceipt, ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState,
-    TaskBindingState, issue_discovery_lease, task_selection_required,
+    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
+    ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
+    ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
+    issue_discovery_lease, task_selection_required,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -2717,11 +2721,13 @@ fn observe_explicit_workspace_facts(
 /// Observes one authenticated activation selector and creates the exact
 /// discovery lease/evidence inputs admitted by the privacy-bounded scanner.
 ///
-/// Only Host-observed filesystem, VCS and root-manifest name facts are
-/// populated. Known-format inspection and governing-source discovery remain
-/// explicitly unresolved. No privacy class, boundary, source closure, or
-/// task is inferred here; the scanner returns its smallest privacy question
-/// until the applicable owner supplies those inputs.
+/// Host observes filesystem/VCS/manifests and a fixed set of root-relative
+/// governing-source filenames only; no document contents are opened. The
+/// authenticated ticket and observed root bind a short discovery lease that
+/// explicitly admits the source-candidate read. Known-format inspection stays
+/// unresolved. No privacy class, boundary, source closure, or task is inferred
+/// here; the scanner returns its smallest privacy question until the
+/// applicable owner supplies those inputs.
 #[allow(
     clippy::too_many_lines,
     reason = "bounded Host observations and the matching discovery lease are assembled in one auditable path"
@@ -2754,13 +2760,17 @@ pub fn observe_cold_start_discovery(
     let instance_ref = instance.instance_ref.clone();
     let root_identity = instance.root_identity.clone();
     let proposed_kind = observed.kind;
-    let mut allowed_reads = vec![DiscoveryRead::FilesystemIdentity];
+    let mut allowed_reads = vec![
+        DiscoveryRead::FilesystemIdentity,
+        DiscoveryRead::GoverningSourceCandidates,
+    ];
     if facts.has_git {
         allowed_reads.push(DiscoveryRead::VcsIdentity);
     }
     if !facts.manifest_names.is_empty() {
         allowed_reads.push(DiscoveryRead::ManifestNamesAndHashes);
     }
+    let consumption_limit = allowed_reads.len() as u32;
     let request = DiscoveryLeaseRequest {
         proposer_ref: ticket.activation_request_id.as_str().to_owned(),
         session_ref: ticket.connection_id.clone(),
@@ -2768,7 +2778,7 @@ pub fn observe_cold_start_discovery(
         candidate_root_ref: root_identity.clone(),
         root_filesystem_identity_ref: root_identity.clone(),
         allowed_reads,
-        consumption_limit: 3,
+        consumption_limit,
         deadline: ticket.kernel_deadline_unix_ms,
     };
     let key = DiscoveryLeaseKey {
@@ -2782,7 +2792,43 @@ pub fn observe_cold_start_discovery(
             "Host-observed discovery lease refused: {error}"
         ))
     })?;
+    lease
+        .authorize(DiscoveryRead::GoverningSourceCandidates, now)
+        .map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "Host source-candidate read is outside its discovery lease: {error:?}"
+            ))
+        })?;
+    let source_candidates = observe_workspace_source_candidates(Path::new(&facts.canonical_root))
+        .map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "Host source-candidate observation failed: {error}"
+            ))
+        })?
+        .into_iter()
+        .map(|candidate| GoverningSourceCandidateEvidence {
+            source_ref: candidate.relative_path,
+            role: match candidate.kind {
+                WorkspaceSourceDocumentKind::UserTask => GoverningSourceRole::UserTask,
+                WorkspaceSourceDocumentKind::Architecture => GoverningSourceRole::Architecture,
+                WorkspaceSourceDocumentKind::Implementation => {
+                    GoverningSourceRole::Implementation
+                }
+                WorkspaceSourceDocumentKind::AgentInstruction => {
+                    GoverningSourceRole::AgentInstruction
+                }
+                WorkspaceSourceDocumentKind::BuildTestContract => {
+                    GoverningSourceRole::BuildTestContract
+                }
+                WorkspaceSourceDocumentKind::DomainPolicy => GoverningSourceRole::DomainPolicy,
+                WorkspaceSourceDocumentKind::SupportingReference => {
+                    GoverningSourceRole::SupportingReference
+                }
+            },
+        })
+        .collect::<Vec<_>>();
     let mut attested_reads = vec![DiscoveryRead::FilesystemIdentity];
+    attested_reads.push(DiscoveryRead::GoverningSourceCandidates);
     if facts.has_git {
         attested_reads.push(DiscoveryRead::VcsIdentity);
     }
@@ -2814,17 +2860,22 @@ pub fn observe_cold_start_discovery(
         editor_workspaces: Vec::new(),
         existing_records: Vec::new(),
         adapters: Vec::new(),
+        governing_source_candidates: Some(source_candidates),
         recent_changes: Vec::new(),
         artifact_dirs: Vec::new(),
         execution_identity: None,
         broker_attached: None,
         redacted_literal_identities: Vec::new(),
-        unresolved_fields: vec![
-            DiscoveryRead::KnownFormatHeaders,
-            DiscoveryRead::GoverningSourceCandidates,
-        ],
+        unresolved_fields: vec![DiscoveryRead::KnownFormatHeaders],
         attested_reads,
     };
+    let governing_source_refs = evidence
+        .governing_source_candidates
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|candidate| candidate.source_ref.clone())
+        .collect();
     let discovery = BootstrapDiscoveryInputs {
         scan_ref: format!("scan:{}", ticket.ticket_id),
         candidate_privacy: None,
@@ -2834,7 +2885,7 @@ pub fn observe_cold_start_discovery(
         proposed_kind,
         identity_fingerprint: instance_ref,
         evidence,
-        governing_source_refs: Vec::new(),
+        governing_source_refs,
         now,
     };
     Ok(ColdStartDiscoveryInput {

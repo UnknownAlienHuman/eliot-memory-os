@@ -394,6 +394,12 @@ pub struct BootstrapScanEvidence {
     pub editor_workspaces: Vec<EditorWorkspaceEvidence>,
     pub existing_records: Vec<ExistingRecordEvidence>,
     pub adapters: Vec<AdapterEvidence>,
+    /// Exact root-relative paths returned by the bounded Host name scan.
+    /// `None` means the read was not performed; `Some([])` means it ran and
+    /// found no candidates. Paths are candidate evidence only: document
+    /// contents and authority are not carried here.
+    #[serde(default)]
+    pub governing_source_candidates: Option<Vec<GoverningSourceCandidateEvidence>>,
     pub recent_changes: Vec<ChangeSummary>,
     pub artifact_dirs: Vec<ArtifactDirEvidence>,
     pub execution_identity: Option<ResourceExecutionIdentity>,
@@ -401,6 +407,16 @@ pub struct BootstrapScanEvidence {
     pub redacted_literal_identities: Vec<String>,
     pub unresolved_fields: Vec<DiscoveryRead>,
     pub attested_reads: Vec<DiscoveryRead>,
+}
+
+/// One Host-observed name-only source candidate. The role is a filename-based
+/// category only; a Human or applicable owner must still admit its content.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GoverningSourceCandidateEvidence {
+    /// Exact root-relative path using `/` separators.
+    pub source_ref: String,
+    pub role: GoverningSourceRole,
 }
 
 impl BootstrapScanEvidence {
@@ -414,7 +430,7 @@ impl BootstrapScanEvidence {
     ///
     /// Returns an error when identity references are blank, a bounded
     /// collection leaves its range (file distribution/manifests/profiles/
-    /// services/editors/records/adapters 0..=32, changes/artifacts/redacted
+    /// services/editors/records/adapters/source candidates 0..=32, changes/artifacts/redacted
     /// 0..=128, unresolved 0..=16, attested reads 1..=5), a reference is blank
     /// or duplicated, a redaction identity is not a digest, or no read class
     /// is attested.
@@ -467,6 +483,28 @@ impl BootstrapScanEvidence {
         for adapter in &self.adapters {
             text(&adapter.adapter_ref, "adapters.adapter_ref")?;
             text(&adapter.kind, "adapters.kind")?;
+        }
+        if let Some(candidates) = &self.governing_source_candidates {
+            Self::check_bounded(candidates.len(), 32, "governing_source_candidates")?;
+            for candidate in candidates {
+                text(&candidate.source_ref, "governing_source_candidates.source_ref")?;
+                if candidate
+                    .source_ref
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                    || candidate.source_ref.starts_with('/')
+                    || candidate
+                        .source_ref
+                        .chars()
+                        .any(|character| character == '\\' || character == ':')
+                {
+                    return Err(WorkScopeError::InvalidSourceEvidence);
+                }
+            }
+            unique(
+                candidates.iter().map(|candidate| &candidate.source_ref),
+                "governing_source_candidates.source_ref",
+            )?;
         }
         Self::check_bounded(self.recent_changes.len(), 128, "recent_changes")?;
         for change in &self.recent_changes {
@@ -1288,6 +1326,16 @@ impl BootstrapScanner {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
         evidence.validate()?;
+        let observed_source_refs = evidence
+            .governing_source_candidates
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|candidate| candidate.source_ref.clone())
+            .collect::<Vec<_>>();
+        if governing_source_refs != observed_source_refs {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
         check_verifier_candidates(verifier_candidates)?;
         let Some(boundary) = privacy_boundary else {
             return Ok(BootstrapScanOutcome::PrivacyBoundaryRequired {
@@ -1572,6 +1620,17 @@ pub fn run_bootstrap_discovery(
         policy.validate()?;
     }
     discovery.evidence.validate()?;
+    let observed_source_refs = discovery
+        .evidence
+        .governing_source_candidates
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|candidate| candidate.source_ref.clone())
+        .collect::<Vec<_>>();
+    if discovery.governing_source_refs != observed_source_refs {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
     key.validate()?;
     lease
         .validate()
@@ -1695,10 +1754,13 @@ impl PrivacyBoundary {
 #[must_use]
 pub fn candidate_source_roles() -> Vec<GoverningSourceRole> {
     vec![
+        GoverningSourceRole::UserTask,
         GoverningSourceRole::Architecture,
         GoverningSourceRole::Implementation,
+        GoverningSourceRole::AgentInstruction,
         GoverningSourceRole::BuildTestContract,
         GoverningSourceRole::DomainPolicy,
+        GoverningSourceRole::SupportingReference,
     ]
 }
 
@@ -1774,7 +1836,10 @@ fn collected_classes(evidence: &BootstrapScanEvidence) -> Vec<DiscoveryRead> {
     {
         collected.push(DiscoveryRead::KnownFormatHeaders);
     }
-    if !evidence.existing_records.is_empty() || !evidence.adapters.is_empty() {
+    if !evidence.existing_records.is_empty()
+        || !evidence.adapters.is_empty()
+        || evidence.governing_source_candidates.is_some()
+    {
         collected.push(DiscoveryRead::GoverningSourceCandidates);
     }
     collected

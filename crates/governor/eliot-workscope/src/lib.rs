@@ -3646,6 +3646,7 @@ mod tests {
             editor_workspaces: Vec::new(),
             existing_records: Vec::new(),
             adapters: Vec::new(),
+            governing_source_candidates: None,
             recent_changes: Vec::new(),
             artifact_dirs: Vec::new(),
             execution_identity: None,
