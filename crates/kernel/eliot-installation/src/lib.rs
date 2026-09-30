@@ -5783,6 +5783,7 @@ impl WindowsInstallationEffectPort {
                     credential_receipt: None,
                     staging_receipt: None,
                     phase_b_receipt: Some(Box::new(receipt)),
+                    system_service_host_root_receipt: None,
                     service_runtime_lineage: None,
                 })
             }
