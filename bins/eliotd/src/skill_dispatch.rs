@@ -953,6 +953,18 @@ fn commit_activation_candidate(
         // admission's own receipt check — an unvalidated receipt cannot
         // reach the fence/route/retained-row legs on a stored-status pass.
         Some(SkillResultEnvelope::refused(&error))
+    } else if let Some(error) = candidate
+        .bound_subject
+        .as_deref()
+        .and_then(|bound| bound.validate().err())
+    {
+        // Owner-row validation leg (issue #1882 W2, I7.13): the published
+        // stages are folded from the BOUND owner row, never from the
+        // presented receipt's self-declared stages, so the row is re-proved
+        // here under the commit's fresh borrow like every other load-bearing
+        // binding — an unvalidated owner row cannot reach Material use
+        // through a plan-time pass.
+        Some(SkillResultEnvelope::refused(&error))
     } else if candidate.ingest_attempt_id.trim().is_empty() {
         Some(SkillResultEnvelope::refused(
             &eliot_skill::SkillError::InvalidField {
@@ -1039,7 +1051,13 @@ fn commit_activation_candidate(
     // admission re-checks live dep staleness even when the catalogue entry
     // itself has not been remarked yet; only revalidation or explicit
     // scoped/provisional admission through the governed lifecycle path
-    // lifts the standing. The owner admits the same
+    // lifts the standing. STITCH (issue #1882 W2/A2): the full-world sweep
+    // — live dependency-set feed, host/profile versions, admitted
+    // definition version, tool-owner view
+    // (`gate_material_use_against` over `LiveSkillWorld`) — has no producer
+    // at this commit and is never synthesized here; the designated driver is
+    // the owning crate's per-caller gate once a live-world feed reaches the
+    // bridge. The owner admits the same
     // standing again at admission time; this leg keeps the commit's fence,
     // route and retained-receipt legs consistent on one observation instead
     // of trusting fields of an unvalidated or stale record.
