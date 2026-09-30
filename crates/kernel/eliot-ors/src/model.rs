@@ -8648,10 +8648,7 @@ impl NativeWorkerClaimRecord {
         ] {
             validate_digest(value, field)?;
         }
-        match (
-            &self.capability_cell,
-            &self.capability_cell_registry_digest,
-        ) {
+        match (&self.capability_cell, &self.capability_cell_registry_digest) {
             (Some(cell), Some(registry_digest)) => {
                 validate_text(cell.as_str(), "native_worker_claim_capability_cell")?;
                 validate_digest(
