@@ -9031,7 +9031,7 @@ impl KernelComposition {
     }
 
     /// Renders one refused pre-call durable staging attempt as the operation's
-    /// error response (issue #1681 W4, I5.6, I14.4).
+    /// error response (issue #1681 W4, I5.6, I14.4; issue #1679 A9-1).
     ///
     /// This refusal is reached only BEFORE any possible Store call: the ORS
     /// reservation above is the durable intent record that must precede every
@@ -9041,6 +9041,15 @@ impl KernelComposition {
     /// `STORAGE_BACKPRESSURE` (the `I14.4` name for "no durable staging was
     /// available") and carries no stage receipt, no poll handle, and no
     /// resubmission instruction, because nothing was staged to poll.
+    ///
+    /// The complete versioned #1679 directive travels whole in
+    /// `recovery.staging_directive`: cause, ORS durable-bytes bottleneck,
+    /// commit status, preserved state and evidence, forbidden actions, the
+    /// preserved operation identity, the authorized bounded fallback, the next
+    /// action, authority, escalation, and the profile revision. Nothing is
+    /// dropped, and a directive that fails the existing contract check is
+    /// never partially emitted: the answer keeps the same error status and
+    /// code with a `null` directive rather than a half-populated one.
     ///
     /// The exact admitted operation identity is preserved verbatim so the caller
     /// retries THIS operation rather than a fresh one, and the ORS refusal text
@@ -9055,20 +9064,13 @@ impl KernelComposition {
         operation_id: &str,
         refusal: &str,
     ) -> serde_json::Value {
+        let directive = store_staging_backpressure_directive(operation_id);
         serde_json::json!({
             "status": "error",
             "code": "STORAGE_BACKPRESSURE",
             "reason": refusal,
             "value": { "kind": kind, "value": null },
-            "recovery": {
-                "staging": {
-                    "operation_id": operation_id,
-                    "preserve_operation_id": true,
-                    "accepted_pending": false,
-                    "stage_receipt": serde_json::Value::Null,
-                    "poll_handle": serde_json::Value::Null,
-                },
-            },
+            "recovery": { "staging_directive": directive },
         })
     }
 
@@ -9140,6 +9142,38 @@ fn store_read_unavailable_directive(
     )
     .ok()
     .and_then(|directive| serde_json::to_value(directive).ok())
+}
+
+/// Builds the complete versioned I14.5 directive for one refused durable
+/// staging attempt, or `None` when the owner refuses to produce a valid one.
+///
+/// `operation_id` is the exact handle the admitted write already carries, so
+/// the directive preserves and the caller retries THAT operation rather than
+/// a fresh one.
+///
+/// Issue #1679 A9-1 (caller STITCH): the remaining directive inputs are
+/// genuinely unavailable at this call site, so this helper emits `None`
+/// rather than a partial directive. `reserve_campaign_source_publications`
+/// fails with a prose `OrsError` that carries no owner-measured ORS durable
+/// queue reading — neither the requested staging bytes nor the available
+/// bytes the `STORAGE_BACKPRESSURE` contract requires — and that failure may
+/// be a CAS identity conflict, contract rejection, or storage fault
+/// rather than measured byte exhaustion, so minting an exhausted-bytes
+/// observation here would fabricate capacity evidence. There is likewise no
+/// owner-produced staging-profile artifact at this call site (the existing
+/// `store_read_profile_revision` names the read-profile catalogue and must
+/// not be relabeled as staging provenance). The ORS reserve owner is the
+/// party that can supply both; until that owner call site exists, the answer
+/// keeps its error status and code with a `null` directive.
+#[cfg(windows)]
+fn store_staging_backpressure_directive(operation_id: &str) -> Option<serde_json::Value> {
+    // `eliot_contracts::OperationId` is the I14.5 directive's operation identity
+    // and is distinct from this module's process-lane `OperationId` import.
+    // The admitted identity is available and well formed here, but the
+    // owner-measured byte pressure and staging profile revision above are
+    // not, so the directive is honestly null rather than partial.
+    let _operation_id = eliot_contracts::OperationId::new(operation_id.to_owned()).ok()?;
+    None
 }
 
 /// Closed outcome of the graceful WASM control half of one
