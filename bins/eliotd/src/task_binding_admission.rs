@@ -2710,15 +2710,12 @@ fn seal_dispatched_binding_with_provenance(
             "task-bound dispatch names no admitted principal",
         ));
     }
-    if binding.session_ref.trim().is_empty()
-        || binding.session_ref.chars().any(char::is_control)
-    {
+    if binding.session_ref.trim().is_empty() || binding.session_ref.chars().any(char::is_control) {
         return Err(TaskBindingError::selection_required(
             "task-bound dispatch names no admitted session",
         ));
     }
-    if binding.operation_id.trim().is_empty()
-        || binding.operation_id.chars().any(char::is_control)
+    if binding.operation_id.trim().is_empty() || binding.operation_id.chars().any(char::is_control)
     {
         return Err(TaskBindingError::selection_required(
             "task-bound dispatch names no operation identity",

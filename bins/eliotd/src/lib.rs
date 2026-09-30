@@ -2371,8 +2371,8 @@ impl DaemonComposition {
             admission: source_artifact_admission,
             profile: &profile,
         };
-        let (record, projection, payload_ref) = Box::pin(
-            bridge.retain_reconciled_result_with_source_artifact_proof(
+        let (record, projection, payload_ref) =
+            Box::pin(bridge.retain_reconciled_result_with_source_artifact_proof(
                 started,
                 source_scope_after_run,
                 candidate_identity_after_run,
@@ -2380,8 +2380,7 @@ impl DaemonComposition {
                 source_root,
                 after_run_source_proof,
                 &publisher,
-            ),
-        )
+            ))
             .await
             .map_err(CapturedLspAdoptionError::from)?;
 

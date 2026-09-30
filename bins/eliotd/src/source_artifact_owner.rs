@@ -388,11 +388,10 @@ fn validate_live_lsp_observation_binding(
                     .count()
                     == 1
         };
-    let dispatch_source_joins_request =
-        dispatch_source.is_some_and(&source_artifact_joins_request);
+    let dispatch_source_joins_request = dispatch_source.is_some_and(&source_artifact_joins_request);
     let after_run_source_joins_request = source_binding
         .and_then(|binding| binding.source_artifact_after_run.as_ref())
-        .is_none_or(&source_artifact_joins_request);
+        .is_none_or(source_artifact_joins_request);
     let source_binding_joins_invocation = source_binding.is_some_and(|binding| {
         binding.instrument_request_id == invocation_request.request_id.as_str()
             && binding.instrument_target == record.instrument_invocation.target
