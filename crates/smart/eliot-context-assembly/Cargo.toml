@@ -40,6 +40,11 @@ thiserror = "2.0.18"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eliot-governor = { path = "../../governor/eliot-governor", version = "0.1.0" }
 eliot-improvement = { path = "../../meta/eliot-improvement", version = "0.1.0" }
+# Issue #1730 W6: the delta-reconstruction caller consumes the retained
+# checkpoint request verbatim and the #1729 fence-bound revision heads, so both
+# owner crates join the host-only edge; the wasm32 guest contour is unchanged.
+eliot-agent-contracts.workspace = true
+eliot-store-api.workspace = true
 
 [dev-dependencies]
 eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }

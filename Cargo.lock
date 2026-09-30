@@ -1170,6 +1170,7 @@ dependencies = [
  "eliot-learning-contracts",
  "eliot-observation-contracts",
  "eliot-receipts",
+ "eliot-store-api",
  "serde",
  "thiserror",
 ]
