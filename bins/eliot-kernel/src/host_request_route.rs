@@ -6687,12 +6687,16 @@ impl KernelComposition {
     /// tables only — never from the host-request ledger (issue #2729).
     ///
     /// The whole scope resolves before anything mutates: every consumed
-    /// entry is bound to its admitted owner namespace first, then the
-    /// accepted batch commits in one ORS write transaction with
-    /// expected-owner/revision checks, so a mixed own/foreign batch leaves
-    /// all cursors and payloads unchanged. The Kernel's existing
-    /// transition serialization is held across resolution and commit, so
-    /// revocation between lookup and commit cannot be ignored. The reply
+    /// entry is bound to its admitted owner namespace first — with the
+    /// acknowledge right proved from the presenter's live session
+    /// occurrence, never from lineage and principal alone — then the
+    /// accepted batch commits in one ORS write transaction that re-proves
+    /// the right and rechecks the expected owner grant revision, so a
+    /// mixed own/foreign batch leaves all cursors and payloads unchanged.
+    /// The Kernel's existing transition serialization is held across
+    /// resolution and commit, and the grant revision recorded on every
+    /// frontier advance makes revocation between lookup and commit
+    /// detectable inside the transaction. The reply
     /// enumerates exactly the presenter's proven scope plus an explicit
     /// unproven-scope flag — never an empty successful inventory, never a
     /// foreign digest, cursor, or gap content. The reply digest binds the
@@ -6762,10 +6766,18 @@ impl KernelComposition {
         // Contradictory duplicates fail the whole scope before any store
         // mutation; the batch re-validates the same rule for its callers.
         reject_contradictory_consumed(&scope.consumed)?;
+        // The presenter carries the full Kernel-derived owner evidence:
+        // lineage, principal, installation, and the live session
+        // occurrence. ORS proves the acknowledgement right from this
+        // evidence against the retained creating occurrence (issue #2729,
+        // AUD2): lineage and principal alone authorize nothing.
         let presenter = serde_json::json!({
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
+            "owner_installation_id": evidence.installation_id,
             "owner_connection": evidence.connection,
+            "owner_launch_nonce": evidence.launch_nonce,
+            "owner_session_epoch": evidence.session_epoch,
         });
         let pure_read = scope.recovery_scope.is_some();
         // Resolve every consumed entry to its admitted namespace before
@@ -6805,6 +6817,11 @@ impl KernelComposition {
                     revision,
                     incarnation,
                 ));
+                // Each batch item carries the presenter's live session
+                // occurrence alongside the resolved expectation, so ORS
+                // re-proves the acknowledgement right inside the commit
+                // transaction (issue #2729, AUD3/AUD6): a grant change
+                // between this resolution and the commit fails closed.
                 batch_items.push(serde_json::json!({
                     "namespace": namespace,
                     "expected_revision": revision,
@@ -6812,6 +6829,10 @@ impl KernelComposition {
                     "sequence": sequence,
                     "owner_authority_lineage": evidence.authority_lineage,
                     "owner_principal": evidence.principal,
+                    "owner_installation_id": evidence.installation_id,
+                    "owner_connection": evidence.connection,
+                    "owner_launch_nonce": evidence.launch_nonce,
+                    "owner_session_epoch": evidence.session_epoch,
                 }));
                 // The ORS request deliberately stays at its existing closed
                 // shape. This parallel leg carries the exact stream identity
