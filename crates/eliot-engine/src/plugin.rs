@@ -108,7 +108,10 @@ impl EliotHookService {
         if !self.task_bound
             && matches!(
                 event.kind,
-                HookEventKind::PreToolUse | HookEventKind::PermissionRequest | HookEventKind::Stop
+                HookEventKind::PreToolUse
+                    | HookEventKind::PermissionRequest
+                    | HookEventKind::PreCompact
+                    | HookEventKind::Stop
             )
         {
             return Ok(allow_decision(
@@ -133,6 +136,14 @@ impl EliotHookService {
         }
     }
 
+    /// Pre-compaction gate for the task-bound session (I12.17 controlled
+    /// boundary; issue #1730).
+    ///
+    /// This gate checks hook-spool boundedness only and proves no handoff
+    /// checkpoint: an allow here is not a compaction permit. Destructive
+    /// compaction additionally requires a registered capture operation with
+    /// durable readback through the governed persistence path, which this
+    /// hook cannot observe; unbound sessions defer above and never deny.
     fn evaluate_pre_compact(
         &self,
     ) -> Result<(bool, HookProcessingStatus, Vec<HookDecisionReason>), EngineError> {
