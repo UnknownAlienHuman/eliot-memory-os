@@ -68,7 +68,7 @@ use super::input::{ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTarget
 pub fn produce_planning_view(
     view_id: ArtifactId,
     view: ActiveUnderstandingView,
-    admitted: AdmittedContextSet,
+    admitted: &AdmittedContextSet,
     canonical_bytes: Vec<u8>,
     admitted_canonical_bytes: Vec<u8>,
     route_id: &str,
@@ -81,7 +81,7 @@ pub fn produce_planning_view(
         canonical_bytes,
         admitted_canonical_bytes,
     )?;
-    view.revalidate_against_admitted(&admitted, route_id, verifier_rule_revisions)?;
+    view.revalidate_against_admitted(admitted, route_id, verifier_rule_revisions)?;
     Ok(view)
 }
 

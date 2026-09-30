@@ -223,7 +223,7 @@ impl ReactiveOwnerSupply {
                 let view = produce_planning_view(
                     view_supply.view_id,
                     view_supply.view,
-                    view_supply.admitted,
+                    &view_supply.admitted,
                     view_supply.canonical_bytes,
                     view_supply.admitted_canonical_bytes,
                     &view_supply.route_id,

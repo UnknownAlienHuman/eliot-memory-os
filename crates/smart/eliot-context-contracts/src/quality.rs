@@ -822,9 +822,7 @@ impl QualityScorecard {
                 .iter_mut()
                 .find(|result| result.dimension == invalidation.dimension)
             else {
-                return Err(ContextError::InvalidField(
-                    "quality.invalidation.dimension",
-                ));
+                return Err(ContextError::InvalidField("quality.invalidation.dimension"));
             };
             if result.invalidation.is_some() {
                 continue;

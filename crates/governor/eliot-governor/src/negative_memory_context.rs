@@ -59,8 +59,7 @@ use std::collections::BTreeMap;
 
 use eliot_context_contracts::{
     ContextBinding, QUALITY_DIMENSIONS, QUALITY_RESULT_SCHEMA_VERSION, QualityDimension,
-    QualityDimensionResult, QualityDimensionState, QualityScorecard,
-    SerializedContextMeasurement,
+    QualityDimensionResult, QualityDimensionState, QualityScorecard, SerializedContextMeasurement,
 };
 use eliot_contracts::ArtifactId;
 use eliot_dreamer_failure::{

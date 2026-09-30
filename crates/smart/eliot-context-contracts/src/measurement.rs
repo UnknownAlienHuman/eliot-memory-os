@@ -5,9 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ContextBinding, ContextError, QualityDimension, QualityDimensionResult, QualityInvalidation,
-    QualityInvalidationReason, QualityScorecard, SourceSnapshot, QUALITY_DIMENSIONS, validate_digest,
-    validate_text,
+    ContextBinding, ContextError, QUALITY_DIMENSIONS, QualityDimension, QualityDimensionResult,
+    QualityInvalidation, QualityInvalidationReason, QualityScorecard, SourceSnapshot,
+    validate_digest, validate_text,
 };
 
 /// Whether a measurement is independently qualified for capacity decisions.
@@ -146,10 +146,10 @@ impl SerializedContextMeasurement {
         // two different verifier revisions for one graded dimension.
         let mut verifier_dimensions = std::collections::BTreeSet::new();
         for (dimension, rule_revision) in &self.verifier_rule_revisions {
-            if !QUALITY_DIMENSIONS.contains(dimension)
-                || !verifier_dimensions.insert(*dimension)
-            {
-                return Err(ContextError::Duplicate("measurement.verifier_rule_revisions"));
+            if !QUALITY_DIMENSIONS.contains(dimension) || !verifier_dimensions.insert(*dimension) {
+                return Err(ContextError::Duplicate(
+                    "measurement.verifier_rule_revisions",
+                ));
             }
             validate_text(
                 rule_revision.as_str(),
@@ -292,9 +292,10 @@ impl SerializedContextMeasurement {
             // already requires the card's fence digest to equal the packet's own
             // fence, so comparing it would compare one value with a copy of
             // itself and could never fire.
-            QualityInvalidationReason::GoverningInstruction => {
-                (card.output.recipe_digest.clone(), self.recipe_digest.clone())
-            }
+            QualityInvalidationReason::GoverningInstruction => (
+                card.output.recipe_digest.clone(),
+                self.recipe_digest.clone(),
+            ),
             // The source revisions. The graded side is the source-revision set
             // the card records; the current side is the set this route read. The
             // admitted payload digest is deliberately not used on either side:
