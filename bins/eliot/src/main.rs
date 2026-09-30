@@ -3414,6 +3414,172 @@ fn revalidate_recorded_profile_selection_receipt(
     record_or_validate_profile_selection_receipt(store_path, transaction)
 }
 
+fn missing_system_service_host_root_receipt(reason: impl Into<String>) -> InstallationError {
+    InstallationError::MigrationRequired {
+        reason: reason.into(),
+    }
+}
+
+fn open_system_service_host_root(
+    expected_host_state_root: &str,
+) -> std::result::Result<ProtectedRootLease, InstallationError> {
+    let host_state_root = Path::new(expected_host_state_root);
+    ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))
+}
+
+fn ensure_system_service_host_root_receipt_before_effects(
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+    recover: bool,
+) -> std::result::Result<InstallationTransaction, InstallationError> {
+    if transaction.profile != InstallationProfile::SystemService {
+        return Ok(transaction.clone());
+    }
+
+    let candidate_host_state_root = &transaction
+        .candidate_manifest
+        .runtime_launch
+        .runtime_state_roots
+        .host_state_root;
+    let current_host_state_root = transaction
+        .current_active_manifest
+        .as_ref()
+        .map(|manifest| &manifest.runtime_launch.runtime_state_roots.host_state_root);
+    if let Some(current_host_state_root) = current_host_state_root
+        && !eliot_platform_windows::windows_paths_equal(
+            Path::new(current_host_state_root.as_str()),
+            Path::new(candidate_host_state_root.as_str()),
+        )
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+
+    if let Some(transaction_receipt) = transaction.system_service_host_root_receipt() {
+        let host_root = open_system_service_host_root(candidate_host_state_root.as_str())?;
+        transaction_receipt.validate_against(&host_root, candidate_host_state_root.as_str())?;
+
+        let first_install_preprojection = transaction.current_active_manifest.is_none()
+            && transaction.stage() == InstallationStage::Registering
+            && !transaction.has_activation_projection_intent();
+        if first_install_preprojection {
+            if recover {
+                if let Some(registry) =
+                    RedbInstallationRegistry::open_existing_at_for_preprojection(
+                        host_root,
+                        transaction_receipt,
+                        candidate_host_state_root.as_str(),
+                    )?
+                {
+                    let approved = registry.load()?;
+                    if !approved.is_uninitialized_for_system_service_bootstrap() {
+                        return Err(missing_system_service_host_root_receipt(
+                            "first-install registry has projected state before its activation intent",
+                        ));
+                    }
+                }
+            } else {
+                let registry = RedbInstallationRegistry::open_at(host_root)?;
+                let approved = registry.load()?;
+                if approved
+                    .system_service_host_root_receipt()
+                    .is_some_and(|receipt| receipt != transaction_receipt)
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                if !approved.is_uninitialized_for_system_service_bootstrap() {
+                    return Err(missing_system_service_host_root_receipt(
+                        "first-install registry has projected state before its activation intent",
+                    ));
+                }
+            }
+            return Ok(transaction.clone());
+        }
+
+        let registry = RedbInstallationRegistry::open_existing_at(host_root)?;
+        let registry = registry.ok_or_else(|| {
+            missing_system_service_host_root_receipt(
+                "SystemService registry is missing after its Host-root receipt was committed",
+            )
+        })?;
+        let approved = registry.load()?;
+        let registry_receipt = approved.system_service_host_root_receipt().ok_or_else(|| {
+            missing_system_service_host_root_receipt(
+                "existing SystemService registry has no Host-root receipt",
+            )
+        })?;
+        if registry_receipt != transaction_receipt {
+            return Err(InstallationError::IdentityConflict);
+        }
+        return Ok(transaction.clone());
+    }
+
+    if let Some(current_host_state_root) = current_host_state_root {
+        let existing_host_root = open_system_service_host_root(current_host_state_root.as_str())?;
+        let registry = RedbInstallationRegistry::open_existing_at(existing_host_root)?
+            .ok_or_else(|| {
+                missing_system_service_host_root_receipt(
+                    "SystemService update has no existing registry from which to inherit the Host-root receipt",
+                )
+            })?;
+        let registry_receipt = registry
+            .load()?
+            .system_service_host_root_receipt()
+            .cloned()
+            .ok_or_else(|| {
+                missing_system_service_host_root_receipt(
+                    "existing SystemService registry has no Host-root receipt",
+                )
+            })?;
+        drop(registry);
+
+        // `open_existing_at` retained and validated the old Host object. Reopen
+        // the exact candidate root only while preserving the copied registry
+        // receipt, then prove that it names the same object before persisting
+        // that binding on the update transaction.
+        let candidate_host_root =
+            open_system_service_host_root(candidate_host_state_root.as_str())?;
+        registry_receipt
+            .validate_against(&candidate_host_root, candidate_host_state_root.as_str())?;
+        let recorded =
+            RedbInstallationTransactionStore::bind_system_service_host_root_receipt_at_exact_path(
+                store_path,
+                &transaction.transaction_id,
+                &registry_receipt,
+                &candidate_host_root,
+            )?;
+        let recorded_receipt = recorded.system_service_host_root_receipt().ok_or_else(|| {
+            missing_system_service_host_root_receipt(
+                "SystemService update did not retain the validated registry Host-root receipt",
+            )
+        })?;
+        if recorded_receipt != &registry_receipt {
+            return Err(InstallationError::IdentityConflict);
+        }
+        recorded_receipt
+            .validate_against(&candidate_host_root, candidate_host_state_root.as_str())?;
+        return Ok(recorded);
+    }
+
+    let progressed = transaction.effect_progress().iter().any(|progress| {
+        !matches!(
+            progress.state,
+            eliot_installation::InstallationEffectProgressState::Pending
+        )
+    });
+    if progressed {
+        return Err(missing_system_service_host_root_receipt(
+            "resumed SystemService transaction has progressed effects but no original Host-root receipt",
+        ));
+    }
+
+    // Only a fresh, still-pending first install can reach the Host bootstrap
+    // prefix without an existing receipt. Its first receipt is captured from
+    // the retained root immediately after that prefix and before registry
+    // creation or projection.
+    Ok(transaction.clone())
+}
+
 #[cfg(windows)]
 fn run_portable_dev_foreground(store_path: &Path, raw_transaction_id: &str) -> Result<i32> {
     let transaction_id = match parse_installation_transaction_id(raw_transaction_id) {
@@ -3737,35 +3903,18 @@ fn verify_pending_profile_host_activation_terminal(
     let registry = RedbInstallationRegistry::inspect_existing_user_owned_at(
         host_root,
         transaction.profile,
-    )
-    .map_err(|error| {
-        InstallationError::IncompleteObservation(format!(
-            "current-user Host activation registry could not be read back: {error}"
-        ))
-    })?
+    )?
     .ok_or_else(|| {
         InstallationError::IncompleteObservation(
             "pending Host exited successfully but its current-user activation registry is absent"
                 .to_owned(),
         )
     })?;
-    let receipt = registry
-        .read_optional_committed_activation_receipt(
-            &transaction.transaction_id,
-            &transaction.installer_plan_digest,
-            &transaction.candidate_manifest.generation,
-        )
-        .map_err(|error| {
-            InstallationError::IncompleteObservation(format!(
-                "exact Host activation terminal readback failed: {error}"
-            ))
-        })?;
-    if receipt.is_none() {
-        return Err(InstallationError::IncompleteObservation(
-            "pending Host exited successfully without its exact committed activation terminal"
-                .to_owned(),
-        ));
-    }
+    registry.read_committed_activation_receipt(
+        &transaction.transaction_id,
+        &transaction.installer_plan_digest,
+        &transaction.candidate_manifest.generation,
+    )?;
     Ok(())
 }
 
@@ -4207,6 +4356,31 @@ fn run_installation_effect(
         return Ok(installation_command_exit_code(status));
     }
 
+    let preflight_transaction = match ensure_system_service_host_root_receipt_before_effects(
+        store_path,
+        &preflight_transaction,
+        recover,
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let recovery_required = installation_error_requires_recovery(&error);
+            write_installation_error(
+                match (recover, recovery_required) {
+                    (true, true) => "INSTALLATION_RECOVER_RECOVERY_REQUIRED",
+                    (true, false) => "INSTALLATION_RECOVER_ERROR",
+                    (false, true) => "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                    (false, false) => "INSTALLATION_APPLY_ERROR",
+                },
+                &format!("SystemService Host-root receipt preflight failed: {error}"),
+            );
+            return Ok(if recovery_required {
+                UNKNOWN_OUTCOME_EXIT
+            } else {
+                INVALID_REQUEST_EXIT
+            });
+        }
+    };
+
     // A response can be lost after Host has durably committed activation.  A
     // recovery command must query that exact terminal before it is allowed to
     // enter rollback; otherwise a perfectly good live generation would remain
@@ -4398,14 +4572,14 @@ fn run_installation_effect(
                         return Ok(INVALID_REQUEST_EXIT);
                     }
                 };
-                let host_root = match ProtectedRootLease::open_existing(Path::new(
-                    current
-                        .candidate_manifest
-                        .runtime_launch
-                        .runtime_state_roots
-                        .host_state_root
-                        .as_str(),
-                )) {
+                let host_state_root = current
+                    .candidate_manifest
+                    .runtime_launch
+                    .runtime_state_roots
+                    .host_state_root
+                    .clone();
+                let host_root = match ProtectedRootLease::open_existing(Path::new(&host_state_root))
+                {
                     Ok(root) => root,
                     Err(error) => {
                         // E3: the retained Host root cannot be reopened after
@@ -4423,6 +4597,64 @@ fn run_installation_effect(
                         ));
                     }
                 };
+                let recorded = match current.system_service_host_root_receipt() {
+                    Some(receipt) => {
+                        if let Err(error) = receipt.validate_against(&host_root, &host_state_root) {
+                            write_installation_error(
+                                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                                &format!(
+                                    "persisted Host-root receipt changed after bootstrap preflight: {error}"
+                                ),
+                            );
+                            return Ok(UNKNOWN_OUTCOME_EXIT);
+                        }
+                        current
+                    }
+                    None if current.current_active_manifest.is_some() => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            "SystemService update reached bootstrap without inheriting its validated registry Host-root receipt",
+                        );
+                        return Ok(UNKNOWN_OUTCOME_EXIT);
+                    }
+                    None => match RedbInstallationTransactionStore::record_system_service_host_root_receipt_at_exact_path(
+                            store_path,
+                            &transaction_id,
+                            &host_root,
+                        ) {
+                        Ok(transaction) => transaction,
+                        Err(error) => {
+                            write_installation_error(
+                                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                                &format!(
+                                    "Host bootstrap applied but its retained Host-root receipt could not be persisted before registry creation: {error}"
+                                ),
+                            );
+                            return Ok(UNKNOWN_OUTCOME_EXIT);
+                        }
+                    },
+                };
+                let recorded_root_receipt = match recorded.system_service_host_root_receipt() {
+                    Some(receipt) => receipt,
+                    None => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            "Host-root receipt persistence returned without a durable SystemService receipt",
+                        );
+                        return Ok(UNKNOWN_OUTCOME_EXIT);
+                    }
+                };
+                if let Err(error) =
+                    recorded_root_receipt.validate_against(&host_root, &host_state_root)
+                {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        &format!(
+                            "persisted Host-root receipt did not validate against the retained bootstrap root: {error}"
+                        ),
+                    );
+                    return Ok(UNKNOWN_OUTCOME_EXIT);
+                }
                 let registry = match RedbInstallationRegistry::open_at(host_root) {
                     Ok(registry) => registry,
                     Err(error) => {
@@ -4440,8 +4672,8 @@ fn run_installation_effect(
                         ));
                     }
                 };
-                let expected_revision = match registry.load() {
-                    Ok(registry) => registry.revision(),
+                let approved = match registry.load() {
+                    Ok(approved) => approved,
                     Err(error) => {
                         // E5: same durable rejection as E4 (registry unreadable
                         // after open is UNKNOWN_OUTCOME/ROLLBACK_REQUIRED).
@@ -4454,6 +4686,25 @@ fn run_installation_effect(
                         ));
                     }
                 };
+                let first_install_preprojection = recorded.current_active_manifest.is_none()
+                    && recorded.stage() == InstallationStage::Registering
+                    && !recorded.has_activation_projection_intent();
+                let registry_root_receipt = approved.system_service_host_root_receipt();
+                let valid_registry_root_binding = if first_install_preprojection {
+                    registry_root_receipt.is_none()
+                        && approved.is_uninitialized_for_system_service_bootstrap()
+                } else {
+                    registry_root_receipt == Some(recorded_root_receipt)
+                };
+                if !valid_registry_root_binding {
+                    return Ok(report_post_bootstrap_failure(
+                        &mut coordinator,
+                        &transaction_id,
+                        PostBootstrapRejectionClass::RegistryProjection,
+                        "pending registry Host-root binding is absent or does not match the persisted transaction receipt",
+                    ));
+                }
+                let expected_revision = approved.revision();
                 if let Err(error) = coordinator.stage_bootstrap_pending_activation(
                     &registry,
                     &transaction_id,
@@ -4502,6 +4753,27 @@ fn run_installation_effect(
                         &format!("pending registry projection failed: {error}"),
                     );
                     return Ok(INVALID_REQUEST_EXIT);
+                }
+                let projected_approved = match registry.load() {
+                    Ok(approved) => approved,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!(
+                                "bootstrap activation was staged but registry readback of its Host-root binding failed: {error}"
+                            ),
+                        );
+                        return Ok(UNKNOWN_OUTCOME_EXIT);
+                    }
+                };
+                if projected_approved.system_service_host_root_receipt()
+                    != Some(recorded_root_receipt)
+                {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        "bootstrap activation was staged but the registry did not retain the exact transaction Host-root receipt",
+                    );
+                    return Ok(UNKNOWN_OUTCOME_EXIT);
                 }
                 // INSTALL-WATCHDOG-APPROVAL: the staged `registry` is the sole
                 // redb writer for the installation registry. Release it (with
@@ -4644,9 +4916,23 @@ fn run_installation_effect(
                     );
                     return Ok(INVALID_REQUEST_EXIT);
                 }
+                let selection = match current.profile_selection_receipt() {
+                    Some(selection) => selection,
+                    None => {
+                        let error = InstallationError::MigrationRequired {
+                            reason: "current-user bootstrap transaction has no persisted profile selection receipt".to_owned(),
+                        };
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &error.to_string(),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
                 let registry = match RedbInstallationRegistry::open_user_owned_at(
                     host_root,
-                    preflight_transaction.profile,
+                    current.profile,
+                    selection,
                 ) {
                     Ok(registry) => registry,
                     Err(error) => {
@@ -4947,6 +5233,31 @@ fn reconcile_host_activation_terminal(
             if !eliot_platform_windows::windows_paths_equal(&canonical_root, host_state_root) {
                 return Err(InstallationError::IdentityConflict);
             }
+            let selection = transaction.profile_selection_receipt().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "current-user activation transaction has no persisted profile selection receipt"
+                        .to_owned(),
+                )
+            })?;
+            let selected_host_root = selection
+                .roots
+                .iter()
+                .find(|root| root.role == "runtime_state_roots.host_state_root")
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "persisted current-user profile selection omitted the Host root"
+                            .to_owned(),
+                    )
+                })?;
+            if host_root.identity() != selected_host_root.identity
+                || selection.owner_sid != host_root.current_user_sid()
+                || !eliot_platform_windows::windows_paths_equal(
+                    &canonical_root,
+                    &selected_host_root.canonical_path,
+                )
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
             host_root
                 .verify_stable_identity()
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
@@ -4959,13 +5270,14 @@ fn reconcile_host_activation_terminal(
             registry
         }
     };
-    let receipt = registry.read_optional_committed_activation_receipt(
+    let receipt = match registry.read_committed_activation_receipt(
         &transaction.transaction_id,
         &transaction.installer_plan_digest,
         &transaction.candidate_manifest.generation,
-    )?;
-    let Some(receipt) = receipt else {
-        return Ok(None);
+    ) {
+        Ok(receipt) => receipt,
+        Err(InstallationError::IncompleteObservation(_)) => return Ok(None),
+        Err(error) => return Err(error),
     };
     let evidence = vec![
         receipt.terminal_digest().clone(),
