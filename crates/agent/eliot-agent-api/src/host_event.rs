@@ -37,11 +37,11 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::route_receipts::CommittedRouteEvidenceRelation;
 use crate::{
     CancelReason, CancellationState, ContractError, EventCursor, EventId, ExecutionUnit,
     ProviderExecutionBinding, ProviderObservationLineage, UsageReceipt,
 };
-use crate::route_receipts::CommittedRouteEvidenceRelation;
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
     ClockReading, LowercaseSha256, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
@@ -1465,7 +1465,8 @@ impl CommittedHostEventIntake {
             (ProviderObservationLineage::SessionObservation(_), None) => Ok(()),
             (ProviderObservationLineage::ExecutionUnitObservation(_), Some(relation)) => {
                 relation.validate()?;
-                if self.envelope.admitted_route_digest.as_ref() != Some(&relation.admission_digest) {
+                if self.envelope.admitted_route_digest.as_ref() != Some(&relation.admission_digest)
+                {
                     return Err(ContractError::BindingMismatch);
                 }
                 Ok(())
