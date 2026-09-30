@@ -460,9 +460,19 @@ impl ProblemState {
                     Self::Repairing | Self::Verifying | Self::Quarantined
                 )
                 | (Self::Repairing, Self::Verifying | Self::Quarantined)
+                // A13.4 reads `→ VERIFYING → RESOLVED | ACCEPTED_RISK |
+                // SUPERSEDED | QUARANTINED`, so `superseded` is a closure
+                // decision taken while verifying, not something only a record
+                // that is already closed can be moved to. Without this edge the
+                // `SUPERSEDED` value the I13.9 `state` field enumerates is
+                // reachable only from a terminal state, which leaves the
+                // documented verifying-stage leg unreachable. `transition`
+                // still refuses `SUPERSEDED` outright, so the only path in
+                // remains `Problem::supersede`, which requires a validated
+                // replacement obligation and returns a retained record.
                 | (
                     Self::Verifying,
-                    Self::Resolved | Self::AcceptedRisk | Self::Quarantined
+                    Self::Resolved | Self::AcceptedRisk | Self::Superseded | Self::Quarantined
                 )
                 | (
                     Self::Resolved | Self::AcceptedRisk | Self::Superseded | Self::Quarantined,
