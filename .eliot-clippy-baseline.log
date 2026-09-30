@@ -1,0 +1,227 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling serde v1.0.229
+    Checking cfg-if v1.0.4
+    Checking typenum v1.20.1
+   Compiling thiserror v2.0.20
+   Compiling version_check v0.9.5
+   Compiling zmij v1.0.23
+    Checking memchr v2.8.3
+    Checking cpufeatures v0.2.17
+   Compiling serde_json v1.0.151
+    Checking itoa v1.0.18
+   Compiling getrandom v0.4.3
+   Compiling ref-cast v1.0.27
+    Checking dyn-clone v1.0.20
+   Compiling semver v1.0.28
+    Checking cpufeatures v0.3.1
+    Checking zeroize v1.9.0
+    Checking signature v3.0.0
+    Checking subtle v2.6.1
+    Checking winnow v1.0.4
+    Checking toml_writer v1.1.2+spec-1.1.0
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling libm v0.2.16
+    Checking arrayvec v0.7.8
+    Checking constant_time_eq v0.4.2
+    Checking foldhash v0.2.0
+    Checking windows-link v0.2.1
+   Compiling wasmtime-internal-core v47.0.4
+   Compiling cranelift-srcgen v0.134.4
+   Compiling log v0.4.34
+    Checking base64 v0.22.1
+   Compiling heck v0.5.0
+    Checking equivalent v1.0.2
+   Compiling redb v4.1.0
+    Checking ed25519 v3.0.0
+   Compiling cranelift-isle v0.134.4
+    Checking windows-sys v0.61.2
+    Checking windows-link v0.1.3
+   Compiling rustc_version v0.4.1
+   Compiling generic-array v0.14.7
+   Compiling hashbrown v0.17.1
+   Compiling cranelift-codegen-shared v0.134.4
+   Compiling target-lexicon v0.13.5
+    Checking allocator-api2 v0.2.21
+    Checking fnv v1.0.7
+    Checking toml_parser v1.1.3+spec-1.1.0
+   Compiling cc v1.4.6
+   Compiling cranelift-assembler-x64-meta v0.134.4
+   Compiling rustversion v1.0.23
+    Checking hashbrown v0.16.1
+    Checking windows-result v0.3.4
+    Checking windows-strings v0.4.2
+   Compiling anyhow v1.0.104
+   Compiling crc32fast v1.5.2
+    Checking arbitrary v1.4.2
+    Checking time-core v0.1.9
+    Checking rustc-hash v2.1.3
+    Checking powerfmt v0.2.0
+    Checking num-conv v0.2.2
+   Compiling curve25519-dalek v5.0.0
+    Checking bumpalo v3.20.3
+   Compiling object v0.39.1
+    Checking bitflags v2.13.2
+    Checking hybrid-array v0.4.15
+    Checking leb128fmt v0.1.0
+    Checking pin-project-lite v0.2.17
+    Checking bytes v1.12.1
+    Checking windows-threading v0.1.0
+    Checking wasm-encoder v0.252.0
+   Compiling wasmparser v0.252.0
+   Compiling wasmtime-internal-unwinder v47.0.4
+    Checking wasmtime-internal-component-util v47.0.4
+   Compiling id-arena v2.3.0
+   Compiling wasmtime-internal-cranelift v47.0.4
+   Compiling libc v0.2.189
+    Checking either v1.18.0
+   Compiling wasmtime-internal-component-macro v47.0.4
+    Checking crypto-common v0.2.2
+    Checking block-buffer v0.12.1
+    Checking cranelift-control v0.134.4
+   Compiling multiversion_no_op v1.0.0
+    Checking scopeguard v1.2.0
+    Checking simdutf8 v0.1.5
+    Checking core_detect v1.0.0
+    Checking once_cell v1.21.4
+    Checking itertools v0.14.0
+   Compiling syn v3.0.5
+   Compiling syn v2.0.119
+   Compiling blake3 v1.8.7
+    Checking digest v0.11.3
+   Compiling cranelift-assembler-x64 v0.134.4
+    Checking sha2 v0.11.0
+   Compiling cranelift-bitset v0.134.4
+    Checking uuid v1.26.1
+    Checking serde_spanned v1.1.1
+    Checking toml_datetime v1.1.1+spec-1.1.0
+    Checking deranged v0.5.8
+    Checking crypto-common v0.1.7
+    Checking block-buffer v0.10.4
+   Compiling indexmap v2.14.2
+   Compiling encoding_rs v0.8.41
+    Checking digest v0.10.7
+    Checking toml v1.1.6+spec-1.1.0
+    Checking sha2 v0.10.9
+    Checking time v0.3.55
+    Checking gimli v0.33.0
+   Compiling serde_derive_internals v0.30.0
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling pulley-macros v47.0.4
+   Compiling windows-interface v0.59.3
+   Compiling windows-implement v0.60.2
+   Compiling wasmtime-internal-versioned-export-macros v47.0.4
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.20
+   Compiling ref-cast-impl v1.0.27
+   Compiling tokio-macros v2.7.2
+   Compiling multiversion-macros v0.9.0
+   Compiling async-trait v0.1.92
+   Compiling wasmtime v47.0.4
+   Compiling pulley-interpreter v47.0.4
+   Compiling schemars_derive v1.2.2
+    Checking windows-core v0.61.2
+    Checking windows-numerics v0.2.0
+    Checking windows-future v0.2.1
+    Checking windows-collections v0.2.0
+    Checking windows v0.61.3
+    Checking multiversion v0.9.0
+    Checking ed25519-dalek v3.0.0
+    Checking cobs v0.3.0
+    Checking winapi-util v0.1.11
+    Checking socket2 v0.6.5
+    Checking mio v1.2.3
+   Compiling cranelift-codegen-meta v0.134.4
+    Checking termcolor v1.4.1
+    Checking tokio v1.53.1
+   Compiling wit-parser v0.252.0
+    Checking schemars v1.2.2
+    Checking eliot-conformance-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-conformance-contracts)
+    Checking smallvec v1.16.1
+    Checking postcard v1.1.3
+    Checking eliot-build-test-graph v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\instrument\eliot-build-test-graph)
+    Checking regalloc2 v0.15.2
+    Checking wasmtime-internal-jit-icache-coherence v47.0.4
+    Checking cranelift-entity v0.134.4
+    Checking eliot-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-contracts)
+    Checking eliot-source-assurance v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\security\eliot-source-assurance)
+    Checking eliot-integration-coverage v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-integration-coverage)
+    Checking cranelift-bforest v0.134.4
+   Compiling cranelift-codegen v0.134.4
+   Compiling wasmtime-internal-wit-bindgen v47.0.4
+    Checking eliot-windows-ipc v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\eliot-windows-ipc)
+    Checking wasmprinter v0.252.0
+    Checking eliot-receipts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-receipts)
+    Checking eliot-evidence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-evidence)
+    Checking eliot-runtime-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-runtime-contracts)
+    Checking eliot-instrument-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\instrument\eliot-instrument-api)
+    Checking eliot-agent-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\agent\eliot-agent-contracts)
+    Checking eliot-task v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-task)
+    Checking eliot-diagnostic v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\instrument\eliot-diagnostic)
+    Checking eliot-doctor-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\meta\eliot-doctor-core)
+    Checking eliot-session v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-session)
+    Checking wasmtime-environ v47.0.4
+    Checking eliot-reports v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\instrument\eliot-reports)
+    Checking eliot-security-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-security-contracts)
+    Checking eliot-epistemic-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-epistemic-contracts)
+    Checking eliot-evaluation-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-evaluation-contracts)
+    Checking eliot-memory-projection-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-memory-projection-contracts)
+    Checking eliot-learning-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-learning-contracts)
+    Checking eliot-change-monitor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-change-monitor)
+    Checking eliot-coordination v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-coordination)
+    Checking eliot-cue-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-cue-contracts)
+    Checking eliot-influence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\security\eliot-influence)
+    Checking eliot-epistemic v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-epistemic)
+    Checking eliot-cue-index v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-cue-index)
+    Checking eliot-learning-activation-assessment v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\meta\eliot-learning-activation-assessment)
+    Checking eliot-learning-delta v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-learning-delta)
+    Checking eliot-observation-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-observation-contracts)
+    Checking eliot-protocol v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-protocol)
+    Checking eliot-platform v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\kernel\eliot-platform)
+    Checking eliot-rules v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-rules)
+    Checking eliot-authority v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-authority)
+    Checking eliot-config v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-config)
+    Checking eliot-module-registry v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-module-registry)
+    Checking eliot-skills v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\surfaces\eliot-skills)
+    Checking eliot-maintenance v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-maintenance)
+    Checking eliot-budget v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-budget)
+    Checking eliot-process v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\kernel\eliot-process)
+    Checking eliot-platform-windows v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\kernel\eliot-platform-windows)
+    Checking eliot-agent-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\agent\eliot-agent-api)
+    Checking eliot-problem v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-problem)
+    Checking eliot-observation v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-observation)
+    Checking eliot-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\kernel\eliot-runtime)
+    Checking eliot-wasm-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\modules\eliot-wasm-runtime)
+    Checking eliot-instrument-nextest v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\instrument\eliot-instrument-nextest)
+    Checking eliot-verifier v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\instrument\eliot-verifier)
+    Checking eliot-process-executor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\instrument\eliot-process-executor)
+    Checking eliot-context-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-context-contracts)
+    Checking eliot-bootstrap v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\foundation\eliot-bootstrap)
+    Checking eliot-testd-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\instrument\eliot-testd-core)
+    Checking cranelift-native v0.134.4
+    Checking cranelift-frontend v0.134.4
+    Checking eliot-workscope v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-workscope)
+    Checking eliot-reactive-context-plan v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-reactive-context-plan)
+    Checking eliot-dreamer-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-dreamer-contracts)
+    Checking eliot-context-candidates v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-context-candidates)
+    Checking eliot-context-measurement v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-context-measurement)
+    Checking eliot-store-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\storage\eliot-store-api)
+    Checking eliot-ors v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\kernel\eliot-ors)
+    Checking eliot-canonical v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-canonical)
+    Checking eliot-skill v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-skill)
+    Checking eliot-read v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-read)
+    Checking eliot-finish v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-finish)
+    Checking eliot-dreamer-failure v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-dreamer-failure)
+    Checking eliot-kernel-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\kernel\eliot-kernel-core)
+    Checking eliot-mcp v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\surfaces\eliot-mcp)
+    Checking eliot-governor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\governor\eliot-governor)
+    Checking eliot-improvement v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\meta\eliot-improvement)
+    Checking eliot-context-admission v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-context-admission)
+    Checking eliot-context-assembly v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\crates\smart\eliot-context-assembly)
+    Checking eliot-wasm-host v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-2787-base\bins\eliot-wasm-host)
+bins\eliot-wasm-host\src\dispatch_drive.rs:935:13: error: very complex type used. Consider factoring parts into `type` definitions
+bins\eliot-wasm-host\src\parent_dispatch.rs:29:13: error: very complex type used. Consider factoring parts into `type` definitions
+error: could not compile `eliot-wasm-host` (lib) due to 2 previous errors
