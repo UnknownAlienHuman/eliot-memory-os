@@ -3697,6 +3697,8 @@ impl KernelComposition {
         contour: &DaemonSupervisionContour,
         now_ms: u64,
         kernel_artifact_sha256: &str,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         let lease_id = contour.incarnation.supervision_lease_id.as_str();
         let current =
@@ -3752,7 +3754,13 @@ impl KernelComposition {
                 binding,
             })?
         };
-        let renewed = authority.commit_active(&stage.ticket)?;
+        let renewed = match authority.commit_active_in_context(&stage.ticket, context) {
+            Ok(renewed) => renewed,
+            Err(error) => {
+                *terminal_owned = true;
+                return Err(error);
+            }
+        };
         authority.verify_active_snapshot(&renewed, lease_id, now_ms)?;
         if renewed.record.revision <= current.record.revision
             || !supervision_binding_matches_contour(&renewed.record.binding, contour)?
@@ -3872,6 +3880,8 @@ impl KernelComposition {
         policy: &DaemonSupervisionRenewalPolicy,
         now_ms: u64,
         kernel_artifact_sha256: &str,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<
         (
             SupervisionLeaseSnapshot,
@@ -3880,7 +3890,6 @@ impl KernelComposition {
         ),
         SupervisionProgressRenewalError,
     > {
-        let context = daemon_progress_operation_context(request);
         let lease_id = contour.incarnation.supervision_lease_id.as_str();
         let current_snapshot =
             authority
@@ -3898,12 +3907,15 @@ impl KernelComposition {
             // failure replaces the refusal with the fenced authority error
             // and is retried on the next tick through the staged-ticket
             // resume.
-            authority.expire_past_due_lease_in_context(
+            if let Err(error) = authority.expire_past_due_lease_in_context(
                 lease_id,
                 &contour.state_fence,
                 now_ms,
-                &context,
-            )?;
+                context,
+            ) {
+                *terminal_owned = true;
+                return Err(error.into());
+            }
             return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
         }
         authority.verify_active_snapshot(&current_snapshot, lease_id, now_ms)?;
@@ -3915,7 +3927,7 @@ impl KernelComposition {
         }
         let current = daemon_supervision_current_state(&current_snapshot, contour, progress)?;
         let decision = Self::decide_daemon_supervision_progress_renewal(
-            request, &current, progress, policy, now_ms, &context,
+            request, &current, progress, policy, now_ms, context,
         )?;
         if decision.outcome != DaemonSupervisionRenewalOutcome::Renewed {
             let receipt = daemon_renewal_receipt_for_decision(&decision, None, None)?;
@@ -3966,10 +3978,11 @@ impl KernelComposition {
                 binding,
             })?
         };
-        let renewed = match authority.commit_active_in_context(&stage.ticket, &context) {
+        let renewed = match authority.commit_active_in_context(&stage.ticket, context) {
             Ok(renewed) => renewed,
             Err(error) => {
-                progress.note_reconciliation_pending_in_context(&context);
+                progress.note_reconciliation_pending_in_context(context);
+                *terminal_owned = true;
                 return Err(error.into());
             }
         };
@@ -3978,14 +3991,14 @@ impl KernelComposition {
             || renewed.record.revision <= current_snapshot.record.revision
             || !supervision_binding_matches_contour(&renewed.record.binding, contour)?
         {
-            progress.note_reconciliation_pending_in_context(&context);
+            progress.note_reconciliation_pending_in_context(context);
             return Err(SupervisionLeaseAuthorityError::Ors(
                 OrsError::SupervisionLeaseBindingMismatch,
             )
             .into());
         }
         progress.record_renewed_in_context(
-            &context,
+            context,
             &request.observation,
             observation_sha256,
             successor_revision,
@@ -4050,6 +4063,8 @@ impl KernelComposition {
         process: &ProcessStartReceipt,
         ready: &EliotdLiveReadyEvidence,
         head: &SupervisionLeaseSnapshot,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<Option<(SupervisionLeaseSnapshot, EliotdLiveReceipt)>, KernelServiceError> {
         let (observation, progress_state) = self
             .daemon_runtime
@@ -4128,6 +4143,8 @@ impl KernelComposition {
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             unix_ms(),
             kernel_artifact_sha256,
+            context,
+            terminal_owned,
         );
         let put_back = |progress: DaemonSupervisionProgressState,
                         expired: Option<bool>|
@@ -4188,9 +4205,11 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    fn renew_daemon_supervision_for_probe(
+    fn renew_daemon_supervision_for_probe_in_context(
         &self,
         request: &KernelControlRequest,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<(SupervisionLeaseSnapshot, EliotdLiveReceipt), KernelServiceError> {
         let (contour, process, ready) = {
             let state = self.daemon_runtime.lock().map_err(|_| {
@@ -4268,9 +4287,18 @@ impl KernelComposition {
             // exact-fence generation retirement. A fenced authority failure
             // refuses the probe closed and is retried on the next probe
             // through the staged-ticket resume.
-            authority
-                .expire_past_due_lease(lease_id, &contour.state_fence, now_ms)
-                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+            if authority
+                .expire_past_due_lease_in_context(
+                    lease_id,
+                    &contour.state_fence,
+                    now_ms,
+                    context,
+                )
+                .is_err()
+            {
+                *terminal_owned = true;
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
         }
         authority
             .verify_active_snapshot(&before, lease_id, now_ms)
@@ -4286,7 +4314,16 @@ impl KernelComposition {
         let _ =
             self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&before))?;
         let (renewed, published) = if let Some(pair) = self
-            .progress_renewal_for_probe(authority, &contour, &launch, &process, &ready, &before)?
+            .progress_renewal_for_probe(
+                authority,
+                &contour,
+                &launch,
+                &process,
+                &ready,
+                &before,
+                context,
+                terminal_owned,
+            )?
         {
             pair
         } else {
@@ -4299,6 +4336,8 @@ impl KernelComposition {
                 self.kernel_artifact_sha256
                     .as_deref()
                     .ok_or(KernelServiceError::ReadinessNotProven)?,
+                context,
+                terminal_owned,
             )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
             let published = self.publish_eliotd_live_receipt(
