@@ -4967,6 +4967,39 @@ impl KernelStoreGateway {
         Ok(Some(phase.1))
     }
 
+    /// Makes one schedule owner's own acknowledgement the durable retained body
+    /// of the horizon obligation it answers.
+    ///
+    /// The acknowledgement is tied to the exact request twice before it is
+    /// retained: once as this owner's answer to this publication, and once as an
+    /// answer shape this obligation may durably hold. Either refusal returns its
+    /// typed reason and writes nothing, leaving the record reconciling rather
+    /// than retaining a horizon that cannot be tied to the request that asked
+    /// for it. Retaining the answer is the last step, and it is the only step
+    /// that changes the durable record: a failure to retain it is reported as a
+    /// reason, never as a partial acknowledgement.
+    fn settle_wake_horizon_acknowledgement(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+        publication: &UserAutomationWakeHorizonPublication,
+        acknowledgement: &UserAutomationWakePublication,
+    ) -> Result<UserAutomationRuntimeObligationDisposition, String> {
+        acknowledgement
+            .validate_for(publication)
+            .map_err(|error| error.to_string())?;
+        let answer = UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+            publication_request: Some(Box::new(publication.clone())),
+            acknowledgement: Box::new(acknowledgement.clone()),
+        };
+        answer
+            .validate_horizon_for(publication)
+            .map_err(|error| error.to_string())?;
+        self.retain_user_automation_obligation_answer(obligation, &answer)?;
+        Ok(UserAutomationRuntimeObligationDisposition::Answered {
+            answer: Box::new(answer),
+        })
+    }
+
     /// Issues one bounded wake horizon under a durably routed obligation and
     /// returns the obligation's final disposition beside the horizon phase the
     /// schedule owner produced.
@@ -4981,6 +5014,10 @@ impl KernelStoreGateway {
     /// and a lost response all leave an obligation that must be reconciled under
     /// its original owner operation identity, because a later read of the
     /// committed configuration is empty of the effect either way.
+    ///
+    /// The `Unavailable` arm is the one that pays for that rule with real
+    /// availability, and it documents its own lumped producers rather than
+    /// leaving a reader to assume a clean no-send.
     async fn issue_wake_horizon<R>(
         &self,
         obligation: &UserAutomationRuntimeObligation,
@@ -5035,29 +5072,20 @@ impl KernelStoreGateway {
         }
         match UserAutomationWakePort::publish_wake_horizon(runtime, publication.clone()).await {
             Ok(acknowledgement) => {
-                acknowledgement
-                    .validate_for(publication)
-                    .map_err(|error| error.to_string())?;
-                let answer = UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
-                    publication_request: Some(Box::new(publication.clone())),
-                    acknowledgement: Box::new(acknowledgement.clone()),
+                settled.disposition = match self.settle_wake_horizon_acknowledgement(
+                    obligation,
+                    publication,
+                    &acknowledgement,
+                ) {
+                    Ok(disposition) => disposition,
+                    Err(reason) => {
+                        reconcile(&reason);
+                        return Ok((
+                            settled,
+                            unreached(UnreachedHorizonKind::UnknownOutcome, &reason),
+                        ));
+                    }
                 };
-                answer
-                    .validate_horizon_for(publication)
-                    .map_err(|error| error.to_string())?;
-                settled.disposition =
-                    match self.retain_user_automation_obligation_answer(obligation, &answer) {
-                        Ok(()) => UserAutomationRuntimeObligationDisposition::Answered {
-                            answer: Box::new(answer),
-                        },
-                        Err(reason) => {
-                            reconcile(&reason);
-                            return Ok((
-                                settled,
-                                unreached(UnreachedHorizonKind::UnknownOutcome, &reason),
-                            ));
-                        }
-                    };
                 Ok((
                     settled,
                     acknowledged_horizon_phase(
@@ -5067,12 +5095,35 @@ impl KernelStoreGateway {
                     )?,
                 ))
             }
-            // The record is already durably `Routed`, which says the owner MAY
-            // have retained this slice. An owner that answers `Unavailable`
-            // after that point therefore does not restore the "never handed
-            // over" proof the record used to carry, so the obligation is
-            // reported under its original identity as unresolved and is never
-            // re-published from this contour.
+            // `Unavailable` is a LUMPED owner answer, NOT a "nothing was sent"
+            // proof, and this branch must not read it as one. It is produced
+            // both by a contour that never engaged a transport at all (the
+            // `UserAutomationWakePort::publish_wake_horizon` trait default in
+            // `user_automation_execution.rs`) and, on the composed Host route,
+            // from inside an ALREADY-ISSUED publication. The Host wake adapter's
+            // `map_journal_error` collapses `JournalError::Synchronization`,
+            // `BackendError::Unavailable`, `BackendError::PlanGap` and the
+            // explicitly indeterminate `BackendError::Unknown` into
+            // `Unavailable`, and that one mapping fires both on the
+            // per-occurrence journal append and on the post-append
+            // acknowledgement readback, so a horizon whose every occurrence was
+            // already retained can still answer `Unavailable`. Those answers
+            // return as `UserAutomationHostExecutionFailure::Unavailable` and are
+            // mapped back by `UserAutomationHostExecutionClient`, i.e. after a
+            // complete authenticated round trip.
+            //
+            // The lump therefore cannot be split here. Reading it as clean
+            // absence would re-open exactly the double-publish window issue
+            // #2970 closes, and the record is already durably `Routed`, so the
+            // obligation is reported unresolved under its original identity.
+            //
+            // The availability cost is real and is not hidden: an answer from
+            // the never-engaged default IS provably never-sent, yet it is not
+            // retryable from this contour. `UserAutomationRuntimeError` has no
+            // value that separates "owner absent" from "owner's own state
+            // unreadable or its write indeterminate", so the honest resolution
+            // is to split that vocabulary on the owner's error contract, not to
+            // infer a narrower meaning here. Tracked as a named follow-up.
             Err(UserAutomationRuntimeError::Unavailable(reason)) => {
                 let detail = unretained_horizon_outcome_reason(
                     &publication.automation_revision,
