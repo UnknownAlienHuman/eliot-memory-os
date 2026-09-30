@@ -8,8 +8,8 @@ use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence
 use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
     EliotActivationRecord, EpochTransition, FailureRecoveryDirective, HostInstallationEpoch,
-    HostKernelStoreLineage, HostState, HostStateJournalService, HostStateRecord,
-    JOURNAL_VERSION, JournalBackend, JournalError, JournalManifest, KernelJobBinding,
+    HostKernelStoreLineage, HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION,
+    JournalBackend, JournalError, JournalManifest, KernelJobBinding,
     KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps, PriorKernelDisposition,
     PriorKernelSource, ReadinessEvidence, ReconcileOutcome, WakeDisposition, record_checksum,
 };
