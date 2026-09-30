@@ -836,11 +836,12 @@ mod authority_revocation_tests {
     use super::*;
     use eliot_authority::{
         AuthoritySet, CapabilityGrant, EffectAuthorizer, GrantGraph, GrantId, GrantStatus,
-        LogicalTime, PrincipalRef,
+        LogicalTime, PrincipalRef, RevocationOperationIdentity,
     };
     use eliot_contracts::{
-        ClockReading, ContractId, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
-        ResourceGeneration, SessionId, SourceId, StateFence,
+        ClockReading, ContractId, EpochId, EpochLineageId, ProductId, ReceiptId, RequestId,
+        RequestMetadata, ResourceGeneration, SessionId, SourceId, StateFence, TaskId,
+        TransactionSequence,
     };
     use eliot_receipts::RequestBinding;
     use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
@@ -859,6 +860,30 @@ mod authority_revocation_tests {
         )
         .expect("epoch");
         StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"))
+    }
+
+    /// The admitted revocation operation identity the history-bound restore is
+    /// handed alongside its evidence. `AuthorityOwner` holds no plan, scope
+    /// binding or Store readback of its own, so it derives none of these five
+    /// coordinates; a fixture must hand it one that survives
+    /// [`RevocationOperationIdentity::admit`] — every text coordinate non-blank
+    /// and a causal `transaction_sequence` present. It reuses this module's own
+    /// principal, scope and naming family, and no test asserts anything about
+    /// this value.
+    fn operation() -> RevocationOperationIdentity {
+        RevocationOperationIdentity::admit(
+            "principal:root",
+            TaskId::new("task:governor-revocation-1").expect("task id"),
+            GOVERNOR_ORDERING_SCOPE,
+            ReceiptId::new("receipt-revoke-1").expect("receipt id"),
+            ClockReading {
+                valid_time_ms: Some(1_000),
+                known_time_ms: Some(1_000),
+                transaction_sequence: Some(TransactionSequence::genesis()),
+                monotonic_ns: None,
+            },
+        )
+        .expect("fixture revocation operation identity is admitted")
     }
 
     fn identity(fence: &StateFence) -> RequestIdentity {
@@ -1127,6 +1152,7 @@ mod authority_revocation_tests {
             &snapshot,
             &fence,
             Some(&evidence),
+            &operation(),
         )
         .expect("current evidence restores");
         let suppressed: Vec<&str> = outcome
@@ -1169,7 +1195,13 @@ mod authority_revocation_tests {
         let fence = fence();
         let snapshot = owner_snapshot(&fence);
         assert!(
-            AuthorityOwner::from_snapshot_with_revocation_history(&snapshot, &fence, None).is_err(),
+            AuthorityOwner::from_snapshot_with_revocation_history(
+                &snapshot,
+                &fence,
+                None,
+                &operation()
+            )
+            .is_err(),
             "missing history blocks restoration"
         );
         let evidence =
@@ -1186,7 +1218,8 @@ mod authority_revocation_tests {
             AuthorityOwner::from_snapshot_with_revocation_history(
                 &snapshot,
                 &other_fence,
-                Some(&evidence)
+                Some(&evidence),
+                &operation()
             )
             .is_err(),
             "stale fence blocks restoration"
