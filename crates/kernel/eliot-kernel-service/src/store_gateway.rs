@@ -103,7 +103,8 @@ use crate::{
     AuthenticatedMaintenanceTriggerSession, CanonicalUserAutomationStore, EbpCanonicalStoreClient,
     EbpStoreTransport, KernelService, KernelServiceError, MaintenanceTriggerClaimRequest,
     MaintenanceTriggerDeliveryError, MaintenanceTriggerDeliveryLedger,
-    MaintenanceTriggerDeliveryRow, StoreClientFault, StoreClientFaultHarness,
+    MaintenanceTriggerDeliveryRow, MaintenanceTriggerRedeliveryOutcome, StoreClientFault,
+    StoreClientFaultHarness,
     UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
     UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationMutationResult,
     UserAutomationOperatorTransition, UserAutomationOwnerLookup, UserAutomationOwnerSnapshot,
@@ -117,7 +118,8 @@ use crate::{
     handle_maintenance_trigger_pending_page, handle_maintenance_trigger_release_expired,
     handle_maintenance_trigger_replacement_pending_set, handle_maintenance_trigger_revocation,
     handle_maintenance_trigger_supersession, recover_maintenance_trigger_commit,
-    replay_maintenance_trigger_after_crash, run_now_wake_read_request,
+    redeliver_after_timeout, replay_maintenance_trigger_after_crash,
+    revoke_consumer_and_surface_pending, run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
@@ -1804,6 +1806,39 @@ impl KernelStoreGateway {
         Ok(ledger.durable_rows())
     }
 
+    /// Reclaims one timed-out claim through owner-mediated redelivery (issue
+    /// #1694).
+    ///
+    /// One owner transition under both guards: the expired claim is released
+    /// under the same trigger identity, then either one fresh finite claim is
+    /// issued from the presented request or, when a decision is already
+    /// committed, its receipt is returned for acknowledgement without
+    /// repeating the downstream effect. Holding the ledger across
+    /// release-then-reclaim admits no interleaving concurrent claim between
+    /// the two steps. The session is bound from live authority inside the
+    /// composed arm under the service guard. Redelivery never mints a new
+    /// trigger ID; a stale deadline fails at issuance and the row stays open
+    /// under its existing disposition. The returned rows are the durable
+    /// snapshot after this transition.
+    pub fn redeliver_maintenance_trigger_after_timeout(
+        &self,
+        principal_ref: &str,
+        request: MaintenanceTriggerClaimRequest,
+        now_unix_ms: u64,
+    ) -> Result<
+        (
+            MaintenanceTriggerRedeliveryOutcome,
+            Vec<MaintenanceTriggerDeliveryRow>,
+        ),
+        MaintenanceTriggerDeliveryError,
+    > {
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        let outcome =
+            redeliver_after_timeout(&service, principal_ref, &mut ledger, request, now_unix_ms)?;
+        Ok((outcome, ledger.durable_rows()))
+    }
+
     /// Enumerates one bounded pending page from the owned delivery ledger
     /// (issue #1694).
     ///
@@ -2038,6 +2073,44 @@ impl KernelStoreGateway {
             mirror_recovered,
             now_unix_ms,
         )
+    }
+
+    /// Revokes one daemon generation/session and surfaces the bounded pending
+    /// set to its replacement (issue #1694).
+    ///
+    /// One owner transition under both guards: revocation comes first —
+    /// pending claims return under the same identity, committed rows move to
+    /// `Reconciling` with receipts preserved, and every later old-generation
+    /// claim or ack fails — then the mirror-gated bounded pending set is
+    /// surfaced, so reconciliation can never be claimed complete before the
+    /// mirrors are rebuilt. The session is bound from live authority inside
+    /// the composed arm under the service guard. Ordinary pending debt
+    /// acquires no runtime lease here. The returned rows are the durable
+    /// snapshot after the revocation; the page is the replacement's bounded
+    /// pending set.
+    pub fn revoke_maintenance_trigger_consumer_and_surface_pending(
+        &self,
+        principal_ref: &str,
+        revocation: MaintenanceTriggerRevocation,
+        continuation: Option<&str>,
+        mirror_recovered: bool,
+        now_unix_ms: u64,
+    ) -> Result<
+        (MaintenanceTriggerPage, Vec<MaintenanceTriggerDeliveryRow>),
+        MaintenanceTriggerDeliveryError,
+    > {
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        let page = revoke_consumer_and_surface_pending(
+            &service,
+            principal_ref,
+            &mut ledger,
+            revocation,
+            continuation,
+            mirror_recovered,
+            now_unix_ms,
+        )?;
+        Ok((page, ledger.durable_rows()))
     }
 
     /// Records terminal expiry for a past-window trigger (issue #1694).
