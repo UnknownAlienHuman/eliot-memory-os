@@ -9,10 +9,7 @@
 //!
 //! # The evidence is a real observation this daemon already made
 //!
-//! There are TWO such sources, both real, and the maintenance decision is the
-//! one every arm used before #1867 W2/A1 added the second.
-//!
-//! The maintenance evidence source is the daemon's OWN live
+//! The single evidence source is the daemon's OWN live
 //! [`eliot_maintenance::AutomationTriggerDecision`] produced by
 //! [`crate::DaemonComposition::evaluate_maintenance_trigger`]
 //! (`maintenance_trigger_evaluator.rs::DaemonComposition::evaluate_maintenance_trigger`),
@@ -21,13 +18,6 @@
 //! `decision` and `admits_job`, and is bound to the observed evidence
 //! references the trigger site passed in. Nothing here invents an observation:
 //! every ref below is derived from that decision's own fields.
-//!
-//! The second is the newest committed
-//! [`eliot_governor::CanonicalLearningDeltaStore`] record this process holds
-//! ([`crate::DaemonComposition::learning_closure`]), and it is consulted on
-//! every pass rather than only when the maintenance decision says so. It is the
-//! second A1 disjunct's source and is described under "The second A1 disjunct
-//! is live" below.
 //!
 //! The evidence source is DERIVED from that decision's own closed fields by
 //! [`maintenance_evidence_source`], not asserted. It previously claimed
@@ -46,43 +36,12 @@
 //! [`conformance_diagnosis_evidence`] below and enters the funnel through the
 //! Self-Quality conformance-diagnosis contract.
 //!
-//! # The second A1 disjunct is live: a real recorded repeated failure
-//!
-//! A1 reads "A real conformance diagnosis **or real repeated verifier
-//! failure** produces a durable deduplicated improvement candidate and a brief
-//! containing the stated evidence, risk, benefit, owner, cost, reversible next
-//! step, and unknowns." The first disjunct is reached through
-//! [`conformance_diagnosis_evidence`]. The second is reached through
-//! [`repeated_failure_evidence`], which is selected by
-//! [`recorded_repeated_failure`] on the newest committed learning-closure
-//! record's OWN derived `consequential_boundary` — so a real repeated failure
-//! signature this daemon observed and committed now produces the same durable
-//! deduplicated candidate and the same eight-field brief through the same
-//! [`assemble_improvement_artifact`] path, with no new write seam, store client
-//! or durability scheme.
-//!
-//! What that arm is NOT is stated where it is written, not here, because the
-//! two facts are easy to conflate and only one of them is true: it is the
-//! funnel's own validated evidence constructor over the record's own content,
-//! NOT a `diagnose_self_quality` diagnosis. `diagnose_self_quality` and
-//! `route_owner` still have no production caller, for BOTH A1 disjuncts, and the
-//! four unowned [`SelfQualityInput`](eliot_self_quality::SelfQualityInput) field
-//! groups plus the independent-denominator requirement that block them are
-//! enumerated on [`recorded_repeated_failure`] with the `git grep` evidence. The
-//! unblocking symbol is `ProductContractRef` (or an owner record this daemon can
-//! read a self-quality policy, evidence-ceilings triple, and observation
-//! window/binding from); until one exists, manufacturing the input would be
-//! fabricating the observation the diagnosis is supposed to read.
-//!
 //! # What is still NOT connected, measured rather than asserted
 //!
 //! W2 also names attempts/evaluators, campaign closure, security incidents,
 //! accepted implementation deviations, complaints, Watchdog, Dreamer and
-//! Concilium suggestions. On this tree the first is now reachable through the
-//! recorded repeated-failure signature described above (it is the
-//! `EvidenceSource::Attempt` residual arm, whose content the closure record
-//! supplies whenever one exists), the conformance diagnosis is reachable, and
-//! the rest are not; the reasons are recorded per-arm on
+//! Concilium suggestions. On this tree only the first and the conformance
+//! diagnosis are reachable, and the reasons are recorded per-arm on
 //! [`maintenance_evidence_source`]: a family census shows the only families any
 //! production trigger site can name are [`crate::SELF_OBSERVED_FAMILY`] and
 //! `MaintenanceFamily::DonorConformance`, so every other source needs a
@@ -91,6 +50,100 @@
 //! receipt and trigger site that would make it live; Watchdog, Dreamer and
 //! Concilium have no arm and are annotated as such. None is filled from a
 //! substitute value.
+//!
+//! # A1's SECOND disjunct has no honest producer, and the arm is NOT written
+//!
+//! A1 reads "A real conformance diagnosis **or real repeated verifier
+//! failure** produces a durable deduplicated improvement candidate and a brief
+//! containing the stated evidence, risk, benefit, owner, cost, reversible next
+//! step, and unknowns." The FIRST disjunct is live through
+//! [`conformance_diagnosis_evidence`]. The SECOND has no arm here, deliberately,
+//! and this section records why so the next owner does not re-derive it and
+//! re-introduce a dead one.
+//!
+//! ## The signal exists at the closure seam and is DISCARDED before it persists
+//!
+//! The Governor's learning-closure owner derives the repeated-failure signal
+//! correctly. `observed_activities` emits
+//! `LifecycleActivity::RepeatedFailureSignature` exactly when the durable
+//! terminal job row is `TestdJobState::Failed` AND its physical attempt count
+//! exceeds one (`crates/governor/eliot-governor/src/learning_closure.rs:582-588`),
+//! and `derive_boundaries` refuses an ordinary read and an empty activity set
+//! first (`:483-491`). So the signal is real.
+//!
+//! It is then collapsed, and the collapse is what makes it unreachable here:
+//!
+//! 1. `close_attempt` persists `boundaries[0]`
+//!    (`learning_closure.rs:492-495`) — "The first derived boundary in the closed
+//!    nine-value order names the record". `derive_boundaries` returns
+//!    `ConsequentialBoundary::ALL` order (`crates/smart/eliot-learning-delta/src/
+//!    boundary.rs:233-236`), where `VerifierOutcome` is index 1 and
+//!    `RepeatedFailureSignature` is index 3 (`boundary.rs:49-58`).
+//! 2. `verifier_finished` is ALWAYS true on the production path.
+//!    `observed_activities` is called with
+//!    `fact.verification_run.finished_at.is_some()`
+//!    (`learning_closure.rs:854-859`), the only production construction of a
+//!    canonical `VerificationRun` is `evaluate_testd_verification_current` →
+//!    `eliot_verifier::evaluate_current`, which hardcodes `finished_at: Some(…)`
+//!    (`crates/instrument/eliot-verifier/src/lib.rs:838`), and
+//!    `read_verifier_execution_fact` returns `Err` when the fact is ABSENT
+//!    (`crates/governor/eliot-governor/src/composition.rs:3212-3221`), so
+//!    `close_attempt_learning` errors out rather than committing with a
+//!    `verifier_finished` of `false`.
+//! 3. `observed_activities` never pushes `MaterialImplementationAttempt` (index
+//!    0), so nothing sorts before the always-present `VerifierOutcome`.
+//!
+//! Therefore `boundaries[0] == VerifierOutcome` for EVERY committed record, and
+//! `StoredLearningDelta::consequential_boundary` is always `"verifier_outcome"`.
+//! A TestD job with `attempts = 3`, `state = Failed` and a real nextest receipt
+//! still commits `"verifier_outcome"`. An arm comparing that field against
+//! `"repeated_failure_signature"` can never fire on any production input.
+//!
+//! ## The record also cannot express FAILURE, which is the second half of the gap
+//!
+//! Even a persisted `RepeatedFailureSignature` would not be enough for a
+//! "repeated VERIFIER FAILURE" claim, because the record does not carry the
+//! verifier's verdict. The run's `outcome` is consumed by
+//! `close_disposition_for` (`learning_closure.rs:607-633`) and only its
+//! three-value `AttemptCloseDisposition` reaches `StoredLearningDelta::disposition`
+//! via `as_stored()`; on the production path `derived` is hardcoded `false`
+//! (`learning_closure.rs:866`), so a conclusive run closes as `INVALID_EVIDENCE`
+//! and a non-conclusive one as `INCONCLUSIVE`. Neither distinguishes
+//! `VerificationOutcome::Pass` from `VerificationOutcome::Fail`, which is the same
+//! fact A1's second disjunct names. The record's `evidence_refs` carry the
+//! verifier run id and raw artifacts (`learning_closure.rs:663-676`) but no
+//! verdict, and `strategy_fingerprint` is computed from plan and invocation
+//! binding alone (`:641-659`), so neither can be read as one.
+//!
+//! ## What the fix needs, and why it is not in this file
+//!
+//! Two changes in `crates/governor/eliot-governor/src/learning_closure.rs`,
+//! neither of which this module may make:
+//!
+//! 1. persist the derived boundary SET rather than `boundaries[0]`, so
+//!    `RepeatedFailureSignature` survives onto `StoredLearningDelta`; and
+//! 2. carry the verifier's `Pass`/`Fail` verdict onto the record, so a consumer
+//!    can tell a repeated failure from a repeated success.
+//!
+//! `StoredLearningDelta` has one `consequential_boundary` field
+//! (`crates/smart/eliot-learning-delta/src/stored.rs:214`), so (1) is a contract
+//! change in that crate as well, not a field this dispatch layer can add.
+//!
+//! ## What is deliberately NOT done here
+//!
+//! No arm, no match pattern, and no `EvidenceSource::Attempt` relabelling stands
+//! in for the missing signal. The three available substitutes were each measured
+//! and each rejected: comparing the collapsed boundary is dead on arrival (above);
+//! deriving failure from `disposition` cannot separate `Pass` from `Fail`; and
+//! reading a verdict out of `evidence_refs` would name a verifier the record
+//! never names, which is the misattribution this file exists to remove.
+//!
+//! The correct label once (1) and (2) exist is [`EvidenceSource::EvaluatorVerdict`],
+//! through the existing `eliot_improvement::sourced_evidence_from_repeated_verifier_failure`
+//! (`crates/meta/eliot-improvement/src/evidence_sources.rs:118-142`), which
+//! already exists, is the closed set's own spelling for a verifier verdict, and
+//! currently has no caller. It is not wired speculatively against a record that
+//! cannot yet carry what it needs.
 //!
 //! The decision now also carries its origin —
 //! [`eliot_maintenance::AutomationTriggerDecision::trigger`] is copied verbatim
@@ -499,21 +552,6 @@ const IMPROVEMENT_CANDIDED_VALUE: f64 = 1.0;
 /// distinguishes one observation from another.
 const IMPROVEMENT_CAMPAIGN: &str = "eliotd.maintenance.improvement";
 
-/// The `ConsequentialBoundary` spelling that names a repeated failure
-/// signature, matched against a committed closure record's OWN recorded
-/// boundary.
-///
-/// It is the owner's canonical `as_str()` output for
-/// `ConsequentialBoundary::RepeatedFailureSignature`
-/// (`crates/smart/eliot-learning-delta/src/boundary.rs:67`), and it is spelled
-/// here because `eliotd` has no `eliot-learning-delta` edge, so the boundary
-/// type cannot be named at this call site — the same by-inference read
-/// `SafeBoundary::from_observed_closure` performs on the same field. It is
-/// compared for EXACT equality, so no other boundary of the closed nine-value
-/// vocabulary can satisfy it. See [`recorded_repeated_failure`] for what the
-/// match proves and for the reason it fails safe.
-const REPEATED_FAILURE_SIGNATURE: &str = "repeated_failure_signature";
-
 /// The independent evaluator that must verify any experiment the maintenance
 /// admission owner releases one of these candidates to.
 ///
@@ -569,10 +607,7 @@ pub enum ImprovementDispatchError {
 /// One assembled, owner-actionable improvement artifact over a real
 /// observation, ready to be made durable.
 ///
-/// Every field is a function of the observation this pass actually made: the
-/// maintenance trigger decision for the two maintenance arms, or the newest
-/// committed learning-closure record when it carries a real recorded
-/// repeated-failure signature ([`recorded_repeated_failure`]). The
+/// Every field is a function of the observed maintenance decision, and the
 /// `ImprovementBrief` carries the exact content I12.24:74 requires a decision
 /// owner to read (problem, evidence, likely benefit, risk, proposed owner,
 /// cost, next reversible step, unknowns) — so that content needs no raw-metric
@@ -596,24 +631,14 @@ pub struct ImprovementArtifact {
 }
 
 /// Assembles the deduplicated improvement candidate, the owner-actionable
-/// brief, and the recorded owner decision from one real observation this pass
-/// made.
+/// brief, and the recorded owner decision from one real maintenance-trigger
+/// observation.
 ///
-/// Two real observations can drive it, and both are recorded owner content, not
-/// caller labels: the maintenance-trigger decision every arm used before, and —
-/// since #1867 W2/A1 — the newest committed learning-closure record when it
-/// carries a real recorded repeated-failure signature
-/// ([`recorded_repeated_failure`]). On the repeated-failure arm the evidence
-/// lineage is the committed record's own (`delta_artifact`, its observed
-/// evidence refs, its campaign/attempt/route), so two passes over the same
-/// committed repeat converge on one candidate exactly as two trigger evaluations
-/// of one occurrence do.
-///
-/// The maintenance decision's own `trigger_id`, `family`, `scope_ref`, `reason`
-/// and `decision` remain the evidence lineage for the two maintenance arms, so
-/// two evaluations of the same failure under the same admitted fence deduplicate
-/// by content (`BoundedBacklog::admit` merges on overlapping lineage) rather
-/// than minting a fresh candidate per observation.
+/// The decision's own `trigger_id`, `family`, `scope_ref`, `reason` and
+/// `decision` are the evidence lineage, so two evaluations of the same
+/// failure under the same admitted fence deduplicate by content
+/// (`BoundedBacklog::admit` merges on overlapping lineage) rather than
+/// minting a fresh candidate per observation.
 ///
 /// `state_fence` is the daemon's own admitted Kernel fence for this pass; it
 /// becomes the candidate's `validity_scope` (see [`admitted_fence_ref`]), so
@@ -635,40 +660,66 @@ pub fn assemble_improvement_artifact(
     state_fence: &StateFence,
     observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
 ) -> Result<ImprovementArtifact, ImprovementDispatchError> {
+    // Evidence lineage: the decision's own stable identity, never a fresh
+    // per-observation value, so a repeat deduplicates.
+    let evidence_refs = maintenance_evidence_refs(decision);
+    let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
+    // `MaintenanceFamily` carries a `Display` impl (its canonical SCREAMING
+    // spelling); `AutomationDecision` and `DecisionReason` are `Debug`-only
+    // closed owner enums and gain no `Display` here, so they are named by
+    // their derived variant spelling instead.
+    let trigger = maintenance_trigger_text(decision);
+    // The replay plan is diagnostic-only (I12.24:76-77): the fixed replay,
+    // holdout and transfer legs are the decision's own canonical refs, and the
+    // counter metrics name what must not regress. Promotion is separately
+    // refused by the intake's budget gate, which this advisory path does not
+    // attempt to satisfy.
+    let replay_plan = maintenance_replay_plan(decision, &evidence_refs);
     let admitted_scope = admitted_fence_ref(state_fence)?;
-    // The newest committed closure record is read HERE, before the evidence and
-    // the replay plan are selected, because the recorded repeated-failure
-    // signature it carries is the discriminator both are derived from. It used
-    // to be read after the candidate, the class gate and the safe boundary were
-    // built; this is a move, not a second read, and it is behaviour-preserving:
-    // the store's own mutex is taken by [`SafeBoundary::from_observed_closure`]
-    // on the same image under the same composition guard, and nothing between
-    // the two positions mutates the store, so both positions see the same
-    // newest record. `load` is the same mutex-guarded read of already-committed
-    // in-process state; it opens no transport and no store client.
-    let observed = newest_observed_closure(observed_closures)?;
-    // The evidence bundle, replay plan and decision fields are selected
-    // together by [`selected_observation`], which carries the two discriminators
-    // and both arms. Selection is a DERIVED source, never an asserted one
-    // (issue #1867 W2), and every arm terminates in the same
-    // `eliot_improvement::sourced_evidence` validation, so no arm can bypass it.
-    let SourcedArm {
-        evidence,
-        replay_plan,
-        decision_fields,
-        repeated_failure,
-    } = selected_observation(decision, &observed, &admitted_scope)?;
+    // The evidence bundle is selected by the DERIVED source, not asserted
+    // (issue #1867 W2). Every source but one is the maintenance occurrence
+    // itself, and is assembled by the funnel's own validated constructor. The
+    // conformance-audit source is different in kind: I12.24:50 names the
+    // trigger "Architecture/Implementation/runtime conformance gap", so that
+    // evidence enters the funnel through the Self-Quality conformance
+    // diagnosis contract, which owns the finding's inert owner handoff
+    // (`eliot_self_quality::conformance_evidence`), rather than being labelled
+    // as a maintenance occurrence and losing the conformance owner, the
+    // priority axis and the invalidation set the finding recorded. Both arms
+    // terminate in the same `eliot_improvement::sourced_evidence` validation,
+    // so neither can bypass it.
+    let evidence = match maintenance_evidence_source(decision) {
+        EvidenceSource::ConformanceDiagnosis => {
+            conformance_diagnosis_evidence(decision, &trigger, &admitted_scope)?
+        }
+        source => sourced_evidence(
+            source,
+            &evidence_refs,
+            &trace_refs,
+            &trigger,
+            &[format!(
+                "unproven-blocked-automation:{}",
+                decision.trigger_id
+            )],
+            &admitted_scope,
+            IMPROVEMENT_OWNER,
+        )?,
+    };
+
     let mut candidate = candidate_from_evidence(
         SERVICE_NAME,
         IMPROVEMENT_SURFACE,
-        &decision_fields.proposed_change,
+        &format!(
+            "evaluate and resolve the blocked maintenance family {} at {}",
+            decision.family, decision.scope_ref
+        ),
         &evidence,
         replay_plan,
         BTreeMap::new(),
-        &decision_fields.delivery_target,
-        &decision_fields.canary_plan,
-        &decision_fields.rollback,
-        &decision_fields.stop_condition,
+        &format!("maintenance-family:{}", decision.family),
+        &format!("maintenance-canary:{}", decision.trigger_id),
+        &format!("maintenance-rollback:{}", decision.trigger_id),
+        &format!("maintenance-stop:{}", decision.trigger_id),
     )?;
     // Admitted intake is triaged for owner review, exactly as the intake
     // path does, so the durable record carries the owner-decision lifecycle.
@@ -686,9 +737,9 @@ pub fn assemble_improvement_artifact(
     //
     // Stated plainly so this call is not read as broader than it is: the
     // candidate assembled above records [`IMPROVEMENT_SURFACE`] (`Memory`),
-    // which is not a protected surface, so on BOTH live arms the class taken is
-    // `Advisory` and the gate passes. What the gate buys here is that the class
-    // is a FUNCTION of the candidate's recorded surface rather
+    // which is not a protected surface, so on the live maintenance path the
+    // class taken is `Advisory` and the gate passes. What the gate buys here is
+    // that the class is a FUNCTION of the candidate's recorded surface rather
     // than of literals — a candidate carrying `Verifier` or `Scheduler` is
     // refused. See `enforce_advisory_class_gate` for the exact ceiling,
     // including the two classes this path cannot represent at all.
@@ -723,23 +774,20 @@ pub fn assemble_improvement_artifact(
     // purpose, because it said nothing about what the closure actually
     // recorded.
     //
-    // `observed` is the same mutex-guarded read `from_observed_closure` just
+    // `load` is the same mutex-guarded read `from_observed_closure` just
     // performed on the same image, under the composition guard the caller
-    // already holds (`daemon_runtime::improvement_intake_artifact`). It is read
-    // by inference and through the record's own accessors, because the two-string
-    // `SafeBoundary` cannot carry the record itself and the record TYPE cannot be
-    // named here: `eliot-improvement` has no `eliot-learning-delta` edge, so
-    // widening `SafeBoundary` to hold one would be a new dependency for a value
-    // the brief only needs to quote, and `eliotd` has no `eliot-learning-delta`
-    // dependency either. An unreadable or empty image is the same typed
-    // `UnsafeBoundary` refusal the boundary constructor returns for the same
-    // condition, never a substituted value.
-    //
-    // The read itself sits at the top of this function rather than here, because
-    // the record's consequential boundary is the first evidence discriminator;
-    // nothing between the two positions mutates the store, so both see the same
-    // newest record.
-    //
+    // already holds (`daemon_runtime::improvement_intake_artifact`), and this
+    // guarded phase commits nothing, so the newest record here is the record
+    // whose `actor_id` and `consequential_boundary` the boundary above names.
+    // It is read a second time because the two-string `SafeBoundary` cannot
+    // carry the record itself: `eliot-improvement` has no `eliot-learning-delta`
+    // edge, so widening `SafeBoundary` to hold one would be a new dependency
+    // for a value the brief only needs to quote. The record TYPE is not named
+    // here either — `eliotd` has no `eliot-learning-delta` dependency — so it is
+    // read by inference and through the record's own accessors. An unreadable
+    // or empty image is the same typed `UnsafeBoundary` refusal the boundary
+    // constructor returns for the same condition, never a substituted value.
+    let observed = newest_observed_closure(observed_closures)?;
     // The durable lineage handle and canonical digest the record itself
     // committed, so the owner can read exactly this closure without searching.
     let (observed_artifact, observed_digest) = (
@@ -754,45 +802,29 @@ pub fn assemble_improvement_artifact(
     // literally the same value.
     let principal = boundary.observed_principal_ref();
     let boundary_ref = boundary.observed_boundary_ref();
-    let unknowns = observed_unknowns(&observed, decision.family, repeated_failure);
+    let unknowns = observed_unknowns(&observed, decision.family);
 
     // Why the brief names the OBSERVED principal, and which brief fields the
     // closure record cannot supply, is stated in the module documentation
     // above under "One principal, two roles".
-    //
-    // The brief's problem, benefit and next reversible step follow the SAME arm
-    // discriminator that chose the evidence, because I12.24:74 requires an owner
-    // to read them without searching raw metrics — a brief whose benefit claims
-    // to unblock a maintenance family its own evidence never names is exactly
-    // the raw-metric search that sentence forbids. `evidence.trigger_problem_or_metric`
-    // is the selected bundle's OWN recorded problem, so using it is
-    // behaviour-preserving for the two maintenance arms (both pass this same
-    // `trigger` string straight through) and correct for the repeated-failure
-    // arm, whose problem is the committed closure record rather than a trigger
-    // evaluation. The benefit and next step are selected by
-    // [`brief_benefit_and_next_step`] under that same discriminator.
-    let (likely_benefit, next_reversible_step) = brief_benefit_and_next_step(
-        decision,
-        &observed,
-        repeated_failure,
-        &observed_artifact,
-        observed_effect,
-        boundary_ref,
-    );
     let brief = brief_at_safe_boundary(
         &candidate,
         &format!(
-            "{}; the learning closure this brief is gated on committed durable delta \
+            "{trigger}; the learning closure this brief is gated on committed durable delta \
              {observed_artifact} (digest {observed_digest}) for attempt {} of campaign {} on \
              route {}, at consequential boundary {boundary_ref} by principal {principal}, over {} \
              observed evidence ref(s)",
-            evidence.trigger_problem_or_metric,
             observed.attempt_id,
             observed.campaign_id,
             observed.route_id,
             observed.evidence_ref_count,
         ),
-        &likely_benefit,
+        &format!(
+            "the blocked family {} is evaluated on every cadence and cannot start, and the \
+             closure this brief is gated on {observed_effect}; giving that family a start route \
+             removes a blocked evaluation per cadence",
+            decision.family
+        ),
         &format!(
             "advisory only; no authority, privacy, finish or durability effect is taken, and the \
              observed boundary {boundary_ref} is not modified by it"
@@ -801,76 +833,15 @@ pub fn assemble_improvement_artifact(
         "one owner triage pass over the stored brief; the observed closure record carries no \
          cost, compute or Human-attention field, so the cost of the decision itself is the only \
          cost this brief can state",
-        &next_reversible_step,
+        &format!(
+            "triage maintenance trigger {} against the observed boundary {boundary_ref}",
+            decision.trigger_id
+        ),
         unknowns,
         &boundary,
     )?;
 
-    // The disposition recorded here is the DAEMON'S OWN, and is named that way.
-    //
-    // It is still the production caller of the bridge's `record_brief_decision`,
-    // which previously had none, and it is still non-mutating: `Investigate` is
-    // one of the two kinds `is_non_mutating` admits, and recording it changes
-    // no surface, which is I12.24:82's "advisory … default; changes nothing
-    // until owner acts" observed rather than asserted.
-    //
-    // What changed is the `owner`. It used to be [`IMPROVEMENT_OWNER`], the
-    // maintenance (`G-19`) admission authority, on the reasoning that this field
-    // names the principal that RECORDED the disposition and the maintenance owner
-    // is that principal because it issued the permit this candidate was assembled
-    // under. That reasoning was wrong, and it is the same error this issue
-    // exists to remove, read from the other side. Issuing a learning-admission
-    // permit is a different act from selecting a disposition over a brief: the
-    // `G-19` owner admitted the CANDIDATE to the bounded backlog, and it never
-    // saw this brief, never read it, and chose nothing about it. Recording its
-    // name against a disposition it did not select is precisely the false
-    // attribution A12.02:3 forbids — "Identity is not a model's self-declared
-    // string" — with the failure running the other way: not a model inventing an
-    // identity, but a real principal's name attached to a decision that principal
-    // never made. A later reader of `improvement_dedup_read` takes that field at
-    // its word, so the false attribution is not harmless; it is a durable claim
-    // about a real owner.
-    //
-    // The owner recorded now is the only principal that genuinely selected this
-    // disposition: the daemon itself, under its own service identity
-    // ([`SERVICE_NAME`]). That identity is not self-declared — A12.02:3 is
-    // "Identity is not a model's self-declared string" — it is the installed
-    // service's own, named by the composition and carried on every request
-    // identity this daemon commits (`improvement_commit_identity` below binds it
-    // as both `product_id` and `source_id`), and the exchange it makes over is
-    // authenticated in the other direction too: the Kernel front door proves
-    // this daemon's peer SID, session identity and artifact digest before the
-    // connection is used (`daemon_kernel_client.rs:1878-1908`). It grants nothing
-    // either way — `is_non_mutating` is what makes the record advisory. A note
-    // that says "the daemon triaged this and no owner has ruled on it" is a
-    // smaller claim than the one it replaces, and it is a TRUE one.
-    //
-    // It is deliberately NOT the brief's `proposed_owner` either. That field
-    // names the principal proposed to DECIDE (the observed boundary's
-    // `actor_id`, read from a committed closure record); this field names the
-    // principal that DID record a disposition. The daemon is not proposed to
-    // decide its own brief, so conflating the two would overwrite the one route
-    // an owner's decision has a named place to arrive through.
-    //
-    // The four dispositions remain unreachable from an owner's selection, and
-    // `OwnerDecisionKind::Reject` in particular is not produced anywhere in
-    // `bins/`. The measurement of every candidate ingress surface, and the exact
-    // route that is missing and where it would attach, are recorded in the
-    // module documentation above under "The recorded disposition is the DAEMON's
-    // own, and no owner ingress exists". Nothing here substitutes a fabricated
-    // caller for it.
-    let decision_record = crate::improvement_intake::record_brief_decision(
-        &brief,
-        SERVICE_NAME,
-        OwnerDecisionKind::Investigate,
-        &format!(
-            "the daemon triaged blocked maintenance family {} at its own initiative; this \
-             disposition selects nothing and no owner has ruled on this brief, because no \
-             owner-issued ingress reaches this process",
-            decision.family
-        ),
-    )
-    .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let decision_record = record_daemon_disposition(&brief, decision.family)?;
 
     // Deduplication and bounded admission are NOT done here. They need the
     // live Governor owner (a real permit whose authority the bound is checked
@@ -884,190 +855,86 @@ pub fn assemble_improvement_artifact(
     })
 }
 
+/// Records the DAEMON'S OWN non-authoritative disposition over the brief it just
+/// assembled, and names it as such.
+///
+/// This is the production caller of the bridge's `record_brief_decision`, which
+/// previously had none, and it is still non-mutating: `Investigate` is one of the
+/// two kinds `is_non_mutating` admits, and recording it changes no surface, which
+/// is I12.24:82's "advisory … default; changes nothing until owner acts" observed
+/// rather than asserted.
+///
+/// # The owner is the daemon, and deliberately NOT `IMPROVEMENT_OWNER`
+///
+/// The `owner` used to be [`IMPROVEMENT_OWNER`], the maintenance (`G-19`)
+/// admission authority, on the reasoning that this field names the principal
+/// that RECORDED the disposition and the maintenance owner is that principal
+/// because it issued the permit this candidate was assembled under. That
+/// reasoning was wrong, and it is the same error this issue exists to remove,
+/// read from the other side. Issuing a learning-admission permit is a different
+/// act from selecting a disposition over a brief: the `G-19` owner admitted the
+/// CANDIDATE to the bounded backlog, and it never saw this brief, never read it,
+/// and chose nothing about it. Recording its name against a disposition it did
+/// not select is precisely the false attribution A12.02:3 forbids — "Identity is
+/// not a model's self-declared string" — with the failure running the other way:
+/// not a model inventing an identity, but a real principal's name attached to a
+/// decision that principal never made. A later reader of
+/// `improvement_dedup_read` takes that field at its word, so the false
+/// attribution is not harmless; it is a durable claim about a real owner.
+///
+/// The owner recorded now is the only principal that genuinely selected this
+/// disposition: the daemon itself, under its own service identity
+/// ([`SERVICE_NAME`]). That identity is not self-declared — A12.02:3 is "Identity
+/// is not a model's self-declared string" — it is the installed service's own,
+/// named by the composition and carried on every request identity this daemon
+/// commits (`improvement_commit_identity` below binds it as both `product_id` and
+/// `source_id`), and the exchange it makes over is authenticated in the other
+/// direction too: the Kernel front door proves this daemon's peer SID, session
+/// identity and artifact digest before the connection is used
+/// (`daemon_kernel_client.rs:1878-1908`). It grants nothing either way —
+/// `is_non_mutating` is what makes the record advisory. A note that says "the
+/// daemon triaged this and no owner has ruled on it" is a smaller claim than the
+/// one it replaces, and it is a TRUE one.
+///
+/// It is deliberately NOT the brief's `proposed_owner` either. That field names
+/// the principal proposed to DECIDE (the observed boundary's `actor_id`, read
+/// from a committed closure record); this field names the principal that DID
+/// record a disposition. The daemon is not proposed to decide its own brief, so
+/// conflating the two would overwrite the one route an owner's decision has a
+/// named place to arrive through.
+///
+/// The four dispositions remain unreachable from an owner's selection, and
+/// `OwnerDecisionKind::Reject` in particular is not produced anywhere in
+/// `bins/`. The measurement of every candidate ingress surface, and the exact
+/// route that is missing and where it would attach, are recorded in the module
+/// documentation above under "The recorded disposition is the DAEMON's own, and
+/// no owner ingress exists". Nothing here substitutes a fabricated caller for it.
+///
+/// `family` is the maintenance family this pass evaluated, and it appears only
+/// in the note text; the disposition it selects does not depend on it.
+fn record_daemon_disposition(
+    brief: &eliot_improvement::ImprovementBrief,
+    family: eliot_maintenance::MaintenanceFamily,
+) -> Result<OwnerDecision, ImprovementDispatchError> {
+    crate::improvement_intake::record_brief_decision(
+        brief,
+        SERVICE_NAME,
+        OwnerDecisionKind::Investigate,
+        &format!(
+            "the daemon triaged blocked maintenance family {family} at its own initiative; this \
+             disposition selects nothing and no owner has ruled on this brief, because no \
+             owner-issued ingress reaches this process"
+        ),
+    )
+    .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))
+}
+
 /// The evidence lineage this observation raises, over the decision's own
 /// stable identity.
 ///
 /// Never a fresh per-observation value: the refs are the decision's own
 /// `trigger_id` and `scope_ref`, so two evaluations of the same occurrence
 /// under the same admitted fence carry the same lineage and deduplicate.
-/// The evidence bundle, replay plan and decision fields one arm selected,
-/// plus the discriminator that chose it.
-struct SourcedArm {
-    /// The evidence bundle, from the funnel's own validated constructor.
-    evidence: SourcedEvidence,
-    /// The replay plan that belongs to THIS evidence.
-    replay_plan: ReplayPlan,
-    /// The I12.24 decision fields that belong to THIS evidence.
-    decision_fields: CandidateDecisionFields,
-    /// Whether the selected arm was the recorded repeated-failure one.
-    ///
-    /// Carried rather than re-derived so the brief selects its problem, benefit,
-    /// and next reversible step on the SAME decision that selected the evidence,
-    /// with no second read of the record and no chance of the two disagreeing.
-    repeated_failure: bool,
-}
-
-/// Selects the evidence, replay plan and decision fields for the observation
-/// this pass actually made (issue #1867 W2, I12.24).
-///
-/// The bundle is selected by a DERIVED source, not asserted. Two discriminators
-/// are consulted, in this order, and every arm terminates in the same
-/// `eliot_improvement::sourced_evidence` validation, so no arm can bypass it.
-/// The replay plan and the decision fields are selected WITH the evidence rather
-/// than separately, so a candidate's fixed replay can never claim evidence the
-/// candidate itself does not cite and its `proposed_change` can never describe an
-/// observation its own evidence never names.
-///
-/// 1. A REAL recorded repeated-failure signature on the newest committed closure
-///    record. This is the second disjunct of A1 ("a real repeated verifier
-///    failure") and it is selected on recorded owner content, never on a caller
-///    label: see [`recorded_repeated_failure`] for what the Governor's own
-///    boundary derivation proves and for the exact measured reason
-///    `diagnose_self_quality` is NOT on this arm.
-/// 2. The DERIVED maintenance source. Every source but one is the maintenance
-///    occurrence itself, and is assembled by the funnel's own validated
-///    constructor. The conformance-audit source is different in kind: I12.24:50
-///    names the trigger "Architecture/Implementation/runtime conformance gap", so
-///    that evidence enters the funnel through the Self-Quality conformance
-///    diagnosis contract, which owns the finding's inert owner handoff
-///    (`eliot_self_quality::conformance_evidence`), rather than being labelled as
-///    a maintenance occurrence and losing the conformance owner, the priority axis
-///    and the invalidation set the finding recorded.
-///
-/// The arm-2 replay plan is diagnostic-only (I12.24:76-77): the fixed replay,
-/// holdout and transfer legs are the decision's own canonical refs, and the
-/// counter metrics name what must not regress. Promotion is separately refused
-/// by the intake's budget gate, which this advisory path does not attempt to
-/// satisfy.
-///
-/// The three arm-2 bindings below are scoped to that arm on purpose. The
-/// repeated-failure arm's evidence is the committed closure record, so deriving a
-/// maintenance-decision ref set and a trigger statement it never cites would be a
-/// value with no consumer. `trigger` reads `decision.family` through its own
-/// `Display` impl while `AutomationDecision` and `DecisionReason` are `Debug`-only
-/// closed owner enums and gain no `Display` here, so those two are named by their
-/// derived variant spelling instead.
-///
-/// Falls through to the arm-2 evidence, so an arm-2 bundle that
-/// `sourced_evidence` or the conformance projection refuses returns its own typed
-/// [`ImprovementDispatchError`] here, unchanged, at the same point in the pass.
-fn selected_observation(
-    decision: &eliot_maintenance::AutomationTriggerDecision,
-    observed: &ObservedClosure,
-    admitted_scope: &str,
-) -> Result<SourcedArm, ImprovementDispatchError> {
-    let (evidence, replay_plan, decision_fields, repeated_failure) =
-        if recorded_repeated_failure(observed) {
-            (
-                repeated_failure_evidence(observed, admitted_scope)?,
-                repeated_failure_replay_plan(observed),
-                repeated_failure_decision_fields(observed),
-                true,
-            )
-        } else {
-            let evidence_refs = maintenance_evidence_refs(decision);
-            let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
-            let trigger = maintenance_trigger_text(decision);
-            let plan = maintenance_replay_plan(decision, &evidence_refs);
-            let bundle = match maintenance_evidence_source(decision) {
-                EvidenceSource::ConformanceDiagnosis => {
-                    conformance_diagnosis_evidence(decision, &trigger, admitted_scope)?
-                }
-                source => sourced_evidence(
-                    source,
-                    &evidence_refs,
-                    &trace_refs,
-                    &trigger,
-                    &[format!(
-                        "unproven-blocked-automation:{}",
-                        decision.trigger_id
-                    )],
-                    admitted_scope,
-                    IMPROVEMENT_OWNER,
-                )?,
-            };
-            (
-                bundle,
-                plan,
-                CandidateDecisionFields {
-                    proposed_change: format!(
-                        "evaluate and resolve the blocked maintenance family {} at {}",
-                        decision.family, decision.scope_ref
-                    ),
-                    delivery_target: format!("maintenance-family:{}", decision.family),
-                    canary_plan: format!("maintenance-canary:{}", decision.trigger_id),
-                    rollback: format!("maintenance-rollback:{}", decision.trigger_id),
-                    stop_condition: format!("maintenance-stop:{}", decision.trigger_id),
-                },
-                false,
-            )
-        };
-    Ok(SourcedArm {
-        evidence,
-        replay_plan,
-        decision_fields,
-        repeated_failure,
-    })
-}
-
-/// The brief's likely benefit and next reversible step, selected under the SAME
-/// arm discriminator that chose the evidence.
-///
-/// I12.24:74 asks the brief to show likely benefit and the next reversible step
-/// so a named decision owner needs no raw-metric search. A brief whose benefit
-/// claims to unblock a maintenance family its own evidence never names is exactly
-/// the search that sentence forbids, so both strings follow the selected arm: the
-/// repeated-failure arm describes the committed closure record, and the two
-/// maintenance arms describe the trigger decision.
-///
-/// `observed_artifact`, `observed_effect` and `boundary_ref` are the committed
-/// record's own durable lineage handle, the record's own behaviour conclusion
-/// read through its predicate ([`observed_behaviour_effect`]), and the observed
-/// boundary ref. They are passed in rather than re-read so this selection is
-/// pure in the same values the brief's other fields already use.
-fn brief_benefit_and_next_step(
-    decision: &eliot_maintenance::AutomationTriggerDecision,
-    observed: &ObservedClosure,
-    repeated_failure: bool,
-    observed_artifact: &str,
-    observed_effect: &str,
-    boundary_ref: &str,
-) -> (String, String) {
-    if repeated_failure {
-        return (
-            format!(
-                "the failure signature the committed closure record {observed_artifact} recorded \
-                 for attempt {} of campaign {} recurred across more than one physical attempt of \
-                 one job, and the closure this brief is gated on {observed_effect}; resolving the \
-                 cause behind that signature stops it recurring again",
-                observed.attempt_id, observed.campaign_id
-            ),
-            format!(
-                "triage the committed learning-closure record {observed_artifact} against the \
-                 observed boundary {boundary_ref}"
-            ),
-        );
-    }
-    (
-        format!(
-            "the blocked family {} is evaluated on every cadence and cannot start, and the closure \
-             this brief is gated on {observed_effect}; giving that family a start route removes a \
-             blocked evaluation per cadence",
-            decision.family
-        ),
-        format!(
-            "triage maintenance trigger {} against the observed boundary {boundary_ref}",
-            decision.trigger_id
-        ),
-    )
-}
-
-/// The evidence lineage this maintenance observation raises, over the decision's
-/// own stable identity.
-///
-/// Never a fresh per-observation value: the refs are the decision's own
-/// `trigger_id` and `scope_ref`, so two evaluations of the same occurrence under
-/// the same admitted fence carry the same lineage and deduplicate.
 fn maintenance_evidence_refs(
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> Vec<String> {
@@ -1132,23 +999,6 @@ struct ObservedClosure {
     carries_behavioural_proposal: bool,
     /// Whether the record names a prior-attempt lineage to retry against.
     has_retry_lineage: bool,
-    /// The consequential boundary the record itself committed, in the owner's
-    /// own canonical spelling (`StoredLearningDelta::consequential_boundary`).
-    ///
-    /// Read by inference through the boundary's own `as_str()`, exactly as
-    /// `SafeBoundary::from_observed_closure` reads it: neither this crate nor
-    /// `eliot-improvement` has an `eliot-learning-delta` edge, and the
-    /// `ConsequentialBoundary` type is deliberately not named here so the
-    /// closed nine-value vocabulary stays the owner's.
-    consequential_boundary: String,
-    /// The raw trace, artifact, and evaluator references the record itself
-    /// observed for the attempt (`StoredLearningDelta::evidence_refs`).
-    ///
-    /// Read by inference through each identity's own `as_str()`. The record
-    /// does not distinguish which of these refs is a trace, which is an
-    /// artifact, and which is an evaluator, so nothing downstream may claim
-    /// one of them is a verifier — see [`repeated_failure_evidence`].
-    observed_evidence_refs: Vec<String>,
 }
 
 /// Reads the newest committed closure record, refusing when there is none.
@@ -1177,285 +1027,7 @@ fn newest_observed_closure(
         evidence_ref_count: observed.evidence_refs.len(),
         carries_behavioural_proposal: observed.carries_behavioural_proposal(),
         has_retry_lineage: observed.lineage_for_retry().is_some(),
-        consequential_boundary: observed.consequential_boundary.as_str().to_owned(),
-        observed_evidence_refs: observed
-            .evidence_refs
-            .iter()
-            .map(|reference| reference.as_str().to_owned())
-            .collect(),
     })
-}
-
-/// The recorded repeated-failure signature this daemon's newest committed
-/// closure carries, if any (issue #1867 W2/A1 second disjunct, I12.24:43).
-///
-/// # `true` is a real repeated failure, derived by the owner
-///
-/// The comparison is against the record's OWN committed
-/// `consequential_boundary`, read through that boundary's own canonical
-/// `as_str()`. The boundary is not a caller label and not this file's: the
-/// Governor's learning-closure owner DERIVES it from the durable terminal
-/// `TestD` job row and the canonical verifier-execution fact
-/// (`crates/governor/eliot-governor/src/learning_closure.rs:854-859`), through
-/// `observed_activities`, which emits
-/// `LifecycleActivity::RepeatedFailureSignature` only when that row is
-/// `TestdJobState::Failed` AND its physical attempt count exceeds one
-/// (`:582-588`); `derive_boundaries` refuses an ordinary read
-/// (`read_file`/`read`/`grep`) and an empty activity set before any of that
-/// (`:483-491`). So a `true` here means this process observed and durably
-/// committed a failure that recurred across more than one physical attempt of
-/// one job — the I12.24:43 "repeated failure/repair or no-progress loop" trigger
-/// itself, and the second disjunct of A1.
-///
-/// A `false` is the absence of one, and the caller falls through to the
-/// maintenance-decision evidence below. The comparison is a string comparison
-/// because `eliotd` has no `eliot-learning-delta` edge, so the
-/// `ConsequentialBoundary` type is not named here; that is the same
-/// by-inference read `SafeBoundary::from_observed_closure` already performs on
-/// the same field. It fails safe in the honest direction: a boundary spelling
-/// that did not match this file's constant selects no repeated-failure
-/// evidence, so it can never claim a repeat that was not recorded. It is not
-/// matched by prefix or substring, so no other boundary can satisfy it.
-///
-/// # What a `true` does NOT prove, stated so no reader overclaims it
-///
-/// The record proves a repeated FAILURE SIGNATURE. It does **not** prove that a
-/// verifier ran, and this file therefore makes no verifier claim on it:
-/// `observed_activities` pushes `LifecycleActivity::VerifierOutcome`
-/// independently of the same branch, gated on
-/// `fact.verification_run.finished_at.is_some()`, and that per-activity fact is
-/// NOT persisted onto `StoredLearningDelta` — only the collapsed single
-/// `consequential_boundary` field is. The recorded evidence refs do not repair
-/// this either: `StoredLearningDelta::evidence_refs` is an untyped mix of "raw
-/// trace, artifact, and evaluator references" (`:218`), so no member of it may
-/// be named a verifier. A1 accepts "a real repeated verifier failure **or**
-/// failure-signature repeat"; this arm implements the second of the two, which
-/// is the one the durable record can actually prove.
-///
-/// # Why `diagnose_self_quality` is NOT on this arm, measured
-///
-/// A1 names a diagnosis, and this crate already depends on `eliot-self-quality`,
-/// so routing the record through `diagnose_self_quality` looks available. It
-/// is not, and the reason is measured on this base rather than assumed:
-/// `diagnose_self_quality` takes a
-/// [`SelfQualityInput`](eliot_self_quality::SelfQualityInput), and four of that
-/// contract's load-bearing field groups have no production owner that supplies
-/// them to this daemon:
-///
-/// - `ProductContractRef` (`objective_ref`, `acceptance_ref`, `recovery_ref`,
-///   which must be three DISTINCT values) is owned by the "Product contract
-///   owner (external)" per the contract's own field-to-owner map
-///   (`eliot-conformance-contracts/src/self_quality.rs:13`). Measured: its only
-///   construction sites in this workspace are test fixtures — `git grep -rn
-///   "ProductContractRef" -- "*.rs"` matches the definition, the re-exports and
-///   `crates/foundation/eliot-conformance-contracts/tests/**` only — and
-///   `git grep -in "objective" -- "bins/eliotd/src/*.rs"` finds no product
-///   contract identity on this path. Naming three strings here would be exactly
-///   the invented observation `conformance_diagnosis_evidence` refuses to
-///   manufacture below.
-/// - `SelfQualityPolicy.rules_digest` and `SelfQualityPolicy.limits` are the
-///   diagnosis rules and their finite bounds, and `limits.max_time_ms` alone
-///   decides the freshness verdict in decision step 9. No owner publishes a
-///   Self-Quality policy record in production, and a caller that spelled these
-///   would be choosing its own evidence's staleness bound.
-/// - `EvidenceCeilings` needs three DISTINCT privacy/authority/proof ceiling
-///   refs; only the crate's own `PROOF_CEILING` constant exists and no owner
-///   issues the other two.
-/// - The observation's `OwnerBinding.schema_ref`/`revision_ref`,
-///   `ObservationWindow.{observed_from_ms, observed_to_ms, environment_ref,
-///   platform_ref, toolchain_ref}` and `MetricMeasurement.{unit_ref,
-///   normalization_ref, population_ref}` are owner-binding, window and unit
-///   facts. `StoredLearningDelta` carries NO timestamp at all, and no
-///   environment, platform, toolchain, unit, normalization or population.
-///
-/// On top of those, the DECISIVE one: an input this daemon could build
-/// honestly would be `DenominatorCompleteness::Partial`, because
-/// `validate_denominator_counts` (`self_quality.rs:1862-1883`) requires
-/// `supplied_*` to equal the ACTUAL snapshot counts while `expected_*` needs an
-/// INDEPENDENT expected set that no owner publishes — and a `Partial`
-/// denominator is decided at decision step 4, BEFORE the candidate step, so
-/// `diagnose_self_quality` returns `Incomplete` and no candidate, no handoff
-/// and no brief exist to project. Reaching a `Candidate` would require
-/// declaring `expected == supplied`, which is a copy of this caller's own list
-/// rather than an independent expectation.
-///
-/// That is why this arm is not a diagnosis and says so: it is the funnel's own
-/// validated evidence constructor over the record's own content, which is what
-/// the trigger's evidence step (`instrumental signal/outcome -> durable Problem
-/// or evidence set`) actually requires. The two symbols the self-quality crate
-/// still lacks a producer for, and the exact symbols that would unblock them,
-/// are recorded in the module documentation above.
-fn recorded_repeated_failure(observed: &ObservedClosure) -> bool {
-    observed.consequential_boundary == REPEATED_FAILURE_SIGNATURE
-}
-
-/// Projects one recorded repeated-failure signature into the improvement
-/// funnel's evidence bundle (issue #1867 W2/A1 second disjunct, I12.24:43).
-///
-/// # Every value is the committed record's own content
-///
-/// - `source` is [`EvidenceSource::Attempt`]. I12.24:43 names the trigger
-///   "repeated failure/repair or no-progress loop" and the closed I12.24 set
-///   spells exactly that `Attempt` — the same mapping
-///   [`maintenance_evidence_source`] already states for the maintenance
-///   residual. It is deliberately NOT `EvaluatorVerdict`, for the reason
-///   [`recorded_repeated_failure`] measures: the record does not persist
-///   whether a verifier ran, and this module will not label a failure as a
-///   verdict it did not observe. The arm is still distinguishable from the
-///   maintenance residual arm, which shares the source: the CONTENT differs,
-///   because every ref below is the closure record's rather than the
-///   maintenance decision's.
-/// - `evidence_refs` is the record's own `evidence_refs` (the raw trace,
-///   artifact and evaluator references the Governor derived from the canonical
-///   verifier fact) plus the record's own `delta_artifact` and the recorded
-///   boundary spelling. All of it is content-derived from the committed
-///   record, so re-observing the same committed repeat converges on one
-///   `candidate_id` and therefore one handle.
-/// - `trace_refs` is the record's own lineage: its campaign, attempt, route and
-///   the boundary it committed.
-/// - `root_cause_hypotheses` maps the recorded boundary to an
-///   `unproven-symptom:` hypothesis, the same never-prove-a-cause rule
-///   `eliot_self_quality::improvement_handoff::sourced_evidence_from_handoff`
-///   documents. A repeated failure signature is an observation, not a proven
-///   mechanism.
-/// - `validity_scope` is the admitted Kernel fence ref ([`admitted_fence_ref`]),
-///   so the candidate is only claimed under the authority epoch and resource
-///   generation this pass was admitted with, and `owner_and_decision_authority`
-///   is the same maintenance (`G-19`) admission authority every other arm in
-///   this file uses.
-///
-/// The bundle is built by [`sourced_evidence`], the funnel's single validated
-/// constructor, so this arm cannot bypass `SourcedEvidence::validate`.
-fn repeated_failure_evidence(
-    observed: &ObservedClosure,
-    validity_scope: &str,
-) -> Result<SourcedEvidence, ImprovementDispatchError> {
-    let mut evidence_refs = observed.observed_evidence_refs.clone();
-    evidence_refs.push(observed.lineage_artifact.clone());
-    evidence_refs.push(format!(
-        "consequential-boundary:{}",
-        observed.consequential_boundary
-    ));
-    let boundary = observed.consequential_boundary.as_str();
-    Ok(sourced_evidence(
-        EvidenceSource::Attempt,
-        &evidence_refs,
-        &[
-            format!("learning-closure-campaign:{}", observed.campaign_id),
-            format!("learning-closure-attempt:{}", observed.attempt_id),
-            format!("learning-closure-route:{}", observed.route_id),
-            format!("consequential-boundary:{boundary}"),
-        ],
-        &format!(
-            "the committed learning-closure record {} for attempt {} of campaign {} on route {} \
-             recorded the derived consequential boundary {boundary} over {} observed evidence \
-             ref(s), which the Governor's learning-closure owner derives only from a durable \
-             terminal job row that failed after more than one physical attempt",
-            observed.lineage_artifact,
-            observed.attempt_id,
-            observed.campaign_id,
-            observed.route_id,
-            observed.evidence_ref_count,
-        ),
-        &[format!(
-            "unproven-symptom:consequential-boundary:{boundary}"
-        )],
-        validity_scope,
-        IMPROVEMENT_OWNER,
-    )?)
-}
-
-/// The I12.24:20-38 decision fields one selected evidence arm contributes.
-///
-/// A field group, not a new contract: every member is a parameter
-/// `candidate_from_evidence` already takes. It exists so the five fields that
-/// make a factual claim about WHAT is being changed and WHERE it lands are
-/// chosen by the same discriminator that chose the evidence, instead of being
-/// spelled once for whichever observation happens to be in flight. That is what
-/// stops a candidate assembled over a durable learning-closure record from
-/// carrying a `proposed_change` about a blocked maintenance family, or a
-/// `maintenance-canary:` ref for a failure the maintenance owner never saw.
-struct CandidateDecisionFields {
-    /// The change this candidate proposes (I12.24 `proposed_change`).
-    proposed_change: String,
-    /// Work item / module / config path the change is delivered to.
-    delivery_target: String,
-    /// Canary plan reference.
-    canary_plan: String,
-    /// Rollback reference.
-    rollback: String,
-    /// Stop condition for the experiment.
-    stop_condition: String,
-}
-
-/// The decision fields that belong to one recorded repeated-failure signature.
-///
-/// All five are the record's OWN content, so a candidate assembled over it
-/// claims only what the closure actually recorded:
-///
-/// - `proposed_change` names the committed record and the boundary it carries,
-///   not a maintenance family this daemon never observed blocking;
-/// - `delivery_target` is the record's own campaign, the scope the repeated
-///   attempt recurred in;
-/// - `canary_plan`, `rollback` and `stop_condition` are the record's own
-///   lineage artifact and boundary, so they are content-derived and stable
-///   across passes over the same committed repeat. They are admission
-///   identities, not a claim that a canary ran or a rollback executed:
-///   promotion stays refused by the intake's budget gate, which this advisory
-///   path does not attempt to satisfy.
-fn repeated_failure_decision_fields(observed: &ObservedClosure) -> CandidateDecisionFields {
-    let boundary = observed.consequential_boundary.as_str();
-    CandidateDecisionFields {
-        proposed_change: format!(
-            "evaluate and resolve the repeated failure signature the committed learning-closure \
-             record {} recorded for attempt {} of campaign {}, derived boundary {boundary}",
-            observed.lineage_artifact, observed.attempt_id, observed.campaign_id
-        ),
-        delivery_target: format!("learning-closure-campaign:{}", observed.campaign_id),
-        canary_plan: format!("learning-closure-canary:{}", observed.lineage_artifact),
-        rollback: format!("learning-closure-rollback:{}", observed.lineage_artifact),
-        stop_condition: format!("learning-closure-stop:{boundary}:{}", observed.campaign_id),
-    }
-}
-
-/// The replay plan that belongs to one recorded repeated-failure signature
-/// (issue #1867 W2/A1 second disjunct, I12.24:76-77).
-///
-/// Selected with [`repeated_failure_evidence`] and never separately, so the
-/// candidate's fixed replay names the record's OWN observed evidence rather than
-/// the maintenance decision's. Reusing the maintenance plan here would put a
-/// `maintenance-evaluator:` verifier and `maintenance-holdout:` refs into a
-/// candidate whose evidence is a learning-closure record, which is exactly the
-/// misattribution this file exists to remove.
-///
-/// - `fixed_replay_refs` is the same record lineage
-///   [`repeated_failure_evidence`] cites, so the replay is over the evidence the
-///   candidate carries;
-/// - `holdout_refs` and `transfer_refs` are the record's own campaign, which is
-///   the scope a holdout for this attempt would be drawn from;
-/// - `counter_metric_names` names the quantity the trigger is about;
-/// - `verifier_refs` is [`IMPROVEMENT_EVALUATOR`], the independent evaluator
-///   that must verify any experiment this admission owner releases a candidate
-///   to. That is the REVALIDATION role and it is not a claim that a verifier
-///   produced the failure: the record does not persist which one did, for the
-///   reason [`recorded_repeated_failure`] states.
-///
-/// Diagnostic-only, exactly like [`maintenance_replay_plan`]: promotion stays
-/// refused by the intake's budget gate, which this advisory path does not
-/// attempt to satisfy.
-fn repeated_failure_replay_plan(observed: &ObservedClosure) -> ReplayPlan {
-    let mut fixed_replay_refs = observed.observed_evidence_refs.clone();
-    fixed_replay_refs.push(observed.lineage_artifact.clone());
-    ReplayPlan {
-        fixed_replay_refs,
-        holdout_refs: vec![format!("learning-closure-holdout:{}", observed.campaign_id)],
-        transfer_refs: vec![format!(
-            "learning-closure-transfer:{}",
-            observed.campaign_id
-        )],
-        counter_metric_names: vec!["repeated_verifier_failures".to_owned()],
-        verifier_refs: vec![IMPROVEMENT_EVALUATOR.to_owned()],
-    }
 }
 
 /// What the observed closure actually concluded about behaviour.
@@ -1476,31 +1048,18 @@ fn observed_behaviour_effect(observed: &ObservedClosure) -> &'static str {
 /// The unknowns the observed closure could not resolve, plus the one it cannot
 /// speak to at all.
 ///
-/// Unknowns are the states the record could NOT resolve. They follow the same
-/// arm discriminator as the rest of the brief: a brief about a recorded
-/// repeated failure whose only unknown were an unrelated maintenance family's
-/// start route would be answering a question its own evidence never raised, and
-/// I12.24:74 asks the brief to state what the owner does not yet know about
-/// THIS problem. `require_refs` in
-/// [`eliot_improvement::ImprovementBrief::validate`] still hard-requires a
-/// non-empty list, and every arm contributes at least one.
+/// Unknowns are the states the record could NOT resolve. The maintenance
+/// start-route question is kept because it is real and no closure record answers
+/// it. `require_refs` in [`eliot_improvement::ImprovementBrief::validate`]
+/// still hard-requires a non-empty list.
 fn observed_unknowns(
     observed: &ObservedClosure,
     family: eliot_maintenance::MaintenanceFamily,
-    repeated_failure: bool,
 ) -> Vec<String> {
-    let mut unknowns = if repeated_failure {
-        vec![format!(
-            "which verifier produced the failure signature the committed record {} recorded is \
-             not persisted on that record, so the brief names no failing verifier",
-            observed.lineage_artifact
-        )]
-    } else {
-        vec![format!(
-            "unknown whether maintenance family {} has a start route",
-            family
-        )]
-    };
+    let mut unknowns = vec![format!(
+        "unknown whether maintenance family {} has a start route",
+        family
+    )];
     if !observed.has_retry_lineage {
         unknowns.push(format!(
             "the observed closure of campaign {} records no prior-attempt lineage, so it \
@@ -1701,17 +1260,6 @@ fn enforce_advisory_class_gate(
 /// below: an observation whose origin is not `IdleTransition` reaching this
 /// intake. The honest outcome here is the `Attempt` label above plus that
 /// stated ceiling, not a refusal to classify a live observation.
-///
-/// # The `Attempt` label is reached two ways, and only one is a family
-///
-/// The `_` arm below labels a maintenance-decision occurrence `Attempt`, and a
-/// family census bounds it to [`crate::SELF_OBSERVED_FAMILY`] (see the
-/// `ASSUMPTION` above). It is NOT the only way an `Attempt` reaches the funnel:
-/// [`repeated_failure_evidence`] also emits `Attempt`, selected on the
-/// committed closure record's own repeated-failure boundary rather than on any
-/// family. The two are disjoint — one reads a maintenance decision, the other
-/// reads a durable learning-closure record — and both terminate in the same
-/// [`sourced_evidence`] validation.
 ///
 /// # The three sources with NO arm, and the producer each waits for
 ///
@@ -1916,14 +1464,6 @@ fn conformance_diagnosis_evidence(
         // precisely the observation the owner routing is supposed to read, so
         // the default is named instead and the routing table is not
         // circumvented by re-deriving a different one.
-        //
-        // The SAME block of unbound fields is what blocks
-        // `diagnose_self_quality` on the repeated-failure arm, where the
-        // missing group is the enclosing `SelfQualityInput` rather than one
-        // observation; that note, and the one additional blocker no observation
-        // can fix (the denominator's independent expected set), is recorded on
-        // [`recorded_repeated_failure`]. The two notes are the same measurement
-        // taken at two levels and neither may be read as the other.
         //
         // `ASSUMPTION:` the named default is the owner `route_owner` would
         // return for the finding recorded here, and the precedence table makes
