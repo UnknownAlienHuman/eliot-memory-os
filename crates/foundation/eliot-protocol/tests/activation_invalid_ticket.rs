@@ -43,6 +43,7 @@ fn valid_ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
         demand_id: "activation-demand-invalid-1".to_owned(),
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
+        peer_admission_receipt: None,
         connection_id: "activation-connection-invalid-1".to_owned(),
         workspace_selector: None,
         cancellation_id: "activation-cancellation-invalid-1".to_owned(),

@@ -3663,9 +3663,16 @@ impl KernelComposition {
                         return Err(TransportError::SessionFenced);
                     }
                     self.claim_observe_pair(session).map(|pair| match pair {
-                        Some((envelope, tool, attempt)) => serde_json::json!({
+                        Some(pair) => serde_json::json!({
                             "status": "known",
-                            "value": { "pair": { "envelope": envelope, "tool": tool, "attempt": attempt } },
+                            "value": { "pair": {
+                                "record": pair.record,
+                                "durable_attempt": pair.durable_attempt,
+                                "envelope": pair.envelope,
+                                "tool": pair.tool,
+                                "attempt": pair.result_attempt,
+                                "source_request_identity": pair.source_request_identity,
+                            } },
                             "recovery": null,
                         }),
                         None => serde_json::json!({
@@ -3761,6 +3768,11 @@ impl KernelComposition {
                         Ok(host_request_route::ObserveDeferDisposition::Settled(record)) => Ok(
                             Self::settled_observe_daemon_response(record.operation_id.as_str()),
                         ),
+                        Ok(host_request_route::ObserveDeferDisposition::ReconciliationRequired(
+                            record,
+                        )) => Ok(Self::unknown_observe_daemon_response(
+                            record.operation_id.as_str(),
+                        )),
                         Ok(host_request_route::ObserveDeferDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
@@ -4013,8 +4025,11 @@ impl KernelComposition {
                 // faked with a consumer in this crate.
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let observe_tool = payload.get("tool").cloned();
-                let (receipt, record) =
-                    self.admit_and_queue_observe_submit(&envelope, observe_tool.as_ref())?;
+                let (receipt, record) = self.admit_and_queue_observe_submit(
+                    &envelope,
+                    observe_tool.as_ref(),
+                    request_identity,
+                )?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))
@@ -8679,6 +8694,23 @@ impl KernelComposition {
                 "operation_id": operation_id,
             },
             "recovery": null,
+        })
+    }
+
+    /// Typed outcome for a protected Observe pair whose published claim did
+    /// not yield a canonical owner receipt. Its durable row is `Unknown` and
+    /// may only advance through explicit reconciliation.
+    fn unknown_observe_daemon_response(operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "unknown",
+            "value": {
+                "outcome": "unknown_outcome",
+                "operation_id": operation_id,
+            },
+            "recovery": {
+                "kind": "unknown_outcome",
+                "reason": "published_observe_pair_requires_reconciliation",
+            },
         })
     }
 
