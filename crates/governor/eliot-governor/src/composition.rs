@@ -122,7 +122,8 @@ use eliot_workscope::{
     ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
     TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
+    WorkScopeAdmissionAuthority, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
+    WorkScopeCandidate, WorkScopeCandidateSet,
     WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
     WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
     evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
@@ -5978,6 +5979,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_generation: u64,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
+        privacy_boundary: &PrivacyBoundary,
         owner_revision: u64,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -6006,8 +6008,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "relocation source closure is not matched for the observed instance".to_owned(),
             ));
         }
-        let snapshot = WorkScopeBindingSnapshot::new(fence, owner_revision, relocated, fresh)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let admission_authority = WorkScopeAdmissionAuthority {
+            privacy_profile: privacy.clone(),
+            privacy_boundary: privacy_boundary.clone(),
+            governing_sources: sources.clone(),
+        };
+        let snapshot = WorkScopeBindingSnapshot::new_with_authority(
+            fence,
+            owner_revision,
+            relocated,
+            fresh,
+            admission_authority,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         WorkScopeBindingOwner::new(snapshot)
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
@@ -6047,6 +6060,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_generation: u64,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
+        privacy_boundary: &PrivacyBoundary,
         owner_revision: u64,
     ) -> Result<(ScopeRelocationOrAttachReceipt, WorkScopeBindingOwner), CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -6073,6 +6087,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             governing_source_generation,
             sources,
             privacy,
+            privacy_boundary,
             owner_revision,
         )?;
         Ok((receipt, bound))
@@ -6097,6 +6112,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         observed: &ScopeBinding,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
+        privacy_boundary: &PrivacyBoundary,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
@@ -6110,6 +6126,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             observed,
             sources,
             privacy,
+            privacy_boundary,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
