@@ -95,6 +95,10 @@ pub enum GovernorObservationError {
     /// Selection evidence names a different task or `WorkScope`.
     #[error("task selection is incompatible with observation scope")]
     TaskScopeIncompatible,
+    /// Selection evidence names the selected task and `WorkScope` but a
+    /// stale `TaskContract` revision or acceptance digest.
+    #[error("task selection is stale for the current Governor binding")]
+    StaleTaskSelection,
     /// A supplied plan or evidence envelope uses another State Fence.
     #[error("observation State Fence mismatch")]
     FenceMismatch,
@@ -254,6 +258,68 @@ impl TaskSelectionEvidence {
     pub const fn is_contaminated(&self) -> bool {
         !self.contamination_flags.is_empty()
     }
+
+    /// Rechecks this request-supplied evidence against the live
+    /// Governor-selected binding at the admission fence (issue #1746, W4).
+    ///
+    /// Structural [`validate`](Self::validate) is never sufficient here: the
+    /// evidence must name the currently selected task and `WorkScope`
+    /// (`TaskScopeIncompatible` otherwise), carry the current `TaskContract`
+    /// revision and acceptance digest (`StaleTaskSelection` otherwise, never
+    /// silently rebound to the new revision), and the observed fence must
+    /// equal the fence the live selection was admitted under
+    /// (`FenceMismatch` otherwise).
+    ///
+    /// This entry performs no owner read: the caller reads `current` from
+    /// the Governor owner at the exact admission fence, so a generation
+    /// change fails closed there until an explicit rebind.
+    ///
+    /// `caller: STITCH`. The observation admission consumer reads the live
+    /// selection from the Governor owner at the exact admission fence and
+    /// projects the stale/conflict outcome instead of admitting task-bound
+    /// work on structurally valid but superseded evidence.
+    pub fn recheck_against_current(
+        &self,
+        current: &CurrentTaskSelection,
+        observed_fence: &StateFence,
+    ) -> Result<(), GovernorObservationError> {
+        self.validate()?;
+        if self.task_ref != current.task_ref || self.work_scope_ref != current.work_scope_ref {
+            return Err(GovernorObservationError::TaskScopeIncompatible);
+        }
+        if self.task_revision != current.task_revision
+            || self.acceptance_digest != current.acceptance_digest
+        {
+            return Err(GovernorObservationError::StaleTaskSelection);
+        }
+        if observed_fence != &current.state_fence {
+            return Err(GovernorObservationError::FenceMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Live Governor-selected task binding that a request-supplied
+/// [`TaskSelectionEvidence`] must be rechecked against at the admission
+/// fence (issue #1746, W4).
+///
+/// The values are read by the caller from the Governor owner — the selected
+/// `TaskContract` revision, the acceptance digest bound by the selection,
+/// the `WorkScope` the selection applies to, and the fence the selection
+/// was admitted under — never from the request.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentTaskSelection {
+    /// Exact task identity selected by the owner.
+    pub task_ref: String,
+    /// Current task-contract revision.
+    pub task_revision: u64,
+    /// Acceptance digest bound by the selection.
+    pub acceptance_digest: String,
+    /// `WorkScope` identity used by the selection.
+    pub work_scope_ref: String,
+    /// Fence the live selection was admitted under.
+    pub state_fence: StateFence,
 }
 
 /// Safe capture disposition for an observation that is not yet reusable memory.
