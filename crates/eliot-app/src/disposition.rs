@@ -114,16 +114,6 @@ const CLAUDE_CONNECTOR_TEST: &str = include_str!("../../../scripts/test-claude-c
 /// cannot silently fall behind the declared consumer set.
 pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
     ConsumerSurface {
-        path: "plugin/eliot-governor/hooks/hooks.json",
-        live_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
-        body: CODEX_PLUGIN_HOOKS,
-    },
-    ConsumerSurface {
-        path: "integrations/claude/eliot/hooks/hooks.json",
-        live_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
-        body: CLAUDE_PLUGIN_HOOKS,
-    },
-    ConsumerSurface {
         path: "integrations/opencode/opencode.json",
         live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
         body: OPENCODE_CONFIG,
@@ -358,20 +348,6 @@ const INVENTORY_REVISION: &str = "2026-09-25";
 pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
     &[
         ConsumerEntry {
-            consumer: "Codex plugin lifecycle hooks",
-            proof: "plugin/eliot-governor/hooks/hooks.json",
-            live_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when hooks route through bins/eliot-agent-bridge and crates/surfaces/* under #13",
-        },
-        ConsumerEntry {
-            consumer: "Claude Code plugin lifecycle hooks",
-            proof: "integrations/claude/eliot/hooks/hooks.json",
-            live_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when hooks route through bins/eliot-agent-bridge and crates/surfaces/* under #13",
-        },
-        ConsumerEntry {
             consumer: "OpenCode MCP server registration",
             proof: "integrations/opencode/opencode.json",
             live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
@@ -526,6 +502,22 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
         evidence: "bridge argv mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; the admitted contour the facade's unconditional Bridge redirect already serves for the claude host (crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge); served through the Kernel front door with no Governor, Store, WAL, or writer construction",
     },
+    MigratedConsumerEdge {
+        consumer: "Codex plugin lifecycle hooks",
+        proof: "plugin/eliot-governor/hooks/hooks.json",
+        legacy_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
+        current_owner_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-agent-bridge.exe",
+        current_owner: "bins/eliot-agent-bridge (codex_controller hook observation edge; scope/capability admission in cli_contract)",
+        evidence: "bridge argv mcp --profile codex_controller --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; controller profile/scope gate through bins/eliot-agent-bridge/src/cli_contract.rs::admit_codex_controller; hook observations served on the admitted SPINE_FUNCTIONAL contour through the Kernel front door",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Code plugin lifecycle hooks",
+        proof: "integrations/claude/eliot/hooks/hooks.json",
+        legacy_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
+        current_owner_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe\"",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "bridge argv mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; the admitted contour the delegated Claude host edges already use; served through the Kernel front door with no Governor, Store, WAL, or writer construction",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -534,6 +526,8 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "plugin/eliot-governor/.mcp.json" => Some(CODEX_PLUGIN_MCP),
         "integrations/claude/claude-desktop/mcpb/manifest.json" => Some(CLAUDE_DESKTOP_MCPB),
         "integrations/claude/eliot/.mcp.json" => Some(CLAUDE_PLUGIN_MCP),
+        "plugin/eliot-governor/hooks/hooks.json" => Some(CODEX_PLUGIN_HOOKS),
+        "integrations/claude/eliot/hooks/hooks.json" => Some(CLAUDE_PLUGIN_HOOKS),
         _ => None,
     }
 }

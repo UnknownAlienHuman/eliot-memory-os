@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook session-start",
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-agent-bridge.exe\" mcp --profile codex_controller --transport stdio --client-declaration \"${PLUGIN_ROOT}\\bin\\agent-bridge\\client-declaration-v2.json\"",
             "timeout": 10
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook pre-tool-use",
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-agent-bridge.exe\" mcp --profile codex_controller --transport stdio --client-declaration \"${PLUGIN_ROOT}\\bin\\agent-bridge\\client-declaration-v2.json\"",
             "timeout": 10
           }
         ]
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook post-tool-use",
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-agent-bridge.exe\" mcp --profile codex_controller --transport stdio --client-declaration \"${PLUGIN_ROOT}\\bin\\agent-bridge\\client-declaration-v2.json\"",
             "timeout": 10
           }
         ]
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook pre-compact",
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-agent-bridge.exe\" mcp --profile codex_controller --transport stdio --client-declaration \"${PLUGIN_ROOT}\\bin\\agent-bridge\\client-declaration-v2.json\"",
             "timeout": 10
           }
         ]
@@ -52,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook post-compact",
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-agent-bridge.exe\" mcp --profile codex_controller --transport stdio --client-declaration \"${PLUGIN_ROOT}\\bin\\agent-bridge\\client-declaration-v2.json\"",
             "timeout": 10
           }
         ]
@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook stop",
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-agent-bridge.exe\" mcp --profile codex_controller --transport stdio --client-declaration \"${PLUGIN_ROOT}\\bin\\agent-bridge\\client-declaration-v2.json\"",
             "timeout": 10
           }
         ]
