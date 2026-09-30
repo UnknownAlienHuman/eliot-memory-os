@@ -11,30 +11,38 @@
 //!
 //! The `StoreOwnerEcxfSource` port implementation is the only place that reads
 //! source evidence, and it is the only thing standing between the operator's
-//! arguments and the exporter: every value the fence could carry would have to
-//! come from
+//! arguments and the exporter: every value the fence could carry comes from
 //! [`capture_ecxf_source`](eliot_store_surreal_adapter::capture_ecxf_source),
 //! the one real coherent read in the admitted vendor edge, which reads the
 //! canonical member classes and the observed `state_fence`,
 //! `schema_generation` and sequence counters inside one fixed
-//! `BEGIN TRANSACTION`/`COMMIT` batch. This module fabricates no fence member,
-//! parses no provider row into domain semantics, and re-derives no digest: the
-//! only thing it forwards is the owner's own verdict.
+//! `BEGIN TRANSACTION`/`COMMIT` batch and projects those same rows onto the
+//! store owners' typed `RevisionHead`, `OrderingHead`, `CanonicalEvent`,
+//! `ProjectionPublicationRecord` and `WriteReceipt` values. This module
+//! fabricates no fence member, parses no provider row into domain semantics, and
+//! re-derives no digest: the only thing it forwards is the owner's own verdict.
 //!
 //! The `ECXF/1` package layout, the `ExportFence` and every residency,
 //! checksum and integrity proof belong to `eliot-ecxf` and to the
 //! `eliot-backup` exporter; neither is reimplemented, defaulted, pre-checked
 //! or weakened here (I05-10 "Consistent export boundary", I05-13).
 //!
-//! Fail-closed is the reachable outcome today, and it is the required one, not
-//! a stub. The store owner states in its own capture that it cannot be
-//! projected into a complete `ECXF/1` source view while it declares evidence
-//! gaps, so the port returns the typed
+//! Fail-closed is still the reachable outcome, and it is the required one, not
+//! a stub — but the reason is now narrower and evidence-derived rather than
+//! structural. The capture *does* carry the typed revision heads, ordering
+//! heads, events, projections and receipts the fence needs, read in the one
+//! transaction that also observed the fence. What it cannot carry is the
+//! evidence no admitted column or class supplies: the scope-to-record closure
+//! (the baseline declares no `scope_id` on a captured table), the source purge
+//! ledger, blob residency reachability, the externally sealed Architecture and
+//! `NormativePair` identities, a source-side export receipt, the store resource
+//! generation, this adapter's own identity and version, and the export's
+//! compression and encryption profiles. The owner states that in its own capture
+//! as a derived `missing_evidence` list, so the port returns the typed
 //! [`BackupError::UnobservedSourceMember`] refusal naming the first member the
 //! owner did not observe. Nothing is defaulted, no fence member is filled in,
-//! and the rows already read are not turned into records; no package is
-//! written. This command reports that refusal and exits nonzero; it never
-//! reports success over an incomplete view.
+//! and no package is written. This command reports that refusal and exits
+//! nonzero; it never reports success over an incomplete view.
 
 use std::path::{Path, PathBuf};
 
@@ -123,8 +131,17 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
         // evidence gaps (see `EcxfSourceCapture`'s own doc contract in
         // `crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`).
         // So the export refuses here, naming the member the owner did not
-        // observe. Nothing is defaulted, no fence member is filled in, and the
-        // rows already read are not turned into records.
+        // observe. Nothing is defaulted and no fence member is filled in.
+        //
+        // The capture already carries the typed fence members the source store
+        // does hold — the revision and ordering heads, the events, the
+        // projections and the receipts, all read inside the same transaction
+        // that observed the fence. They are not projected onto
+        // `CoherentSourceExport` here precisely because the members that remain
+        // cannot be: every one of them would have to be a default, a zero, an
+        // empty collection or a synthesized digest, and a fence member filled
+        // that way is worse than the refusal, because it would publish a
+        // manifest whose fence nobody observed.
         Err(BackupError::UnobservedSourceMember {
             member: unobserved_member(&capture),
         })
@@ -138,12 +155,16 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
 /// (`crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`); this
 /// maps each gap onto the static name of the already-existing
 /// [`CoherentSourceExport`] field it leaves unobserved, and adds no second gap
-/// type. Only `scope_id` is also an `ExportFence` member under that name; the
-/// other four are source-view and manifest members (`purge_ledger`,
-/// `reachable_blob_residency_keys`, `architecture_source_digest`,
-/// `export_receipt`), which is why they are named after the field the source
-/// view would have had to supply. An owner that declares no gap at all has
-/// still not established the observed completeness itself, so that case names
+/// type. Only `scope_id` and `store_generation` are also `ExportFence` members
+/// under those names; the rest are source-view and manifest members
+/// (`purge_ledger`, `reachable_blob_residency_keys`,
+/// `architecture_source_digest`, `export_receipt`, `source_adapter`,
+/// `compression`), which is why they are named after the field the source view
+/// would have had to supply. `StoreResourceGenerationUnavailable` names
+/// `store_generation` rather than `state_fence.resource_generation` because the
+/// fence's resource generation is the generation relevant to one decision, not
+/// the store's own. An owner that declares no gap at all has still not
+/// established the observed completeness itself, so that case names
 /// `completeness` — a source-view field whose counterpart in the fence is
 /// `consistent`, deliberately not the same word.
 fn unobserved_member(capture: &EcxfSourceCapture) -> &'static str {
@@ -155,6 +176,9 @@ fn unobserved_member(capture: &EcxfSourceCapture) -> &'static str {
             "architecture_source_digest"
         }
         Some(EcxfCaptureGap::SourceExportReceiptUnavailable) => "export_receipt",
+        Some(EcxfCaptureGap::StoreResourceGenerationUnavailable) => "store_generation",
+        Some(EcxfCaptureGap::SourceAdapterIdentityUnavailable) => "source_adapter",
+        Some(EcxfCaptureGap::ExportProfileUnavailable) => "compression",
         None => "completeness",
     }
 }
