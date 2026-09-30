@@ -7,18 +7,18 @@ use eliot_cue_activation::CueActivationEvaluation;
 use eliot_dreamer_classification::ClassificationResult;
 use eliot_dreamer_conflict_analysis::ConflictAnalysisCandidate;
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
-use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
 use eliot_dreamer_contracts::{
     DreamInputBundle, ModelDraft, ModelRouteOutcome, ValidatedGroundingCandidate, canonical_bytes,
 };
+use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_orientation::{
     InertProbe, OrientationInterpretation, OrientationResidue, OrientationSemanticView,
     OrientationStageOutput,
 };
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams};
 use eliot_dreamer_rival_model::RivalModelSet;
-use eliot_epistemic::PositionRequest;
-use eliot_epistemic_contracts::CurrentEpistemicPosition;
+use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
+use eliot_epistemic::{CurrentEpistemicPosition, PositionRequest};
 use serde::Serialize;
 
 use crate::pulse::{
@@ -87,7 +87,15 @@ impl StageOutputSet {
             }],
             rival_items: Vec::new(),
             gaps: Vec::new(),
-            inert_probes: Vec::new(),
+            inert_probes: model_draft
+                .recommended_probes
+                .iter()
+                .map(|text| InertProbe {
+                    text: text.clone(),
+                    status: "model_recommendation_inert".to_owned(),
+                    result_space: None,
+                })
+                .collect(),
             stage_outputs: Vec::with_capacity(9),
         }
     }
@@ -114,6 +122,9 @@ impl StageOutputSet {
     }
 
     fn retain_stage(&mut self, stage: &mut PulseStage) -> bool {
+        if stage.id != PulseStageId::Conflict && stage.canonical_output.is_none() {
+            return false;
+        }
         let (Some(owner_output), Some(input_digest), Some(output_digest)) = (
             stage.owner_output.take(),
             stage.input_commitment.as_ref(),
@@ -131,18 +142,33 @@ impl StageOutputSet {
             StageOwnerOutput::Classification(output) => self.classification = Some(output),
             StageOwnerOutput::CueActivation(output) => self.cue_activation = Some(output),
             StageOwnerOutput::EpistemicPosition(output) => {
-                self.gaps.extend(
-                    output
-                        .unknowns
-                        .iter()
-                        .map(|text| residue("epistemic_unknown", text, "epistemic_position")),
-                );
-                self.gaps.extend(
-                    output
-                        .required_inquiry
-                        .iter()
-                        .map(|text| residue("required_inquiry", text, "epistemic_position")),
-                );
+                let Some(position) = canonical_residue(
+                    "epistemic_position",
+                    &output,
+                    "epistemic_position",
+                ) else {
+                    return false;
+                };
+                self.rival_items.push(position);
+                if !push_count_residue(
+                    &mut self.gaps,
+                    "epistemic_unknown_count",
+                    output.unknowns.len(),
+                    "epistemic_position",
+                ) || !push_count_residue(
+                    &mut self.gaps,
+                    "epistemic_required_inquiry_count",
+                    output.required_inquiry.len(),
+                    "epistemic_position",
+                ) {
+                    return false;
+                }
+                self.gaps.extend(output.unknowns.iter().map(|text| {
+                    residue("epistemic_unknown", text, "epistemic_position")
+                }));
+                self.gaps.extend(output.required_inquiry.iter().map(|text| {
+                    residue("required_inquiry", text, "epistemic_position")
+                }));
                 self.epistemic_position = Some(output);
             }
             StageOwnerOutput::Understanding(output) => self.understanding = Some(output),
@@ -178,256 +204,61 @@ impl StageOutputSet {
                         &source,
                     ));
                 }
-                self.gaps
-                    .extend(output.omission_frontier.model_ids.iter().map(|model| {
-                        residue("rival_omission_frontier", model.model_id.as_str(), &source)
-                    }));
+                for (index, model) in output.omission_frontier.model_ids.iter().enumerate() {
+                    let Some(entry) = canonical_residue(
+                        "rival_omission_frontier",
+                        model,
+                        &format!("{source}:omission_frontier:{index}"),
+                    ) else {
+                        return false;
+                    };
+                    self.gaps.push(entry);
+                }
                 self.rivals = Some(output);
             }
             StageOwnerOutput::Conflict(output) => {
-                let source = output.conflict_id.as_str();
-                self.gaps
-                    .push(residue("conflict_outcome", output.outcome.as_str(), source));
-                self.gaps
-                    .push(residue("conflict_scope", &output.scope, source));
-                for position in &output.positions {
-                    self.rival_items.push(residue(
-                        "conflict_position",
-                        &format!(
-                            "index={} minority={} {}: {}",
-                            position.position_index,
-                            position.minority,
-                            position.disposition.as_str(),
-                            position.stance
-                        ),
-                        &position.source_handle,
-                    ));
-                    for conflict_class in &position.conflict_classes {
-                        let Some(entry) = canonical_residue(
-                            "conflict_class",
-                            conflict_class,
-                            &position.source_handle,
-                        ) else {
-                            return false;
-                        };
-                        self.gaps.push(entry);
-                    }
-                    self.gaps.push(residue(
-                        "conflict_position_compatibility_note",
-                        &position.compatibility_note,
-                        &position.source_handle,
-                    ));
-                    self.gaps.extend(position.assumptions.iter().map(|text| {
-                        residue(
-                            "conflict_position_assumption",
-                            text,
-                            &position.source_handle,
-                        )
-                    }));
-                    self.gaps.extend(position.counters.iter().map(|text| {
-                        residue("conflict_position_counter", text, &position.source_handle)
-                    }));
-                    for compatibility in &position.compatibility {
-                        self.gaps.push(residue(
-                            "conflict_position_compatibility",
-                            &format!(
-                                "relation={} supplement={} note={} differs={} unnormalizable={} unsupported={}",
-                                compatibility.relation.as_str(),
-                                compatibility.supplement_version.as_str(),
-                                compatibility.derivation_note,
-                                dimension_names(&compatibility.differing_dimensions),
-                                dimension_names(&compatibility.unnormalizable_dimensions),
-                                dimension_names(&compatibility.unsupported_dimensions),
-                            ),
-                            &compatibility.other_source,
-                        ));
-                        let Some(coverage) = canonical_residue(
-                            "conflict_position_compatibility_coverage",
-                            &compatibility.coverage,
-                            &compatibility.other_source,
-                        ) else {
-                            return false;
-                        };
-                        self.gaps.push(coverage);
-                        for comparison in &compatibility.outcomes {
-                            let text = match &comparison.outcome {
-                                eliot_dreamer_conflict_analysis::DimensionOutcome::Equal { value } => {
-                                    format!("{} equal {}", comparison.dimension.as_str(), value)
-                                }
-                                eliot_dreamer_conflict_analysis::DimensionOutcome::Differing {
-                                    left,
-                                    right,
-                                } => format!(
-                                    "{} differing left={} right={}",
-                                    comparison.dimension.as_str(),
-                                    left,
-                                    right
-                                ),
-                                eliot_dreamer_conflict_analysis::DimensionOutcome::Unnormalizable {
-                                    reason,
-                                } => format!("{} unnormalizable {}", comparison.dimension.as_str(), reason),
-                            };
-                            self.gaps.push(residue(
-                                "conflict_position_dimension",
-                                &text,
-                                &compatibility.other_source,
-                            ));
-                        }
-                    }
+                if !retain_conflict_semantics(self, &output) {
+                    return false;
                 }
-                for group in &output.lineage_groups {
-                    self.gaps.push(residue(
-                        "conflict_lineage_group",
-                        &format!(
-                            "known={} members={}",
-                            group.known,
-                            group.member_sources.join(",")
-                        ),
-                        &group.lineage_root,
-                    ));
-                }
-                for risk in &output.common_mode_risks {
-                    self.gaps.push(residue(
-                        "conflict_common_mode_risk",
-                        &format!(
-                            "{}: {} sources={}",
-                            risk.kind,
-                            risk.description,
-                            risk.affected_sources.join(",")
-                        ),
-                        source,
-                    ));
-                }
-                self.gaps.extend(output.objections.iter().map(|objection| {
-                    residue(
-                        "conflict_objection",
-                        &format!("grounded={} {}", objection.grounded, objection.statement),
-                        &format!("{}:{}", objection.objection_id, objection.target_source),
-                    )
-                }));
-                for probe in &output.recommended_probes {
-                    self.inert_probes.push(InertProbe {
-                        text: format!(
-                            "{} objective={} result={} separates={} owner={} verifier={} cost={} risk={} privacy={} effect={}",
-                            probe.probe_id,
-                            probe.objective_digest,
-                            probe.result_digest,
-                            probe.discriminates_positions.join(","),
-                            probe.owner,
-                            probe.verifier,
-                            probe.cost_note,
-                            probe.risk_note,
-                            probe.privacy_note,
-                            probe.effect_note,
-                        ),
-                        status: "candidate_only".to_owned(),
-                        result_space: probe.resolves_unknown.clone(),
-                    });
-                }
-                self.gaps.push(residue(
-                    "conflict_owner_recommendation",
-                    &format!(
-                        "{}: {} ({})",
-                        output.recommended_owner.kind.as_str(),
-                        output.recommended_owner.rationale,
-                        output.recommended_owner.contract_needed
-                    ),
-                    &output.recommended_owner.owner_handle,
-                ));
-                for verdict in &output.preservation.verdicts {
-                    self.gaps.push(residue(
-                        "conflict_preservation",
-                        &format!(
-                            "{} passed={} known={} {}",
-                            verdict.dimension.as_str(),
-                            verdict.passed,
-                            verdict.known,
-                            verdict.note
-                        ),
-                        source,
-                    ));
-                }
-                self.gaps.push(residue(
-                    "conflict_candidate_commitment",
-                    &output.candidate_digest,
-                    source,
-                ));
-                self.gaps
-                    .push(residue("conflict_analysis_note", &output.note, source));
-                self.gaps.push(residue(
-                    "conflict_independent_root_count",
-                    &output.independent_root_count.to_string(),
-                    source,
-                ));
-                if let Some(resolution) = &output.resolution_status {
-                    self.gaps.push(residue(
-                        "conflict_external_resolution",
-                        &format!("{}: {}", resolution.decision_digest, resolution.note),
-                        &resolution.decided_by,
-                    ));
-                }
-                for causal in &output.causal_states {
-                    self.gaps.push(residue(
-                        "conflict_causal_state",
-                        &format!(
-                            "declared={} effective={} revision={} supplement={} reduction={} mechanism={}",
-                            causal.declared_state.as_str(),
-                            causal.effective_state.as_str(),
-                            causal.declaration_revision.as_deref().unwrap_or("unavailable"),
-                            causal.supplement_version.as_str(),
-                            causal.reduction_reason,
-                            causal.mechanism_claim_id.as_deref().unwrap_or("unavailable"),
-                        ),
-                        &causal.source_handle,
-                    ));
-                    for (name, coverage) in [
-                        ("overall", &causal.coverage),
-                        ("evidence", &causal.evidence_coverage),
-                        ("rivals", &causal.rival_coverage),
-                    ] {
-                        let Some(entry) = canonical_residue(
-                            "conflict_causal_coverage",
-                            coverage,
-                            &format!("{}:{name}", causal.source_handle),
-                        ) else {
-                            return false;
-                        };
-                        self.gaps.push(entry);
-                    }
-                }
-                self.gaps.extend(
-                    output
-                        .unknowns
-                        .iter()
-                        .map(|text| residue("conflict_unknown", text, source)),
-                );
-                self.gaps.extend(
-                    output
-                        .assumptions
-                        .iter()
-                        .map(|text| residue("conflict_assumption", text, source)),
-                );
-                self.gaps.extend(
-                    output
-                        .counterevidence
-                        .iter()
-                        .map(|text| residue("conflict_counterevidence", text, source)),
-                );
-                self.gaps.extend(
-                    output
-                        .invalidation_conditions
-                        .iter()
-                        .map(|text| residue("conflict_invalidation", text, source)),
-                );
                 self.conflict = Some(output);
             }
             StageOwnerOutput::Probes(output) => {
-                self.inert_probes
-                    .extend(output.probes.iter().map(|probe| InertProbe {
-                        text: probe.expected_discrimination.clone(),
+                let source = output.plan_id.as_str();
+                if !push_count_residue(
+                    &mut self.gaps,
+                    "probe_plan_count",
+                    output.probes.len(),
+                    source,
+                ) || !push_count_residue(
+                    &mut self.gaps,
+                    "probe_plan_omissions_count",
+                    output.omissions.len(),
+                    source,
+                )
+                {
+                    return false;
+                }
+                for (index, probe) in output.probes.iter().enumerate() {
+                    let Some(text) = canonical_text(probe) else {
+                        return false;
+                    };
+                    let Some(result_space) = canonical_text(&probe.result_schema) else {
+                        return false;
+                    };
+                    self.inert_probes.push(InertProbe {
+                        text,
                         status: "candidate_only".to_owned(),
-                        result_space: None,
-                    }));
+                        result_space: Some(result_space),
+                    });
+                    let Some(rank) = canonical_residue(
+                        "probe_plan_rank",
+                        &probe.rank,
+                        &format!("{}:probe:{index}", source),
+                    ) else {
+                        return false;
+                    };
+                    self.gaps.push(rank);
+                }
                 for omission in &output.omissions {
                     let Some(entry) =
                         canonical_residue("probe_plan_omission", omission, output.plan_id.as_str())
@@ -582,7 +413,9 @@ pub(crate) fn run_mandatory_stages(
         run_grounding_stage(Some(inputs.grounding)),
         PulseStageId::Grounding
     );
-    if outputs.grounding.as_ref() != inputs.rivals.validated_draft.input.grounded.as_deref() {
+    if outputs.grounding.as_ref()
+        != inputs.rivals.validated_draft.input.grounded.as_ref()
+    {
         return failed_run(
             stages,
             outputs,
@@ -708,7 +541,7 @@ fn check_conflict_binding(
     let grounded = candidate.input.grounded.as_ref();
     if grounded.input.bundle != *bundle
         || grounded.input.bundle_digest != candidate.validated.receipt.bundle_digest
-        || grounded.input.job.job_id != candidate.validated.receipt.job_id
+        || grounded.input.job.canonical_id() != candidate.validated.receipt.job_id
         || grounded.input.task_id.as_str() != bundle.task_id
         || grounded.input.scope_id != bundle.scope_id
         || grounded.input.state_fence != bundle.state_fence
@@ -734,7 +567,7 @@ fn check_classification_binding(
 ) -> Result<(), PulseError> {
     let context = stage.context;
     if context.bundle != bundle
-        || context.job.job_id != model_outcome.job_id
+        || context.job.canonical_id() != model_outcome.job_id
         || context.receipt.job_id != model_outcome.job_id
         || context.receipt.bundle_digest != model_outcome.bundle_digest
         || context.grounded.job_id != model_outcome.job_id
@@ -809,7 +642,7 @@ fn check_grounding_binding(
     };
     if &request.bundle != bundle
         || &draft.bundle != bundle
-        || request.job.job_id != model_outcome.job_id
+        || request.job.canonical_id() != model_outcome.job_id
         || draft.job_id != model_outcome.job_id
         || draft.bundle_digest != model_outcome.bundle_digest
         || draft.task_id.as_str() != bundle.task_id
@@ -841,8 +674,8 @@ fn check_rival_binding(
         || candidate.validated.receipt.task_id != bundle.task_id
         || candidate.validated.receipt.scope_id != bundle.scope_id
         || candidate.validated.receipt.state_fence != bundle.state_fence
-        || stage.current_position.scope != bundle.scope_id
-        || stage.current_position.state_fence != bundle.state_fence
+        || stage.current_position.admission.scope != bundle.scope_id
+        || stage.current_position.admission.fence != bundle.state_fence
     {
         return Err(PulseError::Boundary("rival model route or bundle binding"));
     }
@@ -881,19 +714,586 @@ fn residue(kind: &str, text: &str, source: &str) -> OrientationResidue {
     }
 }
 
-fn canonical_residue<T: Serialize>(
-    kind: &str,
-    value: &T,
-    source: &str,
-) -> Option<OrientationResidue> {
-    let text = String::from_utf8(canonical_bytes(value).ok()?).ok()?;
-    Some(residue(kind, &text, source))
+fn canonical_residue<T: Serialize>(kind: &str, value: &T, source: &str) -> Option<OrientationResidue> {
+    Some(residue(kind, &canonical_text(value)?, source))
 }
 
-fn dimension_names(dimensions: &[eliot_dreamer_conflict_analysis::ComparisonDimension]) -> String {
-    dimensions
-        .iter()
-        .map(|dimension| dimension.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
+fn canonical_text<T: Serialize>(value: &T) -> Option<String> {
+    String::from_utf8(canonical_bytes(value).ok()?).ok()
+}
+
+fn push_count_residue(
+    target: &mut Vec<OrientationResidue>,
+    kind: &str,
+    count: usize,
+    source: &str,
+) -> bool {
+    let Some(entry) = canonical_residue(kind, &count, source) else {
+        return false;
+    };
+    target.push(entry);
+    true
+}
+
+fn push_string_sequence(
+    target: &mut Vec<OrientationResidue>,
+    kind: &str,
+    values: &[String],
+    source: &str,
+) -> bool {
+    if !push_count_residue(target, &format!("{kind}_count"), values.len(), source) {
+        return false;
+    }
+    for (index, value) in values.iter().enumerate() {
+        let Some(entry) = canonical_residue(kind, value, &format!("{source}:{kind}:{index}")) else {
+            return false;
+        };
+        target.push(entry);
+    }
+    true
+}
+
+fn retain_conflict_semantics(
+    target: &mut StageOutputSet,
+    output: &ConflictAnalysisCandidate,
+) -> bool {
+    macro_rules! push {
+        ($target:expr, $kind:expr, $value:expr, $source:expr) => {{
+            let Some(entry) = canonical_residue($kind, $value, $source) else {
+                return false;
+            };
+            ($target).push(entry);
+        }};
+    }
+
+    let source = output.conflict_id.as_str();
+    push!(
+        &mut target.gaps,
+        "conflict_outcome",
+        &output.outcome.as_str(),
+        source
+    );
+    push!(&mut target.gaps, "conflict_scope", &output.scope, source);
+    push!(
+        &mut target.gaps,
+        "conflict_candidate_digest",
+        &output.candidate_digest,
+        source
+    );
+    push!(
+        &mut target.gaps,
+        "conflict_analysis_note",
+        &output.note,
+        source
+    );
+    push!(
+        &mut target.gaps,
+        "conflict_independent_root_count",
+        &output.independent_root_count,
+        source
+    );
+    if !push_count_residue(
+        &mut target.rival_items,
+        "conflict_positions_count",
+        output.positions.len(),
+        source,
+    ) || !push_count_residue(
+        &mut target.gaps,
+        "conflict_lineage_groups_count",
+        output.lineage_groups.len(),
+        source,
+    ) || !push_count_residue(
+        &mut target.gaps,
+        "conflict_common_mode_risks_count",
+        output.common_mode_risks.len(),
+        source,
+    ) || !push_count_residue(
+        &mut target.gaps,
+        "conflict_objections_count",
+        output.objections.len(),
+        source,
+    ) || !push_count_residue(
+        &mut target.gaps,
+        "conflict_recommended_probes_count",
+        output.recommended_probes.len(),
+        source,
+    ) || !push_count_residue(
+        &mut target.gaps,
+        "conflict_preservation_verdicts_count",
+        output.preservation.verdicts.len(),
+        source,
+    ) || !push_count_residue(
+        &mut target.gaps,
+        "conflict_causal_states_count",
+        output.causal_states.len(),
+        source,
+    ) {
+        return false;
+    }
+
+    for (index, position) in output.positions.iter().enumerate() {
+        let position_source = format!("{source}:position:{index}");
+        push!(
+            &mut target.rival_items,
+            "conflict_position_index",
+            &position.position_index,
+            &position_source
+        );
+        push!(
+            &mut target.rival_items,
+            "conflict_position_source",
+            &position.source_handle,
+            &position_source
+        );
+        push!(
+            &mut target.rival_items,
+            "conflict_position_stance",
+            &position.stance,
+            &position_source
+        );
+        push!(
+            &mut target.rival_items,
+            "conflict_position_minority",
+            &position.minority,
+            &position_source
+        );
+        push!(
+            &mut target.rival_items,
+            "conflict_position_disposition",
+            &position.disposition.as_str(),
+            &position_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_position_compatibility_note",
+            &position.compatibility_note,
+            &position_source
+        );
+        if !push_count_residue(
+            &mut target.gaps,
+            "conflict_position_classes_count",
+            position.conflict_classes.len(),
+            &position_source,
+        ) {
+            return false;
+        }
+        for (class_index, conflict_class) in position.conflict_classes.iter().enumerate() {
+            push!(
+                &mut target.gaps,
+                "conflict_position_class",
+                conflict_class,
+                &format!("{position_source}:class:{class_index}")
+            );
+        }
+        if !push_string_sequence(
+            &mut target.gaps,
+            "conflict_position_assumption",
+            &position.assumptions,
+            &position_source,
+        ) || !push_string_sequence(
+            &mut target.gaps,
+            "conflict_position_counter",
+            &position.counters,
+            &position_source,
+        ) || !push_count_residue(
+            &mut target.gaps,
+            "conflict_position_compatibilities_count",
+            position.compatibility.len(),
+            &position_source,
+        ) {
+            return false;
+        }
+        for (compatibility_index, compatibility) in position.compatibility.iter().enumerate() {
+            let compatibility_source = format!("{position_source}:compatibility:{compatibility_index}");
+            push!(
+                &mut target.gaps,
+                "conflict_compatibility_other_source",
+                &compatibility.other_source,
+                &compatibility_source
+            );
+            push!(
+                &mut target.gaps,
+                "conflict_compatibility_relation",
+                &compatibility.relation.as_str(),
+                &compatibility_source
+            );
+            push!(
+                &mut target.gaps,
+                "conflict_compatibility_supplement_version",
+                &compatibility.supplement_version.as_str(),
+                &compatibility_source
+            );
+            push!(
+                &mut target.gaps,
+                "conflict_compatibility_derivation_note",
+                &compatibility.derivation_note,
+                &compatibility_source
+            );
+            if !push_count_residue(
+                &mut target.gaps,
+                "conflict_compatibility_outcomes_count",
+                compatibility.outcomes.len(),
+                &compatibility_source,
+            ) || !push_count_residue(
+                &mut target.gaps,
+                "conflict_compatibility_differing_dimensions_count",
+                compatibility.differing_dimensions.len(),
+                &compatibility_source,
+            ) || !push_count_residue(
+                &mut target.gaps,
+                "conflict_compatibility_unnormalizable_dimensions_count",
+                compatibility.unnormalizable_dimensions.len(),
+                &compatibility_source,
+            ) || !push_count_residue(
+                &mut target.gaps,
+                "conflict_compatibility_unsupported_dimensions_count",
+                compatibility.unsupported_dimensions.len(),
+                &compatibility_source,
+            ) {
+                return false;
+            }
+            for (outcome_index, comparison) in compatibility.outcomes.iter().enumerate() {
+                let outcome_source = format!("{compatibility_source}:outcome:{outcome_index}");
+                push!(
+                    &mut target.gaps,
+                    "conflict_compatibility_dimension",
+                    &comparison.dimension.as_str(),
+                    &outcome_source
+                );
+                match &comparison.outcome {
+                    eliot_dreamer_conflict_analysis::DimensionOutcome::Equal { value } => {
+                        push!(
+                            &mut target.gaps,
+                            "conflict_compatibility_outcome_kind",
+                            &"equal",
+                            &outcome_source
+                        );
+                        push!(
+                            &mut target.gaps,
+                            "conflict_compatibility_equal_value",
+                            value,
+                            &outcome_source
+                        );
+                    }
+                    eliot_dreamer_conflict_analysis::DimensionOutcome::Differing { left, right } => {
+                        push!(
+                            &mut target.gaps,
+                            "conflict_compatibility_outcome_kind",
+                            &"differing",
+                            &outcome_source
+                        );
+                        push!(
+                            &mut target.gaps,
+                            "conflict_compatibility_left",
+                            left,
+                            &outcome_source
+                        );
+                        push!(
+                            &mut target.gaps,
+                            "conflict_compatibility_right",
+                            right,
+                            &outcome_source
+                        );
+                    }
+                    eliot_dreamer_conflict_analysis::DimensionOutcome::Unnormalizable { reason } => {
+                        push!(
+                            &mut target.gaps,
+                            "conflict_compatibility_outcome_kind",
+                            &"unnormalizable",
+                            &outcome_source
+                        );
+                        push!(
+                            &mut target.gaps,
+                            "conflict_compatibility_unnormalizable_reason",
+                            reason,
+                            &outcome_source
+                        );
+                    }
+                }
+            }
+            for (field, dimensions) in [
+                ("differing", &compatibility.differing_dimensions),
+                ("unnormalizable", &compatibility.unnormalizable_dimensions),
+                ("unsupported", &compatibility.unsupported_dimensions),
+            ] {
+                for (dimension_index, dimension) in dimensions.iter().enumerate() {
+                    push!(
+                        &mut target.gaps,
+                        &format!("conflict_compatibility_{field}_dimension"),
+                        &dimension.as_str(),
+                        &format!("{compatibility_source}:{field}:{dimension_index}")
+                    );
+                }
+            }
+            push!(
+                &mut target.gaps,
+                "conflict_compatibility_coverage",
+                &compatibility.coverage,
+                &compatibility_source
+            );
+        }
+    }
+
+    for (index, group) in output.lineage_groups.iter().enumerate() {
+        let group_source = format!("{source}:lineage:{index}");
+        push!(
+            &mut target.gaps,
+            "conflict_lineage_root",
+            &group.lineage_root,
+            &group_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_lineage_known",
+            &group.known,
+            &group_source
+        );
+        if !push_string_sequence(
+            &mut target.gaps,
+            "conflict_lineage_member",
+            &group.member_sources,
+            &group_source,
+        ) {
+            return false;
+        }
+    }
+    for (index, risk) in output.common_mode_risks.iter().enumerate() {
+        let risk_source = format!("{source}:common_mode_risk:{index}");
+        push!(&mut target.gaps, "conflict_risk_kind", &risk.kind, &risk_source);
+        push!(
+            &mut target.gaps,
+            "conflict_risk_description",
+            &risk.description,
+            &risk_source
+        );
+        if !push_string_sequence(
+            &mut target.gaps,
+            "conflict_risk_affected_source",
+            &risk.affected_sources,
+            &risk_source,
+        ) {
+            return false;
+        }
+    }
+    for (index, objection) in output.objections.iter().enumerate() {
+        let objection_source = format!("{source}:objection:{index}");
+        push!(
+            &mut target.gaps,
+            "conflict_objection_id",
+            &objection.objection_id,
+            &objection_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_objection_target_source",
+            &objection.target_source,
+            &objection_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_objection_statement",
+            &objection.statement,
+            &objection_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_objection_grounded",
+            &objection.grounded,
+            &objection_source
+        );
+    }
+    if !push_string_sequence(
+        &mut target.gaps,
+        "conflict_counterevidence",
+        &output.counterevidence,
+        source,
+    ) || !push_string_sequence(
+        &mut target.gaps,
+        "conflict_unknown",
+        &output.unknowns,
+        source,
+    ) || !push_string_sequence(
+        &mut target.gaps,
+        "conflict_assumption",
+        &output.assumptions,
+        source,
+    ) || !push_string_sequence(
+        &mut target.gaps,
+        "conflict_invalidation_condition",
+        &output.invalidation_conditions,
+        source,
+    ) {
+        return false;
+    }
+
+    #[derive(Serialize)]
+    struct ConflictProbe<'a> {
+        probe_id: &'a str,
+        objective_digest: &'a str,
+        result_digest: &'a str,
+        discriminates_positions: &'a [String],
+        resolves_unknown: Option<&'a str>,
+        owner: &'a str,
+        verifier: &'a str,
+        cost_note: &'a str,
+        risk_note: &'a str,
+        privacy_note: &'a str,
+        effect_note: &'a str,
+    }
+    for probe in &output.recommended_probes {
+        let semantic = ConflictProbe {
+            probe_id: &probe.probe_id,
+            objective_digest: &probe.objective_digest,
+            result_digest: &probe.result_digest,
+            discriminates_positions: &probe.discriminates_positions,
+            resolves_unknown: probe.resolves_unknown.as_deref(),
+            owner: &probe.owner,
+            verifier: &probe.verifier,
+            cost_note: &probe.cost_note,
+            risk_note: &probe.risk_note,
+            privacy_note: &probe.privacy_note,
+            effect_note: &probe.effect_note,
+        };
+        let Some(text) = canonical_text(&semantic) else {
+            return false;
+        };
+        let Some(result_space) = canonical_text(&probe.resolves_unknown) else {
+            return false;
+        };
+        target.inert_probes.push(InertProbe {
+            text,
+            status: "candidate_only".to_owned(),
+            result_space: Some(result_space),
+        });
+    }
+    push!(
+        &mut target.gaps,
+        "conflict_owner_kind",
+        &output.recommended_owner.kind.as_str(),
+        source
+    );
+    push!(
+        &mut target.gaps,
+        "conflict_owner_handle",
+        &output.recommended_owner.owner_handle,
+        source
+    );
+    push!(
+        &mut target.gaps,
+        "conflict_owner_rationale",
+        &output.recommended_owner.rationale,
+        source
+    );
+    push!(
+        &mut target.gaps,
+        "conflict_owner_contract_needed",
+        &output.recommended_owner.contract_needed,
+        source
+    );
+    for (index, verdict) in output.preservation.verdicts.iter().enumerate() {
+        let verdict_source = format!("{source}:preservation:{index}");
+        push!(
+            &mut target.gaps,
+            "conflict_preservation_dimension",
+            &verdict.dimension.as_str(),
+            &verdict_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_preservation_passed",
+            &verdict.passed,
+            &verdict_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_preservation_known",
+            &verdict.known,
+            &verdict_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_preservation_note",
+            &verdict.note,
+            &verdict_source
+        );
+    }
+    let resolution = output.resolution_status.as_ref().map(|resolution| {
+        (
+            resolution.decision_digest.as_str(),
+            resolution.decided_by.as_str(),
+            resolution.note.as_str(),
+        )
+    });
+    push!(
+        &mut target.gaps,
+        "conflict_external_resolution",
+        &resolution,
+        source
+    );
+    for (index, causal) in output.causal_states.iter().enumerate() {
+        let causal_source = format!("{source}:causal:{index}");
+        push!(
+            &mut target.gaps,
+            "conflict_causal_source",
+            &causal.source_handle,
+            &causal_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_causal_declared_state",
+            &causal.declared_state.as_str(),
+            &causal_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_causal_effective_state",
+            &causal.effective_state.as_str(),
+            &causal_source
+        );
+        let declaration_revision = causal.declaration_revision.as_deref();
+        push!(
+            &mut target.gaps,
+            "conflict_causal_declaration_revision",
+            &declaration_revision,
+            &causal_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_causal_supplement_version",
+            &causal.supplement_version.as_str(),
+            &causal_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_causal_reduction_reason",
+            &causal.reduction_reason,
+            &causal_source
+        );
+        let mechanism_claim_id = causal.mechanism_claim_id.as_deref();
+        push!(
+            &mut target.gaps,
+            "conflict_causal_mechanism_claim_id",
+            &mechanism_claim_id,
+            &causal_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_causal_overall_coverage",
+            &causal.coverage,
+            &causal_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_causal_evidence_coverage",
+            &causal.evidence_coverage,
+            &causal_source
+        );
+        push!(
+            &mut target.gaps,
+            "conflict_causal_rival_coverage",
+            &causal.rival_coverage,
+            &causal_source
+        );
+    }
+    true
 }
