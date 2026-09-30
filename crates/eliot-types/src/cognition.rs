@@ -24,6 +24,74 @@ pub const OPERATOR_SCHEMA_VERSION: &str = "eliot-operator-contract-v1";
 pub const OPERATOR_IPC_PROTOCOL_VERSION: &str = "eliot-ipc-l3-v2";
 pub const OPERATOR_CONTRACT_MANIFEST: &str = include_str!("../schema/operator-contract-v1.json");
 
+/// Serde adapter for legacy `estimated_tokens` fields whose honest value is an
+/// unvalidated STU projection. The Rust field stays source-compatible as a
+/// `usize`; its wire form is explicitly versioned and refuses scalar aliases,
+/// changed units, empirical claims, actual-token claims, fit claims, and extra
+/// fields.
+pub mod legacy_unvalidated_stu_projection {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+
+    const SCHEMA: &str = "eliot.legacy-estimate/v1";
+    const UNIT: &str = "unvalidated_stu";
+
+    #[derive(Serialize)]
+    struct LegacyStuProjection<'a> {
+        schema: &'a str,
+        unit: &'a str,
+        value: usize,
+        empirical: bool,
+        actual_tokens: (),
+        measured_fit: (),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyStuProjectionOwned {
+        schema: String,
+        unit: String,
+        value: usize,
+        empirical: bool,
+        actual_tokens: (),
+        measured_fit: (),
+    }
+
+    pub fn serialize<S>(value: &usize, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        LegacyStuProjection {
+            schema: SCHEMA,
+            unit: UNIT,
+            value: *value,
+            empirical: false,
+            actual_tokens: (),
+            measured_fit: (),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let LegacyStuProjectionOwned {
+            schema,
+            unit,
+            value,
+            empirical,
+            actual_tokens: (),
+            measured_fit: (),
+        } = LegacyStuProjectionOwned::deserialize(deserializer)?;
+        if schema != SCHEMA || unit != UNIT || empirical {
+            return Err(D::Error::custom(
+                "legacy estimate must be eliot.legacy-estimate/v1 unvalidated_stu with no observation or fit claim",
+            ));
+        }
+        Ok(value)
+    }
+}
+
 pub fn operator_contract_hash() -> String {
     operator_contract_hash_for_manifest(OPERATOR_CONTRACT_MANIFEST)
 }
@@ -73,6 +141,10 @@ pub struct PacketQualityReport {
     pub task_id: String,
     pub revision_fence: MemoryRevision,
     pub structured_bytes: usize,
+    /// Closed compatibility adapter: this scalar is the canonical, unvalidated
+    /// #704 STU projection for the exact serialized packet, never an observed
+    /// tokenizer count or proof that a route budget fits.
+    #[serde(with = "legacy_unvalidated_stu_projection")]
     pub estimated_tokens: usize,
     pub task_frame_present: bool,
     pub current_truth_coverage: f32,

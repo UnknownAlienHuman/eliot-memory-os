@@ -1,4 +1,7 @@
 use crate::EngineError;
+use eliot_context_contracts::{ContextError, MeasurementStatus, StuEstimate};
+use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
+use eliot_contracts::sha256_hex;
 use eliot_skills::{
     SKILL_PACK_HASH_ALGORITHM, canonical_skill_content_hash, canonical_skill_pack_hash,
 };
@@ -27,9 +30,25 @@ pub use eliot_skills::{DERIVED_SKILL_PACKAGES, ELIOT_SKILL_NAMES};
 #[derive(Clone, Debug, Serialize)]
 pub struct SkillPackEntryReport {
     pub name: String,
+    /// Exact UTF-8 bytes of the raw owned skill body read from disk.
+    pub body_utf8_bytes: u64,
+    /// Exact UTF-8 bytes of the raw frontmatter description.
+    pub description_utf8_bytes: u64,
     pub description_characters: usize,
     pub nonblank_lines: usize,
-    pub estimated_tokens: usize,
+    /// #704 unvalidated STU; no route-bound tokenizer or fit claim is present.
+    pub stu_estimate: StuEstimate,
+    pub description_stu_estimate: StuEstimate,
+    pub actual_tokens: Option<u64>,
+    pub measured_fit: Option<bool>,
+    pub measurement_status: MeasurementStatus,
+    /// Profile for interpreting body and description bytes as exact UTF-8.
+    pub raw_text_profile_id: String,
+    pub raw_text_profile_version: String,
+    pub raw_text_profile_options_digest: String,
+    pub raw_text_profile_digest: String,
+    pub body_content_sha256: String,
+    pub description_content_sha256: String,
     pub canonical_hash: String,
     pub opencode_parity: bool,
     pub claude_parity: bool,
@@ -38,12 +57,96 @@ pub struct SkillPackEntryReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SkillPackLintReport {
+    /// Validates lint conditions and the existing planning estimate limits;
+    /// actual route-tokenizer fit remains unknown.
     pub valid: bool,
     pub skill_count: usize,
     pub listing_characters: usize,
+    /// Exact serialized UTF-8 bytes of the final ordered description listing.
+    pub listing_utf8_bytes: u64,
+    pub listing_stu_estimate: StuEstimate,
+    /// Serializer identity and content binding for the final description list.
+    pub listing_serializer_id: String,
+    pub listing_serializer_version: String,
+    pub listing_serializer_options_digest: String,
+    pub listing_serializer_profile_digest: String,
+    pub listing_content_sha256: String,
+    pub actual_tokens: Option<u64>,
+    pub measured_fit: Option<bool>,
+    pub measurement_status: MeasurementStatus,
     pub entries: Vec<SkillPackEntryReport>,
     pub errors: Vec<String>,
     pub pack_hash: String,
+}
+
+impl SkillPackEntryReport {
+    /// Reject changed body/description content or a changed raw UTF-8 profile.
+    pub fn validate_contents(&self, body: &str, description: &str) -> Result<(), EngineError> {
+        let (profile_id, profile_version, profile_options, profile_digest) = raw_text_profile();
+        if self.raw_text_profile_id != profile_id
+            || self.raw_text_profile_version != profile_version
+            || self.raw_text_profile_options_digest != profile_options
+            || self.raw_text_profile_digest != profile_digest
+        {
+            return Err(measurement_error(
+                "skill raw-text measurement profile changed",
+            ));
+        }
+        if self.actual_tokens.is_some()
+            || self.measured_fit.is_some()
+            || self.measurement_status != MeasurementStatus::ConservativeStu
+        {
+            return Err(measurement_error(
+                "skill raw-text measurement contains unsupported evidence",
+            ));
+        }
+        validate_exact_text(
+            body.as_bytes(),
+            self.body_utf8_bytes,
+            &self.body_content_sha256,
+            &self.stu_estimate,
+        )?;
+        validate_exact_text(
+            description.as_bytes(),
+            self.description_utf8_bytes,
+            &self.description_content_sha256,
+            &self.description_stu_estimate,
+        )?;
+        Ok(())
+    }
+}
+
+impl SkillPackLintReport {
+    /// Revalidate the exact serialized description-listing bytes against the
+    /// original serializer profile and content digest. A changed listing is
+    /// stale measurement evidence and cannot be repaired by this method.
+    pub fn validate_listing_envelope(&self, serialized: &[u8]) -> Result<(), EngineError> {
+        let (serializer_id, serializer_version, options_digest, profile_digest) =
+            listing_serializer_profile();
+        if self.listing_serializer_id != serializer_id
+            || self.listing_serializer_version != serializer_version
+            || self.listing_serializer_options_digest != options_digest
+            || self.listing_serializer_profile_digest != profile_digest
+        {
+            return Err(measurement_error(
+                "skill listing serializer profile changed",
+            ));
+        }
+        if self.actual_tokens.is_some()
+            || self.measured_fit.is_some()
+            || self.measurement_status != MeasurementStatus::ConservativeStu
+        {
+            return Err(measurement_error(
+                "skill listing measurement contains unsupported evidence",
+            ));
+        }
+        validate_exact_text(
+            serialized,
+            self.listing_utf8_bytes,
+            &self.listing_content_sha256,
+            &self.listing_stu_estimate,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +163,7 @@ impl SkillPackService {
         let mut errors = Vec::new();
         let mut entries = Vec::new();
         let mut descriptions = 0;
+        let mut listing_descriptions = Vec::new();
         let mut paragraph_owners = BTreeMap::<String, String>::new();
 
         for name in ELIOT_SKILL_NAMES {
@@ -78,18 +182,25 @@ impl SkillPackService {
             if description.is_empty() {
                 errors.push(format!("{name}: description is empty"));
             }
-            descriptions += description.chars().count();
+            let description_characters = description.chars().count();
+            descriptions += description_characters;
+            listing_descriptions.push(description.clone());
             let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count();
-            let estimated_tokens = body.chars().count().div_ceil(4);
+            let (body_utf8_bytes, stu_estimate, body_content_sha256) =
+                exact_text_measurement(body.as_bytes())?;
+            let (description_utf8_bytes, description_stu_estimate, description_content_sha256) =
+                exact_text_measurement(description.as_bytes())?;
             if nonblank_lines > 100 {
                 errors.push(format!("{name}: body exceeds 100 nonblank lines"));
             }
-            if estimated_tokens > 500 {
-                errors.push(format!("{name}: body exceeds estimated 500 token budget"));
-            }
-            if description.chars().count().div_ceil(4) > 25 {
+            if stu_estimate.value > 500 {
                 errors.push(format!(
-                    "{name}: description exceeds estimated 25 token budget"
+                    "{name}: body unvalidated STU planning estimate exceeds 500; actual token fit is unknown"
+                ));
+            }
+            if description_stu_estimate.value > 25 {
+                errors.push(format!(
+                    "{name}: description unvalidated STU planning estimate exceeds 25; actual token fit is unknown"
                 ));
             }
             let lower = body.to_ascii_lowercase();
@@ -134,11 +245,29 @@ impl SkillPackService {
             if !opencode_parity || !claude_parity || !codex_parity || !antigravity_parity {
                 errors.push(format!("{name}: generated host package drift"));
             }
-            entries.push(SkillPackEntryReport {
+            let (
+                raw_text_profile_id,
+                raw_text_profile_version,
+                raw_text_profile_options_digest,
+                raw_text_profile_digest,
+            ) = raw_text_profile();
+            let entry = SkillPackEntryReport {
                 name: name.to_owned(),
-                description_characters: description.chars().count(),
+                body_utf8_bytes,
+                description_utf8_bytes,
+                description_characters,
                 nonblank_lines,
-                estimated_tokens,
+                stu_estimate,
+                description_stu_estimate,
+                actual_tokens: None,
+                measured_fit: None,
+                measurement_status: MeasurementStatus::ConservativeStu,
+                raw_text_profile_id,
+                raw_text_profile_version,
+                raw_text_profile_options_digest,
+                raw_text_profile_digest,
+                body_content_sha256,
+                description_content_sha256,
                 canonical_hash,
                 opencode_parity,
                 claude_parity,
@@ -146,11 +275,25 @@ impl SkillPackService {
                     ("codex".to_owned(), codex_parity),
                     ("antigravity".to_owned(), antigravity_parity),
                 ]),
-            });
+            };
+            entry.validate_contents(&body, &description)?;
+            entries.push(entry);
         }
-        if descriptions.div_ceil(4) > 100 {
-            errors.push("combined descriptions exceed estimated 100 token budget".to_owned());
+        let serialized_listing = serde_json::to_vec(&listing_descriptions)?;
+        let (listing_utf8_bytes, listing_stu_estimate, listing_content_sha256) =
+            exact_text_measurement(&serialized_listing)?;
+        if listing_stu_estimate.value > 100 {
+            errors.push(
+                "combined descriptions unvalidated STU planning estimate exceeds 100; actual token fit is unknown"
+                    .to_owned(),
+            );
         }
+        let (
+            listing_serializer_id,
+            listing_serializer_version,
+            listing_serializer_options_digest,
+            listing_serializer_profile_digest,
+        ) = listing_serializer_profile();
         let skill_count = entries.len();
         let pack_hash_entries = entries
             .iter()
@@ -207,15 +350,96 @@ impl SkillPackService {
                 }
             }
         }
-        Ok(SkillPackLintReport {
+        let report = SkillPackLintReport {
             valid: errors.is_empty() && skill_count == 4,
             skill_count,
             listing_characters: descriptions,
+            listing_utf8_bytes,
+            listing_stu_estimate,
+            listing_serializer_id,
+            listing_serializer_version,
+            listing_serializer_options_digest,
+            listing_serializer_profile_digest,
+            listing_content_sha256,
+            actual_tokens: None,
+            measured_fit: None,
+            measurement_status: MeasurementStatus::ConservativeStu,
             entries,
             errors,
             pack_hash,
-        })
+        };
+        report.validate_listing_envelope(&serialized_listing)?;
+        Ok(report)
     }
+}
+
+fn exact_text_measurement(bytes: &[u8]) -> Result<(u64, StuEstimate, String), EngineError> {
+    let declared_len = u64::try_from(bytes.len()).map_err(|_| ContextError::Overflow)?;
+    let content_digest = sha256_hex(bytes);
+    let envelope = validate_envelope(bytes, declared_len, &content_digest, MAX_MEASUREMENT_BYTES)?;
+    let value = stu_for_bytes(envelope.byte_len)?;
+    Ok((
+        envelope.byte_len,
+        StuEstimate {
+            value,
+            empirical: false,
+        },
+        envelope.digest,
+    ))
+}
+
+fn validate_exact_text(
+    bytes: &[u8],
+    recorded_byte_len: u64,
+    recorded_digest: &str,
+    recorded_stu: &StuEstimate,
+) -> Result<(), EngineError> {
+    if recorded_stu.empirical {
+        return Err(measurement_error("unvalidated STU cannot be empirical"));
+    }
+    let envelope = validate_envelope(
+        bytes,
+        recorded_byte_len,
+        recorded_digest,
+        MAX_MEASUREMENT_BYTES,
+    )?;
+    let expected_stu = stu_for_bytes(envelope.byte_len)?;
+    if recorded_stu.value != expected_stu {
+        return Err(measurement_error(
+            "unvalidated STU does not match the bound UTF-8 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn raw_text_profile() -> (String, String, String, String) {
+    const PROFILE_ID: &str = "eliot-raw-utf8";
+    const PROFILE_VERSION: &str = "v1";
+    const OPTIONS: &[u8] = b"exact String::as_bytes UTF-8; no normalization";
+    profile_binding(PROFILE_ID, PROFILE_VERSION, OPTIONS)
+}
+
+fn listing_serializer_profile() -> (String, String, String, String) {
+    const SERIALIZER_ID: &str = "serde_json";
+    const SERIALIZER_VERSION: &str = "eliot-skill-description-list/v1";
+    const OPTIONS: &[u8] =
+        b"serde_json::to_vec(Vec<String>); compact JSON; default serializer options; UTF-8";
+    profile_binding(SERIALIZER_ID, SERIALIZER_VERSION, OPTIONS)
+}
+
+fn profile_binding(id: &str, version: &str, options: &[u8]) -> (String, String, String, String) {
+    let options_digest = sha256_hex(options);
+    let profile_digest = sha256_hex(format!("{id}\0{version}\0{options_digest}").as_bytes());
+    (
+        id.to_owned(),
+        version.to_owned(),
+        options_digest,
+        profile_digest,
+    )
+}
+
+fn measurement_error(field: &'static str) -> EngineError {
+    ContextError::InvalidField(field).into()
 }
 
 const DERIVED_PACKAGE_NOTICE: &str = "\

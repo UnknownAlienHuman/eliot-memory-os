@@ -45,9 +45,10 @@
 //! this closure only; no provider, Dreamer, canonical-write, or runtime
 //! authority imports are introduced.
 
-use eliot_types::{ContextPacketL3, MaterialPacketFrame, PacketQualityReport, PacketQualityResult};
-
 use crate::EngineError;
+use eliot_context_contracts::ContextError;
+use eliot_types::{ContextPacketL3, MaterialPacketFrame, PacketQualityReport, PacketQualityResult};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PacketQualityService;
@@ -58,12 +59,13 @@ impl PacketQualityService {
         packet: &mut ContextPacketL3,
         frame: Option<&MaterialPacketFrame>,
     ) -> Result<(), EngineError> {
+        let target = packet;
+        let mut packet = (*target).clone();
         let frame = frame.cloned().unwrap_or_default();
         packet.packet_quality = None;
         packet.packet_id.clear();
-        let content = serde_json::to_vec(packet)?;
+        let content = serde_json::to_vec(&packet)?;
         packet.packet_id = format!("eliot/packet/{}", blake3::hash(&content).to_hex());
-        let structured_bytes = serde_json::to_vec(packet)?.len();
         let truth_total = packet.current_truth.len()
             + packet.relevant_supported_claims.len()
             + packet.weak_claims_warning.len()
@@ -93,11 +95,6 @@ impl PacketQualityService {
                 .exact_load_bearing_atoms
                 .len()
             + usize::from(!packet.decision_locality_suffix.verifier.is_empty());
-        let signal_density = if structured_bytes == 0 {
-            0.0
-        } else {
-            (signal_items as f32 * 128.0 / structured_bytes as f32).min(1.0)
-        };
         let task_frame_present =
             !packet.goal.trim().is_empty() && !packet.acceptance_items.is_empty();
         let verifier_present = !packet.decision_locality_suffix.verifier.trim().is_empty();
@@ -134,12 +131,18 @@ impl PacketQualityService {
         } else {
             PacketQualityResult::Sufficient
         };
+        let seed_serialized = serde_json::to_vec(&packet)?;
+        let (seed_bytes, seed_stu, _) = super::canonical_measurement_for_payload(&seed_serialized)?;
+        let seed_bytes = usize::try_from(seed_bytes).map_err(|_| ContextError::Overflow)?;
+        let seed_stu = usize::try_from(seed_stu.value).map_err(|_| ContextError::Overflow)?;
         let report = PacketQualityReport {
             packet_id: packet.packet_id.clone(),
             task_id: packet.task_id.clone(),
             revision_fence: packet.at_revision,
-            structured_bytes,
-            estimated_tokens: structured_bytes.div_ceil(4),
+            structured_bytes: seed_bytes,
+            // Compatibility projection only: this legacy field contains the
+            // canonical #704 unvalidated STU estimate, not observed tokens.
+            estimated_tokens: seed_stu,
             task_frame_present,
             current_truth_coverage,
             causal_bridge_hops: packet.causal_bridge.len(),
@@ -155,10 +158,44 @@ impl PacketQualityService {
             wrong_scope_items_suppressed,
             tool_schema_bytes_visible: frame.tool_schema_bytes_visible,
             instruction_hotset_size: frame.instruction_hotset_size,
-            signal_density,
+            signal_density: 0.0,
             result,
         };
         packet.packet_quality = Some(report);
+
+        // The report is part of the serialized packet it describes. Iterate
+        // the byte/STU fields until the exact final byte vector is unchanged;
+        // matching lengths alone do not prove measurement identity. The
+        // enclosing PacketBudgetDecision binds the final packet digest after
+        // this self-referential report stabilizes.
+        let mut observed_envelopes = BTreeSet::new();
+        loop {
+            let serialized = serde_json::to_vec(&packet)?;
+            if !observed_envelopes.insert(serialized.clone()) {
+                return Err(ContextError::IdentityConflict.into());
+            }
+            let (structured_bytes, stu_estimate, _) =
+                super::canonical_measurement_for_payload(&serialized)?;
+            let structured_bytes =
+                usize::try_from(structured_bytes).map_err(|_| ContextError::Overflow)?;
+            let estimated_tokens =
+                usize::try_from(stu_estimate.value).map_err(|_| ContextError::Overflow)?;
+            let signal_density = if structured_bytes == 0 {
+                0.0
+            } else {
+                (signal_items as f32 * 128.0 / structured_bytes as f32).min(1.0)
+            };
+            if let Some(report) = &mut packet.packet_quality {
+                report.structured_bytes = structured_bytes;
+                report.estimated_tokens = estimated_tokens;
+                report.signal_density = signal_density;
+            }
+            packet.token_budget_report.estimated_tokens = estimated_tokens;
+            if serde_json::to_vec(&packet)? == serialized {
+                break;
+            }
+        }
+        *target = packet;
         Ok(())
     }
 }

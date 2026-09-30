@@ -59,6 +59,8 @@
 
 use std::collections::BTreeMap;
 
+use eliot_context_contracts::{ContextError, MeasurementStatus, StuEstimate};
+use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
 use serde_json::Value;
 
 use eliot_types::memory::GovernedGitScope;
@@ -112,10 +114,89 @@ pub struct PacketBudgetDecision {
     pub packet_mandatory_floor_tokens: usize,
     pub mandatory_floor_tokens: usize,
     pub effective_tokens: usize,
+    /// Compatibility projection of the canonical unvalidated STU planning estimate.
+    /// This is not an observed token count and never proves route fit.
+    #[serde(with = "eliot_types::cognition::legacy_unvalidated_stu_projection")]
     pub estimated_tokens: usize,
+    /// Exact final packet UTF-8 byte length, bound to the serializer profile
+    /// and content digest below. This compiler has no route/model input, so it
+    /// cannot become a full #584 receipt.
+    pub rendered_utf8_bytes: u64,
+    /// Serializer identity used for the exact `ContextPacketL3` envelope.
+    pub serializer_id: String,
+    pub serializer_version: String,
+    pub serializer_options_digest: String,
+    /// Domain-separated digest of serializer identity, version and options.
+    pub serializer_profile_digest: String,
+    /// SHA-256 of the exact final serialized packet. Mutating packet bytes
+    /// invalidates this binding and must be caught by `validate_packet_envelope`.
+    pub content_digest: String,
+    /// Canonical #704 STU estimate; empirical is false without a tokenizer observation.
+    pub stu_estimate: StuEstimate,
+    /// Actual route-tokenizer count, absent because no bound route observation is available.
+    pub actual_tokens: Option<u64>,
+    /// Measured fit is unknown until a route-bound tokenizer observation exists.
+    pub measured_fit: Option<bool>,
+    /// `ConservativeStu` records exact-byte plus unvalidated-STU evidence only;
+    /// route binding and tokenizer observation remain unavailable.
+    pub measurement_status: MeasurementStatus,
     pub render_mode: PacketRenderMode,
     pub section_tokens: BTreeMap<String, usize>,
     pub reason: String,
+}
+
+impl PacketBudgetDecision {
+    /// Revalidate an envelope against the original exact-byte/profile binding.
+    /// This never creates or repairs a binding: changed bytes, profile, STU,
+    /// actual-token claims, or fit claims are rejected.
+    pub fn validate_packet_envelope(&self, serialized: &[u8]) -> Result<(), ContextError> {
+        let (serializer_id, serializer_version, options_digest, profile_digest) =
+            packet_serializer_binding();
+        if self.serializer_id != serializer_id
+            || self.serializer_version != serializer_version
+            || self.serializer_options_digest != options_digest
+            || self.serializer_profile_digest != profile_digest
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        if self.actual_tokens.is_some()
+            || self.measured_fit.is_some()
+            || self.measurement_status != MeasurementStatus::ConservativeStu
+            || self.stu_estimate.empirical
+        {
+            return Err(ContextError::UnknownMeasurement);
+        }
+        let envelope = validate_envelope(
+            serialized,
+            self.rendered_utf8_bytes,
+            &self.content_digest,
+            MAX_MEASUREMENT_BYTES,
+        )?;
+        let stu = stu_for_bytes(envelope.byte_len)?;
+        if self.stu_estimate.value != stu
+            || usize::try_from(stu).ok() != Some(self.estimated_tokens)
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn packet_serializer_binding() -> (String, String, String, String) {
+    const SERIALIZER_ID: &str = "serde_json";
+    const SERIALIZER_VERSION: &str = "eliot-context-packet-l3/v1";
+    const SERIALIZER_OPTIONS: &[u8] =
+        b"serde_json::to_vec; compact JSON; default serializer options; UTF-8";
+    let options_digest = eliot_contracts::sha256_hex(SERIALIZER_OPTIONS);
+    let profile_digest = eliot_contracts::sha256_hex(
+        format!("{SERIALIZER_ID}\0{SERIALIZER_VERSION}\0{options_digest}").as_bytes(),
+    );
+    (
+        SERIALIZER_ID.to_owned(),
+        SERIALIZER_VERSION.to_owned(),
+        options_digest,
+        profile_digest,
+    )
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
