@@ -109,9 +109,9 @@ use eliot_instrument_runner::{
     InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
     PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
     StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
-    VerificationRouteRequest, WorkScope, admitted_profile_for_alias,
+    VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
     profile::{PROFILE_ALIASES, builtin_specs},
-    parity_summary, resolve_verification_route, verify_profile_parity,
+    resolve_verification_route, verify_profile_parity,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
@@ -356,8 +356,17 @@ fn run() -> i32 {
     };
     // The comparison is part of this run's outcome, not a side report: when the
     // caller supplied a counterpart receipt, the shared parity owner decides
-    // whether this run may proceed, and a refusal exits here — after this run's
-    // own receipt was issued, never instead of one.
+    // whether this run may proceed, and a refusal exits here.
+    //
+    // Ordering note, stated because it is load-bearing for the caller: this run's
+    // OWN receipt has already been persisted by `resolve_route` (it writes
+    // `--receipt-out` before returning), and it is retained on refusal on
+    // purpose — the receipt is this run's admission evidence and records what was
+    // actually observed, so destroying it would discard evidence of the very run
+    // whose parity was refused. A parity refusal therefore still leaves a receipt
+    // on disk alongside a nonzero exit, which is why `verify.ps1` discriminates
+    // the two refusals on this entry's `PARITY_PASS`/`PARITY_NON_PASS` verdict
+    // line rather than on the exit code or the receipt's existence.
     if let Err(error) = require_receipt_parity(&request, &receipt) {
         eprintln!("{error}");
         return EXIT_REFUSED;
@@ -521,7 +530,7 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
 
     let cell = Arc::new(DispatchCell::activate()?);
     let port = StagePort::seal_all(&cell, &epoch, &layout, &admitted)?;
-    let runner = InstrumentRunner::new(Arc::new(StageExecutor::with(Arc::clone(&cell))));
+    let runner = InstrumentRunner::new(Arc::new(StageExecutor::with(&cell)));
     let launcher = StageRoute {
         epoch,
         clock,
@@ -801,7 +810,7 @@ fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, C
     // instance field, so the `inspect` below must cross the same instance the
     // `start` registered on; a second executor would read an empty registry and
     // refuse `NotFound`, which says nothing about the operation.
-    let executor = StageExecutor::with(Arc::clone(&cell));
+    let executor = StageExecutor::with(&cell);
     let request = seal_version_request(&cell, epoch, executable)?;
     let receipt = block_on(executor.start(
         request,
@@ -966,7 +975,9 @@ fn read_request() -> Result<Request, CliError> {
                 declared_environments.push(value("--declared-environment")?);
             }
             "--receipt-out" => receipt_out = Some(PathBuf::from(value("--receipt-out")?)),
-            "--compare-against" => compare_against = Some(PathBuf::from(value("--compare-against")?)),
+            "--compare-against" => {
+                compare_against = Some(PathBuf::from(value("--compare-against")?));
+            }
             other => return Err(CliError::Usage(format!("unknown option '{other}'"))),
         }
     }
@@ -1244,7 +1255,6 @@ impl DispatchValidationPort for DispatchCell {
 /// every child this entry starts — the version probes and the stages alike —
 /// crosses the one executor composition below.
 struct StageExecutor {
-    cell: Arc<DispatchCell>,
     /// The ONE physical executor every lifecycle call of this owner crosses.
     ///
     /// `WindowsProcessExecutor` owns the operation registry as an instance
@@ -1254,20 +1264,19 @@ struct StageExecutor {
     /// call is then refused as `NotFound` against an empty registry — which is
     /// a true statement about the wrong executor, not about the operation.
     ///
-    /// The `cell` is retained so the `Arc<dyn DispatchValidationPort>` this
-    /// executor holds and the cell this owner seals its one-shot permits under
-    /// remain the same value; the constructor deliberately clones the `Arc`
-    /// rather than constructing the port from a second cell.
+    /// The cell reaches this owner through this one field: the executor holds
+    /// the `Arc<dyn DispatchValidationPort>` built from it, so the port the
+    /// executor validates against and the cell this owner's caller sealed its
+    /// one-shot permits under are the same value.
     executor: WindowsProcessExecutor,
 }
 
 impl StageExecutor {
-    fn with(cell: Arc<DispatchCell>) -> Self {
+    fn with(cell: &Arc<DispatchCell>) -> Self {
         Self {
             executor: WindowsProcessExecutor::new(
-                Arc::clone(&cell) as Arc<dyn DispatchValidationPort>,
+                Arc::clone(cell) as Arc<dyn DispatchValidationPort>
             ),
-            cell,
         }
     }
 
