@@ -718,6 +718,39 @@ pub trait MaintenanceStateStore {
     fn save(&mut self, job: &MaintenanceJob) -> Result<(), MaintenanceError>;
 }
 
+/// Proves one durable job intent from the owner's own committed bytes (I14.22,
+/// issue #1694 W4).
+///
+/// A transport acknowledgement is never commit proof: the caller presents the
+/// intent it saved (`saved`) and the committed revision the durable owner
+/// served back (`committed`), and this function proves the read-back binds
+/// that exact intent. Both revisions are validated — the original first, so a
+/// malformed intent is refused as its own defect rather than as a read-back
+/// mismatch — and the committed revision must carry the same nonblank
+/// `job_id` and `trigger_id`. Anything else (a substituted job, a job for
+/// another trigger, unvalidated bytes) is refused and the trigger stays
+/// retained and unacknowledged; receipt absence or mismatch is never proof of
+/// non-commit, so the caller reconciles through the owning read path instead
+/// of retrying the effect blindly.
+///
+/// # Errors
+///
+/// Returns the owner's own [`MaintenanceError`] when either revision is
+/// invalid, and [`MaintenanceError::InvalidField`] naming `job_ref` when the
+/// committed read-back does not bind the saved intent's job and trigger
+/// identity.
+pub fn prove_job_intent_durable(
+    saved: &MaintenanceJob,
+    committed: &MaintenanceJob,
+) -> Result<(), MaintenanceError> {
+    saved.validate()?;
+    committed.validate()?;
+    if committed.job_id != saved.job_id || committed.trigger_id != saved.trigger_id {
+        return Err(MaintenanceError::InvalidField("job_ref"));
+    }
+    Ok(())
+}
+
 /// Deterministic maintenance decision and job owner.
 pub struct MaintenanceController<S> {
     store: S,
