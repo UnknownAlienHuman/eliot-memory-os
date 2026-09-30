@@ -1179,7 +1179,6 @@ impl KernelComposition {
         let claim_receipt = &process_start.claim_receipt;
         let process_receipt = &process_start.receipt;
         let process_identity = process_receipt.identity();
-        let physical = process_identity.physical();
         let executable_binding =
             request
                 .executable_binding
@@ -1307,7 +1306,10 @@ impl KernelComposition {
             && durable.request_digest == request.request_digest
             && durable.receipt_digest.as_deref() == Some(claim_receipt.receipt_digest.as_str())
             && durable.state != NativeWorkerClaimState::Requested
-            && durable.capability_cell.as_deref()
+            && durable
+                .capability_cell
+                .as_ref()
+                .map(eliot_ors::OpaqueLabel::as_str)
                 == Some(executable_binding.capability_cell.as_str())
             && durable.capability_cell_registry_digest.as_deref() == Some(registry_digest)
             && executable_binding.capability_cell_registry_digest == registry_digest
