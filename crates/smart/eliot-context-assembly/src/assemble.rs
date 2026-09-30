@@ -1,9 +1,9 @@
 //! Public assembly operation and its explicit phases.
 
 use eliot_context_contracts::{
-    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe, MeasurementStatus,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
-    SerializedContextMeasurement,
+    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextExecutionIdentity,
+    ContextRecipe, MeasurementStatus, QualityOperation, QualityRefusal, QualityRefusalKind,
+    QualityScorecard, SerializedContextMeasurement,
 };
 
 use crate::{AssemblyError, boundary, bounds, measurement, render};
@@ -216,6 +216,7 @@ where
     if admitted.economy.recipe_digest != recipe.recipe_sha256 {
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
+    require_recipe_policy_binding(admitted, recipe)?;
     if admitted.economy.measurement.digest != admitted.canonical_payload_digest()? {
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
@@ -293,8 +294,10 @@ where
         selection,
         quality,
         measurement: measured,
+        execution: applied_execution_identity(policy),
         output_digest,
         recipe_digest: recipe.recipe_sha256.clone(),
+        policy_sha256: recipe.decision.policy_sha256.clone(),
         fence_digest: expected_fence_digest,
     };
     view.validate_against(admitted)?;
@@ -315,6 +318,50 @@ where
         boundaries,
         boundary_binding,
     })
+}
+
+/// The execution identity this assembly is about to stamp on its view.
+///
+/// #1724 W4/W5. Every member is a value this assembly actually applied: the
+/// ordering revision is the one [`ASSEMBLY_ORDERING_REVISION`] names and
+/// `render_and_match` renders under, and the serializer/options/route/model
+/// identity is the [`AssemblyPolicy`] this assembly already required the
+/// injected measurement to match in `measurement::verify`. The view therefore
+/// cannot claim an execution it did not perform, and
+/// `ActiveUnderstandingView::validate` re-compares the stamped identity against
+/// the independently recorded measurement before the view is returned.
+fn applied_execution_identity(policy: &AssemblyPolicy) -> ContextExecutionIdentity {
+    ContextExecutionIdentity {
+        ordering_revision: ASSEMBLY_ORDERING_REVISION.to_owned(),
+        serializer_id: policy.serializer_id.clone(),
+        serializer_version: policy.serializer_version.clone(),
+        serializer_options_digest: policy.serializer_options_digest.clone(),
+        route_id: policy.route_id.clone(),
+        model_id: policy.model_id.clone(),
+        measurement_status: policy.measurement_status,
+    }
+}
+
+/// Require that the recipe's approved policy revision is the admitted set's.
+///
+/// #1724 W5. `admitted.economy.recipe_digest` already pins the compilation-bound
+/// instance, and an instance digest says nothing about which approved policy
+/// revision it was issued under. The approved revision is a SECOND, independent
+/// binding, read off the instance's own recorded `DecisionRevision` on both
+/// sides and compared here, so an admitted set admitted under one approved
+/// policy revision cannot be rendered under an instance issued for another even
+/// when the instance digest is the one the receipt names. This is the same
+/// ORIGINAL recorded value on each side that
+/// `ContextRecipePolicy::binds_recipe` compares against the approved revision's
+/// own `policy_sha256`; no digest is recomputed to stand in for either record.
+fn require_recipe_policy_binding(
+    admitted: &AdmittedContextSet,
+    recipe: &ContextRecipe,
+) -> Result<(), AssemblyError> {
+    if admitted.economy.policy_sha256 != recipe.decision.policy_sha256 {
+        return Err(AssemblyError::Contract(ContextError::IdentityConflict));
+    }
+    Ok(())
 }
 
 /// Require that the card graded the exact output this assembly just produced.

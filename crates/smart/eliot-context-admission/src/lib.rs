@@ -750,6 +750,15 @@ fn assemble_admitted_set(
         applied_rule: input.rule.rule_id.clone(),
         allocations,
         recipe_digest: input.recipe.recipe_sha256.clone(),
+        // #1724 W5: the approved reusable policy revision this admission ran
+        // under, read unchanged from the instance's own recorded
+        // `DecisionRevision` after `validate_admission_contract` has run that
+        // instance through the contract owner's own `ContextRecipe::validate`.
+        // It is the value `ContextRecipePolicy::binds_recipe` compares with the
+        // approved revision's `policy_sha256`, so the receipt is identifiable
+        // from the approved policy alone and the View can be cross-compared
+        // against this value rather than each record hashing itself.
+        policy_sha256: input.recipe.decision.policy_sha256.clone(),
         receipt_digest: "0".repeat(64),
     };
     let mut admitted_set = AdmittedContextSet {

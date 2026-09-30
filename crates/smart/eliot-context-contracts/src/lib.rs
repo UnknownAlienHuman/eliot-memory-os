@@ -79,7 +79,8 @@ pub use learning_ticket::{
     learning_ticket_digest, ticket_fresh_for,
 };
 pub use measurement::{
-    MeasurementStatus, SerializedContextMeasurement, StuEstimate, TokenizerObservation,
+    ContextExecutionIdentity, MeasurementStatus, SerializedContextMeasurement, StuEstimate,
+    TokenizerObservation,
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
 pub use quality::{
@@ -113,12 +114,15 @@ pub use readback::{
 pub use recipe::{
     ApprovedRecipeCatalogue, CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN,
     CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, CONTEXT_RECIPE_RESOLUTION_DIGEST_DOMAIN,
-    ContextRecipePolicy, ContextSectionBudget, CounterMetricMovement, GoverningContextRequirements,
-    ProtectedReservePolicy, RecipeAdmissionPolicy, RecipeApplicability,
+    ContextRecipePolicy, ContextSectionBudget, CounterMetricMovement, EXECUTED_CONTEXT_STAGE,
+    EXECUTED_REPETITION_POLICY, EXECUTED_SECTION_DEGRADATION, GoverningContextRequirements,
+    ProtectedReservePolicy, RECIPE_ACTIVATION_DIGEST_DOMAIN, RECIPE_REVOCATION_DIGEST_DOMAIN,
+    RecipeActivationRecord, RecipeAdmissionPolicy, RecipeApplicability,
     RecipeApplicabilityDimension, RecipeCandidateRejection, RecipeCounterMetric,
-    RecipeExecutionContour, RecipeLayoutPolicy, RecipeOmissionPolicy, RecipePolicyIdentity,
-    RecipeQualification, RecipeQualificationState, RecipeRejectionReason, RecipeResolutionRefusal,
-    RecipeRolePosition, RecipeStage, RecipeSupersession, ResolvedContextRecipe,
+    RecipeExecutionContour, RecipeExecutionSupport, RecipeLayoutPolicy, RecipeOmissionPolicy,
+    RecipePolicyIdentity, RecipeQualification, RecipeQualificationState, RecipeRejectionReason,
+    RecipeResolutionRefusal, RecipeRevocationRecord, RecipeRolePosition, RecipeStage,
+    RecipeSupersession, ResolvedContextRecipe,
 };
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 

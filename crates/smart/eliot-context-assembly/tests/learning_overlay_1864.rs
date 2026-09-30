@@ -253,6 +253,7 @@ fn admitted_with_learning(permit_digest: &str, mark_expires: Option<u64>) -> Adm
                 route_capacity: 100_000,
             },
             recipe_digest: recipe(&context).recipe_sha256.clone(),
+            policy_sha256: recipe(&context).decision.policy_sha256.clone(),
             receipt_digest: digest(),
         },
     };
