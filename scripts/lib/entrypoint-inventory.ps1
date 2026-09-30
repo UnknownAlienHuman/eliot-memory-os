@@ -10,10 +10,13 @@
 # every non-canonical entrypoint refuses or redirects with the stable code
 # LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt and no
 # ambient operator flag; ELIOT_CLAUDE_FRONT_DOOR survives only as refusal
-# evidence. Accordingly no retained launch config may name the Bridge binary
-# directly (delegation is in-binary via
-# crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge) and none
-# may select the cutover flag: either shape drift throws.
+# evidence. Under AUD2 (audit 5847846820, requirement 2) every retained
+# installed host surface satisfies one satisfiable limb: either it stages the
+# canonical Bridge command directly in its installation-owned launch
+# configuration (limb 1, recorded as limb-1-bridge-command) or it binds the
+# cutover selection there (limb 2, recorded as limb-2-cutover-selection).
+# Either recorded shape satisfies when it matches the actual installed bytes;
+# a retained installed host surface satisfying neither limb throws.
 #
 # Invoke-InstalledEntrypointReadback is the AUD6 invocation+readback
 # mechanism: it resolves the exact installed command+environment per consumer
@@ -118,32 +121,37 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     else {
         $null
     }
-    # Delegated-host behavior under the accepted unconditional cutover: the
-    # three delegated hosts at the default profile always emit the stderr
-    # REDIRECT receipt and delegate to the approved Bridge; when the Bridge
-    # is not staged in this bundle the same invocation returns structured
-    # ERROR instead. No ambient operator flag is consulted on either path.
-    $delegatedBehavior = if ($bridgeStaged) {
-        "Unconditionally emit the stderr REDIRECT receipt (LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus canonical_route) and delegate to the approved Bridge at $bridgeBinding; child status wins on success, resolution/launch failure emits structured ERROR with no legacy fallback. No Governor, Store, WAL, or writer object is constructed on this path."
+    # Direct-staging behavior under the accepted unconditional cutover
+    # (AUD2 limb 1): each retained installed host surface launches the
+    # canonical Bridge binary with the canonical MCP argv
+    # (mcp --profile <contour> --transport stdio --client-declaration
+    # <installation-owned declaration>). The Bridge re-validates the
+    # installation-owned client declaration before serving through the
+    # Kernel front door; no Governor, Store, WAL, or writer object is
+    # constructed on this path, and no ambient operator flag is consulted.
+    $bridgeEvidence = if ($bridgeStaged) {
+        "Approved Bridge identity evidence: $bridgeBinding."
     }
     else {
-        'The approved Bridge is not staged in this bundle, so the delegated redirect has no target: unconditionally return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio with no ambient operator flag. No legacy serving path remains.'
+        'The approved Bridge binary is not staged at this bundle root; the installed host surfaces launch their installation-owned Bridge copies.'
     }
     $consumers = @()
 
     $claudeMcp = Read-PinnedConsumerBytes $RepoRoot $SourceCommit 'integrations/claude/eliot/.mcp.json'
     $claudeMcpJson = Convert-ConsumerJson $claudeMcp.text 'integrations/claude/eliot/.mcp.json'
     $claudeServer = $claudeMcpJson.mcpServers.eliot
-    if ([string]$claudeServer.command -ne '${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe') {
+    if ([string]$claudeServer.command -ne '${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe') {
         throw 'Claude Code MCP server command drifted from the inventoried bytes: integrations/claude/eliot/.mcp.json'
     }
     $claudeArgs = @($claudeServer.args)
-    $claudeExpectedArgs = @('mcp', 'stdio', '--host', 'claude', '--instance', 'default')
+    $claudeExpectedArgs = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '${CLAUDE_PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json')
     if (($claudeArgs -join "`0") -cne ($claudeExpectedArgs -join "`0")) {
         throw 'Claude Code MCP server argv drifted from the inventoried bytes: integrations/claude/eliot/.mcp.json'
     }
+    $claudeBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches ${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned declaration>); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
-        entrypoint = 'Claude Code MCP stdio --host claude'
+        entrypoint = 'Claude Code MCP stdio profile SPINE_FUNCTIONAL'
+        cutover_limb = 'limb-1-bridge-command'
         source_config = 'integrations/claude/eliot/.mcp.json'
         packaged_config = $null
         inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; this launch config ships with the Claude plugin install, not the Windows bundle.'
@@ -155,7 +163,7 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         args = @($claudeArgs)
         configured_environment = Get-EnvMember $claudeServer
         effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process; never gates behavior)'
-        behavior = $delegatedBehavior
+        behavior = $claudeBehavior
         canonical_route = 'Claude Code agent-bridge declaration and Kernel canonical configuration route.'
     }
 
@@ -177,8 +185,11 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         throw 'Claude Code hooks inventory is empty: integrations/claude/eliot/hooks/hooks.json'
     }
     foreach ($hook in $claudeHookCommands) {
-        if ([string]$hook.command -ne '${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe') {
+        if ([string]$hook.command -ne '${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe') {
             throw "Claude Code hook command drifted from the inventoried bytes: $($hook.event)"
+        }
+        if (@($hook.args)[0] -ne 'hook') {
+            throw "Claude Code hook argv drifted from the inventoried bytes: $($hook.event)"
         }
     }
     $consumers += [ordered]@{
@@ -190,27 +201,29 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         source_bytes = [int64]$claudeHooks.bytes
         staged_sha256 = $null
         staged_bytes = $null
-        command = '${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe'
+        command = '${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe'
         hook_commands = @($claudeHookCommands)
         configured_environment = 'No env member in hooks.json; effective value NOT_OBSERVED.'
         effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process; never gates behavior)'
-        behavior = 'Unconditionally refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt at the dispatch entry gate before hook handling, with no ambient operator flag; the Bridge implements no hook/host-event argv, so hooks are refused, never served. No legacy serving path remains.'
+        behavior = 'Invokes the canonical Bridge hook entry directly: ${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe hook <event> (bins/eliot-agent-bridge/src/hook_intake.rs::HOOK_MODE_TOKEN), which emits the exact per-event decision schema and defers when the session is not attached to an ELIOT task; model-owned memory writes remain MCP calls. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted.'
         canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
     }
 
     $desktop = Read-PinnedConsumerBytes $RepoRoot $SourceCommit 'integrations/claude/claude-desktop/mcpb/manifest.json'
     $desktopJson = Convert-ConsumerJson $desktop.text 'integrations/claude/claude-desktop/mcpb/manifest.json'
     $desktopConfig = $desktopJson.server.mcp_config
-    if ([string]$desktopConfig.command -ne '${__dirname}/server/eliot-governor.exe') {
+    if ([string]$desktopConfig.command -ne '${__dirname}/server/eliot-agent-bridge.exe') {
         throw 'Claude Desktop MCP server command drifted from the inventoried bytes: integrations/claude/claude-desktop/mcpb/manifest.json'
     }
     $desktopArgs = @($desktopConfig.args)
-    $desktopExpectedArgs = @('mcp', 'stdio', '--host', 'claude-desktop', '--instance', 'default')
+    $desktopExpectedArgs = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '${__dirname}/server/agent-bridge/client-declaration-v2.json')
     if (($desktopArgs -join "`0") -cne ($desktopExpectedArgs -join "`0")) {
         throw 'Claude Desktop MCP server argv drifted from the inventoried bytes: integrations/claude/claude-desktop/mcpb/manifest.json'
     }
+    $desktopBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches ${__dirname}/server/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned declaration>); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
-        entrypoint = 'Claude Desktop MCP stdio --host claude-desktop'
+        entrypoint = 'Claude Desktop MCP stdio profile SPINE_FUNCTIONAL'
+        cutover_limb = 'limb-1-bridge-command'
         source_config = 'integrations/claude/claude-desktop/mcpb/manifest.json'
         packaged_config = $null
         inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; the MCPB server entry ships through MCPB packaging, not the Windows bundle.'
@@ -222,19 +235,21 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         args = @($desktopArgs)
         configured_environment = Get-EnvMember $desktopConfig
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
-        behavior = $delegatedBehavior
+        behavior = $desktopBehavior
         canonical_route = 'Claude Desktop agent-bridge declaration and Kernel canonical configuration route.'
     }
 
     $opencode = Read-PinnedConsumerBytes $RepoRoot $SourceCommit 'integrations/opencode/opencode.json'
     $opencodeJson = Convert-ConsumerJson $opencode.text 'integrations/opencode/opencode.json'
     $opencodeCommand = @($opencodeJson.mcp.eliot.command)
-    $opencodeExpected = @('{env:ELIOT_GOVERNOR_EXE}', 'mcp', 'stdio', '--host', 'opencode', '--instance', 'default')
+    $opencodeExpected = @('{env:ELIOT_AGENT_BRIDGE_EXE}', 'mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '{env:ELIOT_AGENT_BRIDGE_DECLARATION}')
     if (($opencodeCommand -join "`0") -cne ($opencodeExpected -join "`0")) {
         throw 'OpenCode MCP server command drifted from the inventoried bytes: integrations/opencode/opencode.json'
     }
+    $opencodeBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches the installation-owned Bridge executable resolved through {env:ELIOT_AGENT_BRIDGE_EXE} with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration {env:ELIOT_AGENT_BRIDGE_DECLARATION}); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
-        entrypoint = 'OpenCode MCP stdio --host opencode'
+        entrypoint = 'OpenCode MCP stdio profile SPINE_FUNCTIONAL'
+        cutover_limb = 'limb-1-bridge-command'
         source_config = 'integrations/opencode/opencode.json'
         packaged_config = $null
         inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; this launch config ships with the OpenCode host install, not the Windows bundle.'
@@ -244,9 +259,9 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         staged_bytes = $null
         command = [string]$opencodeCommand[0]
         args = @($opencodeCommand | Select-Object -Skip 1)
-        configured_environment = 'No MCP env member; command resolves the executable through ELIOT_GOVERNOR_EXE.'
+        configured_environment = 'No MCP env member; command resolves the Bridge executable through ELIOT_AGENT_BRIDGE_EXE and the client declaration through ELIOT_AGENT_BRIDGE_DECLARATION.'
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
-        behavior = $delegatedBehavior
+        behavior = $opencodeBehavior
         canonical_route = 'OpenCode agent-bridge declaration and Kernel canonical configuration route.'
     }
 
@@ -279,16 +294,18 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         throw 'staged Codex plugin must expose exactly one MCP server named eliot'
     }
     $codexServer = $codexServers[0].Value
-    if ([string]$codexServer.command -ne 'bin/eliot-governor.exe' -or [string]$codexServer.cwd -ne '.') {
+    if ([string]$codexServer.command -ne 'bin/eliot-agent-bridge.exe' -or [string]$codexServer.cwd -ne '.') {
         throw 'staged Codex MCP server command drifted from the inventoried bytes: integrations/codex/plugins/eliot-governor/.mcp.json'
     }
     $codexArgs = @($codexServer.args)
-    $codexExpectedArgs = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
+    $codexExpectedArgs = @('mcp', '--profile', 'codex_controller', '--transport', 'stdio', '--client-declaration', '${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json')
     if (($codexArgs -join "`0") -cne ($codexExpectedArgs -join "`0")) {
         throw 'staged Codex MCP server argv drifted from the inventoried bytes: integrations/codex/plugins/eliot-governor/.mcp.json'
     }
+    $codexBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches bin/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile codex_controller --transport stdio --client-declaration <installation-owned declaration>); the Bridge re-validates the installation-owned client declaration before serving the codex_controller contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
         entrypoint = 'Codex MCP stdio profile codex_controller'
+        cutover_limb = 'limb-1-bridge-command'
         source_config = 'plugin/eliot-governor/.mcp.json'
         packaged_config = 'integrations/codex/plugins/eliot-governor/.mcp.json'
         inventory_basis = 'EXACT_STAGED_BYTES: staged bundle bytes verified identical to the pinned source blob.'
@@ -301,8 +318,8 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         args = @($codexArgs)
         configured_environment = Get-EnvMember $codexServer
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
-        behavior = 'Unconditionally return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio with no ambient operator flag; the codex_controller profile has no Bridge contour (behavior home is the eliot-mcp track per canon) and is never delegated. No legacy serving path remains.'
-        canonical_route = $null
+        behavior = $codexBehavior
+        canonical_route = 'Codex agent-bridge declaration and Kernel canonical configuration route.'
     }
 
     $codexHooks = Read-StagedConsumerBytes $RepoRoot $SourceCommit $BundleRoot 'plugin/eliot-governor/hooks/hooks.json' 'integrations/codex/plugins/eliot-governor/hooks/hooks.json'
@@ -323,7 +340,7 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         throw 'staged Codex hooks inventory is empty: integrations/codex/plugins/eliot-governor/hooks/hooks.json'
     }
     foreach ($hook in $codexHookCommands) {
-        if ([string]$hook.command -notmatch '"\$\{PLUGIN_ROOT\}\\bin\\eliot-governor\.exe" hook ') {
+        if ([string]$hook.command -notmatch '"\$\{PLUGIN_ROOT\}\\bin\\eliot-agent-bridge\.exe" hook ') {
             throw "staged Codex hook command drifted from the inventoried bytes: $($hook.event)"
         }
     }
@@ -339,7 +356,7 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         hook_commands = @($codexHookCommands)
         configured_environment = 'No cutover flag declared; effective value NOT_OBSERVED.'
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
-        behavior = 'Unconditionally refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt at the dispatch entry gate before hook handling, with no ambient operator flag; the Bridge implements no hook/host-event argv, so hooks are refused, never served. No legacy serving path remains.'
+        behavior = 'Invokes the canonical Bridge hook entry directly: "${PLUGIN_ROOT}\bin\eliot-agent-bridge.exe" hook <event> (bins/eliot-agent-bridge/src/hook_intake.rs::HOOK_MODE_TOKEN); hooks deliver prepared context, enforce existing gates, and record observations; model-owned memory writes remain MCP calls. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted.'
         canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
     }
 
@@ -359,31 +376,49 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         }
     }
 
-    # Cutover-selection assertion (AUD2, unconditional disposition): the
-    # cutover travels via in-binary delegation, so no retained launch config
-    # may name the Bridge binary directly and none may select the cutover
-    # flag (it survives only as refusal evidence and never gates).
-    foreach ($consumer in $consumers) {
-        foreach ($field in @('command')) {
-            if ([string]$consumer.$field -match 'eliot-agent-bridge\.exe') {
-                throw "no retained launch config may name the Bridge binary directly: $($consumer.entrypoint)"
+    # Cutover-limb assertion (AUD2, audit 5847846820 requirement 2): the
+    # acceptance disjunction is satisfiable. Every retained installed host
+    # surface below records the limb it satisfies in cutover_limb. Limb 1
+    # (Bridge command staged directly) must name the canonical Bridge
+    # binary -- or its installation-owned environment resolution -- in the
+    # actual installed launch command; limb 2 (cutover selection bound)
+    # must carry ELIOT_CLAUDE_FRONT_DOOR in the installation-owned launch
+    # environment. A retained installed host surface satisfying neither
+    # limb throws, as does a recorded limb that does not match the actual
+    # installed bytes. ELIOT_CLAUDE_FRONT_DOOR survives elsewhere only as
+    # refusal evidence and never gates behavior.
+    $installedHostSurfaces = @(
+        'Claude Code MCP stdio profile SPINE_FUNCTIONAL'
+        'Claude Desktop MCP stdio profile SPINE_FUNCTIONAL'
+        'OpenCode MCP stdio profile SPINE_FUNCTIONAL'
+        'Codex MCP stdio profile codex_controller'
+    )
+    foreach ($name in $installedHostSurfaces) {
+        $surface = @($consumers | Where-Object { [string]$_.entrypoint -ceq $name })
+        if ($surface.Count -ne 1) {
+            throw "retained installed host surface is missing from the cutover inventory: $name"
+        }
+        $limb = [string]$surface[0].cutover_limb
+        if ($limb -ceq 'limb-1-bridge-command') {
+            if ([string]$surface[0].command -notmatch 'eliot-agent-bridge\.exe|ELIOT_AGENT_BRIDGE_EXE') {
+                throw "recorded limb-1 disposition does not match the actual installed launch configuration: $name"
             }
         }
-        foreach ($hook in @($consumer.hook_commands)) {
-            if ([string]$hook.command -match 'eliot-agent-bridge\.exe' -or (@($hook.args) -join ' ') -match 'eliot-agent-bridge\.exe') {
-                throw "no retained hook command may name the Bridge binary directly: $($consumer.entrypoint)"
+        elseif ($limb -ceq 'limb-2-cutover-selection') {
+            $surfaceEnv = $surface[0].configured_environment
+            $flagSelected = $false
+            if ($surfaceEnv -is [System.Collections.IDictionary]) {
+                $flagSelected = $surfaceEnv.Contains('ELIOT_CLAUDE_FRONT_DOOR')
+            }
+            elseif ($null -ne $surfaceEnv) {
+                $flagSelected = $null -ne $surfaceEnv.PSObject.Properties['ELIOT_CLAUDE_FRONT_DOOR']
+            }
+            if (-not $flagSelected) {
+                throw "recorded limb-2 disposition does not match the actual installed launch configuration: $name"
             }
         }
-        $env = $consumer.configured_environment
-        $flagSelected = $false
-        if ($env -is [System.Collections.IDictionary]) {
-            $flagSelected = $env.Contains('ELIOT_CLAUDE_FRONT_DOOR')
-        }
-        elseif ($null -ne $env) {
-            $flagSelected = $null -ne $env.PSObject.Properties['ELIOT_CLAUDE_FRONT_DOOR']
-        }
-        if ($flagSelected) {
-            throw "no retained launch config may select the cutover flag: $($consumer.entrypoint)"
+        else {
+            throw "retained installed host surface satisfies neither cutover limb: $name"
         }
     }
 
