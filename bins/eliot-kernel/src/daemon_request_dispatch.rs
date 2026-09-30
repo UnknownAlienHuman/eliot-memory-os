@@ -23,7 +23,7 @@ use eliot_kernel_service::AuthenticatedHostSession;
 // import is the closed wire vocabulary the ingress projects out of it, never a
 // second stage machine or a second cutover gate.
 #[cfg(windows)]
-use eliot_kernel_service::MaintenanceTriggerDeliveryError;
+use eliot_kernel_service::{MaintenanceTriggerClaimRequest, MaintenanceTriggerDeliveryError};
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
@@ -54,7 +54,11 @@ use eliot_protocol::{
     host_request_operation_id,
 };
 #[cfg(windows)]
-use eliot_protocol::{MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, ProtocolError};
+use eliot_protocol::{
+    MaintenanceTriggerAck, MaintenanceTriggerDecisionReceipt, MaintenanceTriggerGapKind,
+    MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, MaintenanceTriggerTerminalKind,
+    ProtocolError,
+};
 use eliot_runtime_contracts::GenerationCutoverState;
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -301,6 +305,86 @@ pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
 /// unreachable from the front door until
 /// `frame_dispatch::is_daemon_operation` lists it.
 pub(crate) const MAINTENANCE_TRIGGER_INTAKE_OPERATION: &str = "maintenance_trigger_intake";
+
+/// Authenticated daemon operation that issues one finite fenced claim for a
+/// retained maintenance trigger (issue #1694 W3).
+///
+/// The arm serves the existing gateway owner entry
+/// (`KernelStoreGateway::claim_maintenance_trigger`, over the
+/// `claim_trigger_for_daemon` seam) and replies with the
+/// `{ "kind", "value" }` typed echo of the owner-issued
+/// `MaintenanceTriggerClaim`. The name is fixed wire text shared with the
+/// daemon client (`bins/eliotd/src/kernel_recovery_client.rs`), which binds
+/// the live session and proves the echoed claim answers the requested
+/// trigger under the requested delivery identity.
+///
+/// It carries the same front-door caveat as
+/// [`MAINTENANCE_TRIGGER_INTAKE_OPERATION`]: it is recognized here and
+/// unreachable from the front door until
+/// `frame_dispatch::is_daemon_operation` lists it.
+pub(crate) const MAINTENANCE_TRIGGER_CLAIM_OPERATION: &str = "maintenance_trigger_claim";
+/// Authenticated daemon operation that reads one bounded pending-trigger
+/// page with stable continuation (issue #1694 W3).
+///
+/// Serves `KernelStoreGateway::maintenance_trigger_pending_page` (over the
+/// `enumerate_pending_for_reconnect` seam); same wire-echo and front-door
+/// caveat as [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`].
+pub(crate) const MAINTENANCE_TRIGGER_PAGE_OPERATION: &str = "maintenance_trigger_pending_page";
+/// Authenticated daemon operation that replays one retained trigger after a
+/// pre-commit crash (issue #1694 W5).
+///
+/// Serves `KernelStoreGateway::replay_maintenance_trigger_after_crash` (one
+/// `recover_trigger_for_replacement` route); same wire-echo and front-door
+/// caveat as [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`].
+pub(crate) const MAINTENANCE_TRIGGER_REPLAY_OPERATION: &str = "maintenance_trigger_replay";
+/// Authenticated daemon operation that reuses one committed decision receipt
+/// after a post-commit crash (issue #1694 W5).
+///
+/// Serves `KernelStoreGateway::recover_maintenance_trigger_commit` (the
+/// other `recover_trigger_for_replacement` route); same wire-echo and
+/// front-door caveat as [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`].
+pub(crate) const MAINTENANCE_TRIGGER_RECOVER_OPERATION: &str = "maintenance_trigger_recover_commit";
+/// Authenticated daemon operation that records one committed decision
+/// receipt into the delivery ledger (issue #1694 W4/W5).
+///
+/// Serves `KernelStoreGateway::record_maintenance_trigger_decision`, which
+/// re-reads the exact canonical Store receipt before recording. The arm
+/// echoes the owner snapshot's stored receipt, so the client's byte-for-byte
+/// echo check proves the recorded commitment, never a parroted presentation.
+/// Same front-door caveat as [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`].
+pub(crate) const MAINTENANCE_TRIGGER_RECORD_OPERATION: &str = "maintenance_trigger_record_decision";
+/// Authenticated daemon operation that acknowledges one delivery against its
+/// exact committed decision receipt (issue #1694 W4/W5).
+///
+/// Serves `KernelStoreGateway::acknowledge_maintenance_trigger`; the ledger
+/// consumes the live claim on success, so the arm echoes the validated
+/// presented ack the owner accepted. Same front-door caveat as
+/// [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`].
+pub(crate) const MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION: &str =
+    "maintenance_trigger_acknowledge";
+/// Authenticated daemon operation that marks one lost or ambiguous commit
+/// as reconciling (issue #1694 W5).
+///
+/// Serves `KernelStoreGateway::mark_maintenance_trigger_commit_ambiguous`
+/// and answers the affected trigger identity with its post-transition
+/// revision read from the owner snapshot. Same front-door caveat as
+/// [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`].
+pub(crate) const MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION: &str =
+    "maintenance_trigger_mark_ambiguous";
+/// Authenticated daemon operation that records one visible recovery gap for
+/// trigger damage (issue #1694 W7).
+///
+/// Serves `KernelStoreGateway::record_maintenance_trigger_gap` and echoes
+/// the owner-recorded gap. Same front-door caveat as
+/// [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`].
+pub(crate) const MAINTENANCE_TRIGGER_GAP_OPERATION: &str = "maintenance_trigger_record_gap";
+/// Authenticated daemon operation that records terminal expiry for a
+/// past-window trigger (issue #1694 W7).
+///
+/// Serves `KernelStoreGateway::expire_maintenance_trigger` and echoes the
+/// owner-recorded terminal disposition. Same front-door caveat as
+/// [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`].
+pub(crate) const MAINTENANCE_TRIGGER_EXPIRE_OPERATION: &str = "maintenance_trigger_expire";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -607,6 +691,15 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         STORAGE_REPLACEMENT_RESUME_OPERATION => STORAGE_REPLACEMENT_RESUME_OPERATION,
         STORAGE_REPLACEMENT_ROLLBACK_OPERATION => STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
         MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
+        MAINTENANCE_TRIGGER_CLAIM_OPERATION => MAINTENANCE_TRIGGER_CLAIM_OPERATION,
+        MAINTENANCE_TRIGGER_PAGE_OPERATION => MAINTENANCE_TRIGGER_PAGE_OPERATION,
+        MAINTENANCE_TRIGGER_REPLAY_OPERATION => MAINTENANCE_TRIGGER_REPLAY_OPERATION,
+        MAINTENANCE_TRIGGER_RECOVER_OPERATION => MAINTENANCE_TRIGGER_RECOVER_OPERATION,
+        MAINTENANCE_TRIGGER_RECORD_OPERATION => MAINTENANCE_TRIGGER_RECORD_OPERATION,
+        MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION => MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION,
+        MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION => MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION,
+        MAINTENANCE_TRIGGER_GAP_OPERATION => MAINTENANCE_TRIGGER_GAP_OPERATION,
+        MAINTENANCE_TRIGGER_EXPIRE_OPERATION => MAINTENANCE_TRIGGER_EXPIRE_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -2815,6 +2908,698 @@ impl KernelComposition {
     }
 }
 
+/// Closed claim-issuance request for one retained trigger (issue #1694 W3).
+///
+/// Mirrors the daemon client's claim fields exactly; the claiming consumer
+/// identity, finite deadline, and point-of-use context travel together so
+/// issuance stays one call with named fields. Authority comes from the
+/// authenticated session, never from this DTO.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerClaimOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Stable trigger identity being claimed.
+    trigger_id: String,
+    /// Claiming daemon's authority fence; must match the current generation.
+    daemon_fence: StateFence,
+    /// Claiming daemon's session identity within its generation.
+    daemon_session: String,
+    /// Stable delivery identity for this claim epoch.
+    delivery_id: String,
+    /// Latest time at which this claim authorizes delivery.
+    claim_deadline_unix_ms: u64,
+    /// Current Kernel fence the claim is issued under.
+    current_fence: StateFence,
+    /// Issuance time as Unix milliseconds.
+    now_unix_ms: u64,
+}
+
+/// Closed pending-page read request (issue #1694 W3).
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerPageOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Opaque resume cursor; `None` starts from the oldest unresolved row.
+    continuation: Option<String>,
+    /// Read time as Unix milliseconds.
+    now_unix_ms: u64,
+}
+
+/// Closed crash-replay read request (issue #1694 W5).
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerReplayOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Stable trigger identity being replayed.
+    trigger_id: String,
+}
+
+/// Closed commit-recovery read request (issue #1694 W5).
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerRecoverOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Stable trigger identity whose committed receipt is recovered.
+    trigger_id: String,
+}
+
+/// Closed decision-record request (issue #1694 W4/W5).
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerRecordOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Stable trigger identity the decision answers.
+    trigger_id: String,
+    /// Full content of the committed durable decision receipt.
+    receipt: MaintenanceTriggerDecisionReceipt,
+}
+
+/// Closed delivery-acknowledgement request (issue #1694 W4/W5).
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerAcknowledgeOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Current Kernel fence the ack is issued under.
+    current_fence: StateFence,
+    /// Ack echoing the live claim and embedding the committed receipt.
+    ack: MaintenanceTriggerAck,
+    /// Ack time as Unix milliseconds.
+    now_unix_ms: u64,
+}
+
+/// Closed ambiguous-commit mark request (issue #1694 W5).
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerAmbiguousOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Stable trigger identity whose commit response was lost.
+    trigger_id: String,
+    /// Mark time as Unix milliseconds.
+    now_unix_ms: u64,
+}
+
+/// Closed recovery-gap record request (issue #1694 W7).
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerGapOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Stable trigger identity the gap attaches to.
+    trigger_id: String,
+    /// Gap class; enumeration and commit gaps are refused here and recorded
+    /// by their owning transitions instead.
+    kind: MaintenanceTriggerGapKind,
+    /// Evidence locator or reason reference; never payload content.
+    detail: String,
+    /// Recording time as Unix milliseconds.
+    now_unix_ms: u64,
+}
+
+/// Closed terminal-expiry record request (issue #1694 W7).
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerExpireOperation {
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Stable trigger identity leaving its applicability window.
+    trigger_id: String,
+    /// Stable reason reference for the disposition.
+    reason: String,
+    /// Recording time as Unix milliseconds.
+    now_unix_ms: u64,
+}
+
+/// The one admission gate every maintenance-trigger delivery request passes.
+///
+/// The same two checks the intake ingress applies minus its version field:
+/// the request's own State Fence must be well formed and must be the
+/// **exact** admitted session fence. A request failing either is fenced at
+/// the transport, before the gateway is touched.
+#[cfg(windows)]
+fn validate_maintenance_trigger_delivery_fence(
+    session: &Session,
+    state_fence: &StateFence,
+) -> Result<(), TransportError> {
+    state_fence
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if state_fence != &session.module_generation.state_fence {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+/// The admitted-reply envelope every maintenance-trigger delivery arm
+/// answers with: the operation name as `kind` and the owner-issued typed
+/// value as `value`, identical to every other arm on this channel.
+#[cfg(windows)]
+fn maintenance_trigger_delivery_echo(
+    operation: &'static str,
+    value: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": { "kind": operation, "value": value },
+        "recovery": null,
+    })
+}
+
+/// Maps one delivery failure to its stable code suffix and fixed reason.
+///
+/// Variants name the failure kind only: exact source errors stay with their
+/// owners (retry under the same identity re-observes them) and never enter
+/// responses, so a refusal carries its stable code and nothing
+/// privacy-sensitive. Changed-content conflicts stay distinguishable from
+/// other protocol rejections, and a fenced generation stays distinguishable
+/// from a live-authority refusal. Any failure admits nothing and
+/// acknowledges nothing: the producer keeps its retry identity and the row
+/// stays open under its existing disposition. The match stays exhaustive
+/// with no wildcard: a new failure variant breaks here loudly.
+#[cfg(windows)]
+fn maintenance_trigger_delivery_terminal(
+    error: &MaintenanceTriggerDeliveryError,
+) -> (&'static str, &'static str) {
+    match error {
+        MaintenanceTriggerDeliveryError::Protocol(error)
+            if *error == ProtocolError::ReplayConflict =>
+        {
+            (
+                "REPLAY_CONFLICT",
+                "the presented content conflicts with the retained trigger",
+            )
+        }
+        MaintenanceTriggerDeliveryError::Protocol(_) => (
+            "PROTOCOL_REJECTED",
+            "the presented wire value failed protocol validation",
+        ),
+        MaintenanceTriggerDeliveryError::UnknownTrigger => (
+            "UNKNOWN_TRIGGER",
+            "no retained trigger answers the presented identity",
+        ),
+        MaintenanceTriggerDeliveryError::ClaimConflict => (
+            "CLAIM_CONFLICT",
+            "a live claim under another delivery identity holds the trigger",
+        ),
+        MaintenanceTriggerDeliveryError::RevokedConsumer => (
+            "CONSUMER_REVOKED",
+            "the presenting consumer authority was revoked",
+        ),
+        MaintenanceTriggerDeliveryError::ExpiredEligibility => (
+            "ELIGIBILITY_EXPIRED",
+            "the trigger is past its applicability window",
+        ),
+        MaintenanceTriggerDeliveryError::MirrorRecoveryRequired => (
+            "MIRROR_RECOVERY_REQUIRED",
+            "mirror recovery must complete before the pending set surfaces",
+        ),
+        MaintenanceTriggerDeliveryError::Service(KernelServiceError::GenerationFenced) => (
+            "GENERATION_FENCED",
+            "generation authority is fenced until forward recovery",
+        ),
+        MaintenanceTriggerDeliveryError::Service(_) => (
+            "LIVE_AUTHORITY_REFUSED",
+            "live Kernel authority refused session or admission",
+        ),
+        MaintenanceTriggerDeliveryError::StagingProof(_) => (
+            "STAGING_UNAVAILABLE",
+            "the ORS owner could not prove the staged trigger bytes",
+        ),
+        MaintenanceTriggerDeliveryError::Store(_) => (
+            "STORE_REFUSED",
+            "the canonical Store refused the backing read",
+        ),
+        MaintenanceTriggerDeliveryError::OwnerUnavailable(_) => (
+            "OWNER_UNAVAILABLE",
+            "the Kernel owner could not reach service or ledger state",
+        ),
+    }
+}
+
+/// Renders one refused delivery transition as the operation's error
+/// response.
+///
+/// The `status`/`value.kind` shape keeps the existing error discipline: the
+/// stable code names the refused operation and its failure kind, the fixed
+/// reason carries no payload, and `value` stays null so a refused
+/// transition can never decode as an admitted one.
+#[cfg(windows)]
+fn maintenance_trigger_delivery_error_response(
+    operation: &'static str,
+    error: &MaintenanceTriggerDeliveryError,
+) -> serde_json::Value {
+    let (suffix, reason) = maintenance_trigger_delivery_terminal(error);
+    serde_json::json!({
+        "status": "error",
+        "code": format!("{operation}_{suffix}"),
+        "reason": reason,
+        "value": { "kind": operation, "value": null },
+        "recovery": null,
+    })
+}
+
+/// Reads the delivery row for one trigger identity out of the owner's
+/// post-transition snapshot.
+///
+/// The gateway returns the durable snapshot after every transition; the
+/// typed echoes below are read from that snapshot, never reconstructed
+/// from the request. A missing row is an owner inconsistency and fails
+/// closed rather than echoing the presentation.
+#[cfg(windows)]
+fn maintenance_trigger_delivery_row_revision(
+    rows: &[eliot_kernel_service::MaintenanceTriggerDeliveryRow],
+    trigger_id: &str,
+) -> Result<u64, MaintenanceTriggerDeliveryError> {
+    rows.iter()
+        .find(|row| row.record.trigger_id == trigger_id)
+        .map(|row| row.revision)
+        .ok_or(MaintenanceTriggerDeliveryError::OwnerUnavailable(
+            "the recorded trigger is absent from the owner snapshot".to_owned(),
+        ))
+}
+
+#[cfg(windows)]
+impl KernelComposition {
+    /// Issues one finite fenced claim for the calling daemon generation.
+    ///
+    /// The operation selector only picks this entry. The closed request
+    /// carries the claiming consumer identity, the finite deadline, and the
+    /// exact admitted session fence; the principal comes from the
+    /// authenticated session module binding, never from the request DTO. A
+    /// malformed request or a fence that is not the exact admitted session
+    /// fence is fenced at the transport, before the gateway is touched.
+    ///
+    /// Issuance itself is the existing gateway owner entry
+    /// (`KernelStoreGateway::claim_maintenance_trigger`, over the
+    /// `claim_trigger_for_daemon` seam), which binds the live session and
+    /// issues the claim bound to the current compatible daemon
+    /// generation/session, trigger revision, and delivery identity. An exact
+    /// retry returns the live claim; a concurrent claim under another
+    /// identity is refused with `CLAIM_CONFLICT`, never a competing claim.
+    /// Every route scope, receipt, and delivery identity on the reply is
+    /// owner-issued, never from the payload.
+    fn maintenance_trigger_claim_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerClaimOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway.claim_maintenance_trigger(
+            session.module_generation.module_id.as_str(),
+            MaintenanceTriggerClaimRequest {
+                trigger_id: request.trigger_id,
+                daemon_fence: request.daemon_fence,
+                daemon_session: request.daemon_session,
+                delivery_id: request.delivery_id,
+                claim_deadline_unix_ms: request.claim_deadline_unix_ms,
+                current_fence: request.current_fence,
+                now_unix_ms: request.now_unix_ms,
+            },
+        ) {
+            Ok((claim, _)) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_CLAIM_OPERATION,
+                serde_json::to_value(&claim).map_err(|_| TransportError::SessionFenced)?,
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_CLAIM_OPERATION,
+                &error,
+            )),
+        }
+    }
+
+    /// Enumerates one bounded pending page for a reconnecting consumer.
+    ///
+    /// Same admission gate as the claim arm. The existing gateway owner
+    /// entry (`KernelStoreGateway::maintenance_trigger_pending_page`, over
+    /// the `enumerate_pending_for_reconnect` seam) lists the unresolved set
+    /// in trigger-identity order past the presented cursor; the owner
+    /// refuses an unknown continuation or an empty gapless listing with an
+    /// explicit gap rather than a guessed complete-empty set.
+    fn maintenance_trigger_page_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerPageOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway.maintenance_trigger_pending_page(
+            session.module_generation.module_id.as_str(),
+            request.continuation.as_deref(),
+            request.now_unix_ms,
+        ) {
+            Ok(page) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_PAGE_OPERATION,
+                serde_json::to_value(&page).map_err(|_| TransportError::SessionFenced)?,
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_PAGE_OPERATION,
+                &error,
+            )),
+        }
+    }
+
+    /// Replays one retained trigger after a pre-commit crash.
+    ///
+    /// Same admission gate as the claim arm. The existing gateway owner
+    /// entry (`KernelStoreGateway::replay_maintenance_trigger_after_crash`,
+    /// one `recover_trigger_for_replacement` route) returns the exact
+    /// retained record without minting new state; the caller re-presents it
+    /// to the evaluator under the same identity. A committed row replays by
+    /// receipt through the recover arm, never here.
+    fn maintenance_trigger_replay_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerReplayOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway.replay_maintenance_trigger_after_crash(
+            session.module_generation.module_id.as_str(),
+            &request.trigger_id,
+        ) {
+            Ok(record) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_REPLAY_OPERATION,
+                serde_json::to_value(&record).map_err(|_| TransportError::SessionFenced)?,
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_REPLAY_OPERATION,
+                &error,
+            )),
+        }
+    }
+
+    /// Reuses one committed decision receipt after a post-commit crash.
+    ///
+    /// Same admission gate as the claim arm. The existing gateway owner
+    /// entry (`KernelStoreGateway::recover_maintenance_trigger_commit`, the
+    /// other `recover_trigger_for_replacement` route) returns the exact
+    /// committed receipt; the caller acknowledges it without another job,
+    /// recommendation, or wake. Receipt absence stays open: the owner
+    /// reports the absence and the row is not proof of non-commit.
+    fn maintenance_trigger_recover_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerRecoverOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway.recover_maintenance_trigger_commit(
+            session.module_generation.module_id.as_str(),
+            &request.trigger_id,
+        ) {
+            Ok(receipt) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_RECOVER_OPERATION,
+                serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?,
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_RECOVER_OPERATION,
+                &error,
+            )),
+        }
+    }
+
+    /// Records one committed decision receipt into the delivery ledger.
+    ///
+    /// Same admission gate as the claim arm. The existing gateway owner
+    /// entry (`KernelStoreGateway::record_maintenance_trigger_decision`)
+    /// re-reads the exact canonical Store receipt, requires `Committed`
+    /// status, re-proves the bound digest, and only then records the
+    /// decision. The echo is the stored receipt read from the owner's
+    /// post-transition snapshot, so the client's byte-for-byte echo check
+    /// proves the recorded commitment; a same-receipt retry reuses it
+    /// idempotently rather than competing.
+    async fn maintenance_trigger_record_decision_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerRecordOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        let rows = match gateway
+            .record_maintenance_trigger_decision(
+                session.module_generation.module_id.as_str(),
+                &request.trigger_id,
+                request.receipt,
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(maintenance_trigger_delivery_error_response(
+                    MAINTENANCE_TRIGGER_RECORD_OPERATION,
+                    &error,
+                ));
+            }
+        };
+        let stored = rows
+            .iter()
+            .find(|row| row.record.trigger_id == request.trigger_id)
+            .and_then(|row| row.decision_receipt.clone())
+            .ok_or(MaintenanceTriggerDeliveryError::OwnerUnavailable(
+                "the recorded decision receipt is absent from the owner snapshot".to_owned(),
+            ));
+        match stored {
+            Ok(receipt) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_RECORD_OPERATION,
+                serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?,
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_RECORD_OPERATION,
+                &error,
+            )),
+        }
+    }
+
+    /// Acknowledges one delivery against its exact committed decision
+    /// receipt.
+    ///
+    /// Same admission gate as the claim arm. The existing gateway owner
+    /// entry (`KernelStoreGateway::acknowledge_maintenance_trigger`)
+    /// requires the ack to echo the live claim exactly and embed the
+    /// committed receipt byte for byte; a stale consumer cannot ack after
+    /// revocation. The ledger consumes the live claim on success, so the
+    /// echo is the validated presented ack the owner accepted.
+    fn maintenance_trigger_acknowledge_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerAcknowledgeOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway.acknowledge_maintenance_trigger(
+            session.module_generation.module_id.as_str(),
+            &request.ack,
+            &request.current_fence,
+            request.now_unix_ms,
+        ) {
+            Ok(_) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION,
+                serde_json::to_value(&request.ack).map_err(|_| TransportError::SessionFenced)?,
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION,
+                &error,
+            )),
+        }
+    }
+
+    /// Marks one lost or ambiguous commit as reconciling.
+    ///
+    /// Same admission gate as the claim arm. The existing gateway owner
+    /// entry (`KernelStoreGateway::mark_maintenance_trigger_commit_ambiguous`)
+    /// keeps the trigger open with an `AmbiguousCommit` gap record; receipt
+    /// absence during an outage is not proof of non-commit. The reply
+    /// carries the affected trigger identity with its post-transition
+    /// revision read from the owner snapshot, so the caller can prove which
+    /// row moved.
+    fn maintenance_trigger_mark_ambiguous_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerAmbiguousOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        let rows = match gateway.mark_maintenance_trigger_commit_ambiguous(
+            session.module_generation.module_id.as_str(),
+            &request.trigger_id,
+            request.now_unix_ms,
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(maintenance_trigger_delivery_error_response(
+                    MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION,
+                    &error,
+                ));
+            }
+        };
+        let revision = maintenance_trigger_delivery_row_revision(&rows, &request.trigger_id);
+        match revision {
+            Ok(revision) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION,
+                serde_json::json!({
+                    "trigger_id": request.trigger_id,
+                    "revision": revision,
+                }),
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION,
+                &error,
+            )),
+        }
+    }
+
+    /// Records one visible recovery gap for trigger damage.
+    ///
+    /// Same admission gate as the claim arm. The existing gateway owner
+    /// entry (`KernelStoreGateway::record_maintenance_trigger_gap`)
+    /// records the gap; the echo is the owner-recorded gap read from the
+    /// owner's post-transition snapshot, so it names the affected trigger
+    /// under the presented kind. Missing keys, corrupt payloads, and
+    /// inaccessible sources produce this record — never a plaintext
+    /// fallback and never silent deletion.
+    fn maintenance_trigger_record_gap_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerGapOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        let rows = match gateway.record_maintenance_trigger_gap(
+            session.module_generation.module_id.as_str(),
+            &request.trigger_id,
+            request.kind,
+            &request.detail,
+            request.now_unix_ms,
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(maintenance_trigger_delivery_error_response(
+                    MAINTENANCE_TRIGGER_GAP_OPERATION,
+                    &error,
+                ));
+            }
+        };
+        let recorded = rows
+            .iter()
+            .find(|row| row.record.trigger_id == request.trigger_id)
+            .and_then(|row| {
+                row.gaps
+                    .iter()
+                    .filter(|gap| {
+                        gap.kind == request.kind
+                            && gap.trigger_id.as_deref() == Some(request.trigger_id.as_str())
+                    })
+                    .last()
+                    .cloned()
+            })
+            .ok_or(MaintenanceTriggerDeliveryError::OwnerUnavailable(
+                "the recorded gap is absent from the owner snapshot".to_owned(),
+            ));
+        match recorded {
+            Ok(gap) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_GAP_OPERATION,
+                serde_json::to_value(&gap).map_err(|_| TransportError::SessionFenced)?,
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_GAP_OPERATION,
+                &error,
+            )),
+        }
+    }
+
+    /// Records terminal expiry for a past-window trigger.
+    ///
+    /// Same admission gate as the claim arm. The existing gateway owner
+    /// entry (`KernelStoreGateway::expire_maintenance_trigger`) blocks stale
+    /// execution but never deletes the row, its record, or its evidence
+    /// locators. The echo is the owner-recorded terminal disposition read
+    /// from the owner's post-transition snapshot, so it names the affected
+    /// trigger with the expiry class and no successor.
+    fn maintenance_trigger_expire_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerExpireOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_delivery_fence(session, &request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        let rows = match gateway.expire_maintenance_trigger(
+            session.module_generation.module_id.as_str(),
+            &request.trigger_id,
+            &request.reason,
+            request.now_unix_ms,
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(maintenance_trigger_delivery_error_response(
+                    MAINTENANCE_TRIGGER_EXPIRE_OPERATION,
+                    &error,
+                ));
+            }
+        };
+        let recorded = rows
+            .iter()
+            .find(|row| row.record.trigger_id == request.trigger_id)
+            .and_then(|row| row.terminal.clone())
+            .filter(|terminal| terminal.kind == MaintenanceTriggerTerminalKind::Expired)
+            .ok_or(MaintenanceTriggerDeliveryError::OwnerUnavailable(
+                "the recorded expiry is absent from the owner snapshot".to_owned(),
+            ));
+        match recorded {
+            Ok(terminal) => Ok(maintenance_trigger_delivery_echo(
+                MAINTENANCE_TRIGGER_EXPIRE_OPERATION,
+                serde_json::to_value(&terminal).map_err(|_| TransportError::SessionFenced)?,
+            )),
+            Err(error) => Ok(maintenance_trigger_delivery_error_response(
+                MAINTENANCE_TRIGGER_EXPIRE_OPERATION,
+                &error,
+            )),
+        }
+    }
+}
+
 impl KernelComposition {
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
@@ -3140,6 +3925,51 @@ impl KernelComposition {
             #[cfg(windows)]
             MAINTENANCE_TRIGGER_INTAKE_OPERATION => {
                 self.maintenance_trigger_intake_operation(session, payload.clone())
+            }
+            // Issue #1694 W3/W4: the fenced delivery-claim server legs. Each
+            // arm serves one retained-trigger operation through the existing
+            // gateway owner entries and replies with the `{ "kind", "value" }`
+            // typed echo the daemon client proves; an owner refusal is the
+            // operation's typed error answer, never an acknowledgement and
+            // never a second dispatcher, database, or evaluator.
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_CLAIM_OPERATION => {
+                self.maintenance_trigger_claim_operation(session, payload.clone())
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_PAGE_OPERATION => {
+                self.maintenance_trigger_page_operation(session, payload.clone())
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_REPLAY_OPERATION => {
+                self.maintenance_trigger_replay_operation(session, payload.clone())
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_RECOVER_OPERATION => {
+                self.maintenance_trigger_recover_operation(session, payload.clone())
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_RECORD_OPERATION => {
+                Box::pin(
+                    self.maintenance_trigger_record_decision_operation(session, payload.clone()),
+                )
+                .await
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION => {
+                self.maintenance_trigger_acknowledge_operation(session, payload.clone())
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION => {
+                self.maintenance_trigger_mark_ambiguous_operation(session, payload.clone())
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_GAP_OPERATION => {
+                self.maintenance_trigger_record_gap_operation(session, payload.clone())
+            }
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_EXPIRE_OPERATION => {
+                self.maintenance_trigger_expire_operation(session, payload.clone())
             }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
