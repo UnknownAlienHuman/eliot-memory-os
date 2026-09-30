@@ -83,7 +83,7 @@
       "consumer": "eliot-kernel",
       "dependency": "eliot-backup",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 24,
+      "line": 36,
       "symbol": "BackupBundle",
       "declaration": "eliot-backup = { path = \"../../crates/storage/eliot-backup\", version = \"0.1.0\" }"
     },
@@ -91,7 +91,7 @@
       "consumer": "eliot-kernel",
       "dependency": "eliot-ipc",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 29,
+      "line": 41,
       "symbol": "TransportError",
       "declaration": "eliot-ipc.workspace = true"
     },
@@ -99,7 +99,7 @@
       "consumer": "eliot-kernel",
       "dependency": "eliot-protocol",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 51,
+      "line": 63,
       "symbol": "Frame",
       "declaration": "eliot-protocol.workspace = true"
     },
@@ -107,7 +107,7 @@
       "consumer": "eliot-kernel",
       "dependency": "eliot-store-api",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 58,
+      "line": 70,
       "symbol": "WriteReceipt",
       "declaration": "eliot-store-api.workspace = true"
     },
@@ -212,5 +212,5 @@
       "declaration": "eliot-blob-api.workspace = true"
     }
   ],
-  "denominator_digest": "8a35b37d8e54a6306feecc5f30e33cf99cf1ee6488e5f6eec1a022f774176c2d"
+  "denominator_digest": "d53fa78cee1cd697d18ad4c62aaff72448107d47dcd963c5b4c990303766c409"
 }
