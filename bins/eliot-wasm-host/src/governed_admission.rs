@@ -43,7 +43,7 @@ use eliot_context_assembly::{
 use eliot_context_contracts::{
     AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe,
     QualityApplicabilityInput, QualityDimensionResult, QualityOperation, QualityOutputBinding,
-    QualityRefusal, QualityScorecard, SerializedContextMeasurement,
+    QualityRefusal, QualityScorecard, QualitySuitability, SerializedContextMeasurement,
 };
 use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
 use eliot_improvement::candidate_bounds::{
@@ -97,6 +97,20 @@ pub struct QualityDiagnostics {
     pub dimension_results: Vec<QualityDimensionResult>,
     /// Applicability inputs that were never resolved for this packet.
     pub unresolved_applicability: Vec<QualityApplicabilityInput>,
+    /// The contract owner's own read-only diagnostic-display suitability for
+    /// this same card.
+    ///
+    /// This is the A2 fact, produced by the same
+    /// [`QualityScorecard::suitability`] rule every other consumer uses and
+    /// asked for the read-only operation. It is `Some` exactly when the card is
+    /// still displayable, and its `limitations` carry the same non-passing
+    /// dimensions as `dimension_results`. It is recorded here so a host reader
+    /// has the owner's granted display verdict, not a locally invented one, and
+    /// so the informational unknown stays visible without granting any effect:
+    /// `QualityOperation::DiagnosticDisplay` requires no dimension and blocks on
+    /// no applicability input, which is precisely why it can never be mistaken
+    /// for authorization.
+    pub display_suitability: Option<QualitySuitability>,
 }
 
 impl QualityDiagnostics {
@@ -123,6 +137,12 @@ impl QualityDiagnostics {
                 .cloned()
                 .collect(),
             unresolved_applicability: refusal.unresolved_applicability.clone(),
+            // The same owner rule, asked for the read-only operation. A card that
+            // cannot even be shown structurally reports `None`; a merely blocked
+            // one is displayable and says so, carrying its limitations.
+            display_suitability: quality
+                .suitability(QualityOperation::DiagnosticDisplay, &[])
+                .ok(),
         }
     }
 }
