@@ -1,6 +1,7 @@
 //! Host↔Kernel protocol records.
 
 use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration, StateFence, sha256_hex};
+use eliot_host_state::ModuleBuildProvenanceRecord;
 use eliot_ipc::TransportError;
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
@@ -76,7 +77,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 5;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 6;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -1362,14 +1363,15 @@ impl KernelControlRequest {
             permit.validate(&self.candidate, self.generation)?;
         }
         if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &self.command {
-            evidence.validate()?;
-            if evidence.candidate_digest != self.candidate.compute_digest()? {
+            evidence.validate(&self.candidate, self.generation)?;
+            if evidence.startup_evidence.candidate_digest != self.candidate.compute_digest()? {
                 return Err(KernelServiceError::HandshakeMismatch {
                     field: "startup_evidence.candidate_binding",
                 });
             }
-            if evidence.state_fence.resource_generation != self.generation
+            if evidence.startup_evidence.state_fence.resource_generation != self.generation
                 || !evidence
+                    .startup_evidence
                     .state_fence
                     .authority_epoch
                     .is_same_authority(&self.candidate.kernel_epoch)
@@ -3133,6 +3135,101 @@ impl HostStartupEvidence {
     }
 }
 
+/// One authenticated startup report with an optional typed Host journal readback.
+///
+/// Candidate activation sends `Some(rows)` after Host has read the exact rows
+/// back from its journal under the current activation fence. Later readiness
+/// refreshes can send `None`; they do not claim to repeat provenance admission.
+/// The records remain evidence only and do not mint a generation receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStartupEvidenceReport {
+    /// Existing Host-owned startup probes and their candidate binding.
+    pub startup_evidence: HostStartupEvidence,
+    /// Complete canonical module rows freshly read back from the Host journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_build_provenance: Option<Vec<ModuleBuildProvenanceRecord>>,
+}
+
+impl HostStartupEvidenceReport {
+    /// Validates the existing probes plus every optional complete journal row
+    /// against the exact request candidate and generation.
+    pub fn validate(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+        generation: ResourceGeneration,
+    ) -> Result<(), KernelServiceError> {
+        self.startup_evidence.validate()?;
+        if self.startup_evidence.state_fence.resource_generation != generation
+            || !self
+                .startup_evidence
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&candidate.kernel_epoch)
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "startup_evidence.fence",
+            });
+        }
+        let Some(records) = &self.module_build_provenance else {
+            return Ok(());
+        };
+        if records.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "startup_evidence.module_build_provenance",
+                reason: "a present provenance handoff must contain at least one canonical row",
+            });
+        }
+        let mut module_ids = BTreeSet::new();
+        for record in records {
+            record
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "startup_evidence.module_build_provenance.record",
+                    reason: "row must satisfy the canonical Host journal contract",
+                })?;
+            if record.fence.host.installation != candidate.installation_id
+                || record.fence.host.epoch.current.lineage_id.as_str()
+                    != candidate.supervision_incarnation.host_epoch.lineage_id.as_str()
+                || record.fence.host.epoch.current.sequence.get() != candidate.host_epoch.value()
+                || record.fence.activation_id != candidate.activation_id
+                || record
+                    .fence
+                    .activation_generation
+                    .current
+                    .lineage_id
+                    .as_str()
+                    != candidate
+                        .supervision_incarnation
+                        .activation_generation
+                        .lineage_id
+                        .as_str()
+                || record
+                    .fence
+                    .activation_generation
+                    .current
+                    .sequence
+                    .get()
+                    != candidate
+                        .supervision_incarnation
+                        .activation_generation
+                        .sequence
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "startup_evidence.module_build_provenance.fence",
+                });
+            }
+            if !module_ids.insert(record.module_id.as_str()) {
+                return Err(KernelServiceError::InvalidField {
+                    field: "startup_evidence.module_build_provenance.module_id",
+                    reason: "a handoff cannot repeat a module row",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One Kernel-authored introduction row read from the canonical ORS
 /// current tables (wire-native projection of
 /// `eliot_ors::CapabilityIntroductionProjection`: identity strings and
@@ -3407,10 +3504,10 @@ pub enum KernelControlCommand {
     /// Record a bounded failure and its recovery reference.
     Fail(PlatformHandle),
     /// Report closed Host-owned startup evidence (I1.11 steps 1, 2, 4) bound
-    /// to the request candidate. The Kernel records a step only after
-    /// independently validating the corresponding field; the consumer match
-    /// arms own that marking.
-    ReportHostStartupEvidence(HostStartupEvidence),
+    /// to the request candidate, plus optional typed module rows Host read
+    /// back from its journal. The records remain evidence and do not mint a
+    /// generation receipt.
+    ReportHostStartupEvidence(HostStartupEvidenceReport),
 }
 
 impl From<PortError> for KernelServiceError {
@@ -4359,7 +4456,10 @@ mod tests {
             peer_process_id: 7,
             generation: ResourceGeneration::new(3).expect("generation"),
             candidate,
-            command: KernelControlCommand::ReportHostStartupEvidence(evidence),
+            command: KernelControlCommand::ReportHostStartupEvidence(HostStartupEvidenceReport {
+                startup_evidence: evidence,
+                module_build_provenance: None,
+            }),
             payload_digest: String::new(),
         }
         .with_computed_digest()
@@ -4418,8 +4518,8 @@ mod tests {
         let evidence = startup_evidence(&candidate);
         let mut drifted = startup_evidence_request(candidate, evidence);
         if let KernelControlCommand::ReportHostStartupEvidence(inner) = &mut drifted.command {
-            inner.state_fence = StateFence::new(
-                inner.state_fence.authority_epoch.clone(),
+            inner.startup_evidence.state_fence = StateFence::new(
+                inner.startup_evidence.state_fence.authority_epoch.clone(),
                 ResourceGeneration::new(9).expect("generation"),
             );
         }
