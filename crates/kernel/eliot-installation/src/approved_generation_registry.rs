@@ -25,9 +25,8 @@ use super::{
     PHASE_B_PENDING_SCM_DIGEST, PlatformAgentBridgeSecurityConvergenceReceipt,
     PlatformAgentBridgeStagePrepared, PlatformAgentBridgeStagingReceipt, PlatformHandle,
     PreparedDestinationAdmission, PreparedDestinationMaterialisation,
-    ProvisionedSupervisionAuthority, ResourceGeneration,
-    RuntimeLaunchDescriptor, StateFence, canonical_json_bytes, handle, sha256_handle, sha256_hex,
-    text,
+    ProvisionedSupervisionAuthority, ResourceGeneration, RuntimeLaunchDescriptor, StateFence,
+    canonical_json_bytes, handle, sha256_handle, sha256_hex, text,
 };
 
 #[cfg(test)]
@@ -3771,9 +3770,7 @@ impl ApprovedGenerationRegistry {
 
     /// Every materialised destination this authority currently retains.
     #[must_use]
-    pub fn prepared_destination_materialisations(
-        &self,
-    ) -> &[PreparedDestinationMaterialisation] {
+    pub fn prepared_destination_materialisations(&self) -> &[PreparedDestinationMaterialisation] {
         &self.prepared_destination_materialisations
     }
 
@@ -3826,9 +3823,13 @@ impl ApprovedGenerationRegistry {
             }
             return Err(InstallationError::IdentityConflict);
         }
-        if self.prepared_destination_materialisations.iter().any(|record| {
-            record.destination_installation == materialisation.destination_installation
-        }) {
+        if self
+            .prepared_destination_materialisations
+            .iter()
+            .any(|record| {
+                record.destination_installation == materialisation.destination_installation
+            })
+        {
             return Err(InstallationError::IdentityConflict);
         }
         self.prepared_destination_materialisations
@@ -5068,7 +5069,8 @@ impl ApprovedGenerationRegistry {
             {
                 return Err(InstallationError::InvalidField {
                     field: "registry.prepared_destination_materialisations".to_owned(),
-                    reason: "the materialisation does not realise the retained admission".to_owned(),
+                    reason: "the materialisation does not realise the retained admission"
+                        .to_owned(),
                 });
             }
         }

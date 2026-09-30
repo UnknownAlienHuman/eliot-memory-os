@@ -327,11 +327,8 @@ impl PreparedDestinationMaterialisation {
     /// naming another destination, another area or a false absence observation
     /// fails here rather than being believed because it exists.
     pub fn validate(&self) -> Result<(), IsolatedDestinationError> {
-        handle(
-            &self.wire,
-            "prepared_destination.materialisation.wire",
-        )
-        .map_err(IsolatedDestinationError::Installation)?;
+        handle(&self.wire, "prepared_destination.materialisation.wire")
+            .map_err(IsolatedDestinationError::Installation)?;
         if self.wire.as_str() != Self::WIRE {
             return Err(IsolatedDestinationError::Installation(
                 InstallationError::MigrationRequired {
@@ -1812,22 +1809,23 @@ pub fn materialise_prepared_isolated_destination(
     }
 
     // The installation authority's own create-new owned-directory publication.
-    let publication =
-        OwnedDirectoryPublication::create(std::path::Path::new(&derived_destination_root))
-            .map_err(|error| match error {
-                // A destination that already existed by the time the owner
-                // created it, including a concurrent create race, is not owned
-                // by this operation.
-                DirectoryPublicationError::AlreadyExists => {
-                    IsolatedDestinationRefusal::DestinationNotAbsent
-                }
-                DirectoryPublicationError::ReparsePoint => {
-                    IsolatedDestinationRefusal::ForeignInstallationOwner
-                }
-                other => IsolatedDestinationError::Installation(InstallationError::Platform(
-                    format!("the installation authority could not create the isolated destination: {other}"),
-                )),
-            })?;
+    let publication = OwnedDirectoryPublication::create(std::path::Path::new(
+        &derived_destination_root,
+    ))
+    .map_err(|error| match error {
+        // A destination that already existed by the time the owner
+        // created it, including a concurrent create race, is not owned
+        // by this operation.
+        DirectoryPublicationError::AlreadyExists => {
+            IsolatedDestinationRefusal::DestinationNotAbsent
+        }
+        DirectoryPublicationError::ReparsePoint => {
+            IsolatedDestinationRefusal::ForeignInstallationOwner
+        }
+        other => IsolatedDestinationError::Installation(InstallationError::Platform(format!(
+            "the installation authority could not create the isolated destination: {other}"
+        ))),
+    })?;
 
     // (3): the creating code path's own independent measurement of the parent
     // object must equal what the retained lease holds.
@@ -1841,14 +1839,11 @@ pub fn materialise_prepared_isolated_destination(
         ));
     }
     let source_identity = publication.temporary_identity();
-    let receipt = match publication
-        .publish(source_identity)
-        .map_err(|error| {
-            IsolatedDestinationError::Installation(InstallationError::Platform(format!(
-                "the installation authority could not publish the isolated destination: {error}"
-            )))
-        })?
-    {
+    let receipt = match publication.publish(source_identity).map_err(|error| {
+        IsolatedDestinationError::Installation(InstallationError::Platform(format!(
+            "the installation authority could not publish the isolated destination: {error}"
+        )))
+    })? {
         DirectoryPublicationOutcome::Published(receipt) => receipt,
         // The move COMMITTED. The created root is therefore a real object whose
         // identity this operation could not read back; it is preserved and
@@ -1869,27 +1864,27 @@ pub fn materialise_prepared_isolated_destination(
     // protected-root contour, the same no-follow pin -- and its identity is what
     // gets recorded. A junction swapped in immediately after the move is
     // refused here rather than adopted.
-    let created_lease = ProtectedRootLease::open_existing(std::path::Path::new(
-        &derived_destination_root,
-    ))
-    .map_err(|_| IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+    let created_lease =
+        ProtectedRootLease::open_existing(std::path::Path::new(&derived_destination_root))
+            .map_err(|_| {
+                IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
         "the created isolated destination could not be re-proved through a protected-root lease, \
          so its ownership is not established"
             .to_owned(),
-    )))?;
-    created_lease
-        .verify_stable_identity()
-        .map_err(|_| IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
-            "the created isolated destination root did not keep its retained identity"
-                .to_owned(),
-        )))?;
-    let created_path = created_lease
-        .canonical_path()
-        .map_err(|_| IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+    ))
+            })?;
+    created_lease.verify_stable_identity().map_err(|_| {
+        IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+            "the created isolated destination root did not keep its retained identity".to_owned(),
+        ))
+    })?;
+    let created_path = created_lease.canonical_path().map_err(|_| {
+        IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
             "the created isolated destination root could not be resolved through its retained \
              lease"
                 .to_owned(),
-        )))?;
+        ))
+    })?;
     if !same_windows_root_text(
         &created_path.to_string_lossy(),
         &admission.isolation.destination_installation_root,
@@ -1912,12 +1907,10 @@ pub fn materialise_prepared_isolated_destination(
         ));
     }
 
-    let materialisation_wire =
-        PlatformHandle::new(PreparedDestinationMaterialisation::WIRE).map_err(|error| {
-            InstallationError::InvalidField {
-                field: "prepared_destination.materialisation.wire".to_owned(),
-                reason: error.to_string(),
-            }
+    let materialisation_wire = PlatformHandle::new(PreparedDestinationMaterialisation::WIRE)
+        .map_err(|error| InstallationError::InvalidField {
+            field: "prepared_destination.materialisation.wire".to_owned(),
+            reason: error.to_string(),
         })?;
     // The commitment is computed from the values themselves BEFORE the record
     // exists, so the record is built once with its real digest rather than with
