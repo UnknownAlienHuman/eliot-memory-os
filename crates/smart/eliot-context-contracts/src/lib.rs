@@ -39,9 +39,13 @@ pub use admission_input::{
 };
 pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
-    CapacityLimits, ContextCandidate, ContextRecipe, LearningProvenance, LossPolicy,
-    MAX_ATOM_SOURCE_RANGE_UNITS, MeasurementRef, PrivacyClass, ProviderDisposition,
-    ProviderRoleDenominator, RepresentationKind, RoleLossRule,
+    CONTEXT_RECIPE_SCHEMA_VERSION, CandidateFeature, CapacityLimits, ContextCandidate,
+    ContextRecipe, ContextRecipePolicy, ContextSectionBudget, LearningProvenance,
+    LegacyContextRecipeV1, LossPolicy, MAX_ATOM_SOURCE_RANGE_UNITS, MeasurementRef, PrivacyClass,
+    ProviderDisposition, ProviderRoleDenominator, RecipeApplicability, RecipeExecutionContour,
+    RecipeImpactClass, RecipeLayoutPolicy, RecipeOmissionExpansionPolicy, RecipeQualification,
+    RecipeStage, RepresentationKind, RoleLossRule, SectionDegradation, SectionOmissionPolicy,
+    migrate_legacy_recipe_v1,
 };
 pub use boundary::{
     BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryCoordinateSystem,
