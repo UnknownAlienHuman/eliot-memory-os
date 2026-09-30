@@ -234,6 +234,8 @@ license = "MIT"
 anyhow = "1.0.102"
 base64 = "0.22.1"
 blake3 = "1.8.5"
+cap-fs-ext = { version = "=4.0.3" }
+cap-std = { version = "=4.0.3" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 # Terminal mechanics for the optional `eliot dashboard` surface only
 # (I11.1, Appendix I "terminal dashboard"): raw mode, cursor/alternate-screen
