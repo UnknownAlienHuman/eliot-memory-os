@@ -5988,6 +5988,28 @@ pub struct InquiryGovernance {
     pub obligations: Vec<InquiryObligation>,
     /// Evidence freeze of the accepted evidence revision.
     pub freeze: EvidenceFreeze,
+    /// The proof that this freeze was **committed through the governed
+    /// source-admission owner**, with each admitted source's retained original
+    /// bound to it.
+    ///
+    /// W2: "Persist before synthesis and retain the original … commit the freeze
+    /// before admitting synthesis." The ordering is structural rather than
+    /// documentary: every request in [`Self::source_admission_requests`] carries
+    /// this freeze's identity and digest inside its own `request_digest`, and
+    /// [`crate::synthesis_input::CommittedFreeze::commit`] refuses any request
+    /// that does not. So a record carrying this field published a freeze that was
+    /// already committed when the requests were built, and a record without one
+    /// cannot be produced on this path at all.
+    pub committed_freeze: crate::synthesis_input::CommittedFreeze,
+    /// The synthesis-input pack resolved from that committed freeze.
+    ///
+    /// W3: "Build the actual synthesis pack from that freeze. Resolve only its
+    /// admitted included members under the current disclosure and reference
+    /// manifest." Carried whole rather than as a digest, because the omissions
+    /// are the point: a reader needs to see which freeze members did not resolve
+    /// and why, which is the explicit limited/blocked result I21.8 item 3
+    /// requires rather than a stale authorization or a silent omission.
+    pub synthesis_input: crate::synthesis_input::SynthesisInputPack,
     /// Registered research debts.
     pub research_debts: Vec<ResearchDebt>,
     /// Lane class the lane discipline decided for this run.
@@ -6212,15 +6234,43 @@ impl InquiryGovernance {
             claim_audit.records.first(),
             absence_evidence.as_ref(),
         )?;
+        // W2: the freeze is committed through the existing governed
+        // source-admission owner, and the retained original is bound to it there.
+        // Every request on this path is built by
+        // `transition_request_committing_freeze`, so a run that did not persist
+        // before synthesis produces **no** request at all for the sources whose
+        // original it never retained — the plain `transition_request` builder
+        // still exists for a pre-freeze proposal, and this record does not use
+        // it, because a request that named no freeze is exactly the state W2
+        // forbids admitting synthesis from.
+        let source_admission_requests =
+            commit_freeze_through_source_admission(&observation, &freeze, &admissibility)?;
+        // The committed-freeze proof, re-derived from those same requests through
+        // the owner's existing validator. It is not built from the freeze alone:
+        // `CommittedFreeze::commit` takes the requests, so the proof exists only
+        // if every one of them already carried this exact freeze.
+        let committed_freeze =
+            crate::synthesis_input::CommittedFreeze::commit(&freeze, &source_admission_requests)?;
+        // W3: the synthesis pack is resolved from that committed freeze under the
+        // run-bound reference manifest and the admitted disclosure class, so a
+        // member the freeze excluded, the manifest revoked or the disclosure
+        // forbids is a published omission rather than a silent one.
+        let synthesis_input = crate::synthesis_input::SynthesisInputPack::resolve(
+            &committed_freeze,
+            &freeze,
+            &observation.reference_manifest,
+            &admitted_records(&admissibility),
+            &committed_freeze.members_by_handle(),
+            &observation.question,
+            observation.disclosure,
+            &lane_discipline,
+        )?;
         let record = Self {
             inquiry_id: observation.inquiry_id,
             evidence_set_id: observation.evidence_set_id,
             run_reference_manifest: observation.reference_manifest.clone(),
             profile_admission_request: profile.admission_request(),
-            source_admission_requests: admissibility
-                .iter()
-                .map(SourceAdmissibilityRecord::transition_request)
-                .collect::<Result<Vec<_>, _>>()?,
+            source_admission_requests,
             unadmitted_references,
             profile,
             claim_audits: claim_audit.records,
@@ -6232,6 +6282,8 @@ impl InquiryGovernance {
             precision,
             obligations,
             freeze,
+            committed_freeze,
+            synthesis_input,
             research_debts,
             lane_discipline,
             terminal,
@@ -6466,17 +6518,25 @@ impl InquiryGovernance {
     /// digest, or when a request has been swapped for a well-formed request
     /// about a different source, decision, evidence set or fence.
     fn validate_source_admission_requests(&self) -> Result<(), InquiryError> {
-        if self.source_admission_requests.len() != self.admissibility.len() {
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.source_admission_requests",
-            });
-        }
-        for (request, record) in self
-            .source_admission_requests
-            .iter()
-            .zip(&self.admissibility)
-        {
+        // The request count no longer equals the admissibility record count, and
+        // that is the W2 signal rather than a defect: a source whose original was
+        // never retained has no committed admission, so it produces no request.
+        // The check below is therefore per-handle — every request must still be
+        // the request for one of this record's decisions, and every decision with
+        // a committed freeze must still have its request — rather than a count
+        // equality that a run that did not persist before synthesis could never
+        // satisfy.
+        for request in &self.source_admission_requests {
             request.validate_integrity()?;
+            let Some(record) = self
+                .admissibility
+                .iter()
+                .find(|record| record.record.handle == request.source_handle)
+            else {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request_binding",
+                });
+            };
             // The request must still be the request for *this* decision under
             // *this* inquiry and evidence set. Its own digest proves it was not
             // edited; these bindings prove it was not swapped for a well-formed
@@ -6493,6 +6553,73 @@ impl InquiryGovernance {
                     field: "inquiry.source_admission_request_binding",
                 });
             }
+            // W2: a request on this record must name THIS record's committed
+            // freeze, and the retained original it names must be the admitted
+            // record's own revision. Both are comparisons against values a
+            // different owner produced — the freeze's own digest and the admitted
+            // record's own `content_digest` — rather than against a restatement
+            // of the request's own fields.
+            let Some(commitment) = &request.freeze_commit else {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request.freeze_commit",
+                });
+            };
+            if commitment.freeze_digest != self.freeze.digest
+                || commitment.freeze_id != self.freeze.freeze_id
+                || !self.freeze.includes(&request.source_handle)
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request.freeze_commit",
+                });
+            }
+            match self.retained_revisions.get(&request.source_handle) {
+                Some(retained) => {
+                    retained.verify_integrity()?;
+                    if retained.content_digest != record.record.content_digest
+                        || retained.artifact_ref != commitment.retained_artifact_ref
+                        || retained.digest != commitment.retained_revision_digest
+                    {
+                        return Err(InquiryError::IntegrityMismatch {
+                            field: "inquiry.retained_revision_binding",
+                        });
+                    }
+                }
+                None => {
+                    return Err(InquiryError::IntegrityMismatch {
+                        field: "inquiry.retained_revision_binding",
+                    });
+                }
+            }
+        }
+        // Every committed member of the freeze this record published must still
+        // have its admission request, so a dropped request cannot shrink the
+        // committed set while the freeze still names the source. The expected set
+        // is read off the committed freeze and the requests, which are separate
+        // values, and compared rather than one being read back from the other.
+        let mut expected: Vec<&str> = self
+            .freeze
+            .included_members()
+            .iter()
+            .map(String::as_str)
+            .filter(|handle| {
+                self.admissibility.iter().any(|record| {
+                    record.record.handle == **handle
+                        && record.eligibility == SourceEligibility::Eligible
+                        && self.retained_revisions.contains_key(*handle)
+                })
+            })
+            .collect();
+        expected.sort_unstable();
+        let mut carried: Vec<&str> = self
+            .source_admission_requests
+            .iter()
+            .map(|request| request.source_handle.as_str())
+            .collect();
+        carried.sort_unstable();
+        if expected != carried {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.source_admission_request_coverage",
+            });
         }
         Ok(())
     }
@@ -8905,6 +9032,69 @@ fn unresolved_contradictions(admissibility: &[SourceAdmissibilityRecord]) -> Vec
     contradictions.sort();
     contradictions.dedup();
     contradictions
+}
+
+/// Commits the evidence freeze through the existing governed source-admission
+/// owner, binding each admitted source's retained original to it.
+///
+/// This is the W2 producer, and it is deliberately a **producer of the existing
+/// owner's records** rather than a new owner: every value it returns is a
+/// [`GovernorSourceTransitionRequest`], which already had a digest domain, a
+/// canonical preimage and a `validate_integrity` before this issue touched it. The
+/// only new thing is that the request is now built by
+/// [`SourceAdmissibilityRecord::transition_request_committing_freeze`], which
+/// names the committed freeze and the retained original and refuses either that
+/// does not re-prove itself.
+///
+/// A record whose original is missing produces no request for that handle. That
+/// is the honest W2 outcome, not a hole: a source that was admitted without its
+/// bytes persisted cannot have its admission committed, and the run's own freeze
+/// still lists it, so the synthesis pack below reports it as a published
+/// omission with [`crate::synthesis_input::PackLimitation::NoRetainedOriginal`]
+/// rather than dropping it.
+///
+/// The eligibility filter is the same one [`evidence_freeze`] uses to build the
+/// included set, so the committed members and the frozen members cannot disagree
+/// about which sources are in the evidence set.
+///
+/// # Errors
+///
+/// Propagates every refusal of the existing owner's own builder: a retained
+/// revision that is not the admitted record's own revision, a freeze that does not
+/// include the source, a request whose own digest does not re-prove, and the
+/// encoding refusal when the decision's source record has no canonical
+/// commitment.
+fn commit_freeze_through_source_admission(
+    observation: &InquiryObservation,
+    freeze: &EvidenceFreeze,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<Vec<GovernorSourceTransitionRequest>, InquiryError> {
+    let mut requests = Vec::new();
+    for record in admissibility {
+        if record.eligibility != SourceEligibility::Eligible {
+            continue;
+        }
+        let Some(retained) = observation.retained_revisions.get(&record.record.handle) else {
+            continue;
+        };
+        requests.push(record.transition_request_committing_freeze(retained, freeze)?);
+    }
+    Ok(requests)
+}
+
+/// The admitted source records of one run, keyed by handle.
+///
+/// The same records the portfolio assembled and the freeze enumerated, carried
+/// whole rather than rebuilt, so the synthesis pack resolves members against the
+/// records the run published rather than a second projection of them.
+fn admitted_records(
+    admissibility: &[SourceAdmissibilityRecord],
+) -> BTreeMap<String, SourceRecord> {
+    admissibility
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .map(|record| (record.record.handle.clone(), record.record.clone()))
+        .collect()
 }
 
 /// Freezes the accepted evidence revision for one inquiry.

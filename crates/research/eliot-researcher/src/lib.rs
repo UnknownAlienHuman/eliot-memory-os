@@ -17,6 +17,7 @@ pub mod inquiry_governance;
 pub mod inquiry_lanes;
 pub mod inquiry_obligations;
 pub mod source_admissibility;
+pub mod synthesis_input;
 
 use eliot_contracts::StateFence;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, GovernedExchange, ResearchBridge};
@@ -99,9 +100,17 @@ pub use inquiry_obligations::{
     TaskGraphCompilationInputs,
 };
 pub use source_admissibility::{
-    GovernorSourceTransitionRequest, PresentedReference, RecordReferenceSurface,
-    SourceAdmissibilityReason, SourceAdmissibilityRecord, SourceEligibility, SourceIndependence,
-    SourceLimits, SourceTaint, admits_record_reference, record_references,
+    FreezeCommitment, GovernorSourceTransitionRequest, PresentedReference,
+    RecordReferenceSurface, SourceAdmissibilityReason, SourceAdmissibilityRecord, SourceEligibility,
+    SourceIndependence, SourceLimits, SourceTaint, admits_record_reference, record_references,
+};
+// The committed-freeze proof and the governed synthesis-input pack. Exported
+// because the composition root that admits a synthesis run reads the pack, and
+// because a consumer asking "was the freeze committed before synthesis" reads
+// `CommittedFreeze` rather than reconstructing one from request fields.
+pub use synthesis_input::{
+    CommittedFreeze, CommittedFreezeMember, PackLimitation, PackMember, PackOmission,
+    SynthesisInputPack,
 };
 
 pub struct Researcher<B> {
