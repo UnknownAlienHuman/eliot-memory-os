@@ -18,8 +18,8 @@ use eliot_blob::{
     DpapiUserKeyPort, WindowsBlobPlatform, ZstdBlobCompression,
 };
 use eliot_blob_api::{
-    BlobError, BlobId, BlobPolicyBinding, BlobReadChunk, BlobReadRequest, BlobReceiptContext,
-    ObjectResidencyKey, RetentionClass,
+    BlobError, BlobId, BlobPolicyBinding, BlobReadChunk, BlobReadRequest, BlobReadyReceipt,
+    BlobReceiptContext, ObjectResidencyKey, RetentionClass,
 };
 use eliot_governor::{
     SourceArtifactAdmission, SourceArtifactBlobProfile, SourceArtifactBlobProfileError,
@@ -137,8 +137,8 @@ impl SourceArtifactOwner {
         if admission.operation().operation_kind == LSP_TOOL_OBSERVATION_RECEIPT_KIND {
             return Err(SourceArtifactOwnerError::ReservedLspObservationOperationKind);
         }
-        identity.verify_content(bytes)?;
         identity.validate()?;
+        identity.verify_content(bytes)?;
         profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
 
         let policy = blob_policy_binding(profile)?;
@@ -148,7 +148,7 @@ impl SourceArtifactOwner {
         let root_lease = self.root_owner.lease_for_request(&context.request)?;
         let ready =
             blob.stage_source_with_domains(context, root_lease, bytes, policy, residency)?;
-        ready.validate()?;
+        validate_ready_receipt_for_admission(&ready, admission)?;
         ArtifactReference::new(
             identity,
             ready.locator().clone(),
@@ -193,17 +193,9 @@ impl SourceArtifactOwner {
             policy,
             residency,
         )?;
-        ready.validate()?;
+        validate_ready_receipt_for_admission(&ready, admission)?;
         let original_core = &ready.receipt().core;
-        if original_core.operation.operation_kind != LSP_TOOL_OBSERVATION_RECEIPT_KIND
-            || original_core.work_scope != *admission.work_scope()
-            || original_core.task.as_ref() != Some(admission.task())
-            || original_core.session.as_ref() != Some(admission.session())
-            || original_core.causal != *admission.causal()
-            || original_core.request != *admission.request()
-            || original_core.operation != *operation
-            || original_core.authority != *admission.authority()
-        {
+        if original_core.operation.operation_kind != LSP_TOOL_OBSERVATION_RECEIPT_KIND {
             return Err(BlobError::MetadataPayloadMismatch.into());
         }
         eliot_store_api::CapturedBlobPayloadRefV1::from_ready_receipt(
@@ -339,6 +331,25 @@ impl SourceArtifactOwner {
     }
 }
 
+fn validate_ready_receipt_for_admission(
+    ready: &BlobReadyReceipt,
+    admission: &SourceArtifactAdmission,
+) -> Result<(), SourceArtifactOwnerError> {
+    ready.validate()?;
+    let core = &ready.receipt().core;
+    if core.work_scope != *admission.work_scope()
+        || core.task.as_ref() != Some(admission.task())
+        || core.session.as_ref() != Some(admission.session())
+        || core.causal != *admission.causal()
+        || core.request != *admission.request()
+        || core.operation != *admission.operation()
+        || core.authority != *admission.authority()
+    {
+        return Err(BlobError::MetadataPayloadMismatch.into());
+    }
+    Ok(())
+}
+
 fn validate_live_lsp_observation_binding(
     admission: &SourceArtifactAdmission,
     projection: &LspAdoptionProjection,
@@ -347,6 +358,13 @@ fn validate_live_lsp_observation_binding(
 ) -> Result<(), SourceArtifactOwnerError> {
     let decoded: RetainedLspObservationV1 = serde_json::from_slice(original_payload)
         .map_err(SourceArtifactOwnerError::LspObservationPayload)?;
+    if decoded != *record
+        || !projection.matches_retained_observation(&decoded)
+        || projection.observation() != &decoded.result
+    {
+        return Err(SourceArtifactOwnerError::LspObservationBindingMismatch);
+    }
+    let record = &decoded;
     let invocation_request = &record.instrument_invocation.request;
     let source_binding = record.result.receipt().source_binding.as_ref();
     let dispatch_source =
@@ -381,8 +399,7 @@ fn validate_live_lsp_observation_binding(
             && binding.instrument_declared_scope == record.instrument_invocation.declared_scope
             && binding.instrument_input_artifacts == record.instrument_invocation.input_artifacts
     });
-    if decoded != *record
-        || invocation_request != &admission.request().metadata
+    if invocation_request != &admission.request().metadata
         || invocation_request.product_id != admission.work_scope().product_id
         || invocation_request.task_id.as_ref() != Some(&admission.task().task_id)
         || invocation_request.session_id.as_ref() != Some(&admission.session().session_id)
@@ -391,8 +408,6 @@ fn validate_live_lsp_observation_binding(
         || !dispatch_source_joins_request
         || !after_run_source_joins_request
         || !source_binding_joins_invocation
-        || !projection.matches_retained_observation(record)
-        || projection.observation() != &record.result
     {
         return Err(SourceArtifactOwnerError::LspObservationBindingMismatch);
     }
