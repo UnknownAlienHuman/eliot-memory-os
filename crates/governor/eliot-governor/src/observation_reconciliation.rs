@@ -748,7 +748,7 @@ pub enum McpObservationCompletion {
         policy: ObservationIngressPolicyBinding,
         /// Pre-persistence recovery access classification.
         capture_access: ObservationCaptureAccess,
-        /// Exact Policy and WorkScope projection admitted before capture.
+        /// Exact Policy and `WorkScope` projection admitted before capture.
         owner_binding: ObservationCaptureOwnerBinding,
     },
     /// The canonical write is committed, but current owner context moved while
@@ -762,7 +762,7 @@ pub enum McpObservationCompletion {
         policy: ObservationIngressPolicyBinding,
         /// Pre-persistence recovery access classification.
         capture_access: ObservationCaptureAccess,
-        /// Exact Policy and WorkScope projection admitted before capture.
+        /// Exact Policy and `WorkScope` projection admitted before capture.
         owner_binding: ObservationCaptureOwnerBinding,
         /// Typed owner refusal describing the stale post-write context.
         context_error: CompositionError,
@@ -918,6 +918,7 @@ pub struct GovernorObservationReconciliation<'a, P: ?Sized> {
 }
 
 /// Borrowed Governor owner context for the observation reconciliation adapter.
+#[derive(Clone, Copy)]
 pub(crate) struct ObservationOwnerContext<'a> {
     pub observation: &'a ObservationJournal,
     pub problem_revisions: &'a BTreeMap<String, u64>,
@@ -1056,7 +1057,10 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             &input.identity,
             &input.owner_binding.origin,
             fence,
-            input.task_selection.as_ref().map(|selection| selection.evidence()),
+            input
+                .task_selection
+                .as_ref()
+                .map(TaskSelectionAdmissionBinding::evidence),
         )?;
         let policy = self.current_ingress_policy()?;
         if !capture_policy_matches_owner(&policy, &input.owner_binding) {
@@ -1193,7 +1197,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
     }
 
     /// Accepts the exact receipt returned by the prepared Observe exchange and
-    /// re-reads the current policy and WorkScope owners before publication.
+    /// re-reads the current policy and `WorkScope` owners before publication.
     ///
     /// The receipt is checked against the original immutable transition. If
     /// the write is known committed but owner policy/scope changed during the
@@ -1239,10 +1243,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             ));
         }
         let binding = &prepared.owner_binding;
-        let current_policy = match self.current_ingress_policy() {
-            Ok(policy) => policy,
-            Err(error) => return Err(error),
-        };
+        let current_policy = self.current_ingress_policy()?;
         if current_policy != prepared.policy
             || current_policy.state_fence != binding.state_fence
             || current_policy.policy_revision != binding.policy_owner_revision
@@ -1257,10 +1258,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                 "Observation Policy owner changed after canonical commit".to_owned(),
             ));
         }
-        let current_scope = match self.current_work_scope(&binding.state_fence) {
-            Ok(scope) => scope,
-            Err(error) => return Err(error),
-        };
+        let current_scope = self.current_work_scope(&binding.state_fence)?;
         if current_scope != binding.work_scope_binding
             || current_scope.binding.scope.scope_ref != binding.authenticated_scope_ref
             || current_scope.state_fence != binding.work_scope_read_fence
@@ -1269,15 +1267,13 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                 "Observation WorkScope owner changed after canonical commit".to_owned(),
             ));
         }
-        if let Err(error) = validate_observation_origin_current(
+        validate_observation_origin_current(
             self.session,
             identity,
             &binding.origin,
             &binding.state_fence,
             prepared.submission.task_selection.as_ref(),
-        ) {
-            return Err(error);
-        }
+        )?;
         binding.validate()
     }
 
