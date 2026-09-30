@@ -83,7 +83,8 @@ use eliot_protocol::backup::{
     BACKUP_RESTORE_STEP_WIRE_VERSION, BACKUP_SNAPSHOT_PAGE_READ_WIRE_ID,
     BACKUP_SNAPSHOT_PAGE_READ_WIRE_VERSION, BackupAdmissionRef, BackupArchiveValidityAttestation,
     BackupArchiveVerification, BackupAuthenticatedPrincipal, BackupCaptureReceipt,
-    BackupCaptureRequest, BackupClassWire, BackupCutoverAdmission, BackupCutoverReceipt,
+    BackupCaptureRequest, BackupCapability, BackupClassWire, BackupCutoverAdmission,
+    BackupCutoverReceipt,
     BackupDisposition, BackupError, BackupIsolatedRestorePrepare, BackupMutationBinding,
     BackupOperationKind, BackupPhaseAttestation, BackupRehearsalComplete, BackupReplayDisposition,
     BackupReplayLedger, BackupRequestIdentity, BackupRestoreReconcile, BackupRestoreStatus,
@@ -298,6 +299,13 @@ fn rehearsal(identity: &BackupRequestIdentity) -> BackupRehearsalComplete {
     .expect("rehearsal digest")
 }
 
+fn wire_of_capability(capability: BackupCapability) -> String {
+    serde_json::to_string(&capability)
+        .expect("capability wire")
+        .trim_matches('"')
+        .to_owned()
+}
+
 fn fixture(name: &str) -> serde_json::Value {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/backup")
@@ -359,6 +367,19 @@ fn backup_vocabulary_round_trips_catalogues() -> TestResult {
         );
         let decoded: BackupRole = serde_json::from_value(name.clone())?;
         assert_eq!(decoded, role);
+        // The fixture is a projection of `BackupRole::capabilities()`, the
+        // single owner of the role matrix. Compare the full capability array
+        // for every role so a projection drift fails here instead of lying
+        // quietly until a consumer reads it as normative.
+        let projected: Vec<String> = role
+            .capabilities()
+            .iter()
+            .copied()
+            .map(wire_of_capability)
+            .collect();
+        let claimed: Vec<String> =
+            serde_json::from_value(role_map[&name_str].clone()).expect("capability projection");
+        assert_eq!(projected, claimed, "role {name_str} capability projection");
     }
     // Spots both fixtures and code agree on: requester issues captures but
     // never cutover; forensic observes status only; only the installation
