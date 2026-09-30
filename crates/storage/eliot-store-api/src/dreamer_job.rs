@@ -41,8 +41,8 @@ pub const MAX_DREAMER_JOB_TEXT_BYTES: usize = 16 * 1024;
 /// Deterministically maps a K0 validation failure to the store boundary.
 ///
 /// The mapping preserves typed identity, CAS, lease, checkpoint, receipt,
-/// coverage, cancellation, unknown-commit, and internal error classes without
-/// echoing supplied payloads.
+/// coverage, cancellation, unknown-commit, semantic-input availability, and
+/// internal error classes without echoing supplied payloads.
 #[must_use]
 pub fn map_durable_error(error: DurableJobError) -> StoreError {
     match error {
@@ -55,6 +55,10 @@ pub fn map_durable_error(error: DurableJobError) -> StoreError {
         DurableJobError::Serialization(reason) => StoreError::Serialization(reason),
         DurableJobError::FenceMismatch => StoreError::FenceMismatch,
         DurableJobError::OperationMismatch => StoreError::IdentityConflict,
+        DurableJobError::SemanticInputUnavailable => StoreError::Empty {
+            field: "semantic_input",
+        },
+        DurableJobError::SemanticInputMismatch => StoreError::IdentityConflict,
         DurableJobError::CapabilityDenied => StoreError::UnknownOperation,
         DurableJobError::LeaseInvalid | DurableJobError::TerminalImmutable => {
             StoreError::RevisionConflict
