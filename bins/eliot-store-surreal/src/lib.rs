@@ -322,6 +322,7 @@ pub struct StoreComposition {
     profile_selection_receipt: Option<ProfileSelectionReceipt>,
     profile_root_leases: Option<ProfileRootLeaseSet>,
     user_mode_launch_root: Option<UserOwnedRootLease>,
+    profile_peer_binding: Option<UserProfilePeerBinding>,
     runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
 }
 
@@ -352,11 +353,42 @@ type RetainedProfileRoots = (
     Option<ProfileSelectionReceipt>,
 );
 
+/// The Host peer expected by a current-user Store profile, retained from the
+/// same launch config whose roots were admitted against the profile receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UserProfilePeerBinding {
+    expected_sid: String,
+    expected_session_id: u32,
+}
+
+fn validate_user_profile_peer_sid(
+    binding: &UserProfilePeerBinding,
+    selection: &ProfileSelectionReceipt,
+) -> Result<(), String> {
+    if binding.expected_sid != selection.owner_sid {
+        return Err("expected Store peer SID differs from the retained profile owner".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_user_profile_peer_session(
+    binding: &UserProfilePeerBinding,
+    selection: &ProfileSelectionReceipt,
+) -> Result<(), String> {
+    if binding.expected_session_id != selection.session_id {
+        return Err(
+            "expected Store peer session differs from the live retained profile session".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn retain_profile_roots_for_launch(
     config: &StoreLaunchConfig,
     roots: &RuntimeStateRoots,
     runtime_root_leases: &ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
     user_mode_launch_root: Option<&UserOwnedRootLease>,
+    profile_peer_binding: Option<&UserProfilePeerBinding>,
 ) -> Result<RetainedProfileRoots, String> {
     let (profile_root_request, profile_root_leases, profile_selection_receipt) = match roots.profile
     {
@@ -410,6 +442,12 @@ fn retain_profile_roots_for_launch(
                     "persisted profile selection does not match live no-follow roots".to_owned(),
                 );
             }
+            let peer_binding = profile_peer_binding.ok_or_else(|| {
+                "current-user Store profile has no retained peer binding".to_owned()
+            })?;
+            validate_user_profile_peer_sid(peer_binding, &receipt)?;
+            validate_user_profile_peer_sid(peer_binding, live_roots.selection())?;
+            validate_user_profile_peer_session(peer_binding, live_roots.selection())?;
             validate_runtime_leases_against_selection(
                 roots,
                 runtime_root_leases,
@@ -474,6 +512,15 @@ impl StoreComposition {
         config.validate()?;
         let schema_bootstrap_binding = StoreSchemaBootstrapBinding::from_config(config);
         let roots = &config.runtime_launch.runtime_state_roots;
+        let profile_peer_binding = match roots.profile {
+            InstallationProfile::SystemService => None,
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                Some(UserProfilePeerBinding {
+                    expected_sid: config.expected_client_sid.clone(),
+                    expected_session_id: config.expected_client_session_id,
+                })
+            }
+        };
         let mut root_lease_provider = WindowsRuntimeRootLeaseProvider::for_roots(roots)
             .map_err(|error| format!("validate runtime-root provider: {error}"))?;
         let runtime_root_leases = roots
@@ -485,6 +532,7 @@ impl StoreComposition {
                 roots,
                 &runtime_root_leases,
                 user_mode_launch_root.as_ref(),
+                profile_peer_binding.as_ref(),
             )?;
         // Root admission and persisted selection comparison happen before any
         // Store/Blob owner, credential lookup, or provider path is composed.
@@ -561,6 +609,7 @@ impl StoreComposition {
             profile_selection_receipt,
             profile_root_leases,
             user_mode_launch_root,
+            profile_peer_binding,
             runtime_root_leases,
         })
     }
@@ -596,6 +645,16 @@ impl StoreComposition {
                 {
                     return Err(StoreError::Unavailable);
                 }
+                let peer_binding = self
+                    .profile_peer_binding
+                    .as_ref()
+                    .ok_or(StoreError::Unavailable)?;
+                validate_user_profile_peer_sid(peer_binding, original)
+                    .map_err(|_| StoreError::Unavailable)?;
+                validate_user_profile_peer_sid(peer_binding, current.selection())
+                    .map_err(|_| StoreError::Unavailable)?;
+                validate_user_profile_peer_session(peer_binding, current.selection())
+                    .map_err(|_| StoreError::Unavailable)?;
                 validate_runtime_leases_against_selection(
                     &self.runtime_state_roots,
                     &self.runtime_root_leases,
