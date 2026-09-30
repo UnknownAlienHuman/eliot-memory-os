@@ -2,14 +2,15 @@ use crate::{
     AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedObservation, AdmittedObservationKind,
     AdmittedOpenCodeAttempt, AdmittedSlotConsumption, AuthorityCeiling, BasicAuth,
     EnvironmentAllowlist, ExecutableFingerprint, HealthResponse, HttpMethod, HttpRequest,
+    MalformedProviderOutput,
     LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
     OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
     OpenCodeObservationConversionError, OpenCodeWireRouteReceipt, PhysicalObservationBody,
     ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus,
     SealedRouteDisposition, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
     SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields, UsageAvailability,
-    UsageTelemetry, bound_session_identity, committed_message_id, wire_receipt_evidence,
-    wire_route_locator,
+    UsageTelemetry, OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY, bound_session_identity,
+    committed_message_id, wire_receipt_evidence, wire_route_locator,
 };
 use eliot_agent_api::{
     AgentResult, EffectCeiling, EventCursor, ExecutionOutcome, ResultDisposition,
@@ -23,13 +24,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 const CLIENT_PROTOCOL_REVISION: &str = crate::types::OPENCODE_WIRE_LOCATOR_PROTOCOL_REVISION;
 const READ_ONLY_AGENT: &str = crate::types::OPENCODE_WIRE_LOCATOR_AGENT;
 const DEFAULT_SERVER_VERSION: &str = "1.4.3";
 const RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(20);
 const RECONCILIATION_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MALFORMED_OUTPUT_REASON_CHARS: usize = 128;
 static MESSAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -198,6 +200,8 @@ pub enum OpenCodeRunError {
     InvalidPolicy(String),
     #[error("OpenCode protocol violation: {0}")]
     Protocol(String),
+    #[error(transparent)]
+    MalformedStructuredOutput(#[from] Box<MalformedProviderOutput>),
     #[error("OpenCode route is unavailable: {0}")]
     RouteUnavailable(String),
     #[error(
@@ -639,6 +643,14 @@ impl CorrelatedEventState {
 }
 
 impl OpenCodeClient {
+    /// Caps a caller-admitted timeout at this runtime owner's overall
+    /// read-only execution ceiling. The result is safe to bind into a
+    /// provider-neutral request because execution applies the same cap.
+    #[must_use]
+    pub fn cap_admitted_read_only_timeout(&self, requested: Duration) -> Duration {
+        requested.min(self.policy.overall_timeout)
+    }
+
     pub fn new(
         endpoint: LoopbackEndpoint,
         auth: BasicAuth,
@@ -902,59 +914,125 @@ impl OpenCodeClient {
         current_fence: &StateFence,
         runtime_generation: ResourceGeneration,
     ) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
+        self.run_admitted_read_only_with_timeout(
+            admitted,
+            request,
+            current_fence,
+            runtime_generation,
+            self.policy.overall_timeout,
+        )
+        .await
+    }
+
+    /// Runs one admitted read-only attempt under the smaller of the owner
+    /// policy ceiling and a caller-threaded admitted request timeout. The
+    /// caller may reduce a timeout from its own admission; it cannot expand
+    /// the owner policy ceiling.
+    pub async fn run_admitted_read_only_with_timeout(
+        &self,
+        admitted: &AdmittedOpenCodeAttempt,
+        request: &ReadOnlyRunRequest,
+        current_fence: &StateFence,
+        runtime_generation: ResourceGeneration,
+        admitted_timeout: Duration,
+    ) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
+        if admitted_timeout.is_zero() {
+            return Err(AdmittedAttemptError::Run(OpenCodeRunError::Timeout {
+                phase: "admitted request preflight",
+            }));
+        }
         admitted.verify(current_fence, runtime_generation)?;
         admitted.verify_request(request)?;
         let slot = admitted.consume_one_slot(request)?;
+        let deadline = Instant::now() + admitted_timeout.min(self.policy.overall_timeout);
         // Owner-state claim through the supervised server: attach to the
         // bound execution session and reconcile the committed unit before
         // any provider dispatch. Attachment failures precede dispatch and
         // cross unchanged; everything after the claim maps unreconciled
         // failures to unknown outcome (never a seal, never a redispatch).
-        let prepared = self.prepare_admitted_run(admitted, request).await?;
-        let prior = self
-            .reconcile_committed_message(&prepared.session.id, &prepared.message_id, request)
+        let prepared = timeout_at(deadline, self.prepare_admitted_run(admitted, request))
             .await
+            .map_err(|_| {
+                AdmittedAttemptError::Run(admitted_deadline_unknown(
+                    "bound-session preparation",
+                    "the committed execution unit had not yet been reconciled",
+                ))
+            })??;
+        let prior = timeout_at(
+            deadline,
+            self.reconcile_committed_message(&prepared.session.id, &prepared.message_id, request),
+        )
+            .await
+            .map_err(|_| {
+                AdmittedAttemptError::Run(OpenCodeRunError::UnknownOutcome {
+                    cause: "admitted timeout elapsed while reconciling the committed message"
+                        .to_owned(),
+                    reconciliation: "the route owner could not determine whether this admitted slot had a prior provider dispatch"
+                        .to_owned(),
+                })
+            })?
             .map_err(|error| AdmittedAttemptError::Run(map_admitted_post_claim_error(error)))?;
-        let deadline = Instant::now() + self.policy.overall_timeout;
         let (run, statuses) = match prior {
             CommittedPrior::Absent => self
                 .dispatch_admitted(&prepared, request, deadline)
                 .await
                 .map_err(AdmittedAttemptError::Run)?,
-            CommittedPrior::Complete { assistant_id } => self
-                .reconcile_success(
-                    &prepared.session.id,
-                    &prepared.message_id,
-                    Some(&assistant_id),
-                    &request.model,
-                    &request.output_schema,
-                    &prepared.baseline_diff,
+            CommittedPrior::Complete { assistant_id } => {
+                let reconciled = timeout_at(
+                    deadline,
+                    self.reconcile_success(
+                        &prepared.session.id,
+                        &prepared.message_id,
+                        Some(&assistant_id),
+                        &request.model,
+                        &request.output_schema,
+                        &prepared.baseline_diff,
+                    ),
                 )
                 .await
-                .map(|(projection, statuses)| {
-                    (
-                        self.success_result(request, &prepared, projection, Vec::new()),
-                        statuses,
-                    )
-                })
-                .map_err(|error| AdmittedAttemptError::Run(map_admitted_post_claim_error(error)))?,
-            CommittedPrior::Unresolved => self
-                .reconcile_success(
-                    &prepared.session.id,
-                    &prepared.message_id,
-                    None,
-                    &request.model,
-                    &request.output_schema,
-                    &prepared.baseline_diff,
+                .map_err(|_| {
+                    AdmittedAttemptError::Run(admitted_deadline_unknown(
+                        "completed-message reconciliation",
+                        "a previously committed assistant outcome could not be fully reconciled",
+                    ))
+                })?
+                .map_err(|error| {
+                    AdmittedAttemptError::Run(map_admitted_post_claim_error(error))
+                })?;
+                let (projection, statuses) = reconciled;
+                (
+                    self.success_result(request, &prepared, projection, Vec::new()),
+                    statuses,
+                )
+            }
+            CommittedPrior::Unresolved => {
+                let reconciled = timeout_at(
+                    deadline,
+                    self.reconcile_success(
+                        &prepared.session.id,
+                        &prepared.message_id,
+                        None,
+                        &request.model,
+                        &request.output_schema,
+                        &prepared.baseline_diff,
+                    ),
                 )
                 .await
-                .map(|(projection, statuses)| {
-                    (
-                        self.success_result(request, &prepared, projection, Vec::new()),
-                        statuses,
-                    )
-                })
-                .map_err(|error| AdmittedAttemptError::Run(map_admitted_post_claim_error(error)))?,
+                .map_err(|_| {
+                    AdmittedAttemptError::Run(admitted_deadline_unknown(
+                        "unresolved-message reconciliation",
+                        "the admitted slot already had unresolved provider work",
+                    ))
+                })?
+                .map_err(|error| {
+                    AdmittedAttemptError::Run(map_admitted_post_claim_error(error))
+                })?;
+                let (projection, statuses) = reconciled;
+                (
+                    self.success_result(request, &prepared, projection, Vec::new()),
+                    statuses,
+                )
+            }
         };
         seal_admitted_outcome(admitted, slot, &prepared.message_id, run, &statuses)
     }
@@ -1103,14 +1181,32 @@ impl OpenCodeClient {
         request: &ReadOnlyRunRequest,
         deadline: Instant,
     ) -> Result<(NoAuthorityRunResult, SessionStatusMap), OpenCodeRunError> {
-        let connection = self
-            .open_event_stream(None)
+        if Instant::now() >= deadline {
+            return Err(OpenCodeRunError::Timeout {
+                phase: "admitted pre-dispatch",
+            });
+        }
+        let connection = timeout_at(deadline, self.open_event_stream(None))
             .await
+            .map_err(|_| OpenCodeRunError::Timeout {
+                phase: "admitted pre-dispatch",
+            })?
             .map_err(map_admitted_post_claim_error)?;
-        if let Err(error) = self
-            .prompt_async(&prepared.session.id, &prepared.message_id, request)
-            .await
-        {
+        if Instant::now() >= deadline {
+            return Err(OpenCodeRunError::Timeout {
+                phase: "admitted pre-dispatch",
+            });
+        }
+        let prompt_result = timeout_at(
+            deadline,
+            self.prompt_async(&prepared.session.id, &prepared.message_id, request),
+        )
+        .await
+        .map_err(|_| OpenCodeRunError::Timeout {
+            phase: "admitted prompt dispatch",
+        })
+        .and_then(|result| result);
+        if let Err(error) = prompt_result {
             if dispatch_definitively_rejected(&error) {
                 return Err(error);
             }
@@ -1152,22 +1248,46 @@ impl OpenCodeClient {
         {
             Ok(collection) => collection,
             Err(failure) => {
-                if failure.may_reconcile_success
-                    && let Ok((projection, statuses)) = self
-                        .reconcile_success(
+                if failure.may_reconcile_success {
+                    match timeout_at(
+                        deadline,
+                        self.reconcile_success(
                             &prepared.session.id,
                             &prepared.message_id,
                             None,
                             &request.model,
                             &request.output_schema,
                             &prepared.baseline_diff,
-                        )
-                        .await
-                {
-                    return Ok((
-                        self.success_result(request, prepared, projection, failure.events),
-                        statuses,
-                    ));
+                        ),
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            let cause = failure.error.to_string();
+                            return self
+                                .fail_after_dispatch(
+                                    &prepared.session.id,
+                                    &prepared.message_id,
+                                    &prepared.baseline_diff,
+                                    admitted_deadline_unknown(
+                                        "post-dispatch message reconciliation",
+                                        &cause,
+                                    ),
+                                )
+                                .await
+                                .map_err(map_admitted_post_claim_error);
+                        }
+                        Ok(Ok((projection, statuses))) => {
+                            return Ok((
+                                self.success_result(request, prepared, projection, failure.events),
+                                statuses,
+                            ));
+                        }
+                        Ok(Err(error @ OpenCodeRunError::MalformedStructuredOutput(_))) => {
+                            return Err(error);
+                        }
+                        Ok(Err(_)) => {}
+                    }
                 }
                 return self
                     .fail_after_dispatch(
@@ -1181,17 +1301,26 @@ impl OpenCodeClient {
             }
         };
 
-        let (projection, statuses) = self
-            .reconcile_success(
+        let reconciled = timeout_at(
+            deadline,
+            self.reconcile_success(
                 &prepared.session.id,
                 &prepared.message_id,
                 Some(&collection.assistant_message_id),
                 &request.model,
                 &request.output_schema,
                 &prepared.baseline_diff,
-            )
+            ),
+        )
             .await
+            .map_err(|_| {
+                admitted_deadline_unknown(
+                    "terminal-message reconciliation",
+                    "a terminal assistant event was observed but its full owner result was not reconciled",
+                )
+            })?
             .map_err(map_admitted_post_claim_error)?;
+        let (projection, statuses) = reconciled;
         Ok((
             self.success_result(request, prepared, projection, collection.events),
             statuses,
@@ -1673,6 +1802,14 @@ impl OpenCodeClient {
             "observed_completed_at_ms".to_owned(),
             Value::from(projection.completed_at_ms),
         );
+        // Retain the exact assistant text used to produce `output`. The
+        // structured `Value` is a convenience projection; downstream
+        // candidate consumers may need the untouched provider bytes when
+        // validating a stricter, owner-neutral draft schema.
+        extra.insert(
+            OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY.to_owned(),
+            Value::String(projection.raw_output.clone()),
+        );
         NoAuthorityRunResult {
             status: RunStatus::Succeeded,
             candidate_only: true,
@@ -2103,6 +2240,16 @@ fn map_admitted_post_claim_error(error: OpenCodeRunError) -> OpenCodeRunError {
     }
 }
 
+/// A wall-budget expiry after an admitted slot may have had provider work is
+/// an unknown route outcome, never a no-call timeout. `cause` retains the
+/// exact owner boundary that failed to reconcile.
+fn admitted_deadline_unknown(phase: &str, cause: &str) -> OpenCodeRunError {
+    OpenCodeRunError::UnknownOutcome {
+        cause: cause.to_owned(),
+        reconciliation: format!("admitted wall deadline elapsed during {phase}"),
+    }
+}
+
 /// Order verdict for one SSE frame identity against the previous frame of
 /// the same connection.
 enum SseFrameOrder {
@@ -2411,6 +2558,7 @@ fn attest_aborted_messages(
 struct MessageProjection {
     observed_model: ModelSelection,
     output: Value,
+    raw_output: String,
     usage: Option<UsageTelemetry>,
     /// Observed assistant completion timestamp (`info/time/completed`, Unix
     /// milliseconds). Presence is already required for a success projection;
@@ -2505,8 +2653,6 @@ fn inspect_messages(
             "assistant message has no terminal stop attestation".to_owned(),
         ));
     }
-    let output = parse_text_json_output(parts, expected_output_schema)?;
-
     let tokens = info.get("tokens").and_then(Value::as_object);
     let usage = tokens.map(|tokens| UsageTelemetry {
         input_tokens: tokens.get("input").and_then(Value::as_u64),
@@ -2515,12 +2661,12 @@ fn inspect_messages(
         cost_usd: info.get("cost").and_then(Value::as_f64),
         extra: UnknownFields::new(),
     });
-    let usage = usage.filter(|usage| {
-        usage.input_tokens.is_some() && usage.output_tokens.is_some() && usage.cost_usd.is_some()
-    });
+    let (output, raw_output) =
+        parse_text_json_output(parts, expected_output_schema, &observed_model, usage.as_ref())?;
     Ok(MessageProjection {
         observed_model,
         output,
+        raw_output,
         usage,
         completed_at_ms,
     })
@@ -2529,24 +2675,35 @@ fn inspect_messages(
 fn parse_text_json_output(
     parts: &[Value],
     expected_output_schema: &Value,
-) -> Result<Value, OpenCodeRunError> {
+    observed_model: &ModelSelection,
+    usage: Option<&UsageTelemetry>,
+) -> Result<(Value, String), OpenCodeRunError> {
     let text = parts
         .iter()
         .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect::<String>();
-    if text.trim().is_empty() {
-        return Err(OpenCodeRunError::Protocol(
-            "assistant message contains no text JSON output".to_owned(),
-        ));
+    let raw_output = text;
+    let malformed = |reason: String| {
+        OpenCodeRunError::MalformedStructuredOutput(Box::new(MalformedProviderOutput {
+            observed_model: observed_model.clone(),
+            raw_output: raw_output.clone(),
+            usage: usage.cloned(),
+            reason: reason.chars().take(MAX_MALFORMED_OUTPUT_REASON_CHARS).collect(),
+        }))
+    };
+    if raw_output.trim().is_empty() {
+        return Err(malformed("assistant message contains no text JSON output".to_owned()));
     }
-    let output = serde_json::from_str::<Value>(&text).map_err(|error| {
-        OpenCodeRunError::Protocol(format!(
-            "assistant text is not one strict JSON value: {error}"
-        ))
-    })?;
-    attest_top_level_output_schema(&output, expected_output_schema)?;
-    Ok(output)
+    let output = serde_json::from_str::<Value>(&raw_output)
+        .map_err(|error| {
+            malformed(format!(
+                "assistant text is not one strict JSON value: {error}"
+            ))
+        })?;
+    attest_top_level_output_schema(&output, expected_output_schema)
+        .map_err(|error| malformed(error.to_string()))?;
+    Ok((output, raw_output))
 }
 
 fn required_string(value: Option<&Value>, field: &str) -> Result<String, OpenCodeRunError> {

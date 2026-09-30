@@ -117,8 +117,9 @@ pub use job::{
 };
 pub use model_route::{
     CostUsageReceipt, MAX_ALLOWED_ROUTES, MAX_NOTE_CHARS, MAX_ROUTE_CHARS,
-    MODEL_ROUTE_SCHEMA_VERSION, ModelRouteDisposition, ModelRouteOutcome, ModelRoutePrivacy,
-    ModelRouteRequest, bundle_digest_of,
+    MODEL_ROUTE_SCHEMA_VERSION, ModelRouteDisposition, ModelRouteExecutionIdentity,
+    ModelRouteOutcome, ModelRoutePrivacy, ModelRouteProviderUsage, ModelRouteRequest,
+    ModelRouteUsageState, bundle_digest_of,
 };
 pub use probe::{
     AffordanceKind, AffordanceTarget, AuthorityDimension, BranchEvidenceAcceptance,

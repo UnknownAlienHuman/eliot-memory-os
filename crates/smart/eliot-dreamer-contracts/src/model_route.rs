@@ -328,6 +328,11 @@ pub struct ModelRouteExecutionIdentity {
     pub model_id: String,
     /// Exact provider harness/profile identity.
     pub harness_id: String,
+    /// Grounding-owner identity projected from the physically observed route.
+    /// Its revision is the original full execution-configuration fingerprint.
+    /// Older outcomes and unobserved routes carry no such evidence.
+    #[serde(default)]
+    pub grounding_route: Option<crate::grounding::RouteIdentity>,
 }
 
 impl ModelRouteExecutionIdentity {
@@ -337,6 +342,19 @@ impl ModelRouteExecutionIdentity {
         check_text(&self.provider_id, "execution.provider_id", MAX_ROUTE_CHARS)?;
         check_text(&self.model_id, "execution.model_id", MAX_ROUTE_CHARS)?;
         check_text(&self.harness_id, "execution.harness_id", MAX_PROVIDER_USAGE_TEXT_CHARS)?;
+        if let Some(route) = &self.grounding_route {
+            check_text(&route.route_revision, "execution.route_revision", MAX_ROUTE_CHARS)?;
+            if route.provider != self.provider_id
+                || route.model != self.model_id
+                || crate::grounding::route_fingerprint(route)? != route.fingerprint
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "execution.grounding_route",
+                    reason: "grounding route differs from observed provider/model or recorded fingerprint"
+                        .to_string(),
+                });
+            }
+        }
         Ok(())
     }
 }

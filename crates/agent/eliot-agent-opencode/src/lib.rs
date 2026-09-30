@@ -17,8 +17,8 @@ pub use bridge_contract::{
 };
 pub use catalogue::*;
 pub use client::{
-    AdmittedAttemptOutcome, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy,
-    classify_sealed_candidate, redact_route_diagnostics,
+    AdmittedAttemptOutcome, AdmittedOutcomeProjectionError, OpenCodeClient, OpenCodeRunError,
+    OpenCodeRunPolicy, classify_sealed_candidate, redact_route_diagnostics,
 };
 pub use endpoint::{LoopbackEndpoint, LoopbackEndpointError};
 pub use gate::{
