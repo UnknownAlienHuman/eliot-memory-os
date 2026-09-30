@@ -598,7 +598,7 @@ impl CanaryRemovalPlan {
             });
         }
         let mut identities = BTreeSet::new();
-        let mut registry_records = 0u32;
+        let mut categories = BTreeSet::new();
         for effect in &self.effects {
             effect.validate()?;
             if !identities.insert(effect.effect_id.as_str()) {
@@ -627,9 +627,9 @@ impl CanaryRemovalPlan {
                 return Err(InstallationError::IdentityConflict);
             }
         }
-        if registry_records != 1 {
+        if !categories.contains(&CanaryRemovalResource::GenerationRegistryRecord) {
             return Err(InstallationError::IncompleteObservation(
-                "the terminal registry record must appear exactly once inside the removal denominator".to_owned(),
+                "the terminal registry record must stay inside the removal denominator".to_owned(),
             ));
         }
         if self.computed_digest()? != self.plan_digest {
@@ -1252,7 +1252,6 @@ where
     // is safely served elsewhere, so the target is refused at the plan
     // boundary before any destructive path exists.
     let retirement_barrier = observed_retirement_barrier(
-    let retirement_barrier = observed_retirement_barrier(
         &projection,
         generation,
         &install.installation_epoch.installation,
@@ -1655,7 +1654,6 @@ fn observe_admission_fence(
         ));
     };
     let observed = observed_retirement_barrier(
-    let observed = observed_retirement_barrier(
         projection,
         &plan.generation,
         &plan.installation_epoch.installation,
@@ -1777,7 +1775,6 @@ fn pending_external_change_count(
 /// means the registry records no settled safe serving handoff — a staged but
 /// uncommitted activation, an abort, a foreign handoff, or no handoff at
 /// all — and every caller refuses it rather than defaulting it.
-fn observed_retirement_barrier(
 fn observed_retirement_barrier(
     projection: &ApprovedGenerationRegistry,
     generation: &PlatformHandle,
