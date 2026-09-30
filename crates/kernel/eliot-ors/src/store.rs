@@ -26093,7 +26093,11 @@ impl RedbRecoveryStore {
         // like every other base table, so a load on a store that never committed
         // a replacement cutover reads authoritatively empty instead of failing
         // on a missing table. No row is ever backfilled or inferred here.
-        drop(write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?);
+        drop(
+            write
+                .open_table(STORAGE_REPLACEMENT_RECEIPTS)
+                .map_err(storage)?,
+        );
         drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
         drop(
             write
@@ -29567,7 +29571,9 @@ impl RedbRecoveryStore {
         {
             let cutover = Self::committed_cutover_for_receipt(&write, &record.cutover_id)?;
             Self::require_receipt_binds_committed_cutover(&record, &cutover)?;
-            let current = write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+            let current = write
+                .open_table(STORAGE_REPLACEMENT_RECEIPTS)
+                .map_err(storage)?;
             if let Some(existing) = current.get(record.cutover_id.as_str()).map_err(storage)? {
                 let staged: StorageReplacementCutoverReceiptRecord =
                     decode_named(existing.value(), "storage_replacement_cutover_receipt")?;
@@ -29578,7 +29584,9 @@ impl RedbRecoveryStore {
             }
         }
         {
-            let mut current = write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+            let mut current = write
+                .open_table(STORAGE_REPLACEMENT_RECEIPTS)
+                .map_err(storage)?;
             current
                 .insert(record.cutover_id.as_str(), encode(&record)?.as_str())
                 .map_err(storage)?;
@@ -29613,7 +29621,9 @@ impl RedbRecoveryStore {
             });
         };
         let staged: StorageReplacementCutoverReceiptRecord = {
-            let current = write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+            let current = write
+                .open_table(STORAGE_REPLACEMENT_RECEIPTS)
+                .map_err(storage)?;
             let Some(existing) = current.get(cutover_id).map_err(storage)? else {
                 return Err(OrsError::ReservationNotFound);
             };
@@ -29640,7 +29650,9 @@ impl RedbRecoveryStore {
             });
         }
         {
-            let mut current = write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+            let mut current = write
+                .open_table(STORAGE_REPLACEMENT_RECEIPTS)
+                .map_err(storage)?;
             current
                 .insert(cutover_id, encode(&committed)?.as_str())
                 .map_err(storage)?;
@@ -29661,7 +29673,9 @@ impl RedbRecoveryStore {
         cutover_id: &str,
     ) -> Result<Option<StorageReplacementCutoverReceiptRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
-        let current = read.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+        let current = read
+            .open_table(STORAGE_REPLACEMENT_RECEIPTS)
+            .map_err(storage)?;
         let Some(existing) = current.get(cutover_id).map_err(storage)? else {
             return Ok(None);
         };

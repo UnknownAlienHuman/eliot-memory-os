@@ -1038,7 +1038,10 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
         // `RowFamilyKind`: the row is cutover-ownership state, and a restored
         // installation must not read a prior installation's committed-cutover
         // proof back as its own any more than it may re-own the route.
-        family(super::STORAGE_REPLACEMENT_RECEIPTS, RowFamilyKind::CutoverOwnership),
+        family(
+            super::STORAGE_REPLACEMENT_RECEIPTS,
+            RowFamilyKind::CutoverOwnership,
+        ),
         family(super::HOST_REQUESTS, RowFamilyKind::HostRequests),
         family(
             super::VERSIONED_ARTIFACTS,

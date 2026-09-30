@@ -301,8 +301,7 @@ pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
 /// the outcome unestablished — a cutover whose proof exists only in one process's
 /// memory is an effect nobody can reconcile — so it is reported as its own class
 /// instead of collapsing into "the cutover failed" or into a success.
-const STORAGE_REPLACEMENT_RECEIPT_UNESTABLISHED: &str =
-    "REPLACEMENT_RECEIPT_UNESTABLISHED";
+const STORAGE_REPLACEMENT_RECEIPT_UNESTABLISHED: &str = "REPLACEMENT_RECEIPT_UNESTABLISHED";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",

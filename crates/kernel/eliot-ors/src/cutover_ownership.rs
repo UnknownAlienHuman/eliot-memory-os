@@ -601,7 +601,10 @@ impl StorageReplacementTransferRecord {
     /// Validates the recorded format identity text and both bound digests.
     pub fn validate(&self) -> Result<(), OrsError> {
         validate_text(&self.format, "storage_replacement_receipt_transfer_format")?;
-        validate_digest(&self.payload_digest, "storage_replacement_receipt_payload_digest")?;
+        validate_digest(
+            &self.payload_digest,
+            "storage_replacement_receipt_payload_digest",
+        )?;
         validate_digest(
             &self.export_fence_digest,
             "storage_replacement_receipt_export_fence_digest",
@@ -673,7 +676,10 @@ impl StorageReplacementCutoverReceiptRecord {
     /// generations as the two distinct ones the cutover switched between.
     pub fn validate(&self) -> Result<(), OrsError> {
         validate_text(&self.cutover_id, "storage_replacement_receipt_cutover_id")?;
-        validate_text(&self.replacement_id, "storage_replacement_receipt_replacement_id")?;
+        validate_text(
+            &self.replacement_id,
+            "storage_replacement_receipt_replacement_id",
+        )?;
         if self.incumbent_generation == Some(self.candidate_generation) {
             return Err(OrsError::InvalidField {
                 field: "storage_replacement_receipt_store_generations",
