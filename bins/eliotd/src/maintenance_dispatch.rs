@@ -25,6 +25,46 @@
 //!   arm carries the admission owner's own `path::symbol` and the exact route
 //!   `eliotd` does not hold, read from the registered family entry rather than
 //!   restated here, so it cannot drift from the catalog it is rendered from.
+//!
+//! # Live status
+//!
+//! Two different things live in this module, and only one of them runs.
+//!
+//! The **owner dispatch** half — [`MaintenanceDispatch::for_decision`] and the
+//! [`decision_gap`] table — **is** live. `daemon_runtime.rs` reaches it through
+//! `maintenance_trigger_evaluator::DaemonComposition::evaluate_maintenance_trigger`,
+//! and `notification_state_emit.rs` builds the same dispatch value for its
+//! notification-policy check. Those are production call sites.
+//!
+//! The **#1694 W2–W7 maintenance-trigger route** below is not. Every leg of it
+//! currently has **zero production call sites**: intake
+//! ([`admit_maintenance_trigger_intake`]), claim
+//! ([`claim_maintenance_trigger_for_daemon`]), timeout redelivery
+//! ([`redeliver_maintenance_trigger_after_timeout`]), decision commit
+//! ([`record_committed_maintenance_decision`]), crash recovery
+//! ([`recover_maintenance_trigger_handoff`]), acknowledgement
+//! ([`acknowledge_recovered_maintenance_commit`]), ambiguous-commit marking
+//! ([`mark_maintenance_trigger_commit_ambiguous_after_loss`]), ledger restore
+//! ([`restore_maintenance_trigger_ledger_at_startup`]), consumer revocation
+//! ([`revoke_lost_daemon_consumer_for_replacement`]), replacement pending-set
+//! surfacing ([`surface_replacement_pending_set`]), replacement startup
+//! ([`recover_replacement_generation`]), protected-route selection
+//! ([`select_protected_route_deliveries`]), terminal expiry
+//! ([`expire_inapplicable_maintenance_trigger`]), supersession
+//! ([`supersede_maintenance_trigger_with_successor`]), and damage recording
+//! ([`record_maintenance_trigger_damage`]). [`collect_pending_maintenance_triggers`]
+//! is uncalled outright. Three of those legs are additionally *transitively*
+//! dead: each has exactly one caller, and that caller is itself in this
+//! zero-caller set, so a name-level scan reports a caller where no live path
+//! exists.
+//!
+//! The route's own doc comments cross-reference one another, so a reader
+//! following them sees a complete, coherent maintenance sequence with no way in.
+//! Every entry below therefore states its own live status under a
+//! `# Live status` heading, and the cross-references say which further legs are
+//! also unwired. The functions are retained unchanged: removing a `pub` item
+//! from a public module, or wiring one of these legs to a caller, is an owner
+//! decision for the `eliotd` composition root, not a documentation one.
 
 #![forbid(unsafe_code)]
 
@@ -485,9 +525,8 @@ impl MaintenanceTriggerIntakeError {
 /// Admits one retained maintenance trigger through the existing ORS and
 /// Kernel owners before any acknowledgement (I14.22, issue #1694 W2).
 ///
-/// This is the production front-door intake route caller: it derives first,
-/// stages second, admits third, and acknowledges nothing itself. The producer
-/// cursor advances only on the returned
+/// It derives first, stages second, admits third, and acknowledges nothing
+/// itself. The producer cursor advances only on the returned
 /// [`MaintenanceTriggerIntakeReceipt`]; every error returns with the
 /// producer's retry identity and no acceptance.
 ///
@@ -513,6 +552,29 @@ impl MaintenanceTriggerIntakeError {
 /// staged bytes stay with the ORS inbox owner, and protected safety/recovery
 /// routing travels the existing owner-issued grant on both the staging
 /// request and the wire record.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door intake route
+/// caller" was false and has been removed.
+///
+/// It is the W2 entry leg of the #1694 W2–W7 route, and that route has no
+/// entry point: every other leg in it is also uncalled, so nothing in the
+/// daemon run loop can reach this intake and no trigger can arrive for the
+/// legs downstream of it to act on. The nearest real thing is the read-only
+/// maintenance evaluation the daemon run loop does drive,
+/// `maintenance_trigger_evaluator::DaemonComposition::evaluate_maintenance_trigger`,
+/// which resolves the family decision and never admits a trigger into the
+/// Kernel delivery ledger. Its owner bindings,
+/// [`TriggerIntakeOwnerBindings`], are likewise constructed nowhere in the
+/// repository.
+///
+/// Whether this entry is wired to that evaluation or retired is an owner
+/// decision, not a documentation one. It is retained unchanged because
+/// removing a `pub` entry from this public module is an API decision for the
+/// `eliotd` owner (#18), not a documentation fix.
 ///
 /// # Errors
 ///
@@ -1021,15 +1083,26 @@ fn page_walk_error(source: MaintenanceTriggerDeliveryError) -> MaintenanceTrigge
 /// Issues one finite fenced claim for the calling daemon generation (I14.22,
 /// issue #1694 W3).
 ///
-/// This is the production front-door claim caller: it binds the claim to the
-/// current compatible daemon generation/session, the retained trigger
-/// revision, and the delivery identity, then verifies the owner's answer
-/// before returning it. An exact retry returns the live claim from the
-/// owner; a concurrent claim under another identity is refused by the owner
-/// with `ClaimConflict`, never returned here; an old-generation response
-/// fails the fence check. Claim timeout permits owner-mediated redelivery
-/// under the same identity, never a new trigger ID or authority to repeat an
+/// It binds the claim to the current compatible daemon generation/session, the
+/// retained trigger revision, and the delivery identity, then verifies the
+/// owner's answer before returning it. An exact retry returns the live claim
+/// from the owner; a concurrent claim under another identity is refused by the
+/// owner with `ClaimConflict`, never returned here; an old-generation response
+/// fails the fence check. Claim timeout permits owner-mediated redelivery under
+/// the same identity, never a new trigger ID or authority to repeat an
 /// uncertain downstream effect.
+///
+/// # Live status
+///
+/// This entry has NO production caller. It is *transitively* dead rather than
+/// name-level dead, so a scan for call sites reports one: the single call is
+/// inside [`redeliver_maintenance_trigger_after_timeout`], which is itself
+/// uncalled. The earlier claim that this "is the production front-door claim
+/// caller" was therefore false and has been removed. See the module-level
+/// `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to a daemon claim loop or retired is an owner
+/// decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1152,6 +1225,15 @@ pub struct PendingTriggerWalk {
 /// owner has more: the partial accumulation returns with the resume cursor
 /// for the next walk rather than growing without bound.
 ///
+/// # Live status
+///
+/// This entry currently has NO caller anywhere: not in production and not in
+/// this file. It is the W3 enumeration leg the daemon run loop would need to
+/// see pending maintenance debt, and the daemon does not walk that set. The
+/// mirror-gated variant [`surface_replacement_pending_set`] is likewise
+/// uncalled. This doc block made no production claim of its own; the status is
+/// recorded here so the module's enumeration legs are not read as live.
+///
 /// # Errors
 ///
 /// Returns [`MaintenanceTriggerClaimError::Page`] for a Kernel owner page
@@ -1199,8 +1281,7 @@ pub fn collect_pending_maintenance_triggers(
 /// Reclaims one timed-out claim through owner-mediated redelivery (I14.22,
 /// issue #1694 W3).
 ///
-/// This is the production front-door timeout-redelivery caller: it releases
-/// the timed-out claim through
+/// It releases the timed-out claim through
 /// [`KernelStoreGateway::release_expired_maintenance_trigger_claim`] — a
 /// `Claimed` row returns to `Pending`, a `DecisionRecorded` row moves to
 /// `Reconciling` with its committed receipt preserved — then routes on the
@@ -1210,7 +1291,8 @@ pub fn collect_pending_maintenance_triggers(
 /// must acknowledge that exact receipt without another job, recommendation,
 /// or wake — never repeat the uncertain downstream effect — by claiming
 /// first through [`claim_maintenance_trigger_for_daemon`] and completing
-/// through [`acknowledge_recovered_maintenance_commit`]. A row with no
+/// through [`acknowledge_recovered_maintenance_commit`]. Both of those are
+/// also uncalled; see the module-level `# Live status`. A row with no
 /// committed receipt re-issues one fresh finite claim through
 /// [`claim_maintenance_trigger_for_daemon`] under the same identity and
 /// revision, so an exact retry reuses the live claim and a concurrent claim
@@ -1223,6 +1305,18 @@ pub fn collect_pending_maintenance_triggers(
 /// `Expired`, `Superseded`) carry no releasable claim, so the owner refuses
 /// the release and they reconcile through the stored outcome instead of a
 /// fresh claim.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door timeout-redelivery
+/// caller" was false and has been removed. Nothing in the daemon polls for a
+/// timed-out maintenance claim, so no claim is ever reclaimed on a live path.
+/// See the module-level `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to a daemon poll loop or retired is an owner
+/// decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1453,14 +1547,13 @@ fn commit_unproven_error(
 /// Records one committed maintenance decision before any delivery
 /// acknowledgement (I14.22, issue #1694 W4).
 ///
-/// This is the production front-door decision-commit route: the follow-up
-/// daemon-to-Kernel leg after
+/// It is the intended follow-up daemon-to-Kernel leg after
 /// `maintenance_trigger_evaluator::DaemonComposition::commit_maintenance_trigger_decision`
 /// resolves the current #1692 policy, reuses the #1688 evaluator, and retains
 /// the durable downstream intent through its existing outbox owner
 /// (Governor `PreparedTransition` -> Kernel -> named Store transaction, I1.8).
-/// That leg proves the canonical Store receipt in hand; this route binds that
-/// exact receipt into the Kernel delivery ledger, which alone may later be
+/// That leg proves the canonical Store receipt in hand; this route would bind
+/// that exact receipt into the Kernel delivery ledger, which alone may later be
 /// acknowledged. A decision plus a durable downstream intent is distinct from
 /// an executed job or a delivered notification: this route admits no job,
 /// starts nothing, and delivers nothing — it records the commitment the
@@ -1477,6 +1570,24 @@ fn commit_unproven_error(
 /// must carry this exact receipt at `DecisionRecorded`. An identical receipt
 /// replays idempotently through the owner, while a different receipt under a
 /// recorded row conflicts there.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door decision-commit
+/// route" was false and has been removed.
+///
+/// The preceding leg this doc points at,
+/// `maintenance_trigger_evaluator::DaemonComposition::commit_maintenance_trigger_decision`,
+/// is *also* uncalled, so the follow-up relationship this block described was
+/// aspirational on both sides: the daemon run loop reaches
+/// `evaluate_maintenance_trigger` (which does run) and then stops. The nearest
+/// real thing is that read-only evaluation. See the module-level
+/// `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to that evaluation or retired is an owner
+/// decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1657,8 +1768,7 @@ pub enum MaintenanceTriggerRecoveryOutcome {
 /// Routes one interrupted trigger to its crash-recovery handoff (I14.22,
 /// issue #1694 W5).
 ///
-/// This is the production front-door recovery router: it reads the owner's
-/// committed state first through
+/// It reads the owner's committed state first through
 /// [`KernelStoreGateway::recover_maintenance_trigger_commit`], and only when
 /// no committed receipt answers does it fall back to
 /// [`KernelStoreGateway::replay_maintenance_trigger_after_crash`]. A committed
@@ -1669,12 +1779,28 @@ pub enum MaintenanceTriggerRecoveryOutcome {
 ///
 /// A lost or ambiguous commit response is not routed here: it stays
 /// pending/reconciling through
-/// [`mark_maintenance_trigger_commit_ambiguous_after_loss`], and receipt
-/// absence during an outage is never reported as proof of non-commit.
+/// [`mark_maintenance_trigger_commit_ambiguous_after_loss`] — which is itself
+/// uncalled — and receipt absence during an outage is never reported as proof
+/// of non-commit.
 /// Materially new policy or source evidence never overwrites the old result:
 /// it arrives as an explicitly linked new trigger through
 /// [`admit_maintenance_trigger_intake`] and links via
-/// [`supersede_maintenance_trigger_with_successor`].
+/// [`supersede_maintenance_trigger_with_successor`]. Both of those are
+/// uncalled too, so the "new trigger arrives, then links" sequence described
+/// here cannot currently happen; see the module-level `# Live status`.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door recovery router"
+/// was false and has been removed. The daemon run loop performs no
+/// crash-recovery read of a maintenance trigger after startup, so no trigger is
+/// ever routed to this handoff on a live path. See the module-level
+/// `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to a daemon startup recovery pass or retired is
+/// an owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1727,24 +1853,37 @@ pub fn recover_maintenance_trigger_handoff(
 /// Acknowledges one recovered commit with its exact decision receipt (I14.22,
 /// issue #1694 W5).
 ///
-/// This is the commit-before-ack completion caller: it echoes the live claim
-/// exactly (trigger, delivery identity, fence, session) and embeds the
-/// owner-looked-up receipt content byte for byte through
-/// [`KernelStoreGateway::acknowledge_maintenance_trigger`]. No job is
+/// It echoes the live claim exactly (trigger, delivery identity, fence,
+/// session) and embeds the owner-looked-up receipt content byte for byte
+/// through [`KernelStoreGateway::acknowledge_maintenance_trigger`]. No job is
 /// admitted, no recommendation is suggested, and no wake is scheduled here —
 /// the receipt already binds those durable intents.
 ///
 /// The claim must be live under the current generation: claim first through
-/// [`claim_maintenance_trigger_for_daemon`], and after a revocation reclaim
-/// under the replacement identity. A `DecisionRecorded`/`Reconciling` row
-/// whose live claim lapsed re-submits this same receipt through
-/// [`KernelStoreGateway::record_maintenance_trigger_decision`] first — the
+/// [`claim_maintenance_trigger_for_daemon`] — also uncalled — and after a
+/// revocation reclaim under the replacement identity. A
+/// `DecisionRecorded`/`Reconciling` row whose live claim lapsed re-submits this
+/// same receipt through [`KernelStoreGateway::record_maintenance_trigger_decision`]
+/// first — the
 /// owner reuses the identical receipt idempotently — so the live claim binds
 /// the committed row before this ack. Expired eligibility blocks the ack at
 /// the owner; record terminal expiry through
-/// [`expire_inapplicable_maintenance_trigger`] instead. An ack refusal on an
-/// already-settled row reconciles through the recorded outcome, never through
-/// a fresh claim.
+/// [`expire_inapplicable_maintenance_trigger`] instead, which is uncalled as
+/// well. An ack refusal on an already-settled row reconciles through the
+/// recorded outcome, never through a fresh claim.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. This doc block named itself "the commit-before-ack
+/// completion caller" while the whole commit-before-ack route around it is
+/// unwired, so the label described a role rather than a live edge. Nothing in
+/// the daemon acknowledges a maintenance trigger, so no maintenance delivery is
+/// ever completed on a live path. See the module-level `# Live status` for the
+/// whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to a daemon acknowledgement pass or retired is
+/// an owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1787,14 +1926,26 @@ pub fn acknowledge_recovered_maintenance_commit(
 /// Holds one lost or ambiguous commit response open for reconciliation
 /// (I14.22, issue #1694 W5).
 ///
-/// This is the production front-door ambiguous-commit caller for a commit
-/// whose response was lost: it marks the trigger reconciling through
+/// It marks the trigger reconciling through
 /// [`KernelStoreGateway::mark_maintenance_trigger_commit_ambiguous`], which
 /// keeps the row open and attaches a visible `AmbiguousCommit` gap record.
 /// The trigger must then be reconciled by receipt lookup through
-/// [`recover_maintenance_trigger_handoff`] before any further effect — it is
-/// never blindly re-executed and its external effects are never rerun on a
-/// guess.
+/// [`recover_maintenance_trigger_handoff`] — also uncalled — before any further
+/// effect; it is never blindly re-executed and its external effects are never
+/// rerun on a guess.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door ambiguous-commit
+/// caller" was false and has been removed. Nothing in the daemon observes a
+/// lost commit response, so no maintenance trigger is ever marked reconciling
+/// on a live path. See the module-level `# Live status` for the whole
+/// zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to a daemon commit-failure handler or retired is
+/// an owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1852,14 +2003,28 @@ pub enum MaintenanceTriggerStartupError {
 /// Restores the owned delivery ledger once at startup (I14.22, issue #1694
 /// W6).
 ///
-/// This is the production front-door restore caller: it hands the previously
-/// persisted durable rows to
+/// It hands the previously persisted durable rows to
 /// [`KernelStoreGateway::restore_maintenance_trigger_ledger`] before any
 /// claim is served. The rows source is the startup composition's read-back of
 /// the persisted rows through the Store-lane rows backend — this caller owns
 /// neither the read-back nor the persistence, only the handoff. The owner
 /// refuses when it already holds rows and revalidates every row, so a damaged
 /// row fails the restore instead of entering as a guessed-complete entry.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door restore caller"
+/// was false and has been removed. `daemon_runtime.rs` performs a real startup
+/// sequence and reaches the maintenance family catalog
+/// (`maintenance_family_catalog::record_registered_catalog`), but it never
+/// reads persisted maintenance delivery rows back and never hands them to the
+/// Kernel ledger, so no restore runs at daemon startup. See the module-level
+/// `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to the daemon startup sequence or retired is an
+/// owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1879,14 +2044,25 @@ pub fn restore_maintenance_trigger_ledger_at_startup(
 /// Revokes one lost daemon generation's trigger-consumer authority (I14.24,
 /// issue #1694 W6).
 ///
-/// This is the production front-door revocation caller: it revokes the old
-/// consumer fence/session through
+/// It revokes the old consumer fence/session through
 /// [`KernelStoreGateway::revoke_maintenance_trigger_consumer`], which is the
 /// existing Kernel owner. Pending claims are retained under the same identity
 /// and revision for the replacement generation; committed rows move to
 /// `Reconciling` with their receipts preserved; every later old-generation
 /// claim or ack fails. The revocation value itself names the lost fence and
 /// session observed by the startup composition.
+///
+/// # Live status
+///
+/// This entry has NO production caller. It is *transitively* dead rather than
+/// name-level dead, so a scan for call sites reports one: the single call is
+/// inside [`recover_replacement_generation`], which is itself uncalled. The
+/// earlier claim that this "is the production front-door revocation caller"
+/// was therefore false and has been removed. See the module-level
+/// `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to a daemon generation-replacement path or
+/// retired is an owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1914,9 +2090,8 @@ pub fn revoke_lost_daemon_consumer_for_replacement(
 /// Surfaces the bounded pending set to a replacement generation (I14.22,
 /// issue #1694 W6).
 ///
-/// This is the production front-door replacement-enumeration caller: it walks
-/// [`KernelStoreGateway::maintenance_trigger_replacement_pending_set`] in
-/// bounded pages with stable continuation, exactly like
+/// It walks [`KernelStoreGateway::maintenance_trigger_replacement_pending_set`]
+/// in bounded pages with stable continuation, exactly like
 /// [`collect_pending_maintenance_triggers`] but through the mirror-gated
 /// owner entry. Replacement authentication plus the required mirror recovery
 /// must already be complete — `mirror_recovered == false` is refused by the
@@ -1930,6 +2105,18 @@ pub fn revoke_lost_daemon_consumer_for_replacement(
 /// registered Host/Kernel/Watchdog/Doctor route through the owner-issued
 /// grant they already carry, and duplicated delivery authorizes no duplicated
 /// containment.
+///
+/// # Live status
+///
+/// This entry has NO production caller. It is *transitively* dead rather than
+/// name-level dead, so a scan for call sites reports one: the single call is
+/// inside [`recover_replacement_generation`], which is itself uncalled. The
+/// earlier claim that this "is the production front-door replacement-enumeration
+/// caller" was therefore false and has been removed. See the module-level
+/// `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to a daemon generation-replacement path or
+/// retired is an owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -1983,13 +2170,28 @@ pub fn surface_replacement_pending_set(
 /// Recovers one replacement daemon generation in revoke-then-surface order
 /// (I14.24, issue #1694 W6).
 ///
-/// This is the production front-door replacement-startup wiring: it revokes
-/// the lost generation's consumer authority first, then surfaces the bounded
-/// pending set, matching the I14.24 `eliotd`-crash row ("Kernel revokes
-/// daemon epoch … compatible daemon generation; rebuild hot mirrors").
+/// It revokes the lost generation's consumer authority first, then surfaces
+/// the bounded pending set, matching the I14.24 `eliotd`-crash row ("Kernel
+/// revokes daemon epoch … compatible daemon generation; rebuild hot mirrors").
 /// Revocation before surfacing is load-bearing — the replacement reclaims the
 /// same trigger identities only after the old consumer can no longer answer.
 /// Ordinary pending debt keeps no runtime alive here.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door replacement-startup
+/// wiring" was false and has been removed. It is the W6 composition leg: it is
+/// the only caller of [`revoke_lost_daemon_consumer_for_replacement`] and
+/// [`surface_replacement_pending_set`], so those two are transitively dead with
+/// it, and its own absence is what leaves the replacement-startup route with no
+/// entry. `daemon_runtime.rs` does perform a real startup sequence, but it
+/// never revokes a lost generation's maintenance consumer authority. See the
+/// module-level `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to the daemon startup sequence or retired is an
+/// owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -2097,9 +2299,8 @@ fn protected_route_classification_error(
 /// Selects the protected-routing deliveries visible to their registered route
 /// while the evaluator is down (I14.24, issue #1694 W6).
 ///
-/// This is the production front-door protected-visibility selector: it runs
-/// over retained records the replacement already surfaced and replayed, and
-/// assigns each safety/recovery trigger to the registered
+/// It runs over retained records a caller supplies, and assigns each
+/// safety/recovery trigger to the registered
 /// Host/Kernel/Watchdog/Doctor route its owner-issued grant opens. The grant
 /// must validate at `now_unix_ms` and bind this exact trigger identity and
 /// operation hash — classification is owner-issued, never caller-asserted,
@@ -2116,6 +2317,22 @@ fn protected_route_classification_error(
 /// containment; containment still requires the evaluator plus the fenced
 /// claim/commit/ack path. The walk is bounded by its input slice, holds no
 /// lease, keeps no runtime alive, and blocks no unrelated safe work.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door
+/// protected-visibility selector" was false and has been removed. The records
+/// it would read are the ones [`recover_replacement_generation`] and
+/// [`collect_pending_maintenance_triggers`] would surface, and both are
+/// uncalled, so the input slice this selector walks is never produced on a
+/// live path. The owner-issued `MaintenanceTriggerRouteGrant` classification it
+/// verifies does exist and is carried on the wire record; what does not exist
+/// is the daemon-side reader. See the module-level `# Live status`.
+///
+/// Whether this entry is wired to the daemon replacement path or retired is an
+/// owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -2248,8 +2465,7 @@ impl MaintenanceTriggerRetentionError {
 /// Records terminal expiry for one past-window trigger (I14.22, issue #1694
 /// W7).
 ///
-/// This is the production front-door expiry caller: it records the terminal
-/// `Expired` disposition through
+/// It records the terminal `Expired` disposition through
 /// [`KernelStoreGateway::expire_maintenance_trigger`]. Expired eligibility
 /// blocks stale execution — claims and acks against the row fail at the owner
 /// afterwards — but the row, its record, and its evidence locators are
@@ -2257,6 +2473,19 @@ impl MaintenanceTriggerRetentionError {
 /// this only when `now_unix_ms` is past the record's
 /// `applicable_until_unix_ms`: the owner refuses a still-applicable trigger,
 /// and an unknown identity stays unknown.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door expiry caller"
+/// was false and has been removed. The daemon run loop runs a maintenance
+/// cadence but never expires a past-window maintenance trigger, so an
+/// over-applicability window is not enforced by any live caller. See the
+/// module-level `# Live status` for the whole zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to the daemon maintenance cadence or retired is
+/// an owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -2281,15 +2510,31 @@ pub fn expire_inapplicable_maintenance_trigger(
 /// Records supersession by one explicitly linked successor trigger (I14.22,
 /// issue #1694 W7).
 ///
-/// This is the production front-door supersession caller: it links the
-/// successor through
+/// It links the successor through
 /// [`KernelStoreGateway::supersede_maintenance_trigger`]. The old result is
 /// never overwritten — the successor is named on the terminal disposition and
 /// both rows stay readable with their records and receipts. The successor
-/// must already be admitted through [`admit_maintenance_trigger_intake`];
-/// materially new policy or source evidence therefore arrives as a new
-/// trigger first and links here, instead of rerunning the old row's external
-/// effects blindly.
+/// must already be admitted through [`admit_maintenance_trigger_intake`],
+/// which is itself uncalled, so no successor can currently be admitted and this
+/// link cannot currently be formed; see the module-level `# Live status`.
+/// Materially new policy or source evidence would therefore have to arrive as a
+/// new admitted trigger first and link here, instead of rerunning the old row's
+/// external effects blindly.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door supersession
+/// caller" was false and has been removed. The precondition this block relied
+/// on is itself unwired, which is the sharper half of the problem: a reader
+/// following "the successor must already be admitted through
+/// [`admit_maintenance_trigger_intake`]" would arrive at an entry with no
+/// caller either. See the module-level `# Live status` for the whole
+/// zero-caller W2–W7 route.
+///
+/// Whether this entry is wired to a daemon supersession pass or retired is an
+/// owner decision, not a documentation one.
 ///
 /// # Errors
 ///
@@ -2321,19 +2566,35 @@ pub fn supersede_maintenance_trigger_with_successor(
 /// Records a visible recovery/gap record for unrepairable damage (I14.22/I5.2,
 /// issue #1694 W7).
 ///
-/// This is the production front-door damage caller: it records the gap
-/// through [`KernelStoreGateway::record_maintenance_trigger_gap`]. Missing
-/// keys, corrupt payloads, and inaccessible sources produce this record —
+/// It records the gap through [`KernelStoreGateway::record_maintenance_trigger_gap`].
+/// Missing keys, corrupt payloads, and inaccessible sources produce this record —
 /// never a plaintext fallback, never a bare `no_action`, and never silent
 /// deletion, per the I5.2 opaque-payload rules. Only those three kinds travel
-/// this caller: `AmbiguousCommit` belongs to the W5 ambiguous-commit
-/// transition ([`mark_maintenance_trigger_commit_ambiguous_after_loss`]) and
-/// `IncompleteEnumeration` belongs to the page-owning transitions, and the
-/// owner refuses both here, so this caller refuses them before any write.
+/// this entry: `AmbiguousCommit` belongs to the W5 ambiguous-commit
+/// transition ([`mark_maintenance_trigger_commit_ambiguous_after_loss`], also
+/// uncalled) and `IncompleteEnumeration` belongs to the page-owning
+/// transitions, and the owner refuses both here, so this entry refuses them
+/// before any write.
 /// Compaction stays with the ledger owner and happens only after exact
 /// ack or terminal disposition plus required downstream retention — this
-/// caller compacts nothing and deletes nothing — and per-disposition counts
+/// entry compacts nothing and deletes nothing — and per-disposition counts
 /// stay on the existing role-filtered recovery surface.
+///
+/// # Live status
+///
+/// This entry currently has NO production caller; the body is reachable only
+/// by naming it. A source implementation is not evidence of a live edge, so
+/// the earlier claim that this "is the production front-door damage caller"
+/// was false and has been removed. Nothing in the daemon classifies a
+/// maintenance trigger as damaged, so no visible recovery/gap record is
+/// produced for one on a live path. The refusal behaviour described above
+/// (refusing `AmbiguousCommit` and `IncompleteEnumeration` before any write) is
+/// unaffected by the missing caller; it is simply never exercised by the
+/// daemon. See the module-level `# Live status` for the whole zero-caller
+/// W2–W7 route.
+///
+/// Whether this entry is wired to a daemon damage-detection pass or retired is
+/// an owner decision, not a documentation one.
 ///
 /// # Errors
 ///
