@@ -2193,11 +2193,12 @@ impl ApprovedRecipeCatalogue {
 
         // `validate` proved `current` names a held revision, so this lookup
         // cannot miss. It is still written as a checked lookup rather than an
-        // index so the pointer is never dereferenced on trust.
+        // index so the pointer is never dereferenced on trust. `current` stays a
+        // `&ContextRecipePolicy`: a policy is content, not a `Copy` value, and
+        // every use below either borrows it or clones it deliberately.
         let current = self
             .candidates
             .iter()
-            .copied()
             .find(|candidate| RecipePolicyIdentity::of(candidate) == self.current)
             .ok_or_else(|| RecipeResolutionRefusal::InvalidCatalogue {
                 reason: ContextError::IdentityConflict.to_string(),
@@ -2215,7 +2216,6 @@ impl ApprovedRecipeCatalogue {
         let mut unpointed: Vec<RecipePolicyIdentity> = self
             .candidates
             .iter()
-            .copied()
             .filter(|candidate| RecipePolicyIdentity::of(candidate) != self.current)
             .filter(|candidate| self.applicability_rejection(candidate).is_none())
             .map(RecipePolicyIdentity::of)
