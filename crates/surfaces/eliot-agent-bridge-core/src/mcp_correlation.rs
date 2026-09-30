@@ -177,6 +177,25 @@ pub struct CorrelationIdentityParts {
     /// Authority generation of the serving route the producer observed.
     pub auth_generation: Option<String>,
     /// Owner-validated operation binding, when a tool owner minted one.
+    ///
+    /// # Not supplied on the production emission path today
+    ///
+    /// The live emission producer passes `None` here, so on the production path
+    /// all three owner-issued values on the assembled identity are absent and
+    /// [`identity_commits_to_operation`] is never reached with a real binding.
+    /// The exact site that must change is
+    /// `bins/eliot-agent-bridge/src/mcp_correlation.rs:339` —
+    /// `observe_mcp_emission` builds its `CorrelationIdentityParts` with
+    /// `operation_binding: None`. That binary is owned by another lane, so this
+    /// crate does not and must not supply the binding itself.
+    ///
+    /// `None` here means ABSENT, never "matches". [`identity_commits_to_operation`]
+    /// compares each value as `Some(recorded) == Some(binding_value)`, so an
+    /// identity with no recorded operation matches no binding at all, and a
+    /// binding presented against it is refused by
+    /// `crate::mcp_bridge_join::reconcile_terminal_event` rather than accepted
+    /// as a match. No default binding and no default effect class is
+    /// substituted anywhere on this path.
     pub operation_binding: Option<OwnerValidatedOperationBinding>,
 }
 
@@ -187,12 +206,20 @@ impl CorrelationIdentity {
     /// fabricated default generation or profile. The digest is over the exact
     /// canonical segment sequence, so the same observed facts always produce
     /// the same join key and any changed fact produces a different one.
+    ///
+    /// An absent `operation_binding` yields three absent owner-issued values,
+    /// never a placeholder handle, a placeholder commitment, or a placeholder
+    /// effect class. The effect-class segment in particular is derived from the
+    /// owner's own type by a total expression (see
+    /// [`owner_effect_class_name`]), so it can never collapse to an empty
+    /// segment that would let two different owner effect classes share one
+    /// `identity_digest`.
     #[must_use]
     pub fn assemble(parts: &CorrelationIdentityParts) -> Self {
         let binding = parts.operation_binding.as_ref();
         let owner_operation_handle = binding.map(|bound| bound.operation_handle().to_owned());
         let owner_request_commitment = binding.map(|bound| bound.request_commitment().to_owned());
-        let effect_class = binding.map(|bound| bound.effect_class());
+        let effect_class = binding.map(OwnerValidatedOperationBinding::effect_class);
         let effect_segment = effect_class.map(owner_effect_class_name);
         // v2 adds the owner request-commitment segment (issue #2899 W1.2), so
         // the domain separator moves with it: a v1 digest and a v2 digest are
@@ -234,9 +261,15 @@ impl CorrelationIdentity {
 ///
 /// Compares the three owner-issued values by content, never by existence or by
 /// length: a binding that merely exists, or whose commitment is the same width,
-/// says nothing about which operation it commits to. An identity that recorded
-/// no owner operation matches no binding at all, so a binding cannot be adopted
-/// after the fact by an identity that never recorded one.
+/// says nothing about which operation it commits to.
+///
+/// An identity that recorded no owner operation matches NOTHING. Each comparison
+/// is `Some(recorded) == Some(binding_value)`, so an absent recorded value can
+/// never equal a present binding value: absence is not a wildcard, and a binding
+/// cannot be adopted after the fact by an identity that never recorded one. This
+/// is the whole answer to "what if the binding is absent" — it is a refusal, not
+/// a default, and it holds on the live production path today where the producer
+/// supplies no binding at all.
 #[must_use]
 pub fn identity_commits_to_operation(
     identity: &CorrelationIdentity,
@@ -429,6 +462,15 @@ impl EliotEmissionObservation {
     /// Takes the observed parts explicitly so this owner never depends on a
     /// producer's state machine. The coverage ceiling is always the honest
     /// stdio-boundary one: no producer can widen it by asserting more.
+    ///
+    /// The identity is frozen exactly as assembled, including an absence. On
+    /// the live production path the producer supplies no owner operation (see
+    /// [`CorrelationIdentityParts::operation_binding`]), so the frozen record
+    /// carries no owner handle, no owner request commitment, and no owner effect
+    /// class. That absence is the record's honest content and is never repaired
+    /// here: this constructor adds no default binding and no default effect
+    /// class, and a later join that is handed a binding finds an identity that
+    /// commits to no operation and refuses it.
     #[must_use]
     pub fn observe(
         identity: CorrelationIdentity,
@@ -883,16 +925,24 @@ impl OwnerValidatedOperationBinding {
 
 /// The effect class as the OWNER publishes it, for the identity digest.
 ///
-/// The segment is the owner's own wire representation rather than a name
-/// spelled here, so a bridge-side renaming can never make this record attest an
-/// effect class the owner does not publish. The owner type is a closed
-/// fieldless enum, so its serialization cannot fail; the fallback is an empty
-/// segment, which contributes nothing to the digest and names no class.
+/// The segment is derived from the owner's own type rather than spelled here,
+/// so a bridge-side renaming can never make this record attest an effect class
+/// the owner does not publish, and an owner-side rename moves the digest with
+/// the vocabulary instead of leaving it stale.
+///
+/// This is deliberately infallible. An earlier shape reached the name through
+/// `serde_json::to_string` and mapped a serialization failure to an EMPTY
+/// segment; that is a silent default, and on this record it is the worst
+/// available failure: an empty segment makes two invocations carrying DIFFERENT
+/// owner effect classes hash to the same `identity_digest`, so the join key
+/// stops committing to the class it exists to commit to. A closed fieldless enum
+/// cannot fail to format, and returning a plain `String` from a total expression
+/// makes the empty segment unrepresentable rather than merely unlikely — there
+/// is no `Err` arm left to default. `Option::unwrap_or_default` would have
+/// preserved that same silent collapse in fewer lines, which is why the
+/// fallible call is gone instead of being shortened.
 fn owner_effect_class_name(effect: EffectClass) -> String {
-    match serde_json::to_string(&effect) {
-        Ok(name) => name,
-        Err(_) => String::new(),
-    }
+    format!("{effect:?}")
 }
 
 /// Commits to the IDENTITY of the request the owner admitted, never its content.
