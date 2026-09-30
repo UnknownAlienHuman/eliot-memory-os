@@ -2381,10 +2381,7 @@ impl AgentFabric {
     ///
     /// Returns [`FabricError::Contract`] naming the exact unbound port, its
     /// reported state, and the requiring shape.
-    fn refuse_unbound_swarm_scope(
-        &self,
-        request: &StaffingPlanRequest,
-    ) -> Result<(), FabricError> {
+    fn refuse_unbound_swarm_scope(&self, request: &StaffingPlanRequest) -> Result<(), FabricError> {
         if request.lanes.len() == 1 && request.launch.max_fanout == 1 {
             return Ok(());
         }
