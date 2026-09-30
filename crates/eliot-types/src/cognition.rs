@@ -75,18 +75,20 @@ pub mod legacy_unvalidated_stu_projection {
     where
         D: Deserializer<'de>,
     {
-        let projection = LegacyStuProjectionOwned::deserialize(deserializer)?;
-        if projection.schema != SCHEMA
-            || projection.unit != UNIT
-            || projection.empirical
-            || projection.actual_tokens != ()
-            || projection.measured_fit != ()
-        {
+        let LegacyStuProjectionOwned {
+            schema,
+            unit,
+            value,
+            empirical,
+            actual_tokens: (),
+            measured_fit: (),
+        } = LegacyStuProjectionOwned::deserialize(deserializer)?;
+        if schema != SCHEMA || unit != UNIT || empirical {
             return Err(D::Error::custom(
                 "legacy estimate must be eliot.legacy-estimate/v1 unvalidated_stu with no observation or fit claim",
             ));
         }
-        Ok(projection.value)
+        Ok(value)
     }
 }
 
