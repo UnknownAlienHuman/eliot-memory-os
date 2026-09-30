@@ -1539,33 +1539,16 @@ fn restore_solo_fabric(
 }
 
 #[cfg(not(test))]
-/// STITCH(#1108-W4/A2-restore): the production restore side of the async
-/// seam ([`DaemonComposition::agent_fabric_restore_verified_async`]) is
-/// constructed and signature-ready, but no driver context can call it yet,
-/// so production restore stays fail-closed here instead of half-wired:
+/// Synchronous production restore stays fail-closed (issue #1108 A8).
 ///
-/// 1. Every restore caller in this module except [`solo_fair_pull_recovery`]
-///    is synchronous (`solo_request_cancel`, `solo_reconcile_cancel`,
-///    `solo_ingest_result`, `solo_restore`); awaiting the async restore
-///    from any of them would convert sync to async, which this stitch
-///    explicitly does not do.
-/// 2. A solo restore must rebind the persisted solo context (definition
-///    digest, fence, epoch, attempt, receipt lanes) through solo-context
-///    ports, and no non-test solo-context ports exist in this module:
-///    `solo_fabric_ports` and `SoloModelRegistryPort` are `cfg(test)`,
-///    while the production registry port is private to `lib.rs`. The async
-///    restore seam requires caller-supplied `ports` plus the driven
-///    `&SoloClaimedHalves`, so the ports to hand it are not assemblable
-///    from this module on a non-test build.
-/// 3. The remaining async restorer, [`solo_fair_pull_recovery`], therefore
-///    stays on the synchronous verified seam as well: restoring with the
-///    wrong (context-free) ports would silently drop the frozen-plan and
-///    fence bindings the seam exists to enforce.
-///
-/// Wiring the async restore belongs with the W1-ports lane that binds the
-/// non-test solo-context (or accepted production) ports; until then the
-/// stub below refuses typed and no production build resumes effecting
-/// operations from a snapshot.
+/// Every restore caller in this module except `solo_fair_pull_recovery` is
+/// synchronous (`solo_request_cancel`, `solo_reconcile_cancel`,
+/// `solo_ingest_result`, `solo_restore`); awaiting the async restore seam
+/// from any of them would convert sync to async, so the synchronous
+/// production path refuses typed here instead of half-wiring the seam, and
+/// no production build resumes effecting operations from a snapshot over
+/// this path. The async restore path is `restore_solo_fabric_async`,
+/// reached from the async fair-pull recovery poll.
 fn restore_solo_fabric(
     _composition: &DaemonComposition,
     _kernel: &Arc<DaemonKernelClient>,
@@ -1575,6 +1558,61 @@ fn restore_solo_fabric(
         "solo restore is blocked until Kernel retains an independently owner-verified executable-binding digest"
             .to_owned(),
     ))
+}
+
+/// Restores the solo fabric through the verified async seam (issue #1108
+/// A8/A9, production restore caller for the async path).
+///
+/// Production counterpart of the test-only synchronous `restore_solo_fabric`:
+/// builds the closed production ports through
+/// [`DaemonComposition::production_fabric_ports`], then restores through
+/// [`DaemonComposition::agent_fabric_restore_verified_async`] with the
+/// projection's own claimed halves as both the resolution input and the
+/// per-operation `claimed` argument. Session halves are re-resolved over the
+/// live authenticated session and the binding is verified through the Kernel
+/// provider-admission verifier inside the seam, so a stored snapshot or a
+/// stored `Verified` label alone restores nothing: missing, stale, or revoked
+/// evidence refuses typed before any state mutation, and production never
+/// silently resumes effecting operations (ARCH-RES-01). The seam restores
+/// over the daemon state-root store itself, so no manual revision-store
+/// attach is needed here.
+///
+/// Unknown-outcome reconcile mirrors the synchronous seam: an
+/// emitted-but-unresulted dispatch that the restored fabric still reports as
+/// dispatched reconciles to unknown instead of relaunching, blocking blind
+/// retry and route substitution until exact reconciliation.
+///
+/// The caller holds the composition guard across the seam await (see
+/// [`solo_fair_pull_recovery`]); this function takes `&DaemonComposition`
+/// like the construct path and performs no locking of its own.
+#[cfg(not(test))]
+async fn restore_solo_fabric_async(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    projection: &SoloPersistedAttempt,
+) -> Result<AgentFabric, DaemonError> {
+    let material = projection.claimed.material();
+    let ports = composition.production_fabric_ports()?;
+    let mut fabric = composition
+        .agent_fabric_restore_verified_async(
+            kernel,
+            projection.snapshot.clone(),
+            ports,
+            material,
+            &projection.claimed,
+        )
+        .await?;
+    // Reconcile the unknown: an emitted dispatch with no ingested result
+    // cannot relaunch and cannot release; its outcome stays unknown until
+    // the worker observation arrives through the ingest leg.
+    if projection.emitted && projection.result_digest.is_none() {
+        let attempt = AttemptId::new(projection.attempt_id.clone())
+            .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+        if fabric.attempt_of(&attempt) == Some(crate::agent_fabric::AttemptLifecycle::Dispatched) {
+            fabric.mark_unknown_outcome(&attempt)?;
+        }
+    }
+    Ok(fabric)
 }
 
 /// Re-persists the projection after a control operation.
@@ -1735,7 +1773,8 @@ pub enum FairPullRecovery {
 /// drives a previously admitted projection, never a fresh one.
 ///
 /// The Kernel handle is used only for the restore's live owner-evidence
-/// re-resolution that [`restore_solo_fabric`] already performs; this poll
+/// re-resolution that the restore seam already performs (the async verified
+/// seam on a production build, [`restore_solo_fabric`] under test); this poll
 /// performs no authenticated Kernel request of its own and adds none.
 ///
 /// # Errors
@@ -1770,7 +1809,10 @@ pub async fn solo_fair_pull_recovery(
     };
     let composition = composition.lock().await;
     let mut projection = load_projection(composition.state_root(), &operation_id)?;
+    #[cfg(test)]
     let mut fabric = restore_solo_fabric(&composition, kernel, &projection)?;
+    #[cfg(not(test))]
+    let mut fabric = restore_solo_fabric_async(&composition, kernel, &projection).await?;
     let profile = load_scheduling_profile(&composition)?;
     let outcome = fabric.drive_fair_pull(&profile, true)?;
     repersist_after_control(&composition, &fabric, &mut projection)?;
