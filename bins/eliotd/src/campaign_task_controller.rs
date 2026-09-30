@@ -18,9 +18,9 @@ use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
 };
 use eliot_protocol::{
-    dreamer_job::{JobOperation, JobRole}, TaskControllerAction,
-    TaskControllerCampaignOwnerMaterials, TaskControllerOrientationInput,
+    TaskControllerAction, TaskControllerCampaignOwnerMaterials, TaskControllerOrientationInput,
     TaskControllerResultBody,
+    dreamer_job::{JobOperation, JobRole},
 };
 use eliot_store_api::{
     CampaignSourceDocumentSchema, CampaignSourceHead, CampaignSourcePublication,
@@ -441,9 +441,11 @@ fn validate_orientation_task_binding(
     if submission.semantic_input_bytes.is_none() {
         return Err("semantic_input_unavailable");
     }
-    if input.materials.iter().any(|claim| {
-        claim.source_handle.as_str() == input.semantic_source.source_handle.as_str()
-    }) {
+    if input
+        .materials
+        .iter()
+        .any(|claim| claim.source_handle.as_str() == input.semantic_source.source_handle.as_str())
+    {
         return Err("semantic_source_not_distinct");
     }
     Ok(())

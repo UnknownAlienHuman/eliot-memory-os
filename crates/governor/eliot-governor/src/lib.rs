@@ -98,6 +98,10 @@ pub use negative_memory_read::{
     NegativeMemoryReadRefusal, ResolvedNegativeMemoryRuleSet, plan_negative_memory_rule_read,
     resolve_negative_memory_rule_read,
 };
+pub use orientation_projection_owner::{
+    OrientationProjectionMemberStates, OrientationProjectionOwnerInput,
+    OrientationProjectionOwnerOutput, bind_orientation_projections,
+};
 mod controlboard_projection;
 mod learning_admission;
 mod learning_closure;

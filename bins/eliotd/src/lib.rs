@@ -69,9 +69,13 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+/// Joins original context reconstruction, compilation and canonical projection owners.
+pub mod dreamer_orientation_context;
 pub mod dreamer_orientation_model;
 /// Executes the admitted CC-002 worker from retained semantic source bytes.
 pub mod dreamer_orientation_model_worker;
+/// Acquires original runtime publications through authenticated Task Controller claims.
+pub mod dreamer_orientation_runtime;
 /// Execution-path `OpenMetrics` wiring (issue #1841, I16.1/I16.2/I16.5): the
 /// bounded schema, labels, registry and exporter stay owned by
 /// `eliot-observability-runtime`; this module only installs that stack and maps

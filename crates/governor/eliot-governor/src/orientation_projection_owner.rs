@@ -879,13 +879,14 @@ fn continuity_projection(
         };
         return None;
     };
-    let continuity_note = match retained_active_decision_action(payload, input.binding, memory_revision) {
-        Ok(action) => action,
-        Err(state) => {
-            *disposition = state;
-            return None;
-        }
-    };
+    let continuity_note =
+        match retained_active_decision_action(payload, input.binding, memory_revision) {
+            Ok(action) => action,
+            Err(state) => {
+                *disposition = state;
+                return None;
+            }
+        };
     let projection = ContinuityProjection {
         schema_version: CANONICAL_PROJECTIONS_SCHEMA_VERSION,
         binding: input.binding.clone(),
@@ -947,12 +948,13 @@ fn retained_active_decision_action(
         .map_err(|_| ProjectionState::Unknown {
             reason: "latest task row has a malformed original receipt StateFence".to_owned(),
         })?;
-    let receipt_value = current
-        .get("write_receipt")
-        .cloned()
-        .ok_or_else(|| ProjectionState::Unknown {
-            reason: "latest task row omits its original committed WriteReceipt".to_owned(),
-        })?;
+    let receipt_value =
+        current
+            .get("write_receipt")
+            .cloned()
+            .ok_or_else(|| ProjectionState::Unknown {
+                reason: "latest task row omits its original committed WriteReceipt".to_owned(),
+            })?;
     let receipt: eliot_store_api::WriteReceipt =
         serde_json::from_value(receipt_value).map_err(|_| ProjectionState::Unknown {
             reason: "latest task row has a malformed original WriteReceipt".to_owned(),
@@ -960,22 +962,23 @@ fn retained_active_decision_action(
     receipt.validate().map_err(|_| ProjectionState::Unknown {
         reason: "latest task row's original WriteReceipt fails validation".to_owned(),
     })?;
-    let receipt_envelope = receipt
-        .require_reconciliation_envelope()
-        .map_err(|_| ProjectionState::Unknown {
-            reason: "latest task row's original WriteReceipt lacks its owner envelope".to_owned(),
-        })?;
+    let receipt_envelope =
+        receipt
+            .require_reconciliation_envelope()
+            .map_err(|_| ProjectionState::Unknown {
+                reason: "latest task row's original WriteReceipt lacks its owner envelope"
+                    .to_owned(),
+            })?;
     let read_scope_id = payload
         .get("scope_id")
         .and_then(Value::as_str)
         .ok_or_else(|| ProjectionState::Unknown {
             reason: "GetTaskState omitted the exact retained read scope".to_owned(),
         })?;
-    let event: eliot_task::TaskLifecycleEvent = serde_json::from_str(event_json).map_err(|_| {
-        ProjectionState::Unknown {
+    let event: eliot_task::TaskLifecycleEvent =
+        serde_json::from_str(event_json).map_err(|_| ProjectionState::Unknown {
             reason: "retained TaskController event does not decode as its original type".to_owned(),
-        }
-    })?;
+        })?;
     let Some(eliot_task::TaskCommand::SetActiveDecisionState { decision }) = &event.command else {
         return Err(ProjectionState::Missing);
     };

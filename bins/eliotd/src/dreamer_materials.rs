@@ -360,11 +360,9 @@ pub async fn resolve_source_claim(
     scope: &ScopeId,
     claim: &AdmittedSourceClaim,
 ) -> Result<Vec<u8>, DreamerMaterialsError> {
-    Ok(
-        resolve_source_claim_with_readback(reads, ctx, scope, claim)
-            .await?
-            .canonical_payload,
-    )
+    Ok(resolve_source_claim_with_readback(reads, ctx, scope, claim)
+        .await?
+        .canonical_payload)
 }
 
 /// Resolves and retains the original named-read result together with the exact verified bytes.
@@ -391,9 +389,15 @@ pub async fn resolve_source_claim_with_readback(
         return Err(DreamerMaterialsError::FenceMismatch);
     }
     if result.operation != NamedReadOperation::GetEvidencePack
-        || result.payload.get("subject").and_then(serde_json::Value::as_str)
+        || result
+            .payload
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
             != Some(claim.source_handle.as_str())
-        || result.payload.get("scope_id").and_then(serde_json::Value::as_str)
+        || result
+            .payload
+            .get("scope_id")
+            .and_then(serde_json::Value::as_str)
             != Some(scope.as_str())
     {
         return Err(DreamerMaterialsError::SelectorMismatch);
@@ -714,12 +718,11 @@ mod tests {
     async fn resolution_verifies_fence_and_digest_over_live_port()
     -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence()?;
-        let payload =
-            serde_json::json!({
-                "records": [{"capture_index": 0}],
-                "subject": "evidence-a",
-                "scope_id": "scope-one"
-            });
+        let payload = serde_json::json!({
+            "records": [{"capture_index": 0}],
+            "subject": "evidence-a",
+            "scope_id": "scope-one"
+        });
         let bytes = canonical_json_bytes(&payload)?;
         let claim = test_claim("evidence-a", &bytes);
         let scope = ScopeId::new("scope-one")?;

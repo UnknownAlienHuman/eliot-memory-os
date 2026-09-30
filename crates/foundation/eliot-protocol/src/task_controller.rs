@@ -10,8 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES, ProtocolError};
 use crate::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
+use crate::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES, ProtocolError};
 
 /// Stable wire identity for one admitted Task Controller invocation.
 pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str = "eliot.protocol.task-controller-invocation";
@@ -212,8 +212,7 @@ impl TaskControllerOrientationInput {
             .validate_local_read_submission()?;
         if runtime_input.semantic_source != self.semantic_source
             || runtime_input.output_contract != submission.output_contract
-            || runtime_input.context_reconstruction_result
-                != self.context_reconstruction_result
+            || runtime_input.context_reconstruction_result != self.context_reconstruction_result
             || runtime_input.output_schema_recipe != self.output_schema_recipe
             || runtime_input.schema_source != self.schema_source
             || runtime_input.materials != self.materials
@@ -296,10 +295,7 @@ impl TaskControllerOrientationInput {
             });
         }
         let budget = self.budget;
-        if budget.max_sources == 0
-            || budget.max_total_bytes == 0
-            || budget.max_source_bytes == 0
-        {
+        if budget.max_sources == 0 || budget.max_total_bytes == 0 || budget.max_source_bytes == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "task_controller_invocation.orientation.budget",
                 reason: "must carry nonzero owner-issued bounds",

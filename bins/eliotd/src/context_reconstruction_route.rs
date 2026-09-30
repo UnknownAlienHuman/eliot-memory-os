@@ -269,8 +269,11 @@ pub(crate) async fn reconstruct_context_owner_inputs<'a>(
     let context_recipe =
         read_authenticated_context_recipe(kernel, &envelope.state_fence, &scope, task_id, &recipe)
             .await?;
-    let dependency_revisions =
-        observed_scope_head(&recipe.response.revision_heads, &scope, &envelope.state_fence)?;
+    let dependency_revisions = observed_scope_head(
+        &recipe.response.revision_heads,
+        &scope,
+        &envelope.state_fence,
+    )?;
     let request = context_reconstruction_request(
         &scope,
         &dependency_revisions,
@@ -681,8 +684,8 @@ async fn read_authenticated_context_recipe(
         .map_err(|_| ReconstructionPrerequisite::ContextRecipeUnavailable)?;
     let expected_record = crate::campaign_context_owner::derive_context_recipe_record(&body)
         .map_err(|_| ReconstructionPrerequisite::ContextRecipeUnavailable)?;
-    let admitted_task =
-        TaskId::new(task_id.to_owned()).map_err(|_| ReconstructionPrerequisite::ContextRecipeUnavailable)?;
+    let admitted_task = TaskId::new(task_id.to_owned())
+        .map_err(|_| ReconstructionPrerequisite::ContextRecipeUnavailable)?;
     let context_binding = &body.recipe.binding;
     if expected_record != *source
         || context_binding.task_id != admitted_task

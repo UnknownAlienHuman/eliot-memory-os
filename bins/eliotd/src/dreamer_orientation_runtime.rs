@@ -13,8 +13,8 @@ use eliot_protocol::{
     TaskControllerOrientationInput, TaskControllerOrientationOutputSchemaRecipe,
     TaskControllerOrientationSourceClaim,
     dreamer_job::{
-        DurableJobRequest, DurableJobResponse, DurableJobRuntimeOwnerExecutionInput,
-        JobOperation, OpaqueContentRef,
+        DurableJobRequest, DurableJobResponse, DurableJobRuntimeOwnerExecutionInput, JobOperation,
+        OpaqueContentRef,
     },
 };
 
@@ -76,14 +76,12 @@ use serde_json::json;
 
 use crate::{
     DaemonComposition, DaemonKernelClient,
-    campaign_task_controller::{
-        PreparedTaskControllerOrientation, task_controller_result_body,
-    },
+    campaign_task_controller::{PreparedTaskControllerOrientation, task_controller_result_body},
     daemon_kernel_client::TaskControllerClaimedInvocation,
     dreamer_admission::{
-        KernelDreamerJobQueue, OrientationSemanticInputClaim,
-        OrientationSemanticInputError, OrientationSemanticInputPublication,
-        OrientationSubmitError, OrientationSubmitInput, submit_admitted_orientation_typed,
+        KernelDreamerJobQueue, OrientationSemanticInputClaim, OrientationSemanticInputError,
+        OrientationSemanticInputPublication, OrientationSubmitError, OrientationSubmitInput,
+        submit_admitted_orientation_typed,
     },
     dreamer_materials::{
         AdmittedSourceClaim, DreamerMaterialsError, OrientationMaterialBudget,
@@ -156,29 +154,28 @@ pub async fn submit_task_controller_orientation_claim(
         Err(DreamerMaterialsError::FenceMismatch) => {
             return Err(OrientationRuntimeError::Input("orientation_stale_fence"));
         }
-        _ => return Err(OrientationRuntimeError::Input("orientation_materials_invalid")),
+        _ => {
+            return Err(OrientationRuntimeError::Input(
+                "orientation_materials_invalid",
+            ));
+        }
     };
     if schema_source.validate().is_err() {
-        return Err(OrientationRuntimeError::Input("output_schema_source_invalid"));
+        return Err(OrientationRuntimeError::Input(
+            "output_schema_source_invalid",
+        ));
     }
 
     let reads = ReadService::new(KernelContextReadClient::new(Arc::clone(kernel)));
-    let schema_bytes = resolve_source_claim(
-        &reads,
-        &ctx,
-        &orientation.scope,
-        &schema_source,
-    )
-    .await
-    .map_err(OrientationRuntimeError::SchemaRead)?;
+    let schema_bytes = resolve_source_claim(&reads, &ctx, &orientation.scope, &schema_source)
+        .await
+        .map_err(OrientationRuntimeError::SchemaRead)?;
     let queue = KernelDreamerJobQueue::new(kernel.as_ref());
     let request = orientation.request.clone();
     let runtime_owner_execution_input = match &request.operation {
         JobOperation::Submit { submission } => submission
             .decode_runtime_owner_execution_input()
-            .map_err(|_| {
-                OrientationRuntimeError::Input("runtime_owner_execution_input_mismatch")
-            })?
+            .map_err(|_| OrientationRuntimeError::Input("runtime_owner_execution_input_mismatch"))?
             .ok_or(OrientationRuntimeError::Input(
                 "runtime_owner_execution_input_unavailable",
             ))?,
@@ -190,7 +187,11 @@ pub async fn submit_task_controller_orientation_claim(
     };
     let output_contract = match &request.operation {
         JobOperation::Submit { submission } => submission.output_contract.clone(),
-        _ => return Err(OrientationRuntimeError::Input("invalid_orientation_request")),
+        _ => {
+            return Err(OrientationRuntimeError::Input(
+                "invalid_orientation_request",
+            ));
+        }
     };
     let response = submit_admitted_orientation_typed(
         readiness,
@@ -344,12 +345,10 @@ fn orientation_refusal_code(error: &OrientationSubmitError) -> &'static str {
             | OrientationSemanticInputError::ResolvedBytesMismatch
             | OrientationSemanticInputError::SourceClaimMismatch,
         ) => "semantic_input_mismatch",
-        OrientationSubmitError::SemanticInput(
-            OrientationSemanticInputError::Resolution(_),
-        ) => "semantic_input_read_unavailable",
-        OrientationSubmitError::Composition(CompositionError::NotReady) => {
-            "governor_not_ready"
+        OrientationSubmitError::SemanticInput(OrientationSemanticInputError::Resolution(_)) => {
+            "semantic_input_read_unavailable"
         }
+        OrientationSubmitError::Composition(CompositionError::NotReady) => "governor_not_ready",
         OrientationSubmitError::Composition(_) => "orientation_admission_refused",
         OrientationSubmitError::SemanticInput(_) => "semantic_input_invalid",
     }

@@ -1477,13 +1477,8 @@ fn indexed_authorities<'a>(
         for record in authorities {
             let parameters = validate_authority_record(row, record)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
-            if let Some((
-                transition_class,
-                scope_id,
-                operation_id,
-                receipt_state_fence,
-                receipt,
-            )) = &in_scope_receipt
+            if let Some((transition_class, scope_id, operation_id, receipt_state_fence, receipt)) =
+                &in_scope_receipt
             {
                 let operation = infer_authority_operation(*transition_class, &parameters)?;
                 indexed.push(IndexedAuthority {

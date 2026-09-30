@@ -57,10 +57,8 @@ pub fn bind_dreamer_orientation_context<'owner, 'source>(
     original_route: Option<&'owner RouteFingerprint>,
     current_route_scope: Option<&'owner RouteScopeFingerprint>,
     capability_now: Option<u64>,
-) -> Result<
-    DreamerOrientationContextOwnerReadback<'owner, 'source>,
-    DreamerOrientationContextError,
-> {
+) -> Result<DreamerOrientationContextOwnerReadback<'owner, 'source>, DreamerOrientationContextError>
+{
     let binding = reconstruction.binding();
     if compilation.recipe != &reconstruction.context_recipe.body.recipe
         || compilation.request.binding != *binding

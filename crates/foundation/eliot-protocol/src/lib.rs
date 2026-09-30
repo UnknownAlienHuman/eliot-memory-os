@@ -87,9 +87,11 @@ pub use backup::{
 pub use dreamer_job::{
     AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,
     DURABLE_JOB_CONTRACT_VERSION, DurableJobError, DurableJobRecord, DurableJobRequest,
-    DurableJobResponse, DurableRequestIdentity, JobCapability, JobCheckpoint, JobLease,
-    JobOperation, JobOperationKind, JobOutcome, JobRole, JobState, JobSubmission, LeaseSelector,
-    MutationDisposition, MutationReconciliation, OpaqueContentRef, durable_job_contract_identity,
+    DurableJobResponse, DurableJobRuntimeOwnerExecutionInput, DurableRequestIdentity,
+    JobCapability, JobCheckpoint, JobLease, JobOperation, JobOperationKind, JobOutcome, JobRole,
+    JobState, JobSubmission, LeaseSelector, MutationDisposition, MutationReconciliation,
+    OpaqueContentRef, RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_NAME,
+    RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_VERSION, durable_job_contract_identity,
 };
 pub use reactive_restore::{
     MAX_RESTORE_LEDGER_BYTES, MAX_RESTORE_SNAPSHOT_BYTES, MAX_RESTORE_TEXT_BYTES, MAX_RESTORE_URIS,

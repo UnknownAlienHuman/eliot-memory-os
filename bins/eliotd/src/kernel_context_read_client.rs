@@ -1671,8 +1671,7 @@ impl KernelContextReadClient {
         quality: QualityScorecard,
         assembly: &'a AssemblyPolicy,
         measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
-    ) -> Result<ContextCompilationOwnerReadback<'a>, PacketCompositionError>
-    {
+    ) -> Result<ContextCompilationOwnerReadback<'a>, PacketCompositionError> {
         if seven.scope_id.as_str() != request.binding.scope_id.as_str()
             || seven.state_fence != request.binding.state_fence
         {
@@ -1768,8 +1767,7 @@ impl KernelContextReadClient {
                     campaign_view,
                     context_recipe_body_digest,
                 )?;
-                match assemble_active_view(&admitted, recipe, quality.clone(), assembly, measure)
-                {
+                match assemble_active_view(&admitted, recipe, quality.clone(), assembly, measure) {
                     Err(error) => ContextCompilationOwnerOutcome::Refused(Box::new(
                         composition_failure(error, recipe, &request.binding),
                     )),

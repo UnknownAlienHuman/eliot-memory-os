@@ -481,6 +481,8 @@ impl UserAutomationDurableJobMaterial {
             work_scope: work_scope.clone(),
             semantic_input,
             semantic_input_bytes: Some(semantic_input_bytes),
+            runtime_owner_execution_input: None,
+            runtime_owner_execution_input_bytes: None,
             output_contract: output_envelope,
             admission: admitted_job_ref(admission, &work_scope, budget_units, deadline_unix_ms)?,
             cancellation_id: format!("user-automation:{occurrence_id}:cancellation"),

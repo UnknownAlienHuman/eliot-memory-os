@@ -474,7 +474,7 @@ fn dispatch_orientation(
         crate::production_orientation::ProductionOrientationSupply::Ready(joined.owner),
     ) {
         Ok(inputs) => Ok(DreamResult::Orientation(
-            crate::production_orientation::compose_production_result(inputs, job),
+            crate::production_orientation::compose_production_result(&inputs, job),
         )),
         Err(blocked) => Ok(DreamResult::Orientation(*blocked)),
     }

@@ -2,6 +2,7 @@
 
 use eliot_context_assembly::ActiveUnderstandingViewResult;
 use eliot_context_candidates::ContextCandidateSetResult;
+use eliot_context_candidates::{EpistemicInput, PROVIDER_EPISTEMIC};
 use eliot_context_contracts::{
     AtomAvailability, AtomRepresentation, CanonicalProjectionSet, ContextError, ProviderId,
     SerializedContextMeasurement,
@@ -21,7 +22,6 @@ use eliot_dreamer_orientation::{
 };
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, ProbeProposal};
 use eliot_dreamer_rival_model::RivalModelSet;
-use eliot_context_candidates::{EpistemicInput, PROVIDER_EPISTEMIC};
 use eliot_epistemic::{CurrentEpistemicPosition, ObservationRecord, PositionRequest};
 use eliot_epistemic_contracts::EpistemicPositionCandidate;
 use serde::Serialize;

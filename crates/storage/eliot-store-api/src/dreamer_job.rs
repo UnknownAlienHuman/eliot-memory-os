@@ -626,7 +626,11 @@ fn validate_bundle_identities(
         return Err(StoreError::FenceMismatch);
     }
     match (
-        record.record.submission.runtime_owner_execution_input.as_ref(),
+        record
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .as_ref(),
         record
             .record
             .submission
@@ -646,8 +650,7 @@ fn validate_bundle_identities(
         _ => return Err(StoreError::IdentityConflict),
     }
     match response.output_contract.as_ref() {
-        Some(output_contract)
-            if output_contract == &record.record.submission.output_contract => {}
+        Some(output_contract) if output_contract == &record.record.submission.output_contract => {}
         None => {
             return Err(StoreError::Empty {
                 field: "output_contract",

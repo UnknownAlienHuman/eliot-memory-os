@@ -311,8 +311,7 @@ pub struct DurableJobRuntimeOwnerExecutionInput {
     /// Original output-contract reference.
     pub output_contract: OpaqueContentRef,
     /// Original recipe's OutputSchema tuple.
-    pub output_schema_recipe:
-        crate::task_controller::TaskControllerOrientationOutputSchemaRecipe,
+    pub output_schema_recipe: crate::task_controller::TaskControllerOrientationOutputSchemaRecipe,
     /// Original named-read claim for the output schema artifact.
     pub schema_source: crate::task_controller::TaskControllerOrientationSourceClaim,
     /// Original bounded evidence-material claims.
@@ -378,7 +377,9 @@ impl DurableJobRuntimeOwnerExecutionInput {
             .get("context_recipe")
             .and_then(serde_json::Value::as_object)
             .ok_or(DurableJobError::RuntimeOwnerExecutionInputUnavailable)?;
-        if response.get("operation").and_then(serde_json::Value::as_str)
+        if response
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
             != Some("context_reconstruction")
             || response.get("task_id").and_then(serde_json::Value::as_str)
                 != Some(self.task_id.as_str())
@@ -389,7 +390,9 @@ impl DurableJobRuntimeOwnerExecutionInput {
                 != Some(self.task_id.as_str())
             || request.get("scope_id").and_then(serde_json::Value::as_str)
                 != Some(self.work_scope.scope_id.as_str())
-            || request.get("evidence_subject").and_then(serde_json::Value::as_str)
+            || request
+                .get("evidence_subject")
+                .and_then(serde_json::Value::as_str)
                 .is_none_or(str::is_empty)
             || owner_publication.get("source_envelope").is_none()
             || owner_publication.get("source_attempt").is_none()
@@ -425,13 +428,14 @@ impl DurableJobRuntimeOwnerExecutionInput {
         if envelope.state_fence != self.state_fence
             || envelope.envelope_sha256 != result.request_sha256
             || envelope.identity.task_id.as_deref() != Some(self.task_id.as_str())
-            || envelope.identity.work_scope_id.as_deref()
-                != Some(self.work_scope.scope_id.as_str())
+            || envelope.identity.work_scope_id.as_deref() != Some(self.work_scope.scope_id.as_str())
             || envelope.identity.capability != "eliot.query"
             || source_attempt.authority_epoch != self.state_fence.authority_epoch
-            || source_attempt != *result.attempt.as_ref().ok_or(
-                DurableJobError::RuntimeOwnerExecutionInputUnavailable,
-            )?
+            || source_attempt
+                != *result
+                    .attempt
+                    .as_ref()
+                    .ok_or(DurableJobError::RuntimeOwnerExecutionInputUnavailable)?
             || source_attempt.scope_id != self.work_scope.scope_id.as_str()
         {
             return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
@@ -1983,7 +1987,8 @@ impl DurableJobResponse {
             (Some(reference), Some(bytes)) => {
                 reference.validate("runtime_owner_execution_input.sha256")?;
                 reference.validate_original_bytes(bytes)?;
-                if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity()? {
+                if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity()?
+                {
                     return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
                 }
                 let input: DurableJobRuntimeOwnerExecutionInput = serde_json::from_slice(bytes)
@@ -2198,8 +2203,12 @@ impl DurableJobResponse {
                     self.runtime_owner_execution_input_bytes.as_ref(),
                 ) {
                     (None, None, None, None) => {}
-                    (Some(expected_ref), Some(expected_bytes), Some(observed_ref), Some(observed_bytes))
-                        if expected_ref == observed_ref && expected_bytes == observed_bytes => {}
+                    (
+                        Some(expected_ref),
+                        Some(expected_bytes),
+                        Some(observed_ref),
+                        Some(observed_bytes),
+                    ) if expected_ref == observed_ref && expected_bytes == observed_bytes => {}
                     (Some(_), Some(_), None, None) => {
                         return Err(DurableJobError::RuntimeOwnerExecutionInputUnavailable);
                     }

@@ -449,27 +449,12 @@ pub(crate) fn resolve_production_inputs<'a>(
 /// stage refusal, and packet-owner refusal retain their typed terminal
 /// dispositions in the pulse result.
 pub(crate) fn compose_production_result(
-    inputs: ProductionOrientationInputs<'_>,
+    inputs: &ProductionOrientationInputs<'_>,
     semantic_job: &DreamJobInput,
 ) -> OrientationPulseResult {
-    if inputs.cancelled {
-        return carrier_failure_result(&inputs, &PulseError::Cancelled);
-    }
-    if let Err(error) = check_carrier_deadline(inputs.deadline_unix_ms) {
-        return carrier_failure_result(&inputs, &error);
-    }
-    if inputs.schema_version != PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION {
-        return carrier_failure_result(&inputs, &PulseError::Boundary("production inputs version"));
-    }
-    let admitted = admitted_prefix(&inputs);
-    if let Err(field) = validate_identity_closure(&inputs, semantic_job) {
-        return closure_blocked(&inputs, &admitted, field);
-    }
-    if let Some(reason) = unusable_model_reason(inputs.model_outcome.disposition) {
-        return unusable_model_blocked(&inputs, &admitted, reason);
-    }
-    let Some(model_draft) = inputs.model_outcome.draft.as_ref() else {
-        return unusable_model_blocked(&inputs, &admitted, MODEL_OUTCOME_MALFORMED);
+    let (admitted, model_draft) = match preflight_production(inputs, semantic_job) {
+        Ok(ready) => ready,
+        Err(blocked) => return *blocked,
     };
     let prefix = ProductionPulsePrefix {
         identity: BlockedIdentity::of(&inputs),
@@ -558,6 +543,48 @@ pub(crate) fn compose_production_result(
         packet,
         records,
     )
+}
+
+fn preflight_production<'a>(
+    inputs: &'a ProductionOrientationInputs<'_>,
+    semantic_job: &DreamJobInput,
+) -> Result<
+    (
+        OrientationAdmittedPrefix,
+        &'a eliot_dreamer_contracts::ModelDraft,
+    ),
+    Box<OrientationPulseResult>,
+> {
+    if inputs.cancelled {
+        return Err(Box::new(carrier_failure_result(
+            inputs,
+            &PulseError::Cancelled,
+        )));
+    }
+    if let Err(error) = check_carrier_deadline(inputs.deadline_unix_ms) {
+        return Err(Box::new(carrier_failure_result(inputs, &error)));
+    }
+    if inputs.schema_version != PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION {
+        return Err(Box::new(carrier_failure_result(
+            inputs,
+            &PulseError::Boundary("production inputs version"),
+        )));
+    }
+    let admitted = admitted_prefix(inputs);
+    if let Err(field) = validate_identity_closure(inputs, semantic_job) {
+        return Err(Box::new(closure_blocked(inputs, &admitted, field)));
+    }
+    if let Some(reason) = unusable_model_reason(inputs.model_outcome.disposition) {
+        return Err(Box::new(unusable_model_blocked(inputs, &admitted, reason)));
+    }
+    let Some(model_draft) = inputs.model_outcome.draft.as_ref() else {
+        return Err(Box::new(unusable_model_blocked(
+            inputs,
+            &admitted,
+            MODEL_OUTCOME_MALFORMED,
+        )));
+    };
+    Ok((admitted, model_draft))
 }
 
 fn finish_projection_result(
