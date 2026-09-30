@@ -412,7 +412,7 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
     if ($blobs.Count -eq 0) {
         return $result
     }
-    $input = (@($blobs.GetEnumerator() | ForEach-Object { $_.Value }) -join "`n")
+    $input = ((@($blobs.GetEnumerator() | ForEach-Object { $_.Value }) -join "`n") + "`n")
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = 'git'
     $psi.Arguments = "-C `"$Repo`" cat-file --batch"
@@ -423,18 +423,26 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
     $psi.CreateNoWindow = $true
     $process = [System.Diagnostics.Process]::Start($psi)
     try {
-        $process.StandardInput.Write($input)
-        $process.StandardInput.Write("`n")
-        $process.StandardInput.Close()
+        # Feed requests asynchronously while draining stdout. cat-file emits
+        # one potentially large object per request; writing the entire batch
+        # first can deadlock when stdout fills before stdin has been consumed.
+        $writer = $process.StandardInput.WriteAsync($input)
         $standardOutput = $process.StandardOutput.BaseStream
-        $byOid = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
-        foreach ($pair in $blobs.GetEnumerator()) { $byOid[[string]$pair.Value] = [string]$pair.Key }
+        $byOid = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new([System.StringComparer]::Ordinal)
+        foreach ($pair in $blobs.GetEnumerator()) {
+            $oid = [string]$pair.Value
+            if (-not $byOid.ContainsKey($oid)) {
+                $byOid[$oid] = [System.Collections.Generic.List[string]]::new()
+            }
+            [void]$byOid[$oid].Add([string]$pair.Key)
+        }
         $buffer = [byte[]]::new(65536)
         $pending = [System.Collections.Generic.List[byte]]::new()
         $header = [System.Text.StringBuilder]::new()
         $stage = 'header'
         $currentOid = $null
         $remaining = 0
+        $completed = 0
         while ($true) {
             $read = $standardOutput.Read($buffer, 0, $buffer.Length)
             if ($read -le 0) { break }
@@ -446,7 +454,7 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                         $offset++
                         if ($byte -eq 0x0A) {
                             $line = $header.ToString()
-                            $header.Clear()
+                            [void]$header.Clear()
                             $fields = @($line -split ' ')
                             if ($fields.Count -ge 3 -and $fields[1] -ceq 'blob') {
                                 $currentOid = [string]$fields[0]
@@ -471,10 +479,13 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                     if ($remaining -eq 0) {
                         $bytes = $pending.ToArray()
                         if ($byOid.ContainsKey($currentOid)) {
-                            $result[[string]$byOid[$currentOid]] = [pscustomobject]@{
-                                blob = [string]$currentOid
-                                text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                            foreach ($path in $byOid[$currentOid]) {
+                                $result[[string]$path] = [pscustomobject]@{
+                                    blob = [string]$currentOid
+                                    text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                                }
                             }
+                            $completed++
                         }
                         $pending.Clear()
                         $currentOid = $null
@@ -493,7 +504,11 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                     $offset = $read
                 }
             }
+            if ($completed -ge $blobs.Count) { break }
         }
+        [void]$writer.GetAwaiter().GetResult()
+        $process.StandardInput.Close()
+        $process.WaitForExit()
     }
     finally {
         $process.StandardOutput.Close()

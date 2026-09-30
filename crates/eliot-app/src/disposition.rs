@@ -86,9 +86,23 @@ const CLAUDE_PLUGIN_HOOKS: &str =
 const CLAUDE_PLUGIN_MCP: &str = include_str!("../../../integrations/claude/eliot/.mcp.json");
 const CLAUDE_DESKTOP_MCPB: &str =
     include_str!("../../../integrations/claude/claude-desktop/mcpb/manifest.json");
+const CLAUDE_DESKTOP_README: &str =
+    include_str!("../../../integrations/claude/claude-desktop/README.md");
+const CLAUDE_DESKTOP_MCPB_README: &str =
+    include_str!("../../../integrations/claude/claude-desktop/mcpb/README.md");
 const OPENCODE_CONFIG: &str = include_str!("../../../integrations/opencode/opencode.json");
 const OPENCODE_PLUGIN: &str = include_str!("../../../integrations/opencode/plugins/eliot.js");
 const CODEX_MARKETPLACE: &str = include_str!("../../../integrations/codex/marketplace.json");
+const CODEX_PLUGIN_METADATA: &str =
+    include_str!("../../../plugin/eliot-governor/.codex-plugin/plugin.json");
+const OPERATOR_CONTRACTS: &str =
+    include_str!("../../../apps/Eliot.Operator/Protocol/OperatorContracts.cs");
+const OPERATOR_INTENT: &str =
+    include_str!("../../../apps/Eliot.Operator/Protocol/OperatorIntent.cs");
+const OPERATOR_RESPONSE_BOUNDS: &str =
+    include_str!("../../../apps/Eliot.Operator/Protocol/OperatorResponseBounds.cs");
+const OPERATOR_README: &str = include_str!("../../../apps/Eliot.Operator/README.md");
+const OPERATOR_TESTS: &str = include_str!("../../../tests/Eliot.Operator.Tests/Program.cs");
 const WINDOWS_RELEASE_BUILD: &str =
     include_str!("../../../scripts/build-eliot-windows-x64-release.ps1");
 const CLAUDE_DESKTOP_BUILD: &str =
@@ -106,6 +120,11 @@ const HOST_BUNDLE_MANIFEST: &str =
     include_str!("../../../integrations/agent-runtimes/host-bundle.manifest.json");
 const CODEX_ROUTE_PROFILE: &str = include_str!("../../../integrations/codex/route-profile.json");
 const CLAUDE_CONNECTOR_TEST: &str = include_str!("../../../scripts/test-claude-connector.ps1");
+const MCP_REFERENCE_CLIENT: &str = include_str!("../../../scripts/eliot-mcp-reference-client.ps1");
+const OPENCODE_PLUGIN_TEST: &str =
+    include_str!("../../../integrations/opencode/tests/eliot-plugin.test.mjs");
+const TRUSTED_CLI_LIVE_SIGNING_TEST: &str =
+    include_str!("../../../tests/release-security/trusted-cli-live-signing-tests.ps1");
 
 /// Every declared install/launch/advertisement surface of the legacy binary.
 ///
@@ -137,6 +156,11 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         path: "integrations/codex/marketplace.json",
         live_reference: "\"installation\": \"INSTALLED_BY_DEFAULT\"",
         body: CODEX_MARKETPLACE,
+    },
+    ConsumerSurface {
+        path: "plugin/eliot-governor/.codex-plugin/plugin.json",
+        live_reference: "\"name\": \"eliot-governor\"",
+        body: CODEX_PLUGIN_METADATA,
     },
     ConsumerSurface {
         path: "scripts/build-eliot-windows-x64-release.ps1",
@@ -192,6 +216,56 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         path: "scripts/test-claude-connector.ps1",
         live_reference: "'release\\eliot-governor.exe'",
         body: CLAUDE_CONNECTOR_TEST,
+    },
+    ConsumerSurface {
+        path: "integrations/claude/claude-desktop/README.md",
+        live_reference: "cargo build --release -p eliot-app",
+        body: CLAUDE_DESKTOP_README,
+    },
+    ConsumerSurface {
+        path: "integrations/claude/claude-desktop/mcpb/README.md",
+        live_reference: "`eliot-governor.exe`",
+        body: CLAUDE_DESKTOP_MCPB_README,
+    },
+    ConsumerSurface {
+        path: "apps/Eliot.Operator/Protocol/OperatorContracts.cs",
+        live_reference: "crates/eliot-app/src/mcp_stdio/catalog.rs",
+        body: OPERATOR_CONTRACTS,
+    },
+    ConsumerSurface {
+        path: "apps/Eliot.Operator/Protocol/OperatorIntent.cs",
+        live_reference: "crates/eliot-app/src/mcp_stdio.rs",
+        body: OPERATOR_INTENT,
+    },
+    ConsumerSurface {
+        path: "apps/Eliot.Operator/Protocol/OperatorResponseBounds.cs",
+        live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
+        body: OPERATOR_RESPONSE_BOUNDS,
+    },
+    ConsumerSurface {
+        path: "apps/Eliot.Operator/README.md",
+        live_reference: "The `eliot_operator_*` tools are served by `crates/eliot-app`",
+        body: OPERATOR_README,
+    },
+    ConsumerSurface {
+        path: "tests/Eliot.Operator.Tests/Program.cs",
+        live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
+        body: OPERATOR_TESTS,
+    },
+    ConsumerSurface {
+        path: "scripts/eliot-mcp-reference-client.ps1",
+        live_reference: "'codex_controller'",
+        body: MCP_REFERENCE_CLIENT,
+    },
+    ConsumerSurface {
+        path: "integrations/opencode/tests/eliot-plugin.test.mjs",
+        live_reference: "process.env.ELIOT_GOVERNOR_EXE",
+        body: OPENCODE_PLUGIN_TEST,
+    },
+    ConsumerSurface {
+        path: "tests/release-security/trusted-cli-live-signing-tests.ps1",
+        live_reference: "eliot-governor.exe",
+        body: TRUSTED_CLI_LIVE_SIGNING_TEST,
     },
 ];
 
@@ -386,6 +460,13 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             expiry: "remove when the default-installed Codex plugin is a current root plugin under #13",
         },
         ConsumerEntry {
+            consumer: "Codex plugin identity manifest",
+            proof: "plugin/eliot-governor/.codex-plugin/plugin.json",
+            live_reference: "\"name\": \"eliot-governor\"",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove with the Codex Governor plugin subtree after accepted #18 consumer and retirement evidence under #1719",
+        },
+        ConsumerEntry {
             consumer: "OpenCode host integration",
             proof: "integrations/opencode/plugins/eliot.js",
             live_reference: "host-integrations/opencode/bin/eliot-governor.exe",
@@ -468,6 +549,76 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             live_reference: "'release\\eliot-governor.exe'",
             disposition: Disposition::TemporaryFixture,
             expiry: "remove by 2026-12-31, when connector tests target the current root server binary under #11",
+        },
+        ConsumerEntry {
+            consumer: "Claude Desktop package build instructions",
+            proof: "integrations/claude/claude-desktop/README.md",
+            live_reference: "cargo build --release -p eliot-app",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove by 2026-12-31, when the package instructions build and stage the current owner server under #11/#18",
+        },
+        ConsumerEntry {
+            consumer: "Claude Desktop MCPB package instructions",
+            proof: "integrations/claude/claude-desktop/mcpb/README.md",
+            live_reference: "`eliot-governor.exe`",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove by 2026-12-31, when the MCPB guide names only the current owner server under #11/#18",
+        },
+        ConsumerEntry {
+            consumer: "Legacy UL cross-agent reference MCP client",
+            proof: "scripts/eliot-mcp-reference-client.ps1",
+            live_reference: "'codex_controller'",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove when the UL runner and codex_controller profile use the admitted current MCP owner under #18 and its owner track",
+        },
+        ConsumerEntry {
+            consumer: "OpenCode legacy executable fallback fixture",
+            proof: "integrations/opencode/tests/eliot-plugin.test.mjs",
+            live_reference: "process.env.ELIOT_GOVERNOR_EXE",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove when the OpenCode integration no longer accepts the legacy executable fallback under #18",
+        },
+        ConsumerEntry {
+            consumer: "Windows x64 live signing retained-Governor fixture",
+            proof: "tests/release-security/trusted-cli-live-signing-tests.ps1",
+            live_reference: "eliot-governor.exe",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "update after #18 admits retirement so the signing fixture matches the selected bundle denominator",
+        },
+        ConsumerEntry {
+            consumer: "Operator compatibility query contract",
+            proof: "apps/Eliot.Operator/Protocol/OperatorContracts.cs",
+            live_reference: "crates/eliot-app/src/mcp_stdio/catalog.rs",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when LegacyOperatorAdapter consumes the current query contract without the facade MCP catalog under #18",
+        },
+        ConsumerEntry {
+            consumer: "Operator compatibility mutation contract",
+            proof: "apps/Eliot.Operator/Protocol/OperatorIntent.cs",
+            live_reference: "crates/eliot-app/src/mcp_stdio.rs",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when LegacyOperatorAdapter uses the current typed Operator-intent route without facade MCP dispatch under #18",
+        },
+        ConsumerEntry {
+            consumer: "Operator compatibility response contract",
+            proof: "apps/Eliot.Operator/Protocol/OperatorResponseBounds.cs",
+            live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when Operator response bounds are verified against the current owner contract without facade emissions under #18",
+        },
+        ConsumerEntry {
+            consumer: "Operator LegacyOperatorAdapter",
+            proof: "apps/Eliot.Operator/README.md",
+            live_reference: "The `eliot_operator_*` tools are served by `crates/eliot-app`",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when the adapter is replaced by current ControlBoard/runtime-status reads and typed intent writes under #18",
+        },
+        ConsumerEntry {
+            consumer: "Operator legacy-contract regression fixture",
+            proof: "tests/Eliot.Operator.Tests/Program.cs",
+            live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove after the Operator adapter test asserts the current owner contract and no longer references facade output under #18",
         },
     ]
 }
