@@ -1186,8 +1186,7 @@ impl DaemonComposition {
         // `commit_canonical_with_readiness` material gate below. Cold/unbound
         // and non-task-relative admissions carry no sealed identity and pass
         // through untouched.
-        if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) =
-            &admission
+        if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) = &admission
         {
             let live_fence = self.governor.kernel_snapshot().state_fence();
             crate::task_binding_admission::revalidate_task_bound_for_effect(
