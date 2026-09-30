@@ -235,11 +235,17 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
 /// executable path and digest, a digest over the sealed environment, and
 /// the sealed argv. No path is resolved and no file is read here — the
 /// productive tool re-read below stays the file-observing check — so the
-/// observation always describes exactly the request about to start.
-fn admit_sealed_drive_claim(
+/// observation always describes exactly the request about to start. The
+/// admitted stage is returned so the launch receipt records the exact
+/// matched spec digest, profile revision, and parser identity/generation.
+///
+/// This is `pub(crate)` because `start_claimed_from_store` is the single
+/// choke point that reaches `executor.start`: every launch re-admits there,
+/// so no caller can start a sealed request the boundary did not admit.
+pub(crate) fn admit_sealed_drive_claim(
     invocation: &eliot_instrument_api::InstrumentInvocation,
     request: &ProcessRequest,
-) -> Result<(), TestdError> {
+) -> Result<eliot_instrument_runner::AdmittedStage, TestdError> {
     let environment_digest = eliot_contracts::canonical_json_bytes(request.environment())
         .map(|bytes| eliot_contracts::sha256_hex(&bytes))
         .map_err(|_| {
@@ -338,22 +344,28 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     // identity, fence, roots, and generation against the claimed durable
     // job; this admits the invocation against the ONE profile.rs contract
     // before any start. Refusal finishes unknown without executing, under
-    // the same typed pattern as a seal refusal.
-    if let Err(error) = admit_sealed_drive_claim(&job.invocation, permit.request()) {
-        finish_unknown(
-            store,
-            job,
-            lease,
-            &EvidenceCollector::default(),
-            format!("shared admission refused without executing: {error}"),
-        )?;
-        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-            || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
-        )?));
-    }
+    // the same typed pattern as a seal refusal. The admitted stage is kept:
+    // its matched spec digest, profile revision, and parser
+    // identity/generation are recorded in the launch receipt below.
+    let admitted =
+        match admit_sealed_drive_claim(&job.invocation, permit.request()) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                finish_unknown(
+                    store,
+                    job,
+                    lease,
+                    &EvidenceCollector::default(),
+                    format!("shared admission refused without executing: {error}"),
+                )?;
+                return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+                    || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
+                )?));
+            }
+        };
     let collector = Arc::new(EvidenceCollector::default());
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
-        let observation = match observe_tool_identity(permit.request()) {
+        let observation = match observe_tool_identity(permit.request(), &admitted) {
             Ok(observation) => observation,
             Err(error) => {
                 finish_unknown(
@@ -414,7 +426,15 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
 /// ProcessRequest immediately before the consuming start. The resolver has
 /// already selected cargo/rustc through rustup; this readback binds the
 /// resulting files and nextest executable into the durable receipt.
-fn observe_tool_identity(request: &ProcessRequest) -> Result<TestdToolObservation, TestdError> {
+///
+/// `admitted` is the stage the shared boundary just returned for this exact
+/// sealed request: its matched spec digest, profile revision, and parser
+/// identity/generation are copied into the observation, never re-derived,
+/// so the receipt records the generations the launch was admitted under.
+fn observe_tool_identity(
+    request: &ProcessRequest,
+    admitted: &eliot_instrument_runner::AdmittedStage,
+) -> Result<TestdToolObservation, TestdError> {
     let environment = request.environment().non_secret();
     let required = |key: &'static str| {
         environment.get(key).cloned().ok_or(TestdError::Invalid {
@@ -437,6 +457,11 @@ fn observe_tool_identity(request: &ProcessRequest) -> Result<TestdToolObservatio
         rustc_path,
         rustc_sha256,
         selected_toolchain,
+        admitted_profile: admitted.profile.clone(),
+        admitted_profile_revision: admitted.profile_revision,
+        admitted_spec_digest: admitted.spec_digest.clone(),
+        admitted_parser: admitted.parser.as_str().to_owned(),
+        admitted_parser_generation: admitted.parser_generation,
     };
     observation.validate()?;
     for (path, expected) in [

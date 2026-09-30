@@ -2382,6 +2382,13 @@ pub struct NormalizedEvidence {
 /// after the resolver has asked rustup for the selected toolchain executables.
 /// A plan/evaluator version is not a substitute for this observation, and a
 /// rustup shim digest is not accepted as the selected cargo/rustc identity.
+///
+/// The `admitted_*` fields bind the exact shared-boundary admission
+/// (issue #1814) this observation was recorded under: the admitted profile
+/// and revision, the matched spec digest, and the matched parser identity
+/// and generation. The consuming lane copies them from the admitted stage
+/// it just received, never from caller text, so the launch receipt records
+/// the generations it launched under.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestdToolObservation {
@@ -2392,6 +2399,11 @@ pub struct TestdToolObservation {
     pub rustc_path: String,
     pub rustc_sha256: String,
     pub selected_toolchain: String,
+    pub admitted_profile: String,
+    pub admitted_profile_revision: u64,
+    pub admitted_spec_digest: String,
+    pub admitted_parser: String,
+    pub admitted_parser_generation: u64,
 }
 
 impl TestdToolObservation {
@@ -2428,6 +2440,26 @@ impl TestdToolObservation {
                 });
             }
         }
+        validate_text(&self.admitted_profile, "admitted_profile")?;
+        if !is_admitted_testd_profile(&self.admitted_profile) {
+            return Err(TestdError::Invalid {
+                field: "admitted_profile",
+                reason: "launch receipt binds an unregistered admission profile",
+            });
+        }
+        if self.admitted_profile_revision == 0 {
+            return Err(TestdError::Invalid {
+                field: "admitted_profile_revision",
+                reason: "launch receipt binds a zero admission revision",
+            });
+        }
+        if !is_binding_digest(&self.admitted_spec_digest) {
+            return Err(TestdError::Invalid {
+                field: "admitted_spec_digest",
+                reason: "launch receipt binds no admitted spec digest",
+            });
+        }
+        validate_text(&self.admitted_parser, "admitted_parser")?;
         Ok(())
     }
 

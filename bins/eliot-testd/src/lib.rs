@@ -537,6 +537,17 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     {
         return Err(TestdError::InvalidBinding);
     }
+    // Shared admission boundary (issue #1814): this function is the single
+    // choke point that reaches `executor.start`, and it is publicly reachable
+    // through `Testd::start_claimed` without passing the worker drive. The
+    // invocation sealed into this exact request re-admits against the ONE
+    // profile.rs contract here — registered profile and revision, instrument
+    // contract, kind, exact argv template, owner-observed executable identity
+    // — so no caller can start a sealed request the boundary did not admit.
+    // Refusal is the existing typed contract failure, before any child
+    // exists. The matched generations are recorded on the worker drive path,
+    // which admits first and binds the returned stage into its evidence.
+    let _admitted = crate::worker::admit_sealed_drive_claim(&current.invocation, &request)?;
     executor
         .start(request, sink)
         .await

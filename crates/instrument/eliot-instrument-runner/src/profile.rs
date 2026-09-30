@@ -2551,7 +2551,9 @@ impl AdmittedStage {
     /// identity, kind, exact argument template, and the owner-observed
     /// executable identity refuse fail-closed here, before any grant or
     /// process exists. The grant itself stays with the lane's own permit;
-    /// this boundary owns refusal only.
+    /// this boundary owns refusal only. The admitted stage is returned so
+    /// the consuming lane records the exact matched spec digest, profile
+    /// revision, and parser identity/generation in its launch receipt.
     ///
     /// # Errors
     ///
@@ -2563,7 +2565,7 @@ impl AdmittedStage {
         observed: &ResolvedExecutableIdentity,
         supply_receipt: Option<SupplyChainReceipt>,
         profile_revision: u64,
-    ) -> Result<(), AdmissionError> {
+    ) -> Result<Self, AdmissionError> {
         let stage = Self::for_testd_launch(
             invocation,
             sealed_argv,
@@ -2573,7 +2575,7 @@ impl AdmittedStage {
         )?;
         let request = stage.admission_request(invocation, Some(observed));
         stage.admit(&request, Some(observed), profile_revision)?;
-        Ok(())
+        Ok(stage)
     }
 }
 

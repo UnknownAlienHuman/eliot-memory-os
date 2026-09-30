@@ -1633,7 +1633,10 @@ pub(crate) async fn submit_testd_owner_job(
         profile.fixed_argv.clone(),
     )
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    AdmittedStage::admit_testd_launch(
+    // The returned stage carries the matched spec digest, profile revision,
+    // and parser identity/generation; this lane owns refusal only, and the
+    // consuming testd start records those generations in its launch receipt.
+    let _admitted = AdmittedStage::admit_testd_launch(
         &request.submission.invocation,
         &profile.fixed_argv,
         &observed_drive,
