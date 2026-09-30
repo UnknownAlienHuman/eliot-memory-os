@@ -331,6 +331,14 @@ impl StoreObjectIdentityRecord {
     }
 }
 
+impl persistence_codec::PersistedValue for StoreObjectIdentityRecord {
+    const RECORD_TYPE: &'static str = "ors_store_object_identity";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
 fn read_store_object_identity(
     meta: &impl ReadableTable<&'static str, &'static str>,
 ) -> Result<StoreObjectIdentityRecord, OrsError> {
@@ -25075,17 +25083,16 @@ impl RedbRecoveryStore {
                 });
             }
         };
-        if let (Some(expected), Some(identity)) = (expected_installation_id, identity) {
-            if identity
+        if let (Some(expected), Some(identity)) = (expected_installation_id, identity)
+            && identity
                 .installation_id
                 .as_deref()
                 .is_some_and(|bound| bound != expected)
-            {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "ors_store_object_identity",
-                    reason: "ORS database is bound to a different installation identity".to_owned(),
-                });
-            }
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "ORS database is bound to a different installation identity".to_owned(),
+            });
         }
         Ok(())
     }
@@ -25094,19 +25101,6 @@ impl RedbRecoveryStore {
         &self,
         expected_installation_id: Option<&str>,
     ) -> Result<StoreObjectIdentityRecord, OrsError> {
-        if let Some(installation_id) = expected_installation_id {
-            crate::model::validate_text(installation_id, "ors_installation_identity")?;
-            if installation_id.len() > crate::MAX_BACKUP_ID_LEN
-                || installation_id.trim() != installation_id
-                || installation_id.chars().any(char::is_control)
-            {
-                return Err(OrsError::InvalidField {
-                    field: "ors_installation_identity",
-                    reason: "installation identity must be exact, bounded text",
-                });
-            }
-        }
-
         let write = self.database.begin_write().map_err(storage)?;
         let mut meta = write.open_table(META).map_err(storage)?;
         let schema = match meta
