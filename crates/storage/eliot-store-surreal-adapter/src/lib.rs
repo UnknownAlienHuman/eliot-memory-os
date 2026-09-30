@@ -56,8 +56,9 @@ use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalSnapshotPort, CanonicalStoreClient,
     CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME, NamedOperationManifest,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
+    OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta,
+    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SnapshotBeginRequest,
     SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError,
     StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
     generated_operation_manifests, operation_manifest_set_digest,
@@ -704,6 +705,15 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError> {
         apply::read_ordering_heads(self, scopes)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn ordering_head_readbacks(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        apply::read_ordering_head_readbacks(self, scopes)
             .await
             .map_err(AdapterError::into_store_error)
     }

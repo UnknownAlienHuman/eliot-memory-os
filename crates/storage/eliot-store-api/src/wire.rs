@@ -21,6 +21,7 @@ use crate::{
     CanonicalValidationSnapshot, ErasureIntentRecord, ErasureSurfaceKind, ExactJsonBytes,
     IsolatedDestination, IsolatedDestinationReceipt, MAX_STORE_FAILURE_DETAIL_LEN,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
+    OrderingHeadReadback,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
@@ -271,6 +272,9 @@ pub enum StoreRequest {
     OrderingHeads {
         scopes: Vec<OrderingScopeId>,
     },
+    OrderingHeadReadbacks {
+        scopes: Vec<OrderingScopeId>,
+    },
     ValidationSnapshot,
     DreamerJob {
         context: RequestMeta,
@@ -332,6 +336,9 @@ impl StoreRequest {
             Self::OrderingHeads { scopes } => {
                 bounded_unique(scopes, "ordering_scopes", Clone::clone)
             }
+            Self::OrderingHeadReadbacks { scopes } => {
+                bounded_unique(scopes, "ordering_scopes", Clone::clone)
+            }
             Self::DreamerJob { context, request } => {
                 context.validate().map_err(StoreError::Foundation)?;
                 request.validate().map_err(map_durable_error)?;
@@ -355,6 +362,7 @@ impl StoreRequest {
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
             Self::OrderingHeads { .. } => CAPABILITY_ORDERING_HEADS,
+            Self::OrderingHeadReadbacks { .. } => CAPABILITY_ORDERING_HEADS,
             Self::ValidationSnapshot => CAPABILITY_VALIDATION_SNAPSHOT,
             Self::Recovery { .. } => CAPABILITY_RECOVERY,
             Self::InitializeGenesis { .. } => CAPABILITY_INITIALIZE_GENESIS,
@@ -1065,6 +1073,9 @@ pub enum StoreResponse {
     OrderingHeads {
         heads: Vec<OrderingHead>,
     },
+    OrderingHeadReadbacks {
+        heads: Vec<OrderingHeadReadback>,
+    },
     ValidationSnapshot {
         snapshot: CanonicalValidationSnapshot,
     },
@@ -1186,6 +1197,15 @@ impl StoreResponse {
                 bounded_unique(heads, "ordering_heads", |head| head.scope.clone())?;
                 for head in heads {
                     head.validate().map_err(StoreWireError::Store)?;
+                }
+                Ok(())
+            }
+            Self::OrderingHeadReadbacks { heads } => {
+                bounded_unique(heads, "ordering_head_readbacks", |readback| {
+                    readback.head.scope.clone()
+                })?;
+                for readback in heads {
+                    readback.validate().map_err(StoreWireError::Store)?;
                 }
                 Ok(())
             }

@@ -21,8 +21,9 @@ use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, IsolatedDestination,
     IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
+    OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingHeadReadback, OrderingScopeId, PreparedTransition, ReadConsistency,
+    RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
     RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
     ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
@@ -975,6 +976,37 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             .map_err(RequestFailure::into_store_error)?;
         match response {
             StoreResponse::OrderingHeads { heads } => Ok(heads),
+            _ => Err(StoreError::InvalidReceipt),
+        }
+    }
+
+    async fn ordering_head_readbacks(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        let response = self
+            .execute_raw(
+                StoreRequest::OrderingHeadReadbacks {
+                    scopes: scopes.clone(),
+                },
+                None,
+                "store-ordering-head-readbacks",
+            )
+            .await
+            .map_err(RequestFailure::into_store_error)?;
+        match response {
+            StoreResponse::OrderingHeadReadbacks { heads } => {
+                for readback in &heads {
+                    readback.validate()?;
+                    if !scopes.contains(&readback.head.scope) {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    if readback.head.state_fence != self.requirement.state_fence {
+                        return Err(StoreError::FenceMismatch);
+                    }
+                }
+                Ok(heads)
+            }
             _ => Err(StoreError::InvalidReceipt),
         }
     }
