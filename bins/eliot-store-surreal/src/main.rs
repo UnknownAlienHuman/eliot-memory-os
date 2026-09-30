@@ -18,10 +18,11 @@ use eliot_store_surreal::diagnostics::{
 };
 use eliot_store_surreal::{
     CompatibilityVerdict, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity,
-    admit_authenticated_handshake, dispatch_with_log, install_compatibility_decision,
+    admit_authenticated_handshake, dispatch_admitted_with_log, install_compatibility_decision,
     load_compatibility_for_config, load_config, load_evidence_snapshot_verification,
     observed_identity_verdict, parse_compatibility_bytes, require_semantic_ready_for_pipe,
-    resolve_compatibility_verdict, store_bootstrap_descriptor, validate_request_frame_with_log,
+    resolve_compatibility_verdict, store_bootstrap_descriptor,
+    validate_request_frame_with_context,
 };
 
 mod launch_mode;
@@ -649,11 +650,16 @@ async fn serve_handshake_loop(
         };
         let mut round = BoundedEventLog::new();
         let (request_identity, response) =
-            match validate_request_frame_with_log(&mut session, &frame, &mut round) {
-                Ok(request) => {
+            match validate_request_frame_with_context(&mut session, &frame, &mut round) {
+                Ok((request, context)) => {
                     let identity = BridgeIdentity::from_request(&request);
-                    let response =
-                        Box::pin(dispatch_with_log(composition, request, &mut round)).await;
+                    let response = Box::pin(dispatch_admitted_with_log(
+                        composition,
+                        &context,
+                        request,
+                        &mut round,
+                    ))
+                    .await;
                     (identity, response)
                 }
                 Err(error) => {
