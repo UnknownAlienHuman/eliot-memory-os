@@ -1366,11 +1366,19 @@ pub enum EffectPendingItem {
 ///
 /// Proposal, authorization, dispatch, outcome, and pending reconciliation
 /// are exposed as independent sections with privacy-safe owned strings, so
-/// a status reader can never mistake one section for another. `current_contest`
-/// is the live contest overlay: per the effect ledger contract it reports
-/// `Admissible` for unknown keys, so callers must join it with
-/// `proposal.is_some()` — an admissible default for an unknown key is not
-/// proof that an authorization exists.
+/// a status reader can never mistake one section for another.
+/// `current_contest` is the live contest overlay: it reports `None` for
+/// unknown keys, so the type itself refuses to read an absent-key default
+/// as proof that an authorization exists — no join with
+/// `proposal.is_some()` is needed to stay honest.
+///
+/// `redacted` marks the disclosure-filtered projection served by
+/// [`AuthorityOwner::effect_recovery_status_filtered`]: identities,
+/// digests, enums, and revocation lineage are non-disclosing and retained,
+/// while unbounded caller-supplied prose (unknown-outcome reasons,
+/// named-obligation text) is withheld as empty with `redacted: true`. An
+/// empty reason with `redacted: false` is unreachable — blank reasons are
+/// refused when the unknown outcome is noted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectRecoveryStatus {
     pub idempotency_key: String,
@@ -1379,7 +1387,8 @@ pub struct EffectRecoveryStatus {
     pub dispatch: EffectDispatchView,
     pub outcome: EffectOutcomeView,
     pub pending: Vec<EffectPendingItem>,
-    pub current_contest: DependentEffectState,
+    pub current_contest: Option<DependentEffectState>,
+    pub redacted: bool,
 }
 
 /// Current applicability rebuilt before reuse (issue #1793 seq 7).
@@ -1387,7 +1396,10 @@ pub struct EffectRecoveryStatus {
 /// Names the exact grant-graph revision, the durable revocation-history
 /// source revision applied (`None` when restored without CURRENT history
 /// evidence — that restore stays visibly incomplete), whether the closure
-/// hydration feed is present, and which effects the current contest state
+/// hydration feed is present, whether recovery-side effect obligations were
+/// rebuilt from the restored ledger in this generation (`false` means the
+/// dependent-work fence is still closed on missing state, even with no
+/// contested keys listed), and which effects the current contest state
 /// challenges. Missing or corrupt state is reported here, never defaulted
 /// to an empty permissive registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1395,7 +1407,58 @@ pub struct EffectAuthorityApplicability {
     pub grant_graph_revision: u64,
     pub revocation_source_revision: Option<u64>,
     pub owner_hydrations_present: bool,
+    pub effect_obligations_rebuilt: bool,
     pub contested_effect_keys: Vec<String>,
+}
+
+/// Withholds unbounded caller-supplied prose from a recovery status while
+/// keeping every identity, digest, enum, and revocation coordinate intact.
+///
+/// The only caller is
+/// [`AuthorityOwner::effect_recovery_status_filtered`]: the owner-internal
+/// full view is never filtered in place, so forensics keeps its reasons
+/// while cross-boundary readers get the same sections without prose.
+/// Filtered prose reads back empty with `redacted: true`; an empty reason
+/// with `redacted: false` stays unreachable.
+fn filter_effect_status_disclosure(status: EffectRecoveryStatus) -> EffectRecoveryStatus {
+    let EffectRecoveryStatus {
+        idempotency_key,
+        proposal,
+        authorization,
+        dispatch,
+        outcome,
+        pending,
+        current_contest,
+        redacted: _,
+    } = status;
+    let authorization = authorization.map(|view| EffectAuthorizationView {
+        lease_id: view.lease_id,
+        executor_boundary: view.executor_boundary,
+        receipt_obligations: view
+            .receipt_obligations
+            .into_iter()
+            .map(|obligation| match obligation {
+                ReceiptObligation::Named(_) => ReceiptObligation::Named(String::new()),
+                retained => retained,
+            })
+            .collect(),
+    });
+    let outcome = match outcome {
+        EffectOutcomeView::Unknown { .. } => EffectOutcomeView::Unknown {
+            reason: String::new(),
+        },
+        retained => retained,
+    };
+    EffectRecoveryStatus {
+        idempotency_key,
+        proposal,
+        authorization,
+        dispatch,
+        outcome,
+        pending,
+        current_contest,
+        redacted: true,
+    }
 }
 
 impl AuthorityOwner {
@@ -1466,11 +1529,10 @@ impl AuthorityOwner {
                     .to_owned(),
             ));
         }
-        if self
-            .effects
-            .dependent_effect_state(idempotency_key)
-            .is_contested()
-        {
+        if matches!(
+            self.effects.dependent_effect_state(idempotency_key),
+            Some(state) if state.is_contested()
+        ) {
             return Err(CompositionError::Recovery(
                 "effect dispatch is contested by current revocation state".to_owned(),
             ));
@@ -1684,11 +1746,10 @@ impl AuthorityOwner {
         let Some(obligation) = self.effect_obligations.get(idempotency_key) else {
             return true;
         };
-        if self
-            .effects
-            .dependent_effect_state(idempotency_key)
-            .is_contested()
-        {
+        if matches!(
+            self.effects.dependent_effect_state(idempotency_key),
+            Some(state) if state.is_contested()
+        ) {
             return true;
         }
         !matches!(
@@ -1733,7 +1794,9 @@ impl AuthorityOwner {
     pub fn effect_recovery_status(&self, idempotency_key: &str) -> EffectRecoveryStatus {
         let obligation = self.effect_obligations.get(idempotency_key);
         let current_contest = self.effects.dependent_effect_state(idempotency_key);
-        let contested = current_contest.is_contested();
+        let contested = current_contest
+            .as_ref()
+            .is_some_and(DependentEffectState::is_contested);
         let (proposal, authorization, dispatch, outcome) = match obligation {
             None => (
                 None,
@@ -1796,7 +1859,8 @@ impl AuthorityOwner {
         if contested {
             pending.push(EffectPendingItem::ContestedByRoots {
                 revoked_roots: current_contest
-                    .revoked_roots()
+                    .as_ref()
+                    .and_then(DependentEffectState::revoked_roots)
                     .map(|roots| roots.iter().cloned().collect())
                     .unwrap_or_default(),
             });
@@ -1818,7 +1882,22 @@ impl AuthorityOwner {
             outcome,
             pending,
             current_contest,
+            redacted: false,
         }
+    }
+
+    /// Disclosure-filtered projection of [`Self::effect_recovery_status`]
+    /// for readers across a disclosure boundary (issue #1793 seq 7).
+    ///
+    /// Sections stay separate and pending reconciliation stays explicit;
+    /// only unbounded caller-supplied prose is withheld (unknown-outcome
+    /// reasons and named-obligation text read back empty) and the result
+    /// carries `redacted: true`. Identities, digests, enums, and revocation
+    /// lineage are non-disclosing and retained, so the filtered view still
+    /// fences, rebuilds, and reconciles by identity without leaking prose.
+    #[must_use]
+    pub fn effect_recovery_status_filtered(&self, idempotency_key: &str) -> EffectRecoveryStatus {
+        filter_effect_status_disclosure(self.effect_recovery_status(idempotency_key))
     }
 
     /// Idempotency keys with at least one pending reconciliation item, in
@@ -1848,6 +1927,7 @@ impl AuthorityOwner {
             grant_graph_revision: self.grants.revision(),
             revocation_source_revision: self.last_revocation_source_revision,
             owner_hydrations_present: self.owner_hydrations.is_some(),
+            effect_obligations_rebuilt: self.effect_obligations_rebuilt,
             contested_effect_keys: self.effects.contested_effect_keys(),
         }
     }

@@ -719,14 +719,23 @@ impl EffectAuthorizer {
         changed
     }
 
-    /// Current I12.20 standing of one pending effect. Never-contested effects
-    /// and unknown keys report [`DependentEffectState::Admissible`].
+    /// Current I12.20 standing of one pending effect, when the ledger
+    /// records the key. A stored-but-never-contested key reports
+    /// `Some(Admissible)`; a challenged key reports its current contest
+    /// overlay. Unknown keys report [`None`]: no standing was ever
+    /// recorded, and `None` is never proof that an authorization exists —
+    /// join it with the stored authorization record (or the recovery
+    /// obligation) before any reliance.
     /// History is read-only here: this never mutates admission records.
-    pub fn dependent_effect_state(&self, idempotency_key: &str) -> DependentEffectState {
+    pub fn dependent_effect_state(&self, idempotency_key: &str) -> Option<DependentEffectState> {
         self.contest_state
             .get(idempotency_key)
             .cloned()
-            .unwrap_or(DependentEffectState::Admissible)
+            .or_else(|| {
+                self.authorized_by_idempotency
+                    .contains_key(idempotency_key)
+                    .then_some(DependentEffectState::Admissible)
+            })
     }
 
     /// Idempotency keys currently contested or reopened, in ledger order.
@@ -752,8 +761,10 @@ impl EffectAuthorizer {
     /// 2. the actual lease is the exact lease that authorized it;
     /// 3. the observing executor is the exact authorized executor boundary;
     /// 4. no current revocation challenge is open against the authorization
-    ///    (an uncontested stored key is admissible by construction, so this
-    ///    is a real contest read, not an absent-key default);
+    ///    (the stored record above proves the key is known, so an
+    ///    absent-key default is unreachable here: an uncontested stored key
+    ///    reports `Some(Admissible)` and only an open contest overlay
+    ///    refuses);
     /// 5. the lease is still current for this exact effect against the
     ///    current work scope, session, epoch and `now`.
     ///
@@ -790,10 +801,10 @@ impl EffectAuthorizer {
                 "effect_executor_substituted",
             ));
         }
-        if self
-            .dependent_effect_state(stored.proposal.operation.idempotency_key.as_str())
-            .is_contested()
-        {
+        if matches!(
+            self.dependent_effect_state(stored.proposal.operation.idempotency_key.as_str()),
+            Some(state) if state.is_contested()
+        ) {
             return Err(AuthorityError::StaleEffectAuthority(
                 "effect_authorization_contested",
             ));
