@@ -27,7 +27,9 @@ use eliot_wasm_runtime::{
     Sha256Digest,
 };
 
-use crate::artifact_preflight::{read_bounded_artifact, reject_final_reparse_point};
+use crate::artifact_preflight::{
+    read_bounded_artifact, reject_final_reparse_point, require_absolute_artifact_path,
+};
 use crate::cli_contract::GuestExecArgs;
 use crate::wasmtime_provider::WasmtimeComponentEngine;
 
@@ -204,12 +206,22 @@ pub fn validate_request(
 /// bytes if and only if the guest completed.
 #[must_use]
 pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
+    // P2.2 (#758): the experimental lane's absolute-path gate applies here
+    // too — a relative artifact would otherwise resolve against the process
+    // working directory inside `read_bounded_artifact`.
+    if let Err(error) = require_absolute_artifact_path(&args.artifact) {
+        return fail(&format!("GUEST_EXEC_BAD_ARTIFACT:{error:?}"), EXIT_DENIED);
+    }
     let (artifact, preflight) = match read_bounded_artifact(&args.artifact) {
         Ok(pair) => pair,
         Err(error) => return fail(&format!("GUEST_EXEC_BAD_ARTIFACT:{error:?}"), EXIT_DENIED),
     };
     if preflight.digest.as_str() != args.artifact_digest.as_str() {
         return fail("GUEST_EXEC_ARTIFACT_DIGEST_MISMATCH", EXIT_DENIED);
+    }
+    // P2.2 (#758): same gate for the input path — no CWD-relative opens.
+    if let Err(error) = require_absolute_artifact_path(&args.input) {
+        return fail(&format!("GUEST_EXEC_BAD_INPUT:{error:?}"), EXIT_DENIED);
     }
     let input = match read_bounded_input(&args.input) {
         Ok(bytes) => bytes,
