@@ -175,7 +175,7 @@ pub struct CurrentUserTaskReceipt {
     /// Exact working directory read back from the task action.
     pub working_directory: PathBuf,
     /// Exact bootstrap argv tail retained separately from the fixed action
-    /// switches and RunEx placeholders.
+    /// switches and `RunEx` placeholders.
     pub arguments: Vec<String>,
     /// Digest of the exact Task Scheduler XML read back after registration.
     pub task_xml_sha256: String,
