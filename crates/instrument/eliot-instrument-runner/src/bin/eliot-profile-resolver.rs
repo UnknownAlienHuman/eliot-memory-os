@@ -103,15 +103,15 @@ use eliot_contracts::{
     ClockReading, ContractId, EpochContractError, EpochId, EpochLineageId, ProductId, RequestId,
     RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
 };
-use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
+use eliot_instrument_api::{ExecutionStatus, InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
     ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
-    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
-    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
-    StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
-    VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
-    profile::{PROFILE_ALIASES, builtin_specs},
-    resolve_verification_route, verify_profile_parity,
+    InstrumentRegistry, InstrumentRequestPort, InstrumentRun, InstrumentRunner, InstrumentSpec,
+    ParityVerdict, PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment,
+    StageEvidence, StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout,
+    VerificationProfileReceipt, VerificationRouteRequest, WorkScope, admitted_profile_for_alias,
+    parity_summary, profile::{PROFILE_ALIASES, builtin_specs}, resolve_verification_route,
+    verify_profile_parity,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
@@ -598,6 +598,23 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
 /// never ran, so this entry fails closed instead of printing one. This is a
 /// reachability guard on the receipt, not a verdict — the aggregate's own
 /// normalized outcome still decides PASS.
+///
+/// The guard is unchanged in what it decides: fewer than one launched stage
+/// refuses, exactly as before. What the refusal now carries is the evidence the
+/// reduction was discarding. The per-stage outcomes that produced "zero
+/// launches" already exist, one per planned stage, on
+/// [`ProfileAggregate::runs`] — every refusal the orchestrator recorded at a
+/// stage attempt is a typed [`StageEvidence`] reason beside that stage's own
+/// identity and execution axis. Reading them here is what turns the summary from
+/// "no stage launched" into "these stages refused, for these reasons": the
+/// operator learns which stage refused and why for every stage, not the first
+/// one or a count.
+///
+/// The existing summary sentence is kept byte-for-byte as the leading clause of
+/// the message — it is the line existing callers and `scripts/verify.ps1` match
+/// on — and the per-stage detail is appended to it under its own
+/// `VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage=` prefix rather than replacing
+/// it, so the refusal still refuses, with the reasons attached.
 fn require_launched_stage(
     admitted: &AdmittedProfile,
     aggregate: &ProfileAggregate,
@@ -608,12 +625,85 @@ fn require_launched_stage(
         .filter(|run| run.executable_digest.is_some())
         .count();
     if launched == 0 {
-        return Err(CliError::Contract(format!(
+        let mut detail = format!(
             "route '{}' revision {} launched no admitted stage; no tool identity was observed",
             admitted.name, admitted.revision
-        )));
+        );
+        // Every stage's own typed outcome, in plan order, rendered by the one
+        // owner below. A stage that launched cannot appear here — this branch
+        // only runs when none did — so each entry is a real per-stage refusal or
+        // a stage the aggregate could not match, never a synthesized guess.
+        write!(detail, "; {}", stage_refusal_detail(&aggregate.runs))
+            .map_err(|_| CliError::Contract("stage refusal detail is not formattable".to_owned()))?;
+        return Err(CliError::Contract(detail));
     }
     Ok(())
+}
+
+/// Renders every stage's existing typed refusal, one machine-greppable entry each.
+///
+/// The aggregate already holds one outcome per planned stage, so nothing is
+/// reconstructed here and no outcome type is re-created: each [`InstrumentRun`]
+/// is rendered through its own typed state, matching the borrowed
+/// [`StageEvidence`] first so a refusal reason is reported as a
+/// `MISSING`/`OMITTED` reason exactly as the orchestrator classified it, and the
+/// execution axis and the tool-identity absence alongside it. The entry text is
+/// sanitized rather than trusted: a stage id, an execution axis, and an
+/// orchestrator-authored reason are all single-line, but a sanitized rendering
+/// is what keeps a caller parsing one entry per line from ever seeing a second
+/// line that looks like a verdict.
+fn stage_refusal_detail(runs: &[InstrumentRun]) -> String {
+    let mut detail = String::new();
+    // One entry per stage, every time: the loop appends to `detail` rather than
+    // returning from inside the match, so a second stage's refusal cannot end
+    // the report after the first one.
+    for run in runs {
+        if !detail.is_empty() {
+            detail.push_str(" | ");
+        }
+        let evidence = match &run.evidence {
+            StageEvidence::Retained { .. } => "RETAINED",
+            StageEvidence::Omitted { reason } => {
+                detail.push_str(&format!(
+                    "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage={} execution={:?} evidence=OMITTED reason={}",
+                    single_line(run.stage.stage_id.as_str()),
+                    run.execution,
+                    single_line(reason),
+                ));
+                continue;
+            }
+            StageEvidence::Missing { reason } => {
+                detail.push_str(&format!(
+                    "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage={} execution={:?} evidence=MISSING reason={}",
+                    single_line(run.stage.stage_id.as_str()),
+                    run.execution,
+                    single_line(reason),
+                ));
+                continue;
+            }
+        };
+        detail.push_str(&format!(
+            "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage={} execution={:?} evidence={evidence} tool_identity=absent",
+            single_line(run.stage.stage_id.as_str()),
+            run.execution,
+        ));
+    }
+    if detail.is_empty() {
+        return "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage=none admitted_stages=0: the admitted plan declared no stage, so no per-stage refusal exists to report"
+            .to_owned();
+    }
+    detail
+}
+
+/// Collapses one rendered refusal field onto a single greppable line.
+///
+/// Only a line terminator is folded, and it is folded to a literal ␤ rather than
+/// erased: a caller can still tell that two characters met, the fields stay in
+/// their declared order, and no `\u{1}`-delimited field an orchestrator authored
+/// can end a line and start what a parser would read as a verdict of its own.
+/// Nothing is dropped, so this cannot hide a refusal reason.
+fn single_line(field: &str) -> String {
+    field.replace(['\r', '\n'], "\u{2424}")
 }
 
 /// Pins every admitted external stage executable from the real bytes here.
