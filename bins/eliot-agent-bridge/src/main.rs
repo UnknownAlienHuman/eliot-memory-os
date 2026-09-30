@@ -1425,13 +1425,20 @@ fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response
     {
         *wire_result = projected;
         *evidence = Some(view);
-        // I7.24 complete-evidence join: a projected receipt with a non-FULL
+        // I7.24 complete-evidence join: a present receipt with a non-FULL
         // delivery never satisfies a complete-evidence or verifier
-        // prerequisite, so it is consumed by the existing typed gate
-        // instead of being emitted. The slot stays absent while no
-        // route-owner token measurement exists on this path (the bridge
-        // never estimates tokens); only a measured receipt reaches the
-        // gate, and only a FULL one passes it.
+        // prerequisite, so the existing typed gate consumes it here instead
+        // of emitting it. The slot withholds (None) while no route-owner
+        // token measurement exists on this path — the bridge runs no
+        // tokenizer and never estimates counts, so only
+        // [`AgentBridgeCore::project_produced_tool_result`] fed by a
+        // versioned route-owner `TokenMeasurementPayload` attestation may
+        // populate it (today no route emits one; see the withhold matrix in
+        // `route_tokens.rs`). A retained large delivery instead cites its
+        // measured disposition on the wire (`delivery`, observed from the
+        // recorded view) with full bytes behind the handle for explicit
+        // expansion; an unretainable one was already refused above through
+        // `IncompleteDelivery`.
         receipt
             .as_ref()
             .and_then(|present| present.check_complete_evidence().err())
