@@ -63,6 +63,21 @@
 //!   (itself STITCH-called: no live dispatch ingress supplies the lease key
 //!   terms yet). Structural validation of request-supplied
 //!   `TaskSelectionEvidence` is never sufficient.
+//! - [`admit_canonical_write_with_activation`] — the W4 join (issue #1746,
+//!   W4/A2): [`admit_canonical_write`] preceded by
+//!   [`bind_current_task_selection`], so a structurally valid receipt that
+//!   disagrees with the live activation fails closed before any admission.
+//!   Designated caller
+//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition);
+//!   STITCH until the activation lane retains the snapshot to pass.
+//! - [`require_material_bootstrap_for_task_bound`] — the W5/A4 join
+//!   (issue #1746): a sealed [`DispatchedBinding`] proceeds toward the #1742
+//!   Material gate only on a `Material` [`BootstrapAdmission`] naming the
+//!   same task/scope/fence/receipt-revision/governance profile. A diagnostic
+//!   bootstrap (always the no-task case) is never Material authority.
+//!   Designated caller
+//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition);
+//!   STITCH until that gate passes the admitted bootstrap.
 //!
 //! No entry creates a second write path, re-derives a downstream layer's
 //! decision, or accepts a task the caller did not name.
@@ -2075,6 +2090,74 @@ pub fn admit_bootstrap_context(
     }
 }
 
+/// Requires one sealed task-bound dispatch identity to rest on its
+/// owner-evidenced Material bootstrap (issue #1746, W5/A4; I7.8 step 4).
+///
+/// Joins the [`TaskBindingAdmission::TaskBound`] identity
+/// ([`admit_canonical_write`]) to the [`BootstrapAdmission`] assembled from
+/// the real owners ([`admit_bootstrap_context`]): a task-bound effect proceeds
+/// toward the #1742 Material gate
+/// (`GovernorComposition::commit_canonical_with_readiness`) only when the
+/// bootstrap is `Material` and names the same admitted task, `WorkScope`,
+/// presented fence, receipt revision, and governance profile reference as the
+/// sealed binding. Anything else fails closed with a typed error and admits
+/// nothing: `Diagnostic` (including a bootstrap without a task, which always
+/// lands there) withholds with `TASK_SCOPE_INCOMPATIBLE` — a diagnostic
+/// bootstrap is never Material authority — and `IntakeRequired` withholds
+/// with `TASK_SELECTION_REQUIRED`. A moved task, scope, fence, or
+/// bootstrap/profile revision conflicts for rebind; it is never rewritten
+/// under the old operation identity.
+///
+/// Cold/unbound and non-task-relative admissions carry no sealed identity and
+/// pass through untouched. This entry mints nothing and selects nothing.
+///
+/// Designated caller (STITCH, daemon composition lane):
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
+/// between the admission projection and the #1742 material gate, passing the
+/// admitted binding and the bootstrap admitted for the same lease at the write
+/// fence.
+pub fn require_material_bootstrap_for_task_bound(
+    binding: &DispatchedBinding,
+    bootstrap: &BootstrapAdmission,
+) -> Result<(), TaskBindingError> {
+    let material = match bootstrap {
+        BootstrapAdmission::Material(material) => material,
+        BootstrapAdmission::Diagnostic { reason, .. } => {
+            return Err(TaskBindingError::scope_incompatible(format!(
+                "task-bound dispatch rests on a diagnostic bootstrap, never Material authority: {reason}"
+            )));
+        }
+        BootstrapAdmission::IntakeRequired(_) => {
+            return Err(TaskBindingError::selection_required(
+                "task-bound dispatch has no selected task; answer with the bounded intake shape",
+            ));
+        }
+    };
+    if material.task.task_ref != binding.admitted_task_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap names another task than the admitted binding; rebind, no rewrite",
+        ));
+    }
+    if material.scope_ref != binding.scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap names another WorkScope than the admitted binding; rebind, no rewrite",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(&material.state_fence, &binding.presented_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap was assembled at another fence; rebind at the live fence, no silent rebind",
+        ));
+    }
+    if material.receipt_revision != binding.receipt_revision
+        || material.governance_profile_ref != binding.governance_profile_ref
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap/profile revision moved before effect; rebind at the live revision, no silent rebind",
+        ));
+    }
+    Ok(())
+}
+
 /// Computes the `TaskContract` compatibility disposition for one write from
 /// the caller's receipt: the selection is compatible only when the receipt was
 /// compiled at the exact write fence and resolved the exact `WorkScope` the
@@ -2293,6 +2376,47 @@ pub fn admit_canonical_write(
     }
 
     Ok(TaskBindingAdmission::NotTaskRelative)
+}
+
+/// Admits one daemon named-mutation write with the live activation
+/// applicability recheck joined in (issue #1746, W4/A2).
+///
+/// This is [`admit_canonical_write`] preceded by
+/// [`bind_current_task_selection`]: the owner-compiled receipt's acceptance
+/// digest, `TaskContract` revision, `WorkScope`, and owner-proven selection
+/// source/evidence must name exactly what the activation route proved at the
+/// write fence — principal, session, task, non-zero revision, and `WorkScope`.
+/// A receipt that structurally validates but names another task, a moved
+/// revision, another scope, or another fence than the live activation fails
+/// closed here with `TASK_SCOPE_INCOMPATIBLE` before any admission runs, so a
+/// wrong workspace/task or stale selection can never receive a task-bound
+/// write. Absent/ambiguous/exploratory/stale dispositions fall through to
+/// [`admit_canonical_write`], which maps them to the cold candidate, the
+/// bounded intake answer, or the typed error without ever promoting.
+///
+/// Structural validation of request-supplied `TaskSelectionEvidence` is never
+/// sufficient: a `Current` receipt with no owner-validated activation snapshot
+/// (`activation = None`) fails closed rather than admitting on the receipt
+/// alone. No task is created to remove an absence, none is chosen from
+/// ambiguity, and no cold capture is retroactively attached.
+///
+/// Designated caller (STITCH, daemon composition lane):
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
+/// passing the activation snapshot the activation lane resolved for this
+/// session at the write fence. Until that lane retains the snapshot, no live
+/// caller supplies `activation` and this entry stays wired but unreached; the
+/// fence-leg revalidation behind it ([`revalidate_task_bound_for_effect`]) is
+/// the live leg.
+pub fn admit_canonical_write_with_activation(
+    candidate_id: String,
+    context: &RequestMetadata,
+    envelope: &CanonicalWriteEnvelope,
+    receipt: &OnboardingReadinessReceipt,
+    write_fence: &StateFence,
+    activation: Option<&eliot_governor::GovernorActivationSnapshot>,
+) -> Result<TaskBindingAdmission, TaskBindingError> {
+    bind_current_task_selection(activation, receipt, write_fence)?;
+    admit_canonical_write(candidate_id, context, envelope, receipt, write_fence)
 }
 
 /// Admitted operation/payload identity carried through dispatch
