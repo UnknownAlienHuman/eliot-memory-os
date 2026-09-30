@@ -103,15 +103,16 @@ use eliot_contracts::{
     ClockReading, ContractId, EpochContractError, EpochId, EpochLineageId, ProductId, RequestId,
     RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
 };
-use eliot_instrument_api::{ExecutionStatus, InstrumentContractError, InstrumentInvocation};
+use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
     ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
     InstrumentRegistry, InstrumentRequestPort, InstrumentRun, InstrumentRunner, InstrumentSpec,
     ParityVerdict, PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment,
     StageEvidence, StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout,
     VerificationProfileReceipt, VerificationRouteRequest, WorkScope, admitted_profile_for_alias,
-    parity_summary, profile::{PROFILE_ALIASES, builtin_specs}, resolve_verification_route,
-    verify_profile_parity,
+    parity_summary,
+    profile::{PROFILE_ALIASES, builtin_specs},
+    resolve_verification_route, verify_profile_parity,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
@@ -633,8 +634,9 @@ fn require_launched_stage(
         // owner below. A stage that launched cannot appear here — this branch
         // only runs when none did — so each entry is a real per-stage refusal or
         // a stage the aggregate could not match, never a synthesized guess.
-        write!(detail, "; {}", stage_refusal_detail(&aggregate.runs))
-            .map_err(|_| CliError::Contract("stage refusal detail is not formattable".to_owned()))?;
+        write!(detail, "; {}", stage_refusal_detail(&aggregate.runs)?).map_err(|_| {
+            CliError::Contract("stage refusal detail is not formattable".to_owned())
+        })?;
         return Err(CliError::Contract(detail));
     }
     Ok(())
@@ -652,7 +654,7 @@ fn require_launched_stage(
 /// orchestrator-authored reason are all single-line, but a sanitized rendering
 /// is what keeps a caller parsing one entry per line from ever seeing a second
 /// line that looks like a verdict.
-fn stage_refusal_detail(runs: &[InstrumentRun]) -> String {
+fn stage_refusal_detail(runs: &[InstrumentRun]) -> Result<String, CliError> {
     let mut detail = String::new();
     // One entry per stage, every time: the loop appends to `detail` rather than
     // returning from inside the match, so a second stage's refusal cannot end
@@ -664,35 +666,43 @@ fn stage_refusal_detail(runs: &[InstrumentRun]) -> String {
         let evidence = match &run.evidence {
             StageEvidence::Retained { .. } => "RETAINED",
             StageEvidence::Omitted { reason } => {
-                detail.push_str(&format!(
+                write!(
+                    detail,
                     "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage={} execution={:?} evidence=OMITTED reason={}",
                     single_line(run.stage.stage_id.as_str()),
                     run.execution,
                     single_line(reason),
-                ));
+                )
+                .map_err(|_| CliError::Contract("stage refusal detail is not formattable".to_owned()))?;
                 continue;
             }
             StageEvidence::Missing { reason } => {
-                detail.push_str(&format!(
+                write!(
+                    detail,
                     "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage={} execution={:?} evidence=MISSING reason={}",
                     single_line(run.stage.stage_id.as_str()),
                     run.execution,
                     single_line(reason),
-                ));
+                )
+                .map_err(|_| CliError::Contract("stage refusal detail is not formattable".to_owned()))?;
                 continue;
             }
         };
-        detail.push_str(&format!(
+        write!(
+            detail,
             "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage={} execution={:?} evidence={evidence} tool_identity=absent",
             single_line(run.stage.stage_id.as_str()),
             run.execution,
-        ));
+        )
+        .map_err(|_| CliError::Contract("stage refusal detail is not formattable".to_owned()))?;
     }
     if detail.is_empty() {
-        return "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage=none admitted_stages=0: the admitted plan declared no stage, so no per-stage refusal exists to report"
-            .to_owned();
+        return Ok(
+            "VERIFY_PROFILE_RESOLVER_STAGE_REFUSAL stage=none admitted_stages=0: the admitted plan declared no stage, so no per-stage refusal exists to report"
+                .to_owned(),
+        );
     }
-    detail
+    Ok(detail)
 }
 
 /// Collapses one rendered refusal field onto a single greppable line.
@@ -1046,7 +1056,7 @@ fn seal_version_request(
     // identity and consumed by that one launch. Taking only the request out of
     // the pair leaves the registered context behind, which is what lets the read
     // validate under the context it sealed with.
-    cell.register_context(operation, dispatch.context)?;
+    cell.register_context(operation.as_str(), dispatch.context)?;
     Ok(dispatch.request)
 }
 
@@ -1341,14 +1351,14 @@ impl DispatchCell {
     /// is already bound to.
     fn register_context(
         &self,
-        operation: String,
+        operation: &str,
         context: DispatchValidationContext,
     ) -> Result<(), CliError> {
         if self
             .context
             .lock()
             .map_err(|_| CliError::Contract("validation context lock poisoned".to_owned()))?
-            .insert(operation.clone(), context)
+            .insert(operation.to_owned(), context)
             .is_some()
         {
             return Err(CliError::Contract(format!(
@@ -1410,13 +1420,16 @@ impl DispatchValidationPort for DispatchCell {
         request: ProcessRequest,
         observed: SuspendedProcessIdentity,
     ) -> Result<ValidatedDispatch, ProcessExecutionError> {
-        let context = resolve_validation_context(
-            self.context.lock().map_err(|_| {
+        // Resolve against this request's OWN sealed context before the authority lock
+        // is taken, so a stage is never validated against a sibling's fence,
+        // epoch or revision heads. The guard is released before the authority is
+        // locked so the two locks are never held at once.
+        let context = {
+            let sealed_contexts = self.context.lock().map_err(|_| {
                 ProcessExecutionError::Unavailable("validation context poisoned".to_owned())
-            })?
-            .as_ref(),
-            &request,
-        )?;
+            })?;
+            resolve_validation_context(&sealed_contexts, &request)?
+        };
         self.authority
             .lock()
             .map_err(|_| ProcessExecutionError::Unavailable("authority lock poisoned".to_owned()))?
@@ -1612,7 +1625,7 @@ impl StagePort {
             .map_err(|_| CliError::Contract("sealed stage context map poisoned".to_owned()))?
             .clone();
         for (operation, context) in contexts {
-            cell.register_context(operation, context)?;
+            cell.register_context(operation.as_str(), context)?;
         }
         Ok(())
     }
