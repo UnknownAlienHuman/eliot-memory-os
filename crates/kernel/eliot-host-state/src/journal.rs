@@ -9,12 +9,13 @@ use thiserror::Error;
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    AppliedOperation, BackupPreparationState, CutoverIntentState, DrainState, EliotActivationRecord,
-    EpochEvidence, EpochRetirementRecord, HostInstallationEpoch, HostState, HostStateRecord,
-    IdempotencyIdentity, PredecessorRetirementRelation, RecordFence, RecoveryLineageReason,
-    WakeCancellationBatchProjection, activation_transition, backup_preparation_transition,
-    dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
-    kernel_transition, store_rebind_transition, wake_transition,
+    AppliedOperation, BackupPreparationState, CutoverIntentState, DrainState,
+    EliotActivationRecord, EpochEvidence, EpochRetirementRecord, HostInstallationEpoch, HostState,
+    HostStateRecord, IdempotencyIdentity, PredecessorRetirementRelation, RecordFence,
+    RecoveryLineageReason, WakeCancellationBatchProjection, activation_transition,
+    backup_preparation_transition, dependency_transition, drain_transition,
+    epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition,
+    wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
