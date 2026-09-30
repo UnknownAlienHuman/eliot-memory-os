@@ -1649,6 +1649,135 @@ fn rebuild_admission_by_definition(
     Ok(admission_by_definition)
 }
 
+/// Validates every recovered admission and indexes it under its definition.
+///
+/// Recovery treats a supplied admission as a claim to be re-proved, not as
+/// truth: the map key must equal the record's own identity, the definition it
+/// names must exist and be frozen rather than a draft, the admission must bind
+/// that definition, its ceilings must narrow rather than widen the definition's,
+/// and two admissions claiming one definition is a conflict rather than a
+/// last-writer-wins.
+fn index_recovered_admissions(
+    definitions: &BTreeMap<String, SwarmPlanDefinition>,
+    admissions: &BTreeMap<String, SwarmPlanAdmission>,
+) -> Result<BTreeMap<String, String>, FabricError> {
+    let mut admission_by_definition: BTreeMap<String, String> = BTreeMap::new();
+    for (key, admission) in admissions {
+        admission.validate().map_err(contract_rejection)?;
+        if key != admission.admission_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "recovered semantic admission map key does not match record identity".to_owned(),
+            ));
+        }
+        let definition_key = admission.definition_id.as_str();
+        let definition = definitions.get(definition_key).ok_or_else(|| {
+            FabricError::BrokenOwnershipLink(
+                "recovered semantic admission without its stored definition".to_owned(),
+            )
+        })?;
+        if definition.lifecycle == SwarmPlanDefinitionLifecycle::Draft
+            || !admission.binds(definition)
+        {
+            return Err(FabricError::BrokenOwnershipLink(
+                "recovered semantic admission does not bind its frozen definition".to_owned(),
+            ));
+        }
+        if !admission
+            .admitted_ceilings
+            .narrowed_from(&definition.ceilings)
+        {
+            return Err(FabricError::SemanticDrift(
+                "recovered semantic admission widens definition ceilings".to_owned(),
+            ));
+        }
+        if admission_by_definition
+            .insert(definition_key.to_owned(), key.clone())
+            .is_some()
+        {
+            return Err(FabricError::DefinitionConflict(format!(
+                "recovered semantic definition {definition_key} has conflicting admissions"
+            )));
+        }
+    }
+    Ok(admission_by_definition)
+}
+
+/// The two join directions recovery derives from the stored executions.
+///
+/// Both are rebuilt from the records themselves rather than accepted from a
+/// supplied index, so a contradictory snapshot cannot smuggle in a link the
+/// committed records do not support.
+type RecoveredExecutionIndex = (BTreeMap<String, String>, BTreeMap<String, String>);
+
+/// Validates every recovered execution and indexes both join directions.
+///
+/// Each execution is re-proved against the records it names: the map key must
+/// equal its own identity, its definition and admission must exist, the whole
+/// join is re-checked with the owner's own `check_owner_join`, and then the
+/// live-coherence decision a rest state must satisfy is added on top — an
+/// execution may rest under a replaced definition only under a matching
+/// terminal admission disposition, never under a still-`Admitted` one. Two
+/// executions claiming one definition, or one execution claiming two, are
+/// conflicts rather than a last-writer-wins.
+fn index_recovered_executions(
+    definitions: &BTreeMap<String, SwarmPlanDefinition>,
+    admissions: &BTreeMap<String, SwarmPlanAdmission>,
+    executions: &BTreeMap<String, SwarmExecutionRevision>,
+) -> Result<RecoveredExecutionIndex, FabricError> {
+    let mut execution_by_definition: BTreeMap<String, String> = BTreeMap::new();
+    let mut definition_by_execution: BTreeMap<String, String> = BTreeMap::new();
+    for (key, execution) in executions {
+        execution.validate().map_err(contract_rejection)?;
+        if key != execution.execution_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "recovered semantic execution map key does not match record identity".to_owned(),
+            ));
+        }
+        let definition = definitions
+            .get(execution.definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "recovered semantic execution without its stored definition".to_owned(),
+                )
+            })?;
+        let admission = admissions
+            .get(execution.admission_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "recovered semantic execution without its stored admission".to_owned(),
+                )
+            })?;
+        check_owner_join(definition, admission, execution).map_err(contract_rejection)?;
+        if definition.lifecycle == SwarmPlanDefinitionLifecycle::Superseded
+            && admission.disposition == SwarmPlanAdmissionDisposition::Admitted
+        {
+            return Err(FabricError::Superseded(format!(
+                "recovered execution {key} still runs under admission {} of superseded definition {}",
+                admission.admission_id.as_str(),
+                execution.definition_id.as_str()
+            )));
+        }
+        if definition_by_execution
+            .insert(key.clone(), execution.definition_id.as_str().to_owned())
+            .is_some()
+        {
+            return Err(FabricError::DefinitionConflict(format!(
+                "recovered semantic execution {key} claims two definitions"
+            )));
+        }
+        if execution_by_definition
+            .insert(execution.definition_id.as_str().to_owned(), key.clone())
+            .is_some()
+        {
+            return Err(FabricError::DefinitionConflict(format!(
+                "recovered semantic definition {} has conflicting executions",
+                execution.definition_id.as_str()
+            )));
+        }
+    }
+    Ok((execution_by_definition, definition_by_execution))
+}
+
 /// Rebuilds the recovered owner-separated view as a PROJECTION over the
 /// committed records, verifying each record and each link exactly as fresh
 /// admission does (issue #1702 W6/A5).
@@ -1689,9 +1818,6 @@ fn recover_semantic_history(
         executions,
         supersessions,
     } = history;
-    let mut admission_by_definition: BTreeMap<String, String> = BTreeMap::new();
-    let mut execution_by_definition: BTreeMap<String, String> = BTreeMap::new();
-    let mut definition_by_execution: BTreeMap<String, String> = BTreeMap::new();
 
     for (key, definition) in &definitions {
         definition.validate().map_err(contract_rejection)?;
@@ -1701,98 +1827,9 @@ fn recover_semantic_history(
             ));
         }
     }
-    for (key, admission) in &admissions {
-        admission.validate().map_err(contract_rejection)?;
-        if key != admission.admission_id.as_str() {
-            return Err(FabricError::BrokenOwnershipLink(
-                "recovered semantic admission map key does not match record identity".to_owned(),
-            ));
-        }
-        let definition_key = admission.definition_id.as_str();
-        let definition = definitions.get(definition_key).ok_or_else(|| {
-            FabricError::BrokenOwnershipLink(
-                "recovered semantic admission without its stored definition".to_owned(),
-            )
-        })?;
-        if definition.lifecycle == SwarmPlanDefinitionLifecycle::Draft
-            || !admission.binds(definition)
-        {
-            return Err(FabricError::BrokenOwnershipLink(
-                "recovered semantic admission does not bind its frozen definition".to_owned(),
-            ));
-        }
-        if !admission
-            .admitted_ceilings
-            .narrowed_from(&definition.ceilings)
-        {
-            return Err(FabricError::SemanticDrift(
-                "recovered semantic admission widens definition ceilings".to_owned(),
-            ));
-        }
-        if admission_by_definition
-            .insert(definition_key.to_owned(), key.clone())
-            .is_some()
-        {
-            return Err(FabricError::DefinitionConflict(format!(
-                "recovered semantic definition {definition_key} has conflicting admissions"
-            )));
-        }
-    }
-    for (key, execution) in &executions {
-        execution.validate().map_err(contract_rejection)?;
-        if key != execution.execution_id.as_str() {
-            return Err(FabricError::BrokenOwnershipLink(
-                "recovered semantic execution map key does not match record identity".to_owned(),
-            ));
-        }
-        let definition = definitions
-            .get(execution.definition_id.as_str())
-            .ok_or_else(|| {
-                FabricError::BrokenOwnershipLink(
-                    "recovered semantic execution without its stored definition".to_owned(),
-                )
-            })?;
-        let admission = admissions
-            .get(execution.admission_id.as_str())
-            .ok_or_else(|| {
-                FabricError::BrokenOwnershipLink(
-                    "recovered semantic execution without its stored admission".to_owned(),
-                )
-            })?;
-        // Recovery validates the whole stored join, then adds the
-        // live-coherence decision a rest state must satisfy: an execution may
-        // rest under a replaced definition only under a matching terminal
-        // admission disposition, never under a still-admitted one.
-        check_owner_join(definition, admission, execution).map_err(contract_rejection)?;
-        if definition.lifecycle == SwarmPlanDefinitionLifecycle::Superseded
-            && admission.disposition == SwarmPlanAdmissionDisposition::Admitted
-        {
-            return Err(FabricError::Superseded(format!(
-                "recovered execution {} still runs under admission {} of superseded definition {}",
-                key,
-                admission.admission_id.as_str(),
-                execution.definition_id.as_str()
-            )));
-        }
-        if definition_by_execution
-            .insert(key.clone(), execution.definition_id.as_str().to_owned())
-            .is_some()
-        {
-            return Err(FabricError::DefinitionConflict(format!(
-                "recovered semantic execution {} claims two definitions",
-                key
-            )));
-        }
-        if execution_by_definition
-            .insert(execution.definition_id.as_str().to_owned(), key.clone())
-            .is_some()
-        {
-            return Err(FabricError::DefinitionConflict(format!(
-                "recovered semantic definition {} has conflicting executions",
-                execution.definition_id.as_str()
-            )));
-        }
-    }
+    let admission_by_definition = index_recovered_admissions(&definitions, &admissions)?;
+    let (execution_by_definition, definition_by_execution) =
+        index_recovered_executions(&definitions, &admissions, &executions)?;
     for (key, link) in &supersessions {
         let next = definitions.get(key).ok_or_else(|| {
             FabricError::BrokenOwnershipLink(
@@ -1826,9 +1863,12 @@ fn recover_semantic_history(
     let mut advanceable_executions = Vec::new();
     let mut fenced_executions = Vec::new();
     for (key, execution) in &executions {
-        let still_admitted = admissions
-            .get(execution.admission_id.as_str())
-            .is_some_and(|admission| admission.disposition == SwarmPlanAdmissionDisposition::Admitted);
+        let still_admitted =
+            admissions
+                .get(execution.admission_id.as_str())
+                .is_some_and(|admission| {
+                    admission.disposition == SwarmPlanAdmissionDisposition::Admitted
+                });
         let definition_key = execution.definition_id.as_str();
         let still_frozen = definitions
             .get(definition_key)
@@ -1864,8 +1904,10 @@ fn recover_semantic_history(
         .collect();
     heads.sort_unstable();
     let current_definition_id = match heads.as_slice() {
-        [] => None,
         [head] => Some((*head).to_owned()),
+        // No unreplaced definition, or more than one: there is no single current
+        // authority to name, and guessing one would restore authority that
+        // recovery did not establish.
         _ => None,
     };
 
@@ -2382,9 +2424,7 @@ impl AgentFabric {
     /// no store is attached or the committed envelope cannot be loaded and
     /// verified, and the mapped semantic refusal for a record set recovery
     /// cannot resolve.
-    pub fn rehydrate_committed_history(
-        &mut self,
-    ) -> Result<RecoveredSemanticHistory, FabricError> {
+    pub fn rehydrate_committed_history(&mut self) -> Result<RecoveredSemanticHistory, FabricError> {
         let store = self.semantic_revisions.clone().ok_or_else(|| {
             FabricError::DurabilityUnproven(
                 "rehydrating owner-separated history requires an attached durable store".to_owned(),
@@ -3357,19 +3397,20 @@ impl AgentFabric {
         // an unreplaced definition, a `DRAIN`ed one, and a replacement that has
         // not been proposed yet all rebind normally.
         let definition_key = stored.definition_id.as_str();
-        if let Some(link) = self
+        let revoked = self
             .semantic_supersessions
             .values()
             .find(|link| link.prior_definition_id.as_str() == definition_key)
-        {
-            if matches!(
-                link.disposition,
-                OldWaveDisposition::Cancel | OldWaveDisposition::Supersede
-            ) {
-                return Err(FabricError::Superseded(format!(
-                    "semantic execution {key} belongs to a wave revoked by disposition; reconcile it under the replacement instead of reassigning it"
-                )));
-            }
+            .is_some_and(|link| {
+                matches!(
+                    link.disposition,
+                    OldWaveDisposition::Cancel | OldWaveDisposition::Supersede
+                )
+            });
+        if revoked {
+            return Err(FabricError::Superseded(format!(
+                "semantic execution {key} belongs to a wave revoked by disposition; reconcile it under the replacement instead of reassigning it"
+            )));
         }
         let next = reassign_coordinator(&stored, new_coordinator).map_err(contract_rejection)?;
         let record = serde_json::to_value(&next).map_err(|error| {
