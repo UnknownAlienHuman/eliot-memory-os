@@ -45,7 +45,9 @@ use eliot_ipc::{Session, TransportError};
 // claim/replay import pattern). This route consumes the owner types by
 // value; it defines no capability semantics of its own.
 use eliot_kernel_service::{
-    KernelService, PROVIDER_CAPABILITY_WIRE_VERSION, ProviderCapabilityError,
+    KernelService, NativeWorkerExecutionAdmissionEvidence,
+    NativeWorkerExecutionAdmissionPhase, PROVIDER_CAPABILITY_WIRE_VERSION,
+    ProviderCapabilityError,
     ProviderCapabilityExpectation, ProviderCapabilityRequest, ProviderProofKind,
     verify_provider_capability,
 };
@@ -551,6 +553,20 @@ impl KernelComposition {
         let worker_generation = require_capability_generation(payload, "worker_generation")?;
         let fence_digest = require_capability_digest(payload, "fence_digest")?;
         let context = self.provider_capability_for_session(session)?;
+        let original_execution = self.original_native_worker_execution_admission(&claim_id)?;
+        let original = &original_execution.request;
+        if original.claim_id != claim_id
+            || original.attempt_id != attempt_id
+            || original.operation_id != operation_id
+            || original.binding_digest != binding_digest
+            || original.worker_generation != worker_generation
+            || original_execution.executable_binding.executable_binding_digest
+                != executable_digest
+        {
+            return Err(ProviderCapabilityRouteError::BindingMismatch(
+                bounded_identity(&claim_id),
+            ));
+        }
         context.verify_claim_binding(&claim_id, worker_generation, &fence_digest)?;
         context.verify(
             proof_kind,
@@ -582,6 +598,58 @@ impl KernelComposition {
             "verified_at_unix_ms": unix_ms(),
         });
         seal_capability_receipt(body)
+    }
+}
+
+impl KernelComposition {
+    /// Loads and revalidates the original Kernel-owned executable admission
+    /// for a provider-capability proof. This joins the request and immutable
+    /// claim receipt retained by the dispatch owner to the exact current ORS
+    /// row, then rechecks the live capability-cell registry and activation
+    /// generation. Request-supplied executable digests are compared only
+    /// after this independent owner read; they never stand in for the owner
+    /// record.
+    fn original_native_worker_execution_admission(
+        &self,
+        claim_id: &str,
+    ) -> Result<NativeWorkerExecutionAdmissionEvidence, ProviderCapabilityRouteError> {
+        let original = super::dispatch_launch::native_worker_prelaunch_admission(claim_id)
+            .map_err(|_| {
+                ProviderCapabilityRouteError::Session(
+                    "dispatch owner has no original native-worker admission".to_owned(),
+                )
+            })?;
+        if matches!(
+            original.phase,
+            NativeWorkerExecutionAdmissionPhase::Unreconciled
+                | NativeWorkerExecutionAdmissionPhase::Reconciled
+        ) {
+            return Err(ProviderCapabilityRouteError::Session(
+                "original native-worker admission is no longer current".to_owned(),
+            ));
+        }
+        let durable = self.load_claim_record(claim_id).map_err(|_| {
+            ProviderCapabilityRouteError::Store(
+                "native-worker durable claim record is unavailable".to_owned(),
+            )
+        })?;
+        let evidence = NativeWorkerExecutionAdmissionEvidence::from_owner_records(
+            &original.request,
+            &original.claim_receipt,
+            &durable,
+        )
+        .map_err(|_| {
+            ProviderCapabilityRouteError::Session(
+                "original native-worker admission linkage is invalid".to_owned(),
+            )
+        })?;
+        self.validate_prelaunch_native_worker_execution_admission(&evidence)
+            .map_err(|_| {
+                ProviderCapabilityRouteError::Session(
+                    "original native-worker capability binding is stale".to_owned(),
+                )
+            })?;
+        Ok(evidence)
     }
 }
 
