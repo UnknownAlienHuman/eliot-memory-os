@@ -6586,6 +6586,38 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Reads current Policy and WorkScope owners for a cold Host capture from
+    /// the exact original Kernel peer-admission receipt. The receipt is the
+    /// host-origin authority; this path creates no semantic principal,
+    /// Session, or task identity.
+    pub fn observation_capture_owner_binding_for_host_origin(
+        &self,
+        peer_admission_receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        peer_admission_receipt
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        let request_fence = &peer_admission_receipt.state_fence;
+        if request_fence != &self.snapshot.state_fence()
+            || request_fence != &self.recovery.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "Host Observe owner read is not at the exact retained receipt fence".to_owned(),
+            ));
+        }
+        self.observation_capture_owner_binding_for_origin_at_fence(
+            crate::ObservationCaptureOwnerOrigin::HostPeer {
+                domain: crate::ObservationCaptureHostOriginDomain::AgentBridge,
+                peer_admission_receipt: peer_admission_receipt.clone(),
+            },
+            request_fence,
+            None,
+        )
+    }
+
     fn observation_capture_owner_binding_for_activation_inner(
         &self,
         activation: &GovernorActivationSnapshot,
@@ -6683,6 +6715,48 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "authenticated Observe principal does not match the Session owner actor".to_owned(),
             ));
         }
+        if let Some(selection) = task_selection {
+            let evidence = selection.evidence();
+            evidence
+                .validate()
+                .map_err(|error| CompositionError::from(error))?;
+            let work_scope = self.current_work_scope_binding_at_retained_fence()?;
+            if expected_task_ref != Some(selection.task_ref())
+                || selection.task_ref() != evidence.task_ref
+                || selection.session_ref() != session_id.as_str()
+                || selection.principal_ref() != authenticated_principal_ref
+                || selection.state_fence() != request_fence
+                || selection.work_scope() != &work_scope
+                || evidence.work_scope_ref != work_scope.binding.scope.scope_ref
+                || evidence.task_revision != selection.task_revision()
+                || evidence.acceptance_digest != selection.acceptance_digest()
+                || request_fence.task_revision.map(TaskRevision::value)
+                    != Some(selection.task_revision())
+            {
+                return Err(CompositionError::Kernel(
+                    KernelPortError::TaskScopeIncompatible,
+                ));
+            }
+        }
+        let origin = crate::ObservationCaptureOwnerOrigin::ApplicationSession {
+            authenticated_principal_ref: authenticated_principal_ref.to_owned(),
+            authenticated_session_ref: session_id.as_str().to_owned(),
+            authenticated_task_ref: task_selection
+                .map(|selection| selection.evidence().task_ref.clone()),
+        };
+        self.observation_capture_owner_binding_for_origin_at_fence(
+            origin,
+            request_fence,
+            expected_scope_ref,
+        )
+    }
+
+    fn observation_capture_owner_binding_for_origin_at_fence(
+        &self,
+        origin: crate::ObservationCaptureOwnerOrigin,
+        request_fence: &StateFence,
+        expected_scope_ref: Option<&str>,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
         let policy = self.current_observation_ingress_policy_at_retained_fence()?;
         let policy_read = self.recovery.policy_read.as_ref().ok_or_else(|| {
             CompositionError::Recovery(
@@ -6701,46 +6775,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let work_scope_read = self.recovery.owner_read(RecoveryOwner::WorkScope)?;
         if work_scope_read.state_fence != *request_fence
             || work_scope_read.revision != work_scope.owner_revision
-            || expected_scope_ref.is_some_and(|scope_ref| {
-                scope_ref != work_scope.binding.scope.scope_ref
-            })
+            || expected_scope_ref
+                .is_some_and(|scope_ref| scope_ref != work_scope.binding.scope.scope_ref)
             || !is_sha256(&work_scope_read.value_digest)
         {
             return Err(CompositionError::Recovery(
                 "WorkScope named-read source does not match its current owner projection".to_owned(),
             ));
         }
-        if let Some(selection) = task_selection {
-            let evidence = selection.evidence();
-            evidence
-                .validate()
-                .map_err(|error| CompositionError::from(error))?;
-            if expected_task_ref != Some(selection.task_ref())
-                || selection.task_ref() != evidence.task_ref
-                || selection.session_ref() != session_id.as_str()
-                || selection.principal_ref() != authenticated_principal_ref
-                || selection.state_fence() != request_fence
-                || selection.work_scope() != &work_scope
-                || evidence.work_scope_ref != work_scope.binding.scope.scope_ref
-                || evidence.task_revision != selection.task_revision()
-                || evidence.acceptance_digest != selection.acceptance_digest()
-                || request_fence.task_revision.map(TaskRevision::value)
-                    != Some(selection.task_revision())
-            {
-                return Err(CompositionError::Kernel(
-                    KernelPortError::TaskScopeIncompatible,
-                ));
-            }
-        }
         let policy_value = serde_json::to_value(policy.policy)
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
         let work_scope_privacy = work_scope.binding.privacy_class;
         let binding = crate::ObservationCaptureOwnerBinding {
             wire_version: 1,
-            authenticated_principal_ref: authenticated_principal_ref.to_owned(),
-            authenticated_session_ref: session_id.as_str().to_owned(),
-            authenticated_task_ref: task_selection
-                .map(|selection| selection.evidence().task_ref.clone()),
+            origin,
             authenticated_scope_ref: work_scope.binding.scope.scope_ref.clone(),
             state_fence: request_fence.clone(),
             policy_owner_revision: policy.policy_revision,

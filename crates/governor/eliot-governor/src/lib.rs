@@ -220,8 +220,9 @@ pub use migration_inventory::{
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, McpObservationCaptureInput, NegativeMemoryGateObservation,
     NegativeMemoryGateOutcome, ObservationCaptureAccess, ObservationCaptureOwnerBinding,
-    ObservationCapturePolicyAccess,
-    ObservationCaptureVisibility, ObservationIngressPolicyBinding, PreparedMcpObservation,
+    ObservationCaptureOwnerOrigin, ObservationCaptureHostOriginDomain,
+    ObservationCapturePolicyAccess, ObservationCaptureVisibility, ObservationIngressPolicyBinding,
+    PreparedMcpObservation,
     WatchdogAdmittedEntry, WatchdogEntryAdmission, WatchdogEntryKind,
 };
 pub use opencode_action_gate::{
