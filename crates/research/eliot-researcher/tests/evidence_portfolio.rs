@@ -483,6 +483,11 @@ fn source_outside_claim_authority_domain() {
         .ingest(foreign, "primary#0")
         .expect("ingest foreign");
     let manifest = manifest_for(&portfolio, &inquiry);
+    // `AuditedClaim::excerpts` is the quoted-text side of the boundary that
+    // only `audit_claim_with_excerpts` consumes. These cases exercise the
+    // citation/opposition/accounting rules through `audit_claim` and offer no
+    // admitted excerpt, so the honest literal is the empty vector rather than a
+    // fabricated quote.
     let claim = AuditedClaim {
         claim_id: "claim-domain".to_owned(),
         statement: "the alloy survives".to_owned(),
@@ -494,6 +499,7 @@ fn source_outside_claim_authority_domain() {
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: Vec::new(),
     };
     let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::Unsupported);
@@ -558,6 +564,7 @@ fn stale_partial_and_contested_sources_limit_grade() {
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: Vec::new(),
     };
     let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
     // The old fixture listed `rival-src` as a citation AND as a counterclaim and
@@ -955,6 +962,7 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         unknown_refs: vec!["unread-dossier-9".to_owned()],
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: Vec::new(),
     };
     let verdict = audit_claim(&hidden_unknown, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
@@ -971,6 +979,7 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: Vec::new(),
     };
     let verdict = audit_claim(&bare, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
@@ -985,6 +994,7 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: Vec::new(),
     };
     // A claim with no frozen identity cannot be released as supported: there is
     // nothing to check its wording and revision against, so `MethodArtifact-

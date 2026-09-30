@@ -4201,7 +4201,16 @@ fn physical_supervision_signer_unseals_only_with_exact_eliot_host_service_sid_to
         eliot_runtime_contracts::SUPERVISION_AUTHORITY_HOST_SERVICE,
     )
     .expect("resolve exact EliotHost service SID");
-    assert_eq!(live_sid, authority.key_reference.host_service_sid);
+    // `SupervisionAuthorityKeyReference` is a profile-specific enum, and this
+    // gate runs in the installed `NT SERVICE\EliotHost` token, so the exact
+    // service SID can only be carried by the `SystemService` variant. Reading
+    // it through the owner's `as_system_service` also asserts that variant,
+    // which a flat field read on the enum could never have done.
+    let key_reference = authority
+        .key_reference
+        .as_system_service()
+        .expect("physical SystemService gate requires the sealed EliotHost key reference");
+    assert_eq!(live_sid, key_reference.host_service_sid);
     let signer = ProtectedSupervisionLeaseSigner::new_for_profile(
         kernel_root,
         eliot_installation::InstallationProfile::SystemService,
