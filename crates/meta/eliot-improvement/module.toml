@@ -31,18 +31,39 @@ primary_responsibility = "Declare, bound, deduplicate and close improvement cand
 # and the package has real production consumers today.
 disposition = "keep"
 
+# W3 evidence, measured by reverse consumer on this branch. Six manifests declare
+# a Cargo dependency on this package, but a declared dependency is not a
+# production consumer, and the issue's own instruction is to begin there. Only
+# ONE leg reaches a production entry point:
+#
+#   bins/eliotd/src/main.rs daemon_runtime::run -> run_loop ->
+#   maybe_start_improvement_intake -> run_improvement_intake ->
+#   improvement_intake_artifact -> assemble_improvement_artifact
+#   (bins/eliotd/src/improvement_intake_dispatch.rs), and the same pass's
+#   consumer leg through dispatch_improvement_candidate_route ->
+#   commit_unknown_effect_obligation, with crates/meta/eliot-self-quality
+#   reached from inside that leg for the conformance-diagnosis arm.
+#
+# The other four dependents reach this package only from functions that have no
+# production caller: admit_governed_host
+# (bins/eliot-wasm-host/src/governed_admission.rs:173),
+# admit_context_with_learning and assemble_active_view_with_learning. And
+# crates/smart/eliot-context-compiler-wasm is not a root workspace member at
+# all. They are named here as what they are, not as live consumers.
+disposition_evidence = "live candidate/proposal contract: the eliotd improvement intake and candidate route are the production consumers, and every authority-bearing value (proof ceiling, effect class, permits, promotion receipts) is fixed in the Governor admission owner and read by no API here"
+
 # I2.23 `CrateExtractionDecision` fields, filled for this package.
-affected_functional_cells_and_lifecycle_owners = "meta.improvement package owning meta.learning.closure and meta.improvement.promotion_input; admission is owned outside this package by governor maintenance G-19"
-current_source_dependency_and_change_closure = "root workspace member; six production Cargo consumers; changes close over the two cells below and the Governor admission contract that consumes them"
+affected_functional_cells_and_lifecycle_owners = "W2 owner map, one owner per retained responsibility. This package (meta.improvement) owns candidate declaration, intake bounds, the bounded deduplication registry, the brief at a safe boundary, and the advisory promotion-input preparation; the meta.learning.closure cell owns the inner learning loop's candidate material and performs no promotion. Governor maintenance G-19 (eliot-maintenance improvement_admission::admit_improvement_candidate and improvement_admission_policy) owns admission and the decision authority, and no API in this package can admit, promote or finish. Testd (testd-20, ImprovementOperation::ExecuteExperiment and Measure) owns bounded experiment execution and measurement. The Instrument verifier family (instrument-verifier-20-1111, ImprovementOperation::Evaluate) owns independent evaluation, re-checked by check_experiment_owner_routing and check_evaluator_independence. Kernel (kernel-generation-canary-11, ImprovementOperation::CanaryActivate) owns generation/canary activation as a non-authorizing handoff with execution_authorized permanently false. Rollback is owned by the rollback contract owner named on the contract. The unknown external effect is reconciled by the owner named on the obligation, through ImprovementUnknownEffect::with_settled_owner_outcome"
+current_source_dependency_and_change_closure = "root workspace member; six manifests declare a Cargo dependency on it, of which one (bins/eliotd) is a production consumer; changes close over the two cells below and the Governor admission contract that consumes them"
 public_contract_and_independent_test_entrypoint = "src/lib.rs public surface (ImprovementCandidate, CandidateState, ImprovementLifecycle, ReplayPlan, OutcomeEvidence, PromotionInput) plus the two cell modules; package-local proof entrypoints exist under tests/"
-first_real_consumer_or_time_bounded_migration_facade = "real consumers, not a migration facade: bins/eliot-wasm-host/src/governed_admission.rs, bins/eliotd/src/improvement_intake.rs, crates/meta/eliot-self-quality/src/improvement_handoff.rs, crates/smart/eliot-context-admission/src/learning_gate.rs, crates/smart/eliot-context-assembly/src/learning_gate.rs, crates/smart/eliot-context-compiler-wasm/src/host.rs"
+first_real_consumer_or_time_bounded_migration_facade = "real production consumer, not a migration facade: bins/eliotd/src/improvement_intake_dispatch.rs::assemble_improvement_artifact, reached from daemon_runtime::run_improvement_intake; the candidate contract is consumed on the same pass by bins/eliotd/src/improvement_candidate_dispatch.rs::dispatch_improvement_candidate_route and commit_unknown_effect_obligation. The four remaining dependents (eliot-wasm-host governed_admission, eliot-context-admission learning_gate, eliot-context-assembly learning_gate, and the non-member eliot-context-compiler-wasm host) reach this package only through admit_governed_host / admit_context_with_learning / assemble_active_view_with_learning, none of which has a production caller"
 source_maintenance_owner_and_vendor_type_boundary = "cognitive-wave-integrator; no vendor or storage types in the public contract"
 dependency_security_license_and_build_isolation = "own advisory-only boundary; no source, config, policy, artifact, generation or authority effect"
-expected_agent_workset_context_and_reverse_fanout_delta = "package-local workset with six one-hop consumers; the reverse fanout is bounded by the two declared cells"
+expected_agent_workset_context_and_reverse_fanout_delta = "package-local workset with six one-hop Cargo dependents, one of which is a production consumer; the reverse fanout is bounded by the two declared cells"
 expected_compile_test_integration_and_release_cost_delta = "admitted as a root workspace member; build cost is already carried by its real consumers"
 migration_reexport_rollback_removal_and_expiry = "no migration or expiry is pending; removal is a separate decision that must first close every consumer reference"
 counter_risks_merge_or_rejoin_condition = "I2.23 merge conditions are not met (independent consumers, independent test seam, own causal responsibility); rejoin only if every real consumer is replaced and a measured change closure shows the split is no longer beneficial"
-evidence_status_and_review_owner = "source present with real consumers; behavior proof and production activation remain #11 Product proof, not claimed here"
+evidence_status_and_review_owner = "source present, disposition keep, one measured production consumer leg (eliotd improvement intake and candidate route); behavior proof and production activation remain #11 Product proof, not claimed here"
 
 owned_mutable_state = []
 allowed_effects = []

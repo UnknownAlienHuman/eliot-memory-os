@@ -453,8 +453,8 @@ use eliot_store_api::{
 
 use super::DaemonComposition;
 use super::improvement_candidate_route::{
-    ImprovementEffectState, ImprovementRouteRequest, UnknownEffectObligation,
-    assess_improvement_repeat, check_improvement_handoff_identity, improvement_operation_owners,
+    ImprovementEffectState, ImprovementRouteRequest, assess_improvement_repeat,
+    check_improvement_handoff_identity, improvement_operation_owners,
     read_improvement_effect_state, route_improvement_candidate,
 };
 use super::improvement_intake_dispatch::{ImprovementArtifact, ImprovementDispatchError};
@@ -737,15 +737,24 @@ pub fn dispatch_improvement_candidate_route(
 ///
 /// # What the record contains, and what it does NOT
 ///
-/// The document is the obligation's own checked identity — owner, candidate,
-/// experiment, committed operation and idempotency namespace, forward-repair
-/// reference and invalidation set — plus the two answers the Governor owner gave
-/// (`retry_permitted`, `completion_retained`). It contains NO effect outcome, NO
-/// receipt, NO permit and NO authority, because this daemon holds none: the
-/// owner's outcome is private to the Governor module and writable only through
-/// its own re-checked seam, which nothing in this workspace can satisfy. So the
-/// record is a named debt plus the denying answer, never a claim that the effect
-/// was settled, completed, or may be retried.
+/// The document is the obligation's own checked identity, committed verbatim
+/// through the Governor owner's own
+/// `eliot_maintenance::ImprovementUnknownEffectIdentity`: the whole
+/// `ProposalCommitment` the pipeline computed (domain, encoding revision,
+/// algorithm, operation reference, idempotency namespace, digest and canonical
+/// size together) beside the owner, candidate, experiment, forward-repair
+/// reference and invalidation set, plus the two answers the Governor owner gave
+/// (`retry_permitted`, `completion_retained`). Carrying the owner's own record
+/// rather than a daemon-local restatement of its identities is what lets a later
+/// pass re-bind the debt to the exact proposal bytes it was raised over: the
+/// binding is a content comparison of that commitment, not the presence of an
+/// operation reference.
+///
+/// It contains NO effect outcome, NO receipt, NO permit and NO authority, because
+/// this daemon holds none: the owner's outcome is private to the Governor module
+/// and writable only through its own re-checked seam, which nothing in this
+/// workspace can satisfy. So the record is a named debt plus the denying answer,
+/// never a claim that the effect was settled, completed, or may be retried.
 ///
 /// The key is a function of the obligation's own checked fields and of nothing
 /// else, so re-committing the SAME unresolved obligation on a later pass
@@ -832,19 +841,21 @@ pub async fn commit_unknown_effect_obligation(
 ///
 /// # Folding the whole obligation duplicates no single debt
 ///
-/// Every field is copied verbatim from the committed
-/// `ImprovementUnknownEffect` (`improvement_candidate_route::obligation_of`),
-/// which builds them from checked records only, so re-observing the SAME
+/// The key folds the Governor owner's own committed identity
+/// (`ImprovementUnknownEffectIdentity`, read through
+/// `ImprovementUnknownEffect::retained_identity`), so re-observing the SAME
 /// unresolved debt on a later pass carries byte-identical values and lands on
-/// the same key. What folding those fields in costs is therefore nothing for a
-/// repeat; what it buys is that two genuinely DIFFERENT debts on one candidate —
-/// a different experiment, a different committed operation, a different owner or
-/// invalidation set — stop converging on one key and stop taking the first
-/// debt's operation and experiment binding with them. The earlier
-/// candidate-only key lost exactly that binding: a second distinct debt on one
-/// candidate could not become a second record, because the store arbitrates
-/// receipts by idempotency key first and refuses changed content under a
-/// retained key.
+/// the same key. What folding that record in costs is therefore nothing for a
+/// repeat; what it buys is that two genuinely DIFFERENT debts on one candidate
+/// stop converging on one key and stop taking the first debt's operation and
+/// experiment binding with them. The earlier candidate-only key lost exactly
+/// that binding: a second distinct debt on one candidate could not become a
+/// second record, because the store arbitrates receipts by idempotency key first
+/// and refuses changed content under a retained key.
+///
+/// The folded record is the OWNER's, including the whole `ProposalCommitment`,
+/// so a debt raised over different proposal bytes is a different key rather than
+/// a second document that reuses the first debt's operation binding.
 ///
 /// # Why the identity is folded as a digest rather than spelled inline
 ///
@@ -858,16 +869,14 @@ pub async fn commit_unknown_effect_obligation(
 /// keeps the `improvement-reconciliation:<candidate>` shape its readers and
 /// diagnostics already name.
 fn reconciliation_record_key(
-    obligation: &UnknownEffectObligation,
+    obligation: &eliot_maintenance::ImprovementUnknownEffectIdentity,
 ) -> Result<String, ImprovementDispatchError> {
+    // The Governor owner's own committed identity, serialized whole. Nothing is
+    // re-spelled here, so the key cannot disagree with the record the same commit
+    // writes under it, and the whole `ProposalCommitment` travels: two debts over
+    // different proposal bytes are different keys.
     let debt_identity = serde_json::json!({
-        "owner_id": &obligation.owner_id,
-        "candidate_id": &obligation.candidate_id,
-        "experiment_id": &obligation.experiment_id,
-        "operation_ref": &obligation.operation_ref,
-        "idempotency_key": &obligation.idempotency_key,
-        "forward_repair_ref": &obligation.forward_repair_ref,
-        "invalidation_set": &obligation.invalidation_set,
+        "unknown_effect_obligation": obligation,
     });
     let debt_digest = eliot_contracts::sha256_hex(
         &canonical_json_bytes(&debt_identity)

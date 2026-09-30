@@ -291,10 +291,10 @@ pub use improvement_candidate_dispatch::{
     dispatch_improvement_candidate_route,
 };
 pub use improvement_candidate_route::{
-    ImprovementEffectState, ImprovementRouteRequest, UnknownEffectObligation,
-    assess_improvement_repeat, check_improvement_handoff_identity,
-    improvement_candidate_retry_permitted, improvement_operation_owners, improvement_route_owner,
-    read_improvement_effect_state, reconcile_improvement_unknown, route_improvement_candidate,
+    ImprovementEffectState, ImprovementRouteRequest, assess_improvement_repeat,
+    check_improvement_handoff_identity, improvement_candidate_retry_permitted,
+    improvement_operation_owners, improvement_route_owner, read_improvement_effect_state,
+    reconcile_improvement_unknown, route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
