@@ -1130,7 +1130,19 @@ impl KernelComposition {
                     self.enqueue_local_read_pair_under_transition(envelope, tool)?;
                     Some("skill")
                 }
-                Ok(LocalReadAdmission::CampaignPacket { .. }) => {
+                Ok(admission @ LocalReadAdmission::CampaignPacket { .. }) => {
+                    // A2: the effect-capable (Material) lane re-joins the live
+                    // Governor-issued material authority before dispatch. A
+                    // missing derivation or a revocation that landed after
+                    // envelope admission fails this lane closed; read-only
+                    // lanes stay exempt. Routing carries no visibility input,
+                    // so a hidden packet method invoked by name faces the
+                    // identical gate.
+                    super::tool_exposure::authorize_material_lane(
+                        self,
+                        &admission,
+                        &envelope.state_fence,
+                    )?;
                     self.enqueue_campaign_packet_pair_under_transition(envelope, tool)?;
                     Some("campaign-packet")
                 }
