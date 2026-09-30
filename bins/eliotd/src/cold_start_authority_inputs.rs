@@ -110,7 +110,11 @@ impl ColdStartAuthorityInputJoin {
     /// exact retained Host discovery and owner-authenticated scanner receipt.
     /// This is a consistency boundary only; callers must supply real owner
     /// readbacks for the privacy and source values.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the exact cross-owner evidence join is one fail-closed admission boundary"
+    )]
     pub fn try_join(
         discovery: &ColdStartDiscoveryInput,
         state_fence: &StateFence,
