@@ -61,6 +61,7 @@ pub mod cell_declaration_registry;
 /// calls `KernelContextReadClient::reconstruct_context_inputs`, the existing
 /// Governor composition edge over `GovernorContextInputs`.
 pub mod context_reconstruction_route;
+pub mod coordination_owner_ingress;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -410,6 +411,16 @@ pub enum DaemonError {
     /// rejected the candidate.
     #[error("Governor FinishAttempt: {0}")]
     Finish(#[from] FinishAttemptError),
+    /// Governor-owned coordination admission or its canonical owner-image
+    /// persistence failed (issue #370 R1).
+    ///
+    /// The typed refusal travels unchanged, never stringified, so a driver can
+    /// still distinguish an unknown work item, an expired or foreign lease, a
+    /// moved fence, and a store compare-and-set conflict instead of collapsing
+    /// them into one lifecycle message. Every arm is either the coordination
+    /// owner's own error or the store's own arbitration error.
+    #[error("Governor coordination: {0}")]
+    Coordination(#[from] eliot_governor::CoordinationCommitError),
     /// Authenticated Kernel B1 transport or admission failed.
     #[error("Kernel B1 transport: {0}")]
     Kernel(String),
@@ -1449,6 +1460,97 @@ impl DaemonComposition {
         );
         Ok((receipt, effective))
     }
+    /// Admits one coordination candidate result and durably publishes the
+    /// resulting `owner/coordination` image (issue #370 R1).
+    ///
+    /// This is the daemon composition root's single entry to the coordination
+    /// owner's write route, and the only place in `eliotd` that can commit one.
+    /// It owns no Store client and opens no second durability path: the write
+    /// travels the retained neutral Kernel port through
+    /// [`eliot_governor::GovernorComposition::commit_coordination_candidate_result`],
+    /// exactly as the experience, learning, and capability-evidence legs do.
+    ///
+    /// The compare-and-set predecessor is read from the refresh-consistent
+    /// Kernel named read of `owner/coordination` in the same guarded step that
+    /// builds the image, so it is the value the store arbitrates and the value
+    /// rehydration will read back. It is never derived from the in-memory
+    /// owner, which is precisely the value a refresh is about to replace.
+    ///
+    /// The post-commit `refresh_from_kernel` is what makes the mutation
+    /// durable rather than in-process: the committed image is re-read through
+    /// the `owner/coordination` named read and rehydrated by the coordination
+    /// owner's own recovery admission, so the admitted candidate result survives
+    /// into the next composition. As in
+    /// [`Self::commit_experience_bank_record`], the durable receipt is returned
+    /// unmodified and a failed refresh marks the dependent view stale instead
+    /// of hiding divergence.
+    ///
+    /// `draft` carries admitted ingress identity only: its `session_id`,
+    /// `work_item_id`, `lease_id`, and `result_id` are supplied by the caller,
+    /// and the coordination owner re-checks the lease holder, the lease window,
+    /// the authority epoch, and the fence against the image it already holds.
+    /// This entry mints no coordination identity, and the admitted receipt stays
+    /// capped at `CandidateArtifact`: it is a candidate artifact reference, not
+    /// a Task finish decision.
+    ///
+    /// # Not yet reached (issue #370 R1)
+    ///
+    /// The durable route above is real and complete at every layer, but this
+    /// entry still has no live caller, and the measured blocker is upstream of
+    /// it: no owner issues a coordination `work_item_id`/`lease_id`. Measured on
+    /// this tree, not inferred —
+    ///
+    /// - `CoordinationOwner::register_work`, `acquire_work`, and
+    ///   `acquire_work_with_issuance` have no non-test caller anywhere in the
+    ///   workspace, so no work item ever reaches `Claimed`/`Running`/
+    ///   `Checkpointed`/`Reassigned` and there is no admitted lease, session and
+    ///   item to build a draft from;
+    /// - `NativeWorkerExecutableBinding` already carries `work_unit_id` and
+    ///   `lease_id`, but as *presented* parameters with no writer:
+    ///   `publish_native_worker_binding` takes both as `&str` arguments and its
+    ///   only non-test construction is the test at
+    ///   `crates/governor/eliot-governor/tests/native_worker_binding.rs`;
+    /// - the live Task Controller poll does supply a Kernel-issued
+    ///   `TaskControllerAttempt` with a real `session_id`, `task_id`,
+    ///   `scope_id`, `state_fence`, and `authority_epoch`, but no work-item or
+    ///   lease identity.
+    ///
+    /// The legitimate caller is therefore the session/work-item driver, and its
+    /// issuer is whoever first registers a work item — not this entry. Deriving
+    /// a `work_item_id` or `lease_id` here would fabricate exactly the
+    /// coordination authority the owner validates on the way in, so it was not
+    /// done. See [`crate::coordination_owner_ingress`] for the ingress shape a
+    /// driver must supply.
+    pub async fn commit_coordination_candidate_result(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        draft: eliot_governor::AgentResultDraft,
+    ) -> Result<eliot_governor::CommittedCoordinationResult, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        // The predecessor revision is read here, from the refresh-consistent
+        // named read, rather than inside the owner: a caller-presented integer
+        // would be exactly the substituted compare-and-set the fenced CAS
+        // exists to refuse. The build and the exchange are one `&mut self` step
+        // for the same reason the other commit entries are.
+        let expected_revision = self
+            .governor
+            .coordination_owner_readback()
+            .map_err(DaemonError::Coordination)?
+            .1;
+        let committed = self
+            .governor
+            .commit_coordination_candidate_result(identity, operation_id, expected_revision, draft)
+            .await
+            .map_err(DaemonError::Coordination)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(committed)
+    }
+
     /// Returns the retained owner receipt for an already-committed
     /// experience record, if this composition committed its idempotency
     /// key (P1-1, issue #1942).

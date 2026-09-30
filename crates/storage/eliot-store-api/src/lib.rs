@@ -4026,6 +4026,12 @@ pub enum NamedMutationOperation {
     /// opaque bytes and only arbitrates the fixed `owner/module_registry`
     /// revision. Admission currentness remains a Governor readback decision.
     RecordModuleCatalogSnapshot,
+    /// Persists the Governor-owned coordination owner image through the same
+    /// fenced `RecoverySchema` transition (issue #370 R1). The store treats
+    /// the snapshot as opaque bytes and only arbitrates the `owner/coordination`
+    /// revision, so a coordination mutation survives the refresh that
+    /// rehydrates every other owner rather than being erased by it.
+    RecordCoordinationOwner,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -4175,6 +4181,7 @@ impl NamedMutationOperation {
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
+            | Self::RecordCoordinationOwner
             | Self::RecordAuthorityRevocation
             | Self::ApplyProblemOwnerState => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,

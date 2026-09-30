@@ -463,6 +463,27 @@ static RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 2] = [
         required: true,
     },
 ];
+/// Owner-approved Governor coordination owner-image persistence fields. The
+/// coordination snapshot stays an opaque canonical JSON document at this
+/// boundary: the store arbitrates only the fixed `owner/coordination` address
+/// and the outer revision, and never derives a session, work item, lease, or
+/// result admission from the bytes it persists.
+///
+/// This is the same closed two-field shape the other bounded owner-snapshot
+/// rows use (`RecordFinishEvidence`, `RecordModuleCatalogSnapshot`): one
+/// compare-and-set predecessor and one verbatim image.
+static RECORD_COORDINATION_OWNER_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "expected_coordination_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "revision",
@@ -1366,6 +1387,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
+        NamedMutationOperation::RecordCoordinationOwner => "RecordCoordinationOwner",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -1399,6 +1421,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
+        b"RecordCoordinationOwner" => Some(NamedMutationOperation::RecordCoordinationOwner),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -1578,6 +1601,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordModuleCatalogSnapshot => {
             &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
         }
+        NamedMutationOperation::RecordCoordinationOwner => &RECORD_COORDINATION_OWNER_PARAMETERS,
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,
