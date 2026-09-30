@@ -1,13 +1,14 @@
 //! Store-neutral wire contract for the owner-persisted `TaskContract`
 //! acceptance-item set (issue #325 P1, I7.9).
 //!
-//! I7.9 requires the Finish service to rehydrate "the current TaskContract,
-//! acceptance items, exact artifacts, current State Fence, executed verifier
-//! runs and effect outcomes". Only the owner that holds the `TaskContract` can
-//! say which obligations exist, so the acceptance denominator has to be a
-//! durable owner record inside the governed store and not a projection of the
-//! verifier plan being checked against it. This module is the write half of
-//! that record; [`crate::task_contract_acceptance_read_request`] /
+//! I7.9 requires the Finish service to rehydrate "the current
+//! `TaskContract`, acceptance items, exact artifacts, current State Fence,
+//! executed verifier runs and effect outcomes". Only the owner that holds the
+//! `TaskContract` can say which obligations exist, so the acceptance
+//! denominator has to be a durable owner record inside the governed store and
+//! not a projection of the verifier plan being checked against it. This module
+//! is the write half of that record;
+//! [`crate::task_contract_acceptance_read_request`] /
 //! [`crate::decode_task_contract_acceptance_set`] are the closed read half and
 //! [`crate::NamedReadOperation::GetTaskContractAcceptanceSet`] serves it.
 //!
@@ -163,13 +164,21 @@ pub fn task_contract_acceptance_record_key(task_id: &str, task_revision: u64) ->
 ///
 /// The record travels as the single `record` parameter, the same shape the
 /// other owner-record writes use, so no second parameter encoding is introduced.
+///
+/// The builder borrows rather than takes the record: it validates the record and
+/// serializes it into the request's owned `record` parameter, and the returned
+/// `NamedMutationRequest` carries those closed bytes, not the record itself. No
+/// field of the record is stored into the request by move, so consuming the
+/// owner's record here would only strip the owner of a value the store never
+/// mutates. The request is therefore built from exactly the bytes the record
+/// was validated against.
 pub fn task_contract_acceptance_record_request(
-    record: TaskContractAcceptanceRecord,
+    record: &TaskContractAcceptanceRecord,
 ) -> Result<NamedMutationRequest, StoreError> {
     record.validate()?;
     let parameters = BTreeMap::from([(
         "record".to_owned(),
-        serde_json::to_value(&record)
+        serde_json::to_value(record)
             .map_err(|error| StoreError::Serialization(error.to_string()))?,
     )]);
     Ok(NamedMutationRequest {

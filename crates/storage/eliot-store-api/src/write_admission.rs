@@ -256,9 +256,9 @@
 //! Issue #1874's body describes seven reachable mutations and names
 //! `RecordAuthorityRevocation` among them. That list is a subset, not the
 //! activated set, and `RecordAuthorityRevocation` is not reachable at all; the
-//! activated set is the twenty rows above. I5.15's own initial executable set
+//! activated set is the twenty-one rows above. I5.15's own initial executable set
 //! is a contract-denomination list and does not enumerate named mutations, so
-//! the twenty rows activate under I5.17 against this crate's proven
+//! the twenty-one rows activate under I5.17 against this crate's proven
 //! handler, schema, and consumer triple.
 //!
 //! # Non-goals
