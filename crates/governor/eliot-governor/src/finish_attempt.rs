@@ -764,8 +764,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             )
         {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                "task is not in a plan-bearing state; current plan admission is refused"
-                    .to_owned(),
+                "task is not in a plan-bearing state; current plan admission is refused".to_owned(),
             )));
         }
         let mut plan_identity: Option<(String, String, String)> = None;
@@ -819,7 +818,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         // already admits an absent verifier for exactly this reason, and every
         // consumer that needs one refuses on its own pre-existing typed check
         // rather than reading a stand-in.
-        CanonicalPlanBinding::new(plan_id, plan_revision, *task_id, work_scope_id)
+        CanonicalPlanBinding::new(plan_id, plan_revision, task_id.clone(), work_scope_id)
             .map_err(FinishAttemptError::Composition)
     }
 

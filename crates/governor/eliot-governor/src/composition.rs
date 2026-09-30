@@ -94,7 +94,7 @@ use eliot_maintenance::{
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_observation::{ObservationAdmissionResult, ObservationJournal, ObservationJournalEntry};
+use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -5875,7 +5875,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(FinishError::FenceMismatch.into());
         }
         if identity.request.metadata.task_id.as_ref() != Some(task_id) {
-            return Err(FinishAttemptError::Composition(
+            return Err(FinishError::Canonical(
                 eliot_canonical::CanonicalError::TaskBindingMismatch,
             )
             .into());
@@ -5894,9 +5894,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         let snapshot = self.owners.canonical.prepare_current_plan(plan)?;
         let envelope = current_plan_envelope(identity, operation_id, &snapshot, task_id)?;
-        Ok(Some(
-            service.prepare_current_plan_exchange(identity, operation_id, envelope)?,
-        ))
+        Ok(Some(service.prepare_current_plan_exchange(
+            identity,
+            operation_id,
+            envelope,
+        )?))
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
