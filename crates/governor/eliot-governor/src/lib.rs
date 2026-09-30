@@ -238,7 +238,7 @@ pub use observation_reconciliation::{
     NegativeMemoryGateOutcome, ObservationCaptureAccess, ObservationCaptureOwnerBinding,
     ObservationCaptureOwnerOrigin, ObservationCaptureHostOriginDomain,
     ObservationCapturePolicyAccess, ObservationCaptureVisibility, ObservationIngressPolicyBinding,
-    PreparedMcpObservation,
+    McpObservationCompletion, PreparedMcpObservation,
     WatchdogAdmittedEntry, WatchdogEntryAdmission, WatchdogEntryKind,
 };
 pub use opencode_action_gate::{
