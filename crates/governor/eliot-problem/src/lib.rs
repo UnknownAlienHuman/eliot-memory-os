@@ -15,6 +15,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod ownership;
+
+pub use ownership::{
+    AssignedOwnership, AuthenticatedOwnerLease, AuthorizedWaiver, ClosureEvidence, LeaseIdentity,
+    ObligationKind, OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseLoss, OwnerLossReason,
+    OwnerRoute, Ownership, OwnershipObligation, UnassignedOwnership, WaiverRecord, obligation_id,
+};
+
 /// Stable package identity.
 pub const CONTRACT_NAME: &str = "eliot.governor.problem";
 /// Current package contract revision.
@@ -201,6 +209,40 @@ fn owner_name(value: &str) -> Result<(), ProblemError> {
     text(value, "owner")
 }
 
+/// Appends newly observed evidence without disturbing what is already retained.
+///
+/// Append-only: an existing reference is kept once and its position is not
+/// rewritten, so a closure readback augments the observation history rather
+/// than replacing it.
+fn merge_evidence(
+    retained: &[ArtifactId],
+    observed: &[ArtifactId],
+) -> Vec<ArtifactId> {
+    let mut merged = retained.to_vec();
+    for reference in observed {
+        if !merged.contains(reference) {
+            merged.push(reference.clone());
+        }
+    }
+    merged
+}
+
+/// The ownership epoch a legacy record without a lease is migrated under.
+///
+/// The legacy record never held an ownership epoch, so this derives the
+/// migration's epoch from the record's own committed revision rather than
+/// inventing a plausible one: the value is deterministic, non-zero, and it
+/// carries no claim that a lease was ever issued.
+fn unassigned_legacy_epoch(revision: u64) -> Result<u64, ProblemError> {
+    if revision == 0 {
+        return Err(ProblemError::InvalidField {
+            field: "revision",
+            reason: "must be non-zero",
+        });
+    }
+    Ok(revision)
+}
+
 /// Advances a record revision, refusing overflow instead of reusing one.
 ///
 /// A saturating bump pins a live record to the revision that already names its
@@ -381,6 +423,30 @@ impl OwnerRef {
     }
 }
 
+/// The closed I13.9 Problem classification.
+///
+/// The set is closed: I13.9 enumerates exactly these six classes, so an
+/// unlisted class cannot be spelled and a listed class cannot be renamed. The
+/// class is the record's own routing input for the I13.8 default-owner table,
+/// so an owner-loss obligation names a role derived from the record rather than
+/// a role the caller raising the loss chose.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProblemClass {
+    /// Runtime/operational failure.
+    Operational,
+    /// Boundary or interface failure between components.
+    Integration,
+    /// Wrong interpretation, belief or reasoning.
+    Cognitive,
+    /// Wrong, missing or contradictory data.
+    DataQuality,
+    /// Security or integrity failure.
+    Security,
+    /// Budget or resource-consumption failure.
+    Cost,
+}
+
 /// Problem lifecycle from opening through evidence-backed resolution.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -496,30 +562,179 @@ impl RevocationRebuildOrder {
 }
 
 /// Durable operational/cognitive/integration/data-quality problem.
+///
+/// Every I13.9 field is present and separately named. In particular
+/// `class`/`severity` drive the I13.8 routing, `observed_evidence` is kept
+/// distinct from `hypotheses` so a guess is never counted as an observation,
+/// `ownership` replaces a bare principal pair with a lease/epoch-bound owner
+/// that has an explicit unassigned state, and `expected_resolution` is the
+/// independently expected closure set that a resolution is checked against
+/// rather than the set the closer supplies.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Problem {
     pub problem_id: ProblemId,
     pub signal_refs: Vec<SignalId>,
+    /// I13.9 `class`.
+    pub class: ProblemClass,
+    /// I13.9 `severity`, taken from the admitting Signal's own severity.
+    pub severity: SignalSeverity,
     pub title: String,
+    /// I13.9 `symptom`.
+    pub symptom: String,
     pub scope_id: String,
-    pub owner: OwnerRef,
+    /// I13.9 `scope/affected_dependencies`, the exact dependencies hit.
+    pub affected_dependencies: Vec<String>,
+    /// I13.9 `evidence`: what was actually observed.
+    pub observed_evidence: Vec<ArtifactId>,
+    /// I13.9 `hypotheses`: candidate explanations, never evidence.
+    pub hypotheses: Vec<ProblemHypothesis>,
+    /// I13.9 `owner_and_epoch`, lease-bound with an explicit unassigned state.
+    pub ownership: Ownership,
+    /// I13.9 `containment`.
+    pub containment: Vec<ArtifactId>,
+    /// I13.9 `repair_history`, one retained entry per committed repair.
+    pub repair_history: Vec<RepairRecord>,
+    /// I13.9 `next_probe_or_action`: the next discriminative action.
+    pub next_probe: String,
     pub state: ProblemState,
-    pub evidence_refs: Vec<ArtifactId>,
+    /// I13.9 `resolution_condition`, stated by the record rather than the closer.
     pub resolution_condition: String,
+    /// The independently expected observables a resolution must cover.
+    ///
+    /// Fixed when the Problem is raised, so the principal that closes it cannot
+    /// choose the set it will be measured against.
+    pub expected_resolution: Vec<ArtifactId>,
+    /// I13.9 `reopen_history`, retained per reopen revision.
+    pub reopen_history: Vec<ReopenRecord>,
+    /// The outstanding reassignment/escalation obligation while unassigned.
+    pub obligation: Option<OwnershipObligation>,
     pub acknowledged_by: Option<String>,
     pub state_fence: StateFence,
     pub revision: u64,
     pub reopen_count: u32,
 }
 
+/// One retained I13.9 hypothesis: a candidate explanation plus what supports it.
+///
+/// Hypotheses are kept separate from `observed_evidence` on purpose: I13.9 lists
+/// them as different fields, and collapsing them would let a guess be counted
+/// as an observation when closure is checked.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProblemHypothesis {
+    /// The candidate explanation under test.
+    pub statement: String,
+    /// Artifacts that bear on the hypothesis without establishing it.
+    pub supporting_evidence: Vec<ArtifactId>,
+    /// The observation that would discriminate this hypothesis from the others.
+    pub discriminating_probe: String,
+}
+
+impl ProblemHypothesis {
+    /// Validates the statement, bearing evidence and its discriminating probe.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        text(&self.statement, "hypothesis.statement")?;
+        text(&self.discriminating_probe, "hypothesis.discriminating_probe")?;
+        nonempty(&self.supporting_evidence, "hypothesis.supporting_evidence")?;
+        let evidence = self
+            .supporting_evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&evidence, "hypothesis.supporting_evidence")
+    }
+}
+
+/// One retained I13.9 repair history entry, bound to the revision that made it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairRecord {
+    /// The record revision this repair was committed at.
+    pub revision: u64,
+    /// The repair action that was attempted.
+    pub action: String,
+    /// The evidence the attempt actually produced.
+    pub evidence: Vec<ArtifactId>,
+}
+
+impl RepairRecord {
+    /// Validates the bound revision, action and evidence.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        if self.revision == 0 {
+            return Err(ProblemError::InvalidField {
+                field: "repair.revision",
+                reason: "must be non-zero",
+            });
+        }
+        text(&self.action, "repair.action")?;
+        nonempty(&self.evidence, "repair.evidence")?;
+        let evidence = self
+            .evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&evidence, "repair.evidence")
+    }
+}
+
+/// One retained I13.9 reopen-history entry.
+///
+/// A reopen count alone is not retained reopen evidence: each reopen appends
+/// this record carrying the evidence that actually recurred, bound to the
+/// revision it produced, and `validate` requires the history length to equal
+/// the count so the two can never drift apart.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReopenRecord {
+    /// The revision this reopen produced.
+    pub revision: u64,
+    /// The state the record held before this reopen.
+    pub previous_state: ProblemState,
+    /// The evidence that the problem actually recurred.
+    pub evidence: Vec<ArtifactId>,
+}
+
+impl ReopenRecord {
+    /// Validates the bound revision, prior state and recurrence evidence.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        if self.revision == 0 {
+            return Err(ProblemError::InvalidField {
+                field: "reopen.revision",
+                reason: "must be non-zero",
+            });
+        }
+        if !matches!(
+            self.previous_state,
+            ProblemState::Resolved
+                | ProblemState::AcceptedRisk
+                | ProblemState::Superseded
+                | ProblemState::Quarantined
+        ) {
+            return Err(ProblemError::InvalidField {
+                field: "reopen.previous_state",
+                reason: "a reopen may only follow a terminal state",
+            });
+        }
+        nonempty(&self.evidence, "reopen.evidence")?;
+        let evidence = self
+            .evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&evidence, "reopen.evidence")
+    }
+}
+
 impl Problem {
-    /// Validates problem invariants and evidence identity.
+    /// Validates problem invariants, lease-bound ownership and evidence identity.
     pub fn validate(&self) -> Result<(), ProblemError> {
         text(&self.title, "title")?;
+        text(&self.symptom, "symptom")?;
         text(&self.scope_id, "scope_id")?;
         text(&self.resolution_condition, "resolution_condition")?;
-        self.owner.validate()?;
+        text(&self.next_probe, "next_probe")?;
+        self.ownership.validate()?;
         fence(&self.state_fence)?;
         if self.revision == 0 {
             return Err(ProblemError::InvalidField {
@@ -528,35 +743,103 @@ impl Problem {
             });
         }
         nonempty(&self.signal_refs, "signal_refs")?;
-        nonempty(&self.evidence_refs, "evidence_refs")?;
+        nonempty(&self.observed_evidence, "observed_evidence")?;
+        nonempty(&self.affected_dependencies, "affected_dependencies")?;
+        nonempty(&self.expected_resolution, "expected_resolution")?;
         let signals = self
             .signal_refs
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         unique_text(&signals, "signal_refs")?;
+        unique_text(&self.affected_dependencies, "affected_dependencies")?;
         let evidence = self
-            .evidence_refs
+            .observed_evidence
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        unique_text(&evidence, "evidence_refs")?;
-        if let Some(principal) = &self.acknowledged_by {
-            owner_name(principal)?;
+        unique_text(&evidence, "observed_evidence")?;
+        let expected = self
+            .expected_resolution
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&expected, "expected_resolution")?;
+        for hypothesis in &self.hypotheses {
+            hypothesis.validate()?;
         }
-        Ok(())
+        for repair in &self.repair_history {
+            repair.validate()?;
+        }
+        for reopen in &self.reopen_history {
+            reopen.validate()?;
+        }
+        // A reopen count is not reopen evidence: the two must agree, so a count
+        // can never stand in for evidence that was never retained.
+        if self.reopen_history.len() != usize::try_from(self.reopen_count).unwrap_or(usize::MAX) {
+            return Err(ProblemError::InvalidField {
+                field: "reopen_count",
+                reason: "must equal the retained reopen history length",
+            });
+        }
+        // An unassigned Problem is not resolved, accepted risk, or discardable:
+        // its obligation must be visible on the record, and an assigned Problem
+        // must not carry a stale one.
+        match (&self.ownership, &self.obligation) {
+            (Ownership::Unassigned(_), None) => Err(ProblemError::InvalidField {
+                field: "obligation",
+                reason: "an unassigned problem must retain its outstanding obligation",
+            }),
+            (Ownership::Unassigned(unassigned), Some(obligation)) => {
+                if *obligation != unassigned.obligation {
+                    return Err(ProblemError::InvalidField {
+                        field: "obligation",
+                        reason: "must be the obligation raised by the retained owner loss",
+                    });
+                }
+                Ok(())
+            }
+            (Ownership::Assigned(_), Some(_)) => Err(ProblemError::InvalidField {
+                field: "obligation",
+                reason: "an assigned problem retains no outstanding obligation",
+            }),
+            (Ownership::Assigned(_), None) => Ok(()),
+        }
+    }
+
+    /// The exact observables a resolution is checked against.
+    ///
+    /// These were fixed when the Problem was raised, which is what makes
+    /// resolution evidence-backed: the closing principal does not get to pick
+    /// the set that closes it.
+    pub fn expected_observables(&self) -> &[ArtifactId] {
+        &self.expected_resolution
+    }
+
+    /// The I13.8 default-owner route for this Problem's class.
+    pub const fn default_owner_route(&self) -> OwnerRoute {
+        OwnerRoute::for_class(self.class)
     }
 
     /// Advances only along the declared Problem lifecycle.
     ///
     /// The candidate state is validated on a copy, so a rejected edge or a
-    /// refused revision leaves the live record exactly as it was.
+    /// refused revision leaves the live record exactly as it was. A terminal
+    /// edge is refused: closure goes through [`Self::resolve`] or
+    /// [`Self::accept_risk`], which require independent evidence or an
+    /// authorized waiver, so a bare transition can never declare resolution.
     pub fn transition(
         &mut self,
         expected_fence: &StateFence,
         next: ProblemState,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
+        if matches!(
+            next,
+            ProblemState::Resolved | ProblemState::AcceptedRisk | ProblemState::Superseded
+        ) {
+            return Err(ProblemError::ResolutionRequiresEvidence);
+        }
         if !self.state.can_transition_to(next) {
             return Err(ProblemError::IllegalTransition {
                 from: format!("{:?}", self.state),
@@ -572,48 +855,164 @@ impl Problem {
         Ok(())
     }
 
-    /// Records receipt by the current owner; acknowledgement is not resolution.
+    /// Resolves only against the independently expected observable set.
+    ///
+    /// The evidence is checked against `expected_resolution`, which the record
+    /// fixed when it was raised, and the verifier must be independent of the
+    /// current owner and bound to the record's current fence. A non-empty
+    /// evidence list is not enough: unrelated evidence does not satisfy the
+    /// condition, and neither delivery, restart nor model opinion can appear
+    /// here at all because the only input is an independent readback.
+    pub fn resolve(
+        &mut self,
+        expected_fence: &StateFence,
+        closure: &ClosureEvidence,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        self.check_closure_preconditions(closure)?;
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.observed_evidence = merge_evidence(
+            &candidate.observed_evidence,
+            &closure.verified_observables,
+        );
+        candidate.state = ProblemState::Resolved;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Accepts risk only under an authorized, scoped, expiring waiver.
+    ///
+    /// The waiver authority is a separate principal from the owner, so the
+    /// owner cannot waive its own obligation. The authority, limits, expiry and
+    /// residual risk are retained on the record as [`WaiverRecord`].
+    pub fn accept_risk(
+        &mut self,
+        expected_fence: &StateFence,
+        waiver: &AuthorizedWaiver,
+    ) -> Result<WaiverRecord, ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        waiver.validate()?;
+        let owner = self.ownership.assigned()?;
+        if waiver.authority.principal == owner.holder.principal {
+            return Err(ProblemError::WaiverAuthorityRequired);
+        }
+        if self.state != ProblemState::Verifying {
+            return Err(ProblemError::IllegalTransition {
+                from: format!("{:?}", self.state),
+                to: "ACCEPTED_RISK".to_owned(),
+            });
+        }
+        let revision = next_revision(self.revision)?;
+        let record = WaiverRecord {
+            authority: waiver.authority.clone(),
+            decision_ref: waiver.decision_ref.clone(),
+            limits: waiver.limits.clone(),
+            expires_at_ms: waiver.expires_at_ms,
+            residual_risk: waiver.residual_risk.clone(),
+            evidence: waiver.evidence.clone(),
+        };
+        let mut candidate = self.clone();
+        candidate.observed_evidence = merge_evidence(&candidate.observed_evidence, &waiver.evidence);
+        candidate.state = ProblemState::AcceptedRisk;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(record)
+    }
+
+    /// Refuses a resolution whose evidence the owner alone chose.
+    ///
+    /// This is the one place the independent-closure rule is enforced, so both
+    /// [`Self::resolve`] and the read-only checks share it.
+    fn check_closure_preconditions(&self, closure: &ClosureEvidence) -> Result<(), ProblemError> {
+        closure.validate()?;
+        let owner = self.ownership.assigned()?;
+        if closure.verifier.principal == owner.holder.principal {
+            return Err(ProblemError::IndependentVerifierRequired);
+        }
+        if closure.verifier_fence != self.state_fence {
+            return Err(ProblemError::FenceMismatch);
+        }
+        // The expected set was fixed when the record was raised. Every one of
+        // them must be covered, so a list of unrelated artifacts cannot close
+        // the Problem even when the list is non-empty.
+        for expected in &self.expected_resolution {
+            if !closure.verified_observables.contains(expected) {
+                return Err(ProblemError::UnresolvedExpectation {
+                    value: expected.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Records receipt by the current lease-backed owner.
+    ///
+    /// Acknowledgement is not resolution: it records that the owner saw the
+    /// record and leaves the state, evidence and obligation untouched.
     pub fn acknowledge(
         &mut self,
         expected_fence: &StateFence,
-        principal: &str,
+        lease: &AuthenticatedOwnerLease,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        owner_name(principal)?;
-        if principal != self.owner.principal {
-            return Err(ProblemError::OwnerMismatch);
+        // A record whose owner was lost has no principal any caller can present,
+        // so the lost owner is fenced from every later update.
+        let owner = self.ownership.assigned()?;
+        if !lease.is_exactly(&owner.lease) || lease.holder().principal != owner.holder.principal {
+            return Err(ProblemError::OwnerLeaseMismatch);
         }
         match &self.acknowledged_by {
-            Some(existing) if existing != principal => Err(ProblemError::AcknowledgementConflict),
+            Some(existing) if *existing != owner.holder.principal => {
+                Err(ProblemError::AcknowledgementConflict)
+            }
             Some(_) => Ok(()),
             None => {
-                self.acknowledged_by = Some(principal.to_owned());
+                self.acknowledged_by = Some(owner.holder.principal.clone());
                 Ok(())
             }
         }
     }
 
-    /// Changes owner only after comparing the caller's fence against the live one.
+    /// Assigns an eligible successor under a newly issued ownership lease.
     ///
-    /// `expected_fence` is the fence the caller believes is current; it is
-    /// compared against the record's live fence and a mismatch is refused, so a
-    /// renewed or already-reassigned record cannot be fenced by a stale caller.
-    /// `new_fence` is the successor authority fence and must be structurally
-    /// valid. The successor is built and validated as a candidate, so a refused
-    /// reassignment leaves the live record untouched.
-    pub fn reassign_owner(
+    /// `lease` must be an [`AuthenticatedOwnerLease`], so the successor is
+    /// named by the lease owner rather than by the caller: a caller that only
+    /// has a principal string cannot reach this entry at all. The grant's
+    /// ownership epoch must be greater than the epoch currently held, so I13.8's
+    /// "new Authority Epoch" cannot be a reuse, and the grant must be bound to
+    /// the record's live fence.
+    pub fn assign_owner(
         &mut self,
         expected_fence: &StateFence,
-        owner: OwnerRef,
-        new_fence: StateFence,
+        lease: &AuthenticatedOwnerLease,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        owner.validate()?;
-        fence(&new_fence)?;
+        let grant = lease.grant();
+        if !lease.is_bound_to(&self.state_fence) {
+            return Err(ProblemError::FenceMismatch);
+        }
+        let current_epoch = self.ownership.assigned()?.ownership_epoch;
+        if grant.ownership_epoch <= current_epoch {
+            return Err(ProblemError::InvalidField {
+                field: "lease.ownership_epoch",
+                reason: "must be a new epoch greater than the epoch this record holds",
+            });
+        }
+        if self.is_resolved() {
+            return Err(ProblemError::ImmutableState);
+        }
         let revision = next_revision(self.revision)?;
         let mut candidate = self.clone();
-        candidate.owner = owner;
-        candidate.state_fence = new_fence;
+        candidate.ownership = Ownership::Assigned(AssignedOwnership {
+            holder: grant.holder.clone(),
+            lease: lease.identity().clone(),
+            ownership_epoch: grant.ownership_epoch,
+        });
+        candidate.obligation = None;
         candidate.acknowledged_by = None;
         candidate.revision = revision;
         candidate.validate()?;
@@ -621,9 +1020,132 @@ impl Problem {
         Ok(())
     }
 
+    /// Records a fenced owner loss and leaves the obligation visible.
+    ///
+    /// This is the seam that makes loss non-silent. The lease owner reports the
+    /// exact [`LeaseIdentity`] it observed dead; a loss naming a different
+    /// identity is a delayed event for an already-superseded lease and is
+    /// refused with [`ProblemError::StaleOwnerLoss`], so it cannot unassign the
+    /// current successor. When the loss is current, only the assignment is
+    /// cleared: the unresolved phase, evidence, hypotheses, repair history and
+    /// reopen history are all retained, and one obligation derived from the
+    /// record's own class and the fenced epoch is raised. The unresolved
+    /// Problem is still unresolved afterwards.
+    ///
+    /// An already-terminal record is preserved rather than reopened: losing a
+    /// former owner does not resurrect a resolved Problem.
+    pub fn record_owner_loss(
+        &mut self,
+        expected_fence: &StateFence,
+        loss: &OwnerLeaseLoss,
+    ) -> Result<OwnershipObligation, ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        loss.validate()?;
+        let owner = self.ownership.assigned()?;
+        if !loss.observed_lease.is_exactly(&owner.lease) {
+            return Err(ProblemError::StaleOwnerLoss);
+        }
+        if matches!(
+            self.state,
+            ProblemState::Resolved
+                | ProblemState::AcceptedRisk
+                | ProblemState::Superseded
+                | ProblemState::Quarantined
+        ) {
+            return Err(ProblemError::ImmutableState);
+        }
+        let revision = next_revision(self.revision)?;
+        let obligation = OwnershipObligation {
+            obligation_id: obligation_id(
+                self.problem_id.as_str(),
+                self.default_owner_route(),
+                owner.ownership_epoch,
+            )?,
+            route: self.default_owner_route(),
+            lost_lease: Some(owner.lease.clone()),
+            ownership_epoch: owner.ownership_epoch,
+            raised_at_revision: revision,
+        };
+        // The one exact line where owner loss becomes a visible obligation and
+        // the former owner is fenced: the assignment is replaced by an
+        // unassigned state that names the fenced holder, the retained loss
+        // evidence and this obligation.
+        let mut candidate = self.clone();
+        candidate.ownership = Ownership::Unassigned(UnassignedOwnership {
+            last_holder: owner.holder.clone(),
+            reason: loss.reason,
+            lost_lease: Some(owner.lease.clone()),
+            ownership_epoch: owner.ownership_epoch,
+            loss_evidence: loss.evidence.clone(),
+            obligation: obligation.clone(),
+        });
+        candidate.obligation = Some(obligation.clone());
+        candidate.acknowledged_by = None;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(obligation)
+    }
+
+    /// Migrates a legacy record that carried no ownership lease.
+    ///
+    /// The absence is the finding: the record becomes explicitly unassigned
+    /// under [`OwnerLossReason::LegacyRecordWithoutLease`] with a visible
+    /// escalation obligation, and never a synthesized live lease. A legacy
+    /// record that already looks assigned is refused, because that would mean
+    /// inventing a lease for a record whose lease was never issued.
+    pub fn migrate_legacy_without_lease(
+        &mut self,
+        expected_fence: &StateFence,
+        legacy_holder: &OwnerRef,
+    ) -> Result<OwnershipObligation, ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        legacy_holder.validate()?;
+        if self.ownership.is_assigned() {
+            return Err(ProblemError::OwnerLeaseMismatch);
+        }
+        if let Ownership::Unassigned(unassigned) = &self.ownership {
+            if unassigned.reason == OwnerLossReason::LegacyRecordWithoutLease {
+                return Ok(unassigned.obligation.clone());
+            }
+        }
+        let revision = next_revision(self.revision)?;
+        let route = self.default_owner_route();
+        let obligation = OwnershipObligation {
+            obligation_id: obligation_id(
+                self.problem_id.as_str(),
+                route,
+                unassigned_legacy_epoch(self.revision)?,
+            )?,
+            route,
+            lost_lease: None,
+            ownership_epoch: unassigned_legacy_epoch(self.revision)?,
+            raised_at_revision: revision,
+        };
+        let mut candidate = self.clone();
+        candidate.ownership = Ownership::Unassigned(UnassignedOwnership {
+            last_holder: legacy_holder.clone(),
+            reason: OwnerLossReason::LegacyRecordWithoutLease,
+            lost_lease: None,
+            ownership_epoch: obligation.ownership_epoch,
+            loss_evidence: Vec::new(),
+            obligation: obligation.clone(),
+        });
+        candidate.obligation = Some(obligation.clone());
+        candidate.acknowledged_by = None;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(obligation)
+    }
+
     /// Reopens a terminal problem only with new evidence and the current fence.
     ///
-    /// The reopened record is built as a candidate and validated before it is
+    /// Actual recurrence is what reopens: the supplied evidence is retained as a
+    /// [`ReopenRecord`] bound to the revision this reopen produces, and
+    /// `validate` requires the retained history length to equal the count, so a
+    /// bare count can never stand in for evidence that was not kept. The
+    /// reopened record is built as a candidate and validated before it is
     /// committed, so a refused reopen leaves the terminal record unchanged.
     pub fn reopen(
         &mut self,
@@ -649,7 +1171,12 @@ impl Problem {
         let revision = next_revision(self.revision)?;
         let reopen_count = next_reopen_count(self.reopen_count)?;
         let mut candidate = self.clone();
-        candidate.evidence_refs.extend(new_evidence);
+        candidate.observed_evidence = merge_evidence(&candidate.observed_evidence, &new_evidence);
+        candidate.reopen_history.push(ReopenRecord {
+            revision,
+            previous_state: self.state,
+            evidence: new_evidence,
+        });
         candidate.state = ProblemState::Open;
         candidate.acknowledged_by = None;
         candidate.reopen_count = reopen_count;
@@ -706,7 +1233,7 @@ impl Problem {
             let fresh = request
                 .revocation_evidence
                 .iter()
-                .filter(|evidence| !self.evidence_refs.contains(evidence))
+                .filter(|evidence| !self.observed_evidence.contains(evidence))
                 .cloned()
                 .collect::<Vec<_>>();
             if fresh.is_empty() {
@@ -714,11 +1241,10 @@ impl Problem {
             }
             candidate.reopen(expected_fence, fresh)?;
         } else {
-            for evidence in &request.revocation_evidence {
-                if !candidate.evidence_refs.contains(evidence) {
-                    candidate.evidence_refs.push(evidence.clone());
-                }
-            }
+            candidate.observed_evidence = merge_evidence(
+                &candidate.observed_evidence,
+                &request.revocation_evidence,
+            );
             candidate.acknowledged_by = None;
         }
         candidate.revision = next_revision(candidate.revision)?;
