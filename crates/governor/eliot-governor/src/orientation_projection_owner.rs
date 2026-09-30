@@ -19,6 +19,7 @@ use eliot_dreamer_failure::NegativeMemoryDisposition;
 use eliot_read::{DeclaredResultSelector, ReadCoverage, ReadIdentity};
 use eliot_store_api::{NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeRevisionView};
 use eliot_workscope::{ScopeBindingDisposition, WorkScopeBindingSnapshot};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::canonical_projections::GovernorProjectionSet;
@@ -66,6 +67,24 @@ pub struct OrientationProjectionMemberStates {
     pub omissions: ProjectionState,
 }
 
+/// Full original Governor read closure preserved for packet provenance.
+///
+/// This borrows the exact request and role readback, including every original
+/// `ReadIdentity`, named request, owner payload, disposition, and the before /
+/// after source snapshots. Consumers commit these retained owner values as
+/// supplied; this type adds no derived digest or replacement identity.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct OrientationProjectionSourceClosure<'a> {
+    /// Exact source request used to acquire the seven roles.
+    pub context_request: &'a ContextReconstructionRequest,
+    /// Exact Governor readback, with original read identities and payloads.
+    pub role_inputs: &'a SevenRoleInputs,
+    /// Exact source snapshot captured before those reads.
+    pub source_snapshot_before: &'a ScopeRevisionView,
+    /// Exact source snapshot captured after those reads.
+    pub source_snapshot_after: &'a ScopeRevisionView,
+}
+
 /// CC-004 output with partial members and source lineage preserved by borrow.
 #[derive(Clone, Debug)]
 pub struct OrientationProjectionOwnerOutput<'a> {
@@ -75,6 +94,8 @@ pub struct OrientationProjectionOwnerOutput<'a> {
     pub disposition: ProjectionState,
     /// Exact disposition for each member.
     pub members: OrientationProjectionMemberStates,
+    /// Full original read closure to bind into downstream packet provenance.
+    pub source_closure: OrientationProjectionSourceClosure<'a>,
     /// Validated task member, when its named source is available.
     pub task_projection: Option<TaskProjection>,
     /// Validated continuity member, when its named source is available.
@@ -192,6 +213,12 @@ fn output<'a>(
         projections,
         disposition,
         members,
+        source_closure: OrientationProjectionSourceClosure {
+            context_request: input.context_request,
+            role_inputs: input.role_inputs,
+            source_snapshot_before: &input.role_inputs.heads_before,
+            source_snapshot_after: &input.role_inputs.heads_after,
+        },
         task_projection: parts.task,
         continuity_projection: parts.continuity,
         safety_projection: parts.safety,
