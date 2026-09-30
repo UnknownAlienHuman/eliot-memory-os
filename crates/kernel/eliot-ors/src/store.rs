@@ -3661,17 +3661,24 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         activation: AdmissionReservationActivationRequest,
     ) -> Result<AdmissionReservationSnapshot, OrsError>;
-    /// Marks an inactive reservation as reconciling with exact evidence.
+    /// Marks a staged, reconciling or active reservation as reconciling with
+    /// exact evidence (I14.20:94-96). An `ACTIVE` row moves to `RECONCILING`
+    /// only; it can never be expired here.
     fn reconcile_kernel_admission_reservation(
         &self,
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError>;
-    /// Releases an inactive reservation with receipt-backed evidence.
+    /// Releases a staged, reconciling or active reservation with receipt-backed
+    /// evidence (I14.20:94-96). This is the path that takes an `ACTIVE`
+    /// reservation to `RELEASED`; expiry is not (I14.20:99).
     fn release_kernel_admission_reservation(
         &self,
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError>;
-    /// Expires an inactive reservation only after its declared expiry time.
+    /// Expires an inactive (staged or reconciling) reservation only after its
+    /// declared expiry time. An `ACTIVE` row is refused: I14.20:99 — "an active
+    /// reservation attached to a nonterminal attempt cannot be expired as
+    /// cleanup."
     fn expire_kernel_admission_reservation(
         &self,
         disposition: AdmissionReservationDisposition,
@@ -31252,7 +31259,9 @@ impl RedbRecoveryStore {
 /// disposition transitions already had, rather than a second scheme.
 #[derive(Clone, Copy)]
 enum AdmissionReservationTransitionSpec<'a> {
-    /// A receipt-backed disposition of an inactive/reconciling reservation.
+    /// A receipt-backed disposition of a staged, reconciling or active
+    /// reservation. `ACTIVE` is a legal source for `Released` and
+    /// `Reconciling` only, never for `Expired` (I14.20:94-96, I14.20:99).
     Disposition {
         /// The caller-supplied disposition with its reason and evidence.
         disposition: &'a AdmissionReservationDisposition,
@@ -31433,6 +31442,35 @@ impl RedbRecoveryStore {
         ))
     }
 
+    /// Whether one admission-reservation state may legally be the source of a
+    /// transition to `target` (I14.20:94-96, #1678 section 8).
+    ///
+    /// `STAGED_INACTIVE` and `RECONCILING` reach every target, which keeps the
+    /// activation path (`-> ACTIVE`) intact. `ACTIVE` reaches exactly `RELEASED` and
+    /// `RECONCILING`, so an active reservation can be disposed of or handed to
+    /// recovery by its owning execution/recovery path. I14.20:99 keeps expiry
+    /// narrower — "an active reservation attached to a nonterminal attempt cannot be
+    /// expired as cleanup" — so `ACTIVE -> EXPIRED` has no arm here and stays
+    /// refused. `RELEASED` and `EXPIRED` are terminal and are never a source.
+    ///
+    /// The match is exhaustive so a future `AdmissionReservationState` variant
+    /// cannot silently default to a legal source.
+    fn legal_admission_reservation_source(
+        state: AdmissionReservationState,
+        target: AdmissionReservationState,
+    ) -> bool {
+        match state {
+            AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling => {
+                true
+            }
+            AdmissionReservationState::Active => matches!(
+                target,
+                AdmissionReservationState::Released | AdmissionReservationState::Reconciling
+            ),
+            AdmissionReservationState::Released | AdmissionReservationState::Expired => false,
+        }
+    }
+
     fn prepare_admission_reservation_transition(
         record: &mut AdmissionReservationRecord,
         spec: AdmissionReservationTransitionSpec<'_>,
@@ -31487,11 +31525,15 @@ impl RedbRecoveryStore {
         {
             return Err(OrsError::FenceMismatch);
         }
-        if record.state == target
-            || !matches!(
-                record.state,
-                AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling
-            )
+        // I14.20:94-96 — `STAGED_INACTIVE` and `RECONCILING` reach every
+        // target, which keeps the activation path (`-> ACTIVE`) intact, and
+        // `ACTIVE` reaches exactly `RELEASED` and `RECONCILING`, so an active
+        // reservation can be disposed of or handed to recovery by its owning
+        // execution/recovery path. I14.20:99 keeps expiry narrower — "an active
+        // reservation attached to a nonterminal attempt cannot be expired as
+        // cleanup" — so `ACTIVE -> EXPIRED` has no arm here and stays refused.
+        // The match is exhaustive so a future state can never default to legal.
+        if record.state == target || !Self::legal_admission_reservation_source(record.state, target)
         {
             return Err(OrsError::InvalidTransition);
         }

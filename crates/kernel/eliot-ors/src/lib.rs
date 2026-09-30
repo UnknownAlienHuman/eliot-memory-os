@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod admission_reservation;
+mod admission_reservation_release;
 mod admission_reservation_stage;
 mod backup_snapshot;
 mod control_reserve;
@@ -40,6 +41,12 @@ pub use admission_reservation::{
     AdmissionReservationLaunchPrerequisite, AdmissionReservationRecord,
     AdmissionReservationSnapshot, AdmissionReservationStage, AdmissionReservationState,
     AdmissionReservationTransitionRequest, verify_admission_reservation_launch_prerequisite,
+};
+pub use admission_reservation_release::{
+    AdmissionReservationAttemptDisposition, AdmissionReservationCancellationCut,
+    AdmissionReservationRowDisposition, cancel_admission_reservation,
+    disposition_admission_reservation_row, expire_admission_reservation,
+    reconcile_admission_reservation, release_admission_reservation,
 };
 pub use admission_reservation_stage::{
     ADMISSION_RESERVATION_STAGE_VERSION, AdmissionReservationIdentityInput,
