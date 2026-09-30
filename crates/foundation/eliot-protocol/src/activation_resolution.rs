@@ -296,6 +296,425 @@ impl AgentActivationKernelOwnerReadback {
     }
 }
 
+/// Exact policy and work-scope projection returned by the current authenticated
+/// owner read used to admit Observation capture.  The snapshots are retained
+/// verbatim as JSON values; their digests and revisions are the values returned
+/// by the owner, not hashes or revisions reconstructed by Kernel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationObservationAccessBinding {
+    /// Privacy class from the current WorkScope owner binding.
+    pub privacy: eliot_security_contracts::PrivacyClass,
+    /// Exact visibility class selected by the current observation policy.
+    pub visibility: String,
+    /// Exact ingress taint classification issued by the persisted policy for
+    /// raw, unscreened Observation bytes. This is not source assurance.
+    pub instruction_taint: eliot_security_contracts::InstructionTaint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationObservationPolicyReadback {
+    /// Exact canonical value from Governor's `ObservationCaptureOwnerBinding`.
+    /// The typed siblings below are validated mirrors used by Kernel joins.
+    pub owner_projection_value: serde_json::Value,
+    /// Governor's unchanged digest for `owner_projection_value`.
+    pub owner_projection_sha256: String,
+    pub wire_version: u16,
+    /// Tagged owner-authenticated origin. The value is retained verbatim so
+    /// Kernel does not reinterpret the Governor's closed origin enum.
+    pub origin: serde_json::Value,
+    pub authenticated_scope_ref: String,
+    pub state_fence: StateFence,
+    pub policy_owner_revision: u64,
+    pub policy_read_revision: u64,
+    pub policy_read_fence: StateFence,
+    pub policy_named_read_digest: String,
+    pub config_policy_snapshot: serde_json::Value,
+    pub config_policy_snapshot_sha256: String,
+    pub ingress_setting_key: String,
+    pub ingress_setting_value_ref: String,
+    pub ingress_setting_owner_ref: String,
+    /// Typed owner decision serialized without reinterpretation.
+    pub policy: serde_json::Value,
+    /// Owner-produced recovery access metadata; Kernel copies it without
+    /// deriving privacy or taint from the other evidence fields.
+    pub access: AgentActivationObservationAccessBinding,
+    pub work_scope_owner_revision: u64,
+    pub work_scope_read_revision: u64,
+    pub work_scope_read_fence: StateFence,
+    pub work_scope_canonical_read_digest: String,
+    pub work_scope_binding: serde_json::Value,
+    pub work_scope_binding_sha256: String,
+}
+
+impl AgentActivationObservationPolicyReadback {
+    /// Builds the protocol mirror from the exact Governor projection, without
+    /// recomputing its authority digests or reconstructing owner fields.
+    pub fn from_owner_projection(
+        owner_projection_value: serde_json::Value,
+        owner_projection_sha256: String,
+    ) -> Result<Self, ProtocolError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Projection {
+            wire_version: u16,
+            origin: serde_json::Value,
+            authenticated_scope_ref: String,
+            state_fence: StateFence,
+            policy_owner_revision: u64,
+            policy_read_revision: u64,
+            policy_read_fence: StateFence,
+            policy_named_read_digest: String,
+            config_policy_snapshot: serde_json::Value,
+            config_policy_snapshot_sha256: String,
+            ingress_setting_key: String,
+            ingress_setting_value_ref: String,
+            ingress_setting_owner_ref: String,
+            policy: serde_json::Value,
+            access: AgentActivationObservationAccessBinding,
+            work_scope_owner_revision: u64,
+            work_scope_read_revision: u64,
+            work_scope_read_fence: StateFence,
+            work_scope_canonical_read_digest: String,
+            work_scope_binding: serde_json::Value,
+            work_scope_binding_sha256: String,
+        }
+        let projection: Projection = serde_json::from_value(owner_projection_value.clone())
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        Ok(Self {
+            owner_projection_value,
+            owner_projection_sha256,
+            wire_version: projection.wire_version,
+            origin: projection.origin,
+            authenticated_scope_ref: projection.authenticated_scope_ref,
+            state_fence: projection.state_fence,
+            policy_owner_revision: projection.policy_owner_revision,
+            policy_read_revision: projection.policy_read_revision,
+            policy_read_fence: projection.policy_read_fence,
+            policy_named_read_digest: projection.policy_named_read_digest,
+            config_policy_snapshot: projection.config_policy_snapshot,
+            config_policy_snapshot_sha256: projection.config_policy_snapshot_sha256,
+            ingress_setting_key: projection.ingress_setting_key,
+            ingress_setting_value_ref: projection.ingress_setting_value_ref,
+            ingress_setting_owner_ref: projection.ingress_setting_owner_ref,
+            policy: projection.policy,
+            access: projection.access,
+            work_scope_owner_revision: projection.work_scope_owner_revision,
+            work_scope_read_revision: projection.work_scope_read_revision,
+            work_scope_read_fence: projection.work_scope_read_fence,
+            work_scope_canonical_read_digest: projection.work_scope_canonical_read_digest,
+            work_scope_binding: projection.work_scope_binding,
+            work_scope_binding_sha256: projection.work_scope_binding_sha256,
+        })
+    }
+
+    pub fn application_identity(
+        &self,
+    ) -> Result<(&str, &str, Option<&str>), ProtocolError> {
+        let origin = self.origin.as_object().ok_or(ProtocolError::InvalidField {
+            field: "agent_activation_observation_policy_readback.origin",
+            reason: "application-session origin must be an object",
+        })?;
+        if origin.len() != 4
+            || origin.get("kind").and_then(serde_json::Value::as_str)
+                != Some("APPLICATION_SESSION")
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.origin.kind",
+                reason: "application-session origin is required",
+            });
+        }
+        let principal = origin.get("authenticated_principal_ref")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.origin.authenticated_principal_ref",
+                reason: "authenticated principal is required",
+            })?;
+        let session = origin.get("authenticated_session_ref")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.origin.authenticated_session_ref",
+                reason: "authenticated session is required",
+            })?;
+        let task_value = origin.get("authenticated_task_ref").ok_or(
+            ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.origin.authenticated_task_ref",
+                reason: "explicit task applicability (including null) is required",
+            },
+        )?;
+        let task = if task_value.is_null() {
+            None
+        } else {
+            Some(task_value.as_str().ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.origin.authenticated_task_ref",
+                reason: "task applicability must be a string or null",
+            })?)
+        };
+        Ok((principal, session, task))
+    }
+}
+
+/// Independent Governor Policy/WorkScope observation decision for a raw Host
+/// peer when semantic activation is unresolved. This is deliberately separate
+/// from `AgentActivationOwnerReadback`: it carries no application principal,
+/// session, task, or activation evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationObservationHostPolicyReadback {
+    /// Exact canonical value emitted by the Governor owner projection.
+    pub owner_projection_value: serde_json::Value,
+    /// Unchanged digest emitted by that owner projection.
+    pub owner_projection_sha256: String,
+    /// Time at which the owner readback was captured.
+    pub observed_at_unix_ms: u64,
+    /// Exact current Kernel P-07 owner projection, independent of semantic
+    /// task activation.
+    pub kernel_owner: AgentActivationKernelOwnerReadback,
+}
+
+impl AgentActivationObservationHostPolicyReadback {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.kernel_owner.validate()?;
+        if self.observed_at_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_host_policy_readback.observed_at_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        lowercase_sha256(
+            &self.owner_projection_sha256,
+            "agent_activation_observation_host_policy_readback.owner_projection_sha256",
+        )?;
+        let bytes = canonical_json_bytes(&self.owner_projection_value)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if eliot_contracts::sha256_hex(&bytes) != self.owner_projection_sha256 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_host_policy_readback.owner_projection_sha256",
+                reason: "does not bind the exact owner projection value",
+            });
+        }
+        let origin = self
+            .owner_projection_value
+            .get("origin")
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_observation_host_policy_readback.origin",
+                reason: "host-origin policy projection is required",
+            })?;
+        if origin.get("kind").and_then(serde_json::Value::as_str) != Some("HOST_PEER")
+            || origin.get("domain").and_then(serde_json::Value::as_str) != Some("AGENT_BRIDGE")
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_host_policy_readback.origin",
+                reason: "must identify the exact AgentBridge host-origin domain",
+            });
+        }
+        let receipt_value = origin
+            .get("peer_admission_receipt")
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_observation_host_policy_readback.peer_admission_receipt",
+                reason: "full original peer admission receipt is required",
+            })?;
+        let receipt: AgentBridgePeerAdmissionReceipt = serde_json::from_value(receipt_value.clone())
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        receipt.validate()?;
+        if self.owner_projection_value.get("state_fence") != Some(&serde_json::to_value(
+            &receipt.state_fence,
+        )
+        .map_err(|error| ProtocolError::Json(error.to_string()))?) {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_host_policy_readback.state_fence",
+                reason: "must equal the full original peer receipt fence",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        let receipt_value = self
+            .owner_projection_value
+            .get("origin")
+            .and_then(|origin| origin.get("peer_admission_receipt"))
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_observation_host_policy_readback.peer_admission_receipt",
+                reason: "full original peer admission receipt is required",
+            })?;
+        let receipt: AgentBridgePeerAdmissionReceipt = serde_json::from_value(receipt_value.clone())
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if receipt.receipt_sha256 != ticket.peer_admission_receipt_sha256
+            || ticket.peer_admission_receipt.as_ref() != Some(&receipt)
+            || receipt.state_fence != ticket.state_fence
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_host_policy_readback.binding",
+                reason: "must bind the exact ticket peer receipt and full fence",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl AgentActivationObservationPolicyReadback {
+    /// Returns the exact Governor-owned value and digest after checking that
+    /// the typed protocol mirror has not drifted from that projection.
+    pub fn validated_owner_projection(
+        &self,
+    ) -> Result<(&serde_json::Value, &str), ProtocolError> {
+        let mut mirrored = serde_json::to_value(self)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let object = mirrored.as_object_mut().ok_or(ProtocolError::InvalidField {
+            field: "agent_activation_observation_policy_readback.owner_projection",
+            reason: "typed owner projection must serialize as an object",
+        })?;
+        object.remove("owner_projection_value");
+        object.remove("owner_projection_sha256");
+        if mirrored != self.owner_projection_value {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.owner_projection_value",
+                reason: "typed mirror differs from the exact Governor owner projection",
+            });
+        }
+        lowercase_sha256(
+            &self.owner_projection_sha256,
+            "agent_activation_observation_policy_readback.owner_projection_sha256",
+        )?;
+        let bytes = canonical_json_bytes(&self.owner_projection_value)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if eliot_contracts::sha256_hex(&bytes) != self.owner_projection_sha256 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.owner_projection_sha256",
+                reason: "does not bind the Governor owner projection value",
+            });
+        }
+        Ok((&self.owner_projection_value, &self.owner_projection_sha256))
+    }
+
+    pub fn validate_against(
+        &self,
+        binding: &AgentActivationResolvedBinding,
+        state_fence: &StateFence,
+    ) -> Result<(), ProtocolError> {
+        if self.wire_version != 1 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.wire_version",
+                reason: "unsupported wire version",
+            });
+        }
+        self.validated_owner_projection()?;
+        let (principal, session, task_ref) = self.application_identity()?;
+        for (value, field) in [
+            (
+                principal,
+                "agent_activation_observation_policy_readback.origin.authenticated_principal_ref",
+            ),
+            (
+                session,
+                "agent_activation_observation_policy_readback.origin.authenticated_session_ref",
+            ),
+            (
+                self.authenticated_scope_ref.as_str(),
+                "agent_activation_observation_policy_readback.authenticated_scope_ref",
+            ),
+            (
+                self.ingress_setting_key.as_str(),
+                "agent_activation_observation_policy_readback.ingress_setting_key",
+            ),
+            (
+                self.ingress_setting_value_ref.as_str(),
+                "agent_activation_observation_policy_readback.ingress_setting_value_ref",
+            ),
+            (
+                self.ingress_setting_owner_ref.as_str(),
+                "agent_activation_observation_policy_readback.ingress_setting_owner_ref",
+            ),
+            (
+                self.access.visibility.as_str(),
+                "agent_activation_observation_policy_readback.access.visibility",
+            ),
+        ] {
+            bounded_text(value, field)?;
+        }
+        if let Some(task_ref) = task_ref {
+            bounded_text(
+                task_ref,
+                "agent_activation_observation_policy_readback.authenticated_task_ref",
+            )?;
+        }
+        if principal != binding.principal_id
+            || session != binding.session_id
+            || self.authenticated_scope_ref != binding.work_scope_id
+            || self.state_fence != *state_fence
+            || self.policy_read_fence != *state_fence
+            || self.work_scope_read_fence != *state_fence
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.binding",
+                reason: "must bind the exact authenticated identity and state fence",
+            });
+        }
+        if self.policy_owner_revision == 0
+            || self.policy_read_revision != self.policy_owner_revision
+            || self.work_scope_owner_revision == 0
+            || self.work_scope_read_revision != self.work_scope_owner_revision
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.revision",
+                reason: "owner and read revisions must be nonzero and match exactly",
+            });
+        }
+        for (digest, field) in [
+            (
+                self.policy_named_read_digest.as_str(),
+                "agent_activation_observation_policy_readback.policy_named_read_digest",
+            ),
+            (
+                self.config_policy_snapshot_sha256.as_str(),
+                "agent_activation_observation_policy_readback.config_policy_snapshot_sha256",
+            ),
+            (
+                self.work_scope_canonical_read_digest.as_str(),
+                "agent_activation_observation_policy_readback.work_scope_canonical_read_digest",
+            ),
+            (
+                self.work_scope_binding_sha256.as_str(),
+                "agent_activation_observation_policy_readback.work_scope_binding_sha256",
+            ),
+        ] {
+            lowercase_sha256(digest, field)?;
+        }
+        if !self.config_policy_snapshot.is_object()
+            || !self.policy.is_string()
+            || !self.work_scope_binding.is_object()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.snapshot",
+                reason: "exact object snapshots and a typed policy label are required",
+            });
+        }
+        if !matches!(
+            self.access.instruction_taint,
+            eliot_security_contracts::InstructionTaint::CommandLike
+                | eliot_security_contracts::InstructionTaint::Untrusted
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.access.instruction_taint",
+                reason: "raw unscreened Observation input requires conservative owner policy taint",
+            });
+        }
+        if self.ingress_setting_key != "eliot.observation.ingress_policy" {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.ingress_setting_key",
+                reason: "must name the canonical Observation ingress setting",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Independent current-owner readback captured immediately before result
 /// submission. It is distinct from the result's semantic evidence: the owner
 /// supplies a fresh, timestamped readback of the same binding so Kernel can
@@ -311,6 +730,11 @@ pub struct AgentActivationOwnerReadback {
     /// source-compatible without weakening the production Kernel gate.
     #[serde(default)]
     pub kernel_owner: Option<AgentActivationKernelOwnerReadback>,
+    /// Exact current PolicyOwner and WorkScope owner readbacks used only by
+    /// the Observation capture producer. Older readbacks remain valid, while
+    /// Observation admission fails closed when this owner projection is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_policy: Option<AgentActivationObservationPolicyReadback>,
     pub readback_sha256: String,
 }
 
@@ -329,6 +753,7 @@ impl AgentActivationOwnerReadback {
             evidence,
             observed_at_unix_ms,
             kernel_owner: None,
+            observation_policy: None,
             readback_sha256: String::new(),
         };
         readback.readback_sha256 = readback.compute_digest()?;
@@ -345,6 +770,23 @@ impl AgentActivationOwnerReadback {
         kernel_owner.validate()?;
         self.kernel_owner = Some(kernel_owner);
         self.readback_sha256 = String::new();
+        self.readback_sha256 = self.compute_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Attaches the exact authenticated owner policy readback and reseals the
+    /// owner readback commitment.
+    pub fn with_observation_policy_readback(
+        mut self,
+        observation_policy: AgentActivationObservationPolicyReadback,
+    ) -> Result<Self, ProtocolError> {
+        observation_policy.validate_against(
+            &self.evidence.binding,
+            &self.evidence.state_fence,
+        )?;
+        self.observation_policy = Some(observation_policy);
+        self.readback_sha256.clear();
         self.readback_sha256 = self.compute_digest()?;
         self.validate()?;
         Ok(self)
@@ -372,6 +814,12 @@ impl AgentActivationOwnerReadback {
         }
         if let Some(kernel_owner) = &self.kernel_owner {
             kernel_owner.validate()?;
+        }
+        if let Some(observation_policy) = &self.observation_policy {
+            observation_policy.validate_against(
+                &self.evidence.binding,
+                &self.evidence.state_fence,
+            )?;
         }
         lowercase_sha256(
             &self.readback_sha256,
@@ -822,6 +1270,10 @@ pub struct AgentActivationResolutionResult {
     /// task authority and is present only for the privacy-boundary hold.
     #[serde(default)]
     pub cold_start_question: Option<AgentActivationColdStartQuestion>,
+    /// Independent current Policy/WorkScope decision for raw Host-origin
+    /// capture when this result does not create an application Session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_host_policy_readback: Option<AgentActivationObservationHostPolicyReadback>,
     pub result_sha256: String,
 }
 
@@ -886,6 +1338,7 @@ impl AgentActivationResolutionResult {
             dependency_observation: None,
             owner_evidence,
             cold_start_question: None,
+            observation_host_policy_readback: None,
             result_sha256: String::new(),
         }
         .with_computed_digest()?;
@@ -951,6 +1404,31 @@ impl AgentActivationResolutionResult {
 
     pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
         self.result_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Attaches the exact Governor-host-origin Policy/WorkScope decision to a
+    /// negative activation result and reseals the result identity.
+    pub fn with_observation_host_policy_readback(
+        mut self,
+        readback: AgentActivationObservationHostPolicyReadback,
+    ) -> Result<Self, ProtocolError> {
+        if !matches!(
+            self.disposition,
+            AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+                | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+                | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_result.observation_host_policy_readback",
+                reason: "host-origin cold policy readback is only for unresolved activation",
+            });
+        }
+        readback.validate()?;
+        self.observation_host_policy_readback = Some(readback);
+        self.result_sha256.clear();
+        self.result_sha256 = self.compute_digest()?;
+        self.validate()?;
         Ok(self)
     }
 
@@ -1036,6 +1514,26 @@ impl AgentActivationResolutionResult {
         if let Some(observation) = &self.dependency_observation {
             observation.validate()?;
         }
+        if let Some(readback) = &self.observation_host_policy_readback {
+            if !matches!(
+                self.disposition,
+                AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+                    | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+                    | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+            ) {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_result.observation_host_policy_readback",
+                    reason: "host-origin policy readback is only valid without a resolved app binding",
+                });
+            }
+            readback.validate()?;
+            if readback.observed_at_unix_ms > self.resolved_at_unix_ms {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_result.observation_host_policy_readback.observed_at_unix_ms",
+                    reason: "must be observed no later than the exact semantic result",
+                });
+            }
+        }
         match (&self.disposition, &self.owner_evidence) {
             (AgentActivationResolutionDisposition::Resolved { binding }, Some(evidence)) => {
                 evidence.validate_against_binding(binding, &self.ticket_state_fence)?;
@@ -1116,7 +1614,11 @@ impl AgentActivationResolutionResult {
             }
         }
         self.disposition
-            .validate_against(ticket, self.resolved_at_unix_ms)
+            .validate_against(ticket, self.resolved_at_unix_ms)?;
+        if let Some(readback) = &self.observation_host_policy_readback {
+            readback.validate_against(ticket)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1137,20 +1639,21 @@ impl AgentActivationResolutionResult {
 }
 
 // ---------------------------------------------------------------------------
-// Wave 2 receiver transport: closed v2 submit/reconcile envelope.
+// Wave 2 receiver transport: closed v3 submit and v2 reconcile envelopes.
 // ---------------------------------------------------------------------------
 
-/// Wire identity of the daemon-to-Kernel v2 semantic-result submission.
+/// Wire identity of the daemon-to-Kernel v3 semantic-result submission.
 ///
 /// The submission envelope carries its own wire identity and version so the
 /// Kernel can reject unknown submission versions before adopting (parsing or
 /// trusting) the inner [`AgentActivationResolutionResult`]. It is versioned
 /// independently of the result it carries: a future submission revision does
-/// not change result v2 semantics by itself.
+/// not change result v3 semantics by itself. Version 3 adds the optional exact
+/// Observation policy/work-scope projection to the fresh owner readback.
 pub const AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_ID: &str =
     "eliot.protocol.agent-activation-result-submit";
 /// Current submission envelope contract version.
-pub const AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_VERSION: u16 = 2;
+pub const AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_VERSION: u16 = 3;
 
 /// Wire identity of the daemon-to-Kernel lost-acknowledgement reconcile query.
 ///
