@@ -8559,8 +8559,10 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         // Minter-to-durable-state join: the grant binds only to a persisted
-        // canonical record read back under the session fence. This is a
-        // read-only existence/digest proof — canonical writes stay on the
+        // canonical record read back under the session fence and validated
+        // through the canonical model's own gate, so a toast is never launched
+        // against a record that any other reader of it would refuse. This is a
+        // read-only existence/fence proof — canonical writes stay on the
         // `eliotd` admission path, never in this composition root.
         self.require_durable_notification_record(
             session,
@@ -8614,9 +8616,11 @@ impl KernelComposition {
     ///
     /// Reads back the canonical `GetNotificationState` projection for
     /// `notification_id` through the retained store gateway under the live
-    /// session fence, then requires one same-fence record with that exact
-    /// identity. An unavailable store, a failed read, a missing record, or a
-    /// fence disagreement fails closed. The presented digest is intentionally
+    /// session fence, then requires exactly one same-fence record with that
+    /// exact identity, decoded into the canonical model and validated through
+    /// its own `validate()`. An unavailable store, a failed read, no record, a
+    /// duplicate identity, a record the canonical model refuses, or a fence
+    /// disagreement all fail closed. The presented digest is intentionally
     /// opaque here (no derivation is specified; shape is enforced by the
     /// binder). This performs no canonical write: record creation is the
     /// owner's job on the admitted [`NOTIFICATION_STATE_MUTATION_OPERATION`]
@@ -8641,23 +8645,45 @@ impl KernelComposition {
             .get(eliot_store_api::NOTIFY_PAGE_RECORDS)
             .and_then(serde_json::Value::as_array)
             .ok_or(TransportError::SessionFenced)?;
-        let record = records
-            .iter()
-            .find(|value| {
-                value
-                    .get("notification_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(notification_id)
-            })
-            .ok_or(TransportError::SessionFenced)?;
-        let record_fence: StateFence = serde_json::from_value(
-            record
-                .get("state_fence")
-                .cloned()
-                .ok_or(TransportError::SessionFenced)?,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
-        if record_fence != fence {
+        // The record is decoded into the canonical model and validated through
+        // the model's OWN `validate()`, rather than read as loose JSON and
+        // field-picked. That call is the single gate every consumer of a
+        // decoded canonical record passes through, and for a record carrying a
+        // terminal disposition it re-runs the `resolve` leg's own
+        // `validate_resolution` over the ORIGINAL receipt stored on the record
+        // (`crates/kernel/eliot-kernel-core/src/module/notification_state.rs`).
+        // Proving the join here therefore proves the grant does not depend on a
+        // record that would be refused everywhere else it is read — including a
+        // record whose disposition is terminal with no receipt behind it.
+        //
+        // This is a READ of the recorded value. Nothing here recomputes a
+        // digest, derives one, or compares a recomputed value to a presented
+        // one: `_notification_digest` stays opaque exactly as before, and the
+        // presented digest is still shape-checked by the binder.
+        let mut found = None;
+        for value in records {
+            let Ok(record) = serde_json::from_value::<eliot_kernel_core::Notification>(
+                value.clone(),
+            ) else {
+                continue;
+            };
+            if record.notification_id.as_str() != notification_id {
+                continue;
+            }
+            if found.is_some() {
+                // Two records answering one canonical identity at one fence is
+                // not a projection. Choosing the first would let a grant bind to
+                // whichever duplicate the store happened to order first, so the
+                // join refuses rather than selects.
+                return Err(TransportError::SessionFenced);
+            }
+            found = Some(record);
+        }
+        let record = found.ok_or(TransportError::SessionFenced)?;
+        record
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if record.state_fence != fence {
             return Err(TransportError::SessionFenced);
         }
         Ok(())
