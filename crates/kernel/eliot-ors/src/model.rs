@@ -7882,16 +7882,26 @@ impl HostRequestApplicationBinding {
     }
 
     fn validate_activation_projection(&self) -> Result<(), OrsError> {
+        match (self.p07_revision, self.p07_bundle_sha256.as_ref()) {
+            (Some(revision), Some(bundle_sha256)) if revision != 0 => {
+                validate_digest(bundle_sha256, "host_request_p07_bundle_sha256")?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_p07_projection",
+                    reason: "P07 owner revision and bundle digest must be present together",
+                });
+            }
+        }
         match (
             self.resolved_application_binding.as_ref(),
             self.resolved_application_binding_sha256.as_ref(),
             self.activation_owner_evidence.as_ref(),
             self.activation_owner_evidence_sha256.as_ref(),
             self.activation_result_sha256.as_ref(),
-            self.p07_revision,
-            self.p07_bundle_sha256.as_ref(),
         ) {
-            (Some(binding), Some(binding_sha), Some(owner), Some(_), Some(result), Some(revision), Some(p07)) => {
+            (Some(binding), Some(binding_sha), Some(owner), Some(_), Some(result)) => {
                 let expected_fence = serde_json::to_value(&self.state_fence)
                     .map_err(|error| OrsError::Encoding(error.to_string()))?;
                 if owner.get("binding") != Some(binding)
@@ -7902,14 +7912,11 @@ impl HostRequestApplicationBinding {
                         .get("owner_revision")
                         .and_then(Value::as_u64)
                         .is_none_or(|owner_revision| owner_revision == 0)
-                    || revision == 0
                     || result.is_empty()
-                    || p07.is_empty()
                 {
                     return Err(OrsError::FenceMismatch);
                 }
                 validate_digest(result, "host_request_activation_result_sha256")?;
-                validate_digest(p07, "host_request_p07_bundle_sha256")?;
                 validate_digest(
                     owner
                         .get("evidence_sha256")
@@ -7918,11 +7925,11 @@ impl HostRequestApplicationBinding {
                     "host_request_activation_owner_evidence_digest",
                 )
             }
-            (None, None, None, None, None, None, None)
+            (None, None, None, None, None)
                 if self.task_ref.is_none() && self.task_revision.is_none() => Ok(()),
             _ => Err(OrsError::InvalidField {
                 field: "host_request_activation_binding",
-                reason: "task activation evidence must be complete together, and absent only for task-free requests",
+                reason: "activation decision and evidence must be complete together, and absent only for task-free requests",
             }),
         }
     }
