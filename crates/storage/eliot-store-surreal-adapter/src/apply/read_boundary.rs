@@ -2473,6 +2473,7 @@ async fn automation_history_payload(
                 "automation_id": row.automation_id,
                 "revision": row.revision,
                 "revision_json": row.revision_json,
+                "normalization_receipt_json": row.normalization_receipt_json,
             })
         })
         .collect();
@@ -2536,6 +2537,10 @@ async fn read_revisions_after(
                 automation_id: automation_row_text(object, "automation_id")?,
                 revision: automation_row_text(object, "revision")?,
                 revision_json: automation_row_text(object, "revision_json")?,
+                normalization_receipt_json: object
+                    .get(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+                    .filter(|value| !value.is_null())
+                    .cloned(),
                 state_fence: automation_row_fence(object)?,
             })
         })
