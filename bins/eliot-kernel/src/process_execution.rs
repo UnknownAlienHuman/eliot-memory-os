@@ -125,10 +125,8 @@ fn record_process_owner_operation_context(
     operation_id: &eliot_process::OperationId,
 ) {
     let generation = owner.generation().get().to_string();
-    let authority_epoch = eliot_contracts::StateFence::canonical_epoch_digest(
-        owner.authority_epoch(),
-    )
-    .ok();
+    let authority_epoch =
+        eliot_contracts::StateFence::canonical_epoch_digest(owner.authority_epoch()).ok();
     record_process_context_field(context, "operation", Some(operation_id.as_str()));
     record_process_context_field(context, "generation", Some(generation.as_str()));
     record_process_context_field(context, "authority_epoch", authority_epoch.as_deref());
@@ -142,11 +140,7 @@ fn record_process_start_request_context(
     let owner_generation = owner.generation().get().to_string();
     let owner_authority_epoch =
         eliot_contracts::StateFence::canonical_epoch_digest(owner.authority_epoch()).ok();
-    record_process_context_field(
-        context,
-        "generation",
-        Some(owner_generation.as_str()),
-    );
+    record_process_context_field(context, "generation", Some(owner_generation.as_str()));
     record_process_context_field(context, "authority_epoch", owner_authority_epoch.as_deref());
     if admission.validate().is_err() {
         return;
@@ -2803,11 +2797,7 @@ impl ProcessExecutionGateway {
                 }
                 Ok(OriginGrantEffectOutcome::Unknown) => {}
                 Err(error) => {
-                    observe_process_in_context(
-                        context,
-                        "kernel.process.cancel_rejected",
-                        "fenced",
-                    );
+                    observe_process_in_context(context, "kernel.process.cancel_rejected", "fenced");
                     super::kernel_diagnostics::observe_terminal_error_in_context(
                         process_terminal_code(&error),
                         context,
@@ -3047,7 +3037,8 @@ impl ProcessExecutionGateway {
         operation_id: eliot_process::OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
         let context = Self::operation_context_for(owner, &operation_id);
-        self.reconcile_in_context(owner, operation_id, &context).await
+        self.reconcile_in_context(owner, operation_id, &context)
+            .await
     }
 
     /// Reconciles one operation under its caller's already established safe
@@ -3092,11 +3083,7 @@ impl ProcessExecutionGateway {
                         .canonical_epoch_digest()
                         .as_deref(),
                 );
-                observe_process_in_context(
-                    context,
-                    "kernel.process.reconcile_reported",
-                    "success",
-                );
+                observe_process_in_context(context, "kernel.process.reconcile_reported", "success");
                 Ok(evidence)
             }
             Err(error) => {
@@ -3957,10 +3944,8 @@ impl KernelComposition {
                 // Material/Critical process start is fail-closed on the exact
                 // target fence before any external effect owner is entered.
                 let outer_binding = match self
-                    .reject_process_start_without_material_coverage_in_context(
-                        &admission,
-                        &context,
-                    ) {
+                    .reject_process_start_without_material_coverage_in_context(&admission, &context)
+                {
                     Ok(outer_binding) => outer_binding,
                     Err(rejection) => return ProcessExecutionResponse::Rejected(rejection),
                 };

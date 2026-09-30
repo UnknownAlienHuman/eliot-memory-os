@@ -616,8 +616,7 @@ fn process_owner_authorization_stays_exact() {
     )
     .expect("owner");
     let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
-    authorize_process_owner_in_context(&owner, &owner, &context)
-        .expect("exact owner authorizes");
+    authorize_process_owner_in_context(&owner, &owner, &context).expect("exact owner authorizes");
     let foreign = ProcessOwnerBinding::new(
         BROKER_MODULE,
         "b".repeat(64),
