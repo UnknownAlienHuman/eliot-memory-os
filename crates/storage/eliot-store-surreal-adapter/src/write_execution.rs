@@ -57,7 +57,6 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::ResourceGeneration;
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, OperationId, OrderingHeadExpectation, PreparedTransition,
     RequestMeta, ReservedWriteRequest, ResourceGeneration, RevisionHeadExpectation, StateFence,
