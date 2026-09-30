@@ -874,6 +874,35 @@ pub fn coverage_percentage(
     Some((covered as f64 / total as f64) * 100.0)
 }
 
+/// Resolves the exact source-dependency handles one retained trace version
+/// depends on: the allowed Tool/Facet manifest revision the denominator was
+/// built against, the manifest-declared invalidation handles, and one handle
+/// per declared stream cursor interval. Handles derive only from an already
+/// validated manifest (see [`BoundComplianceInputs::bind`]); repeats collapse
+/// so retention never fails typed on a duplicated handle.
+fn retention_source_dependencies(manifest: &ObservationCoverageManifest) -> Vec<String> {
+    let mut dependencies = Vec::new();
+    let mut push_unique = |handle: String| {
+        if !dependencies.contains(&handle) {
+            dependencies.push(handle);
+        }
+    };
+    push_unique(format!(
+        "allowed-manifest:{}",
+        manifest.allowed_manifest_digest
+    ));
+    for dependency in &manifest.invalidation_dependencies {
+        push_unique(dependency.clone());
+    }
+    for range in &manifest.first_and_last_expected_cursors_by_stream {
+        push_unique(format!(
+            "stream-cursor:{}:{}..={}",
+            range.stream, range.first_expected_cursor, range.last_expected_cursor
+        ));
+    }
+    dependencies
+}
+
 /// One retained compliance trace version with its source dependencies.
 ///
 /// The record carries the exact invalidation handles the trace depends on
@@ -1007,6 +1036,31 @@ impl ComplianceTraceLedger {
             }
         }
         lowered
+    }
+
+    /// Retains the trace derived from one bound manifest plus evidence pair
+    /// with source dependencies resolved from the manifest itself (issue
+    /// #1936 W1, I7.23).
+    ///
+    /// This is the single retention scheme for bound derivations: the trace
+    /// comes only from [`derive_compliance_trace`], so an invalid or unbound
+    /// pair fails typed and is retained nowhere, and the dependencies always
+    /// bind the allowed-manifest revision, the manifest-declared invalidation
+    /// handles, and the exact stream cursor intervals the denominator was
+    /// built against. A retained version therefore always carries the handles
+    /// [`Self::invalidate_source`] needs: source invalidation, reparse, or
+    /// revocation lowers `applicable`, older versions of the same fingerprint
+    /// are superseded without deletion, and [`Self::current_for`] never
+    /// promotes a historical `PASS` onto a new fingerprint. The ledger stays
+    /// pure in-memory retention owned by the evaluation-evidence writer: it
+    /// opens no database.
+    pub fn retain_derived(
+        &mut self,
+        inputs: &BoundComplianceInputs<'_>,
+    ) -> Result<u64, EvaluationContractError> {
+        let trace = derive_compliance_trace(inputs)?;
+        let source_dependencies = retention_source_dependencies(inputs.manifest);
+        self.append(trace, source_dependencies)
     }
 
     /// Returns the latest applicable version for `fingerprint`, or `None`
