@@ -116,13 +116,19 @@ public sealed class RuntimeDiscoveryService
             {
                 throw Latch("endpoint_invalid", error.Message);
             }
-            catch (ArgumentException error)
+            // Framework text never becomes a latched message. The bytes decoded
+            // here are the endpoint object, whose members include the pipe name
+            // and the handoff nonce, and a framework `ArgumentException` or
+            // `InvalidOperationException` raised by the closed decode can echo a
+            // fragment of them. The message is replayed verbatim for the life of
+            // the process, so a bounded closed code is the whole diagnostic.
+            catch (ArgumentException)
             {
-                throw Latch("endpoint_invalid", $"{OperatorFaultReason.EndpointInvalid}: {error.Message}");
+                throw Latch("endpoint_invalid", OperatorFaultReason.EndpointInvalid);
             }
-            catch (InvalidOperationException error)
+            catch (InvalidOperationException)
             {
-                throw Latch("endpoint_invalid", $"{OperatorFaultReason.EndpointInvalid}: {error.Message}");
+                throw Latch("endpoint_invalid", OperatorFaultReason.EndpointInvalid);
             }
             catch (RuntimeDiscoveryException error)
             {
@@ -137,6 +143,12 @@ public sealed class RuntimeDiscoveryService
     /// Records the refusal as this process's terminal disposition and returns
     /// it to throw. The exception is rebuilt per call so a stable typed code
     /// never becomes a shared stack trace.
+    ///
+    /// The latched message is replayed verbatim for the life of the process, so
+    /// only a closed [`OperatorFaultReason`] code or a locally authored bounded
+    /// refusal may be passed here. Framework exception text must never be
+    /// latched: a decode failure over the endpoint object can echo the pipe
+    /// name or the handoff nonce inside it.
     private RuntimeDiscoveryException Latch(string code, string message)
     {
         _terminalRefusal = (code, message);
