@@ -22,11 +22,6 @@ pub use injection_indicators::{
     RepeatedLineageEvidence, RetainedExternalEvidence, SummaryAuthorityEvidence,
     ToolDefinitionChangeEvidence, ToolDefinitionDelta, UndeclaredEffectEvidence,
 };
-pub use notification_intents::{
-    AuthorizedSecurityRelease, SecurityNotification, SecurityNotificationHistory,
-    SecurityNotificationImpact, SecurityPromotionReviewInput, SecurityPublication,
-    SecurityReassessment,
-};
 pub use native_resource_lease::{
     NATIVE_RESOURCE_LEASE_VERSION, NativeResourceLease, NativeResourceLeaseBinding,
     NativeResourceLeaseBindingField, NativeResourceLeaseConsumptionReceipt,
@@ -37,6 +32,11 @@ pub use native_resource_selection::{
     NativeResourceDevicePolicy, NativeResourceKind, NativeResourceNetworkPolicy,
     NativeResourceReparsePolicy, NativeResourceSelection, NativeResourceSelectionCandidate,
     NativeResourceSelectionError,
+};
+pub use notification_intents::{
+    AuthorizedSecurityRelease, SecurityNotification, SecurityNotificationHistory,
+    SecurityNotificationImpact, SecurityPromotionReviewInput, SecurityPublication,
+    SecurityReassessment,
 };
 pub use revocation_digest::{
     REVOCATION_DISPOSITION_COMPLETE, REVOCATION_DISPOSITION_PARTIAL,

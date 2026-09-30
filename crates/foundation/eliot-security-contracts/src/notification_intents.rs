@@ -54,13 +54,11 @@ use crate::injection_indicators::{
     IndicatorClass, IndicatorObservation, IndicatorResolution, IndicatorSourceMap,
 };
 use crate::surface_types::{
-    AssessedSourceRevision, EffectCeiling, SourceAssessmentScope, assessment_refs,
-    assessment_text,
+    AssessedSourceRevision, EffectCeiling, SourceAssessmentScope, assessment_refs, assessment_text,
 };
 
 /// Domain separator for the publication identity digest.
-const PUBLICATION_IDENTITY_DOMAIN: &str =
-    "eliot.security.notification-publication-identity.v1";
+const PUBLICATION_IDENTITY_DOMAIN: &str = "eliot.security.notification-publication-identity.v1";
 
 /// What the named owner is being told, in the closed vocabulary of this
 /// contract.
@@ -499,12 +497,11 @@ impl SecurityNotification {
         self.evidence_refs
             .iter()
             .map(String::as_str)
-            .chain(self.reassessments.iter().flat_map(|reassessment| {
-                reassessment
-                    .evidence_refs
+            .chain(
+                self.reassessments
                     .iter()
-                    .map(String::as_str)
-            }))
+                    .flat_map(|reassessment| reassessment.evidence_refs.iter().map(String::as_str)),
+            )
             .collect()
     }
 
@@ -599,7 +596,11 @@ pub struct SecurityNotificationHistory {
 /// notification is already held, so no second entry and no second history row
 /// were produced.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "outcome",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum SecurityPublication {
     /// A new notification was retained.
     Published {

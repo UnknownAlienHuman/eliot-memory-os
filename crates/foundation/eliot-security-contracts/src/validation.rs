@@ -47,9 +47,7 @@ pub enum SecurityContractError {
     IndicatorEvidenceUnproven { field: &'static str },
     #[error("high impact is claimed without an independent deterministic rule binding: {field}")]
     IndicatorImpactUnproven { field: &'static str },
-    #[error(
-        "release does not rest on fresh discriminating evidence under a new profile: {field}"
-    )]
+    #[error("release does not rest on fresh discriminating evidence under a new profile: {field}")]
     IndicatorReleaseNotAdmissible { field: &'static str },
     #[error("revoked influence is still marked active")]
     RevokedInfluenceActive,
