@@ -1600,21 +1600,88 @@ fn forward_receipt_error(error: &BridgeError) -> Response {
 /// cursor, and sequence. The host's own untyped identifier therefore never
 /// names a delivery point on its own: a wire with no typed normalization is
 /// refused before any pending injection moves.
+///
+/// #2899 W4/A10: this is the live host-side PRODUCER of the stdio → host-event
+/// → Agent Bridge/Kernel correlation. `BridgeRunner::forward_hook` is the one
+/// ingress in this process that reaches the owner's `observe_host_event`, so it
+/// is the only place the owner's terminal host journal actually receives a
+/// `HostEventEnvelope` — and that owner journal is exactly what the correlation
+/// join verifies a candidate against before deriving any assessment
+/// ([`eliot_agent_bridge::mcp_correlation::reconcile_live_stdio_host_event`]).
+/// The join therefore runs here, on the ingress that populates the journal it
+/// reads, rather than on a durable `EventEnvelope` admission that could only
+/// look up an identity the journal never holds.
+///
+/// A reconciliation failure never fails this forward. The host event is already
+/// admitted and durable; discarding a competent observation because a
+/// correlation could not be closed would lose evidence, so the failure is
+/// reported as a bounded, secret-free reason instead.
 fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> (Response, bool) {
     match runner.forward_hook(event) {
-        Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
-            Ok(receipts) => (
-                Response::Forwarded {
-                    bootstrap: None,
-                    reactive_receipts: receipts,
-                    event_forwarding: None,
-                },
-                false,
-            ),
-            Err(error) => (forward_receipt_error(&error), false),
-        },
+        Ok(()) => {
+            reconcile_hook_correlation(runner, event);
+            match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
+                Ok(receipts) => (
+                    Response::Forwarded {
+                        bootstrap: None,
+                        reactive_receipts: receipts,
+                        event_forwarding: None,
+                    },
+                    false,
+                ),
+                Err(error) => (forward_receipt_error(&error), false),
+            }
+        }
         Err(error) => forward_dispatch_error(&error),
     }
+}
+
+/// Joins one admitted stdio host event onto the live MCP correlation it names.
+///
+/// The CONSUMER half of #2899's live path. It is pure wiring over the existing
+/// owners: the join reads the candidate back out of the owner's own journal and
+/// the correlation's own immutable identity, so a stale, foreign,
+/// unattributable, duplicated, or reordered event closes nothing current, and
+/// an exact replay stays idempotent.
+///
+/// Every outcome is reported as a bounded, secret-free line: the correlation
+/// digest, the closed reason code, and whether the revision filed a transport
+/// edge. A host event that names no tracked correlation, or that the owner
+/// cannot normalize, is an ordinary observation and is never escalated into a
+/// fault or a recovery directive.
+fn reconcile_hook_correlation(runner: &mut BridgeRunner, event: &HostEventEnvelope) {
+    let outcome =
+        eliot_agent_bridge::mcp_correlation::reconcile_live_stdio_host_event(runner, event);
+    let (correlation_digest, state, edge_filed, failure) = match outcome {
+        Ok(eliot_agent_bridge::mcp_correlation::HostEventReconciliation::Resolved {
+            correlation_digest,
+            state,
+            edge_filed,
+        }) => (
+            correlation_digest,
+            state.as_str(),
+            edge_filed,
+            String::new(),
+        ),
+        Ok(eliot_agent_bridge::mcp_correlation::HostEventReconciliation::NotTerminal) => {
+            (String::new(), "not_terminal", false, String::new())
+        }
+        Ok(eliot_agent_bridge::mcp_correlation::HostEventReconciliation::NoTrackedCorrelation) => (
+            String::new(),
+            "no_tracked_correlation",
+            false,
+            String::new(),
+        ),
+        Err(error) => (String::new(), "unreconciled", false, error.to_string()),
+    };
+    tracing::info!(
+        host_event_id = %event.event_id,
+        correlation_digest = %correlation_digest,
+        assessment_state = state,
+        transport_edge_filed = edge_filed,
+        reconcile_failure = %failure,
+        "mcp host-event correlation reconciliation"
+    );
 }
 
 /// Delivers response-piggybacked reactive injections through the live stdio

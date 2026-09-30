@@ -378,6 +378,47 @@ pub fn observe_mcp_emission(
     runner.submit_emission_observation(&emission, canonical, None, deadline_unix_ms)
 }
 
+/// Joins one live stdio host event onto the correlation it names.
+///
+/// This is the host-side half of the live path, and it is deliberately a
+/// consumer of an event the OWNER already admitted, never a second reader and
+/// never a second store. The caller passes the exact envelope the owner
+/// journaled, so the join verifies against the owner's own journal
+/// ([`AgentBridgeCore::terminal_reduction_inputs`]) and closes nothing a
+/// caller could nominate.
+///
+/// The integration identity is the envelope's OWN owner-validated
+/// `producer_adapter_identity`, read through the closed normalized observation
+/// the owner already validated ([`HostEventEnvelope::normalized`]). It is
+/// never caller text: an event the owner refused to normalize, or whose typed
+/// observation does not validate, yields no identity here and therefore no
+/// join at all, which is the I7.23 `UNKNOWN` direction rather than a
+/// self-reported pass.
+///
+/// A join failure is returned, never collapsed into an ordinary outcome: the
+/// typed [`ReconcileFailure`] stays typed across the layer boundary so the
+/// caller can report the exact reason instead of presenting an unattributable
+/// event as merely uninteresting. The caller does not fail the forward that
+/// carried the event — the host event is already durable, and discarding a
+/// competent observation because a correlation could not be closed would lose
+/// evidence — but it reports the failure as a bounded, secret-free reason.
+pub fn reconcile_live_stdio_host_event(
+    runner: &mut BridgeRunner,
+    event: &HostEventEnvelope,
+) -> Result<HostEventReconciliation, ReconcileFailure> {
+    // The identity is the observation's own closed, versioned, owner-validated
+    // producer-adapter field, never an unvalidated wire string. An envelope the
+    // owner cannot normalize is not a host observation at all, and
+    // `reconcile_terminal_host_event` refuses it as non-terminal before any
+    // identity is read, so there is no identity to supply.
+    let Ok(normalized) = event.normalized() else {
+        return Ok(HostEventReconciliation::NotTerminal);
+    };
+    let integration_id = normalized.producer_adapter_identity.clone();
+    let now_unix_ms = owner_now_unix_ms().unwrap_or(0);
+    runner.reconcile_terminal_host_event(event, &integration_id, now_unix_ms)
+}
+
 /// Milliseconds since the Unix epoch, or `None` when the host clock is
 /// unavailable. Used only as the owner's own clock reading; a missing reading
 /// never advances a deadline on its own.
