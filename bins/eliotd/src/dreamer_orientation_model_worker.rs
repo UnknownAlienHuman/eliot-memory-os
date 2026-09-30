@@ -16,7 +16,7 @@ use eliot_contracts::{
 };
 use eliot_dreamer_contracts::{
     ContractViolation, DreamInputBundle, DreamJobAdmission, DreamJobInput, ModelRouteRequestError,
-    RecipeInput,
+    PROVIDER_OUTPUT_SCHEMA_VERSION, RecipeInput, provider_output_schema_v2,
 };
 use eliot_protocol::dreamer_job::{DurableJobError, OpaqueContentRef};
 use eliot_read::LocalReadPort;
@@ -216,6 +216,7 @@ async fn resolve_original_output_schema<R: LocalReadPort>(
     };
     input.output_schema_recipe.validate()?;
     if schema_id.as_str() != job.output_schema.as_str()
+        || *schema_version != PROVIDER_OUTPUT_SCHEMA_VERSION
         || input.output_contract_ref.artifact_id.as_ref() != Some(schema_id)
         || input.output_contract_ref.sha256.as_str() != schema_digest.as_str()
         || input.output_contract_ref.byte_length != input.output_schema_source.expected_byte_length
@@ -243,6 +244,11 @@ async fn resolve_original_output_schema<R: LocalReadPort>(
         .map_err(|_| DreamerOrientationModelWorkerError::OutputSchemaNotCanonicalObject)?;
     if !schema.is_object() || canonical_json_bytes(&schema)?.as_slice() != schema_bytes.as_slice() {
         return Err(DreamerOrientationModelWorkerError::OutputSchemaNotCanonicalObject);
+    }
+    let expected_schema = provider_output_schema_v2()
+        .map_err(|_| DreamerOrientationModelWorkerError::OutputSchemaIdentityMismatch)?;
+    if schema != expected_schema {
+        return Err(DreamerOrientationModelWorkerError::OutputSchemaIdentityMismatch);
     }
 
     let major = u16::try_from(*schema_version)
