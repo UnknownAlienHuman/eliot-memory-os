@@ -76,6 +76,20 @@ pub struct SourceSecurityAssessment {
     pub observed_features: Vec<ObservedSourceFeature>,
     /// Interpretations proposed by a model, kept distinct from observations.
     pub model_interpretations: Vec<ModelProposedInterpretation>,
+    /// I8.8 indicator observations classified for this exact source revision.
+    ///
+    /// These are the classified form of the same retained evidence the rows
+    /// above carry: each one names the class its producer assigned, the exact
+    /// evidence for it, and that producer's provenance. The use boundary
+    /// resolves every one of them through the finite indicator-to-source map
+    /// and keeps only the narrowing that survives, so a retained record is
+    /// evidence and never authority.
+    ///
+    /// Empty means no indicator was classified for this source, which is not a
+    /// finding in either direction; it is the ordinary state for a source that
+    /// raised no signal.
+    #[serde(default)]
+    pub indicator_observations: Vec<crate::RecordedIndicatorObservation>,
 }
 
 /// Closed inventory of dimensions that a source assessment may describe.
@@ -476,6 +490,12 @@ impl SourceSecurityAssessment {
             interpretation.validate()?;
             dimensions.insert(assessment_value_dimension(&interpretation.value));
         }
+        // A retained indicator record is validated here, once, so a malformed
+        // one is refused at the use boundary instead of being skipped by the
+        // resolution that consumes it.
+        for record in &self.indicator_observations {
+            record.validate()?;
+        }
         if REQUIRED_ASSESSMENT_DIMENSIONS
             .iter()
             .any(|dimension| !dimensions.contains(dimension))
@@ -528,6 +548,52 @@ impl SourceSecurityAssessment {
                 .narrowed_with(&base)),
             None => Ok(base),
         }
+    }
+
+    /// Resolves every I8.8 indicator observation this assessment retains, and
+    /// returns the use authority that survives all of them.
+    ///
+    /// This is the entry point a use boundary calls: it takes the retained
+    /// indicator records, sends each through the finite indicator-to-source map
+    /// with this assessment's own [`AssessedSourceRevision`], and intersects the
+    /// surviving authorities. Intersection only removes permitted uses and
+    /// effects, so no record can widen them, and instruction taint always comes
+    /// from the assurance in force, so no record can clear it.
+    ///
+    /// Nothing here mutates quarantine, Incident state or authority. A
+    /// model-proposed record, a record whose comparison inputs were missing, and
+    /// every content-shaped class each resolve to
+    /// [`crate::IndicatorResolution::CandidateOnly`], which resolves to exactly
+    /// the base narrowing; those records are therefore retained inert evidence
+    /// here and nowhere else. Any record the map refuses fails the whole
+    /// resolution rather than being skipped, so a malformed record cannot make
+    /// the source look as though no indicator existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assessment shape or any retained indicator
+    /// record is malformed, when the indicator map refuses a class/evidence/
+    /// observation combination, or when the fence or source in force is no
+    /// longer the assessed one.
+    pub fn resolve_recorded_indicator_uses(
+        &self,
+        current_assurance: &SourceAssurance,
+        state_fence: &StateFence,
+    ) -> Result<SourceUseAuthority, crate::SecurityContractError> {
+        let mut surviving = self.resolve_source_use(current_assurance, state_fence)?;
+        for record in &self.indicator_observations {
+            surviving = self
+                .resolve_indicator_use(
+                    record.indicator,
+                    &record.evidence,
+                    &record.observation,
+                    current_assurance,
+                    state_fence,
+                    record.release_condition.as_deref(),
+                )?
+                .narrowed_with(&surviving);
+        }
+        Ok(surviving)
     }
 
     /// Resolves what one action may take from this assessed source right now.
