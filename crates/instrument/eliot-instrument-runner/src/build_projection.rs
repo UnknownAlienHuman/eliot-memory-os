@@ -89,7 +89,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eliot_build_test_graph::{
     BuildFingerprint, BuildFlight, BuildTestGraph, CacheLookup, CandidateIdentity,
@@ -1111,6 +1111,33 @@ impl TargetRootBuildCoordinator {
         }
     }
 
+    /// The single-flight registry for one governed target root, created on the
+    /// first claim in that root.
+    ///
+    /// This is the one place a root's registry is created, so a claim can never
+    /// resolve through a registry that belongs to a different root. The
+    /// returned handle is the stored one, not a copy of its contents:
+    /// [`SingleFlightBuildRegistry`] shares its own map through an `Arc`, so a
+    /// claim taken through this handle and a release taken through it observe
+    /// the same slot.
+    fn registry_for(&self, target_root: &Path) -> SingleFlightBuildRegistry {
+        let mut live = self.live.borrow_mut();
+        live.entry(target_root.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
+    /// The single-flight registry for one governed target root, when this
+    /// coordinator still holds a live producer slot in that root.
+    ///
+    /// `None` means the root has no live slot in this coordinator, which is a
+    /// different fact from "the slot is held by a different producer": a
+    /// completion for a root this coordinator never claimed is refused rather
+    /// than resolved against some other root's registry.
+    fn registry_of(&self, target_root: &Path) -> Option<SingleFlightBuildRegistry> {
+        self.live.borrow().get(target_root).cloned()
+    }
+
     /// Claims the producer slot for one work item, or returns the waiter's view
     /// of the existing producer of that item's target root.
     ///
@@ -1155,9 +1182,8 @@ impl TargetRootBuildCoordinator {
                 source,
             }
         })?;
+        let registry = self.registry_for(&target_root);
         let (flight, producer, flight_operation) = {
-            let mut live = self.live.borrow_mut();
-            let registry = live.entry(target_root.clone()).or_default();
             let flight = registry.claim(&item.envelope.fingerprint, item.work_item_id.clone())?;
             let mut operations = self.live_operation.borrow_mut();
             let (producer, flight_operation) = match &flight {
@@ -1278,21 +1304,17 @@ impl TargetRootBuildCoordinator {
                 },
             );
         }
-        let released = {
-            let mut live = self.live.borrow_mut();
-            let Some(registry) = live.get(&target_root) else {
-                return Err(BuildProjectionError::NotTheProducer {
-                    work_item_id: item.work_item_id.clone(),
-                });
-            };
-            let released = registry
-                .release(&item.envelope.fingerprint, &item.work_item_id)
-                .map_err(BuildProjectionError::SingleFlight)?;
-            if released {
-                live.remove(&target_root);
-            }
-            released
+        let Some(registry) = self.registry_of(&target_root) else {
+            return Err(BuildProjectionError::NotTheProducer {
+                work_item_id: item.work_item_id.clone(),
+            });
         };
+        let released = registry
+            .release(&item.envelope.fingerprint, &item.work_item_id)
+            .map_err(BuildProjectionError::SingleFlight)?;
+        if released {
+            self.live.borrow_mut().remove(&target_root);
+        }
         if !released {
             return Err(BuildProjectionError::NotTheProducer {
                 work_item_id: item.work_item_id.clone(),
@@ -1379,6 +1401,40 @@ impl TargetRootBuildCoordinator {
                 lineage: claim.lineage.clone(),
                 operation: claim.operation.as_str().to_owned(),
             })
+    }
+
+    /// Reads the terminal evidence of one closed flight for a waiter.
+    ///
+    /// The waiter presents the [`ProducerClaim`] its
+    /// [`TargetRootBuildCoordinator::claim`] returned, and the claim's own
+    /// (target root, lineage, operation) key selects the [`ProducerOutcome`]
+    /// the producer's [`TargetRootBuildCoordinator::completion_wakeup`]
+    /// published. Both the success and the failure arm deliver the producer's
+    /// own `RawEvidence` verbatim (I18.26 line 34), and `None` means exactly
+    /// "no result is retained for *this* flight yet" — the waiter keeps its
+    /// claim and reads again later.
+    ///
+    /// This is the narrow reading of a waiter's side of the contract, and it is
+    /// deliberately not a second resolution scheme beside
+    /// [`TargetRootBuildCoordinator::terminal_outcome`]: `terminal_outcome` is
+    /// the complete four-state answer (retained / still running / the result was
+    /// released / this is a foreign flight), and this method is the `Retained`
+    /// arm's evidence read alone. A caller that needs to distinguish "expired"
+    /// from "not my flight" must use `terminal_outcome`, which is the only
+    /// place those two facts stay separate.
+    ///
+    /// # Errors
+    ///
+    /// This read is infallible: the retained set is owned by this coordinator
+    /// behind the same [`RefCell`] as every other accessor, so there is no
+    /// fallible store to consult and no error is invented for a read that
+    /// cannot fail.
+    #[must_use]
+    pub fn waiter_evidence(&self, claim: &ProducerClaim) -> Option<ProducerOutcome> {
+        self.closed
+            .borrow()
+            .get(&FlightKey::of(claim))
+            .map(|closed| closed.outcome.clone())
     }
 }
 
