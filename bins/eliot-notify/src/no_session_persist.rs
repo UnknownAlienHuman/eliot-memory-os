@@ -37,8 +37,9 @@
 //! root, inserting a schema-compatible marker entry. Both attempts are a
 //! single best-effort pass with no retry: failure is reported in the outcome,
 //! never escalated, and the caller's existing error variant is preserved.
-//! [`spool_obligation_available`] reads the marker back so the surviving
-//! obligation is observable rather than assumed.
+//! [`spool_obligation_read`] reads the marker back so the surviving obligation
+//! is observable rather than assumed, and reports an unreadable spool owner as
+//! its own state rather than as an absent marker.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -199,33 +200,60 @@ fn classify_condition(condition: &str) -> &'static str {
 /// claim or a resolution.
 const NO_SESSION_KEY_PREFIX: &str = "no-session/";
 
-/// Reports whether a durable no-session marker is still readable from the
-/// spool.
+/// Durable-readback state of the spool's own no-session markers.
+///
+/// Three states, not two, and the distinction is the whole of what the operator
+/// is told. `spool_obligation_available() -> bool` reported `false` for a ledger
+/// this process could not read AND for a ledger that was read and genuinely
+/// holds no marker. I11.6:19 makes the durable record the surviving evidence of
+/// a delivery the adapter could not deliver, so "I could not look" and "I looked
+/// and there is nothing there" are opposite claims about the store, and the
+/// first one is the one that must not read as the second. A denied traversal of
+/// the per-user protected contour, a dangling reparse point, a reparse loop, a
+/// mid-rename race, and bytes that no longer decode as the ledger are all
+/// [`Self::Unreadable`]; only a successful read with no matching key is
+/// [`Self::Absent`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
+pub enum SpoolObligationRead {
+    /// A durable `no-session/` marker is readable right now.
+    Available,
+    /// The ledger was read successfully and holds no `no-session/` marker.
+    Absent,
+    /// The ledger could not be read or decoded, so its contents are unknown.
+    /// This is an inability to establish the fact, never an absence of it.
+    Unreadable,
+}
+
+/// Reads back the durable no-session markers from the spool.
 ///
 /// I11.6:13-14 requires the Event Log / spool to persist the obligation, so the
 /// obligation's survival is read back from the owning store rather than assumed
 /// from the write's return value. This appends no marker, mutates no
 /// reservation, and resolves nothing: it applies exactly the same bounded
-/// protected-lease read the marker writer uses. An unreadable or absent ledger
-/// reports `false` so a caller reports spool-unavailable instead of claiming a
-/// durable record it cannot see.
+/// protected-lease read the marker writer uses. The three outcomes are kept
+/// apart so an unreadable ledger reports spool-unavailable rather than claiming
+/// a clean absence it never established.
 #[must_use]
-pub fn spool_obligation_available() -> bool {
+pub fn spool_obligation_read() -> SpoolObligationRead {
     let relative = PathBuf::from(crate::FALLBACK_LEDGER_RELATIVE);
     let Some(bytes) = read_ledger_bytes(&relative) else {
-        return false;
+        return SpoolObligationRead::Unreadable;
     };
     let Some(snapshot) = parse_ledger_snapshot(&bytes) else {
-        return false;
+        return SpoolObligationRead::Unreadable;
     };
-    snapshot
-        .get("entries")
-        .and_then(Value::as_object)
-        .is_some_and(|entries| {
-            entries
-                .keys()
-                .any(|key| key.starts_with(NO_SESSION_KEY_PREFIX))
-        })
+    let Some(entries) = snapshot.get("entries").and_then(Value::as_object) else {
+        return SpoolObligationRead::Unreadable;
+    };
+    if entries
+        .keys()
+        .any(|key| key.starts_with(NO_SESSION_KEY_PREFIX))
+    {
+        SpoolObligationRead::Available
+    } else {
+        SpoolObligationRead::Absent
+    }
 }
 
 /// Durable marker key for one no-session observation. The `no-session/`

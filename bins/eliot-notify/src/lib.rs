@@ -306,13 +306,16 @@ impl ObligationContour {
 /// ever produced on a path where no desktop toast was observed, and it is never
 /// a resolution or an acknowledgement.
 ///
-/// The four booleans are four independent observations reported verbatim on the
-/// wire — the Event Log write, the marker's own write-time readback, the later
-/// availability probe, and the never-claimed toast — and they are not mutually
-/// exclusive, so there is no state they could be folded into.
+/// The three booleans are three independent write-time observations reported
+/// verbatim on the wire — the Event Log write, the marker's own write-time
+/// readback, and the never-claimed toast — and they are not mutually exclusive,
+/// so there is no state they could be folded into. The two LATER read-backs (the
+/// spool and the canonical owner) are typed rather than boolean, because each of
+/// them has an "I could not read it" outcome that is not an absence and that a
+/// boolean would report as one.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "the four flags are independent write-time and read-back observations, not a state"
+    reason = "the remaining flags are independent write-time observations, not a state"
 )]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct UnsatisfiedObligation {
@@ -324,9 +327,10 @@ pub struct UnsatisfiedObligation {
     pub event_logged: bool,
     /// Whether the spool marker survived its own readback.
     pub spool_persisted: bool,
-    /// Whether a durable no-session marker is still readable from the spool.
-    /// Read back from the owning store, never assumed from the write.
-    pub spool_obligation_available: bool,
+    /// The durable read-back of the spool's own no-session markers. Read from
+    /// the owning store, never assumed from the write, and an unreadable spool
+    /// owner is its own state rather than reported as an absent marker.
+    pub spool: no_session_persist::SpoolObligationRead,
     /// The canonical obligation read back from the canonical owner. The three
     /// states are reported verbatim: the owner's own unresolved flag is never
     /// inferred here, an owner that could not be read is never reported as an
@@ -867,7 +871,7 @@ impl NotificationComposition {
             reason_code: persisted.reason_code,
             event_logged: persisted.event_logged,
             spool_persisted: persisted.spool_persisted,
-            spool_obligation_available: no_session_persist::spool_obligation_available(),
+            spool: no_session_persist::spool_obligation_read(),
             canonical,
         }
     }
