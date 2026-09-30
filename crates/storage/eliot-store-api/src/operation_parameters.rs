@@ -1773,33 +1773,7 @@ fn check_declared_shape(
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             lookup.validate()
         }
-        ParameterShape::CampaignSourcePublications => {
-            let publications: Vec<crate::CampaignSourcePublication> =
-                serde_json::from_value(value.clone())
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
-            if publications.is_empty() || publications.len() > 64 {
-                return Err(StoreError::InvalidField {
-                    field: "campaign_source_publications",
-                    reason: "must contain between one and 64 publications",
-                });
-            }
-            let mut keys = std::collections::BTreeSet::new();
-            for publication in &publications {
-                publication.validate()?;
-                let key = serde_json::to_string(&(
-                    publication.record.role,
-                    &publication.record.owner_id,
-                    &publication.record.record_id,
-                ))
-                .map_err(|error| StoreError::Serialization(error.to_string()))?;
-                if !keys.insert(key) {
-                    return Err(StoreError::Duplicate {
-                        field: "campaign_source_publications.key",
-                    });
-                }
-            }
-            Ok(())
-        }
+        ParameterShape::CampaignSourcePublications => validate_campaign_source_publications(value),
         ParameterShape::CampaignViewLookup => {
             let lookup: crate::CampaignLearningStateViewLookup =
                 serde_json::from_value(value.clone())
@@ -1834,6 +1808,40 @@ fn check_declared_shape(
             }
         }
     }
+}
+
+/// Validates the `campaign_source_publications` parameter.
+///
+/// Split out of [`check_declared_shape`] because it is the only declared shape
+/// whose validation is real work rather than shape dispatch: it decodes the
+/// publication list, bounds it, validates every publication, and refuses a
+/// repeated `(role, owner, record)` identity. Keeping it named says what it
+/// decides; inlining it in the dispatch match buried that under six other arms.
+fn validate_campaign_source_publications(value: &Value) -> Result<(), StoreError> {
+    let publications: Vec<crate::CampaignSourcePublication> = serde_json::from_value(value.clone())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if publications.is_empty() || publications.len() > 64 {
+        return Err(StoreError::InvalidField {
+            field: "campaign_source_publications",
+            reason: "must contain between one and 64 publications",
+        });
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for publication in &publications {
+        publication.validate()?;
+        let key = serde_json::to_string(&(
+            publication.record.role,
+            &publication.record.owner_id,
+            &publication.record.record_id,
+        ))
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if !keys.insert(key) {
+            return Err(StoreError::Duplicate {
+                field: "campaign_source_publications.key",
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_instrument_registry_snapshot(value: &Value) -> Result<(), StoreError> {

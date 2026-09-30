@@ -637,7 +637,7 @@ pub fn prepare_problem_owner_transition(
                 }
                 ProblemOwnerTransitionBody::Escalate { evidence } => {
                     candidate
-                        .escalate_obligation(fence, evidence.clone())
+                        .escalate_obligation(fence, evidence)
                         .map_err(problem_refused)?;
                 }
                 ProblemOwnerTransitionBody::Resolve(evidence) => {
@@ -674,12 +674,23 @@ pub fn prepare_problem_owner_transition(
     candidate.validate().map_err(problem_refused)?;
     // The candidate must be the checked successor of the revision this
     // transition expected, so the persisted history and the readback can never
-    // describe a state at a revision nothing replaced.
+    // describe a state at a revision nothing replaced. `Create` establishes
+    // revision 1 and replaces no predecessor; every other verb derives its
+    // successor from the revision it read, and a revision that cannot be
+    // incremented is refused rather than panicked on or replaced by a
+    // fabricated one. The value came from a committed record, so it is
+    // record-controlled input, not an internal invariant.
     let required_revision = match transition {
-        ProblemOwnerTransition::Create => 1,
+        ProblemOwnerTransition::Create => Some(1),
         _ => expected_revision.checked_add(1),
     };
-    if required_revision != Some(candidate.revision) {
+    let Some(required_revision) = required_revision else {
+        return Err(owner_refused(format!(
+            "problem {} is at revision {expected_revision}, which cannot be advanced without reusing a revision",
+            current.map_or_else(String::new, |record| record.problem_id.to_string()),
+        )));
+    };
+    if required_revision != candidate.revision {
         return Err(owner_refused(
             "candidate record is not the checked successor of the expected revision".to_owned(),
         ));

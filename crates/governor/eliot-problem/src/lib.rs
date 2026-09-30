@@ -1299,7 +1299,7 @@ impl Problem {
     pub fn escalate_obligation(
         &mut self,
         expected_fence: &StateFence,
-        evidence: Vec<ArtifactId>,
+        evidence: &[ArtifactId],
     ) -> Result<OwnershipObligation, ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         nonempty(&evidence, "escalation.evidence")?;
