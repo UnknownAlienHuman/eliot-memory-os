@@ -999,7 +999,9 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
         input
             .original_write_submission
             .validate()
-            .map_err(|error| owner_refused(format!("original write submission is invalid: {error}")))?;
+            .map_err(|error| {
+                owner_refused(format!("original write submission is invalid: {error}"))
+            })?;
         let (policy, current_scope) = self.validate_capture_owners(&input)?;
         let task_selection_evidence = capture_task_selection_evidence(&input, &current_scope)?;
         let submission = Self::build_mcp_observation_submission(
@@ -1027,7 +1029,9 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             envelope,
             response_mode,
         )
-        .map_err(|error| owner_refused(format!("versioned Observe write admission failed: {error}")))?;
+        .map_err(|error| {
+            owner_refused(format!("versioned Observe write admission failed: {error}"))
+        })?;
         let admitted_source = versioned.original_source();
         if admitted_source != original {
             return Err(owner_refused(

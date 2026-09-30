@@ -275,8 +275,8 @@ impl KernelComposition {
             );
             observe_terminal_error(kernel_build_error_code(error));
         })?;
-        let (ors, canonical_store_evidence) =
-            Self::open_ors_for_config(&config, &ors_path).inspect_err(|error| {
+        let (ors, canonical_store_evidence) = Self::open_ors_for_config(&config, &ors_path)
+            .inspect_err(|error| {
                 observe_entrypoint_with_detail(
                     EntrypointStage::Composition,
                     "kernel.composition.build_failed",
@@ -316,7 +316,7 @@ impl KernelComposition {
                 binding.installation_id(),
                 evidence_provider,
             )
-                .map(|(store, _identity)| store)
+            .map(|(store, _identity)| store)
         } else {
             RedbRecoveryStore::open_with_evidence(ors_path, evidence_provider)
         };
@@ -478,7 +478,7 @@ impl KernelComposition {
             platform,
             canonical_store_evidence,
         )
-            .map_err(&terminal)
+        .map_err(&terminal)
     }
 
     /// Initializes one owner-lineage graph revision before the first
