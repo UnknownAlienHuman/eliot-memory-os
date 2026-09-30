@@ -1665,9 +1665,7 @@ impl ChangeMonitor {
             return Err(ChangeMonitorError::InvalidReconciliation);
         }
         let unknown_resource = unknown.observation.resource_ref();
-        if unknown_resource.is_empty()
-            || evidence.observation.resource_ref() != unknown_resource
-        {
+        if unknown_resource.is_empty() || evidence.observation.resource_ref() != unknown_resource {
             return Err(ChangeMonitorError::InvalidReconciliation);
         }
         if !unknown.observation.unknown_origin
