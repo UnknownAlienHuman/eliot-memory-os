@@ -232,11 +232,62 @@ static GET_EVIDENCE_PACK_PARAMETERS: [ParameterDeclaration; 2] = [
         required: true,
     },
 ];
-static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
-    name: "subject",
-    shape: ParameterShape::Subject,
-    required: true,
-}];
+// Exact owner-issued selection fields shared by task-control writes and a
+// task-bound capture. The admission owner verifies their complete evidence,
+// revision, scope and proof-reference joins; this schema grants no authority.
+const TASK_SELECTION_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: "task_selection_evidence_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_revision",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_acceptance_digest",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_scope_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_source_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_evidence_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+];
+static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 8] = [
+    ParameterDeclaration {
+        name: "subject",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    // The Governor validates the complete typed submission before serializing
+    // it, just as task control retains its complete admitted task_event_json.
+    // Older subject-only capture producers remain within their existing shape.
+    ParameterDeclaration {
+        name: "observation_submission_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    TASK_SELECTION_PARAMETERS[0],
+    TASK_SELECTION_PARAMETERS[1],
+    TASK_SELECTION_PARAMETERS[2],
+    TASK_SELECTION_PARAMETERS[3],
+    TASK_SELECTION_PARAMETERS[4],
+    TASK_SELECTION_PARAMETERS[5],
+];
 static APPEND_AUDIT_EVENT_PARAMETERS: [ParameterDeclaration; 6] = [
     ParameterDeclaration {
         name: "operation_id",
@@ -1154,7 +1205,7 @@ static GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS: [ParameterDeclaration; 3
 /// task revision on apply, mirroring how `AppendAuditEvent` carries
 /// `expected_revision`), the admitted `actor_ref`, and `task_event_json` which
 /// preserves the complete lifecycle command in task history.
-static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
+static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 16] = [
     ParameterDeclaration {
         name: "task_id",
         shape: ParameterShape::Subject,
@@ -1205,6 +1256,12 @@ static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
         shape: ParameterShape::Subject,
         required: false,
     },
+    TASK_SELECTION_PARAMETERS[0],
+    TASK_SELECTION_PARAMETERS[1],
+    TASK_SELECTION_PARAMETERS[2],
+    TASK_SELECTION_PARAMETERS[3],
+    TASK_SELECTION_PARAMETERS[4],
+    TASK_SELECTION_PARAMETERS[5],
 ];
 
 /// One bounded immutable swarm owner revision.
