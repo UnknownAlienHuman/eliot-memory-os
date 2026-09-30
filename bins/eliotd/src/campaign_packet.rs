@@ -16,13 +16,13 @@
 //! `eliot_context_admission::check_campaign_view_for_admission` against the
 //! binding the admission decision would be made under and the owner-issued
 //! Decision Safety Floor for that boundary, and
-//! `eliot_context_assembly::check_campaign_view_for_assembly` against the
-//! admitted set it is about to render. Every one of them re-derives the
-//! State-Fence, task/scope identity and load-bearing Context recipe owner
-//! revision joins itself, and every one of them compares the recipe revision
-//! against `context_recipe_body_digest`, which the Context owner re-derived
-//! from the exact recipe body its own publication validator accepted. No cell
-//! inherits another's verdict. The `#40`-frozen
+//! `eliot_context_assembly::check_campaign_view_for_delivery` against the
+//! delivery owner record this route is about to deliver. Every one of them
+//! re-derives the State-Fence, task/scope identity and load-bearing Context
+//! owner-revision joins itself, and the candidate and admission cells compare
+//! the recipe revision against `context_recipe_body_digest`, which the Context
+//! owner re-derived from the exact recipe body its own publication validator
+//! accepted. No cell inherits another's verdict. The `#40`-frozen
 //! `eliot_context::ContextCompiler` is deliberately not called here: the
 //! frozen donor surface takes no new caller, and no legacy-only helper may
 //! accept a view the current owner cells refused.
@@ -35,6 +35,7 @@ use eliot_context::campaign_publication::{
     context_safety_floor_identity,
 };
 use eliot_context_admission::check_campaign_view_for_admission;
+use eliot_context_assembly::check_campaign_view_for_delivery;
 use eliot_context_candidates::{CandidateRequest, check_campaign_learning_state_view};
 use eliot_context_contracts::{
     ContextError, ContextRecipe, ProjectedCitation, SessionDeliverySnapshot,
@@ -267,11 +268,15 @@ enum CampaignPacketGapCode {
     /// owner. The admission cell reaches its own join from this route through
     /// `eliot_context_admission::check_campaign_view_for_admission`, which
     /// re-derives the join from the binding admission decides under rather than
-    /// inheriting the candidate cell's verdict. The assembly cell's join is
-    /// reached from `KernelContextReadClient::compile_context_packet`, which is
-    /// the only place an actual `AdmittedContextSet` exists to join against;
-    /// this route produces none because `admit_context` has no callable
-    /// argument set. Both full decisions stay unreachable for that same reason.
+    /// inheriting the candidate cell's verdict. The assembly cell reaches its
+    /// delivery-stage join from this route through
+    /// `eliot_context_assembly::check_campaign_view_for_delivery`, bound to the
+    /// delivery owner record this packet is about to deliver; its
+    /// admitted-set join, `eliot_context_assembly::check_campaign_view_for_assembly`,
+    /// stays at `KernelContextReadClient::compile_context_packet`, the only place
+    /// an actual `AdmittedContextSet` exists to join against, and this route
+    /// produces none because `admit_context` has no callable argument set. Both
+    /// full decisions stay unreachable for that same reason.
     ///
     /// Minting any of the absent pieces here from a constant, a CLI flag, an env
     /// var, or a caller-supplied string would fabricate the exact selection
@@ -290,13 +295,17 @@ enum CampaignPacketGapCode {
     /// The view passed both
     /// `eliot_learning_state_view::validate_campaign_learning_state_view_current`
     /// and the candidate cell's
-    /// `eliot_context_candidates::check_campaign_learning_state_view`, but
+    /// `eliot_context_candidates::check_campaign_learning_state_view`, but a
+    /// cell below the candidate stage refused it:
     /// `eliot_context_admission::check_campaign_view_for_admission` compared it
     /// against the binding the admission decision would be made under, together
     /// with the owner-issued Decision Safety Floor for that boundary, and
-    /// refused it. The two cells are independent comparisons against different
-    /// bindings — and the admission cell's adds the I7.11 floor coverage check —
-    /// so passing the candidate cell is never evidence for admission.
+    /// `eliot_context_assembly::check_campaign_view_for_delivery` compared it
+    /// against the delivery owner record this packet is about to deliver. The
+    /// cells are independent comparisons against different owner records — the
+    /// admission cell's adds the I7.11 floor coverage check, and the assembly
+    /// cell's adds the delivery owner revision and its read fence — so passing
+    /// an earlier cell is never evidence for a later one.
     OwnerCellRefusedCampaignView,
 }
 
@@ -1296,6 +1305,53 @@ async fn resolve_compile_and_bind_result(
         tracing::warn!(
             reason = %refusal,
             "current admission cell refused the campaign learning-state view"
+        );
+        return campaign_packet_result_body(
+            envelope,
+            attempt,
+            context_blocked_response(
+                publication,
+                CampaignPacketGapCode::OwnerCellRefusedCampaignView,
+                None,
+                &resolved.resolutions,
+                prior.is_some() && !prior_is_current,
+            ),
+        );
+    }
+    // #1862: the ASSEMBLY (delivery) cell reaches its own campaign-view join on
+    // this route too, and it does not inherit the candidate or admission cell's
+    // verdict.
+    //
+    // Assembly is the delivery owner, and the delivery this route performs is
+    // the published packet. The delivery owner record it binds against is the
+    // Context owner's own `ContextDelivery` row — the prior
+    // `SessionDeliverySnapshot` decoded above from the authenticated current
+    // named read, whose derivation `validate_context_owner_bodies` has already
+    // re-run against the Context owner's publication validator at the
+    // consumption edge. Nothing here mints it, and a recipe that declares no
+    // delivery row holds none, which the cell treats as an explicit absence
+    // rather than as permission to accept a frozen delivery reference.
+    //
+    // The packet's own retained Kernel fence is what the view's `ContextDelivery`
+    // row must have been read under, so a row carried over from another
+    // attempt's read is refused here instead of being delivered. The delivery
+    // snapshot's own `state_fence` is preserved verbatim by
+    // `context_delivery_publication` (a later recipe may belong to a later
+    // attempt and fence), so the cell compares the fence against the delivery
+    // record itself and never against the packet fence.
+    //
+    // #1862: this is the delivery-stage half of the load-bearing owner-revision
+    // and State Fence refusal. A `STALE`, `BLOCKED`, invalidated or
+    // cross-delivery view cannot reach `CampaignPacketOutcome::Compiled`
+    // through this pipeline, and no legacy compiler DTO stands behind it.
+    if let Err(refusal) = check_campaign_view_for_delivery(
+        &publication.view,
+        &binding.state_fence,
+        context_delivery_snapshot.as_ref(),
+    ) {
+        tracing::warn!(
+            reason = %refusal,
+            "current assembly cell refused the campaign learning-state view"
         );
         return campaign_packet_result_body(
             envelope,

@@ -20,7 +20,10 @@
 //! `CampaignLearningStateView` whose State Fence, task/scope identity or
 //! load-bearing Context recipe owner revision does not join the admitted set
 //! about to be rendered. It re-derives that join from the admitted set's own
-//! binding and inherits no other cell's verdict. The #40-frozen
+//! binding and inherits no other cell's verdict.
+//! [`check_campaign_view_for_delivery`] is the same cell's delivery-stage join
+//! against the delivery owner record the live campaign route holds, and is what
+//! that route reaches. The #40-frozen
 //! `eliot_context::ContextCompiler` decides nothing on this route.
 
 #![forbid(unsafe_code)]
@@ -47,7 +50,7 @@ pub use boundary::{
     assembly_boundary_limits, boundary_binding_digest, project_assembly_boundaries,
     read_back_boundaries, verify_boundary_binding,
 };
-pub use campaign_view::check_campaign_view_for_assembly;
+pub use campaign_view::{check_campaign_view_for_assembly, check_campaign_view_for_delivery};
 pub use cite::project_citation;
 pub use error::AssemblyError;
 #[cfg(not(target_arch = "wasm32"))]
