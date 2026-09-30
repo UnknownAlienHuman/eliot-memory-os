@@ -632,11 +632,13 @@ impl KernelComposition {
         if operation == USER_BROKER_HEARTBEAT_OPERATION {
             let request: UserBrokerHeartbeatPayload = serde_json::from_value(payload.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
-            return self.dispatch_user_broker_heartbeat(session, frame, &request, identity, now);
+            return self
+                .dispatch_user_broker_heartbeat(session, frame, &request, identity, now);
         }
         if operation == USER_BROKER_AUTHORIZE_LAUNCH_OPERATION {
-            let request: UserBrokerAuthorizeLaunchPayload = serde_json::from_value(payload.clone())
-                .map_err(|_| TransportError::SessionFenced)?;
+            let request: UserBrokerAuthorizeLaunchPayload =
+                serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
             return self.dispatch_user_broker_authorize_launch(
                 session, frame, &request, identity, now,
             );
