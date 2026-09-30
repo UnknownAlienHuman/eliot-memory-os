@@ -35,14 +35,21 @@
 //! UI/CLI display note is the owner's own retained record — it is set only by
 //! [`AgentBridgeCore::note_stale_ui_disposition`], survives in
 //! [`crate::TerminalReductionInputs`] and is projected here as
-//! [`BridgeHostCoverage::stale_ui_noted`] — so the confirmation
-//! [`assess_correlation`] receives is the owner's record and not a joining
-//! caller's claim. It is absent from this seam's request types on purpose: a
-//! bare `bool` here would let any caller assert "the host says the UI is
-//! current" (or its opposite) with no observation behind it, and would decide
-//! whether a healthy completion offers a refresh. That is a proof claim, and
+//! [`BridgeHostCoverage::stale_ui_noted`].
+//!
+//! It is absent from *this seam's* request types on purpose: a bare `bool` here
+//! would let any caller assert "the host says the UI is current" (or its
+//! opposite) with no observation behind it, and would decide whether a healthy
+//! completion offers a refresh. That is a proof claim, and
 //! [`AgentBridgeCore::note_stale_ui_disposition`] is the only thing that may
 //! make it.
+//!
+//! **Scope, stated precisely:** that guarantee holds for this seam only.
+//! [`crate::mcp_correlation::AssessmentInputs`] is re-exported publicly and its
+//! `ui_confirmed_stale` field is still a caller-assignable `bool`, so a caller
+//! of `assess_correlation` can assert the same claim by another route. Closing
+//! that requires the field to leave `AssessmentInputs` too, which is a
+//! separate change with its own owner.
 //!
 //! The correlation identity is deliberately NOT an input to this join. A
 //! correlation's recorded digest names the correlation; it says nothing about
