@@ -243,12 +243,7 @@ impl KernelComposition {
             .then(|| StateFence::canonical_epoch_digest(&request.candidate.kernel_epoch).ok())
             .flatten();
         let context = super::kernel_diagnostics::operation_context(
-            validated.then(|| {
-                request
-                    .command
-                    .operation_id()
-                    .map_or(request.message_id.as_str(), |value| value.as_str())
-            }),
+            validated.then_some(request.message_id.as_str()),
             generation.as_deref(),
             None,
             epoch.as_ref().map(|value| value.as_str()),
