@@ -3,9 +3,11 @@
 //! Implements the I5.5 capture/promotion split at the `eliot-store-surreal`
 //! boundary, before any provider I/O:
 //!
-//! - `CaptureObservation` without a unique task selection is classified
-//!   [`GateDisposition::ColdUnbound`]: durably retainable cold bytes with no
-//!   task activation, support/influence promotion, or finish relevance.
+//! - `CaptureObservation` without a task identity on either side is classified
+//!   [`GateDisposition::ColdUnbound`] only for `CaptureObservation` and
+//!   `AppendAuditEvent` candidate-family operations under the `Candidate`
+//!   effect ceiling: durably retainable cold bytes with no task activation,
+//!   task-memory, support/influence promotion, or finish relevance.
 //! - Every task-relative reusable/control transition (`UpdateTaskState` and any
 //!   `CaptureObservation` that names a task) requires the exact binding: the
 //!   context and transition task identities agree, the fences agree, and at
@@ -47,7 +49,10 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::TaskId;
-use eliot_store_api::{NamedMutationOperation, PreparedTransition, RequestMeta, StoreError};
+use eliot_store_api::{
+    EffectClass, NamedMutationOperation, PreparedTransition, RequestMeta, StoreError,
+    TransitionClass,
+};
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
@@ -194,8 +199,10 @@ fn has_single_authority_ref(transition: &PreparedTransition) -> bool {
 /// Gates one prepared transition before any provider I/O.
 ///
 /// Rules:
-/// - `CaptureObservation` with no task identity on either side is
-///   [`GateDisposition::ColdUnbound`].
+/// - A cold unbound capture may contain only `CaptureObservation` and
+///   `AppendAuditEvent`, both in the `CaptureCandidate` family under the
+///   `Candidate` ceiling. Other candidate-family operations may retain task
+///   memory or authority evidence and are rejected before provider I/O.
 /// - `CaptureObservation` naming a task, and every `UpdateTaskState`, require
 ///   exact binding: context/transition task identities present and equal,
 ///   fences equal, `WorkScope` (transition `scope_id`) consistent with the
@@ -237,7 +244,23 @@ pub fn gate_apply(
         let transition_task = transition.task_id.as_deref();
         let context_task = context.task_id.as_ref().map(TaskId::as_str);
         match (transition_task, context_task) {
-            (None, None) => return Ok(GateDisposition::ColdUnbound),
+            (None, None) => {
+                if operations.iter().any(|operation| {
+                    !matches!(
+                        operation,
+                        NamedMutationOperation::CaptureObservation
+                            | NamedMutationOperation::AppendAuditEvent
+                    )
+                })
+                    || transition.transition_class != TransitionClass::CaptureCandidate
+                    || transition.requested_effect_ceiling != EffectClass::Candidate
+                {
+                    return Err(TaskBindingRejection::selection_required(
+                        "cold unbound capture may carry only CaptureObservation and AppendAuditEvent under the Candidate effect ceiling",
+                    ));
+                }
+                return Ok(GateDisposition::ColdUnbound);
+            }
             (Some(task), Some(ctx)) if task == ctx => {
                 require_exact_binding(context, transition, task)?;
                 return Ok(GateDisposition::TaskBound);
