@@ -3303,15 +3303,20 @@ fn check_ors_journal_binding(
     ports: &RestorePorts<'_>,
     identity: &OrsRestoreBinding,
 ) -> Result<(), KernelRestoreError> {
-    // Conflict resolution (wind-down, 2026-09-29): main added the
-    // `RESTORE_JOURNAL_IDENTITY` equality check and documents it as
-    // "load-bearing, not decorative" (backup_restore_ports.rs:51). This branch's
-    // `admit_restore_journal` derives `journal_identity_ref` from the plan's own
-    // stream key instead. The two guarantees are incompatible; main's is kept
-    // because it is the stricter and the merged one. The consequence is recorded
-    // in the issue REPORT.md: until the issuer is reconciled to name the constant
-    // journal identity, this check refuses every owner-issued admission. That is
-    // fail-closed, never a wrong import.
+    // `RESTORE_JOURNAL_IDENTITY` is load-bearing, not decorative
+    // (backup_restore_ports.rs:51): the admission and the ORS namespace the
+    // adapter actually writes must be the same owner channel, so an admission
+    // for any other journal — including one describing an in-process store —
+    // refuses before a single effect runs.
+    //
+    // The owner that issues these admissions was reconciled to name this exact
+    // constant (`OrsRestoreJournalOwner::durable_journal_record` reports
+    // `RESTORE_JOURNAL_IDENTITY`, while the per-plan stream key stays the
+    // lookup key it loads the persisted binding with and is proved exactly by
+    // `matches_stream`). Before that reconciliation the owner reported the
+    // stream key here and this check refused EVERY owner-issued admission:
+    // fail-closed, and equally dead. The guarantee is unchanged by the fix —
+    // only the value the owner was required to report.
     if ports.journal_admission.journal_identity_ref != RESTORE_JOURNAL_IDENTITY {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal admission does not name the durable ORS restore journal".to_owned(),
