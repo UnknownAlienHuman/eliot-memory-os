@@ -426,8 +426,12 @@ impl IndicatorEvidence {
     /// class.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         match self {
-            Self::ExternalInstructionAttempt(evidence)
-            | Self::StandingInstructionOrSecretPersistence(evidence) => {
+            // These two payloads are distinct types, so they get separate arms
+            // and share only the retained-evidence check they both need.
+            Self::ExternalInstructionAttempt(evidence) => {
+                validate_retained(&evidence.retained_source_ref, &evidence.evidence_handles)
+            }
+            Self::StandingInstructionOrSecretPersistence(evidence) => {
                 validate_retained(&evidence.retained_source_ref, &evidence.evidence_handles)
             }
             Self::UnexpectedToolDefinitionChange(evidence) => {
