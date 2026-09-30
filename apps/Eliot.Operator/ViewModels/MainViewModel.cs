@@ -754,6 +754,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
         OperatorPendingOperation pending,
         string action)
     {
+        // A first structured answer becomes reconcilable under this exact
+        // identity, while an already-unknown phase is preserved: the phase
+        // depends only on the retained record, so it is resolved once and
+        // shared by the normal answer path and the answered-but-cleanup-
+        // limited path below.
+        var unresolvedPhase = pending.Phase is
+            OperatorOperationPhase.UnknownReconciling
+            or OperatorOperationPhase.PossiblyExecuted
+                ? pending.Phase
+                : OperatorOperationPhase.UnknownReconciling;
         try
         {
             var answer = await _client.UserAutomationAsync(
@@ -764,11 +774,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
             // Store, but it does not settle an earlier attempt of the same
             // retained identity. Preserve an already-unknown phase; a first
             // structured answer becomes reconcilable under this exact identity.
-            var unresolvedPhase = pending.Phase is
-                OperatorOperationPhase.UnknownReconciling
-                or OperatorOperationPhase.PossiblyExecuted
-                    ? pending.Phase
-                    : OperatorOperationPhase.UnknownReconciling;
             ReplacePending(pending.OperationId, unresolvedPhase);
             RefreshPendingState();
         }
@@ -782,13 +787,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 $"{action}: {unknown.OperationId} may have executed at stage {unknown.Stage} ({unknown.Message}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
-        catch (OperatorCleanupIncompleteException cleanup)
+        catch (OperatorCleanupIncompleteException<JsonElement> cleanup)
         {
-            // The owner side is settled: only the local teardown of the
-            // transport that carried it was limited. That is NOT an unknown
-            // owner result, so the record is never promoted to possibly
-            // executed, and it is never compacted either.
-            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            // The owner answered, and the settled answer travels on the fault
+            // itself: it is shown through the normal answer path FIRST, so the
+            // result payload, outcome flags and banner reach the operator.
+            // Only then is the local cleanup limitation reported, under the
+            // same identity. The record stays reconcilable, but the answer is
+            // processed, never discarded and never rewritten as unknown.
+            ShowUserAutomationResult(action, cleanup.OwnerAnswer, request);
+            ReplacePending(pending.OperationId, unresolvedPhase);
             RefreshPendingState();
             SetBanner(
                 "Owner answered — transport cleanup incomplete",
@@ -1269,119 +1277,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 : await _client.CommandAsync(
                     envelope,
                     _requestCancellation?.Token ?? CancellationToken.None);
-            bool accepted;
-            bool executed;
-            bool staleFence;
-            string outcome;
-            string? receiptId;
-            try
-            {
-                var parsed = ReadCommandReceipt(receipt, pending);
-                accepted = parsed.Accepted;
-                executed = parsed.Executed;
-                staleFence = parsed.StaleFence;
-                outcome = parsed.Outcome;
-                receiptId = parsed.ReceiptId;
-            }
-            catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException or JsonException)
-            {
-                // The owner answered but the receipt shape proves nothing:
-                // retain the same identity for reconciliation.
-                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
-                RefreshPendingState();
-                SetBanner(
-                    "Unknown outcome — reconcile, do not resubmit",
-                    $"{action}: {pending.OperationId} returned an unreadable receipt; use Reconcile before any retry.",
-                    OperatorBannerSeverity.Warning);
-                return;
-            }
-            if (accepted && executed && receiptId is null)
-            {
-                // The owner claims a durable mutation but proves nothing:
-                // retain the same identity for reconciliation, never resubmit.
-                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
-                RefreshPendingState();
-                SetBanner(
-                    "Unknown outcome — reconcile, do not resubmit",
-                    $"{action}: {pending.OperationId} was accepted without a canonical receipt; use Reconcile before any retry.",
-                    OperatorBannerSeverity.Warning);
-                return;
-            }
-            if (accepted && executed)
-            {
-                if (!RemovePending(pending.OperationId, OperatorOperationPhase.Receipted))
-                {
-                    RefreshPendingState();
-                    SetBanner(
-                        "Receipt received — recovery retained",
-                        $"{action}: the owner returned a receipt, but the local journal could not be compacted; reconcile the retained operation after recovery.",
-                        OperatorBannerSeverity.Warning);
-                    return;
-                }
-            }
-            else if (!accepted)
-            {
-                // An owner-bound refusal is terminal and distinct from a
-                // stale-fence answer, which proves the mutation was not
-                // admitted at the current State Fence.
-                var terminal = staleFence ? OperatorOperationPhase.StaleFence : OperatorOperationPhase.Rejected;
-                if (staleFence)
-                {
-                    // The owner PROVED the State Fence moved: the mutation was
-                    // not admitted at the submitted revision. That is a fence
-                    // change this client observed directly, and the retained
-                    // task context carries exactly the revision the owner just
-                    // refused. Rows, selection, cursor, graph focus, task
-                    // context and result payload are dropped HERE, before
-                    // anything can read that revision again. The retained
-                    // operation record is not dependent UI state and is
-                    // compacted by the branch below as usual.
-                    //
-                    // The request that observed the refusal has already
-                    // completed, so no in-flight response can apply state from
-                    // before it; the retained state is dropped without
-                    // cancelling the request token a later command still uses.
-                    ClearRetainedProjectionState(
-                        "The owner refused at the current State Fence; dependent UI state was invalidated before use.");
-                }
-                if (!RemovePending(pending.OperationId, terminal))
-                {
-                    RefreshPendingState();
-                    SetBanner(
-                        "Rejection received — recovery retained",
-                        $"{action}: the owner rejected the command, but the local journal could not be compacted; retain the exact operation for reconciliation.",
-                        OperatorBannerSeverity.Warning);
-                    return;
-                }
-            }
-            else
-            {
-                // An accepted-but-not-yet-executed response is still an
-                // owner-pending effect. Keep it durable and make the UI
-                // reconcile the same identity rather than treating the
-                // provisional answer as a terminal success.
-                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
-            }
-            RefreshPendingState();
-            if (executed) await RefreshAsync();
-            var bannerTitle = accepted && !executed
-                ? "Command accepted — reconcile pending owner work"
-                : staleFence
-                    ? "Command refused — stale State Fence"
-                    : accepted
-                        ? "Command accepted"
-                        : "Command rejected";
-            var bannerSeverity = accepted && !executed
-                ? OperatorBannerSeverity.Warning
-                : accepted
-                    ? OperatorBannerSeverity.Success
-                    : OperatorBannerSeverity.Warning;
-            SetBanner(
-                bannerTitle,
-                receiptId is null
-                    ? $"{action}: {outcome}; no durable mutation executed."
-                    : $"{action}: {outcome}; canonical receipt {receiptId}.",
-                bannerSeverity);
+            // A settled owner answer is processed as the owner outcome even
+            // when the transport that carried it could not finish its local
+            // cleanup: the cleanup catch below delivers the same answer
+            // through this same path, so the journal records the true owner
+            // disposition instead of an unknown one.
+            await ProcessSettledCommandAnswerAsync(pending, receipt, action, cleanup: null);
         }
         catch (OperatorUnknownOutcomeException unknown)
         {
@@ -1396,18 +1297,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 $"{action}: {unknown.OperationId} may have executed at stage {unknown.Stage} ({unknown.Message}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
-        catch (OperatorCleanupIncompleteException cleanup)
+        catch (OperatorCleanupIncompleteException<JsonElement> cleanup)
         {
-            // The owner side is settled and only the local teardown of the
-            // transport that carried it was limited. That is distinct from an
-            // unknown owner result, so the record is never promoted to possibly
-            // executed, and it is never compacted either.
-            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
-            RefreshPendingState();
-            SetBanner(
-                "Owner answered — transport cleanup incomplete",
-                $"{action}: {cleanup.OperationId} was answered by the Governor, but the local transport cleanup was limited at stage {cleanup.Stage} ({cleanup.Message}); the retained operation stays reconcilable under the same identity.",
-                OperatorBannerSeverity.Warning);
+            // The owner side is settled and the settled answer travels on the
+            // fault itself: it is processed through the normal owner-outcome
+            // path FIRST, so the journal records the true owner disposition
+            // (receipted, rejected, or reconcilable) instead of an unknown
+            // one. The local cleanup limitation is reported alongside that
+            // outcome, never as `UnknownReconciling` for the answer.
+            await ProcessSettledCommandAnswerAsync(pending, cleanup.OwnerAnswer, action, cleanup);
         }
         catch (OperatorRestartRequiredException restart)
         {
@@ -1470,6 +1368,143 @@ public sealed class MainViewModel : INotifyPropertyChanged
             IsBusy = false;
             NotifyCounts();
         }
+    }
+
+    /// Processes one settled, fully-validated owner answer for a typed intent.
+    ///
+    /// The journal update is identical whether the transport that carried the
+    /// answer cleaned up or not: the normal answer path and the
+    /// answered-but-cleanup-limited path share it, so a settled owner outcome
+    /// is never rewritten as unknown because of a local teardown. When the
+    /// answer arrived on a cleanup limitation, that local limitation is noted
+    /// alongside the owner outcome instead of replacing it. The retained
+    /// operation keeps the same identity throughout; only the exact
+    /// owner-bound receipt branches may compact it.
+    private async Task ProcessSettledCommandAnswerAsync(
+        OperatorPendingOperation pending,
+        JsonElement receipt,
+        string action,
+        OperatorCleanupIncompleteException<JsonElement>? cleanup)
+    {
+        // A settled owner outcome is reported exactly as observed; the local
+        // cleanup limitation, when present, is appended as a separate fact so
+        // the banner names both without merging them into one phase.
+        string NoteCleanup(string detail) => cleanup is null
+            ? detail
+            : $"{detail} The local transport cleanup was limited at stage {cleanup.Stage}; the settled owner outcome above stands.";
+        bool accepted;
+        bool executed;
+        bool staleFence;
+        string outcome;
+        string? receiptId;
+        try
+        {
+            var parsed = ReadCommandReceipt(receipt, pending);
+            accepted = parsed.Accepted;
+            executed = parsed.Executed;
+            staleFence = parsed.StaleFence;
+            outcome = parsed.Outcome;
+            receiptId = parsed.ReceiptId;
+        }
+        catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException or JsonException)
+        {
+            // The owner answered but the receipt shape proves nothing:
+            // retain the same identity for reconciliation.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Unknown outcome — reconcile, do not resubmit",
+                NoteCleanup($"{action}: {pending.OperationId} returned an unreadable receipt; use Reconcile before any retry."),
+                OperatorBannerSeverity.Warning);
+            return;
+        }
+        if (accepted && executed && receiptId is null)
+        {
+            // The owner claims a durable mutation but proves nothing:
+            // retain the same identity for reconciliation, never resubmit.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Unknown outcome — reconcile, do not resubmit",
+                NoteCleanup($"{action}: {pending.OperationId} was accepted without a canonical receipt; use Reconcile before any retry."),
+                OperatorBannerSeverity.Warning);
+            return;
+        }
+        if (accepted && executed)
+        {
+            if (!RemovePending(pending.OperationId, OperatorOperationPhase.Receipted))
+            {
+                RefreshPendingState();
+                SetBanner(
+                    "Receipt received — recovery retained",
+                    NoteCleanup($"{action}: the owner returned a receipt, but the local journal could not be compacted; reconcile the retained operation after recovery."),
+                    OperatorBannerSeverity.Warning);
+                return;
+            }
+        }
+        else if (!accepted)
+        {
+            // An owner-bound refusal is terminal and distinct from a
+            // stale-fence answer, which proves the mutation was not
+            // admitted at the current State Fence.
+            var terminal = staleFence ? OperatorOperationPhase.StaleFence : OperatorOperationPhase.Rejected;
+            if (staleFence)
+            {
+                // The owner PROVED the State Fence moved: the mutation was
+                // not admitted at the submitted revision. That is a fence
+                // change this client observed directly, and the retained
+                // task context carries exactly the revision the owner just
+                // refused. Rows, selection, cursor, graph focus, task
+                // context and result payload are dropped HERE, before
+                // anything can read that revision again. The retained
+                // operation record is not dependent UI state and is
+                // compacted by the branch below as usual.
+                //
+                // The request that observed the refusal has already
+                // completed, so no in-flight response can apply state from
+                // before it; the retained state is dropped without
+                // cancelling the request token a later command still uses.
+                ClearRetainedProjectionState(
+                    "The owner refused at the current State Fence; dependent UI state was invalidated before use.");
+            }
+            if (!RemovePending(pending.OperationId, terminal))
+            {
+                RefreshPendingState();
+                SetBanner(
+                    "Rejection received — recovery retained",
+                    NoteCleanup($"{action}: the owner rejected the command, but the local journal could not be compacted; retain the exact operation for reconciliation."),
+                    OperatorBannerSeverity.Warning);
+                return;
+            }
+        }
+        else
+        {
+            // An accepted-but-not-yet-executed response is still an
+            // owner-pending effect. Keep it durable and make the UI
+            // reconcile the same identity rather than treating the
+            // provisional answer as a terminal success.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+        }
+        RefreshPendingState();
+        if (executed) await RefreshAsync();
+        var bannerTitle = accepted && !executed
+            ? "Command accepted — reconcile pending owner work"
+            : staleFence
+                ? "Command refused — stale State Fence"
+                : accepted
+                    ? "Command accepted"
+                    : "Command rejected";
+        var bannerSeverity = accepted && !executed
+            ? OperatorBannerSeverity.Warning
+            : accepted
+                ? OperatorBannerSeverity.Success
+                : OperatorBannerSeverity.Warning;
+        SetBanner(
+            bannerTitle,
+            NoteCleanup(receiptId is null
+                ? $"{action}: {outcome}; no durable mutation executed."
+                : $"{action}: {outcome}; canonical receipt {receiptId}."),
+            bannerSeverity);
     }
 
     /// Reads one owner-bound command receipt. The receipt is read only when it is
