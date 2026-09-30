@@ -111,7 +111,8 @@
 //!   canonical dimension. A caller submits no `Equal`/`Differing` verdict:
 //!   [`CompatibilityRelation`] is derived from the admitted values;
 //! - one [`CausalEvidenceRecord`] per causal or predictive claim, carrying the
-//!   mechanism claim identity and revision, the falsifier specification and its
+//!   mechanism claim identity, revision, and the retained claim bytes its
+//!   recorded digest reproduces, the falsifier specification and its
 //!   observed status, the matched control and the competent evaluator result,
 //!   the intervention execution and receipt where one is claimed, the
 //!   rival/confounder denominator with its omissions, and the retained
@@ -146,6 +147,10 @@
 //! - a causal record is joined to ITS OWN source's retained material, never to
 //!   the union of every member in the analysis, and its mechanism claim must be
 //!   read at that member's retained revision.
+//! - the mechanism claim's retained bytes must reproduce the digest the owner
+//!   RECORDED for them, the same recorded-digest pairing a source member gets.
+//!   A claim digest matching no retained bytes is a string, not the source's own
+//!   declared claim.
 //! - an intervention receipt must be the receipt of a retained evidence
 //!   envelope. A 64-character digest matching no envelope is a string, not an
 //!   execution receipt.
@@ -174,12 +179,27 @@
 //! publish a complete causal cell by pointing at the complete one.
 //!
 //! The declared label and the derived assessment are separated in both
-//! directions. Nothing short of the declared state's own requirements promotes
-//! it, and an observed falsifier that came back `Inconsistent` assesses the
-//! claim [`CausalClaimState::Refuted`] whatever the source called it: a refuted
-//! prediction, structural, correlational, or causal claim is never published
-//! under the label it was declared with. Refutation reaches no leg that grants
-//! causality, so closing a claim down never mixes the states together.
+//! directions, and the separation is carried in the data rather than asserted in
+//! prose: [`CausalClaimRecord::declared_state`] is the source's claim verbatim
+//! beside the revision it was read at, and
+//! [`CausalClaimRecord::effective_state`] is a separate value computed from
+//! typed evidence records alone. Nothing short of the declared state's own
+//! requirements promotes it, and an observed falsifier that came back
+//! `Inconsistent` assesses the claim [`CausalClaimState::Refuted`] whatever the
+//! source called it: a refuted prediction, structural, correlational, or causal
+//! claim is never published under the label it was declared with. Refutation
+//! reaches no leg that grants causality, so closing a claim down never mixes the
+//! states together.
+//!
+//! Prediction, intervention, and attribution stay separate because the state
+//! derivation MATCHES ON the accepted shared relation vocabulary — I12.18's
+//! seven readings, which [`FailureCausalStatus`] already carries — rather than
+//! on this crate's own spellings of them
+//! ([`CausalClaimState::relation_status`]). Prediction support, intervention
+//! support, and causal attribution are then three arms of one exhaustive match,
+//! each naming only what its own reading requires, rather than a single verdict
+//! that could stand for all three. Reusing the owner's enum also means a reading
+//! added there stops this crate compiling until it has been decided here.
 //!
 //! A claim whose position has no admitted source member is refused at
 //! admission rather than assessed against nothing. Nothing here raises a
@@ -259,9 +279,9 @@ use std::fmt::Write as _;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
 use eliot_dreamer_contracts::{
-    CurationRejectionCode, GroundedDreamDraft, PossibleResultSchema, PreservationDimension,
-    ProbeObjective, ResultTarget, ResultUpdate, ValidatedCurationItem, ValidatedDreamDraft,
-    ValidationReceipt, check_fence, is_hex64_lower,
+    CurationRejectionCode, FailureCausalStatus, GroundedDreamDraft, PossibleResultSchema,
+    PreservationDimension, ProbeObjective, ResultTarget, ResultUpdate, ValidatedCurationItem,
+    ValidatedDreamDraft, ValidationReceipt, check_fence, is_hex64_lower,
 };
 use eliot_epistemic_contracts::{
     ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictSet,
@@ -324,6 +344,8 @@ pub const MAX_CAUSAL_EVIDENCE_RECORDS: usize = 64;
 pub const MAX_ENVELOPES_PER_RECORD: usize = 16;
 /// Maximum retained source bytes per owner-issued source member.
 pub const MAX_RETAINED_SOURCE_BYTES: usize = 65_536;
+/// Maximum retained mechanism claim bytes per owner-issued causal record.
+pub const MAX_MECHANISM_CLAIM_BYTES: usize = 16_384;
 /// Maximum owner-issued comparison profile descriptors.
 pub const MAX_PROFILE_DESCRIPTORS: usize = 8;
 /// Maximum bytes for one owner-issued profile definition.
@@ -757,7 +779,7 @@ pub struct SuppliedComparison {
 /// | [`OwnerComparisonProfile`] | the normalization/comparison profile owner | `profile_id` + `owner` + `definition_digest` |
 /// | [`DimensionObservation`] | the profile owner, applied to one source member | `source` + `dimension` + `source_member_digest` |
 /// | [`EvidenceRecord`] | the evidence-source owner | `evidence_id` + `envelope` provenance + `receipt_digest` |
-/// | [`CausalEvidenceRecord`] | the evaluator/verifier owner | `source_handle` + `mechanism.claim_id` + fence |
+/// | [`CausalEvidenceRecord`] | the evaluator/verifier owner | `source_handle` + `mechanism.claim_id` + `mechanism.claim_digest` over `claim_bytes` + fence |
 ///
 /// A-39 reads those identities, validates them against the item's own
 /// task/scope/fence and retained bytes, and derives no stronger state than the
@@ -1062,14 +1084,58 @@ impl EvidenceRecord {
 }
 
 /// Owner-issued binding of a mechanism claim to the revision it was read at.
+///
+/// The claim's own retained bytes are what make this a binding rather than a
+/// pointer. `claim_digest` is the value the owner RECORDED for those bytes, and
+/// [`CausalEvidenceRecord::validate`] requires the bytes to reproduce it — the
+/// same recorded-digest/retained-bytes pairing [`SourceMemberRecord::validate`]
+/// already applies to a source member, applied here to the declaration. Without
+/// that pairing the claim's verbatim text rides along as a 64-character string
+/// that could stand for any text at all, and the source's own declared claim
+/// would not be the claim this cell preserves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MechanismBinding {
     /// Mechanism claim identity as issued by its owner.
     pub claim_id: String,
     /// Source revision the mechanism claim was read at.
     pub source_revision: String,
+    /// Exact bytes the owner retained for the mechanism claim.
+    pub claim_bytes: Vec<u8>,
     /// Canonical digest the owner RECORDED for the mechanism claim.
+    ///
+    /// This is the original recorded value. It is never recomputed here and
+    /// substituted for the check: the retained bytes are compared against it.
     pub claim_digest: String,
+}
+
+impl MechanismBinding {
+    /// Validates the mechanism claim's shape and its recorded-digest/retained-
+    /// bytes binding.
+    pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        check_handle(&self.claim_id, "causal_evidence.mechanism.claim_id")?;
+        check_bounded_text(
+            &self.source_revision,
+            "causal_evidence.mechanism.source_revision",
+            MAX_SCOPE_BYTES,
+        )?;
+        check_digest(
+            &self.claim_digest,
+            "causal_evidence.mechanism.claim_digest",
+        )?;
+        if self.claim_bytes.is_empty() || self.claim_bytes.len() > MAX_MECHANISM_CLAIM_BYTES {
+            return Err(ConflictAnalysisError::Bounds {
+                phase: "causal_evidence.mechanism.claim_bytes".to_owned(),
+                detail: "retained mechanism claim bytes are empty or exceed their ceiling".to_owned(),
+            });
+        }
+        if sha256_hex(&self.claim_bytes) != self.claim_digest {
+            return Err(ConflictAnalysisError::Digest {
+                detail: "retained mechanism claim bytes do not reproduce the recorded digest"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Observed status of an owner-issued falsifier.
@@ -1264,9 +1330,12 @@ impl RivalDenominator {
 /// One owner-issued causal or predictive evidence record.
 ///
 /// The declared state is preserved verbatim and separately from the assessment
-/// this cell computes. Prediction support, intervention execution, and causal
-/// attribution stay distinct: this record can carry all three and still promote
-/// only the one the declaration claims.
+/// this cell computes, and it is the source's own text: `mechanism.claim_bytes`
+/// must reproduce the digest the owner recorded for the claim, so the
+/// declaration this cell carries is the one the source owner retained rather
+/// than a label attached to a well-formed digest. Prediction support,
+/// intervention execution, and causal attribution stay distinct: this record can
+/// carry all three and still promote only the one the declaration claims.
 ///
 /// Two coverage denominators hang off this record and neither substitutes for
 /// the other: [`Self::rivals`], the rival/confounder denominator, and the
@@ -1307,19 +1376,7 @@ impl CausalEvidenceRecord {
     /// Validates the record's shape, evidence, and rival denominator.
     pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
         check_handle(&self.source_handle, "causal_evidence.source_handle")?;
-        check_handle(
-            &self.mechanism.claim_id,
-            "causal_evidence.mechanism.claim_id",
-        )?;
-        check_bounded_text(
-            &self.mechanism.source_revision,
-            "causal_evidence.mechanism.source_revision",
-            MAX_SCOPE_BYTES,
-        )?;
-        check_digest(
-            &self.mechanism.claim_digest,
-            "causal_evidence.mechanism.claim_digest",
-        )?;
+        self.mechanism.validate()?;
         check_bounded_text(
             &self.falsifier.specification,
             "causal_evidence.falsifier.specification",
@@ -2153,6 +2210,39 @@ impl CausalClaimState {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Returns the accepted shared relation status this declared state stands
+    /// for.
+    ///
+    /// I12.18 types exactly seven relation readings —
+    /// `STRUCTURAL | BEHAVIORAL_CORRELATION | CAUSAL_HYPOTHESIS |
+    /// PREDICTION_SUPPORTED | INTERVENTION_SUPPORTED | REFUTED | UNKNOWN` — and
+    /// [`FailureCausalStatus`] already carries that set one for one, so this
+    /// crate reads the accepted vocabulary instead of deciding a second spelling
+    /// of it. The two names differ only in precision: the shared names are the
+    /// longer ones (`BehavioralCorrelation` for what this cell calls
+    /// correlation, `PredictionSupported` and `InterventionSupported` for the
+    /// two supported readings), so no state is widened or collapsed crossing
+    /// over.
+    ///
+    /// This is the vocabulary the crate's own proof ceiling and its state
+    /// derivation MATCH ON, so a reading added to the accepted contract stops
+    /// this crate compiling until it has been decided here rather than passing
+    /// through a catch-all arm as if it did not exist. That is the point of
+    /// reusing the owner's enum instead of re-declaring the set: the reuse is
+    /// load-bearing, not decorative.
+    #[must_use]
+    pub const fn relation_status(self) -> FailureCausalStatus {
+        match self {
+            Self::Structural => FailureCausalStatus::Structural,
+            Self::Correlational => FailureCausalStatus::BehavioralCorrelation,
+            Self::CausalHypothesis => FailureCausalStatus::CausalHypothesis,
+            Self::Prediction => FailureCausalStatus::PredictionSupported,
+            Self::Intervention => FailureCausalStatus::InterventionSupported,
+            Self::Refuted => FailureCausalStatus::Refuted,
+            Self::Unknown => FailureCausalStatus::Unknown,
+        }
+    }
 }
 
 /// One legacy version 1 caller declaration of a causal or predictive claim.
@@ -2180,11 +2270,21 @@ pub struct SuppliedCausalClaim {
 
 /// One preserved causal declaration and its evidence-qualified assessment.
 ///
-/// `declared_state` is the source's own claim, preserved verbatim.
-/// `effective_state` is derived: it equals the declared state only when the
-/// owner-issued evidence supports that exact state, and is
-/// [`CausalClaimState::Unknown`] otherwise. A declaration is never promoted
-/// past the evidence, and prose never promotes it at all.
+/// `declared_state` is the source's own claim, preserved verbatim, together
+/// with the source identity and revision it was read at. `effective_state` is a
+/// SEPARATE value derived only from typed evidence records: it equals the
+/// declared state only when the owner-issued evidence supports that exact state,
+/// and is [`CausalClaimState::Unknown`] otherwise. A declaration is never
+/// recomputed, widened, or defaulted from the assessment, the assessment never
+/// overwrites the declaration, and prose never promotes either.
+///
+/// The declaration carries its own `declaration_revision` and, where an owner
+/// record supplies one, its `mechanism_claim_id`. A reader can therefore tell
+/// which snapshot the source's claim was read at independently of the evidence
+/// that was judged against it, which is what keeps the two separable rather than
+/// one value standing in for the other. Both are `None` on the legacy path,
+/// which is what that path's unverified ceiling means: it retains a
+/// declaration with no source revision behind it and says so.
 ///
 /// The two coverage cells are reported SEPARATELY and neither stands in for the
 /// other. `evidence_coverage` is what the retained envelopes themselves record;
@@ -2196,10 +2296,18 @@ pub struct SuppliedCausalClaim {
 pub struct CausalClaimRecord {
     /// Source handle holding the claim.
     pub source_handle: String,
-    /// State the caller declared, preserved verbatim.
+    /// State the source declared, preserved verbatim and never recomputed.
     pub declared_state: CausalClaimState,
     /// State after the algorithm step 7 evidence rule is applied.
+    ///
+    /// This is the assessment, and it is computed from typed evidence records
+    /// only. It is never the declaration copied: a claim whose evidence falls
+    /// short reports [`CausalClaimState::Unknown`] here while `declared_state`
+    /// still carries what the source said.
     pub effective_state: CausalClaimState,
+    /// Source revision the preserved declaration was read at, when an owner
+    /// record supplies one.
+    pub declaration_revision: Option<String>,
     /// Proof ceiling for this supplement.
     pub supplement_version: SupplementVersion,
     /// Bounded reason for reduction or unverified preservation.
@@ -2746,6 +2854,10 @@ fn count_causal_evidence_bytes(records: &[CausalEvidenceRecord]) -> usize {
             record.task_id.as_str(),
             record.scope_id.as_str(),
         ]));
+        // The retained claim bytes are counted against the same total as the
+        // source member's, so a record cannot buy unbounded declaration text
+        // with a digest that costs 64 bytes on the ceiling.
+        total = total.saturating_add(record.mechanism.claim_bytes.len());
         if let Some(intervention) = &record.intervention {
             total = total.saturating_add(count_text_bytes(&[
                 intervention.execution_id.as_str(),
@@ -4441,40 +4553,55 @@ fn qualified_position_relation(mapping: &[PositionCompatibility]) -> QualifiedPo
 /// prose fields are nonblank. Lower-level structural, correlational, and
 /// prediction declarations are preserved as declarations and explicitly
 /// marked unverified; none is evidence-qualified by this projection.
+///
+/// The arms are the accepted shared relation vocabulary's readings, so this
+/// ceiling is decided in the same vocabulary the owner-record path is and there
+/// is no second spelling of the set to drift. The match is total and each
+/// reading returns the state it may keep TOGETHER WITH the reason it is
+/// reported there, which is why the pair is returned rather than assigned into
+/// two pre-seeded locals: no reading of the vocabulary leaves the reason unset,
+/// so a declared `unknown` cannot reach the candidate with a blank
+/// `reduction_reason` the way a fall-through chain would let it.
 fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
-    let mut effective = claim.declared_state;
-    let mut reduction_reason = String::new();
-    if matches!(
-        claim.declared_state,
-        CausalClaimState::CausalHypothesis | CausalClaimState::Intervention
-    ) {
-        effective = CausalClaimState::Unknown;
-        reduction_reason = format!(
-            "declared {} retained as legacy v1 unverified: owner-bound evidence and coverage are absent",
-            claim.declared_state.as_str()
-        );
-    } else if matches!(
-        claim.declared_state,
-        CausalClaimState::Structural | CausalClaimState::Correlational
-    ) {
-        reduction_reason = format!(
-            "declared {} retained as legacy v1 unverified; declaration is not support evidence",
-            claim.declared_state.as_str()
-        );
-    } else if matches!(
-        claim.declared_state,
-        CausalClaimState::Prediction | CausalClaimState::Refuted
-    ) {
-        effective = CausalClaimState::Unknown;
-        reduction_reason = format!(
-            "declared {} retained as legacy v1 unverified: outcome and verifier records are absent",
-            claim.declared_state.as_str()
-        );
-    }
+    let (effective, reduction_reason) = match claim.declared_state.relation_status() {
+        FailureCausalStatus::Structural | FailureCausalStatus::BehavioralCorrelation => (
+            claim.declared_state,
+            format!(
+                "declared {} retained as legacy v1 unverified; declaration is not support evidence",
+                claim.declared_state.as_str()
+            ),
+        ),
+        FailureCausalStatus::CausalHypothesis | FailureCausalStatus::InterventionSupported => (
+            CausalClaimState::Unknown,
+            format!(
+                "declared {} retained as legacy v1 unverified: owner-bound evidence and coverage are absent",
+                claim.declared_state.as_str()
+            ),
+        ),
+        FailureCausalStatus::PredictionSupported | FailureCausalStatus::Refuted => (
+            CausalClaimState::Unknown,
+            format!(
+                "declared {} retained as legacy v1 unverified: outcome and verifier records are absent",
+                claim.declared_state.as_str()
+            ),
+        ),
+        FailureCausalStatus::Unknown => (
+            CausalClaimState::Unknown,
+            String::from(
+                "declared unknown retained as legacy v1 unverified; no owner-bound evidence was supplied",
+            ),
+        ),
+    };
     CausalClaimRecord {
         source_handle: claim.source_handle.clone(),
         declared_state: claim.declared_state,
         effective_state: effective,
+        // A legacy declaration has no owner-issued revision behind it. Reporting
+        // `None` rather than borrowing the mechanism revision keeps the
+        // unverified ceiling honest: there is no snapshot this declaration was
+        // read at, and inventing one would be exactly the widening the
+        // separation forbids.
+        declaration_revision: None,
         supplement_version: SupplementVersion::LegacyV1Unverified,
         reduction_reason,
         coverage: EvidenceCoverage::Unknown,
@@ -4585,34 +4712,57 @@ fn derive_causal_state(record: &CausalEvidenceRecord) -> CausalClaimState {
     // is the one promotion this cell must never make, and it also drops
     // preserved counterevidence on the way out. `Refuted` is not a promotion
     // either — it takes the declared state away rather than granting a stronger
-    // one, and it never reaches `Intervention`, so a refuted prediction still
-    // cannot become an intervention.
+    // one, and it never reaches `InterventionSupported`, so a refuted
+    // prediction still cannot become an intervention.
     if record.falsifier.observed == FalsifierStatus::Inconsistent
-        && matches!(
-            record.declared_state,
-            CausalClaimState::Structural
-                | CausalClaimState::Correlational
-                | CausalClaimState::CausalHypothesis
-                | CausalClaimState::Prediction
-        )
+        && falsifier_bears_on(record.declared_state.relation_status())
     {
         return CausalClaimState::Refuted;
     }
-    match record.declared_state {
-        CausalClaimState::Structural
-        | CausalClaimState::Correlational
-        | CausalClaimState::CausalHypothesis
-        | CausalClaimState::Prediction => record.declared_state,
-        CausalClaimState::Intervention => match &record.intervention {
+    // The arms below are the accepted shared relation vocabulary's readings, not
+    // this crate's own spellings, so the separation between prediction support,
+    // intervention support, and attribution is decided once in the vocabulary
+    // the rest of the system already reads. It is decided ARM BY ARM, and each
+    // arm names only what its own reading requires: a supported prediction
+    // returns the prediction reading and has no arm that could return the
+    // intervention one, an intervention needs its own proved execution, and
+    // structural and correlational edges reach nothing above themselves. There
+    // is deliberately no arm here that grants one reading on the strength of
+    // another's evidence.
+    match record.declared_state.relation_status() {
+        FailureCausalStatus::Structural => CausalClaimState::Structural,
+        FailureCausalStatus::BehavioralCorrelation => CausalClaimState::Correlational,
+        FailureCausalStatus::CausalHypothesis => CausalClaimState::CausalHypothesis,
+        FailureCausalStatus::PredictionSupported => CausalClaimState::Prediction,
+        FailureCausalStatus::InterventionSupported => match &record.intervention {
             Some(_) => CausalClaimState::Intervention,
             None => CausalClaimState::Unknown,
         },
-        CausalClaimState::Refuted => match record.falsifier.observed {
+        FailureCausalStatus::Refuted => match record.falsifier.observed {
             FalsifierStatus::Inconsistent => CausalClaimState::Refuted,
             _ => CausalClaimState::Unknown,
         },
-        CausalClaimState::Unknown => CausalClaimState::Unknown,
+        FailureCausalStatus::Unknown => CausalClaimState::Unknown,
     }
+}
+
+/// Returns whether an observed falsifier verdict bears on this declared reading.
+///
+/// This is the W7 separation read in the shared vocabulary: a refutation
+/// withdraws a structural, correlational, hypothesis, or prediction claim, and
+/// it withdraws nothing else. `INTERVENTION_SUPPORTED` is excluded on purpose.
+/// An intervention is not falsified by the claim's own mechanism falsifier
+/// running inconsistent — the falsifier tests the mechanism, and folding that
+/// into the intervention reading would let a mechanism refutation read as an
+/// intervention refutation, merging two readings the contract keeps apart.
+fn falsifier_bears_on(status: FailureCausalStatus) -> bool {
+    matches!(
+        status,
+        FailureCausalStatus::Structural
+            | FailureCausalStatus::BehavioralCorrelation
+            | FailureCausalStatus::CausalHypothesis
+            | FailureCausalStatus::PredictionSupported
+    )
 }
 
 /// Builds one causal assessment from an owner-issued evidence record.
@@ -4644,6 +4794,13 @@ fn owner_causal_record(record: &CausalEvidenceRecord) -> CausalClaimRecord {
         source_handle: record.source_handle.clone(),
         declared_state: record.declared_state,
         effective_state: effective,
+        // The declaration is reported with the revision it was read at, and
+        // admission has already compared that revision to the retained source
+        // member's own (`check_mechanism_revision`), so this is the revision
+        // whose bytes the preserved declaration came out of. It travels beside
+        // `declared_state` rather than inside the assessment so the source's
+        // claim and the evidence judged against it stay separately traceable.
+        declaration_revision: Some(record.mechanism.source_revision.clone()),
         supplement_version: SupplementVersion::OwnerRecordV2,
         reduction_reason,
         coverage,
@@ -5363,9 +5520,17 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
     // versioned candidate preimage is the consumer that depends on this
     // binding; it still has to read the published surfaces itself.
     let derived = owner_causal_record(record);
+    // The declaration's own revision is committed with the assessment. It is
+    // already committed above as the mechanism claim's revision, and admission
+    // has proved the two are the same string, so this is not a second copy of
+    // the value: it is the published cell's separate declaration field entering
+    // the preimage, which is what keeps one candidate identity from spanning a
+    // change to the snapshot the source's claim was read at.
     parts.push(format!(
-        "causal_derived:{}:{}:{}:{}:{}",
+        "causal_derived:{}:{}:{}:{}:{}:{}:{}",
         derived.source_handle,
+        derived.declared_state.as_str(),
+        derived.declaration_revision.as_deref().unwrap_or("absent"),
         derived.effective_state.as_str(),
         coverage_spelling(derived.coverage),
         coverage_spelling(derived.evidence_coverage),
