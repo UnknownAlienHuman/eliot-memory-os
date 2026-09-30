@@ -38,12 +38,34 @@ pub(crate) const USER_BROKER_HEARTBEAT_OPERATION: &str = "eliot.user-broker.hear
 pub(crate) const USER_BROKER_FENCE_OPERATION: &str = "eliot.user-broker.fence";
 pub(crate) const USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION: &str =
     "eliot.user-broker.validate-native-resource-selection-current";
+pub(crate) const USER_BROKER_BIND_OPERATOR_SESSION_TOKEN_OPERATION: &str =
+    "eliot.user-broker.bind-operator-session-token";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserBrokerHeartbeatPayload {
     registration: RegistrationReceipt,
     observed_at: u64,
+}
+
+/// Caller-declared evidence for one Operator session token bind.
+///
+/// Every field here is caller-supplied and is re-validated by the Kernel token
+/// owner over live admission. None of it is authority: this route only uses it
+/// to join the request to the one live registration this connection already
+/// holds, and the broker separately compares the echoed tuple against the
+/// OS-observed connected peer.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserBrokerOperatorSessionTokenPayload {
+    registration_digest: String,
+    handoff_nonce: String,
+    windows_sid: String,
+    interactive_session_id: String,
+    client_process_id: String,
+    client_image_path: String,
+    role: String,
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,6 +592,18 @@ impl KernelComposition {
             )?;
             return serde_json::to_value(()).map_err(|_| TransportError::SessionFenced);
         }
+        if operation == USER_BROKER_BIND_OPERATOR_SESSION_TOKEN_OPERATION {
+            let request: UserBrokerOperatorSessionTokenPayload =
+                serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+            return self.dispatch_user_broker_bind_operator_session_token(
+                session,
+                frame,
+                &request,
+                identity,
+                now,
+            );
+        }
         if operation != USER_BROKER_REGISTER_OPERATION {
             return Err(TransportError::SessionFenced);
         }
@@ -725,6 +759,111 @@ impl KernelComposition {
             },
         );
         serde_json::to_value(grant).map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Binds one fresh, short-lived Operator session token for the UI binding
+    /// this User Broker session is redeeming (`#1777`, I11.8).
+    ///
+    /// The token is minted by the Kernel owner
+    /// (`eliot_kernel_service::bind_operator_session_token`) over live Kernel
+    /// admission and its own clock, so the broker can neither produce nor
+    /// recompute it and no refresh path exists here. This route owns only the
+    /// join that the owner cannot make: the presented `registration_digest`
+    /// must be the digest of *this* connection's own live, unexpired, unfenced
+    /// registration, and the presented `windows_sid` / `interactive_session_id`
+    /// must be the same OS-observed peer tuple that registration was admitted
+    /// on. All of it is caller-declared, so none of it is authority; the broker
+    /// still compares the echoed tuple against the OS-observed connected peer
+    /// before it accepts any redemption.
+    fn dispatch_user_broker_bind_operator_session_token(
+        &self,
+        session: &Session,
+        frame: &Frame,
+        request: &UserBrokerOperatorSessionTokenPayload,
+        identity: &RequestIdentity,
+        now: u64,
+    ) -> Result<Value, TransportError> {
+        // The live registration join is scoped so the `service` lock below is
+        // never taken while the registration table is held.
+        let registration_digest = {
+            let live = self
+                .user_broker_registration_authority
+                .live
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let current = live
+                .get(&session.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if !current.session.matches(session) {
+                return Err(TransportError::SessionFenced);
+            }
+            validate_user_broker_operation_identity(
+                self,
+                session,
+                frame,
+                identity,
+                &current.registration,
+                now,
+            )?;
+            if current.receipt.status != RegistrationStatus::Active
+                || current.receipt.expires_at <= now
+                || request.registration_digest != current.receipt.registration_digest
+                || request.windows_sid != current.receipt.windows_sid
+                || request.interactive_session_id != current.receipt.interactive_session_id
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            load_live_user_broker_registration(self, current)?;
+            current.receipt.registration_digest.clone()
+        };
+        // `SessionBinding` lives in `eliot-receipts`, which this composition
+        // root has no direct dependency edge on; its `Deserialize` impl plus
+        // struct-field inference carries the exact evidence type. The evidence
+        // is read off the live authenticated session, never asserted.
+        let session_binding = serde_json::from_value(serde_json::json!({
+            "session_id": &session.connection_id,
+            "authority_epoch": &session.authority_epoch,
+            "state_fence": &session.module_generation.state_fence,
+        }))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let inputs = eliot_kernel_service::OperatorSessionTokenInputs {
+            registration_digest,
+            handoff_nonce: request.handoff_nonce.clone(),
+            windows_sid: request.windows_sid.clone(),
+            interactive_session_id: request.interactive_session_id.clone(),
+            client_process_id: request.client_process_id.clone(),
+            client_image_path: request.client_image_path.clone(),
+            role: request.role.clone(),
+            capabilities: request.capabilities.clone(),
+            session: session_binding,
+        };
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let authorization = eliot_kernel_service::bind_operator_session_token(&service, &inputs)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let bound = authorization.inputs();
+        Ok(serde_json::json!({
+            "kind": "operator_session_token",
+            "value": {
+                "operation_id": authorization.operation_id(),
+                "token": authorization.token(),
+                "issued_at_unix_ms": authorization.issued_at_unix_ms(),
+                "expires_at_unix_ms": authorization.expires_at_unix_ms(),
+                "generation": authorization.generation().value(),
+                "authority_epoch": authorization.authority_epoch(),
+                "state_fence": authorization.state_fence(),
+                "registration_digest": &bound.registration_digest,
+                "handoff_nonce": &bound.handoff_nonce,
+                "windows_sid": &bound.windows_sid,
+                "interactive_session_id": &bound.interactive_session_id,
+                "client_process_id": &bound.client_process_id,
+                "client_image_path": &bound.client_image_path,
+                "role": &bound.role,
+                "capabilities": &bound.capabilities,
+            },
+        }))
     }
 
     #[allow(
