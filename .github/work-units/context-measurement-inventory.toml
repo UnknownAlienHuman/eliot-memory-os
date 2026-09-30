@@ -1,12 +1,13 @@
-inventory_digest = "1c3d3e34c5ad3f62a16398e47b5207265365749bfebef3f92568413e5a8a7742"
+inventory_digest = "4af76c8588cfda6ff7cd0dec6238aa8b63679a2504b192b09c323847aef3df86"
+proposed_splits = []
 
 [header]
 schema = "eliot.context-measurement-inventory.v2"
-rule_revision = "866.2"
+rule_revision = "866.3"
 tool_version = "0.2.0"
 source_sha = "93a54c1d8147e8166c198fe51b33432270da1a614ab106d9d861a96d5631b130"
 source_sha_kind = "sha256 over sorted <path>:<sha256> of the declared scan roots; the generated artifact is never one of its own inputs, so committing it does not stale the inventory"
-rule_digest = "97f8ecd1e0e94a62db026c9262ef70d2d927d2fc6d8874a70d74a591de740cee"
+rule_digest = "0ce7b022db9456c5f131067e0adca1e03f7a75d5420a493945a1504c62953411"
 owner_digest = "0b937c796a591bc265b2512277d7aa397920eaa521a0fd7a2467aa053b2397cb"
 owner_map_path = ".github/work-units/context-measurement-owner-map.toml"
 owner_map_status = "SUPPLIED"
