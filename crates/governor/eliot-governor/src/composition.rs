@@ -110,9 +110,8 @@ use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionStat
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
     CanonicalReadClient, CausalWriteReceipt, OrderingHeadExpectation, PreparedTransition,
-    ProblemOwnerTransition,
-    RevisionHeadExpectation, ScopeRevisionView, StoreHealth, TaskContractAcceptanceSet,
-    WriteReceipt,
+    ProblemOwnerTransition, RevisionHeadExpectation, ScopeRevisionView, StoreHealth,
+    TaskContractAcceptanceSet, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
