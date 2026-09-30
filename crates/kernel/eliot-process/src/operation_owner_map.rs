@@ -67,6 +67,15 @@ pub enum OwnerAdmission {
     /// for exactly the row's operation, decided by the Kernel-owned
     /// authority and rechecked at the effect boundary.
     ChallengeGrant,
+    /// A grant-less stop/cancel admitted by replay-store owner-binding
+    /// equality only: `ProcessExecutionGateway::cancel` reaches
+    /// `cancel_with_origin_grant_inner(.., None)`, where
+    /// `authorize_effect_with_grant` returns immediately after
+    /// `authorize_process_owner` (expected replay owner equals presented
+    /// owner). The row carries no `OriginControlGrant`, no nonce, and no
+    /// effect-currency recheck; `NotFound` and unreadable-journal
+    /// `UnknownOutcome` fail closed before the effect.
+    OwnerBindingOnly,
     /// A retained Host-owned Job branch (outer kill domain) the Host itself
     /// created and still holds. Pre-Kernel Host authority by design: Host
     /// start/cleanup must not depend on a running Kernel.
@@ -89,11 +98,14 @@ pub enum OwnerAdmission {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OperationOwnerRecord {
     /// Which of the six issue lifecycle operations this row covers.
-    /// `stop/cancel` has two rows: the challenge-grant Kill path and the
-    /// retained-handle Host termination path.
+    /// `stop/cancel` has five rows: the challenge-grant Kill path, the
+    /// retained-handle Host termination path, and three owner-binding-only
+    /// grant-less cancel paths (native-worker cancel_observe, wire Cancel
+    /// frames, daemon recovery plus its operation-port adapter).
     pub lifecycle: &'static str,
-    /// The challenge operation class, or `None` for the pre-challenge Host
-    /// bootstrap/recovery rows that precede any control class.
+    /// The challenge operation class, or `None` for rows that carry no
+    /// `OriginControlGrant`: the pre-challenge Host bootstrap/recovery rows
+    /// and the owner-binding-only grant-less cancel rows.
     pub operation: Option<OriginControlOperation>,
     /// The exact target admitted for this operation.
     pub admitted_target: &'static str,
@@ -251,9 +263,75 @@ pub static ATTACH_CREDENTIAL_BLOCKED_ROW: OperationOwnerRecord = OperationOwnerR
     gap: "concrete gap: AttachCredential has packaging (bins/eliotd/src/process_origin.rs::request_origin_control, re-exported by bins/eliotd/src/lib.rs) but zero non-test callers and no admitted dispatch path; binding an actual connection plus retained process identity through the transport/platform mechanism, or an explicit refusal when that proof is unavailable, is implementation work still open",
 };
 
+/// Stop/cancel from the native-worker cancel_observe route, owner binding only.
+///
+/// The `native_worker.cancel_observe` arm stages a `ProcessExecutionRequest::Cancel`
+/// with no `OriginControlGrant` anywhere on the path (the route file holds
+/// zero `OriginChallenge` references): staging checks the claim binding,
+/// message identity, and claim state, and the effect boundary admits on
+/// replay-store owner equality alone.
+pub static NATIVE_WORKER_CANCEL_ROW: OperationOwnerRecord = OperationOwnerRecord {
+    lifecycle: "stop/cancel (native-worker cancel_observe, owner binding only)",
+    operation: None,
+    admitted_target: "staged native-worker claim operation_id bound to the caller session owner via caller_binding",
+    physical_observation: "bins/eliot-kernel/src/native_worker_lifecycle_route.rs::stage_native_worker_cancellation (cancellation_id, message identity, claim-text reason, nonzero observed_at_unix_ms, NativeWorkerBindingView parse plus load_and_bind, Admitted/Ready/Active/Cancelling claim-state gate, advance to Cancelling; Submitted results preserved for Wave-D reconciliation) entered from ::dispatch_native_worker_frame under NATIVE_WORKER_CANCEL_OBSERVE_OPERATION (\"native_worker.cancel_observe\") with peer authentication plus generation-fence context",
+    proof: "owner-binding-only: session owner from caller_binding; no OriginControlGrant presented, decided, or rechecked (zero OriginChallenge references in bins/eliot-kernel/src/native_worker_lifecycle_route.rs)",
+    authority_check: "bins/eliot-kernel/src/process_execution.rs::ProcessExecutionGateway::cancel into ::cancel_with_origin_grant_inner(.., None), where ::authorize_effect_with_grant returns after authorize_process_owner replay-owner equality; NotFound and unreadable-journal UnknownOutcome fail closed before the effect",
+    effect_primitive: "executor.cancel via ProcessExecutionGateway::cancel_with_origin_grant_inner",
+    reconciliation_receipt: "CancellationReceipt projected as ProcessExecutionResponse::Cancelled; staged claim result rows stay available to Wave-D reconciliation",
+    production_caller: "bins/eliot-kernel/src/native_worker_lifecycle_route.rs::dispatch_native_worker_frame",
+    admission: OwnerAdmission::OwnerBindingOnly,
+    gap: "",
+};
+
+/// Stop/cancel from wire Cancel frames, owner binding only.
+///
+/// The generic process arm admits `Cancel` even while `Degraded` (observations
+/// and terminal recovery stay reachable) and the front-door handler forwards
+/// the request to the grant-less gateway cancel with the session owner.
+/// Frame shape, idempotency binding, and service state are checked; no
+/// challenge grant is involved.
+pub static WIRE_CANCEL_ROW: OperationOwnerRecord = OperationOwnerRecord {
+    lifecycle: "stop/cancel (wire Cancel frame, owner binding only)",
+    operation: None,
+    admitted_target: "wire ProcessExecutionRequest::Cancel operation_id bound to the session owner",
+    physical_observation: "bins/eliot-kernel/src/frame_dispatch.rs generic process arm (FrameKind::Cancel plus MessageType::Cancel control identity, payload shape plus request validate, idempotency-key equals operation_id, peer validate, Ready-or-Degraded service-state gate admitting Inspect/Cancel/Reconcile while Degraded)",
+    proof: "owner-binding-only: ProcessSessionBinding owner carried by the frame identity; no OriginControlGrant presented, decided, or rechecked on this path",
+    authority_check: "bins/eliot-kernel/src/process_execution.rs::ProcessExecutionGateway::cancel into ::cancel_with_origin_grant_inner(.., None), where ::authorize_effect_with_grant returns after authorize_process_owner replay-owner equality; NotFound and unreadable-journal UnknownOutcome fail closed before the effect",
+    effect_primitive: "executor.cancel via ProcessExecutionGateway::cancel_with_origin_grant_inner",
+    reconciliation_receipt: "CancellationReceipt projected as ProcessExecutionResponse::Cancelled; ProcessExecutionRequest::Reconcile stays available on the same arm",
+    production_caller: "bins/eliot-kernel/src/process_execution.rs::KernelComposition::execute_process_request",
+    admission: OwnerAdmission::OwnerBindingOnly,
+    gap: "",
+};
+
+/// Stop/cancel from supervised daemon restart recovery, owner binding only.
+///
+/// Recovery cancels the exact supervised previous generation it already
+/// inspected and receipt-matched, then proves tree closure by re-inspection
+/// before reconciling. The operation-port adapter is the same grant-less
+/// primitive under one bound owner for front-door clients.
+pub static DAEMON_RECOVERY_CANCEL_ROW: OperationOwnerRecord = OperationOwnerRecord {
+    lifecycle: "stop/cancel (daemon recovery, owner binding only)",
+    operation: None,
+    admitted_target: "supervised previous eliotd generation operation_id from its retained ProcessStartReceipt",
+    physical_observation: "bins/eliot-kernel/src/daemon_runtime.rs supervised-restart recovery: gateway inspect view binding plus identity matched against the retained receipt before cancel; after cancel a second inspect must show Exited plus Completed cancellation plus complete tree-terminated descendants, otherwise recovery fails fenced instead of proceeding",
+    proof: "owner-binding-only: retained supervised-generation owner binding; no OriginControlGrant presented, decided, or rechecked on this path",
+    authority_check: "bins/eliot-kernel/src/process_execution.rs::ProcessExecutionGateway::cancel into ::cancel_with_origin_grant_inner(.., None), where ::authorize_effect_with_grant returns after authorize_process_owner replay-owner equality; NotFound and unreadable-journal UnknownOutcome fail closed before the effect",
+    effect_primitive: "executor.cancel via ProcessExecutionGateway::cancel_with_origin_grant_inner",
+    reconciliation_receipt: "CancellationReceipt plus post-cancel inspect closure proof plus reconcile_closed_daemon_process by the original operation identity",
+    production_caller: "bins/eliot-kernel/src/daemon_runtime.rs::close_previous_daemon_process; bins/eliot-kernel/src/process_execution_client.rs::GatewayOperationPort::cancel",
+    admission: OwnerAdmission::OwnerBindingOnly,
+    gap: "",
+};
+
 /// The frozen table in lifecycle order. Its order and length are frozen:
 /// review any diff to this table as a policy change, not a refactor.
-pub static FROZEN_OPERATION_OWNER_MAP: &[OperationOwnerRecord; 7] = &[
+///
+/// The three trailing rows are the owner-binding-only grant-less cancel
+/// paths; they follow the seven original rows so the
+/// [`owner_record_for`] indices above them never shift.
+pub static FROZEN_OPERATION_OWNER_MAP: &[OperationOwnerRecord; 10] = &[
     FRESH_STORE_LAUNCH_ROW,
     OWNED_RECONNECT_ROW,
     CHALLENGE_KILL_ROW,
@@ -261,6 +339,9 @@ pub static FROZEN_OPERATION_OWNER_MAP: &[OperationOwnerRecord; 7] = &[
     MUTATE_BLOCKED_ROW,
     ADOPT_BLOCKED_ROW,
     ATTACH_CREDENTIAL_BLOCKED_ROW,
+    NATIVE_WORKER_CANCEL_ROW,
+    WIRE_CANCEL_ROW,
+    DAEMON_RECOVERY_CANCEL_ROW,
 ];
 
 /// Returns the frozen table in lifecycle order.
