@@ -942,6 +942,45 @@ fn assemble_result(assembly: ResultAssemblyInput<'_>) -> Result<AdmissionResult,
         optional_cost,
         fixed,
     )?;
+    // I12.13 / #1725 step 1 — the approved section budget is enforced against
+    // the material that was actually admitted, and this is the only point where
+    // that is true. Floor selection and optional filling are both complete, so
+    // `admitted_set` is the final owned set, and it is still a local here: it is
+    // moved into `ContextOutcome::Complete` below, so the check cannot go later
+    // without validating something other than the set this result delivers.
+    //
+    // The policy is READ, never derived. An input that presents no approved
+    // `ContextRecipePolicy` runs no budget check at all, because
+    // `AdmissionInput::approved_policy` is absent and this adds no default,
+    // synthesis or inference: a budget whose `required_exact_references` and
+    // `minimum_required_whole_units` no owner approved is not enforcement. When
+    // a policy IS presented, `AdmissionInput::validate` has already joined it to
+    // this input's own `recipe` through `ContextRecipePolicy::binds_recipe`, so
+    // the budgets provably describe the same approved revision as the recipe
+    // this admission ran.
+    //
+    // Each budget validates BOTH halves independently and from the OBSERVED
+    // admitted records, never from the policy's own declarations: every
+    // `required_exact_references` identity present among the admitted records of
+    // that semantic role, AND the distinct admitted whole units of that role
+    // reaching `minimum_required_whole_units`. A count never stands in for
+    // membership in either direction. The admitted representation must also be
+    // one the role's `omission_or_handle_policy` permits, which is the contract
+    // crate's single `LossPolicy::allows` rule, so under `NON_DROPPABLE` a
+    // handle cannot stand in for a required whole unit.
+    //
+    // A refusal propagates through this function's existing typed `ContextError`
+    // arm — `MissingFloor` for an absent required reference or an unmet
+    // independent whole-unit floor, `WholeUnitRequired` for a whole-only unit
+    // admitted in a weaker representation — instead of becoming a nominally
+    // complete `AdmissionResult`. No new variant and no new error type: these
+    // are the meanings the contract already gives them. A section whose floor
+    // cannot be met is a refusal, never a complete result.
+    if let Some(approved_policy) = &input.approved_policy {
+        for budget in &approved_policy.section_budgets {
+            budget.validate_admitted_section(&admitted_set)?;
+        }
+    }
     let evidence = eliot_context_contracts::AdmissionDecisionEvidence {
         binding: input.binding.clone(),
         decisions: all_decisions(input, &admitted_set, omissions),
