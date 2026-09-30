@@ -1569,7 +1569,9 @@ impl ToolExposureHistoryEntry {
     /// Only this stage is set, from the supplied owner observation and its
     /// source reference. Transport completion never implies delivery
     /// completeness, and an already recorded transport fact is never
-    /// overwritten. The transport seam is the STITCH caller.
+    /// overwritten. The bridge transport owner populates this stage through
+    /// `bins/eliot-agent-bridge/src/lib.rs::BridgeRunner::apply_bridge_transport_fact`;
+    /// the entry-lifecycle seam joining it into a persisted revision is STITCH.
     ///
     /// # Errors
     ///
@@ -1592,8 +1594,10 @@ impl ToolExposureHistoryEntry {
     /// delivery without its projection source fails, and unknown coverage stays
     /// `None`. Execution and transport stages are never re-read here, and a
     /// recorded delivery is never overwritten — a later authorized expansion
-    /// persists as a successor revision. The bridge/host projection seam is the
-    /// STITCH caller.
+    /// persists as a successor revision. The bridge delivery-projection owner
+    /// populates this stage through
+    /// `bins/eliot-agent-bridge/src/lib.rs::BridgeRunner::apply_bridge_delivery_fact`;
+    /// the entry-lifecycle seam joining it into a persisted revision is STITCH.
     ///
     /// # Errors
     ///
