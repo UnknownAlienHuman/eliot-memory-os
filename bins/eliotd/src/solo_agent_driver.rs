@@ -73,7 +73,7 @@ use std::sync::{Arc, Mutex};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_coordinator::{
-    AdmittedProviderCapability, AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME,
+    AdmissionId, AdmittedProviderCapability, CandidateId, RUNTIME_PROFILE_FILE_NAME,
     SchedulingProfile, StaffingPlanRequest, load_runtime_scheduling_profile,
 };
 use eliot_contracts::{StateFence, fences_match_exact, sha256_hex};
@@ -97,7 +97,6 @@ use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerpri
 /// Solo recipe identity pinned by this slice (I10.15 first supported recipe).
 pub const SOLO_RECIPE_ID: &str = "solo-verified-v1";
 /// Accepted-interface revision reported by the solo model registry adapter.
-#[cfg(test)]
 pub const SOLO_MODEL_REGISTRY_REVISION: &str = "solo-model-registry/v1";
 /// Accepted-interface revision reported by the solo admission adapter.
 pub const SOLO_ADMISSION_AUTHORITY_REVISION: &str = "solo-admission-authority/v1";
@@ -366,8 +365,8 @@ pub fn assemble_solo_intake(
     operation: AdmittedDelegateOperation,
     now_unix_ms: u64,
 ) -> Result<SoloDelegateIntake, DaemonError> {
-    let shape: AdmittedDelegateShape = serde_json::from_slice(&operation.delegate_bytes)
-        .map_err(|error| {
+    let shape: AdmittedDelegateShape =
+        serde_json::from_slice(&operation.delegate_bytes).map_err(|error| {
             DaemonError::ProviderAdmission(FabricError::Contract(format!(
                 "admitted delegate bytes are not the canonical delegate shape: {error}"
             )))
@@ -379,15 +378,20 @@ pub fn assemble_solo_intake(
     require_text(&operation.task_id, "admitted task identity")
         .map_err(DaemonError::ProviderAdmission)?;
     if operation.claimed.operation_id != operation.operation_id {
-        return Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(
-            "admitted delegate operation identity does not match the presented claim halves"
-                .to_owned(),
-        )));
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "admitted delegate operation identity does not match the presented claim halves"
+                    .to_owned(),
+            ),
+        ));
     }
     if operation.plan.launch.task_id.as_str() != operation.task_id {
-        return Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(
-            "admitted delegate task identity does not match the Task Controller plan".to_owned(),
-        )));
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "admitted delegate task identity does not match the Task Controller plan"
+                    .to_owned(),
+            ),
+        ));
     }
     let mut seen: Vec<&str> = Vec::with_capacity(shape.owned_resources.len());
     for resource in &shape.owned_resources {
@@ -1457,8 +1461,7 @@ pub fn adopt_solo_drive(
             )));
         }
     }
-    let capability =
-        composition.agent_fabric_verified_capability(kernel, material)?;
+    let capability = composition.agent_fabric_verified_capability(kernel, material)?;
     let attempt_id = AttemptId::new(attempt_id)
         .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
     let staffed = receipt.lanes.first().ok_or_else(|| {
@@ -1479,9 +1482,8 @@ pub fn adopt_solo_drive(
                 route: staffed.route.clone(),
             })
             .map_err(DaemonError::ProviderAdmission)?;
-        let definition_digest =
-            crate::agent_fabric::frozen_definition_digest(&intake.plan)
-                .map_err(DaemonError::ProviderAdmission)?;
+        let definition_digest = crate::agent_fabric::frozen_definition_digest(&intake.plan)
+            .map_err(DaemonError::ProviderAdmission)?;
         solo_fabric_ports(
             SoloVerifiedContext {
                 definition_id: intake.plan.candidate_id.clone(),
@@ -1764,8 +1766,7 @@ fn restore_solo_fabric(
             DaemonError::ProviderAdmission(FabricError::BrokenOwnershipLink(
                 "solo restore finds no definition binding the frozen plan digest".to_owned(),
             ))
-        })?
-        .clone();
+        })?;
     let live_fence = kernel.kernel_fence();
     if !fences_match_exact(&live_fence, &definition.fence) {
         return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
@@ -1773,8 +1774,7 @@ fn restore_solo_fabric(
         )));
     }
     let ports = composition.production_fabric_ports()?;
-    let material =
-        composition.resolve_verified_material(kernel, projection.claimed.material())?;
+    let material = composition.resolve_verified_material(kernel, projection.claimed.material())?;
     let config = daemon_coordinator_config()?;
     let mut fabric = AgentFabric::restore_verified(
         projection.snapshot.clone(),

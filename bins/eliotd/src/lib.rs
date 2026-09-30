@@ -157,7 +157,6 @@ pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{
     ActivationClaim, classify_claimed_ticket_value, terminal_for_invalid_ticket,
 };
-#[cfg(test)]
 use agent_fabric::build_admitted_provider_capability;
 pub use agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
