@@ -5809,10 +5809,15 @@ impl BridgeRunner {
         entry: ToolExposureHistoryEntry,
         delivered: bool,
         source_ref: String,
-    ) -> Result<ToolExposureHistoryEntry, BridgeError> {
+    ) -> Result<ToolExposureHistoryEntry, Box<BridgeError>> {
         entry
             .record_transport_completed(delivered, source_ref)
-            .map_err(|error| Self::map_exposure_history_error(error, "history.transport_completed"))
+            .map_err(|error| {
+                Box::new(Self::map_exposure_history_error(
+                    error,
+                    "history.transport_completed",
+                ))
+            })
     }
     /// Populates the `result_delivery` stage of an exposure-history entry from
     /// this bridge's delivery-projection owner (I7.24).
@@ -5832,18 +5837,23 @@ impl BridgeRunner {
     /// the resulting entry is inconsistent.
     pub fn apply_bridge_delivery_fact(
         entry: ToolExposureHistoryEntry,
-        delivery: DeliveryStatus,
+        delivery: &DeliveryStatus,
         source_ref: String,
-    ) -> Result<ToolExposureHistoryEntry, BridgeError> {
+    ) -> Result<ToolExposureHistoryEntry, Box<BridgeError>> {
         entry
             .record_delivery(Self::exposure_delivery(delivery), source_ref)
-            .map_err(|error| Self::map_exposure_history_error(error, "history.result_delivery"))
+            .map_err(|error| {
+                Box::new(Self::map_exposure_history_error(
+                    error,
+                    "history.result_delivery",
+                ))
+            })
     }
     /// Maps the bridge projection's observed delivery vocabulary onto the
     /// exposure-history delivery vocabulary (I7.24 `FULL | PARTIAL |
     /// TRUNCATED | MISSING`). The same four dispositions in the same order:
     /// no inference, no coercion.
-    const fn exposure_delivery(delivery: DeliveryStatus) -> ResultDelivery {
+    fn exposure_delivery(delivery: &DeliveryStatus) -> ResultDelivery {
         match delivery {
             DeliveryStatus::Full => ResultDelivery::Full,
             DeliveryStatus::Partial => ResultDelivery::Partial,
