@@ -82,7 +82,9 @@ use eliot_dreamer_contracts::{
 use eliot_dreamer_orientation::OrientationError;
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
 use eliot_dreamer_rival_model::{RivalModelSet, RivalPolicy, structure_rival_models};
-use eliot_epistemic::{CurrentEpistemicPosition, ObservationRecord, PositionRequest, resolve};
+use eliot_epistemic::{
+    AdmittedBindingError, CurrentEpistemicPosition, ObservationRecord, PositionRequest, resolve,
+};
 use eliot_epistemic_contracts::{
     ConflictSet, CurrentEpistemicPosition as AdmittedPosition, EpistemicPositionCandidate,
 };
@@ -487,8 +489,8 @@ pub(crate) enum PulseError {
     #[error("pulse epistemic position refused")]
     Epistemic,
     /// Original admitted candidate, source observation, and local resolver result did not join.
-    #[error("pulse admitted epistemic owner binding refused")]
-    EpistemicBinding,
+    #[error("pulse admitted epistemic owner binding refused: {0}")]
+    EpistemicBinding(AdmittedBindingError),
     /// Understanding assembler refused.
     #[error("pulse understanding view refused")]
     Understanding,
@@ -535,8 +537,26 @@ impl PulseError {
             Self::Classification => OrientationError::Invalid("pulse classification owner refused"),
             Self::CueActivation => OrientationError::Invalid("pulse cue activation owner refused"),
             Self::Epistemic => OrientationError::Invalid("pulse epistemic position owner refused"),
-            Self::EpistemicBinding => {
-                OrientationError::Binding("admitted epistemic owner and resolver result")
+            Self::EpistemicBinding(AdmittedBindingError::Mismatch { field }) => {
+                OrientationError::Binding(field)
+            }
+            Self::EpistemicBinding(AdmittedBindingError::Unsupported { field }) => {
+                OrientationError::Invalid(field)
+            }
+            Self::EpistemicBinding(AdmittedBindingError::CandidateContract) => {
+                OrientationError::Invalid("admitted candidate contract")
+            }
+            Self::EpistemicBinding(AdmittedBindingError::PositionContract) => {
+                OrientationError::Invalid("admitted position contract")
+            }
+            Self::EpistemicBinding(AdmittedBindingError::ResolverRequest) => {
+                OrientationError::Invalid("native resolver request contract")
+            }
+            Self::EpistemicBinding(AdmittedBindingError::Observation) => {
+                OrientationError::Invalid("original source observation contract")
+            }
+            Self::EpistemicBinding(AdmittedBindingError::Canonicalization) => {
+                OrientationError::Invalid("source binding canonicalization")
             }
             Self::Understanding => {
                 OrientationError::Invalid("pulse understanding view owner refused")
@@ -693,7 +713,7 @@ pub(crate) fn run_epistemic_stage(
                 inputs.request,
                 &output,
             )
-            .map_err(|_| PulseError::EpistemicBinding)?;
+            .map_err(PulseError::EpistemicBinding)?;
             // CEP defines no native input digest; retain a canonical ledger
             // commitment over the exact source, admitted, and resolver inputs.
             let input_commitment = canonical_input_commitment(&(
@@ -759,7 +779,7 @@ where
             let output = assemble_active_view(
                 inputs.admitted,
                 inputs.recipe,
-                inputs.quality.clone(),
+                (*inputs.quality).clone(),
                 inputs.policy,
                 inputs.measure,
             )

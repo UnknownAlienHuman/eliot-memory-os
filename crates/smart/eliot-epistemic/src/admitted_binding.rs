@@ -42,6 +42,66 @@ pub enum AdmittedBindingError {
     Unsupported { field: &'static str },
 }
 
+impl AdmittedBindingError {
+    /// Bounded stage disposition identifying the exact typed refusal class.
+    #[must_use]
+    pub const fn stage_disposition(&self) -> &'static str {
+        match self {
+            Self::CandidateContract => "candidate_contract",
+            Self::PositionContract => "admitted_position_contract",
+            Self::ResolverRequest => "resolver_request_contract",
+            Self::Observation => "source_observation_contract",
+            Self::Canonicalization => "source_preimage_canonicalization",
+            Self::Mismatch { field: "position currentness" } => "mismatch:position_currentness",
+            Self::Mismatch { field: "original candidate payload digest" } => {
+                "mismatch:candidate_payload_digest"
+            }
+            Self::Mismatch { field: "original candidate scope" } => "mismatch:candidate_scope",
+            Self::Mismatch { field: "original candidate state fence" } => {
+                "mismatch:candidate_state_fence"
+            }
+            Self::Mismatch { field: "original evidence digest preimage" } => {
+                "mismatch:evidence_digest_preimage"
+            }
+            Self::Mismatch { field: "original coverage digest preimage" } => {
+                "mismatch:coverage_digest_preimage"
+            }
+            Self::Mismatch { field: "original conflict digest preimage" } => {
+                "mismatch:conflict_digest_preimage"
+            }
+            Self::Mismatch { field: "original proof digest preimage" } => {
+                "mismatch:proof_digest_preimage"
+            }
+            Self::Mismatch { field: "admitted claim identity" } => {
+                "mismatch:admitted_claim_identity"
+            }
+            Self::Mismatch { field: "captured observation and resolver request" } => {
+                "mismatch:capture_resolver_request"
+            }
+            Self::Mismatch { field: "native resolver record and original observation" } => {
+                "mismatch:resolver_record_observation"
+            }
+            Self::Mismatch { field: "original observation proof digest" } => {
+                "mismatch:observation_proof_digest"
+            }
+            Self::Mismatch { field: "observed candidate claim and support semantics" } => {
+                "mismatch:candidate_claim_support"
+            }
+            Self::Mismatch { field: "native resolver result and original observation" } => {
+                "mismatch:resolver_result_observation"
+            }
+            Self::Mismatch { .. } => "mismatch:admitted_binding_field",
+            Self::Unsupported {
+                field: "candidate must be the existing single-observation producer shape",
+            } => "unsupported:single_observation_shape",
+            Self::Unsupported { field: "non-current observation freshness" } => {
+                "unsupported:observation_freshness"
+            }
+            Self::Unsupported { .. } => "unsupported:admitted_binding_field",
+        }
+    }
+}
+
 /// A validated borrow of the original candidate and admitted view.
 ///
 /// This value does not issue or copy a receipt. Its references remain bound to
@@ -153,7 +213,6 @@ pub fn bind_admitted_position<'a>(
         || observation.evidence.status != EpistemicStatus::Observed
         || observation.lifecycle != LifecycleState::Active
         || request.records.len() != 1
-        || !request.records.contains(&observation.observation_id)
     {
         return Err(AdmittedBindingError::Mismatch {
             field: "captured observation and resolver request",
