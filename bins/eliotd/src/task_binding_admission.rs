@@ -1902,10 +1902,15 @@ pub enum BootstrapAdmission {
     /// authority by itself.
     Material(MaterialBootstrap),
     /// Diagnostic bootstrap: selection/intake data, never Material-ready.
-    /// A bootstrap without a task always lands here.
+    /// A bootstrap without a task always lands here. It carries the exact
+    /// non-material task-or-selection-state (bounded eligible handles,
+    /// exploratory/stale identity, or the current evidence withheld on
+    /// readiness/profiles) so the caller answers from owner evidence instead
+    /// of inventing a choice.
     Diagnostic {
         reason: &'static str,
         next_safe_action: String,
+        selection: TaskSelectionResponse,
     },
     /// No task is selected: answer with this scope's bounded intake shape.
     IntakeRequired(Box<eliot_workscope::TaskSelectionRequired>),
@@ -1957,8 +1962,9 @@ pub struct MaterialBootstrap {
 /// [`ReadinessLifecycle`] and the surface's typed [`ScopeResolutionState`]
 /// decide. `Material` additionally requires an authenticated scope, material
 /// readiness, exact current selection evidence, and fingerprint-matched
-/// verified profiles; anything else is `Diagnostic` (without a task, always)
-/// or `IntakeRequired` (no task selected). Budget previews and expansion
+/// verified profiles; anything else is `Diagnostic` (without a task, always,
+/// carrying the exact non-material task-or-selection-state) or
+/// `IntakeRequired` (no task selected). Budget previews and expansion
 /// handles travel on the owners' surfaces; required selection, authority, and
 /// recovery information is never dropped by this join.
 ///
@@ -2129,17 +2135,36 @@ pub fn admit_bootstrap_context(
     };
     match selection_response_for_receipt(receipt)? {
         TaskSelectionResponse::Absent(intake) => Ok(BootstrapAdmission::IntakeRequired(intake)),
-        TaskSelectionResponse::Ambiguous(_) => Ok(BootstrapAdmission::Diagnostic {
-            reason: "task selection is ambiguous; answer with the bounded eligible handles",
-            next_safe_action: receipt.next_safe_action.clone(),
-        }),
-        TaskSelectionResponse::Exploratory { .. } => Ok(BootstrapAdmission::Diagnostic {
+        TaskSelectionResponse::Ambiguous(candidate_handles) => {
+            Ok(BootstrapAdmission::Diagnostic {
+                reason: "task selection is ambiguous; answer with the bounded eligible handles",
+                next_safe_action: receipt.next_safe_action.clone(),
+                selection: TaskSelectionResponse::Ambiguous(candidate_handles),
+            })
+        }
+        TaskSelectionResponse::Exploratory {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        } => Ok(BootstrapAdmission::Diagnostic {
             reason: "exploratory binding is read-only orientation, not material work",
             next_safe_action: receipt.next_safe_action.clone(),
+            selection: TaskSelectionResponse::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            },
         }),
-        TaskSelectionResponse::Stale { .. } => Ok(BootstrapAdmission::Diagnostic {
+        TaskSelectionResponse::Stale {
+            task_ref,
+            task_revision,
+        } => Ok(BootstrapAdmission::Diagnostic {
             reason: "task selection is stale; refresh or rebind before material work",
             next_safe_action: receipt.next_safe_action.clone(),
+            selection: TaskSelectionResponse::Stale {
+                task_ref,
+                task_revision,
+            },
         }),
         TaskSelectionResponse::Current(task) => {
             // `resolve_task_selection` admits `CurrentTaskContract` only from
@@ -2151,18 +2176,21 @@ pub fn admit_bootstrap_context(
                 return Ok(BootstrapAdmission::Diagnostic {
                     reason: "bootstrap is not authenticated material readiness",
                     next_safe_action: receipt.next_safe_action.clone(),
+                    selection: TaskSelectionResponse::Current(task),
                 });
             }
             if !verified_profiles {
                 return Ok(BootstrapAdmission::Diagnostic {
                     reason: "coverage or governance profile evidence is unknown or unverified",
                     next_safe_action: receipt.next_safe_action.clone(),
+                    selection: TaskSelectionResponse::Current(task),
                 });
             }
             let (Some(coverage), Some(governance)) = (coverage, governance) else {
                 return Ok(BootstrapAdmission::Diagnostic {
                     reason: "coverage or governance profile evidence is unknown or unverified",
                     next_safe_action: receipt.next_safe_action.clone(),
+                    selection: TaskSelectionResponse::Current(task),
                 });
             };
             Ok(BootstrapAdmission::Material(MaterialBootstrap {
