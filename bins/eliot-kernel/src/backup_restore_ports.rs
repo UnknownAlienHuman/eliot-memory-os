@@ -503,7 +503,12 @@ impl std::fmt::Display for KernelRestoreError {
 
 impl std::error::Error for KernelRestoreError {}
 
-fn non_blank(value: &str, field: &'static str) -> Result<(), KernelRestoreError> {
+/// Requires a carried identity to be non-blank and free of control characters.
+///
+/// Crate-internal so the restore coordinator refuses a blank operation identity
+/// through the SAME predicate that validates the ports bundle, instead of a
+/// second copy that could drift from it.
+pub(crate) fn non_blank(value: &str, field: &'static str) -> Result<(), KernelRestoreError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(KernelRestoreError::InvalidInput {
             field,

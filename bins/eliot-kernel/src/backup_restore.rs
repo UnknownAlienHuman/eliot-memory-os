@@ -143,8 +143,8 @@ use super::backup_restore_ports::{
     KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, OrsRestoreJournalOwner,
     PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
     RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal,
-    backup_to_kernel, check_kernel_effect_fence, ors_to_backup, require_production_admitted,
-    sync_file, sync_parent_directory,
+    backup_to_kernel, check_kernel_effect_fence, non_blank, ors_to_backup,
+    require_production_admitted, sync_file, sync_parent_directory,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -1152,15 +1152,11 @@ impl KernelBackupRestore {
         plan: &mut RestorePlan,
         operation_id: &str,
     ) -> Result<(), KernelRestoreError> {
-        // Refused, not sanitised: a blank or control-bearing identity would
-        // either collapse distinct operations onto one stream or put a control
+        // Refused, not sanitised, and through the SAME predicate the ports
+        // bundle validates: a blank or control-bearing identity would either
+        // collapse distinct operations onto one stream or put a control
         // character into a value the journal addresses and echoes.
-        if operation_id.trim().is_empty() || operation_id.chars().any(char::is_control) {
-            return Err(KernelRestoreError::InvalidInput {
-                field: "restore.operation_id",
-                reason: "must be non-blank with no control characters",
-            });
-        }
+        non_blank(operation_id, "restore.operation_id")?;
         plan.plan_id = format!("{}-{}", plan.plan_id, operation_id);
         Ok(())
     }
