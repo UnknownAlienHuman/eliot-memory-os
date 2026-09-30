@@ -14,10 +14,22 @@
 //! |---|---|---|
 //! | Construct/admit `ModelRouteRequest` | `model_stage::model_route_request` over the admitted pair | wired |
 //! | Execute the admitted provider route, return `ModelRouteOutcome` | `model_stage::model_route_outcome` over the measured local call | wired |
+//! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
+//! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
+//! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
 //! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | wired |
-//! | Acquire each mandatory stage's owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | wired |
+//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | wired |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
+//!
+//! The two records the admitted pipeline itself produces — the grounding
+//! request and the structured A-05 validated grounding candidate — are NOT owner
+//! channel members. They are outputs of stages that run after the channel is
+//! resolved, so no source could ever supply them; they enter the carrier as
+//! `dispatch_stage::PipelineOrientationRecords` parameters. The coherent v1
+//! hypothesis pair enters beside them as explicit parameters, because
+//! `dispatch_orientation` is what derived and validated that pair. Only values
+//! a Governor/canonical owner publishes travel over [`OrientationSupply`].
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch is reported only as the
@@ -55,9 +67,9 @@ use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_classification::ClassificationPolicy;
 use eliot_dreamer_conflict_analysis::{ConflictAnalysisPolicy, ConflictSupplements};
 use eliot_dreamer_contracts::{
-    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft, JobClass,
-    ModelRouteDisposition, ModelRouteOutcome, ModelRouteRequest, ValidatedCandidate,
-    ValidatedCurationItem, ValidatedDreamDraft, ValidatedGroundingCandidate, bundle_digest_of,
+    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, JobClass, ModelRouteDisposition,
+    ModelRouteOutcome, ModelRouteRequest, ValidatedCandidate, ValidatedCurationItem,
+    bundle_digest_of,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CurrentEpistemicPositionHandle, OrientationDisposition,
@@ -69,6 +81,7 @@ use eliot_dreamer_rival_model::RivalPolicy;
 use eliot_epistemic::PositionRequest;
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
 
+use crate::dispatch_stage::PipelineOrientationRecords;
 use crate::pulse::{
     CEILING_BLOCKED, CEILING_CANDIDATE_ONLY, CONFLICT_OUTPUT_QUALIFIED, CandidateStage,
     ClassificationStage, ConflictStage, CueActivationStage, MANDATORY_DENOMINATOR, PulseError,
@@ -146,7 +159,7 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub epistemic: &'a PositionRequest,
     /// Understanding stage inputs with the route measurement.
     pub understanding: UnderstandingStage<'a, MeasureFn>,
-    /// Claim-grounding request (cloned; the owner takes owned input).
+    /// Claim-grounding request this binary's own grounding stage admitted.
     pub grounding: &'a GroundingRequest,
     /// Rival-structuring stage inputs.
     pub rivals: RivalStage<'a>,
@@ -170,8 +183,8 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub cancelled: bool,
 }
 
-/// Governor-supplied records for the CC-004 projections and the nine mandatory
-/// stage members.
+/// Governor-supplied records for the CC-004 projections and the mandatory
+/// stage members whose owners sit outside this binary.
 ///
 /// This is the Owner channel, not a second contract and not a state machine: it
 /// carries the exact owner records by reference, adds no semantic recomputation,
@@ -180,6 +193,11 @@ pub(crate) struct ProductionOrientationInputs<'a> {
 /// rather than deriving canonical state in this binary. Nothing is defaulted:
 /// a member the Governor has not published leaves the channel incomplete, and
 /// the caller supplies the whole channel or none of it.
+///
+/// The grounding request, the grounded draft, the receipt-bound v1 draft, and
+/// the validated grounding candidate are deliberately absent: they are outputs
+/// of stages this binary already runs, so no owner channel can supply them.
+/// They travel as explicit [`ProductionOrientationInputs`] parameters instead.
 pub struct OrientationSupply<'a> {
     /// CC-004 canonical projection set emitted by the Governor's own producer.
     pub projections: &'a CanonicalProjectionSet,
@@ -209,20 +227,12 @@ pub struct OrientationSupply<'a> {
     pub assembly_policy: &'a AssemblyPolicy,
     /// Route measurement invoked once over the canonical payload bytes.
     pub measure: MeasureFn,
-    /// Owner grounding request (claim-grounding stage).
-    pub grounding: &'a GroundingRequest,
-    /// Validated grounding candidate carrying the rival declarations.
-    pub validated_draft: &'a ValidatedGroundingCandidate,
     /// Admitted current position the rivals bind against.
     pub current_position: &'a AdmittedPosition,
     /// Rival-structuring policy.
     pub rival_policy: &'a RivalPolicy,
     /// Validated curation item under conflict analysis.
     pub curation_item: &'a ValidatedCurationItem,
-    /// Validator-bound draft under conflict analysis.
-    pub validated_dream_draft: &'a ValidatedDreamDraft,
-    /// Claim-grounded draft under conflict analysis.
-    pub grounded: &'a GroundedDreamDraft,
     /// Admitted conflict set under analysis.
     pub conflict_set: &'a ConflictSet,
     /// Expected receipts and supplement bounds for conflict analysis.
@@ -253,25 +263,65 @@ pub struct OrientationSupply<'a> {
 ///
 /// The CC-002 request/outcome are produced by this binary's own model stage from
 /// admitted material and proved against the admitted bundle, so that boundary
-/// is present on every admitted Orientation job. The CC-004 projection set and
-/// the nine mandatory stage-owner records are Governor-published values supplied
-/// through [`OrientationSupply`]; without that channel the carrier cannot be
-/// filled honestly and this returns the typed blocked result naming the missing
-/// owner supply. With a supplied channel the same composer below produces
-/// complete/partial results with no dispatch change.
+/// is present on every admitted Orientation job. The grounding request and the
+/// structured A-05 validated grounding candidate arrive as `pipeline`, and the
+/// coherent v1 hypothesis pair as `v1_grounded`/`v1_draft`; all four come from
+/// this binary's own admitted stage entries, never from the owner channel. The
+/// CC-004 projection set and the remaining stage-owner records are
+/// Governor-published values supplied through [`OrientationSupply`]; without
+/// that channel the carrier cannot be filled honestly and this returns the typed
+/// blocked result naming the missing owner supply. With a supplied channel the
+/// same composer below produces complete/partial results with no dispatch
+/// change.
 ///
 /// No member is synthesized here: absent Governor records are a refusal, never
 /// a default, an empty set, or a locally built lookalike, all of which would be
 /// self-issued authority.
+/// The admitted Orientation material this carrier is resolved against.
+///
+/// These five references are one admitted job's identity, its derived inputs and
+/// its sealed policy, so they travel together: a caller cannot supply a bundle
+/// from one admission with a policy from another.
+pub(crate) struct AdmittedOrientationRefs<'a> {
+    /// The admitted kernel job this pulse answers.
+    pub admission: &'a KernelJobAdmission,
+    /// The admitted Orientation job with frame, evidence and denominator.
+    pub admitted_job: &'a AdmittedOrientationJob,
+    /// The receipt-bound v1 validated candidate.
+    pub candidate: &'a ValidatedCandidate,
+    /// The bounded bundle this pulse binds.
+    pub bundle: &'a DreamInputBundle,
+    /// The sealed orientation policy.
+    pub policy: &'a OrientationPolicy,
+}
 pub(crate) fn resolve_production_inputs<'a>(
-    admission: &'a KernelJobAdmission,
-    admitted_job: &'a AdmittedOrientationJob,
-    candidate: &'a ValidatedCandidate,
-    bundle: &'a DreamInputBundle,
-    policy: &'a OrientationPolicy,
+    admitted: &AdmittedOrientationRefs<'a>,
     route: Option<(&'a ModelRouteRequest, &'a ModelRouteOutcome)>,
     supply: Option<&'a OrientationSupply<'a>>,
+    pipeline: &PipelineOrientationRecords<'a>,
 ) -> Result<ProductionOrientationInputs<'a>, Box<OrientationPulseResult>> {
+    let AdmittedOrientationRefs {
+        admission,
+        admitted_job,
+        candidate,
+        bundle,
+        policy,
+    } = *admitted;
+    let PipelineOrientationRecords {
+        grounding,
+        validated_draft,
+        v1: Some(v1),
+    } = *pipeline
+    else {
+        return Err(Box::new(supply_missing_blocked(
+            admission,
+            admitted_job,
+            candidate,
+            bundle,
+            policy,
+            route,
+        )));
+    };
     let (Some(supply), Some((model_request, model_outcome))) = (supply, route) else {
         return Err(Box::new(supply_missing_blocked(
             admission,
@@ -310,17 +360,17 @@ pub(crate) fn resolve_production_inputs<'a>(
             policy: supply.assembly_policy,
             measure: supply.measure,
         },
-        grounding: supply.grounding,
+        grounding,
         rivals: RivalStage {
             bundle,
-            validated_draft: supply.validated_draft,
+            validated_draft,
             current_position: supply.current_position,
             policy: supply.rival_policy,
         },
         conflict: ConflictStage {
             item: supply.curation_item,
-            draft: supply.validated_dream_draft,
-            grounded: supply.grounded,
+            draft: v1.draft,
+            grounded: v1.grounded,
             conflict_set: supply.conflict_set,
             supplements: supply.supplements,
             policy: supply.conflict_policy,

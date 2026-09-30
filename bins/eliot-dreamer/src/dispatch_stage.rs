@@ -58,6 +58,7 @@ use std::time::Instant;
 use eliot_dreamer_candidate_validation::{
     CandidateValidationOutcome, DreamDraftValidationError, validate_grounded_dream_draft_at,
 };
+use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
 use eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate;
 use eliot_dreamer_contracts::{
@@ -164,8 +165,74 @@ pub struct CurationExecutionCarrier<'a> {
 pub(crate) struct OwnerCarriers<'a> {
     /// Curation owner records, present only for an admitted Curation job.
     pub curation: Option<CurationExecutionCarrier<'a>>,
+    /// The screened binding a Curation job resolved, absent for every other class.
+    pub screen: Option<ScreenBinding>,
+    /// The protection assessment derived from that binding.
+    pub curation_protection: Option<CurationProtectionSet>,
     /// Orientation owner records, present only for an admitted Orientation job.
     pub orientation: Option<&'a OrientationSupply<'a>>,
+}
+
+/// The two Orientation carrier records the admitted pipeline itself produces.
+///
+/// They are outputs of stages that run after the Governor supply channel is
+/// resolved, so no channel can carry them: the grounding request comes from
+/// `grounding_stage::resolve_grounding_inputs` and the structured A-05
+/// validated grounding candidate from `validation_stage::validate_admitted_draft`.
+/// This is the existing pipeline's own committed receipt, joined by reference —
+/// never a copy, a default, or a lookalike rebuilt for the composer.
+///
+/// The v1 hypothesis pair is deliberately absent: it is derived and validated
+/// inside `dispatch_orientation` itself, so that arm carries it directly rather
+/// than through this struct.
+pub(crate) struct PipelineOrientationRecords<'a> {
+    /// Owner grounding request the claim-grounding stage ran under.
+    pub grounding: &'a GroundingRequest,
+    /// Structured A-05 validated candidate carrying the rival declarations.
+    pub validated_draft: &'a ValidatedGroundingCandidate,
+    /// The coherent v1 pair, present only once the v1 A-05 entry has accepted its
+    /// aggregate. It cannot exist before this pipeline runs, which is why it is
+    /// never asked of the Governor channel.
+    pub v1: Option<V1GroundedPair<'a>>,
+}
+impl<'a> PipelineOrientationRecords<'a> {
+    /// Builds the record from the facts this pipeline holds before the v1 entry.
+    pub(crate) fn new(
+        grounding: &'a GroundingRequest,
+        validated_draft: &'a ValidatedGroundingCandidate,
+    ) -> Self {
+        Self {
+            grounding,
+            validated_draft,
+            v1: None,
+        }
+    }
+
+    /// Attaches the coherent v1 pair this arm derived and the v1 entry accepted.
+    pub(crate) fn with_v1(
+        self,
+        grounded: &'a eliot_dreamer_contracts::GroundedDreamDraft,
+        draft: &'a eliot_dreamer_contracts::ValidatedDreamDraft,
+    ) -> Self {
+        Self {
+            v1: Some(V1GroundedPair { grounded, draft }),
+            ..self
+        }
+    }
+}
+
+/// The coherent v1 pair this arm derived and the real v1 A-05 entry accepted.
+///
+/// Both halves are read back out of the accepted aggregate rather than
+/// re-derived, so the conflict stage consumes exactly what validation approved.
+/// They cannot travel the Governor channel: they do not exist until this
+/// pipeline has run.
+#[derive(Clone, Copy)]
+pub(crate) struct V1GroundedPair<'a> {
+    /// The grounded draft the v1 entry accepted.
+    pub grounded: &'a eliot_dreamer_contracts::GroundedDreamDraft,
+    /// The validated draft the v1 entry accepted.
+    pub draft: &'a eliot_dreamer_contracts::ValidatedDreamDraft,
 }
 
 /// Maps a native owner refusal to a typed fail-closed refusal.
@@ -211,7 +278,9 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 /// the structured A-05 validated candidate (`Some` for every non-Curation
 /// admitted class, carried from the validation stage; `None` for Curation,
 /// which owns its separate carrier, and for refused classes, which never
-/// reach validation). Returns the owner-typed [`DreamResult`].
+/// reach validation), and the two pipeline-produced records the Orientation
+/// carrier joins (read only on the Orientation arm). Returns the owner-typed
+/// [`DreamResult`].
 ///
 /// Fail-closed: the admission/job binding is verified first, then the class
 /// parameter is bound against the semantic job, then the exhaustive nine-arm
@@ -231,11 +300,10 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 pub(crate) fn dispatch_admitted(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
-    screen: Option<ScreenBinding>,
-    curation_protection: Option<CurationProtectionSet>,
     carriers: OwnerCarriers<'_>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
+    pipeline: PipelineOrientationRecords<'_>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -251,10 +319,10 @@ pub(crate) fn dispatch_admitted(
             let Some(carrier) = carriers.curation else {
                 return Err(DreamerError::InvalidAdmission(CURATION_CARRIER_REFUSAL));
             };
-            let Some(binding) = screen else {
+            let Some(binding) = carriers.screen else {
                 return Err(DreamerError::InvalidAdmission(CURATION_SCREEN_REFUSAL));
             };
-            let Some(protection) = curation_protection else {
+            let Some(protection) = carriers.curation_protection else {
                 return Err(DreamerError::InvalidAdmission(CURATION_PROTECTION_REFUSAL));
             };
             dispatch_curation(binding, protection, carrier)
@@ -268,7 +336,7 @@ pub(crate) fn dispatch_admitted(
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate, carriers.orientation)
+            dispatch_orientation(admission, job, candidate, carriers.orientation, pipeline)
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -370,11 +438,16 @@ pub(crate) fn require_validated_binding(
 /// [`DreamResult::Orientation`] complete/partial/blocked result. A v1
 /// semantic rejection maps to the static refusal and never reaches
 /// composition, so rejection invokes zero handlers with no fallback dispatch.
+///
+/// `pipeline` carries the two records the admitted pipeline itself produced,
+/// so the carrier joins that pipeline's own committed receipt instead of asking
+/// the Governor channel for values the channel could never hold.
 fn dispatch_orientation(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     validated: &ValidatedGroundingCandidate,
     orientation_supply: Option<&OrientationSupply<'_>>,
+    pipeline: PipelineOrientationRecords<'_>,
 ) -> Result<DreamResult, DreamerError> {
     require_validated_binding(admission, job, validated)?;
     let admitted = admission_of(admission, job)?;
@@ -423,13 +496,19 @@ fn dispatch_orientation(
     let admitted_job = orientation_admitted_job(admitted, frame);
     let policy = orientation_dispatch_policy()?;
     match crate::production_orientation::resolve_production_inputs(
-        admission,
-        &admitted_job,
-        &candidate,
-        &bundle,
-        &policy,
+        &crate::production_orientation::AdmittedOrientationRefs {
+            admission,
+            admitted_job: &admitted_job,
+            candidate: &candidate,
+            bundle: &bundle,
+            policy: &policy,
+        },
         Some((&model_request, &model_outcome)),
         orientation_supply,
+        // The coherent v1 pair this very arm derived and the real v1 A-05 entry
+        // accepted above, read back out of the accepted aggregate, so the conflict
+        // stage consumes exactly what validation approved.
+        &pipeline.with_v1(&candidate.grounded, &candidate.validated),
     ) {
         Ok(inputs) => crate::production_orientation::compose_production_result(inputs, job)
             .map(DreamResult::Orientation)
