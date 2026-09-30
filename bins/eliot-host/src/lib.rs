@@ -4559,14 +4559,7 @@ impl HostJobBranches {
         // Issue #1775: an owned reconnect resolves the collision against the
         // same approved identity as the fresh launch, so a foreign occupant
         // produces the typed directive and an unreadable owner defers.
-        host_job_launch::ensure_store_endpoint_available(
-            &launch.canonical_store_arguments,
-            &host_job_launch::StoreEndpointOwnershipBinding {
-                installation: &host.installation,
-                generation,
-                state_fence: &launch.authority_state_fence,
-            },
-        )?;
+        Self::ensure_relaunch_store_endpoint_available(launch, host, generation)?;
         let child = Self::launch(
             &executable,
             executable_lease,
@@ -4588,6 +4581,21 @@ impl HostJobBranches {
             None,
         )?;
         Ok(child)
+    }
+
+    fn ensure_relaunch_store_endpoint_available(
+        launch: &RuntimeLaunchDescriptor,
+        host: &HostInstallationEpoch,
+        generation: &PlatformHandle,
+    ) -> Result<(), HostError> {
+        host_job_launch::ensure_store_endpoint_available(
+            &launch.canonical_store_arguments,
+            &host_job_launch::StoreEndpointOwnershipBinding {
+                installation: &host.installation,
+                generation,
+                state_fence: &launch.authority_state_fence,
+            },
+        )
     }
 
     fn branch_state(
