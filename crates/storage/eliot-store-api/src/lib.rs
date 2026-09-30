@@ -6276,6 +6276,7 @@ pub fn validate_store_receipt_envelope_with_causal(
     receipt: &WriteReceipt,
     causal: &CausalBinding,
 ) -> Result<(), StoreError> {
+    receipt.validate()?;
     let commit_sequence = committed_receipt_sequence(receipt)?;
     let mut candidate = receipt.clone();
     candidate.envelope = None;
