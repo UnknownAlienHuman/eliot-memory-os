@@ -9,7 +9,9 @@
 use eliot_authority::PrincipalRef;
 use eliot_contracts::StateFence;
 use eliot_protocol::RequestIdentity;
-use eliot_receipts::{OperationBinding, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding};
+use eliot_receipts::{
+    OperationBinding, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding,
+};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,8 +24,7 @@ use crate::{PolicyOwner, SourceArtifactAdmission};
 /// These spellings select the I5.12 policy fields; their values must be
 /// explicitly present in the recovered owner snapshot. No domain or policy
 /// value is inferred from an admission or supplied as a default here.
-pub const SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING: &str =
-    "source_artifact.blob.scope_domain_id";
+pub const SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING: &str = "source_artifact.blob.scope_domain_id";
 pub const SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING: &str =
     "source_artifact.blob.access_domain_id";
 pub const SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING: &str =
@@ -34,14 +35,12 @@ pub const SOURCE_ARTIFACT_BLOB_RETENTION_DOMAIN_SETTING: &str =
     "source_artifact.blob.retention_domain_id";
 pub const SOURCE_ARTIFACT_BLOB_ERASURE_DOMAIN_SETTING: &str =
     "source_artifact.blob.erasure_domain_id";
-pub const SOURCE_ARTIFACT_BLOB_PRIVACY_CLASS_SETTING: &str =
-    "source_artifact.blob.privacy_class";
+pub const SOURCE_ARTIFACT_BLOB_PRIVACY_CLASS_SETTING: &str = "source_artifact.blob.privacy_class";
 pub const SOURCE_ARTIFACT_BLOB_RETENTION_CLASS_SETTING: &str =
     "source_artifact.blob.retention_class";
 pub const SOURCE_ARTIFACT_BLOB_INSTRUCTION_TAINT_SETTING: &str =
     "source_artifact.blob.instruction_taint";
-pub const SOURCE_ARTIFACT_BLOB_EFFECT_CEILING_SETTING: &str =
-    "source_artifact.blob.effect_ceiling";
+pub const SOURCE_ARTIFACT_BLOB_EFFECT_CEILING_SETTING: &str = "source_artifact.blob.effect_ceiling";
 
 /// Retention classes accepted from the recovered, human-owned source policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -214,13 +213,16 @@ impl SourceArtifactBlobProfile {
             }
             Ok(value.to_owned())
         };
-        let parse = |key: &'static str| -> Result<serde_json::Value, SourceArtifactBlobProfileError> {
-            let value = setting(key)?;
-            if value.trim().is_empty() || value.chars().any(char::is_control) {
-                return Err(SourceArtifactBlobProfileError::InvalidSetting { setting_key: key });
-            }
-            Ok(serde_json::Value::String(value.to_owned()))
-        };
+        let parse =
+            |key: &'static str| -> Result<serde_json::Value, SourceArtifactBlobProfileError> {
+                let value = setting(key)?;
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err(SourceArtifactBlobProfileError::InvalidSetting {
+                        setting_key: key,
+                    });
+                }
+                Ok(serde_json::Value::String(value.to_owned()))
+            };
 
         let policy = SourceArtifactBlobPolicy {
             privacy_class: serde_json::from_value(parse(
@@ -252,12 +254,8 @@ impl SourceArtifactBlobProfile {
         let residency_domains = SourceArtifactResidencyDomains {
             scope_domain_id: domain(SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING)?,
             access_domain_id: domain(SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING)?,
-            confidentiality_domain_id: domain(
-                SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING,
-            )?,
-            encryption_key_domain_id: domain(
-                SOURCE_ARTIFACT_BLOB_ENCRYPTION_KEY_DOMAIN_SETTING,
-            )?,
+            confidentiality_domain_id: domain(SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING)?,
+            encryption_key_domain_id: domain(SOURCE_ARTIFACT_BLOB_ENCRYPTION_KEY_DOMAIN_SETTING)?,
             retention_domain_id: domain(SOURCE_ARTIFACT_BLOB_RETENTION_DOMAIN_SETTING)?,
             erasure_domain_id: domain(SOURCE_ARTIFACT_BLOB_ERASURE_DOMAIN_SETTING)?,
         };
@@ -347,7 +345,12 @@ impl SourceArtifactBlobProfile {
             return Err(SourceArtifactBlobProfileError::KeyLineageMismatch);
         }
         if active_key_generation == 0
-            || active_key_generation != admission.work_scope().state_fence.resource_generation.value()
+            || active_key_generation
+                != admission
+                    .work_scope()
+                    .state_fence
+                    .resource_generation
+                    .value()
         {
             return Err(SourceArtifactBlobProfileError::KeyGenerationMismatch);
         }

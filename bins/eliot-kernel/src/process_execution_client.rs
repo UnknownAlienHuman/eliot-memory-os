@@ -123,8 +123,7 @@ pub fn process_execution_client(
     session: &Session,
     session_binding: &ProcessSessionBinding,
 ) -> Result<KernelProcessExecutionClient, ProcessExecutionRejection> {
-    let (owner, gateway) =
-        authenticated_process_route(kernel, session, session_binding)?;
+    let (owner, gateway) = authenticated_process_route(kernel, session, session_binding)?;
     let starter: Arc<dyn ProcessStarter> = Arc::new(GatewayProcessStarter {
         kernel: Arc::clone(kernel),
         gateway: Arc::clone(&gateway),

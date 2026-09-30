@@ -56,14 +56,14 @@ use eliot_runtime_contracts::{
     I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, WakeIntent,
 };
 use eliot_store_api::{
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CausalWriteReceipt, NamedReadRequest,
-    NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
-    dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
-    verify_canonical_request_hash,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CausalWriteReceipt,
+    NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
+    admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
+    generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 

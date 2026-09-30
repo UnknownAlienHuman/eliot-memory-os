@@ -136,9 +136,6 @@ mod reactive_feed;
 mod route_execution_identity;
 mod route_receipts;
 pub mod semantic_revision_store;
-/// I5.2 D1 same-stack source-artifact Blob owner. It consumes the live
-/// Governor source-effect admission and retains S-04 receipt lineage here.
-pub mod source_artifact_owner;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -146,6 +143,9 @@ mod skill_evidence_read;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod solo_agent_driver;
+/// I5.2 D1 same-stack source-artifact Blob owner. It consumes the live
+/// Governor source-effect admission and retains S-04 receipt lineage here.
+pub mod source_artifact_owner;
 pub mod staffing_policy;
 pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
@@ -1035,11 +1035,9 @@ impl DaemonComposition {
             &config.launch().kernel,
             QueueLimits::default(),
         )?;
-        let source_artifact_owner = SourceArtifactOwner::new(
-            &config.state_root,
-            governor.kernel_snapshot().state_fence(),
-        )
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let source_artifact_owner =
+            SourceArtifactOwner::new(&config.state_root, governor.kernel_snapshot().state_fence())
+                .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         let cached_revision_fence = Some(Box::new(governor.kernel_snapshot().state_fence()));
         Ok(Self {
             governor,

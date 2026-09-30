@@ -77,10 +77,10 @@ mod kernel_config;
 /// once here and imported by the binary; later leaves extend through their
 /// own serialized turns, never a second copy.
 pub mod kernel_diagnostics;
+mod lsp_current_executor;
 mod process_execution;
 mod process_execution_client;
 mod process_stream_readback;
-mod lsp_current_executor;
 pub use lsp_current_executor::{
     GitAdmissionFuture, GitAdmissionPort, KernelGitProcessRunner, KernelLspCurrentExecutor,
     KernelLspProcessOwnerPort,
