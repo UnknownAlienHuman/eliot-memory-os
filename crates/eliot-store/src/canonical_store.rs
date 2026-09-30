@@ -3211,6 +3211,32 @@ impl CanonicalStore {
     /// Reuses the existing owner, record and query: this delegates to
     /// [`Self::task_contract_by_id`], whose meaning for its other callers is
     /// unchanged, and adds no second read path, table or identity scheme.
+    ///
+    /// # Neutral binding (issue #1741, I7.9)
+    ///
+    /// This is the only enumeration of `TaskContract.acceptance_items` in the
+    /// repository, so it is the read the finish path's denominator must come
+    /// from. The neutral contract it has to satisfy is already closed in
+    /// `eliot-store-api`: `NamedReadOperation::GetTaskContractAcceptanceSet`
+    /// with the exact `task_id` and `task_revision` selectors
+    /// (`task_contract_acceptance_read_request`) and the
+    /// `TaskContractAcceptanceSet` payload
+    /// (`decode_task_contract_acceptance_set`). That operation is deliberately
+    /// known-but-unsupported today: the authenticated daemon store
+    /// (`eliot-store-surreal` over `eliot-store-surreal-adapter`) owns a
+    /// different schema and has no durable `TaskContract` record, and adding
+    /// `eliot-governor -> eliot-store` here is refused by
+    /// `crates/governor/AGENTS.md`. So this read stays the owner-side source
+    /// and the neutral operation stays refused, and the Governor finish path
+    /// fails closed with a typed `AcceptanceDenominatorError` rather than
+    /// falling back to a plan's own list.
+    ///
+    /// `submitter_satisfied_claim` and `submitter_claim_is_bound` stay
+    /// unread by the finish path: I7.9 forbids treating a submitter-shaped
+    /// claim as coverage, so the neutral payload carries only the obligation
+    /// itself. What is still missing is a durable owner record of this
+    /// enumeration inside the authenticated daemon store, plus the store-owned
+    /// catalogue row and handler that serve it.
     pub async fn task_acceptance_items_at_revision(
         &self,
         task_id: TaskId,

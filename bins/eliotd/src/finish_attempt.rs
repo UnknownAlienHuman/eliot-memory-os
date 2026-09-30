@@ -75,7 +75,15 @@ fn finish_rejection_cause(error: &FinishAttemptError) -> (AgentResponseDispositi
         FinishAttemptError::Kernel(_) | FinishAttemptError::Store(_) => {
             (AgentResponseDisposition::Failed, "RUNTIME_FAILED")
         }
-        FinishAttemptError::Finish(_) | FinishAttemptError::Serialization(_) => (
+        // Issue #1741, I7.9: the contract owner's acceptance denominator could
+        // not be rehydrated or disagrees with the plan's declared set. The
+        // decision context is incomplete, so this is the same
+        // `DECISION_CONTEXT_INCOMPLETE` refusal as a rehydrated owner state that
+        // does not validate — never a degraded success and never the plan's own
+        // list.
+        FinishAttemptError::AcceptanceDenominator(_)
+        | FinishAttemptError::Finish(_)
+        | FinishAttemptError::Serialization(_) => (
             AgentResponseDisposition::Failed,
             "DECISION_CONTEXT_INCOMPLETE",
         ),
@@ -237,11 +245,37 @@ pub async fn serve_finish_claim(
     let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
         .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
 
+    // Issue #1741, I7.9: rehydrate the contract owner's acceptance-item
+    // enumeration for this exact task id and task revision BEFORE any evidence
+    // is prepared. This is one bounded read on the existing authenticated
+    // Kernel named-read route, so the composition borrow is held across it; the
+    // two write legs below still run with no lock held across their exchange, as
+    // before. A refusal here is a typed rejection body: the plan's own
+    // `required_acceptance_item_ids` are never used as the denominator, so a
+    // candidate whose plan narrows the contract's obligations cannot proceed.
+    let task_id = eliot_contracts::TaskId::new(draft.task_id.clone())
+        .map_err(|error| format!("admitted finish draft names an invalid task: {error}"))?;
+    let contract_acceptance = {
+        let guard = composition.lock().await;
+        guard
+            .rehydrate_task_contract_acceptance(&task_id, draft.expected_task_revision)
+            .await
+    };
+    let contract_acceptance = match contract_acceptance {
+        Ok(acceptance) => acceptance,
+        Err(error) => return rejected_finish_result(&claimed, &error),
+    };
+
     // Plan the evidence exchange while the composition is borrowed, then run
     // Kernel IO with no composition lock held.
     let evidence = {
         let guard = composition.lock().await;
-        guard.prepare_finish_evidence(&claimed.request_identity, &claimed.operation_id, &draft)
+        guard.prepare_finish_evidence(
+            &claimed.request_identity,
+            &claimed.operation_id,
+            &draft,
+            &contract_acceptance,
+        )
     };
     let evidence = match evidence {
         Ok(evidence) => evidence,

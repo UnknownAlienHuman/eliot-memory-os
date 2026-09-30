@@ -1536,7 +1536,35 @@ impl DaemonComposition {
     // through the Governor finish owner, and `accept_prepared_exchange`
     // re-checks the pre-commit fence before the receipt is admitted.
 
+    /// Rehydrates the contract owner's acceptance-item enumeration for one finish
+    /// candidate at the exact task id and task revision (issue #1741, I7.9).
+    ///
+    /// This is the single bounded read the finish path performs before it
+    /// prepares anything, and it is the only route to the denominator. It holds
+    /// the composition lock across exactly one Kernel round trip, which is the
+    /// same shape as the synchronous `refresh_from_kernel` the decision leg
+    /// already performs under the lock; the write legs still run unlocked.
+    ///
+    /// A refusal is a typed `AcceptanceDenominatorError`. There is no fallback to
+    /// the canonical plan's declared list.
+    pub async fn rehydrate_task_contract_acceptance(
+        &self,
+        task_id: &eliot_contracts::TaskId,
+        task_revision: u64,
+    ) -> Result<eliot_store_api::TaskContractAcceptanceSet, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .rehydrate_task_contract_acceptance(task_id, task_revision)
+            .await
+    }
+
     /// Prepares the Governor-owned finish-evidence exchange without transporting it.
+    ///
+    /// `contract_acceptance` is the contract owner's rehydrated enumeration from
+    /// [`Self::rehydrate_task_contract_acceptance`], passed in so this phase
+    /// stays synchronous and pure.
     ///
     /// Runtime callers hold the composition lock only for this synchronous phase,
     /// then exchange the immutable plan through Kernel after releasing the lock.
@@ -1545,12 +1573,13 @@ impl DaemonComposition {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
+        contract_acceptance: &eliot_store_api::TaskContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.governor
-            .prepare_finish_evidence(identity, operation_id, draft)
+            .prepare_finish_evidence(identity, operation_id, draft, contract_acceptance)
     }
 
     /// Revalidates one exchanged finish leg against the live Governor owner.

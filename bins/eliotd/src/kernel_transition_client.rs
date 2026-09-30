@@ -21,8 +21,9 @@ use eliot_store_api::{
     CampaignSourceHead, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
     CampaignSourceRevisionRead, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHeadExpectation, ScopeId,
-    StoreHealth, WriteReceipt, generated_operation_manifests, validate_store_receipt_envelope,
-    verify_canonical_request_hash,
+    StoreHealth, TaskContractAcceptanceSet, WriteReceipt, decode_task_contract_acceptance_set,
+    generated_operation_manifests, task_contract_acceptance_read_request,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use tracing::Instrument as _;
 
@@ -396,6 +397,49 @@ impl KernelTransitionPort for DaemonKernelClient {
                 acceptance,
                 open_items,
             })
+        })
+    }
+
+    /// Reads the contract owner's exact `TaskContract` acceptance-item set for
+    /// one task at one task revision (issue #1741, I7.9).
+    ///
+    /// Same transport template as every other neutral read on this client: the
+    /// request is built and validated by the neutral API, travels as the single
+    /// `"store_named"` operation over the authenticated Kernel route, and the
+    /// typed response is decoded by the neutral API's closed decoder. This adds
+    /// no second read path and no raw query surface; Kernel remains the route
+    /// and fence authority and the store remains the only owner of the durable
+    /// enumeration.
+    ///
+    /// The exact task id, task revision and fence are forwarded unchanged. A
+    /// response that substitutes the task, the revision, or the fence is
+    /// refused here as well as in the neutral decoder, so no implementor can
+    /// widen the denominator the finish gate is computed over.
+    fn task_contract_acceptance_set(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+        state_fence: &StateFence,
+    ) -> KernelPortFuture<'_, TaskContractAcceptanceSet> {
+        let task_id = task_id.clone();
+        let state_fence = state_fence.clone();
+        Box::pin(async move {
+            let request =
+                task_contract_acceptance_read_request(&task_id, task_revision, &state_fence)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            let response = self.store_named_async(request).await?;
+            let set = decode_task_contract_acceptance_set(&response)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if set.task_id.as_str() != task_id.as_str()
+                || set.task_revision != task_revision
+                || set.read_state_fence != state_fence
+            {
+                return Err(KernelPortError::Contract(
+                    "daemon acceptance-set read does not match the requested task, revision, and active state fence"
+                        .to_owned(),
+                ));
+            }
+            Ok(set)
         })
     }
 }

@@ -25,8 +25,8 @@ use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationManifestDigest, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    ScopeId, SecurityContext, StoreFailure, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    generated_operation_manifests, operation_manifest_set_digest,
+    ScopeId, SecurityContext, StoreFailure, TaskContractAcceptanceSet, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
 };
 use eliot_task::{TaskCommand, TaskLifecycleOwner, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -36,7 +36,7 @@ use eliot_testd_core::{
 use thiserror::Error;
 
 use crate::{
-    CanonicalAdmissionOwner, CanonicalAdmissionSnapshot, CanonicalContractAcceptance,
+    AcceptanceDenominatorError, CanonicalAdmissionOwner, CanonicalAdmissionSnapshot,
     CanonicalFinishEvidence, CanonicalPlanBinding, CanonicalVerifierExecutionFact,
     CompositionError, GovernorOwners, KernelPortError, KernelTransitionPort,
     acceptance_coverage_from_verifier_fact, evaluate_testd_verification_current,
@@ -68,6 +68,15 @@ pub enum FinishAttemptError {
     /// The neutral Kernel transition could not establish an outcome.
     #[error("finish Kernel transition failed: {0}")]
     Kernel(#[from] KernelPortError),
+    /// The contract owner's acceptance denominator could not be rehydrated or
+    /// joined with the plan's declared set.
+    ///
+    /// This is a refusal, not a degradation: there is no path here that keeps
+    /// the plan's own enumeration when the owner set is absent, stale, or
+    /// different, because adopting the plan's list is the exact defect the
+    /// owner read exists to close.
+    #[error("finish acceptance denominator refused: {0}")]
+    AcceptanceDenominator(#[from] AcceptanceDenominatorError),
     /// The canonical receipt was not a committed finish mutation.
     #[error("finish mutation was not committed: {0}")]
     Store(String),
@@ -338,30 +347,32 @@ fn prepare_receipt_readback(
 }
 
 impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
-    /// Rehydrates the contract's acceptance identity from the task-selection owner
+    /// Rehydrates the task-and-plan-bound observation receipts this finish
+    /// attempt depends on, at the exact `task.revision` and fence
     /// (issue #325 P1, I7.9).
     ///
-    /// The digest is read off the same-fence, task-and-plan-bound observation
-    /// receipts this path already required, at the exact `task.revision`. That
-    /// owner is different from the canonical plan's own binding, which is what
-    /// makes the digest an authority over the contract's obligation set rather
-    /// than an echo of the plan's list: the plan's declared items are admissible
-    /// as the contract's items only while the owner's digest admits them.
+    /// This walks the same-fence, task-and-plan-bound receipts the path already
+    /// required and contributes each accepted receipt's record id to
+    /// `observation_refs`, so the rehydration and the observation join cannot
+    /// drift apart. Task-bound receipts that disagree about the recorded task
+    /// selection identity are ambiguous owner state, not a majority vote, so
+    /// this fails closed rather than picking one.
     ///
-    /// Every accepted, task-and-plan-bound receipt also contributes its record id
-    /// to `observation_refs`, so the rehydration and the observation join cannot
-    /// drift apart. Task-bound receipts that disagree about the acceptance
-    /// identity are ambiguous owner state, not a majority vote, so this fails
-    /// closed rather than picking one.
-    fn rehydrate_contract_acceptance_digest(
+    /// The acceptance identity carried on those receipts is NOT the finish
+    /// denominator. It is a caller-stated selection receipt field
+    /// (`eliot-workscope` fills it with `sha256_hex` over the task goal on the
+    /// exploratory branch), and an owner enumeration is now rehydrated through
+    /// [`Self::rehydrate_task_contract_acceptance`] instead. This walk therefore
+    /// no longer returns a digest; it only joins the receipts.
+    fn rehydrate_task_bound_observation_refs(
         &self,
         task_id: &TaskId,
         task: &TaskRecord,
         plan: &CanonicalPlanBinding,
         fence: &StateFence,
         observation_refs: &mut BTreeSet<String>,
-    ) -> Result<String, FinishAttemptError> {
-        let mut contract_acceptance_digest: Option<String> = None;
+    ) -> Result<(), FinishAttemptError> {
+        let mut selection_identity: Option<String> = None;
         for entry in self.observation.snapshot() {
             let receipt = match &entry.result {
                 ObservationAdmissionResult::Accepted { receipt }
@@ -381,7 +392,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                     "accepted task observation receipt is invalid: {error}"
                 )))
             })?;
-            if contract_acceptance_digest
+            if selection_identity
                 .as_ref()
                 .is_some_and(|seen| *seen != selection.acceptance_digest)
             {
@@ -390,15 +401,16 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                         .to_owned(),
                 )));
             }
-            contract_acceptance_digest = Some(selection.acceptance_digest.clone());
+            selection_identity = Some(selection.acceptance_digest.clone());
             observation_refs.insert(receipt.record_id.clone());
         }
-        contract_acceptance_digest.ok_or_else(|| {
-            FinishAttemptError::Composition(CompositionError::Recovery(
+        if selection_identity.is_none() {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
                 "canonical finish evidence has no accepted task-and-plan-bound observation"
                     .to_owned(),
-            ))
-        })
+            )));
+        }
+        Ok(())
     }
 
     /// Reads the canonical owner fact that is the ONLY source of verifier
@@ -512,6 +524,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         fence: &StateFence,
         plan: &CanonicalPlanBinding,
+        contract_acceptance_set: &TaskContractAcceptanceSet,
     ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
         let (frame_refs, finish_authority_ref) =
             self.scan_task_frame_and_authority(task_id, task, fence);
@@ -540,14 +553,12 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let coordination = self.read_current_finish_projection(task_id, fence)?;
 
         let mut observation_refs = BTreeSet::new();
-        // Issue #325 P1, I7.9: the acceptance-set commitment is rehydrated from
-        // the task-selection evidence the contract owner admitted for this exact
-        // task revision — a different owner than the canonical plan. It is the
-        // only thing that makes the plan's declared item set the contract's
-        // obligation set rather than the plan's own list, so a plan that names
-        // fewer obligations than the set the owner committed to is refused below
-        // instead of shrinking the denominator the gate is computed over.
-        let contract_acceptance_digest = self.rehydrate_contract_acceptance_digest(
+        // The task-and-plan-bound observation receipts are joined here so their
+        // record ids enter the artifact evidence. They are not the acceptance
+        // denominator: their recorded selection identity is caller-stated at
+        // intake, so the denominator is rehydrated from the contract owner
+        // instead.
+        self.rehydrate_task_bound_observation_refs(
             task_id,
             task,
             plan,
@@ -559,30 +570,24 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical plan has no verifier binding".to_owned(),
             ))
         })?;
-        // The enumeration travels from the plan because that is where it is
-        // written, but it is not trusted for being a plan's own list: the gate
-        // below recomputes the acceptance-set commitment from these exact ids and
-        // refuses unless it reproduces the digest rehydrated above. A narrowed
-        // list therefore cannot ride under a digest issued for a larger set.
-        //
-        // RESIDUAL OWNER GAP (unreachable from this crate, not a caller
-        // assertion to be worked around): the enumerated `TaskContract`
-        // acceptance items are owned by `eliot-store`'s `CanonicalStore`
-        // (`task_contract_by_id` -> `TaskContract.acceptance_items`). This crate
-        // declares `eliot-store-api` but not `eliot-store`, so the chain
-        // terminates at the task-selection owner's commitment rather than at the
-        // contract owner's enumeration. The digest that arrives here is
-        // format-checked by `eliot-observation` and is caller-stated at intake
-        // (or `sha256_hex` over the task goal in the exploratory branch of
-        // `eliot-workscope`), so the owner-side derivation from
-        // `acceptance_items` needs the store edge and is left named rather than
-        // faked with a fence or a proof argument.
-        let contract_acceptance = CanonicalContractAcceptance {
-            task_id: task_id.as_str().to_owned(),
-            task_revision: task.revision,
-            acceptance_digest: contract_acceptance_digest,
-            item_ids: verifier_plan.required_acceptance_item_ids.clone(),
-        };
+        // Issue #1741, I7.9: the denominator is the CONTRACT OWNER's
+        // enumeration, rehydrated at this exact task id and task revision through
+        // the neutral `GetTaskContractAcceptanceSet` named read
+        // ([`Self::rehydrate_task_contract_acceptance`]). The plan's declared
+        // `required_acceptance_item_ids` are compared against it item by item
+        // and are never adopted: a plan that declares a strict subset would
+        // otherwise report a smaller denominator as complete coverage, and a plan
+        // that declares a strict superset would make the gate carry an
+        // obligation the contract never required. The retained acceptance
+        // identity is the owner's own recorded value, and the existing
+        // `CanonicalContractAcceptance::validate` proves it commits to the
+        // enumeration retained beside it.
+        let contract_acceptance = AcceptanceDenominatorError::bind(
+            task_id.as_str(),
+            task.revision,
+            contract_acceptance_set,
+            verifier_plan,
+        )?;
 
         let acceptance = acceptance_coverage_from_verifier_fact(
             &contract_acceptance.denominator(),
@@ -693,6 +698,58 @@ fn task_closure_authority_ref(
 }
 
 impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
+    /// Rehydrates the contract owner's exact `TaskContract` acceptance-item
+    /// enumeration for one finish candidate (issue #1741, I7.9).
+    ///
+    /// I7.9 requires the Finish service to rehydrate the current `TaskContract`
+    /// and its acceptance items. The canonical plan enumerates the obligations a
+    /// plan *declares*, and the task-selection evidence carries an acceptance
+    /// identity that is caller-stated at intake (or `sha256_hex` over the task
+    /// goal on the exploratory branch of `eliot-workscope`), so neither can be
+    /// the contract owner's enumeration. This is the only route that can.
+    ///
+    /// The read travels over the existing neutral Kernel named-read route
+    /// through the existing [`KernelTransitionPort`] async port. No runtime is
+    /// started inside the owner, no second port scheme is introduced, and the
+    /// read is bounded to one round trip; the write legs of the finish path
+    /// still run with no composition borrow held, as before.
+    ///
+    /// Fails closed with a typed [`AcceptanceDenominatorError`] when the live
+    /// canonical fence does not carry this exact task revision, when the port
+    /// route is not admitted, or when the returned set is bound to another task,
+    /// revision, or fence. There is no fallback to the plan's declared list.
+    pub async fn rehydrate_task_contract_acceptance(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+    ) -> Result<TaskContractAcceptanceSet, FinishAttemptError> {
+        let fence = self.canonical.state_fence().clone();
+        if fence
+            .task_revision
+            .as_ref()
+            .map(|revision| revision.value())
+            != Some(task_revision)
+        {
+            return Err(AcceptanceDenominatorError::TaskRevisionStale.into());
+        }
+        let set = self
+            .kernel
+            .task_contract_acceptance_set(task_id, task_revision, &fence)
+            .await?;
+        if set.task_id.as_str() != task_id.as_str() {
+            return Err(AcceptanceDenominatorError::TaskSubstituted.into());
+        }
+        if set.task_revision != task_revision {
+            return Err(AcceptanceDenominatorError::TaskRevisionStale.into());
+        }
+        if set.read_state_fence != fence {
+            return Err(AcceptanceDenominatorError::FenceStale.into());
+        }
+        set.validate()
+            .map_err(|error| AcceptanceDenominatorError::Malformed(error.to_string()))?;
+        Ok(set)
+    }
+
     /// Rehydrates and publishes the verifier-execution owner from the
     /// current durable TestD row. `job_id` is the only TestD input crossing
     /// this boundary: the row, receipt, run, canonical task, current plan,
@@ -1006,6 +1063,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
+        contract_acceptance_set: &TaskContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         validate_identity(identity)?;
         draft.validate().map_err(FinishError::from)?;
@@ -1048,7 +1106,8 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical task does not match the current canonical plan".to_owned(),
             )));
         }
-        let produced = self.produce_finish_evidence(&task_id, task, &fence, &plan)?;
+        let produced =
+            self.produce_finish_evidence(&task_id, task, &fence, &plan, contract_acceptance_set)?;
         if self
             .canonical
             .read_finish_evidence(&fence)
