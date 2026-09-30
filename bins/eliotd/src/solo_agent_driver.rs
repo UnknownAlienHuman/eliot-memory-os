@@ -1374,7 +1374,7 @@ async fn drive_admitted_material_async(
         .map_err(DaemonError::ProviderAdmission)?;
     guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
     check_verified_binds_intake(&intake, &material)?;
-    let prepared = material.clone();
+    let prepared = Box::new(material.clone());
     let operation_id = material.operation_id.clone();
     let attempt_id = AttemptId::new(material.attempt_id.clone())
         .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
