@@ -1387,10 +1387,13 @@ impl OriginChallengeAuthority {
                 reason: "effect is unproven; reconcile instead of replaying",
             });
         }
-        entry.effect_receipt.clone().ok_or(ContractError::InvalidValue {
-            field: "origin_grant_effect",
-            reason: "an effected entry must preserve its original kill receipt",
-        })
+        entry
+            .effect_receipt
+            .clone()
+            .ok_or(ContractError::InvalidValue {
+                field: "origin_grant_effect",
+                reason: "an effected entry must preserve its original kill receipt",
+            })
     }
 
     /// Reads the original admitted target/operation for one decided challenge
