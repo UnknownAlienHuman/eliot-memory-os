@@ -85,17 +85,16 @@ use eliot_contracts::{
     sha256_hex,
 };
 use eliot_evaluation_contracts::{
-    ComparisonBasis, EvaluatorScopeUncertaintyInvalidation, HUMAN_ATTENTION_EVALUATION_CONTRACT_VERSION,
-    HumanAttentionApprovalEvidence, HumanAttentionAssemblyInput, HumanAttentionClaim,
-    HumanAttentionDenominatorFraming, HumanAttentionEvaluation,
-    HumanAttentionEvaluationRevisionRef, HumanAttentionEvidenceGap,
-    HumanAttentionHumanReportEvidence, HumanAttentionInterruptionEvidence, HumanAttentionInvalidation,
-    HumanAttentionMethod,
-    HumanAttentionMetricGroup, HumanAttentionMetricValue, HumanAttentionNotificationEvidence,
-    HumanAttentionObservationWindow, HumanAttentionPrivacyEvidence, HumanAttentionProfileEvidence,
+    ComparisonBasis, EvaluatorScopeUncertaintyInvalidation,
+    HUMAN_ATTENTION_EVALUATION_CONTRACT_VERSION, HumanAttentionApprovalEvidence,
+    HumanAttentionAssemblyInput, HumanAttentionClaim, HumanAttentionDenominatorFraming,
+    HumanAttentionEvaluation, HumanAttentionEvaluationRevisionRef, HumanAttentionEvidenceGap,
+    HumanAttentionHumanReportEvidence, HumanAttentionInterruptionEvidence,
+    HumanAttentionInvalidation, HumanAttentionMethod, HumanAttentionMetricGroup,
+    HumanAttentionMetricValue, HumanAttentionNotificationEvidence, HumanAttentionObservationWindow,
+    HumanAttentionPrivacyEvidence, HumanAttentionProfileEvidence,
     HumanAttentionRiskOutcomeEvidence, HumanAttentionTaskOutcomeEvidence,
-    HumanAttentionTaskVerifierEvidence, ProfileRevisionRef,
-    assemble_human_attention_evidence,
+    HumanAttentionTaskVerifierEvidence, ProfileRevisionRef, assemble_human_attention_evidence,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
