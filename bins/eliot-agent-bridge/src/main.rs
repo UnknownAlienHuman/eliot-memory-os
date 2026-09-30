@@ -280,6 +280,30 @@ enum Request {
     Stop,
 }
 
+/// Explicit I14.4/I14.5 conformance position for a bridge-local refusal.
+///
+/// Issue #1679 A9/W7: [`Response::Backpressure`] and
+/// [`Response::TransportBackpressure`] carry only the bridge-local pressure
+/// the event/transport owner typed for this operation — a dimension, a
+/// recovery route, and a local phase — with no I14 disposition, no operation
+/// identity, no profile revision, no state fence, and no authority epoch.
+/// Naming a disposition or a directive here would fabricate capacity evidence
+/// this projection never observed, and the bridge transport-event
+/// `RecoveryDirective` is a different instruction that must never substitute
+/// for the I14 admission directive. This marker makes the honestly-local
+/// position machine-readable on the wire instead of comment-only: its single
+/// value states that no I14.4/I14.5 conformance is claimed. Threading a live
+/// owner `I14BackpressureResponseV1` (validated by its own `validate`) needs
+/// the reserve owner's call site plus its crate boundary, which the sibling
+/// owner waves hold — see the seam note in `bridge_error`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BackpressureI1445Conformance {
+    /// Bridge-local pressure only: no I14 disposition, no versioned I14
+    /// recovery directive, no I14.4/I14.5 conformance claimed.
+    NotClaimed,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Response {
@@ -386,20 +410,24 @@ enum Response {
     /// phase remain structured through the host response.
     ///
     /// Issue #1679: bridge-local pressure only — no I14 disposition and no
-    /// versioned recovery directive. This arm never claims I14.4/5
-    /// conformance as-is; the versioned directive is whole-or-null and null
-    /// at this projection (see `bridge_error`), with STITCH placement for a
-    /// later slice to thread the reserve owner's live measurement.
+    /// versioned recovery directive. `i14_4_5_conformance` carries the
+    /// explicit non-claim, so this arm never claims I14.4/5 conformance
+    /// as-is; the versioned directive stays whole-or-null and null at this
+    /// projection (see `bridge_error`), with STITCH placement for a later
+    /// slice to thread the reserve owner's live measurement.
     Backpressure {
         pressure: BridgeEventCapacityPressure,
+        i14_4_5_conformance: BackpressureI1445Conformance,
     },
     /// Typed transport refusal from the kernel; local durable phase is unknown.
     ///
     /// Issue #1679: same whole-or-null seam as [`Response::Backpressure`] —
     /// bridge-local pressure only, no I14 disposition, no versioned
-    /// directive, never an I14.4/5 conformance claim as-is.
+    /// directive; `i14_4_5_conformance` carries the explicit non-claim, never
+    /// an I14.4/5 conformance claim as-is.
     TransportBackpressure {
         pressure: BridgeTransportBackpressure,
+        i14_4_5_conformance: BackpressureI1445Conformance,
     },
     /// Typed acknowledgement of one live reactive admission.
     ///
@@ -2482,26 +2510,47 @@ fn bridge_error(error: &BridgeError) -> Response {
     // bottleneck observation or a revision here would fabricate capacity
     // evidence this projection never observed (cf. the owner-side
     // `control_reserve_rejection` builders, which refuse to emit unless the
-    // live partition actually reads saturated). The typed bridge pressure
-    // below is unchanged. A later slice threads the reserve owner's live
+    // live partition actually reads saturated). The carried pressure is
+    // re-validated with its existing owner check (`is_consistent`); a report
+    // that fails it becomes a typed error rather than an unvalidated
+    // refusal. The honest answer keeps the validated pressure with the
+    // explicit I14.4/5 non-claim marker rather than a partial directive. A
+    // later cross-crate slice threads the reserve owner's live
     // `I14BackpressureResponseV1` measurement into this response; until that
-    // owner call site exists the answer keeps this pressure with a null
-    // versioned directive rather than a partial one.
+    // owner call site exists there is nothing further to bind here.
     } else if let BridgeError::Backpressure(pressure) = error {
-        Response::Backpressure {
-            pressure: *pressure,
+        if !pressure.is_consistent() {
+            Response::Error {
+                code: "BRIDGE_EVENT_BACKPRESSURE_INCONSISTENT",
+                detail: "bridge-event capacity pressure failed its closed dimension/recovery consistency check; no refusal is emitted from an unvalidated report".to_owned(),
+            }
+        } else {
+            Response::Backpressure {
+                pressure: *pressure,
+                i14_4_5_conformance: BackpressureI1445Conformance::NotClaimed,
+            }
         }
     // Issue #1679 bridge backpressure (caller STITCH): same whole-or-null
     // seam as the event-capacity arm above. The transport refusal carries no
     // owner-measured observation at this projection — no disposition, no
     // operation identity, no profile revision, no state fence — so the
     // versioned directive is honestly null here rather than a fabricated
-    // transport record. Placement is this same response, fed later by the
-    // reserve owner's live measurement; the typed bridge pressure below is
-    // unchanged.
+    // transport record, and the carried pressure is re-validated with its
+    // existing owner check (`is_consistent`) with the same typed-error
+    // refusal on failure. Placement is this same response, fed later by the
+    // reserve owner's live measurement; the typed bridge pressure plus the
+    // explicit I14.4/5 non-claim marker below is unchanged.
     } else if let BridgeError::TransportBackpressure(pressure) = error {
-        Response::TransportBackpressure {
-            pressure: *pressure,
+        if !pressure.is_consistent() {
+            Response::Error {
+                code: "BRIDGE_TRANSPORT_BACKPRESSURE_INCONSISTENT",
+                detail: "bridge transport backpressure failed its closed dimension/recovery consistency check; no refusal is emitted from an unvalidated report".to_owned(),
+            }
+        } else {
+            Response::TransportBackpressure {
+                pressure: *pressure,
+                i14_4_5_conformance: BackpressureI1445Conformance::NotClaimed,
+            }
         }
     } else if let BridgeError::ActivationDenied(report) = error {
         Response::ActivationDenied {
