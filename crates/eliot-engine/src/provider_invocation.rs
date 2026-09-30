@@ -14,6 +14,12 @@ use time::{Duration, OffsetDateTime};
 use crate::EngineError;
 use crate::antigravity::ProviderProcessOutcome;
 
+/// One exact provider byte capture at the external transport boundary.
+///
+/// `capture` owns the bytes it spooled: it writes exactly `bytes` to the spool
+/// file and computes `blob_ref` (algorithm, digest and size) over exactly those
+/// bytes. The `blob_ref` is therefore a content address *for these bytes*, not a
+/// label a caller may attach to something else.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderOutputCapture {
     pub blob_ref: BlobRef,
@@ -21,6 +27,23 @@ pub struct ProviderOutputCapture {
     pub truncation_detected: bool,
     pub stream_closed_cleanly: bool,
     pub output_observed: bool,
+    /// The exact bytes that were observed at the external boundary, spooled and
+    /// digested. This is the only place original provider bytes exist before a
+    /// `Value` is built, so it is the only sound provenance for a lexically
+    /// validated external-review document.
+    pub captured_bytes: Vec<u8>,
+}
+
+impl ProviderOutputCapture {
+    /// Whether this capture's content address provably addresses
+    /// [`Self::captured_bytes`] — same algorithm, digest and exact size.
+    #[must_use]
+    pub fn addresses_exact_bytes(&self) -> bool {
+        self.blob_ref.algorithm == "blake3"
+            && self.blob_ref.digest_hex == blake3::hash(&self.captured_bytes).to_hex().to_string()
+            && self.blob_ref.size_bytes
+                == u64::try_from(self.captured_bytes.len()).unwrap_or(u64::MAX)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -536,6 +559,9 @@ impl ProviderOutputSpool {
             truncation_detected: false,
             stream_closed_cleanly: true,
             output_observed: !bytes.is_empty(),
+            // `blob_ref` was computed above over exactly these bytes, so the
+            // handle and the bytes are bound by construction at this boundary.
+            captured_bytes: bytes,
         })
     }
 }

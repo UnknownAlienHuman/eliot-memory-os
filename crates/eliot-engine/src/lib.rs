@@ -154,10 +154,10 @@ pub use external_agent::{
 pub use external_review::{
     ExternalProviderRegistryReport, ExternalProviderRegistryService, ExternalReviewBridgeReport,
     ExternalReviewBridgeService, ExternalReviewDoctorStatus, ExternalReviewDocumentOrigin,
-    ExternalReviewGate, ExternalReviewGateContext, ExternalReviewJobService,
-    ExternalReviewNormalizationOutcome, ExternalReviewNormalizer, ExternalReviewPacketBuilder,
-    ExternalReviewReportService, ExternalReviewTaintPolicy, ValidatedExternalReviewDocument,
-    external_review_request,
+    ExternalReviewEvidenceStanding, ExternalReviewGate, ExternalReviewGateContext,
+    ExternalReviewJobService, ExternalReviewNormalizationOutcome, ExternalReviewNormalizer,
+    ExternalReviewPacketBuilder, ExternalReviewReportService, ExternalReviewTaintPolicy,
+    ValidatedExternalReviewDocument, decode_external_provider_json, external_review_request,
 };
 pub use host::{
     AgentResultAdmission, AuthorityCleanupReport, DERIVED_SKILL_PACKAGES, ELIOT_SKILL_NAMES,

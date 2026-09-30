@@ -2691,7 +2691,18 @@ impl AntigravityRunner {
             && governed_log_capture_complete(log_capture.as_ref().ok());
         let normalized = match &provider_response {
             Ok(response) if exit_success && base_capture_complete => {
-                AntigravityTextOutputNormalizer.normalize_text(request, response)
+                // #2989 raw external ingress: when the provider's own transport
+                // bytes are an external-review candidate document, normalize
+                // exactly those captured bytes through the duplicate-rejecting
+                // gate, bound to the content-addressed handle that addresses
+                // them. Any other provider output keeps the explicit, honestly
+                // unqualified text-derived contour below.
+                if provider_emitted_review_document(&stdout_capture) {
+                    AntigravityTextOutputNormalizer
+                        .normalize_provider_document(request, &stdout_capture)
+                } else {
+                    AntigravityTextOutputNormalizer.normalize_text(request, response)
+                }
             }
             Ok(_) => match model_observation.as_ref() {
                 Err(error) => {
@@ -2947,6 +2958,73 @@ impl AntigravityRunner {
 }
 
 impl AntigravityTextOutputNormalizer {
+    /// Normalize a live provider document through the raw external byte ingress.
+    ///
+    /// This is the production path that satisfies #2989 on an actual external
+    /// adapter: `capture` holds the exact provider transport bytes observed at
+    /// the boundary together with the content-addressed handle that addresses
+    /// them. When the provider emitted its own external-review candidate JSON,
+    /// those exact bytes cross the duplicate-rejecting decoder once, and the
+    /// same document — bound to those bytes and to the handle that addresses
+    /// them — reaches `ExternalReviewNormalizer`. A duplicate member at any
+    /// depth, a malformed/oversized document, or a handle that does not address
+    /// the captured bytes is rejected before any candidate result exists, and no
+    /// partial trusted result is produced.
+    ///
+    /// A provider that emitted no external-review document falls back to the
+    /// explicit text-derived contour of [`Self::normalize_text`], which is and
+    /// remains `internal_constructed`/unqualified.
+    pub fn normalize_provider_document(
+        &self,
+        request: &AntigravityReviewRequest,
+        capture: &crate::provider_invocation::ProviderOutputCapture,
+    ) -> AntigravityNormalizedResult {
+        let external_request = external_request_from_antigravity(request);
+        let Ok(raw) = ValidatedExternalReviewDocument::from_provider_capture(capture) else {
+            return AntigravityTextOutputNormalizer.reject_output(
+                request,
+                "Antigravity provider raw document failed strict lexical validation",
+            );
+        };
+        // The job's retained handle is the capture's own handle, so the
+        // normalizer's byte comparison proves the result's raw evidence is the
+        // exact provider bytes it normalized.
+        let job = ExternalReviewJob {
+            job_id: new_id("external-review-job"),
+            request_id: external_request.request_id.clone(),
+            provider_id: external_request.provider_id.clone(),
+            status: ExternalReviewJobStatus::Succeeded,
+            adapter_request_id: None,
+            adapter_result_id: None,
+            result_id: None,
+            raw_output_blob_ref: Some(capture.blob_ref.clone()),
+            message: "Antigravity provider raw document strictly decoded and retained".to_owned(),
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: Some(OffsetDateTime::now_utc()),
+        };
+        let outcome = ExternalReviewNormalizer.normalize(&external_request, &job, &raw);
+        let rejected = outcome.result.is_none();
+        AntigravityNormalizedResult {
+            result_id: new_id("antigravity-result"),
+            request_id: request.request_id.clone(),
+            run_id: new_id("antigravity-normalization-run"),
+            candidate_only: true,
+            taint: TaintClass::ExternalAgent,
+            external_review_result: outcome.result,
+            rejected,
+            rejection_reasons: if rejected {
+                vec![format!(
+                    "external-review normalizer rejected Antigravity provider document as {:?}",
+                    outcome.receipt.status
+                )]
+            } else {
+                Vec::new()
+            },
+            write_receipt: None,
+            created_at: OffsetDateTime::now_utc(),
+        }
+    }
+
     pub fn reject_output(
         &self,
         request: &AntigravityReviewRequest,
@@ -4049,9 +4127,53 @@ fn output_text(stdout: &[u8], stderr: &[u8]) -> String {
     truncate_text(&text, DEFAULT_MAX_OUTPUT_BYTES)
 }
 
+/// Whether the provider's captured transport bytes are an external-review
+/// candidate document rather than a plain-text response envelope.
+///
+/// The decision is made on the raw captured bytes, never on a re-serialized
+/// value, so the document that will later be strictly decoded is the one this
+/// routing chose. A provider whose bytes are not an external-review document
+/// keeps the text-derived contour.
+fn provider_emitted_review_document(
+    capture: &crate::provider_invocation::ProviderOutputCapture,
+) -> bool {
+    let Ok(envelope) = crate::external_review::decode_external_provider_json(
+        capture.captured_bytes.as_slice(),
+        "antigravity provider envelope",
+    ) else {
+        return false;
+    };
+    let Some(response) = envelope
+        .get("response")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    crate::external_review::decode_external_provider_json(
+        response.as_bytes(),
+        "antigravity provider review document",
+    )
+    .is_ok_and(|review| review.get("findings").is_some())
+}
+
+/// Decode the live Antigravity provider's raw stdout envelope.
+///
+/// This is the real external raw-byte ingress: `stdout` is the exact provider
+/// transport output observed at the boundary. `serde_json::from_str` would build
+/// a `serde_json::Map` (`BTreeMap`) and collapse any duplicate object member
+/// last-wins before any later check could observe it, so the raw bytes cross the
+/// shared duplicate-rejecting decoder (`eliot_types::strict_json_value`, owned by
+/// #2985) exactly once first. A duplicate member at any depth, malformed or
+/// trailing input, or a document above the external-review byte ceiling is one
+/// bounded rejection; no provider byte, offset or member value is echoed.
 fn agy_single_turn_response(stdout: &str) -> Result<String, String> {
-    let envelope: Value = serde_json::from_str(stdout.trim())
-        .map_err(|error| format!("Antigravity JSON output is invalid: {error}"))?;
+    let envelope = crate::external_review::decode_external_provider_json(
+        stdout.as_bytes(),
+        "antigravity single turn envelope",
+    )
+    .map_err(|error| error.to_string())?;
     if envelope.get("status").and_then(Value::as_str) != Some("SUCCESS") {
         return Err("Antigravity JSON output did not report SUCCESS".to_owned());
     }
@@ -4885,6 +5007,7 @@ mod security_tests {
             truncation_detected: false,
             stream_closed_cleanly: true,
             output_observed: false,
+            captured_bytes: Vec::new(),
         };
         assert!(!governed_log_capture_complete(Some(&empty)));
         assert!(!governed_log_capture_complete(None));
