@@ -670,13 +670,12 @@ fn notify_owner_capacity_row(
     };
     let normal_limit = limit("notify_reserve.normal_limit", normal_capacity)?;
     let protected_limit = limit("notify_reserve.protected_limit", protected_capacity)?;
-    let physical_total =
-        normal_capacity
-            .checked_add(protected_capacity)
-            .ok_or(NotifyReserveError::InvalidField {
-                field: "notify_reserve.physical_total_limit",
-                reason: "disjoint partition capacities overflow the physical total",
-            })?;
+    let physical_total = normal_capacity.checked_add(protected_capacity).ok_or(
+        NotifyReserveError::InvalidField {
+            field: "notify_reserve.physical_total_limit",
+            reason: "disjoint partition capacities overflow the physical total",
+        },
+    )?;
     let physical_total_limit =
         NonZeroU64::new(physical_total).ok_or(NotifyReserveError::InvalidField {
             field: "notify_reserve.physical_total_limit",
