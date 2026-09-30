@@ -93,6 +93,26 @@ pub struct CommittedCoordinationResult {
     pub result: Option<AgentResultReceipt>,
 }
 
+/// The observed event context for one coordination lifecycle registration.
+///
+/// `CoordinationOwner::register_work` takes this metadata alongside the item
+/// itself, and the commit entry that drives it would otherwise carry eight
+/// parameters for one mutation. Grouping the three observation fields into one
+/// value keeps the commit entry inside the crate's arity bound without dropping
+/// or defaulting anything: every field is still required, still reaches the
+/// owner unchanged, and the owner still writes them into the event exactly as
+/// it did before.
+#[derive(Clone, Debug)]
+pub struct CoordinationEventContext {
+    /// Retry identity for this exact registration, used by the owner as the
+    /// event request id.
+    pub request_id: String,
+    /// Actor the owner records as the registrant of this event.
+    pub actor_id: String,
+    /// Clock reading the owner records for this event.
+    pub observed_at: ClockReading,
+}
+
 /// Assembles the closed `RecordCoordinationOwner` parameter map for one image.
 ///
 /// `expected_coordination_revision` is the outer owner revision the store must
@@ -253,12 +273,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         operation_id: OperationId,
         expected_coordination_revision: u64,
         item: WorkItem,
-        request_id: &str,
-        actor_id: &str,
-        observed_at: ClockReading,
+        context: CoordinationEventContext,
     ) -> Result<CommittedCoordinationResult, CoordinationCommitError> {
         let mut image = self.owners().coordination.clone();
-        image.register_work(item, request_id, actor_id, observed_at)?;
+        image.register_work(
+            item,
+            &context.request_id,
+            &context.actor_id,
+            context.observed_at,
+        )?;
         self.publish_coordination_image(
             identity,
             operation_id,
