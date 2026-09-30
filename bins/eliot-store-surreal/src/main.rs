@@ -482,6 +482,8 @@ fn bind_observed_identity_inner(
 async fn serve_handshake_loop(
     composition: &StoreComposition,
     config: &eliot_store_surreal::StoreLaunchConfig,
+    readiness: &eliot_store_surreal::ReadinessReceipt,
+    writer_compatibility: &CompatibilityVerdict,
 ) -> Result<(), String> {
     let limits = TransportLimits::default();
     let expectation = match eliot_platform_windows::NamedPipePeerExpectation::new(
@@ -563,7 +565,7 @@ async fn serve_handshake_loop(
         }),
     );
     let authenticated_peer = server.peer_identity().clone();
-    let (mut session, server_hello) = match admit_authenticated_handshake(
+    let (mut session, mut server_hello) = match admit_authenticated_handshake(
         hello_frame,
         limits,
         config,
@@ -591,6 +593,22 @@ async fn serve_handshake_loop(
             return Err(error);
         }
     };
+    if session.reserved_write_requested() {
+        let (kernel_generation, state_fence) =
+            session.authenticated_kernel_generation_and_fence()?;
+        if composition.install_reserved_write_generation(
+            readiness,
+            writer_compatibility,
+            kernel_generation,
+            state_fence,
+        )? {
+            session.enable_reserved_write_capability();
+            server_hello
+                .allowed_capabilities
+                .push(eliot_store_api::CAPABILITY_RESERVED_WRITE.to_owned());
+            server_hello.allowed_capabilities.sort();
+        }
+    }
     let mut negotiated_limits = limits;
     negotiated_limits.max_frame_bytes = session.max_frame_bytes();
     let handshake_frame = control_frame(
@@ -857,7 +875,7 @@ async fn run() -> Result<(), String> {
         gated.is_ok(),
     );
     gated?;
-    serve_handshake_loop(&composition, &config).await
+    serve_handshake_loop(&composition, &config, &readiness, &compatibility).await
 }
 
 #[cfg(not(windows))]

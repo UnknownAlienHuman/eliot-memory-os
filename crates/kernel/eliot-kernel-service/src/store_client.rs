@@ -18,7 +18,8 @@ use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerHello};
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
-    BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
+    BackupOperationReconciliation, CAPABILITIES, CAPABILITY_RESERVED_WRITE,
+    CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, IsolatedDestination,
     IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
@@ -226,6 +227,7 @@ pub struct EbpCanonicalStoreClient<T> {
     requirement: HostStoreBootstrapRequirement,
     protocol_version: ProtocolVersion,
     limits: TransportLimits,
+    reserved_write_capability: bool,
     request_counter: AtomicU64,
     /// One-shot production fault hook (issue #2030). The harness-gated
     /// `arm_fault` arms it, observation reads it, and the write paths consume
@@ -278,6 +280,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             transport: Arc::new(Mutex::new(transport)),
             requirement,
             protocol_version: server.selected_protocol,
+            reserved_write_capability: server
+                .allowed_capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_RESERVED_WRITE),
             limits,
             request_counter: AtomicU64::new(1),
             fault: AtomicU8::new(StoreClientFault::NONE),
@@ -724,6 +730,12 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         &self,
         request: ReservedWriteRequest,
     ) -> Result<WriteReceipt, StoreError> {
+        if !self.reserved_write_capability {
+            return Err(StoreError::InvalidField {
+                field: "store.reserved_write",
+                reason: "the authenticated Store generation did not negotiate reserved-write execution",
+            });
+        }
         request.validate()?;
         request.context.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&request.context.state_fence)?;
@@ -1326,6 +1338,7 @@ mod tests {
                     allowed_capabilities: CAPABILITIES
                         .iter()
                         .map(|value| (*value).to_owned())
+                        .chain(std::iter::once(CAPABILITY_RESERVED_WRITE.to_owned()))
                         .collect(),
                     allowed_effects: EFFECTS.iter().map(|value| (*value).to_owned()).collect(),
                     config_snapshot: json!({
@@ -2627,7 +2640,7 @@ fn client_hello(
             "store.apply".to_owned(),
             "store.validation_snapshot".to_owned(),
         ],
-        optional_capabilities: Vec::new(),
+        optional_capabilities: vec![CAPABILITY_RESERVED_WRITE.to_owned()],
         advisory_capabilities: Vec::new(),
         state_owner: "eliot-kernel".to_owned(),
         failure_domain: "canonical-store".to_owned(),
@@ -2680,6 +2693,7 @@ fn client_hello(
         capabilities: CAPABILITIES
             .iter()
             .map(|value| (*value).to_owned())
+            .chain(std::iter::once(CAPABILITY_RESERVED_WRITE.to_owned()))
             .collect(),
         privacy_classes: vec!["PUBLIC".to_owned()],
         max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
@@ -2706,7 +2720,8 @@ fn decode_server_hello(
         .config_snapshot
         .get("artifact_hash")
         .and_then(serde_json::Value::as_str);
-    let expected_capabilities: BTreeSet<&str> = CAPABILITIES.iter().copied().collect();
+    let mut expected_capabilities: BTreeSet<&str> = CAPABILITIES.iter().copied().collect();
+    expected_capabilities.insert(CAPABILITY_RESERVED_WRITE);
     let observed_capabilities: BTreeSet<&str> = server
         .allowed_capabilities
         .iter()
@@ -2715,13 +2730,19 @@ fn decode_server_hello(
     let expected_effects: BTreeSet<&str> = EFFECTS.iter().copied().collect();
     let observed_effects: BTreeSet<&str> =
         server.allowed_effects.iter().map(String::as_str).collect();
+    let expected_without_reserved: BTreeSet<&str> = expected_capabilities
+        .iter()
+        .copied()
+        .filter(|capability| *capability != CAPABILITY_RESERVED_WRITE)
+        .collect();
     if server.authority_epoch != requirement.authority_epoch().clone()
         || server.selected_protocol != ProtocolVersion::CURRENT
         || server.session_principal_binding != expected_session_principal_binding
         || server.rejection_reason.is_some()
         || artifact_hash != Some(requirement.approved_artifact_hash.as_str())
         || config_hash != Some(requirement.approved_config_hash.as_str())
-        || observed_capabilities != expected_capabilities
+        || (observed_capabilities != expected_capabilities
+            && observed_capabilities != expected_without_reserved)
         || observed_effects != expected_effects
     {
         return Err(StoreClientError::Contract(
