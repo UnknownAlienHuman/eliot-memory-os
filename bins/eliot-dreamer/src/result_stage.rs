@@ -141,6 +141,29 @@ mod slice_8_result_tests {
             candidate_id: format!("{job_id}-candidate-1"),
             kind: "review_required".to_owned(),
             source_handles: vec!["evidence-1".to_owned()],
+            // This Slice-8 fixture runs no admitted Curation route: no A-20
+            // screen, no A-31 handler, no owner digests. The I9.6 fields below
+            // state that absence honestly — what the candidate rests on, that
+            // no owner protection finding or routing hint was derived, the
+            // scope/handle it is proposed under, and the candidate-only
+            // no-mutation fact — rather than inventing evidence a fixture
+            // never produced.
+            support: "handle-only fixture: the candidate rests on source handle evidence-1; \
+                      no owner screen digest, request digest, or result digest exists because \
+                      no admitted Curation route ran."
+                .to_owned(),
+            counterevidence: "no owner protection finding and no routing rejection hint was \
+                              derived for evidence-1, so its protection state is unknown \
+                              rather than cleared."
+                .to_owned(),
+            scope_and_applicability: format!(
+                "applies to scope scope-slice-8 for job {job_id}; the proposed mutable target is \
+                 evidence-1; the state fence is this fixture's fence, not a Kernel-admitted fence."
+            ),
+            preservation_report: "no source mutation was performed: this candidate-only \
+                                  review_required proposal changes nothing; no owner protection \
+                                  finding was reported because no real screen ran."
+                .to_owned(),
             proposed_transformation: "Inspect provenance; do not alter the source.".to_owned(),
             uncertainty: "No semantic promotion from a handle-only bundle.".to_owned(),
             rollback: "Discard the candidate.".to_owned(),
