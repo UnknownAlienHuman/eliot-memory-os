@@ -2581,25 +2581,11 @@ pub fn backup_restore_test(
     envelope_command(&response, BACKUP_RESTORE_TEST_OPERATION)?;
     envelope_idempotency(&response, &request.request)?;
     let wire_status = envelope_status(&response)?;
-    // The route the execution actually admitted is read ONCE, here, before the
-    // reply is graded, and it is the grading input for the `blocked` band. It is
-    // read from the owner's own answer rather than reconstructed from the
-    // status, so the band this surface may claim is set by gates that provably
-    // ran and by gates the owner provably did not admit. A reply that does not
-    // carry the route at all yields `None`, which only the `blocked` arm accepts,
-    // so a richer status can never borrow another status's route to justify a
-    // ceiling.
-    let route_parts = if wire_status == BACKUP_STATE_BLOCKED {
-        Some(envelope_executed_route(&response)?)
-    } else {
-        None
-    };
-    let executed_route = route_parts
-        .as_ref()
-        .map(|(passed, not_admitted)| ExecutedRoute {
-            passed: passed.as_slice(),
-            not_admitted: not_admitted.as_slice(),
-        });
+    let route = admitted_executed_route(&response, wire_status)?;
+    let executed_route = route.as_ref().map(|route| ExecutedRoute {
+        passed: route.passed.as_slice(),
+        not_admitted: route.not_admitted.as_slice(),
+    });
     // The owner's own receipt is decoded BEFORE the reply is graded, so the
     // grade is placed by the rung the owner declared rather than by the status
     // token beside it. An answer that carries no receipt declares no rung, and
@@ -2609,17 +2595,7 @@ pub fn backup_restore_test(
     // owner answer below is projected on the strength of a status this surface
     // has not first related to the catalogue row read above.
     let claim = restore_test_claim(wire_status, executed_route.as_ref(), receipt.as_ref())?;
-    // A successful exit is not by itself this operation's own answer state, so the
-    // `ok` state is decided by what the owner actually returned rather than by
-    // the token: a rehearsal that carried its own restore receipt has a graded,
-    // owner-declared outcome, while an `ok` with no receipt proved only the exit
-    // and stays the unknown state. Both keep the reconciled operation identity
-    // unchanged.
-    let state = match wire_status {
-        BACKUP_WIRE_OK if receipt.is_some() => BACKUP_STATE_CANDIDATE,
-        BACKUP_WIRE_OK => BACKUP_STATE_UNKNOWN,
-        other => other,
-    };
+    let state = restore_test_state(wire_status, receipt.is_some());
     let mut outcome = BackupOperationOutcome {
         operation: BACKUP_RESTORE_TEST_OPERATION.to_owned(),
         state: state.to_owned(),
@@ -2774,6 +2750,60 @@ pub fn backup_restore_test(
     respond(request, CommandId::BackupRestoreTest, &outcome)
 }
 
+/// Decides the answer STATE this operation reports for one graded reply.
+///
+/// Every status other than `ok` is its own state, so it is reported verbatim. A
+/// successful transport/exit is not by itself this operation's answer state, so
+/// the `ok` state is decided by what the owner actually returned rather than by
+/// the token: a rehearsal that carried its own restore receipt has a graded,
+/// owner-declared outcome, while an `ok` with no receipt proved only the exit and
+/// stays the unknown state. Both keep the reconciled operation identity
+/// unchanged, so this decision changes what the operator is told and never which
+/// operation they are told to reconcile.
+fn restore_test_state(wire_status: &str, owner_returned_receipt: bool) -> &str {
+    match wire_status {
+        BACKUP_WIRE_OK if owner_returned_receipt => BACKUP_STATE_CANDIDATE,
+        BACKUP_WIRE_OK => BACKUP_STATE_UNKNOWN,
+        other => other,
+    }
+}
+
+/// Reads the route the owner actually admitted, for the one status whose band
+/// it grades.
+///
+/// The route is read ONCE, from the owner's own answer, rather than
+/// reconstructed from the status, so the band this surface may claim is set by
+/// gates that provably ran and by gates the owner provably did not admit. Only
+/// `blocked` reads it: every other status returns `None`, which only the
+/// `blocked` arm of [`restore_test_claim`] accepts, so a richer status can never
+/// borrow another status's route to justify a ceiling. A reply that carries no
+/// route at all yields `None` for `blocked` too, and that arm then refuses.
+///
+/// The gate lists are returned OWNED because they are decoded here and the
+/// [`ExecutedRoute`] view of them borrows this function's own result; the caller
+/// holds the tuple for as long as it grades and projects the claim.
+fn admitted_executed_route(
+    response: &Value,
+    wire_status: &str,
+) -> Result<Option<ExecutedRouteOwned>, BackupClientError> {
+    if wire_status != BACKUP_STATE_BLOCKED {
+        return Ok(None);
+    }
+    let (passed, not_admitted) = envelope_executed_route(response)?;
+    Ok(Some(ExecutedRouteOwned {
+        passed,
+        not_admitted,
+    }))
+}
+
+/// The owner's own decoded gate lists, before they are viewed as one route.
+struct ExecutedRouteOwned {
+    /// Gates the owner admits it ran.
+    passed: Vec<String>,
+    /// Gates the owner names it did not admit.
+    not_admitted: Vec<String>,
+}
+
 /// The owner's own restore receipt, decoded into the vocabularies that own it.
 ///
 /// The Kernel route projects the receipt the restore owner produced
@@ -2885,25 +2915,29 @@ fn rehearsal_band(level: VerifyClassCeiling) -> (BackupStage, ProofCeiling, Effe
             ProofCeiling::CandidateArtifact,
             EffectClass::Candidate,
         ),
-        // The isolated root imported with no active authority. That is a real
-        // lifecycle advance on this operation's own ladder and still not an
-        // operational-recovery claim, so it reads at the candidate artifact
-        // ceiling: A13.7 keeps activation and cutover out of reach here.
-        VerifyClassCeiling::IsolatedImportComplete => (
-            BackupStage::RestoreStepApplied,
-            ProofCeiling::CandidateArtifact,
-            EffectClass::Candidate,
-        ),
-        // Import is staged and external effects remain UNRESOLVED. The stage is
-        // the same advance as above — reconciliation is not complete, so the
-        // lifecycle has not reached `Reconciled` and this surface must not say
-        // it has — while the unresolved effects are exactly why the ceiling
-        // stops at the candidate band rather than rising.
-        VerifyClassCeiling::ReconciliationRequired => (
-            BackupStage::RestoreStepApplied,
-            ProofCeiling::CandidateArtifact,
-            EffectClass::Candidate,
-        ),
+        // The isolated root imported with no active authority
+        // (`IsolatedImportComplete`), and the same import with external effects
+        // still UNRESOLVED (`ReconciliationRequired`), place the claim at the
+        // SAME band, and the two rungs are therefore one arm rather than two
+        // named arms with identical bodies: the lifecycle advance is identical —
+        // a restore step was applied — and the lifecycle has not reached
+        // `Reconciled` under either rung, because reconciliation is exactly what
+        // the second rung says is still outstanding, so this surface must not say
+        // it has happened. The unresolved effects are why the ceiling stops at
+        // the candidate band rather than rising, and A13.7 keeps activation and
+        // cutover out of reach here under either rung.
+        //
+        // Naming them separately would assert a distinction this surface does not
+        // draw: the difference between the two rungs is a fact about the owner's
+        // reconciliation state, and the owner reports it in the receipt itself,
+        // not through the band this surface may claim.
+        VerifyClassCeiling::IsolatedImportComplete | VerifyClassCeiling::ReconciliationRequired => {
+            (
+                BackupStage::RestoreStepApplied,
+                ProofCeiling::CandidateArtifact,
+                EffectClass::Candidate,
+            )
+        }
         // The owner asserts bounded validation evidence for the isolated root.
         // A13.7 keeps that with the restore owner and no isolated rehearsal
         // holds it, so this rung is refused by
