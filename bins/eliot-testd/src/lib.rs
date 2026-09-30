@@ -31,7 +31,7 @@ use eliot_testd_core::{
     Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision, SourceObservationGitPort,
     TargetRoots, TestJob, TestdError, TestdSourceObservation, TestdStore,
     is_admitted_testd_profile, issue_process_admission, testd_profile_resource_limits,
-    validate_running_lease, verify_layout_binding,
+    validate_running_lease, verify_envelope_layout_binding, verify_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -493,7 +493,16 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     })?;
     validate_running_lease(&current, lease, now)?;
     current.target_roots.validate()?;
-    if let Some(layout) = current.target_layout.as_ref() {
+    if let (Some(layout), Some(envelope)) =
+        (current.target_layout.as_ref(), current.work_envelope.as_ref())
+    {
+        // Issue #1897 (AUD4): a job that carries the retained work envelope has
+        // exactly one root authority — the envelope's governed root — so the
+        // owner-issued layout is verified against the envelope instead of
+        // resolving a second root from its build-class level. A job admitted
+        // without a lane keeps the pre-lane layout check unchanged.
+        verify_envelope_layout_binding(&current.target_roots, layout, envelope)?;
+    } else if let Some(layout) = current.target_layout.as_ref() {
         verify_layout_binding(&current.target_roots, layout)?;
     }
     let (request, grant) = permit.into_parts();

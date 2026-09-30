@@ -101,7 +101,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ArtifactId, EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::ProcessBinding;
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
@@ -121,13 +121,14 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    BuildClass, JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
-    KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, ProcessAdmission, RetryPolicy,
-    TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION, TESTD_OWNER_SUBMIT_WIRE_VERSION,
-    TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots, TestdOwnerSubmitDirective,
-    TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding,
-    TestdVerifierJobSubmission, derive_layout_path, issue_process_admission, testd_profile_binding,
-    verification_receipt_sha256, verify_layout_binding,
+    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope,
+    JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
+    KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
+    RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
+    TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
+    TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
+    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
+    testd_profile_binding, verification_receipt_sha256, verify_envelope_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1409,23 +1410,11 @@ pub(crate) async fn submit_testd_owner_job(
             "Kernel TestD state directory is not canonical".to_owned(),
         ));
     }
-    let contour_root = state_dir.join("testd-execution");
-    std::fs::create_dir_all(&contour_root)
-        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    if std::fs::canonicalize(&contour_root).ok().as_deref() != Some(contour_root.as_path()) {
-        return Err(DispatchLaunchError::Gate(
-            "Kernel TestD execution contour is not canonical".to_owned(),
-        ));
-    }
-    // Issue #1806: resolve one owner-issued workspace/checkout/class layout
-    // before process admission. The admitted build root is today's contour
-    // from the installation mapping (a dedicated `%LOCALAPPDATA%\Eliot\build`
-    // mapping awaits the #1771 path-profile owner); workspace and checkout
-    // components derive deterministically from Governor-issued material, and
-    // the class comes from the admitted productive invocation kind. The same
-    // checkout and class always resolve to the same stable root — never a
-    // fresh directory per request — while distinct checkouts, including ones
-    // sharing a branch or commit, resolve apart.
+    // Issue #1897 (AUD1): resolve the lane's admitted identity BEFORE the
+    // layout. `workspace_component` comes from the Governor-issued project
+    // identity and `checkout_component` from the canonical, verified source
+    // root above, so the lane runs under the real admitted checkout — no Git
+    // worktree is created because a historical field is named `worktree_id`.
     let workspace_component =
         TargetLayoutBinding::derive_workspace_component(&request.submission.project_id)
             .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
@@ -1438,32 +1427,115 @@ pub(crate) async fn submit_testd_owner_job(
                 "productive TestD submission kind has no admitted build class".to_owned(),
             )
         })?;
+    // Issue #1897 (AUD1): the ACTUAL admitted local application-data root is
+    // resolved through the existing installation-mapping owner, not copied from
+    // the issue's literal `C:\Users\kleym` example. It is the root the
+    // governed build lanes live under, so it also becomes this job's external
+    // execution contour: the I2.22 target root must be a strict descendant of
+    // the granted contour, and the governed build root is the only contour
+    // that can hold it.
+    let local_app_data = eliot_platform_windows::current_user_local_app_data_root().map_err(
+        |error| DispatchLaunchError::Gate(format!("local application-data root: {error:?}")),
+    )?;
+    let governed_build_root = local_app_data.join("Eliot").join(BUILD_ROOT_DIRECTORY);
+    std::fs::create_dir_all(&governed_build_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if std::fs::canonicalize(&governed_build_root).ok().as_deref()
+        != Some(governed_build_root.as_path())
+    {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel governed build root is not canonical".to_owned(),
+        ));
+    }
+    let contour_root = governed_build_root.clone();
+    let lane_identity = admitted_lane_identity(
+        LaneIdentityInput {
+            work_item_id: job_id.clone(),
+            workspace_id: workspace_component.clone(),
+            worktree_id: checkout_component.clone(),
+            local_app_data,
+            source_root: source_root.clone(),
+            product: request.submission.invocation.request.product_id.as_str().to_owned(),
+            candidate: request.submission.invocation.request.source_id.as_str().to_owned(),
+            profile: request.submission.invocation.profile.clone(),
+            target: request.submission.invocation.target.clone(),
+            declared_scope: request.submission.invocation.declared_scope.clone(),
+            input_artifacts: request.submission.invocation.input_artifacts.clone(),
+            contract_revision: format!(
+                "task-revision-{}",
+                request
+                    .submission
+                    .invocation
+                    .request
+                    .state_fence
+                    .task_revision
+                    .as_ref()
+                    .map_or(0u64, |revision| revision.value())
+            ),
+            nextest_sha256: request.process_tool.observation.nextest_sha256.clone(),
+            cargo_sha256: request.process_tool.observation.cargo_sha256.clone(),
+            rustc_sha256: request.process_tool.observation.rustc_sha256.clone(),
+            toolchain: request
+                .process_tool
+                .observation
+                .selected_toolchain
+                .clone(),
+            build_class,
+        },
+    )?;
+    // Issue #1806 + #1897: the layout carries the admitted identity the lane
+    // was built from and the fingerprint digest that is now a real level of the
+    // governed root, but it no longer derives a competing root of its own: the
+    // envelope's `derive_target_root` is the one authority (I2.22 is the most
+    // specific governing document for the target-root shape) and
+    // `verify_envelope_layout_binding` proves the admitted roots are exactly it.
     let target_layout = TargetLayoutBinding::new(
         TARGET_LAYOUT_REVISION,
-        contour_root.to_string_lossy(),
+        governed_build_root.to_string_lossy(),
         workspace_component,
         checkout_component,
         build_class,
-        None,
+        Some(
+            lane_identity
+                .fingerprint
+                .digest()
+                .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?,
+        ),
     )
     .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    let layout_root = derive_layout_path(&target_layout)
+    // The envelope is allocated here only to resolve the lane's ONE governed
+    // root, from the same identity the submission carries and the same declared
+    // resource claims the submission carries. The store allocates and persists
+    // its own copy from that identity; the two agree because both run the same
+    // `derive_target_root` over the same admitted inputs.
+    let submission_metadata = JobSubmissionMetadata::verification();
+    let lane_envelope = GovernedWorkEnvelope::allocate(
+        lane_identity.clone(),
+        submission_metadata
+            .resource_profile
+            .exclusive_resources
+            .clone(),
+        Vec::new(),
+    )
+    .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let governed_root = lane_envelope
+        .derive_target_root()
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    std::fs::create_dir_all(&layout_root)
+    std::fs::create_dir_all(&governed_root)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    if std::fs::canonicalize(&layout_root).ok().as_deref() != Some(layout_root.as_path()) {
+    if std::fs::canonicalize(&governed_root).ok().as_deref() != Some(governed_root.as_path()) {
         return Err(DispatchLaunchError::Gate(
-            "Kernel TestD layout root is not canonical".to_owned(),
+            "Kernel TestD governed lane root is not canonical".to_owned(),
         ));
     }
     let target_roots = TargetRoots::new(
         contour_root.to_string_lossy().into_owned(),
         source_root.to_string_lossy().into_owned(),
-        layout_root.to_string_lossy().into_owned(),
-        layout_root.to_string_lossy().into_owned(),
+        governed_root.to_string_lossy().into_owned(),
+        governed_root.to_string_lossy().into_owned(),
     )
     .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    verify_layout_binding(&target_roots, &target_layout)
+    verify_envelope_layout_binding(&target_roots, &target_layout, &lane_envelope)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let environment = request
         .process_tool
@@ -1549,20 +1621,20 @@ pub(crate) async fn submit_testd_owner_job(
         invocation: request.submission.invocation.clone(),
         target_roots,
         target_layout: Some(target_layout),
-        // Issue #1897 (W1): no lane is allocated here. A lane identity
-        // needs the work item's BuildFingerprint, candidate, and contract
-        // revision, and no productive owner computes them for a testd
-        // submission today: the only fingerprint constructor is the dev
-        // CLI receipt check, and the work-item declaration that must
-        // carry them (issue #1902) has no productive driver. The Kernel
-        // does not invent them; the store allocates and persists the
-        // envelope for submissions whose lane producer exists.
-        lane: None,
+        // Issue #1897 (AUD1): the lane is now allocated from the admitted
+        // source, the Governor-issued candidate identity, and the resolved
+        // build profile, against the actual admitted local application-data
+        // root. The store allocates and persists the envelope from this
+        // identity before dispatch and attaches the allocator's leases at
+        // claim; the Kernel never invents a lane tuple beside it.
+        lane: Some(lane_identity),
         priority: 0,
         // This is the Kernel's productive verifier launch: the job class is
         // verification, so it is ordered ahead of every background lane and
-        // reserves capacity against them (I2.22).
-        metadata: JobSubmissionMetadata::verification(),
+        // reserves capacity against them (I2.22). It is the same declaration
+        // the lane envelope above was allocated from, so the persisted envelope
+        // and the job's resource profile cannot disagree.
+        metadata: submission_metadata,
     };
     submission
         .validate()
@@ -1593,6 +1665,136 @@ pub(crate) async fn submit_testd_owner_job(
         .validate()
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
     Ok(response)
+}
+
+/// Environment class the productive TestD profile runs under.
+///
+/// A declaration, not a measurement: the productive profile is the closed
+/// non-inheriting `cargo nextest run` binding
+/// ([`TESTD_PRODUCTIVE_PROFILE_ARGV`](eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ARGV)),
+/// so its build environment is the lane-local one
+/// ([`TestdProcessToolIntent::validate_for_roots`](eliot_testd_core::TestdProcessToolIntent))
+/// and never the caller's ambient environment. It is named here so the
+/// fingerprint records the class it actually ran in.
+const TESTD_PRODUCTIVE_ENVIRONMENT_CLASS: &str = "non-inheriting-productive-testd";
+
+/// Every admitted value the lane identity is built from.
+///
+/// Each field is either read from material the Kernel has already admitted and
+/// verified in this function (the canonical source root, the Governor-issued
+/// candidate identity, the registered profile, the owner-observed tool
+/// digests, the resolved build class) or is the profile's own declared
+/// constant. Nothing here is defaulted or filled in to make a fingerprint
+/// validate.
+#[derive(Clone, Debug)]
+struct LaneIdentityInput {
+    work_item_id: String,
+    workspace_id: String,
+    worktree_id: String,
+    local_app_data: PathBuf,
+    source_root: PathBuf,
+    product: String,
+    candidate: String,
+    profile: String,
+    target: String,
+    declared_scope: String,
+    input_artifacts: Vec<ArtifactId>,
+    contract_revision: String,
+    nextest_sha256: String,
+    cargo_sha256: String,
+    rustc_sha256: String,
+    toolchain: String,
+    build_class: BuildClass,
+}
+
+/// Builds the admitted lane identity for one productive TestD job.
+///
+/// Issue #1897 (AUD1): I2.22 requires every mutating work item to be allocated
+/// a worktree identity, a `BuildFingerprint`, a target/build mode, a fixture
+/// namespace, a runtime lease, resource claims, a contract revision, and a
+/// candidate identity. This is the one place the productive path supplies the
+/// inputs of that tuple, and every one of them is admitted material:
+///
+/// * the workspace identity derives from the Governor-issued project identity
+///   and the worktree identity from the canonical, verified source root, so the
+///   lane is the real admitted checkout and no Git worktree is created merely
+///   because a historical field is named `worktree_id`;
+/// * the candidate is the admitted `source_id` of the request the Governor
+///   bound the work to, and the contract revision is its admitted frozen task
+///   revision;
+/// * the toolchain, the three observed tool digests, the profile name, the
+///   target description, and the build class are the resolved build profile the
+///   process admission already proved;
+/// * `local_app_data` is the ACTUAL admitted local application-data root
+///   resolved through the installation-mapping owner, never a literal path.
+///
+/// The two digests are computed from real bytes: `manifest_digest` over the
+/// admitted workspace manifest, and `source_closure_digest` over the whole
+/// admitted input closure (product, candidate, canonical checkout, target
+/// description, declared scope, declared input artifacts, and the three
+/// owner-observed tool digests the process admission verified). A manifest that
+/// cannot be read is a typed refusal; it is never replaced by an invented
+/// digest.
+fn admitted_lane_identity(input: LaneIdentityInput) -> Result<LaneIdentity, DispatchLaunchError> {
+    let manifest = input.source_root.join("Cargo.toml");
+    let manifest_bytes = std::fs::read(&manifest)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let source_root_text = input.source_root.to_string_lossy().into_owned();
+    let input_artifacts = input
+        .input_artifacts
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let source_closure_digest = sha256_hex(
+        canonical_json_bytes(&(
+            input.product.as_str(),
+            input.candidate.as_str(),
+            source_root_text.as_str(),
+            input.target.as_str(),
+            input.declared_scope.as_str(),
+            input_artifacts.as_slice(),
+            input.nextest_sha256.as_str(),
+            input.cargo_sha256.as_str(),
+            input.rustc_sha256.as_str(),
+        ))
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?,
+    );
+    let fingerprint = BuildFingerprint {
+        workspace: input.workspace_id.clone(),
+        candidate: input.candidate.clone(),
+        toolchain: input.toolchain.clone(),
+        target: input.target.clone(),
+        profile: input.profile.clone(),
+        // The registered productive profile takes fixed argv and admits no
+        // caller features, so the empty set is the observed declaration.
+        features: Vec::new(),
+        environment_class: TESTD_PRODUCTIVE_ENVIRONMENT_CLASS.to_owned(),
+        source_closure_digest,
+        manifest_digest: sha256_hex(&manifest_bytes),
+        // The productive profile declares no build script or proc-macro
+        // closure; neither is invented here.
+        build_script_digest: None,
+        proc_macro_digest: None,
+        build_class: input.build_class.dir_name().to_owned(),
+        contract_revision: input.contract_revision.clone(),
+    };
+    fingerprint
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    // Issue #1897 (W3): the productive nextest binding is a batch verification
+    // run that reuses its lane-local target root across agents and worktrees
+    // under this exact fingerprint, with no incremental flag in its fixed
+    // argv. That is I2.22's shared non-incremental mode; the interactive mode
+    // belongs to a developer's own loop and the release mode to a locked
+    // release candidate.
+    Ok(LaneIdentity {
+        work_item_id: input.work_item_id,
+        workspace_id: input.workspace_id,
+        worktree_id: input.worktree_id,
+        fingerprint,
+        build_mode: BuildMode::SharedNonIncremental,
+        local_app_data: input.local_app_data,
+    })
 }
 
 struct KernelIssuedProcessProvider {

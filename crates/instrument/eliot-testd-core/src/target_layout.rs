@@ -41,10 +41,57 @@
 //! selection never globally cleans a target directory to repair identity,
 //! and a missing safe root is a typed refusal, never a repository
 //! `target/` fallback.
+//!
+//! Root authority for a governed lane (issue #1897).
+//!
+//! `TargetRoots::validate` owns the one cache/target relation —
+//! `cache_root == target_root` — and nothing here weakens or restates it. The
+//! process environment resolver
+//! ([`super::TestdProcessToolIntent::validate_for_roots`]) and the governed
+//! Cargo environment
+//! ([`GovernedWorkEnvelope::cargo_environment`]) both bind the same directory,
+//! so the relation is one relation on all three surfaces.
+//!
+//! Two root authorities exist, and they are NOT reconciled into one derivation
+//! today:
+//!
+//! * the pre-lane layout resolver [`derive_layout_path`], which resolves
+//!   `<build-root>/<workspace-id>/<checkout-id>/<build-class>[/<fingerprint>]`
+//!   from an owner-issued [`TargetLayoutBinding`]; and
+//! * the governed work envelope's `derive_target_root`, which resolves
+//!   `<local-app-data>/Eliot/build/<workspace-id>/<worktree-id>/<build-mode>/
+//!   <fingerprint>`.
+//!
+//! They are not the same path: `BuildClass::dir_name()` and
+//! `BuildMode::as_str()` are disjoint closed sets by design — the build class
+//! is the output-kind discriminator, the build mode is the cache policy — and
+//! the two bases are chosen by different owners. I2.22 is the most specific
+//! governing document for the target-root shape, so for a lane that carries a
+//! `GovernedWorkEnvelope` the envelope's `derive_target_root` is the ONE root
+//! authority. [`verify_envelope_layout_binding`] is therefore how an enveloped
+//! job is checked: the layout contributes the admitted build root and the
+//! workspace/checkout identity, the envelope contributes the whole governed
+//! root, and nothing is derived twice. [`verify_layout_binding`] remains the
+//! check for a row admitted before a lane existed; it never selects a root for
+//! an enveloped job.
+//!
+//! What this module does NOT decide, and leaves to the submitting owner: the
+//! admitted `build_root` of an enveloped layout must be the envelope's own
+//! build-root base (`<local-app-data>/Eliot\build`), because the governed root
+//! must also be a strict descendant of the execution contour
+//! ([`TargetRoots::validate`](super::TargetRoots::validate)) that the Kernel
+//! issues. The productive TestD launch resolves that contour to the governed
+//! build root for exactly this reason (the Kernel's productive TestD launch in
+//! `bins/eliot-kernel/src/dispatch_launch.rs`, which resolves the contour from
+//! `current_user_local_app_data_root`). A submission whose contour is elsewhere
+//! still resolves two different roots, and the containment check above refuses
+//! it rather than accepting it.
 
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use eliot_build_test_graph::GovernedWorkEnvelope;
 
 use super::{
     TargetRoots, TestdError, is_binding_digest, is_strict_descendant, validate_root_identity,
@@ -135,10 +182,12 @@ pub struct TargetLayoutBinding {
     pub workspace_id: String,
     /// Validated checkout (worktree) identity component.
     pub checkout_id: String,
-    /// Governed build class selecting the final path level.
+    /// Governed build class selecting the class path level.
     pub build_class: BuildClass,
     /// Exact `BuildFingerprint` digest the bound output must satisfy, when
-    /// the producer owns a fingerprint.
+    /// the producer owns a fingerprint. It is also the final level of the
+    /// derived root (see [`derive_layout_path`]), so it partitions the mutable
+    /// root by build inputs rather than merely being compared after the fact.
     #[serde(default)]
     pub build_fingerprint: Option<String>,
 }
@@ -238,7 +287,8 @@ impl TargetLayoutBinding {
     }
 }
 
-/// Pure derivation of the layout path: `<build-root>/<workspace>/<checkout>/<class>`.
+/// Pure derivation of the layout path:
+/// `<build-root>/<workspace>/<checkout>/<class>[/<fingerprint>]`.
 ///
 /// No filesystem access happens here: the build root is shape-checked
 /// lexically (absolute, no parent traversal, no lowercasing of the proposed
@@ -246,6 +296,17 @@ impl TargetLayoutBinding {
 /// root. Directory creation stays with the physical owner (testd daemon or
 /// Kernel), and [`verify_layout_binding`] establishes filesystem truth
 /// afterwards, including after path replacement.
+///
+/// The final `<fingerprint>` level is present exactly when the owner issued a
+/// `BuildFingerprint` digest for this binding, which is what the governed work
+/// envelope does (issue #1897: its governed root is
+/// `<build-root>/<workspace>/<checkout>/<build-mode>/<fingerprint>`). Issue
+/// #1806's binding already carried that digest as the constraint its bound
+/// output "must satisfy"; resolving it as a path level is what makes it a real
+/// constraint instead of a compared-but-unused field. Without it two work
+/// items in one workspace, checkout, and class that differ only in build inputs
+/// would share one mutable root. A binding without a fingerprint keeps the
+/// class-level root it has always resolved.
 pub fn derive_layout_path(layout: &TargetLayoutBinding) -> Result<PathBuf, TestdError> {
     layout.validate()?;
     let build_root = Path::new(&layout.build_root);
@@ -264,10 +325,13 @@ pub fn derive_layout_path(layout: &TargetLayoutBinding) -> Result<PathBuf, Testd
             reason: "parent traversal is forbidden",
         });
     }
-    let derived = build_root
+    let mut derived = build_root
         .join(&layout.workspace_id)
         .join(&layout.checkout_id)
         .join(layout.build_class.dir_name());
+    if let Some(fingerprint) = layout.build_fingerprint.as_deref() {
+        derived = derived.join(fingerprint);
+    }
     if !is_strict_descendant(&derived, build_root) {
         return Err(TestdError::Invalid {
             field: "target_layout.build_root",
@@ -315,6 +379,81 @@ pub fn verify_layout_binding(
     }
     let canonical_target = validate_root_identity(&roots.target_root, "target_roots.target_root")?;
     if canonical_derived != canonical_target {
+        return Err(TestdError::InvalidBinding);
+    }
+    Ok(BoundTargetRoots {
+        roots: roots.clone(),
+        layout: layout.clone(),
+    })
+}
+
+/// Verifies canonical roots of an enveloped job against its layout binding.
+///
+/// This is the lane-root check, not a second derivation. The envelope's
+/// `derive_target_root` is the single authority for where a governed lane
+/// builds; [`derive_layout_path`] is deliberately NOT called here, so the
+/// layout's build-class level never competes with the envelope's build-mode
+/// level. The layout contributes exactly two admitted facts and both are
+/// compared by content:
+///
+/// * its identity: `layout.workspace_id == envelope.workspace_id` and
+///   `layout.checkout_id == envelope.worktree_id`, so the lane runs under the
+///   admitted workspace and the real admitted checkout, not beside them; and
+/// * its containment: the governed root is a strict descendant of
+///   `<admitted build root>/<workspace-id>/<checkout-id>` and its remaining
+///   levels are exactly the envelope's build mode and normalized fingerprint,
+///   so no other root can be substituted for the lane's.
+///
+/// The existing [`TargetRoots::validate`](super::TargetRoots::validate) gate
+/// still runs first and unchanged, so `cache_root == target_root`, contour and
+/// source disjointness, and target-inside-contour hold exactly as before. Every
+/// equality here compares canonical identities, never textual prefixes. A
+/// missing or mismatched safe root is a typed refusal, never a repository
+/// `target/` fallback.
+///
+/// # Errors
+///
+/// Returns [`TestdError`] when the binding shapes, the root gate, or the
+/// admitted build-root identity fail, and [`TestdError::InvalidBinding`] when
+/// the lane identity, the containment, or the canonical target root disagrees.
+pub fn verify_envelope_layout_binding(
+    roots: &TargetRoots,
+    layout: &TargetLayoutBinding,
+    envelope: &GovernedWorkEnvelope,
+) -> Result<BoundTargetRoots, TestdError> {
+    layout.validate()?;
+    roots.validate()?;
+    if envelope.workspace_id != layout.workspace_id
+        || envelope.worktree_id != layout.checkout_id
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    let build_root = validate_root_identity(&layout.build_root, "target_layout.build_root")?;
+    let lane_root = build_root.join(&layout.workspace_id).join(&layout.checkout_id);
+    let canonical_lane_root =
+        validate_root_identity(&lane_root.to_string_lossy(), "target_layout.lane_root")?;
+    let governed = envelope
+        .derive_target_root()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let canonical_governed =
+        validate_root_identity(&governed.to_string_lossy(), "work_envelope.governed_root")?;
+    let Ok(levels) = canonical_governed.strip_prefix(&canonical_lane_root) else {
+        return Err(TestdError::InvalidBinding);
+    };
+    let fingerprint = envelope
+        .normalized_fingerprint()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let mut remaining = levels.components();
+    let mode = remaining.next().map(|component| component.as_os_str().to_owned());
+    let digest = remaining.next().map(|component| component.as_os_str().to_owned());
+    if remaining.next().is_some()
+        || mode.as_deref() != Some(std::ffi::OsStr::new(envelope.build_mode.as_str()))
+        || digest.as_deref() != Some(std::ffi::OsStr::new(&fingerprint))
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    let canonical_target = validate_root_identity(&roots.target_root, "target_roots.target_root")?;
+    if canonical_governed != canonical_target {
         return Err(TestdError::InvalidBinding);
     }
     Ok(BoundTargetRoots {
