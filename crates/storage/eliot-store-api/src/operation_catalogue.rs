@@ -109,9 +109,9 @@ use crate::operation_parameters::{
 };
 use crate::{
     CONTRACT_NAME, CONTRACT_VERSION, ContractVersion, EffectClass, GENESIS_MANIFEST_NAME,
-    NamedMutationOperation, NamedOperationManifest, NamedReadOperation, NamedReadRequest,
-    OperationManifestDigest, OperationManifestSpec, PAYLOAD_AUTHORITY_VERSION, PreparedTransition,
-    StoreError, TransitionClass, canonical_json_bytes, sha256_hex,
+    NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, NamedReadOperation,
+    NamedReadRequest, OperationManifestDigest, OperationManifestSpec, PAYLOAD_AUTHORITY_VERSION,
+    PreparedTransition, StoreError, TransitionClass, canonical_json_bytes, sha256_hex,
 };
 
 /// Operation identity kind carried by each manifest entry.
