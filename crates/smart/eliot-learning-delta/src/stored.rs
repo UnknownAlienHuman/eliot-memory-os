@@ -311,6 +311,32 @@ impl StoredLearningDelta {
             }
         }
         require_non_empty_unique(&self.evidence_refs, "stored.evidence_refs")?;
+        // The repeated-verifier-failure vocabulary has exactly ONE constructor
+        // ([`repeated_verifier_failure_ref`]) and it refuses a blank verifier,
+        // because a bare prefix would satisfy a prefix-presence test while
+        // naming no verifier at all. `Deserialize` is a public trait impl that
+        // never runs that constructor, so a durable payload can carry the bare
+        // prefix and be restored as a record whose references are non-blank and
+        // duplicate-free. The record's own validator therefore refuses it here,
+        // which is what makes
+        // [`StoredLearningDelta::repeated_verifier_failure_verifier`] total over
+        // the vocabulary: on any record that passed this check, the reader can
+        // only return a marker that names a verifier.
+        //
+        // The comparison is on the marker's CONTENT (its remainder after the
+        // prefix), not on the presence of the prefix, so a record that merely
+        // spells the vocabulary cannot pass as a proven repeat.
+        for id in &self.evidence_refs {
+            if let Some(verifier) = id
+                .as_str()
+                .strip_prefix(REPEATED_VERIFIER_FAILURE_REF_PREFIX)
+                && verifier.trim().is_empty()
+            {
+                return Err(LearningDeltaError::InvalidInput {
+                    field: "stored.repeated_verifier_failure",
+                });
+            }
+        }
         if let Some(retry) = &self.retry_relation {
             retry.validate()?;
             if retry.prior_attempt_id == self.attempt_id {
@@ -382,11 +408,20 @@ impl StoredLearningDelta {
     /// not an inference from a count, an ordinal or a status the caller supplies.
     /// The whole remainder of the marker is the verifier identity, so an identity
     /// containing `:` is returned intact.
+    ///
+    /// A marker whose remainder names no verifier returns `None` as well, and
+    /// that is not a silent downgrade: [`Self::validate`] REFUSES such a record
+    /// (`stored.repeated_verifier_failure`), because the sole constructor
+    /// [`repeated_verifier_failure_ref`] cannot mint one. So the filter here
+    /// makes the reader total on any record that passed validation, and a
+    /// restored payload that bypassed the constructor is rejected by the record's
+    /// own gate rather than read back as a proven repeat.
     #[must_use]
     pub fn repeated_verifier_failure_verifier(&self) -> Option<&str> {
         self.evidence_refs.iter().find_map(|id| {
             id.as_str()
                 .strip_prefix(REPEATED_VERIFIER_FAILURE_REF_PREFIX)
+                .filter(|verifier| !verifier.trim().is_empty())
         })
     }
 
