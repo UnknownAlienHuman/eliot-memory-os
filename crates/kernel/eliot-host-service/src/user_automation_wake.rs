@@ -779,7 +779,7 @@ fn retained_occurrence_wake_readback(
 ///
 /// `operation` is the PARENT `RunNow` identity, not a digest derived here. The
 /// existing readback binding requires the retained record's operation identity
-/// to equal the committed parent RunNow operation, and the parent is the only
+/// to equal the committed parent `RunNow` operation, and the parent is the only
 /// writer of that operation: deriving a fresh identity would mint a wake under
 /// an operation no committed transition owns.
 ///

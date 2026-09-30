@@ -7085,9 +7085,11 @@ impl KernelComposition {
             != eliot_kernel_core::user_automation::UserAutomationConfigurationState::Active
             || owner.revision.owner_principal != authenticated_principal
             || owner.revision.revision != request.automation_revision
-            || owner.revision.digest().map_err(|error| {
-                UserAutomationRuntimeError::Rejected(error.to_string())
-            })? != request.revision_digest
+            || owner
+                .revision
+                .digest()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+                != request.revision_digest
         {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }

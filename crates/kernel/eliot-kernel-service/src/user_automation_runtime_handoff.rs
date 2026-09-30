@@ -1881,7 +1881,8 @@ pub fn run_now_occurrence_wake_publication(
 ) -> Result<UserAutomationWakeOccurrencePublication, String> {
     let UserAutomationTrigger::Manual { nonce } = &invocation.trigger else {
         return Err(
-            "a run-now occurrence must name an explicit manual nonce to publish its wake".to_owned(),
+            "a run-now occurrence must name an explicit manual nonce to publish its wake"
+                .to_owned(),
         );
     };
     let occurrence_id = invocation
@@ -1893,10 +1894,7 @@ pub fn run_now_occurrence_wake_publication(
         identity,
         automation_id: invocation.automation_id.clone(),
         automation_revision: invocation.automation_revision.clone(),
-        revision_digest: owner
-            .revision
-            .digest()
-            .map_err(|error| error.to_string())?,
+        revision_digest: owner.revision.digest().map_err(|error| error.to_string())?,
         // The publication is same-fence by construction, so it takes the fence
         // from the owner readback this handoff already proved rather than
         // restating one: a caller cannot pair an occurrence with a fence no
@@ -1906,9 +1904,7 @@ pub fn run_now_occurrence_wake_publication(
         manual_nonce: nonce.clone(),
         wake_intent: wake_intent.clone(),
     };
-    publication
-        .validate()
-        .map_err(|error| error.to_string())?;
+    publication.validate().map_err(|error| error.to_string())?;
     Ok(publication)
 }
 

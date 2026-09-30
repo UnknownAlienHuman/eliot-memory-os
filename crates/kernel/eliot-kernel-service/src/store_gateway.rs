@@ -52,7 +52,7 @@ use eliot_runtime_contracts::{
     I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
     I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
     I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, WakeIntent,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
@@ -5879,54 +5879,15 @@ impl KernelStoreGateway {
                 },
             ));
         };
-        // The Store mints this occurrence's inert `WakeIntent` and the owner
-        // journal is the only writer of a `WakeRecord`, so the wake must be
-        // PUBLISHED to the owner before it can be read back. Without this the
-        // lookup below answers `NotRetained` for every manual occurrence and the
-        // handoff can never reach the preflight. The publication is a publisher,
-        // not a schedule: it names this one committed occurrence under its own
-        // parent `RunNow` identity, extends no occurrence denominator, and
-        // mints no authority (I11.12: "run-now uses an explicit manual nonce and
-        // does not mutate the schedule").
-        //
-        // A refused publication is the occurrence's `UnknownOutcome` wake
-        // disposition, exactly like a refused readback: it is never treated as
-        // "nothing was sent" and never as a published wake, so the refusal
-        // below still decides whether the preflight is reached.
-        if defer_reason.is_none() {
-            let publication = run_now_occurrence_wake_publication(
-                sealed.context.clone(),
-                sealed.authenticated_principal.clone(),
-                sealed.identity.clone(),
-                &owner,
-                &invocation,
-                published_wake_intent,
-            )?;
-            if let Err(error) =
-                UserAutomationWakePort::publish_occurrence_wake(runtime, publication).await
-            {
-                return Ok((
-                    UserAutomationWakePhase::UnknownOutcome {
-                        reason: error.to_string(),
-                    },
-                    UserAutomationExecutionPhase::Unavailable {
-                        reason: unproven_run_now_wake_reason(&occurrence_id),
-                    },
-                ));
-            }
-        }
-        let wake_request = run_now_wake_read_request(
-            sealed.context.clone(),
-            sealed.authenticated_principal.clone(),
-            sealed.identity.clone(),
-            invocation.clone(),
-        );
-        let wake = match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
-            Ok(readback) => UserAutomationWakePhase::Published { readback },
-            Err(error) => UserAutomationWakePhase::UnknownOutcome {
-                reason: error.to_string(),
-            },
-        };
+        let wake = Self::publish_and_read_run_now_wake(
+            runtime,
+            sealed,
+            &owner,
+            &invocation,
+            published_wake_intent,
+            defer_reason,
+        )
+        .await?;
         if let Some(reason) = defer_reason {
             return Ok((wake, UserAutomationExecutionPhase::Deferred { reason }));
         }
@@ -5987,6 +5948,75 @@ impl KernelStoreGateway {
             owner.current_configuration_state,
             blocked_fingerprint,
             &occurrence_id,
+        )
+    }
+
+    /// Decides one committed run-now occurrence's wake phase: publish it to the
+    /// wake owner, then read the owner's own record back.
+    ///
+    /// The name is the step's decision, not its mechanics. After this returns,
+    /// the caller either holds a proven occurrence wake or it does not, and
+    /// every route to the second answer is the same named disposition:
+    /// `Published` only when this owner holds a `Pending` record for exactly
+    /// this occurrence under this fence and the committed parent `RunNow`
+    /// identity, and `UnknownOutcome` for a refused publication, a complete
+    /// `NotRetained`, an unreadable owner, and a lost response alike. "We asked"
+    /// is never reported as "it is retained".
+    ///
+    /// Publication is required because the Store mints this occurrence's inert
+    /// `WakeIntent` and the Host journal is the only writer of a `WakeRecord`,
+    /// so a lookup alone answers `NotRetained` for every manual occurrence. The
+    /// publication is a publisher, not a schedule: it names this one committed
+    /// occurrence under its own parent `RunNow` identity, extends no occurrence
+    /// denominator and mints no authority (I11.12:33 — a run-now "uses an
+    /// explicit manual nonce and does not mutate the schedule"). The readback is
+    /// a second owner read, not a restatement of the request, so a record the
+    /// activation cutover already cleared cannot be reported as published.
+    ///
+    /// A paused or retired owner is settled before an admission is attempted, so
+    /// no journal effect is issued for one: the manual occurrence still mutates
+    /// nothing, and the owner would refuse the publication anyway.
+    async fn publish_and_read_run_now_wake<R>(
+        runtime: &R,
+        sealed: &UserAutomationServiceRequest,
+        owner: &UserAutomationOwnerSnapshot,
+        invocation: &UserAutomationInvocation,
+        published_wake_intent: &WakeIntent,
+        defer_reason: Option<UserAutomationDeferReason>,
+    ) -> Result<UserAutomationWakePhase, String>
+    where
+        R: UserAutomationWakePort + ?Sized,
+    {
+        if defer_reason.is_none() {
+            let publication = run_now_occurrence_wake_publication(
+                sealed.context.clone(),
+                sealed.authenticated_principal.clone(),
+                sealed.identity.clone(),
+                owner,
+                invocation,
+                published_wake_intent,
+            )?;
+            if let Err(error) =
+                UserAutomationWakePort::publish_occurrence_wake(runtime, publication).await
+            {
+                return Ok(UserAutomationWakePhase::UnknownOutcome {
+                    reason: error.to_string(),
+                });
+            }
+        }
+        let wake_request = run_now_wake_read_request(
+            sealed.context.clone(),
+            sealed.authenticated_principal.clone(),
+            sealed.identity.clone(),
+            invocation.clone(),
+        );
+        Ok(
+            match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
+                Ok(readback) => UserAutomationWakePhase::Published { readback },
+                Err(error) => UserAutomationWakePhase::UnknownOutcome {
+                    reason: error.to_string(),
+                },
+            },
         )
     }
 

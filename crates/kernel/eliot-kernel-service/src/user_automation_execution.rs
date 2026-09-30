@@ -1313,7 +1313,7 @@ impl UserAutomationWakeReadRequest {
 /// state.
 ///
 /// The parent `RunNow` identity is this publication's operation identity because
-/// the readback that proves the wake is bound to the committed parent RunNow
+/// the readback that proves the wake is bound to the committed parent `RunNow`
 /// operation. A derived identity here would produce a readback no committed
 /// parent can claim.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -3522,7 +3522,7 @@ pub trait UserAutomationWakePort: Send + Sync {
     }
 
     /// Publishes the pending wake of one committed manual (run-now) occurrence
-    /// to the existing WakeIntent/Task Scheduler owner.
+    /// to the existing `WakeIntent`/Task Scheduler owner.
     ///
     /// This is a publisher, not a member of the recurring horizon: the owner
     /// writes exactly one journal record for exactly one already-committed

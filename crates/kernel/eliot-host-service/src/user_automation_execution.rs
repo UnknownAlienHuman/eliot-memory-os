@@ -5,6 +5,7 @@
 //! the retained channel binding and delegates to the concrete Durable Job and
 //! Host journal adapters; it owns no dispatch table or lifecycle state.
 
+use eliot_contracts::StateFence;
 use eliot_kernel_service::{
     UserAutomationDurableJobPort, UserAutomationHostChannelBinding,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
@@ -111,6 +112,40 @@ where
         }
     }
 
+    /// Answers the two operations whose result is the wake owner's own retained
+    /// journal record.
+    ///
+    /// The ordinary lookup and the manual publication are different owner calls
+    /// over different request types, but the same kind of answer: the record this
+    /// Host journal actually retains. Both project into the same correlated
+    /// `WakeRead` response, so the correlation fields the transport requires are
+    /// stamped in exactly one place and neither operation can answer with a
+    /// response shape its carrier pairing does not admit.
+    async fn dispatch_wake_read(
+        &self,
+        operation: UserAutomationHostExecutionOperation,
+        request_sha256: String,
+        state_fence: StateFence,
+    ) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError> {
+        let readback = match operation {
+            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
+                self.wake.read_pending_wake(request).await?
+            }
+            UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
+                self.wake.publish_occurrence_wake(request).await?
+            }
+            // The caller only routes the two record-bearing operations here; a
+            // different owner effect reaching this seam is a dispatch defect and
+            // is refused rather than answered with a foreign record.
+            _ => return Err(UserAutomationRuntimeError::IdentityConflict),
+        };
+        Ok(UserAutomationHostExecutionResponse::WakeRead {
+            request_sha256,
+            state_fence,
+            readback,
+        })
+    }
+
     /// Handles one carrier after the named-pipe server has attached its
     /// server-authored session. Foreign, replayed, or stale carriers are
     /// rejected before the Durable Job or Host journal owner is called.
@@ -156,26 +191,15 @@ where
                     wake_ids,
                 })
             }
-            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
-                let readback = self.wake.read_pending_wake(request).await?;
-                Ok(UserAutomationHostExecutionResponse::WakeRead {
-                    request_sha256,
-                    state_fence,
-                    readback,
-                })
-            }
-            // Publication answers with the owner's own retained readback, the
-            // same shape a lookup returns, because the retained record IS the
-            // publication's proof. The `WakeRead` variant is reused rather than
-            // duplicated: a second response variant carrying the same owner
-            // answer would add a wire member that no distinct fact requires.
-            UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
-                let readback = self.wake.publish_occurrence_wake(request).await?;
-                Ok(UserAutomationHostExecutionResponse::WakeRead {
-                    request_sha256,
-                    state_fence,
-                    readback,
-                })
+            // The two operations whose answer is the wake owner's own retained
+            // journal record — the ordinary lookup and the manual publication —
+            // share one dispatch arm and one response projection, because the
+            // retained record is the proof in both cases. Their port methods and
+            // request types differ, so only the projection is shared.
+            operation @ (UserAutomationHostExecutionOperation::ReadPendingWake { .. }
+            | UserAutomationHostExecutionOperation::PublishOccurrenceWake { .. }) => {
+                self.dispatch_wake_read(operation, request_sha256, state_fence)
+                    .await
             }
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 let channel_binding_sha256 = session.authenticated_channel_binding_digest()?;

@@ -26,8 +26,8 @@ use super::{
     UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationReadback, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
-    UserAutomationWakeOccurrencePublication, UserAutomationWakePort,
-    UserAutomationWakePublication, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationWakeOccurrencePublication, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 
 /// Persisted observer for the authenticated cancellation transport boundary.
@@ -541,7 +541,7 @@ pub enum UserAutomationHostExecutionOperation {
     /// occurrence denominator; it names one already-committed manual occurrence
     /// under its own parent `RunNow` identity.
     PublishOccurrenceWake {
-        /// Committed occurrence, manual nonce, and parent RunNow identity.
+        /// Committed occurrence, manual nonce, and parent `RunNow` identity.
         request: Box<UserAutomationWakeOccurrencePublication>,
     },
     /// Enumerate the complete committed denominator from one Host snapshot.
@@ -1209,10 +1209,11 @@ fn request_context(request: &UserAutomationHostExecutionRequest) -> &RequestMeta
         | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
             &request.context
         }
-        UserAutomationHostExecutionOperation::ReadPendingWake { request }
-        | UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
-            &request.context
-        }
+        UserAutomationHostExecutionOperation::ReadPendingWake { request } => &request.context,
+        // The publication is its own closed carrier, not a `UserAutomationWakeReadRequest`, so
+        // it cannot share an or-pattern binding with the read it is followed by: one name in one
+        // or-pattern must carry one type. Its own arm keeps the wire field name unchanged.
+        UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => &request.context,
         UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => &request.context,
         UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
         | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
