@@ -21,7 +21,8 @@ use eliot_store_api::{
     CampaignSourceHead, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
     CampaignSourceRevisionRead, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHeadExpectation, ScopeId,
-    StoreHealth, TaskContractAcceptanceSet, WriteReceipt, decode_task_contract_acceptance_set,
+    OriginalWriteSubmission, StoreHealth, TaskContractAcceptanceSet, WriteReceipt,
+    decode_task_contract_acceptance_set,
     generated_operation_manifests, task_contract_acceptance_read_request,
     validate_store_receipt_envelope, verify_canonical_request_hash,
 };
@@ -85,7 +86,7 @@ fn check_identity_binding_with_selection(
         &identity.request.metadata,
         transition,
     )
-    .map_err(task_binding_kernel_error)?;
+    .map_err(|error| task_binding_kernel_error(&error))?;
     match (&admission, task_selection) {
         (super::task_binding_admission::TaskBindingAdmission::TaskRelative, Some(selection)) => {
             super::task_binding_admission::admit_prepared_transition_with_owner_selection(
@@ -96,12 +97,9 @@ fn check_identity_binding_with_selection(
                 selection.observed_scope,
                 selection.live_fence,
             )
-            .map_err(task_binding_kernel_error)?;
+            .map_err(|error| task_binding_kernel_error(&error))?;
         }
-        (super::task_binding_admission::TaskBindingAdmission::TaskRelative, None) => {
-            return Err(KernelPortError::TaskSelectionRequired);
-        }
-        (_, Some(_)) => {
+        (super::task_binding_admission::TaskBindingAdmission::TaskRelative, None) | (_, Some(_)) => {
             return Err(KernelPortError::TaskSelectionRequired);
         }
         (_, None) => {}
@@ -176,7 +174,7 @@ fn check_identity_binding_with_selection(
 }
 
 fn task_binding_kernel_error(
-    error: super::task_binding_admission::TaskBindingError,
+    error: &super::task_binding_admission::TaskBindingError,
 ) -> KernelPortError {
     match error.code() {
         super::task_binding_admission::TASK_SELECTION_REQUIRED => {
@@ -254,42 +252,14 @@ async fn read_task_controller_source_head(
 }
 
 impl DaemonKernelClient {
-    /// Applies one selection-bound Task Controller transition through the
-    /// normal authenticated transport after validating original owner evidence
-    /// against the immutable prepared transition and fresh Host observation.
-    pub(crate) fn apply_prepared_with_owner_selection<'a>(
+    fn apply_prepared_with_admission_context<'a>(
         &'a self,
         identity: &RequestIdentity,
         transition: PreparedTransition,
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
-        request_identity: (&'a str, &'a str, &'a str, &'a str),
-        owner: &'a eliot_governor::TaskSelectionAdmissionBinding,
-        observed_scope: &'a eliot_workscope::ObservedScopeResources,
-        live_fence: &'a StateFence,
-    ) -> KernelPortFuture<'a, WriteReceipt> {
-        let context = OwnerSelectionContext {
-            request_identity,
-            owner,
-            observed_scope,
-            live_fence,
-        };
-        self.apply_prepared_with_owner_selection_context(
-            identity,
-            transition,
-            expected_revision_heads,
-            expected_ordering_heads,
-            context,
-        )
-    }
-
-    fn apply_prepared_with_owner_selection_context<'a>(
-        &'a self,
-        identity: &RequestIdentity,
-        transition: PreparedTransition,
-        expected_revision_heads: Vec<RevisionHeadExpectation>,
-        expected_ordering_heads: Vec<OrderingHeadExpectation>,
-        task_selection: OwnerSelectionContext<'a>,
+        task_selection: Option<OwnerSelectionContext<'a>>,
+        original_write_submission: Option<OriginalWriteSubmission>,
     ) -> KernelPortFuture<'a, WriteReceipt> {
         let identity = identity.clone();
         let span = tracing::info_span!(
@@ -303,23 +273,44 @@ impl DaemonKernelClient {
                     &transition,
                     &expected_revision_heads,
                     &expected_ordering_heads,
-                    Some(&task_selection),
+                    task_selection.as_ref(),
                 )?;
+                if let Some(source) = &original_write_submission {
+                    source
+                        .validate()
+                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                    if transition.transition_class
+                        != eliot_store_api::TransitionClass::CaptureCandidate
+                        || transition.named_operations.len() != 1
+                        || transition.named_operations[0].operation
+                            != eliot_store_api::NamedMutationOperation::CaptureObservation
+                    {
+                        return Err(KernelPortError::Contract(
+                            "versioned original write requires one CaptureObservation transition"
+                                .to_owned(),
+                        ));
+                    }
+                }
                 let _ = super::diagnostics::emit_handoff(
                     super::diagnostics::HandoffKind::Prepared,
                     identity.idempotency_key.as_str(),
                     identity.request.metadata.request_id.as_str(),
                 );
                 let expected_transition = transition.clone();
+                let mut request = serde_json::json!({
+                    "context": identity.request.metadata.clone(),
+                    "transition": transition,
+                    "expected_revision_heads": expected_revision_heads,
+                    "expected_ordering_heads": expected_ordering_heads,
+                });
+                if let Some(source) = original_write_submission {
+                    request["original_write_submission"] = serde_json::to_value(source)
+                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                }
                 let value = self
                     .transact_async_with_identity(
                         "apply_prepared",
-                        serde_json::json!({
-                            "context": identity.request.metadata.clone(),
-                            "transition": transition,
-                            "expected_revision_heads": expected_revision_heads,
-                            "expected_ordering_heads": expected_ordering_heads,
-                        }),
+                        request,
                         identity.clone(),
                     )
                     .await
@@ -343,6 +334,25 @@ impl DaemonKernelClient {
             .instrument(span),
         )
     }
+
+    fn apply_prepared_with_owner_selection<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        task_selection: OwnerSelectionContext<'a>,
+        original_write_submission: Option<OriginalWriteSubmission>,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        self.apply_prepared_with_admission_context(
+            identity,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            Some(task_selection),
+            original_write_submission,
+        )
+    }
 }
 
 impl KernelTransitionPort for DaemonKernelClient {
@@ -353,61 +363,31 @@ impl KernelTransitionPort for DaemonKernelClient {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt> {
-        let identity = identity.clone();
-        // #740: handoff/commitment span over the neutral transition
-        // boundary. Identity binding agreement marks the prepared handoff;
-        // the validated receipt envelope marks the commitment. The two
-        // are never the same record. The span instruments the future
-        // (`Send`-safe) instead of an entered guard, which cannot cross
-        // an await.
-        let span = tracing::info_span!(
-            "eliotd.transition_handoff",
-            operation = %super::diagnostics::sanitize_identity(&identity.idempotency_key)
-        );
-        Box::pin(
-            async move {
-                check_identity_binding(
-                    &identity,
-                    &transition,
-                    &expected_revision_heads,
-                    &expected_ordering_heads,
-                )?;
-                let _ = super::diagnostics::emit_handoff(
-                    super::diagnostics::HandoffKind::Prepared,
-                    identity.idempotency_key.as_str(),
-                    identity.request.metadata.request_id.as_str(),
-                );
-                let expected_transition = transition.clone();
-                let value = self
-                    .transact_async_with_identity(
-                        "apply_prepared",
-                        serde_json::json!({
-                            "context": identity.request.metadata.clone(),
-                            "transition": transition,
-                            "expected_revision_heads": expected_revision_heads,
-                            "expected_ordering_heads": expected_ordering_heads,
-                        }),
-                        identity.clone(),
-                    )
-                    .await
-                    .map_err(kernel_port_error)?;
-                let value = kind_value(&value, "write_receipt")?;
-                let receipt: WriteReceipt = serde_json::from_value(value)
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                validate_store_receipt_envelope(
-                    &identity.request.metadata,
-                    &expected_transition,
-                    &receipt,
-                )
-                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                let _ = super::diagnostics::emit_handoff(
-                    super::diagnostics::HandoffKind::Committed,
-                    identity.idempotency_key.as_str(),
-                    receipt.operation_id.as_str(),
-                );
-                Ok(receipt)
-            }
-            .instrument(span),
+        self.apply_prepared_with_admission_context(
+            identity,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            None,
+            None,
+        )
+    }
+
+    fn apply_prepared_with_original_submission<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        original_write_submission: OriginalWriteSubmission,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        self.apply_prepared_with_admission_context(
+            identity,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            None,
+            Some(original_write_submission),
         )
     }
 
@@ -600,15 +580,43 @@ impl KernelTransitionPort for OwnerSelectionKernelPort<'_> {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt> {
+        let task_selection = OwnerSelectionContext {
+            request_identity: self.request_identity,
+            owner: self.owner,
+            observed_scope: self.observed_scope,
+            live_fence: self.live_fence,
+        };
         self.kernel.apply_prepared_with_owner_selection(
             identity,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
-            self.request_identity,
-            self.owner,
-            self.observed_scope,
-            self.live_fence,
+            task_selection,
+            None,
+        )
+    }
+
+    fn apply_prepared_with_original_submission<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        original_write_submission: OriginalWriteSubmission,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        let task_selection = OwnerSelectionContext {
+            request_identity: self.request_identity,
+            owner: self.owner,
+            observed_scope: self.observed_scope,
+            live_fence: self.live_fence,
+        };
+        self.kernel.apply_prepared_with_owner_selection(
+            identity,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            task_selection,
+            Some(original_write_submission),
         )
     }
 
