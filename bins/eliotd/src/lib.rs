@@ -4197,78 +4197,34 @@ impl DaemonComposition {
             .map_err(DaemonError::Composition)
     }
 
-    /// Re-reads one compiled cold-start surface at the authenticated attach
-    /// boundary (issue #1746 W5; #8 W1).
+    /// Reads the retained terminal cold-start readiness after an authenticated
+    /// attach trigger (issue #1790 W6).
     ///
-    /// This is an owner readback adapter, not a second cold-start compiler:
-    /// the input must carry the Governor-issued lease, its complete prior
-    /// surface, and the full Governor-built ORS claim. Partial lease fields
-    /// cannot identify a durable readiness row. The method checks the claim,
-    /// full lease key/epoch/deadline/terminal state, compares the supplied
-    /// fence to the Governor's current snapshot, then asks the Governor for
-    /// the exact terminal under that claim. It returns the
-    /// surface only if every projected frozen field is equal to the expected
-    /// owner projection. Expiry uses the daemon's internal Unix-millisecond
-    /// clock, so the caller cannot extend a lease by supplying an older tick. A moved fence, changed receipt,
-    /// session, scope/task/source/profile revision, or projection fails closed.
-    /// The bridge activation ticket is not an input because it carries only
-    /// correlation identity.
+    /// The caller supplies only the original Governor-issued ORS claim returned
+    /// by compilation. Carry that claim through the trigger path unchanged; do not
+    /// reconstruct it from the admitted scan or readiness evidence.
+    /// Governor re-reads the durable lease and terminal receipt and checks the
+    /// installation, binding digest, current fence, expiry, and retained
+    /// WorkScope before projecting the surface. The returned view carries the
+    /// terminal readiness state and its smallest missing question for the live
+    /// Agent/Human activation response. No readiness value is inferred from the
+    /// activation ticket, directory name, or question text.
     ///
-    /// `caller: STITCH`. The authenticated Kernel/attach producer must supply
-    /// the actual lease/surface/full-claim tuple and observed fence; the
-    /// current activation route does not carry those semantic owner values.
-    /// This method never derives them from host fields or creates a replacement
-    /// receipt.
+    /// Integration caller: the accepted `AttachOrLaunch` path in
+    /// `daemon_runtime::trigger_accepted_cold_start`, after Governor has joined
+    /// or compiled the trigger terminal. The runtime must carry this returned
+    /// view to the authenticated activation surface.
     pub fn read_cold_start_surface_for_attach(
         &self,
-        input: &task_binding_admission::ColdStartAttachInput,
+        claim: &eliot_ors::ColdStartReadinessClaim,
     ) -> Result<eliot_governor::ColdStartSurfaceView, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        input.lease.validate().map_err(|error| {
-            DaemonError::Composition(CompositionError::Recovery(format!(
-                "cold-start attach lease is invalid: {error}"
-            )))
-        })?;
-        if !matches!(
-            input.lease.state,
-            eliot_workscope::OnboardingLeaseState::Ready
-                | eliot_workscope::OnboardingLeaseState::Ambiguous
-                | eliot_workscope::OnboardingLeaseState::Failed
-        ) || !input.matches_lease()
-        {
-            return Err(DaemonError::Composition(
-                CompositionError::ActivationStaleFence,
-            ));
-        }
-
-        input.readiness_claim.validate().map_err(|error| {
-            DaemonError::Composition(CompositionError::Recovery(format!(
-                "cold-start attach readiness claim is invalid: {error}"
-            )))
-        })?;
-        let now = unix_ms();
-        let live_fence = self.governor.kernel_snapshot().state_fence();
-        if input.state_fence != live_fence
-            || input.expected_surface.state_fence != live_fence
-            || input.expected_surface.lease_deadline < now
-            || !input.matches_lease()
-        {
-            return Err(DaemonError::Composition(
-                CompositionError::ActivationStaleFence,
-            ));
-        }
-
-        let (current_lease, current_surface) = self
+        let (_, surface) = self
             .governor
-            .cold_start_owner_readback_for_claim(&input.readiness_claim, now)?;
-        if current_lease != input.lease || current_surface != input.expected_surface {
-            return Err(DaemonError::Composition(
-                CompositionError::ActivationStaleFence,
-            ));
-        }
-        Ok(current_surface)
+            .cold_start_owner_readback_for_claim(claim, unix_ms())?;
+        Ok(surface)
     }
 
     /// Admits one explicit workspace instance as an attach to the retained
