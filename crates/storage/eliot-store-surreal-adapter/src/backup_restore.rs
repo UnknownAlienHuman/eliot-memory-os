@@ -34,12 +34,16 @@
 //! its declared length come from the retained reference. An importable member
 //! that retains no payload is refused typed before any write, because a batch
 //! that carries no content must not be able to answer with a well-formed
-//! partial receipt. Resolution then reads those rows back — the ones this
-//! operation wrote, under this operation's own key — and compares every field
-//! against the batch's own member before the payload is used, including the
-//! owner's attested payload digest, which is validated against the bytes the
-//! carrier actually holds. A carrier this operation published and cannot read
-//! back is an unresolved member, never a member with empty content. The resolved
+//! partial receipt. The retained reference's own recorded length and digest are
+//! validated against the original bytes it carries before it is parsed at all,
+//! so the digest that travels on is the owner's proof about its own record and
+//! not a checksum of a locally re-derived encoding. Resolution then reads those
+//! rows back — the ones this operation wrote, under this operation's own key —
+//! and compares every field against the batch's own member before the payload is
+//! used, including the owner's attested payload digest, which is re-proved
+//! against the canonical encoding of the bytes the carrier actually holds. A
+//! carrier this operation published and cannot read back is an unresolved
+//! member, never a member with empty content. The resolved
 //! payloads stay private to this execution path and are re-read out of the
 //! destination before any receipt reports a member restored.
 //!
@@ -317,9 +321,11 @@ struct ArchiveMemberCarrier {
     /// Owner-recorded digest of the resolved canonical payload bytes.
     ///
     /// This is the value the archive/artifact owner attested for the bytes it
-    /// published. Resolution validates it against the payload it actually holds,
-    /// so a carrier that claims one digest and carries other bytes is refused
-    /// rather than accepted because its claim looked plausible.
+    /// published. Publication validates it against the owner's *original*
+    /// recorded payload, and resolution validates the same attested value
+    /// against the canonical encoding of the payload the carrier actually
+    /// holds, so a carrier that claims one digest and carries other bytes is
+    /// refused rather than accepted because its claim looked plausible.
     payload_digest: String,
     /// Actual byte length of the resolved canonical payload.
     byte_count: u64,
@@ -2508,6 +2514,17 @@ async fn publish_archive_member_carriers(
 /// and the destination address come from the retained reference, and the class
 /// must be one this port owns: a member naming a class with no destination is
 /// refused rather than mapped onto a table.
+///
+/// The owner's two attested facts about its own bytes are discharged *here*,
+/// against the original recorded payload, before the payload is parsed into a
+/// carrier: the declared length must be the actual length of the payload the
+/// owner recorded, and the declared digest must validate exactly those bytes.
+/// Nothing is recomputed over a locally re-derived encoding to satisfy them, so
+/// the digest the carrier carries and the resolution step re-proves is a proof
+/// about the owner's own record rather than a checksum of whatever this port
+/// happened to decode. The resolution step's separate check then re-proves that
+/// same attested value against the canonical encoding of the payload it holds,
+/// which is the encoding the destination will serve back.
 fn carrier_for(
     batch: &CanonicalRestoreBatch,
     member: &SnapshotMember,
@@ -2521,6 +2538,22 @@ fn carrier_for(
         return Err(StoreError::InvalidField {
             field: "restore.retained_member_payload",
             reason: "retained payload length does not match the member's declared byte count",
+        });
+    }
+    // The owner's recorded length and digest describe exactly the payload string
+    // it retained. Both are compared with those bytes rather than with a
+    // re-encoding of them, so a reference whose own attestation does not hold is
+    // refused here, typed, before any carrier row is published.
+    if u64::try_from(retained.payload.len()).ok() != Some(retained.byte_count) {
+        return Err(StoreError::InvalidField {
+            field: "restore.retained_member_byte_count",
+            reason: "retained payload length does not match the owner-recorded length",
+        });
+    }
+    if sha256_hex(retained.payload.as_bytes()) != retained.payload_digest {
+        return Err(StoreError::InvalidField {
+            field: "restore.retained_member_payload_digest",
+            reason: "retained payload does not match the owner-attested digest",
         });
     }
     let class = RestoreRecordClass::parse(&retained.class).ok_or(StoreError::InvalidField {
