@@ -2814,13 +2814,57 @@ fn installation_host_root_key(
 /// - it proves that this installation authority allocated a **new, distinct**
 ///   isolated installation identity at one exact canonical protected Host root
 ///   for one exact preparation operation, bound to the exact source
-///   installation, target manifest/build/profile, proposed restoration
-///   requirements and current purge/reference closure the caller had already
-///   admitted;
+///   installation and the exact target manifest/build/profile;
 /// - it is **not** an approval, **not** an active generation, **not** an
 ///   Authority Epoch, and **not** authority to launch, to accept materialized
 ///   roots, or to cut over.  A13.7 keeps those separate: "Cutover requires
 ///   separate authority."
+///
+/// # Why this record carries no purge/revocation closure and no restoration
+/// requirements
+///
+/// An earlier revision of this type carried two further handles, a "purge
+/// reference closure" and "proposed restoration requirements".  Neither had a
+/// source, and both are gone rather than filled, because the architecture does
+/// not define either as a separate identity an allocation may carry.
+///
+/// `A13.7` lists "privacy purge and revocation closure" as an item restore
+/// **verifies**, in the same list as "provenance and integrity" and "Authority
+/// Epoch monotonicity".  It is a verification obligation discharged *at restore
+/// time against the current owner*, not a caller-presented value bound at
+/// allocation time.  `I05.13` says the same in its restore list: "apply privacy
+/// purge ledger".  The only owner-issued quantity behind that verification is
+/// the ORS purge-ledger **counter** — `RedbRecoveryStore::purge_ledger_revision`
+/// (`crates/kernel/eliot-ors/src/store.rs`) and its read-only seam
+/// `read_purge_ledger_revision_read_only`
+/// (`crates/kernel/eliot-ors/src/status.rs`), both `u64`.  A counter is not a
+/// closure: the restore path discharges the obligation by *comparing* the
+/// archive's declared `manifest.purge_ledger_revision` against the revisions
+/// the owner issued when it applied each entry
+/// (`check_purge_revision_closure`, `bins/eliot-kernel/src/backup_restore.rs`),
+/// and the comparison is the closure.  Manufacturing a `PlatformHandle` from
+/// that `u64` would fabricate a closure that no owner ever issued, and
+/// `I05.27` forbids it: "fields affecting authority, scope, ordering, privacy
+/// or effect cannot be omitted/defaulted silently."  No `PlatformHandle`-shaped
+/// purge or revocation closure handle is owner-issued anywhere in the tree.
+///
+/// "Restoration requirements" is not an architecture term at all — it appears in
+/// no `docs/architecture/` document, and no presented preparation request or
+/// destination admission carries such a field.  The real requirement-bearing
+/// artifact is the *restoration receipt* (`I05.13:40`), and that is owner-issued
+/// per blob at restore time by the backup owner from the admitted key manifest
+/// (`issue_restoration_receipts`,
+/// `crates/storage/eliot-backup/src/portable_recovery.rs`).  It does not exist
+/// before restore runs, so an allocation recorded earlier cannot bind it, and
+/// the two unrelated `restore_requirements: Vec<String>` fields in the tree
+/// (`crates/eliot-types/src/cognition.rs`,
+/// `crates/smart/eliot-memory-curation/src/lib.rs`) are memory-curation
+/// candidate text about a reversible action, not a backup or restore identity.
+///
+/// A `PlatformHandle` is a claim that some owner issued this exact identity
+/// (`I05.27`, "Canonical operation identity").  A field whose only honest
+/// content is a counter or a proposal has no such owner, so the fields are
+/// absent: an allocation that named them could only have named a fabrication.
 ///
 /// Refusal is structural, not procedural.  The type carries no approval field
 /// and has no conversion to `ApprovedGeneration`, so an allocated destination
@@ -2853,10 +2897,6 @@ pub struct IsolatedInstallationAllocation {
     pub target_build_ref: PlatformHandle,
     /// Admitted target profile the destination is allocated for.
     pub target_profile: InstallationProfile,
-    /// Restoration requirements the caller proposed for this destination.
-    pub proposed_restoration_requirements: PlatformHandle,
-    /// Purge/reference closure observed by the caller when it allocated.
-    pub purge_reference_closure: PlatformHandle,
 }
 
 impl IsolatedInstallationAllocation {
@@ -2907,14 +2947,6 @@ impl IsolatedInstallationAllocation {
             (
                 &self.target_build_ref,
                 "isolated_installation_allocation.target_build_ref",
-            ),
-            (
-                &self.proposed_restoration_requirements,
-                "isolated_installation_allocation.proposed_restoration_requirements",
-            ),
-            (
-                &self.purge_reference_closure,
-                "isolated_installation_allocation.purge_reference_closure",
             ),
         ] {
             handle(value, field)?;
