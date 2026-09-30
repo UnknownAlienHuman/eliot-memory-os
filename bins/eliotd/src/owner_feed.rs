@@ -8,11 +8,19 @@
 //! This module owns the daemon (O1) side of the durable owner chain: the one
 //! production [`OwnerPublishPort`] implementation against the Kernel front-door
 //! `publish_owner_bundle` / `query_owner_bundle` operations, and the trigger
-//! that drives [`synchronize_kernel_owner`](eliot_governor::GovernorComposition::synchronize_kernel_owner)
-//! on provider-revision advance and on recovery. The feed exchange itself
+//! that drives [`synchronize_owner_feed_with_canonical_receipts`] on
+//! provider-revision advance and on recovery. The feed exchange itself
 //! (read, restore, serve, publish, readback verification) stays in
-//! `eliot-governor`; this module only binds it to the live composition and
-//! the authenticated transport.
+//! `eliot-governor`; this module only binds it to the live plan it captured
+//! and the authenticated transport.
+//!
+//! This module does not drive
+//! `eliot_governor::GovernorComposition::synchronize_kernel_owner`, or either
+//! of its canonical-receipt/quarantine-evidence siblings: those three methods
+//! have no caller anywhere in the repository and are only bound-snapshot
+//! wrappers over the same free functions. The trigger in this module calls
+//! the free function directly. Whether those methods are wired or retired is
+//! an owner decision, so nothing in this module depends on them.
 //!
 //! Forbidden boundary: no ORS access (the Kernel owns ORS in its own
 //! process), no second grant graph, no epoch invention, no secret bytes, no
