@@ -4495,7 +4495,7 @@ impl KernelComposition {
                 session_binding,
                 request,
                 identity,
-                admitted_task_id,
+                &admitted_task_id,
             )
             .await;
         let response = serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?;
