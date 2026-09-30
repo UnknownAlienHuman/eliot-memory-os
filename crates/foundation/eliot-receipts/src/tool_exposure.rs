@@ -1325,6 +1325,439 @@ impl ToolExposureHistoryEntry {
     }
 }
 
+/// Refuses a second supply for one recorded history stage.
+///
+/// Recorded owner evidence is never overwritten in place: a changed observation
+/// persists as a successor revision through [`dispose_exposure_revision`], never
+/// as a rewrite of the recorded fact.
+fn require_stage_unrecorded(
+    stage: &OwnerStageFact,
+    field: &'static str,
+) -> Result<(), ToolExposureError> {
+    if stage.observed.is_some() {
+        return Err(ToolExposureError::InvalidField {
+            field,
+            reason: "recorded stage evidence is never overwritten; persist a successor revision",
+        });
+    }
+    Ok(())
+}
+
+impl ToolExposureHistoryEntry {
+    /// Records the registration fact from the definition/facet owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference (the `canonical-name@profile-version` evidence staged
+    /// by the semantic-registry owner). No neighbouring stage is read or
+    /// inferred, and an already recorded registration is never overwritten —
+    /// a changed owner verdict persists as a successor revision through the
+    /// existing observation/receipt path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_registered(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.registered, "history.registered")?;
+        self.registered = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the advertisement fact from the publish-seam owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference (the surface-decision reference that rendered the
+    /// advertised surface). Advertisement never implies eligibility, and an
+    /// already recorded advertisement is never overwritten — a changed owner
+    /// verdict persists as a successor revision through the existing
+    /// observation/receipt path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_advertised(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.advertised_to_route, "history.advertised_to_route")?;
+        self.advertised_to_route = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the eligibility fact from the scope/policy/grant owners.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference (the Governor/Kernel grant verdict bound to the
+    /// surface decision). Eligibility is never inferred from advertisement or
+    /// selection, and an already recorded eligibility is never overwritten —
+    /// a changed owner verdict persists as a successor revision through the
+    /// existing observation/receipt path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_eligible(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(
+            &self.eligible_under_scope_policy_and_grant,
+            "history.eligible_under_scope_policy_and_grant",
+        )?;
+        self.eligible_under_scope_policy_and_grant =
+            OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the planner/model selection fact from the selection owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. No neighbouring stage is read or inferred, and an
+    /// already recorded selection is never overwritten. The dispatch admission
+    /// seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_selected(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(
+            &self.selected_by_planner_or_model,
+            "history.selected_by_planner_or_model",
+        )?;
+        self.selected_by_planner_or_model = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the call fact from the execution owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. Selection, transport, and delivery stages are never
+    /// inferred from the call, and an already recorded call is never
+    /// overwritten. The execution seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_called(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.called, "history.called")?;
+        self.called = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the transport-completion fact from the transport owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. Transport completion never implies delivery
+    /// completeness, and an already recorded transport fact is never
+    /// overwritten. The transport seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_transport_completed(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.transport_completed, "history.transport_completed")?;
+        self.transport_completed = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the delivery-completeness fact from the bridge/host projection owner.
+    ///
+    /// Delivery and its owner source reference are set as one pair: a supplied
+    /// delivery without its projection source fails, and unknown coverage stays
+    /// `None`. Execution and transport stages are never re-read here, and a
+    /// recorded delivery is never overwritten — a later authorized expansion
+    /// persists as a successor revision. The bridge/host projection seam is the
+    /// STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when delivery is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_delivery(
+        mut self,
+        delivery: ResultDelivery,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        if self.result_delivery.is_some() {
+            return Err(ToolExposureError::InvalidField {
+                field: "history.result_delivery",
+                reason: "recorded delivery evidence is never overwritten; persist a successor revision",
+            });
+        }
+        text(&source_ref, "history.delivery_source_ref")?;
+        self.result_delivery = Some(delivery);
+        self.delivery_source_ref = Some(source_ref);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the expansion/retry fact from the retry owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. Retry never implies progress — the no-progress signal
+    /// stays with the repeat-detection owner — and an already recorded retry
+    /// fact is never overwritten. The retry seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_retry(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.expanded_or_retried, "history.expanded_or_retried")?;
+        self.expanded_or_retried = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the observable-use fact from the use owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. Observable use requires a public action/decision/
+    /// verifier link carried in the source reference; delivery alone never
+    /// implies use, and an already recorded use fact is never overwritten. The
+    /// verifier/use seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_use(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(
+            &self.observably_used_in_decision_action_or_verifier,
+            "history.observably_used_in_decision_action_or_verifier",
+        )?;
+        self.observably_used_in_decision_action_or_verifier =
+            OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the terminal task/product outcome reference from the outcome owner.
+    ///
+    /// Only the outcome reference is set; no stage is inferred from it, and a
+    /// recorded outcome is never overwritten — a later outcome persists as a
+    /// successor revision. The task-completion seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an outcome is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_outcome(mut self, outcome_ref: String) -> Result<Self, ToolExposureError> {
+        if self.terminal_task_or_product_outcome_ref.is_some() {
+            return Err(ToolExposureError::InvalidField {
+                field: "history.terminal_task_or_product_outcome_ref",
+                reason: "a recorded outcome reference is never overwritten; persist a successor revision",
+            });
+        }
+        text(&outcome_ref, "history.terminal_task_or_product_outcome_ref")?;
+        self.terminal_task_or_product_outcome_ref = Some(outcome_ref);
+        self.validate()?;
+        Ok(self)
+    }
+}
+
+/// Replay disposition for one exposure-history revision against the recorded prior.
+///
+/// Returned by [`dispose_exposure_revision`]. A signal is evidence for the
+/// existing observation/receipt/outbox owner; it is never permission to execute
+/// again. [`ExposureRevisionDisposition::IdempotentReplay`] obliges the owner to
+/// reconcile the original event — persist nothing new and record no new use —
+/// while a [`ExposureRevisionDisposition::SuccessorRevision`] persists alongside
+/// the retained prior, never as an overwrite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExposureRevisionDisposition {
+    /// No prior recorded revision on this lineage: the entry persists first.
+    FirstRevision,
+    /// Same lineage with identical recorded evidence: a replayed publication,
+    /// not new work.
+    IdempotentReplay,
+    /// Same lineage with divergent recorded evidence: a later linked revision
+    /// of the same evaluation.
+    SuccessorRevision,
+}
+
+/// Classifies one owner-populated history entry against the recorded prior.
+///
+/// Both revisions validate first; recorded content then decides. Comparisons
+/// run on the revision lineage — tool definition and version, route, and the
+/// owner-joined turn/run/attempt/surface identities — never on a single stage:
+/// - no prior revision yields [`ExposureRevisionDisposition::FirstRevision`];
+/// - same lineage with identical recorded evidence yields
+///   [`ExposureRevisionDisposition::IdempotentReplay`];
+/// - same lineage with divergent recorded evidence yields
+///   [`ExposureRevisionDisposition::SuccessorRevision`], so a replay can
+///   produce neither duplicate execution nor false usage evidence;
+/// - different lineages fail as a typed error: they are not a revision pair
+///   and route back to their owners.
+///
+/// Unknown coverage never decides: `None` stages compare as recorded unknown
+/// on both sides, never coerced to `false` to force a replay or a successor.
+///
+/// # Errors
+///
+/// Returns an error when either revision is inconsistent or the two entries
+/// belong to different revision lineages.
+pub fn dispose_exposure_revision(
+    previous: Option<&ToolExposureHistoryEntry>,
+    current: &ToolExposureHistoryEntry,
+) -> Result<ExposureRevisionDisposition, ToolExposureError> {
+    current.validate()?;
+    let Some(previous) = previous else {
+        return Ok(ExposureRevisionDisposition::FirstRevision);
+    };
+    previous.validate()?;
+    if history_lineage(previous) != history_lineage(current) {
+        return Err(ToolExposureError::InvalidField {
+            field: "history.identities",
+            reason: "exposure revisions on different lineages are not a revision pair; route to their owners",
+        });
+    }
+    if previous == current {
+        Ok(ExposureRevisionDisposition::IdempotentReplay)
+    } else {
+        Ok(ExposureRevisionDisposition::SuccessorRevision)
+    }
+}
+
+/// Revision lineage of one history entry: the identities that join revisions
+/// of a single evaluation. Stage observations play no part in the lineage.
+type HistoryLineage<'a> = (
+    &'a str,
+    &'a str,
+    Option<&'a String>,
+    Option<&'a String>,
+    Option<&'a String>,
+    Option<&'a String>,
+    Option<&'a String>,
+);
+
+fn history_lineage(entry: &ToolExposureHistoryEntry) -> HistoryLineage<'_> {
+    (
+        entry.tool_definition.as_str(),
+        entry.definition_version.as_str(),
+        entry.route_fingerprint.as_ref(),
+        entry.identities.turn_ref.as_ref(),
+        entry.identities.run_ref.as_ref(),
+        entry.identities.attempt_ref.as_ref(),
+        entry.identities.surface_ref.as_ref(),
+    )
+}
+
+/// One replay-safe exposure-history revision packaged for the existing
+/// observation/receipt/outbox path.
+///
+/// This boundary performs no store write: the observation owner persists
+/// [`ExposureHistoryRevision::entry`] for
+/// [`ExposureRevisionDisposition::FirstRevision`] and
+/// [`ExposureRevisionDisposition::SuccessorRevision`] alongside the retained
+/// prior, keyed by [`ExposureHistoryRevision::lineage_digest`], and reconciles
+/// the original event for [`ExposureRevisionDisposition::IdempotentReplay`]
+/// where the entry is `None` so a replay cannot persist a duplicate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExposureHistoryRevision {
+    /// Replay disposition of the current entry against the recorded prior.
+    pub disposition: ExposureRevisionDisposition,
+    /// Stable digest of the revision lineage joining one evaluation's revisions.
+    pub lineage_digest: String,
+    /// Canonical digest of the current entry bytes.
+    pub entry_digest: String,
+    /// The validated entry to persist, or `None` for an idempotent replay.
+    pub entry: Option<ToolExposureHistoryEntry>,
+}
+
+/// Packages one owner-populated history entry as a replay-safe revision for
+/// the existing observation/receipt/outbox path.
+///
+/// The entry is classified with [`dispose_exposure_revision`], then bound to
+/// its lineage and canonical digests computed over canonical JSON bytes. The
+/// observation/receipt/outbox owner (STITCH caller) performs the durable
+/// write; this constructor only guarantees the revision is validated,
+/// replay-safe, and content-addressed before it leaves this boundary.
+///
+/// # Errors
+///
+/// Returns an error when either revision is inconsistent, the two entries
+/// belong to different lineages, or canonical bytes cannot be produced.
+pub fn persist_exposure_history_revision(
+    previous: Option<&ToolExposureHistoryEntry>,
+    current: &ToolExposureHistoryEntry,
+) -> Result<ExposureHistoryRevision, ToolExposureError> {
+    let disposition = dispose_exposure_revision(previous, current)?;
+    let lineage_digest = digest_history_lineage(current)?;
+    let entry_digest = digest_history_entry(current)?;
+    let entry = match disposition {
+        ExposureRevisionDisposition::IdempotentReplay => None,
+        ExposureRevisionDisposition::FirstRevision
+        | ExposureRevisionDisposition::SuccessorRevision => Some(current.clone()),
+    };
+    Ok(ExposureHistoryRevision {
+        disposition,
+        lineage_digest,
+        entry_digest,
+        entry,
+    })
+}
+
+/// Canonical digest of one history entry's recorded bytes.
+fn digest_history_entry(entry: &ToolExposureHistoryEntry) -> Result<String, ToolExposureError> {
+    let bytes =
+        crate::canonical_json_bytes(entry).map_err(|_| ToolExposureError::InvalidField {
+            field: "history.revision",
+            reason: "exposure history entry is not canonically serializable",
+        })?;
+    Ok(crate::sha256_hex(&bytes))
+}
+
+/// Canonical digest of one history entry's revision lineage.
+fn digest_history_lineage(entry: &ToolExposureHistoryEntry) -> Result<String, ToolExposureError> {
+    let bytes = crate::canonical_json_bytes(&history_lineage(entry)).map_err(|_| {
+        ToolExposureError::InvalidField {
+            field: "history.revision",
+            reason: "exposure history lineage is not canonically serializable",
+        }
+    })?;
+    Ok(crate::sha256_hex(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
