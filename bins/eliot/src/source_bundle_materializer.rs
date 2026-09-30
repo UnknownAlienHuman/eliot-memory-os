@@ -2719,6 +2719,7 @@ mod tests {
             "eliot-testd.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
+            "eliot-user-broker.exe",
             "eliot-notify.exe",
         ]
         .into_iter()
@@ -2784,6 +2785,7 @@ mod tests {
             eliot_testd_exe: PathBuf::new(),
             eliot_native_worker_exe: PathBuf::new(),
             eliot_wasm_host_exe: PathBuf::new(),
+            eliot_user_broker_exe: PathBuf::new(),
             eliot_notify_exe: PathBuf::new(),
             agent_bridge_exe: None,
             agent_bridge_account: None,
