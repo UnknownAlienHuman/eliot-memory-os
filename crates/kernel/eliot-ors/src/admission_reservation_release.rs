@@ -440,9 +440,7 @@ pub fn cancel_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
     // rather than being flattened into "before commit".
     let proven = if record.activation_receipt.is_some() {
         AdmissionReservationCancellationCut::AfterActivation
-    } else if record.canonical_admission.is_some()
-        || record.canonical_admission_receipt.is_some()
-    {
+    } else if record.canonical_admission.is_some() || record.canonical_admission_receipt.is_some() {
         AdmissionReservationCancellationCut::AfterCanonicalCommitBeforeActivation
     } else {
         AdmissionReservationCancellationCut::BeforeCanonicalCommit
@@ -477,10 +475,17 @@ pub enum AdmissionReservationRowDisposition {
     /// `AdmissionReservationRecord`: it is under the typed owner, and its
     /// authority is exactly what its own state and the launch-prerequisite
     /// verifier say — never more.
+    ///
+    /// The snapshot is boxed so this disposition stays small: the two legacy
+    /// variants carry only identities, a phase, a digest and a reason, so an
+    /// unboxed snapshot would make every quarantine/refusal result carry ~1.4 KB
+    /// it never uses. `AdmissionReservationSnapshot` is a single owner readback
+    /// that consumers immediately dereference, so the indirection costs one
+    /// pointer and changes nothing they do.
     Migrated {
         /// Exact typed owner record and store-issued receipt read back under the
         /// row's identity.
-        snapshot: AdmissionReservationSnapshot,
+        snapshot: Box<AdmissionReservationSnapshot>,
     },
     /// The row carries only the retired opaque operational-input payload. It is
     /// retained as evidence, is never deserialized into the typed record, and
@@ -563,7 +568,9 @@ pub fn disposition_admission_reservation_row<S: OperationalRecoveryStore + ?Size
                         .to_owned(),
                 });
             }
-            Ok(AdmissionReservationRowDisposition::Migrated { snapshot })
+            Ok(AdmissionReservationRowDisposition::Migrated {
+                snapshot: Box::new(snapshot),
+            })
         }
         Ok(None) => Err(OrsError::ReservationNotFound),
         // A durable reservation row the typed owner refuses is the retired

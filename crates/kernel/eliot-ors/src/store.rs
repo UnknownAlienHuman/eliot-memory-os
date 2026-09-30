@@ -31442,6 +31442,35 @@ impl RedbRecoveryStore {
         ))
     }
 
+    /// Whether one admission-reservation state may legally be the source of a
+    /// transition to `target` (I14.20:94-96, #1678 section 8).
+    ///
+    /// `STAGED_INACTIVE` and `RECONCILING` reach every target, which keeps the
+    /// activation path (`-> ACTIVE`) intact. `ACTIVE` reaches exactly `RELEASED` and
+    /// `RECONCILING`, so an active reservation can be disposed of or handed to
+    /// recovery by its owning execution/recovery path. I14.20:99 keeps expiry
+    /// narrower — "an active reservation attached to a nonterminal attempt cannot be
+    /// expired as cleanup" — so `ACTIVE -> EXPIRED` has no arm here and stays
+    /// refused. `RELEASED` and `EXPIRED` are terminal and are never a source.
+    ///
+    /// The match is exhaustive so a future `AdmissionReservationState` variant
+    /// cannot silently default to a legal source.
+    fn legal_admission_reservation_source(
+        state: AdmissionReservationState,
+        target: AdmissionReservationState,
+    ) -> bool {
+        match state {
+            AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling => {
+                true
+            }
+            AdmissionReservationState::Active => matches!(
+                target,
+                AdmissionReservationState::Released | AdmissionReservationState::Reconciling
+            ),
+            AdmissionReservationState::Released | AdmissionReservationState::Expired => false,
+        }
+    }
+
     fn prepare_admission_reservation_transition(
         record: &mut AdmissionReservationRecord,
         spec: AdmissionReservationTransitionSpec<'_>,
@@ -31504,16 +31533,8 @@ impl RedbRecoveryStore {
         // reservation attached to a nonterminal attempt cannot be expired as
         // cleanup" — so `ACTIVE -> EXPIRED` has no arm here and stays refused.
         // The match is exhaustive so a future state can never default to legal.
-        let legal_source = match record.state {
-            AdmissionReservationState::StagedInactive
-            | AdmissionReservationState::Reconciling => true,
-            AdmissionReservationState::Active => matches!(
-                target,
-                AdmissionReservationState::Released | AdmissionReservationState::Reconciling
-            ),
-            AdmissionReservationState::Released | AdmissionReservationState::Expired => false,
-        };
-        if record.state == target || !legal_source {
+        if record.state == target || !Self::legal_admission_reservation_source(record.state, target)
+        {
             return Err(OrsError::InvalidTransition);
         }
         if spec.now_ms() < record.updated_at_ms {
