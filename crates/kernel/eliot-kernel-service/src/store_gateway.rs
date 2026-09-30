@@ -5598,8 +5598,8 @@ impl KernelStoreGateway {
         Ok(())
     }
 
-    /// Compiles and publishes the bounded recurring wake horizon this committed
-    /// operation owns, if any.
+    /// Retains, then publishes, the one bounded wake horizon a committed
+    /// operator operation owns, if any.
     ///
     /// `Create`, a `Resume` of the same immutable revision, and an `Edit` that
     /// committed a new `Active` revision each own exactly one publication
@@ -5618,16 +5618,10 @@ impl KernelStoreGateway {
     /// #2806: a committed configuration plus an explicit publication obligation,
     /// never a silent success.
     ///
-    /// The publication is retained in the composition-bound durable outbox under
-    /// its original owner operation identity before it is issued. The requested
-    /// occurrence identities are a deterministic function of the immutable
-    /// committed revision and the trigger, so a replay of the same parent
-    /// operation finds the same retained record: an answered publication serves
-    /// the owner's retained acknowledgement verbatim, and a publication whose
-    /// effect may already have been issued is reported as an unknown outcome
-    /// under its retained identity instead of being issued a second time. The
-    /// retry handle stays the derived name of the remaining set; the retained
-    /// record is what a restart actually resumes.
+    /// This entry point only decides whether a horizon exists and compiles it.
+    /// Retaining and publishing it is [`Self::retain_and_publish_wake_horizon`],
+    /// the single owner of that sequence, which the post-disposition slice a due
+    /// wake advances reaches through [`Self::publish_due_wake_horizon_advance`].
     async fn publish_schedule_horizon<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -5664,6 +5658,45 @@ impl KernelStoreGateway {
             None,
         )
         .map_err(|error| error.to_string())?;
+        let (obligation, phase) = self
+            .retain_and_publish_wake_horizon(sealed, revision, &publication, runtime)
+            .await?;
+        obligations.extend(obligation);
+        Ok(Some(phase))
+    }
+
+    /// Retains and then publishes one bounded wake horizon, for any caller that
+    /// already proved the slice belongs to an immutable revision it may publish.
+    ///
+    /// This is the ONLY implementation of the horizon obligation route, and both
+    /// of its entry points run it unchanged: [`Self::publish_schedule_horizon`]
+    /// for the horizon a committed `Create`/`Resume`/`Edit` owns, and
+    /// [`Self::publish_due_wake_horizon_advance`] for the post-disposition slice
+    /// a due wake advances. Neither may re-derive any part of it, so the
+    /// composition-bound durable outbox, the retained-obligation
+    /// classification, the possible-effect marking and the acknowledgement
+    /// settlement each have exactly one owner and there is no second durable
+    /// write path.
+    ///
+    /// The publication is an owner effect, so its intent is retained before
+    /// anything is handed to the schedule owner, in the composition-bound durable
+    /// outbox under its original owner operation identity. A record that could
+    /// not be retained is a named unavailability: nothing is issued, and the
+    /// horizon keeps its exact requested and remaining sets beside it.
+    ///
+    /// The returned obligation is present exactly when a durable record backs
+    /// this publication. `None` is a pre-retention answer — nothing was retained
+    /// and nothing was issued, so there is no record a reconciliation could read.
+    async fn retain_and_publish_wake_horizon<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        publication: &UserAutomationWakeHorizonPublication,
+        runtime: Option<&R>,
+    ) -> Result<(Option<UserAutomationRuntimeObligation>, UserAutomationHorizonPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
         let requested_occurrence_ids = publication.requested_occurrence_ids();
         let retry_handle = publication
             .retry_handle(&requested_occurrence_ids)
@@ -5675,23 +5708,20 @@ impl KernelStoreGateway {
         // this principal and fence. A revision that a concurrent pause,
         // remove, or superseding edit already moved is not published from a
         // stale commit: that leg owns the wake disposition instead.
-        if let Err(reason) = self
-            .revalidate_horizon_owner(sealed, revision, &publication)
-            .await
+        if let Err((kind, reason)) =
+            self.revalidate_horizon_owner(sealed, revision, publication).await
         {
-            let (kind, reason) = reason;
-            return Ok(Some(unreached_horizon_phase(
-                &publication,
-                &requested_occurrence_ids,
-                retry_handle,
-                kind,
-                &reason,
-            )));
+            return Ok((
+                None,
+                unreached_horizon_phase(
+                    publication,
+                    &requested_occurrence_ids,
+                    retry_handle,
+                    kind,
+                    &reason,
+                ),
+            ));
         }
-        // The publication is an owner effect, so its intent is retained before
-        // anything is handed to the schedule owner. A record that could not be
-        // retained is a named unavailability: nothing is issued, and the horizon
-        // keeps its exact requested and remaining sets beside it.
         let mut obligation = match retained_user_automation_obligation(
             UserAutomationRuntimeObligationKind::WakeHorizonPublication,
             &sealed.identity,
@@ -5702,12 +5732,15 @@ impl KernelStoreGateway {
         ) {
             Ok(obligation) => obligation,
             Err(error) => {
-                return Ok(Some(unretained_wake_horizon_phase(
-                    &publication,
-                    &requested_occurrence_ids,
-                    &retry_handle,
-                    error.to_string(),
-                )));
+                return Ok((
+                    None,
+                    unretained_wake_horizon_phase(
+                        publication,
+                        &requested_occurrence_ids,
+                        &retry_handle,
+                        error.to_string(),
+                    ),
+                ));
             }
         };
         // The retained record is consulted first, so an answered or reconciling
@@ -5732,37 +5765,185 @@ impl KernelStoreGateway {
             .reconcile_wake_horizon_possible_effect(
                 runtime,
                 &mut obligation,
-                &publication,
+                publication,
                 &requested_occurrence_ids,
                 &retry_handle,
             )
             .await?
         {
-            obligations.push(obligation);
-            return Ok(Some(phase));
+            return Ok((Some(obligation), phase));
         }
-        let retained = classify_retained_horizon_publication(&obligation, &publication, retained);
+        let retained = classify_retained_horizon_publication(&obligation, publication, retained);
         if let Some(phase) = retained_horizon_phase(
             retained,
             &mut obligation,
-            &publication,
+            publication,
             &requested_occurrence_ids,
             &retry_handle,
         ) {
-            obligations.push(obligation);
-            return Ok(Some(phase));
+            return Ok((Some(obligation), phase));
         }
-        let phase = self
+        let (settled, phase) = self
             .issue_wake_horizon(
                 &obligation,
                 runtime,
-                &publication,
+                publication,
                 &requested_occurrence_ids,
                 retry_handle,
             )
             .await?;
-        obligations.push(phase.0);
-        Ok(Some(phase.1))
+        Ok((Some(settled), phase))
+    }
+
+    /// Retains, then publishes, the one bounded recurring horizon slice a due
+    /// wake's post-disposition advance owns (issue #2806 items 6, W6 and W8, and
+    /// the lost-response half of A3).
+    ///
+    /// This is the entry point that makes the retention route reachable for that
+    /// advance. Until now [`Self::publish_schedule_horizon`] was the only caller
+    /// of the `retained_user_automation_obligation` →
+    /// [`Self::mark_wake_horizon_obligation_possible_effect`] →
+    /// [`Self::settle_wake_horizon_acknowledgement`] sequence, so the due-wake
+    /// consumer reached [`UserAutomationWakePort::publish_wake_horizon`]
+    /// directly and a lost response to its post-disposition slice had nothing to
+    /// resume from. This runs the SAME sequence, through the SAME
+    /// [`Self::retain_and_publish_wake_horizon`] the operator route runs, over the
+    /// SAME composition-bound outbox: no second durable write path, no second
+    /// copy of the retained-obligation classification, no process-local retry
+    /// ledger and no detached scheduler loop.
+    ///
+    /// **How a lost response resumes, and under which identity.** The obligation
+    /// key is `runtime_obligation_operation_id(kind, parent, subject_ids)` over
+    /// the admitted due-wake carrier's parent identity triple, the existing
+    /// `WakeHorizonPublication` kind, and this slice's exact requested occurrence
+    /// set. All three are immutable content — the revision is immutable, the
+    /// cursor is positional, and the consumed occurrence is excluded from its own
+    /// slice — so the key is byte-identical after a restart. A repeat delivery of
+    /// the same due wake therefore FINDS the same row: an answered row serves the
+    /// owner's retained acknowledgement verbatim instead of republishing, and a
+    /// row that already reached the monotonic `Routed` state is put to the
+    /// schedule owner as a possible effect under that same original owner
+    /// operation identity instead of being re-issued. A later calendar occurrence
+    /// advances a different set, so it keys a different record rather than
+    /// overwriting this one — which is I11.12's "a later calendar occurrence is a
+    /// different identity" held in the durable store and not only in the
+    /// compiler.
+    ///
+    /// The parent is the admitted due-wake carrier's identity, not an operator
+    /// commit's: the advance is not a committed operator operation and mints no
+    /// canonical identity of its own (see
+    /// [`Self::due_wake_horizon_parent_request`]).
+    ///
+    /// The returned obligation is present exactly when a durable record backs
+    /// this publication. `None` is a pre-retention answer — nothing was retained
+    /// and nothing was issued, so there is no record a reconciliation could read.
+    /// The returned `Err` is a slice this boundary cannot even bind or name
+    /// coherently, which the caller must project as an unknown outcome rather
+    /// than as a clean absence of work.
+    pub async fn publish_due_wake_horizon_advance<R>(
+        &self,
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        publication: &UserAutomationWakeHorizonPublication,
+        runtime: &R,
+    ) -> Result<(Option<UserAutomationRuntimeObligation>, UserAutomationHorizonPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let sealed = Self::due_wake_horizon_parent_request(request, resolution);
+        Self::validate_due_wake_horizon_advance(&sealed, resolution, publication)?;
+        self.retain_and_publish_wake_horizon(
+            &sealed,
+            &resolution.revision,
+            publication,
+            Some(runtime),
+        )
+        .await
+    }
+
+    /// Composes the retained-parent request one due-wake horizon advance is
+    /// issued under.
+    ///
+    /// The advance follows an owner-acknowledged occurrence disposition; it is
+    /// not a committed operator operation, so it owns no sealed operator request
+    /// and must mint no canonical identity for one. It reuses the admitted
+    /// due-wake carrier's identity, principal and live request metadata — the
+    /// same triple [`Self::due_wake_execution_join`] reads — and names the
+    /// read-only `Status` view of the exact revision this advance publishes for,
+    /// so the retained record is bound to the occurrence's own parent operation
+    /// and this leg issues no transition.
+    fn due_wake_horizon_parent_request(
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+    ) -> UserAutomationServiceRequest {
+        UserAutomationServiceRequest {
+            context: request.context.clone(),
+            authenticated_principal: request.authenticated_principal.clone(),
+            identity: request.identity.clone(),
+            intent: UserAutomationOperatorIntent {
+                intent_id: format!(
+                    "{}:due-wake-horizon-advance",
+                    request.identity.operation_id.as_str()
+                ),
+                principal_ref: request.authenticated_principal.clone(),
+                state_fence: request.context.state_fence.clone(),
+                operation: UserAutomationOperation::Status {
+                    automation_id: resolution.revision.automation_id.clone(),
+                },
+            },
+        }
+    }
+
+    /// Binds one caller-supplied horizon slice to the due-wake carrier and the
+    /// resolved revision it must be retained under, before anything is retained
+    /// or issued.
+    ///
+    /// A horizon request carries its own context, identity, fence and revision
+    /// binding, so a caller could otherwise hand this boundary a slice that is
+    /// internally valid but belongs to a different carrier or a different
+    /// revision than the due wake actually resolved. The durable record is keyed
+    /// on the parent identity and the slice's own subject set, so accepting one
+    /// of those would retain a real obligation under a false parent. The
+    /// revision-relative proof itself is
+    /// [`UserAutomationWakeHorizonPublication::validate_against_revision`], the
+    /// same function `advance_wake_horizon` already ran; it is repeated here
+    /// because the caller, not this boundary, chose the value.
+    fn validate_due_wake_horizon_advance(
+        sealed: &UserAutomationServiceRequest,
+        resolution: &UserAutomationDueWakeResolution,
+        publication: &UserAutomationWakeHorizonPublication,
+    ) -> Result<(), String> {
+        // The retained row's fence digest, Authority Epoch, generation and
+        // retention instant all derive from the parent request, while every wake
+        // intent in this slice is bound to the publication's own fence. A slice
+        // whose two fences differ would retain a record under a fence its own
+        // entries were never compiled for, so no record is written at all.
+        if publication.state_fence != sealed.context.state_fence {
+            return Err(
+                "the bounded horizon slice after the admitted occurrence is issued under a \
+                 State Fence that is not the one its retained obligation would be recorded \
+                 under; nothing was retained and nothing was sent"
+                    .to_owned(),
+            );
+        }
+        if publication.trigger != UserAutomationHorizonTrigger::DispositionAdvance
+            || publication.revision_digest != resolution.revision_digest
+        {
+            return Err(
+                "the horizon slice handed to the due-wake advance is not the bounded advance of \
+                 the revision this due wake resolved; nothing was retained and nothing was sent"
+                    .to_owned(),
+            );
+        }
+        publication
+            .validate_against_revision(&resolution.revision)
+            .map_err(|error| {
+                format!(
+                    "the bounded horizon slice after the admitted occurrence is not a slice of \
+                     the resolved revision's own normalized contract: {error}; nothing was \
+                     retained and nothing was sent"
+                )
+            })
     }
 
     /// Makes one schedule owner's own acknowledgement the durable retained body
