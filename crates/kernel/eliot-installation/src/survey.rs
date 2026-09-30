@@ -23,6 +23,14 @@
 //! existing `SurrealDB` process or installation stays an observation or import
 //! candidate: this module records no adopt, reuse, kill or port decision, and
 //! `I3.15` keeps the `InstallationTransaction` the single installation owner.
+//!
+//! The one of those states a survey *does* carry is `unsupported`: a catalogue
+//! entry whose `supported_platforms` excludes the surveyed platform is reported
+//! in [`InstallationSurvey::unsupported_families`] and is never walked. A family
+//! the accepted revision excludes here therefore cannot appear as a detection
+//! result that merely found nothing, which is what makes "all seed families are
+//! accounted for as supported detection or an explicit gap" true of the report
+//! rather than only of the catalogue.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -230,6 +238,24 @@ pub struct SurveyFamilyReport {
     pub candidates: Vec<SurveyCandidate>,
 }
 
+/// One catalogue family this survey explicitly reports as unsupported.
+///
+/// `I3.3.1` declares `supported_platforms` per entry and requires `unsupported`
+/// to be shown separately from a detection result. A recipe the accepted
+/// revision does not declare valid on the platform being surveyed therefore
+/// belongs here and is never walked: it has no stage result, no candidate and
+/// no evidence, because this survey says nothing about it in either direction.
+/// Reporting the gap is the point — an unsupported family must never be
+/// indistinguishable from a family that was surveyed and found nothing.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurveyUnsupportedFamily {
+    /// The catalogue family this gap is about.
+    pub family_id: PlatformHandle,
+    /// Discovery category carried by the validated catalogue entry.
+    pub category: IntegrationCategory,
+}
+
 /// A probe answer already produced by an executor admitted outside this
 /// coordinator.
 ///
@@ -301,11 +327,24 @@ pub struct InstallationSurvey {
     pub catalogue_revision: u64,
     /// One report per catalogue entry, ascending by family identity.
     pub families: Vec<SurveyFamilyReport>,
+    /// Catalogue entries whose recipe does not declare the surveyed platform,
+    /// ascending by family identity.
+    ///
+    /// Every catalogue entry appears in exactly one of [`Self::families`] and
+    /// this list, so a family that was not surveyed is reported as an explicit
+    /// gap instead of quietly disappearing from the report. This partition is an
+    /// internal consistency invariant of one survey; it is not the completeness
+    /// check. Completeness is owned by
+    /// [`IntegrationDiscoveryCatalogue::require_seed_family_coverage`](super::IntegrationDiscoveryCatalogue::require_seed_family_coverage),
+    /// which is checked against the independent `I3.3.1` seed set and never
+    /// against either of these two lists.
+    pub unsupported_families: Vec<SurveyUnsupportedFamily>,
 }
 
 impl InstallationSurvey {
-    /// Validates stage order, coverage partitioning, alias ordering and the
-    /// probe admission/answer correspondence.
+    /// Validates stage order, coverage partitioning, alias ordering, the
+    /// probe admission/answer correspondence and the surveyed/unsupported
+    /// partition.
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.catalogue_origin, "survey.catalogue_origin")?;
         if self.catalogue_revision == 0 {
@@ -368,11 +407,24 @@ impl InstallationSurvey {
             }
             validate_probe_stage_coverage(family)?;
         }
+        // The surveyed and explicitly-unsupported sets partition the accepted
+        // revision's entries. Overlap would let one family be reported both as
+        // a detection result and as an explicit gap.
+        let unsupported_ids = self
+            .unsupported_families
+            .iter()
+            .map(|family| family.family_id.clone())
+            .collect::<Vec<_>>();
+        validate_ascending("survey.unsupported_families.family_id", &unsupported_ids)?;
+        if unsupported_ids.iter().any(|id| families.contains(id)) {
+            return Err(InstallationError::IdentityConflict);
+        }
         Ok(())
     }
 }
 
-/// Surveys `catalogue` against `source` and returns the ordered report.
+/// Surveys `catalogue` against `source` on `observed_platform` and returns the
+/// ordered report.
 ///
 /// The catalogue is a set, so its entries are walked in ascending family order
 /// and the source's per-stage observations are sorted before use: reordering
@@ -381,10 +433,18 @@ impl InstallationSurvey {
 /// exact observed identity only, and every unavailable input keeps its own
 /// coverage state.
 ///
+/// `I3.3.1` declares `supported_platforms` per entry, so it is read here rather
+/// than only shape-validated: an entry that does not declare `observed_platform`
+/// is reported in
+/// [`InstallationSurvey::unsupported_families`](InstallationSurvey::unsupported_families)
+/// and is not walked, because a recipe the accepted revision excludes from this
+/// platform cannot support a detection claim about it.
+///
 /// `catalogue` is validated before traversal and its [`InstallationError`]
 /// surfaces unchanged; no second validation scheme applies here.
 pub fn survey_installation(
     catalogue: &IntegrationDiscoveryCatalogue,
+    observed_platform: &PlatformHandle,
     source: &dyn SurveyObservationSource,
     probe_answers: &[SurveyProbeAnswer],
 ) -> Result<InstallationSurvey, InstallationError> {
@@ -405,7 +465,23 @@ pub fn survey_installation(
     }
 
     let mut families = Vec::with_capacity(ordered.len());
+    let mut unsupported_families = Vec::new();
     for (family_id, entry) in ordered {
+        if !entry.supported_platforms.contains(observed_platform) {
+            // Fail closed for the same reason the identity case below does: an
+            // answer about a family this platform does not support says nothing
+            // about this installation, so it is refused rather than parked.
+            if answers.contains_key(&family_id) {
+                return Err(InstallationError::IncompleteObservation(
+                    "survey probe answer names a family unsupported on this platform".to_owned(),
+                ));
+            }
+            unsupported_families.push(SurveyUnsupportedFamily {
+                family_id,
+                category: entry.category,
+            });
+            continue;
+        }
         let empty = BTreeMap::new();
         let family_answers = answers.get(&family_id).unwrap_or(&empty);
         let report = survey_family(entry, source, family_answers)?;
@@ -419,6 +495,7 @@ pub fn survey_installation(
         catalogue_origin: catalogue.origin.clone(),
         catalogue_revision: catalogue.revision,
         families,
+        unsupported_families,
     };
     survey.validate()?;
     Ok(survey)

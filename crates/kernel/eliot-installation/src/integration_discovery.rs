@@ -414,7 +414,15 @@ pub struct IntegrationDiscoveryCatalogueEntry {
     pub family_id: PlatformHandle,
     /// Discovery category.
     pub category: IntegrationCategory,
-    /// Platforms on which the recipe is valid.
+    /// Platforms this recipe is valid on, per `I3.3.1`'s per-entry catalogue
+    /// schema.
+    ///
+    /// This is the catalogue's only per-recipe statement of where detection
+    /// applies, and it is load-bearing rather than descriptive: an entry that
+    /// excludes the platform being surveyed is reported by
+    /// [`survey_installation`](super::survey_installation) as an explicit
+    /// `unsupported` gap and is not walked, so a recipe cannot be counted as
+    /// supported detection on a platform its own entry excludes.
     pub supported_platforms: Vec<PlatformHandle>,
     /// Known executable/config/manifest locations.
     pub known_locations: Vec<PlatformHandle>,
@@ -722,6 +730,13 @@ impl IntegrationDiscoveryCatalogue {
     /// never derived from `self.entries`, so this is a coverage check and not a
     /// tautology. A seed family that is missing is an explicit gap; it is
     /// never reported as "not installed".
+    ///
+    /// Coverage is by declaration and category only, so a declared family may
+    /// still be excluded from the platform being surveyed. That case is the
+    /// entry's `supported_platforms` and is reported as an explicit
+    /// `unsupported` gap by
+    /// [`survey_installation`](super::survey_installation); it is not resolved
+    /// here, where no observed platform exists to resolve it against.
     ///
     /// # Errors
     /// Returns [`InstallationError::IncompleteObservation`] naming every
@@ -1039,7 +1054,12 @@ pub fn survey_accepted_installation(
     source: &dyn SurveyObservationSource,
 ) -> Result<AcceptedInstallationSurvey, CatalogueAdmissionError> {
     let accepted = load_accepted_catalogue(context)?;
-    let survey = super::survey_installation(accepted.catalogue(), source, &[])?;
+    let survey = super::survey_installation(
+        accepted.catalogue(),
+        context.observed_platform,
+        source,
+        &[],
+    )?;
     // The probe stage is deliberately answered with an empty answer set: this
     // coordinator runs no process, so the mandatory `I3.3` order ends in
     // `Withheld` for every identity rather than in a probe nobody executed.
