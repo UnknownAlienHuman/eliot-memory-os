@@ -281,6 +281,14 @@ sealed class FakeGovernorClient : IGovernorClient
     public bool ThrowUnknownOnce { get; set; }
     public bool RotateGeneration { get; set; }
 
+    // This fake has no broker-authenticated transport, so there is no
+    // redeemed grant to report. The production client reports null for any
+    // connection that is not live and authenticated, and null never
+    // authorizes: callers treat it as "let the transport authenticate",
+    // never as a capability. Fabricating a binding here would grant the
+    // harness capabilities no owner ever issued to it.
+    public OperatorRoleBinding? GrantedBinding => null;
+
     public Task<OperatorSnapshot> SnapshotAsync(
         string? projectId = null,
         string? taskId = null,
@@ -381,7 +389,7 @@ sealed class FakeGovernorClient : IGovernorClient
     }
 
     public Task<JsonElement> CommandAsync(
-        object commandEnvelope,
+        OperatorIntentEnvelope commandEnvelope,
         CancellationToken cancellationToken = default)
     {
         CommandCount++;
