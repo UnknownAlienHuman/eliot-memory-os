@@ -1145,21 +1145,31 @@ impl WorkClass {
     /// so there is exactly one capacity vocabulary in the tree.
     ///
     /// The mapping is total and has no invalid arm: `Control` names the
-    /// protected partition and the eight `Normal` classes name the normal
-    /// partition, so a class can never be admitted by a path that lets it draw
-    /// from the other one.
+    /// protected partition and every `Normal` class names the normal partition,
+    /// so a class can never be admitted by a path that lets it draw from the
+    /// other one.
+    ///
+    /// Which exhaustiveness is load-bearing, precisely: the **outer** `match` on
+    /// `WorkClass` is the compile-time gate, and it must stay a no-wildcard
+    /// match. A new work class is a new partition decision, so a new
+    /// `WorkClass` variant has to fail to compile here until someone says which
+    /// partition it draws from. The `Self::Normal(_)` arm is the second variant
+    /// of that same gate, not a wildcard on the type: because `WorkClass` has
+    /// exactly two top-level shapes today, naming the second one exhaustively
+    /// over the outer enum is what makes the match total. The *inner*
+    /// `NormalWorkClass` taxonomy is deliberately not enumerated, because there
+    /// is no per-variant decision here to fail on — a new `NormalWorkClass`
+    /// inherits `NormalWorkload`, which is the correct answer for anything named
+    /// `Normal`, so enumerating the eight would guard nothing and only invite
+    /// eight identical arms to drift. Should a future variant need a partition
+    /// other than `NormalWorkload`, the type must gain a third `WorkClass` shape
+    /// for it, and the outer match here will not compile until that shape is
+    /// given a partition explicitly.
     #[must_use]
     pub const fn capacity_class(self) -> CapacityClass {
         match self {
             Self::Control => CapacityClass::ProtectedControl,
-            Self::Normal(NormalWorkClass::Interactive) => CapacityClass::NormalWorkload,
-            Self::Normal(NormalWorkClass::Verification) => CapacityClass::NormalWorkload,
-            Self::Normal(NormalWorkClass::CanonicalWrite) => CapacityClass::NormalWorkload,
-            Self::Normal(NormalWorkClass::NormalBackground) => CapacityClass::NormalWorkload,
-            Self::Normal(NormalWorkClass::ModelJob) => CapacityClass::NormalWorkload,
-            Self::Normal(NormalWorkClass::Swarm) => CapacityClass::NormalWorkload,
-            Self::Normal(NormalWorkClass::Reporting) => CapacityClass::NormalWorkload,
-            Self::Normal(NormalWorkClass::Maintenance) => CapacityClass::NormalWorkload,
+            Self::Normal(_) => CapacityClass::NormalWorkload,
         }
     }
 
