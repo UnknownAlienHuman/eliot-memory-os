@@ -7097,14 +7097,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     }
 
     /// Admits the initial binding for a newly resolved scope (issue #1787,
-    /// bootstrap-constructor production caller).
+    /// bootstrap-constructor entry).
     ///
     /// Used when no retained owner exists yet: the bootstrap caller supplies
     /// the described scope, the binding it actually read, the current
     /// observation, and the source closure that authenticates it. Admission
     /// mints the owner only after descriptor agreement, clear identity legs,
     /// and a fresh `MATCHED` guard check at the retained fence. Persist the
-    /// minted owner with [`Self::install_admitted_work_scope_owner`].
+    /// minted owner with [`Self::install_admitted_work_scope_owner`]. Live
+    /// status: no production caller. `git grep -n admit_initial_scope_binding`
+    /// returns only this definition and one intra-doc link in
+    /// [`Self::install_admitted_work_scope_owner`]'s own doc. The nearest live
+    /// rebind entry is [`Self::admit_observed_scope_attach`], reached from the
+    /// daemon scope-attach ingress and persisting through the same
+    /// installer; no bootstrap ingress supplies the described scope this entry
+    /// requires. Whether one is wired to it or this entry is retired is an
+    /// owner decision.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     pub fn admit_initial_scope_binding(

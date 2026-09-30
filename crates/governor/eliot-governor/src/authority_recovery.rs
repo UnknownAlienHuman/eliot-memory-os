@@ -289,9 +289,22 @@ impl AuthorityOwnerSnapshot {
 
     /// Rehydrates the canonical owner parts from one durable owner payload.
     ///
-    /// This is the production constructor seam for a current payload. The
-    /// hydration registry is supplied by the durable owner record; it is never
-    /// replaced with an empty registry when the graph contains live lineage.
+    /// A four-argument pass-through to [`Self::new_with_owner_hydrations`]:
+    /// the hydration registry is supplied by the durable owner record and is
+    /// never replaced with an empty registry when the graph contains live
+    /// lineage. That property belongs to the constructor it delegates to, not
+    /// to this entry.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// from_durable_owner_payload` returns only this definition, and the live
+    /// recovery path is `GovernorComposition::from_recovery` in
+    /// `composition.rs`, which rebuilds the owner through
+    /// [`Self::new_with_owner_hydrations`] and then the private
+    /// `AuthorityOwner::from_snapshot` — a different constructor pair that
+    /// does not name this seam. Whether this entry is wired to that path or
+    /// retired is an owner decision.
     pub fn from_durable_owner_payload(
         state_fence: StateFence,
         grant_graph: GrantGraphRecoverySnapshot,
