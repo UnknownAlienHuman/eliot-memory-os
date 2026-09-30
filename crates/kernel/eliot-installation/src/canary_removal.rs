@@ -1781,9 +1781,7 @@ fn observed_handoff_barrier(
     installation: &PlatformHandle,
 ) -> Result<Option<PlatformHandle>, InstallationError> {
     if let Some(committed) = projection.committed_cutover_activation() {
-        if committed.target_generation == *generation
-            || committed.installation != *installation
-        {
+        if committed.target_generation == *generation || committed.installation != *installation {
             return Ok(None);
         }
         return Ok(Some(committed.operation_id.clone()));
