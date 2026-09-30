@@ -572,7 +572,7 @@ def _producer_check(
         _wsets = artifact.get("consumer_worksets")
         if not isinstance(_wsets, list):
             return "error", "consumer_worksets must be a list in the inventory artifact"
-        header, rows, worksets, _splits = producer._validate_artifact(
+        header, rows, worksets, splits = producer._validate_artifact(
             artifact, producer._measure_test_paths(root, _wsets)
         )
     except producer.InventoryError as exc:
@@ -580,12 +580,29 @@ def _producer_check(
     recorded_inventory_digest = str(artifact.get("inventory_digest", ""))
     try:
         # Validate the recorded inventory_digest over the artifact content.
+        #
+        # The canonicalisation MUST span the producer's own closed top-level
+        # key set -- header, rows, consumer_worksets AND proposed_splits --
+        # because that is exactly the mapping ``build_inventory`` digests
+        # (scripts/context_measurement_inventory.py: ``inventory["inventory_digest"]
+        # = _sha256(_canonical_bytes(inventory))``) and exactly the mapping its
+        # own ``_validate_artifact`` re-derives when it rejects
+        # ``DIGEST_MISMATCH``. Omitting ``proposed_splits`` here would hash a
+        # strict subset of the content, so the oracle would compare the
+        # producer's full-content digest against a narrower digest and report
+        # a mismatch on a perfectly valid artifact -- rejecting on a digest it
+        # itself normalised wrongly, and leaving the producer's actual split
+        # accounting unverified. Including it reproduces the producer's own
+        # normalisation; it does not relax the comparison, because the digest
+        # still has to be re-derived from the artifact content rather than
+        # trusted.
         recomputed_inventory_digest = _sha256(
             _canonical_bytes(
                 {
                     "header": header,
                     "rows": rows,
                     "consumer_worksets": worksets,
+                    "proposed_splits": splits,
                 }
             )
         )
