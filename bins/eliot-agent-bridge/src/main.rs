@@ -4934,6 +4934,7 @@ mod tests {
                         Request::ReactiveSnapshot => "reactive_snapshot",
                         Request::ReconcileExternal {} => "reconcile_external",
                         Request::RecoveryProjectionPage { .. } => "recovery_projection_page",
+                        Request::ResourceRead { .. } => "resource_read",
                         Request::RecoverNextPage {} => "recover_next_page",
                         Request::Reconnect { .. } => "reconnect",
                         Request::Detach { .. } => "detach",
@@ -5141,7 +5142,7 @@ mod tests {
             panic!("first successful response must carry the bootstrap")
         };
         assert!(
-            !carried.governance.limiting_integration_evidence.is_empty(),
+            !bootstrap.governance.limiting_integration_evidence.is_empty(),
             "bootstrap must carry limiting integration evidence"
         );
         let mut second = Response::Forwarded {
