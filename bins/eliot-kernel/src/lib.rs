@@ -616,6 +616,14 @@ pub struct KernelComposition {
         reason = "zero-sized marker binds the production Store-rebind seam"
     )]
     store_rebind_boundary: KernelStoreRebindProductionBoundary,
+    /// Canonical object path passed to the open that produced `p07_ors`.
+    /// Scan contours use this locator with identity/generation read back from
+    /// that retained handle; they never reopen the path to infer ORS identity.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "the authenticated scan contour is Windows-only")
+    )]
+    ors_object_path: PathBuf,
     work_root: PathBuf,
     runtime: Runtime,
     platform: Arc<WindowsPlatform>,

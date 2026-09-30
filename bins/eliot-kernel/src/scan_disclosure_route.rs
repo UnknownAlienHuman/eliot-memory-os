@@ -250,7 +250,7 @@ impl KernelComposition {
     ) -> Result<ScanDisclosureOwnerValue, TransportError> {
         match action {
             ScanDisclosureOwnerAction::IssueContour => {
-                let contour = Self::issue_scan_disclosure_contour(&self.work_root)?;
+                let contour = self.issue_scan_disclosure_contour(current)?;
                 Ok(ScanDisclosureOwnerValue::Contour { contour })
             }
             ScanDisclosureOwnerAction::IssueBinding => {
@@ -777,25 +777,38 @@ impl KernelComposition {
 
     #[cfg(windows)]
     fn issue_scan_disclosure_contour(
-        work_root: &std::path::Path,
+        &self,
+        current: &CurrentScanDisclosureActivation,
     ) -> Result<InstallationScanContour, TransportError> {
-        let object_path = work_root.join(".eliot").join("kernel-ors.redb");
-        let object_path =
-            std::fs::canonicalize(&object_path).map_err(|_| TransportError::PlanGap {
-                dependency: "kernel.ors_object_path_readback",
-                reason: "the live Kernel ORS object path could not be read back",
+        let host_binding = self
+            .eliotd_receipt_binding
+            .as_ref()
+            .ok_or(TransportError::PlanGap {
+                dependency: "kernel.host_installation_ors_binding",
+                reason: "this ORS composition has no Host installation binding",
             })?;
-        let _object_ref = object_path
+        if host_binding.installation_id() != current.installation_id {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let identity = self
+            .p07_ors
+            .installed_store_identity()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.installation_id() != current.installation_id {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let ors_object_ref = self
+            .ors_object_path
             .to_str()
             .filter(|value| !value.trim().is_empty())
             .ok_or(TransportError::SessionFenced)?
             .to_owned();
-        // ORS exposes no durable store-wide generation counter on this base.
-        // P-07 revision and daemon resource generation identify different
-        // owners and must not be substituted for the missing ORS generation.
-        Err(TransportError::PlanGap {
-            dependency: "kernel.ors_object_generation_owner",
-            reason: "the live ORS object path is known but ORS has no durable store-wide object generation readback",
+        Ok(InstallationScanContour {
+            installation_id: current.installation_id.clone(),
+            ors_object_ref,
+            ors_generation: identity.ors_generation(),
         })
     }
 
