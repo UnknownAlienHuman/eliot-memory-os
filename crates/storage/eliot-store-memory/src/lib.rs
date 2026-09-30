@@ -43,12 +43,11 @@ use eliot_store_api::{
     canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
     decode_erasure_surfaces, decode_instrument_registry_mutation, decode_notification_mutation,
     decode_reactive_mutation, decode_resource_content, generated_operation_manifests,
-    genesis_manifest, genesis_transition,
-    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
-    named_mutation_operation_name, sha256_hex, validate_automation_read_params,
-    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
-    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    genesis_manifest, genesis_transition, is_genesis_fence, issue_genesis_receipt_envelope,
+    issue_store_receipt_envelope, named_mutation_operation_name, sha256_hex,
+    validate_automation_read_params, validate_genesis_receipt_envelope,
+    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
+    validate_store_receipt_envelope, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
