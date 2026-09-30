@@ -2111,7 +2111,7 @@ impl ColdStartController {
                 evidence_ref,
             ),
             TaskBindingInput::Selected(evidence) => {
-                Self::validate_selected_evidence(&evidence)?;
+                OnboardingReadinessReceipt::validate_selected_evidence(&evidence)?;
                 Self::check_current_task_ref(
                     evidence.task_ref,
                     evidence.task_revision,
