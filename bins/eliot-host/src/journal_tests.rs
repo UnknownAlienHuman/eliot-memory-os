@@ -416,11 +416,7 @@ fn readiness_supervision_snapshot(
         kernel_epoch: fixture.candidate.kernel_epoch.clone(),
         kernel_front_door_server_sid: "S-1-5-19".to_owned(),
         kernel_front_door_session_id: 0,
-        kernel_front_door_artifact_sha256: fixture
-            .candidate
-            .artifact_hash
-            .as_str()
-            .to_owned(),
+        kernel_front_door_artifact_sha256: fixture.candidate.artifact_hash.as_str().to_owned(),
         watchdog_epoch: AuthorityEpoch::new(1)?,
         generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
             target_id: "kernel-readiness".to_owned(),
