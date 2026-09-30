@@ -1855,19 +1855,20 @@ impl KernelStoreGateway {
             .map_err(MaintenanceTriggerDeliveryError::OwnerUnavailable)?;
         receipt.validate()?;
         let session = self.bind_maintenance_session(principal_ref)?;
-        let operation_id = OperationId::new(receipt.canonical_receipt_ref.clone()).map_err(|_| {
-            MaintenanceTriggerDeliveryError::Protocol(ProtocolError::InvalidField {
-                field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
-                reason: "decision receipt names no well-formed canonical receipt",
-            })
-        })?;
+        let operation_id =
+            OperationId::new(receipt.canonical_receipt_ref.clone()).map_err(|_| {
+                MaintenanceTriggerDeliveryError::Protocol(ProtocolError::InvalidField {
+                    field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
+                    reason: "decision receipt names no well-formed canonical receipt",
+                })
+            })?;
         let stored = self.store.receipt(operation_id).await?;
-        let stored = stored.ok_or_else(|| {
-            MaintenanceTriggerDeliveryError::Protocol(ProtocolError::InvalidField {
+        let stored = stored.ok_or(MaintenanceTriggerDeliveryError::Protocol(
+            ProtocolError::InvalidField {
                 field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
                 reason: "no committed Store receipt answers this decision",
-            })
-        })?;
+            },
+        ))?;
         stored.validate()?;
         if stored.status != WriteReceiptStatus::Committed {
             return Err(MaintenanceTriggerDeliveryError::Protocol(
