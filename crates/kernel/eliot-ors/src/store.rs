@@ -4126,6 +4126,16 @@ pub trait OperationalRecoveryStore: Send + Sync {
         request_digest: &str,
         attempt: &crate::HostRequestAttempt,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Marks an exact protected Observe claim as submitted before returning
+    /// its executable pair to the daemon. This v0 local handoff has no
+    /// outbound Host transport channel, so it records the existing possible-
+    /// effect state without fabricating a v1 transport observation.
+    fn begin_host_request_observe_pair(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Expires an active v1 claim under its exact retained identity. Expiry
     /// moves possible-effect work to `Unknown`; it never grants another send.
     fn reconcile_expired_host_request_claim(
@@ -10402,6 +10412,78 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Durably fences one protected Observe pair before exposing it to the
+    /// daemon. This is a local pair handoff, not an outbound Host transport,
+    /// so the v0 row advances its existing operation state without acquiring
+    /// synthetic v1 channel custody evidence.
+    pub fn begin_host_request_observe_pair(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut record) = existing else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version != 0
+            || record.kind != crate::HostRequestKind::Invocation
+            || record.capability_ref.as_str() != "eliot.observe"
+            || record.state != crate::HostRequestState::Routed
+            || record.result_digest.is_some()
+            || record.result_response.is_some()
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(current) = record.attempt.as_ref() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        attempt.validate(&record.fence_digest)?;
+        let input = record
+            .executable_input
+            .as_ref()
+            .ok_or(OrsError::InvalidTransition)?;
+        if current != attempt
+            || current.phase != crate::HostRequestAttemptPhase::Claimed
+            || !current.transport_observations.is_empty()
+            || current.owner_readback.is_some()
+            || current.input_commitment_sha256.as_deref()
+                != Some(input.commitment_sha256.as_str())
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        record.state = record
+            .state
+            .transition_to(crate::HostRequestState::Submitted)?;
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
     }
 
     /// Moves one expired v1 send claim to reconciliation while retaining the
@@ -34333,6 +34415,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::claim_host_request_attempt(self, operation_id, request_digest, attempt)
     }
 
+    fn begin_host_request_observe_pair(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::begin_host_request_observe_pair(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+        )
+    }
+
     fn reconcile_expired_host_request_claim(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -34993,6 +35089,18 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store
             .claim_host_request_attempt(operation_id, request_digest, attempt)
+    }
+
+    /// Durably marks an exact protected Observe claim submitted before its
+    /// executable pair is exposed to the daemon.
+    pub fn begin_host_request_observe_pair(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .begin_host_request_observe_pair(operation_id, request_digest, attempt)
     }
 
     /// Reconciles an expired active send claim under its retained identity.
