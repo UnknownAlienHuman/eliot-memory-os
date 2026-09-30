@@ -2123,10 +2123,7 @@ fn owner_normalization_bindings(
     request: &UserAutomationStoreRequest,
     state_fence: &StateFence,
 ) -> Result<(Option<TaskBinding>, Option<SessionBinding>), StoreError> {
-    let task = match (
-        request.context.task_id.clone(),
-        state_fence.task_revision.clone(),
-    ) {
+    let task = match (request.context.task_id.clone(), state_fence.task_revision) {
         (Some(task_id), Some(task_revision)) => Some(TaskBinding {
             task_id,
             task_revision,
