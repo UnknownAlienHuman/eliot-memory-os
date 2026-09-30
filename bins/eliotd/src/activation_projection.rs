@@ -585,7 +585,13 @@ pub fn failed_internal_for_mapping_failure_with_observation(
 
 // ---------------------------------------------------------------------------
 // Issue #1746 W5/W6 + A4/A5: bootstrap bound to activation, revalidated
-// through dispatch
+// through dispatch.
+//
+// Reachability (STITCH, same as the admission entries): zero production call
+// sites. The designated caller is the pre-commit effect gate in
+// `DaemonComposition::commit_canonical_and_refresh`, which itself has zero
+// production call sites, so this seam is reached from no live daemon path
+// yet. Every entry below names that caller; nothing here is inferred live.
 // ---------------------------------------------------------------------------
 
 /// I7.20 conflict directive carried by every bootstrap-dispatch conflict.
@@ -596,9 +602,7 @@ pub fn failed_internal_for_mapping_failure_with_observation(
 /// reconciliation. Shared safe status/recovery remains available under its own
 /// authority and never passes through the revalidation entry.
 // Issue #1746: dispatch seam consumed by the STITCH composition caller
-// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
-// lands.
-#[allow(dead_code)]
+// (`DaemonComposition::commit_canonical_and_refresh`; no live daemon path yet).
 pub const BOOTSTRAP_DISPATCH_CONFLICT_DIRECTIVE: &str = "rebind-under-new-operation";
 
 /// I7.20 recovery directive carried by a bootstrap bind refusal for an
@@ -608,9 +612,7 @@ pub const BOOTSTRAP_DISPATCH_CONFLICT_DIRECTIVE: &str = "rebind-under-new-operat
 /// activation already carries; nothing is selected here and no task is created
 /// to remove the missing selection.
 // Issue #1746: dispatch seam consumed by the STITCH composition caller
-// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
-// lands.
-#[allow(dead_code)]
+// (`DaemonComposition::commit_canonical_and_refresh`; no live daemon path yet).
 pub const BOOTSTRAP_SELECTION_INTAKE_DIRECTIVE: &str = "answer-with-bounded-selection-intake";
 
 /// I7.20 agent-facing outcome for the bootstrap↔activation join and for
@@ -628,9 +630,7 @@ pub const BOOTSTRAP_SELECTION_INTAKE_DIRECTIVE: &str = "answer-with-bounded-sele
 /// `STALE_OR_CONFLICT`; the revalidate leg ([`revalidate_bootstrap_dispatch`])
 /// always answers `STALE_OR_CONFLICT`.
 // Issue #1746: dispatch seam consumed by the STITCH composition caller
-// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
-// lands.
-#[allow(dead_code)]
+// (`DaemonComposition::commit_canonical_and_refresh`; no live daemon path yet).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapDispatchOutcome {
     disposition: AgentResponseDisposition,
@@ -640,9 +640,8 @@ pub struct BootstrapDispatchOutcome {
     operation_id: String,
 }
 
-// Issue #1746: see the struct-level seam note; the constructors and
+// Issue #1746: see the seam note above; the constructors and
 // accessors are consumed together with the seal once wired.
-#[allow(dead_code)]
 impl BootstrapDispatchOutcome {
     fn conflict(reason_code: &'static str, detail: &'static str, operation_id: &str) -> Self {
         Self {
@@ -726,9 +725,7 @@ impl std::error::Error for BootstrapDispatchOutcome {}
 /// conflict outcome on drift. Sealed only by [`bind_bootstrap_to_activation`];
 /// minted nowhere else; selects nothing.
 // Issue #1746: dispatch seam consumed by the STITCH composition caller
-// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
-// lands.
-#[allow(dead_code)]
+// (`DaemonComposition::commit_canonical_and_refresh`; no live daemon path yet).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundBootstrapDispatch {
     /// Exact ticket-bound activation identity, owner-resolved.
@@ -771,10 +768,16 @@ pub struct BoundBootstrapDispatch {
 /// correlation and the bootstrap admission for the same lease at the write
 /// fence, passing the sealed value toward the dispatch effect gate
 /// ([`revalidate_bootstrap_dispatch`]).
+///
+/// Source revisions travel inside the seal for the gate to compare: the
+/// activation carries no receipt/governance revisions, so bind-time compares
+/// the shared identity (principal/session/scope/task/revision/fence) and the
+/// gate compares the sealed receipt/governance/coverage/projection revisions
+/// against the live owners. A `Retry`/`Stale`/`Denied` refusal binds only the
+/// bootstrap here; the activation outcomes themselves stay answerable through
+/// the activation route under their own authority.
 // Issue #1746: dispatch seam consumed by the STITCH composition caller
-// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
-// lands.
-#[allow(dead_code)]
+// (`DaemonComposition::commit_canonical_and_refresh`; no live daemon path yet).
 pub fn bind_bootstrap_to_activation(
     activation: ActivationCorrelation,
     bootstrap: &MaterialBootstrap,
@@ -883,8 +886,9 @@ pub fn bind_bootstrap_to_activation(
 /// live owners (issue #1746, W6; acceptance A5; I7.20).
 ///
 /// The live task/scope, principal/session, task revision, acceptance digest,
-/// bootstrap receipt revision, governance profile reference/revision,
-/// projection generation, and fence come from the live owners at the existing
+/// bootstrap receipt revision, governance profile reference/revision, coverage
+/// fingerprint, projection generation, and fence come from the live owners at
+/// the existing
 /// queued-claim/launch/effect gate — never from the request and never from a
 /// mutable ambient selection. An intervening rebind, task revision or
 /// acceptance change, logout, or generation change returns the I7.20 conflict
@@ -899,23 +903,28 @@ pub fn bind_bootstrap_to_activation(
 /// → `TASK_SELECTION_REQUIRED`; moved task → `TASK_SCOPE_INCOMPATIBLE`; moved
 /// scope → `SCOPE_CONFLICT`; moved principal/session (logout/rebind) →
 /// `IDENTITY_CONFLICT`; moved task revision → `STALE_STATE_FENCE`; moved
-/// acceptance digest → `EVIDENCE_STALE`; moved receipt/governance revision →
-/// `EVIDENCE_STALE`; re-projected bootstrap → `STALE_PROJECTION`; moved
+/// acceptance digest → `EVIDENCE_STALE`; moved receipt/governance/coverage
+/// revision → `EVIDENCE_STALE`; re-projected bootstrap → `STALE_PROJECTION`; moved
 /// generation → `STALE_AUTHORITY_EPOCH`; otherwise moved fence →
 /// `STALE_STATE_FENCE`.
 ///
 /// Designated caller (STITCH, daemon composition lane): the pre-commit effect
 /// gate in `DaemonComposition::commit_canonical_and_refresh`, passing the live
-/// Governor task/scope, principal/session, revisions, and kernel-snapshot
-/// fence. This entry mints no binding and installs none.
+/// Governor task/scope, principal/session, revisions, coverage fingerprint,
+/// and kernel-snapshot fence. This entry mints no binding and installs none.
+///
+/// Already-possible effects are never refused here: when the gate knows the
+/// sealed operation already committed (duplicate delivery after commit), it
+/// reconciles under the preserved [`BoundBootstrapDispatch::operation_id`]
+/// through the existing retained-identity reconcile instead of treating this
+/// outcome as a pre-execution refusal. The original identity is never
+/// rewritten and the effect is never re-executed.
 #[allow(
     clippy::too_many_arguments,
     reason = "revalidation joins the sealed bootstrap identity against every live owner value that can invalidate it in one fail-closed edge"
 )]
 // Issue #1746: dispatch seam consumed by the STITCH composition caller (the
-// pre-commit effect gate in `DaemonComposition::commit_canonical_and_refresh`);
-// allow until that wiring lands.
-#[allow(dead_code)]
+// pre-commit effect gate in `DaemonComposition::commit_canonical_and_refresh`).
 pub fn revalidate_bootstrap_dispatch(
     bound: &BoundBootstrapDispatch,
     live_principal_ref: &str,
@@ -927,6 +936,7 @@ pub fn revalidate_bootstrap_dispatch(
     live_receipt_revision: u64,
     live_governance_profile_ref: &str,
     live_governance_revision: u64,
+    live_coverage_fingerprint: &str,
     live_projection_generation: u64,
     live_fence: &eliot_contracts::StateFence,
 ) -> Result<(), BootstrapDispatchOutcome> {
@@ -1000,9 +1010,9 @@ pub fn revalidate_bootstrap_dispatch(
         ));
     }
     // Source-revision drift: the bootstrap rests on the receipt, governance
-    // profile, and projection revisions sealed at bind time. Any move conflicts
-    // for rebind; the admitted projection is never silently adopted under the
-    // old operation identity.
+    // profile, coverage fingerprint, and projection revisions sealed at bind
+    // time. Any move conflicts for rebind; the admitted projection is never
+    // silently adopted under the old operation identity.
     if live_receipt_revision != bound.bootstrap.receipt_revision {
         return Err(conflict(
             "EVIDENCE_STALE",
@@ -1015,6 +1025,15 @@ pub fn revalidate_bootstrap_dispatch(
         return Err(conflict(
             "EVIDENCE_STALE",
             "admitted governance profile revision moved before dispatch; rebind at the live revision, no silent rebind",
+        ));
+    }
+    // Coverage-only drift: the coverage profile was re-verified (new
+    // fingerprint) without a governance revision move. The sealed fingerprint
+    // is compared with the live owner value here, never refreshed in place.
+    if live_coverage_fingerprint != bound.bootstrap.coverage_fingerprint {
+        return Err(conflict(
+            "EVIDENCE_STALE",
+            "admitted coverage fingerprint moved before dispatch; rebind at the live coverage, no silent rebind",
         ));
     }
     if live_projection_generation != bound.bootstrap.projection_generation {
