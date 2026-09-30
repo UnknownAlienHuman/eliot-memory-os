@@ -4155,17 +4155,6 @@ fn validate_raw_outputs(
     if process_succeeded(process_completed, exit_code)
         && matches!(
             operation,
-            SemanticOperation::Diagnostics | SemanticOperation::ProbeVersion
-        )
-        && output_for(outputs, LspRawOutputKind::Stdout).is_none()
-    {
-        return Err(BridgeError::InconsistentBinding(
-            "successful analyzer invocation has no retained stdout artifact".to_owned(),
-        ));
-    }
-    if process_succeeded(process_completed, exit_code)
-        && matches!(
-            operation,
             SemanticOperation::Definitions { .. }
                 | SemanticOperation::References { .. }
                 | SemanticOperation::Symbols { .. }
