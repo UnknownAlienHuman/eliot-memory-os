@@ -3017,12 +3017,13 @@ pub fn admit_named_mutation_capture(
 pub fn admit_task_controller_prepared_transition(
     context: &RequestMetadata,
     transition: &PreparedTransition,
-    request_task_ref: &str,
-    request_scope_ref: &str,
+    request_identity: (&str, &str, &str, &str),
     owner: &TaskSelectionAdmissionBinding,
     observed_scope: &ObservedScopeResources,
     live_fence: &StateFence,
 ) -> Result<(), TaskBindingError> {
+    let (request_principal_ref, request_session_id, request_task_ref, request_scope_ref) =
+        request_identity;
     let evidence = &owner.evidence;
     evidence.validate().map_err(|error| {
         TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
@@ -3044,21 +3045,25 @@ pub fn admit_task_controller_prepared_transition(
         ));
     }
 
-    let request_session_ref = context.session_id.as_ref().map(SessionId::as_str);
-    if request_session_ref != Some(owner.session_ref.as_str()) {
+    let context_session_ref = context.session_id.as_ref().map(SessionId::as_str);
+    if request_session_id != owner.session_ref
+        || context_session_ref != Some(request_session_id)
+    {
         return Err(TaskBindingError::scope_incompatible(
             "task selection owner binding belongs to another authenticated session",
         ));
     }
-    if owner.principal_ref.trim().is_empty()
-        || owner.principal_ref.chars().any(char::is_control)
+    if request_principal_ref.trim().is_empty()
+        || request_principal_ref.chars().any(char::is_control)
+        || owner.principal_ref != request_principal_ref
     {
-        return Err(TaskBindingError::selection_required(
-            "task selection owner binding has no authenticated principal",
+        return Err(TaskBindingError::scope_incompatible(
+            "task selection owner binding belongs to another authenticated principal",
         ));
     }
 
     if evidence.task_revision != owner.task_revision
+        || evidence.acceptance_digest != owner.acceptance_digest()
         || evidence.selection_source_ref != owner.selection_source_ref
         || evidence.evidence_ref != owner.evidence_ref
     {
@@ -3073,6 +3078,67 @@ pub fn admit_task_controller_prepared_transition(
             "owner-retained WorkScope binding is invalid: {error}"
         ))
     })?;
+
+    let mut found_task_relative_operation = false;
+    for named in &transition.named_operations {
+        if requirement_for_named_mutation(named.operation)
+            != CanonicalOperationRequirement::TaskRelativeEffectful
+        {
+            continue;
+        }
+        found_task_relative_operation = true;
+        let required_text = |key: &str| {
+            named
+                .parameters
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    TaskBindingError::selection_required(format!(
+                        "task-relative operation omits its immutable {key} selection binding"
+                    ))
+                })
+        };
+        let operation_evidence: TaskSelectionEvidence = serde_json::from_str(required_text(
+            "task_selection_evidence_json",
+        )?)
+        .map_err(|error| {
+            TaskBindingError::selection_required(format!(
+                "task-relative operation selection evidence is invalid: {error}"
+            ))
+        })?;
+        let owner_task_revision = owner.task_revision.to_string();
+        if &operation_evidence != evidence
+            || required_text("task_selection_revision")? != owner_task_revision.as_str()
+            || required_text("task_selection_acceptance_digest")? != owner.acceptance_digest()
+            || required_text("task_selection_scope_ref")?
+                != owner.work_scope.binding.scope.scope_ref.as_str()
+            || required_text("task_selection_source_ref")? != owner.selection_source_ref.as_str()
+            || required_text("task_selection_evidence_ref")? != owner.evidence_ref.as_str()
+        {
+            return Err(TaskBindingError::scope_incompatible(
+                "task-relative operation selection payload differs from the original owner evidence",
+            ));
+        }
+        if !transition
+            .required_proof_and_approval_refs
+            .iter()
+            .any(|reference| reference == &owner.selection_source_ref)
+            || !transition
+                .required_proof_and_approval_refs
+                .iter()
+                .any(|reference| reference == &owner.evidence_ref)
+        {
+            return Err(TaskBindingError::selection_required(
+                "task-relative operation omits the original task selection proof references",
+            ));
+        }
+    }
+    if !found_task_relative_operation {
+        return Err(TaskBindingError::selection_required(
+            "prepared task-relative transition has no typed task-relative operation",
+        ));
+    }
+
     if request_scope_ref != transition.scope_id.as_str()
         || owner.work_scope.binding.scope.scope_ref != request_scope_ref
         || evidence.work_scope_ref != request_scope_ref
