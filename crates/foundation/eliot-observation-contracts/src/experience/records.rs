@@ -894,31 +894,40 @@ impl SessionEpisodeRecord {
     }
 
     /// Canonical preimage bytes (digest and measured length excluded).
+    ///
+    /// The preimage is every admitted member in declaration order, excluding
+    /// only `digest` and `byte_length`. Serde implements `Serialize` for
+    /// tuples of two through sixteen elements, so this record's twenty
+    /// members are encoded as a twenty-element array of canonical values
+    /// rather than a twenty-element tuple: the same members, in the same
+    /// order, producing the same canonical bytes, with none dropped, skipped
+    /// or reordered.
     fn preimage_bytes(&self) -> Result<Vec<u8>, ObservationError> {
-        canonical_json_bytes(&(
-            &self.contract_version,
-            &self.handle,
-            self.episode_revision,
-            &self.session_and_attempt_refs,
-            &self.capture_mode,
-            &self.body_kind,
-            &self.source_ref,
-            &self.source_availability,
-            self.content_self_contained,
-            &self.portability,
-            &self.touched_entity_refs,
-            &self.observed_window,
-            self.truncated,
-            &self.coverage,
-            &self.messages,
-            &self.scope,
-            &self.fence,
-            &self.provenance,
-            &self.retention,
-            &self.predecessor,
-        ))
-        .map_err(|_| ObservationError::InvalidField {
-            field: "session_episode.digest",
+        const DIGEST_FIELD: &str = "session_episode.digest";
+        let members = [
+            canonical_shape_value(&self.contract_version, DIGEST_FIELD)?,
+            canonical_shape_value(&self.handle, DIGEST_FIELD)?,
+            canonical_shape_value(&self.episode_revision, DIGEST_FIELD)?,
+            canonical_shape_value(&self.session_and_attempt_refs, DIGEST_FIELD)?,
+            canonical_shape_value(&self.capture_mode, DIGEST_FIELD)?,
+            canonical_shape_value(&self.body_kind, DIGEST_FIELD)?,
+            canonical_shape_value(&self.source_ref, DIGEST_FIELD)?,
+            canonical_shape_value(&self.source_availability, DIGEST_FIELD)?,
+            canonical_shape_value(&self.content_self_contained, DIGEST_FIELD)?,
+            canonical_shape_value(&self.portability, DIGEST_FIELD)?,
+            canonical_shape_value(&self.touched_entity_refs, DIGEST_FIELD)?,
+            canonical_shape_value(&self.observed_window, DIGEST_FIELD)?,
+            canonical_shape_value(&self.truncated, DIGEST_FIELD)?,
+            canonical_shape_value(&self.coverage, DIGEST_FIELD)?,
+            canonical_shape_value(&self.messages, DIGEST_FIELD)?,
+            canonical_shape_value(&self.scope, DIGEST_FIELD)?,
+            canonical_shape_value(&self.fence, DIGEST_FIELD)?,
+            canonical_shape_value(&self.provenance, DIGEST_FIELD)?,
+            canonical_shape_value(&self.retention, DIGEST_FIELD)?,
+            canonical_shape_value(&self.predecessor, DIGEST_FIELD)?,
+        ];
+        canonical_json_bytes(&members).map_err(|_| ObservationError::InvalidField {
+            field: DIGEST_FIELD,
             reason: "record is not canonically encodable",
         })
     }
@@ -1615,4 +1624,20 @@ fn canonical_shape_digest<T: Serialize>(
             field,
             reason: "shape is not canonically encodable",
         })
+}
+
+/// Canonical value of one record-shape member.
+///
+/// A record shape with more members than serde's tuple arity limit (sixteen)
+/// carries its members as an array of these values instead of a longer tuple.
+/// The member is encoded, never omitted: the resulting array holds every
+/// member in declaration order, exactly as the equivalent tuple would.
+fn canonical_shape_value(
+    member: &impl Serialize,
+    field: &'static str,
+) -> Result<serde_json::Value, ObservationError> {
+    serde_json::to_value(member).map_err(|_| ObservationError::InvalidField {
+        field,
+        reason: "shape member is not canonically encodable",
+    })
 }
