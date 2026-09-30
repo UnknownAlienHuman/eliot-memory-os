@@ -2466,6 +2466,20 @@ fn status_response(
             } else {
                 None
             };
+            // Sealed readiness preview for Status readers (issue #1790,
+            // W6-surface): the retained snapshot's composed bootstrap —
+            // readiness disposition plus smallest missing question with its
+            // intake provenance — is shown on every current read instead of
+            // only the once-per-session auto-boot. Read-only: the one-shot
+            // delivery slot is never consumed here, a moved seal yields None,
+            // and the same live Kernel probe that gates the activation
+            // question gates this preview, so a stale binding shows neither.
+            let bootstrap = if kernel_binding_failure.is_none() {
+                let tasks = runner.retained_auto_boot_tasks();
+                runner.preview_first_response_bootstrap(&tasks, CurrentAssessment::Ready)
+            } else {
+                None
+            };
             Response::Status {
                 profile: Profile::as_str(profile),
                 control_capacity: runner.control_capacity(),
@@ -2482,7 +2496,7 @@ fn status_response(
                 observation_forwarding_port,
                 recovery,
                 reactive: Some(reactive_status_view(runner)),
-                bootstrap: None,
+                bootstrap,
                 resources: Some(resource_status_view(runner)),
             }
         }
