@@ -667,6 +667,13 @@ pub struct DaemonComposition {
     /// [`DaemonComposition::controlboard`]. An empty supply reads as an
     /// empty inbox, never as resolved or suppressed state.
     notification_snapshot: Vec<Notification>,
+    /// Explicit workspace locator retained from the last accepted
+    /// authenticated activation. It is only a locator for a fresh Host-side
+    /// resource observation; identity and authority always come from the
+    /// current WorkScope owner and the current Task Controller selection.
+    /// The locator is keyed by the complete semantic activation binding so a
+    /// later request cannot borrow another task's workspace path.
+    activation_workspace_locator: Option<RetainedActivationWorkspaceLocator>,
     /// Shared Governor Skill catalogue handle for catalogue-guarded skill
     /// promotion. Empty until catalogue installation wiring lands; absent
     /// entries forward open-world.
@@ -761,6 +768,19 @@ pub struct DaemonComposition {
     /// of the store image itself follows the canonical-write envelope wiring
     /// (remainder, #1699); this field never claims it.
     swarm_attachment: eliot_governor::SwarmAttachmentComposition,
+}
+
+/// An activation's explicit Host workspace selector retained only to repeat
+/// the mechanical observation at a later task-bound ingress. This path never
+/// supplies identity by itself; every consumer re-observes it and compares
+/// the result with the current owner-issued WorkScope binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedActivationWorkspaceLocator {
+    principal_ref: String,
+    session_ref: String,
+    task_ref: String,
+    work_scope_ref: String,
+    root: PathBuf,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -1061,6 +1081,7 @@ impl DaemonComposition {
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
             notification_snapshot: Vec::new(),
+            activation_workspace_locator: None,
             skill_catalogue: Arc::new(
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
@@ -2365,6 +2386,133 @@ impl DaemonComposition {
     /// only, never the client; no new thread, no new handshake.
     pub fn note_owner_session_binding(&mut self, facts: OwnerSessionFacts) {
         self.owner_session = Some(facts);
+    }
+
+    /// Retains the explicit Host workspace selector from an accepted,
+    /// owner-authenticated activation. The path is only a locator: callers
+    /// must observe it again and compare the result with the live WorkScope
+    /// owner before admitting any task-bound transition.
+    pub fn note_activation_workspace_locator(
+        &mut self,
+        ticket: &AgentActivationResolutionTicket,
+        result: &AgentActivationResolutionResult,
+        owner_readback: Option<&AgentActivationOwnerReadback>,
+    ) -> Result<(), crate::task_binding_admission::TaskBindingError> {
+        let (AgentActivationResolutionDisposition::Resolved { binding }, Some(owner_evidence)) =
+            (&result.disposition, result.owner_evidence.as_ref())
+        else {
+            return Err(crate::task_binding_admission::TaskBindingError::selection_required(
+                "accepted activation did not retain a resolved semantic owner binding",
+            ));
+        };
+        let readback = owner_readback.ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::selection_required(
+                "accepted activation has no retained authenticated owner readback",
+            )
+        })?;
+        readback
+            .validate()
+            .map_err(|error| {
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                    "retained activation owner readback is invalid: {error}"
+                ))
+            })?;
+        if readback.evidence != *owner_evidence
+            || readback.evidence.binding.as_ref() != binding
+            || result.ticket_id != ticket.ticket_id
+            || result.ticket_state_fence != readback.evidence.state_fence
+        {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "activation workspace locator is not bound to the accepted owner result",
+                ),
+            );
+        }
+        let root = ticket.workspace_selector.as_deref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::selection_required(
+                "accepted activation has no explicit Host workspace locator",
+            )
+        })?;
+        let root = Path::new(root);
+        if !root.is_absolute() {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained activation workspace locator is not absolute",
+                ),
+            );
+        }
+        self.activation_workspace_locator = Some(RetainedActivationWorkspaceLocator {
+            principal_ref: binding.principal_id.clone(),
+            session_ref: binding.session_id.clone(),
+            task_ref: binding.task_id.clone(),
+            work_scope_ref: binding.work_scope_id.clone(),
+            root: root.to_path_buf(),
+        });
+        Ok(())
+    }
+
+    /// Returns the exact activation locator for one owner selection. It does
+    /// not search by scope, task recency, or path proximity.
+    pub fn activation_workspace_locator_for_selection(
+        &self,
+        selection: &eliot_governor::TaskSelectionAdmissionBinding,
+    ) -> Result<PathBuf, crate::task_binding_admission::TaskBindingError> {
+        let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::selection_required(
+                "no accepted activation retained an explicit workspace locator",
+            )
+        })?;
+        if locator.principal_ref != selection.principal_ref()
+            || locator.session_ref != selection.session_ref()
+            || locator.task_ref != selection.task_ref()
+            || locator.work_scope_ref != selection.work_scope().binding.scope.scope_ref
+        {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::selection_required(
+                    "no retained activation locator matches the exact current task selection",
+                ),
+            );
+        }
+        Ok(locator.root.clone())
+    }
+
+    /// Starts an owner-retained Task Controller selection read. The returned
+    /// Governor token is passed across the exact Kernel acceptance-set read;
+    /// callers release the shared composition lock before performing that I/O.
+    pub fn prepare_task_selection_for_request(
+        &self,
+        now: u64,
+        authenticated_principal_ref: &str,
+        request_session_ref: &str,
+        request_task_ref: &str,
+        request_scope_ref: &str,
+        request_fence: &eliot_contracts::StateFence,
+    ) -> Result<eliot_governor::PendingTaskSelectionRequest, eliot_governor::CompositionError> {
+        self.governor.prepare_task_selection_for_request(
+            now,
+            authenticated_principal_ref,
+            request_session_ref,
+            request_task_ref,
+            request_scope_ref,
+            request_fence,
+        )
+    }
+
+    /// Completes the split owner selection read after Kernel I/O. Governor
+    /// re-reads the active selection, WorkScope, and live fence before it
+    /// accepts the unchanged canonical TaskContract response.
+    pub fn finish_task_selection_for_request(
+        &self,
+        pending: eliot_governor::PendingTaskSelectionRequest,
+        now_after_kernel_read: u64,
+        acceptance_set: eliot_store_api::TaskContractAcceptanceSet,
+    ) -> Result<eliot_governor::TaskSelectionAdmissionBinding, eliot_governor::CompositionError>
+    {
+        self.governor.finish_task_selection_for_request(
+            pending,
+            now_after_kernel_read,
+            acceptance_set,
+        )
     }
 
     /// Notes verified canonical notification records into this composition.

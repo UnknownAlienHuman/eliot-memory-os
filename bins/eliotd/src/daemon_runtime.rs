@@ -22,28 +22,19 @@
 //!
 //! It must not be read as "this driver commits no canonical write". It does:
 //! the `TestD` owner finish driver runs `commit_testd_terminal_owner_fact`,
-//! which exchanges up to three Governor-owned canonical legs over the neutral
-//! `KernelTransitionPort`. Those legs therefore pass through
-//! `DaemonKernelClient::apply_prepared` and its `check_identity_binding`, so the
-//! **live** #1929 admission edge is the transport one
-//! (`task_binding_admission::admit_named_mutation_capture`), not the
-//! composition-root one. What is unreachable is only the leg that needs a typed
-//! `TaskSelectionEvidence`.
-//!
-//! That leg cannot be given a call here honestly today. Committing through
-//! `commit_canonical_and_refresh` requires a caller-presented
-//! `MaterialReadinessInputs`, whose `OnboardingReadinessReceipt` is the only
-//! carrier of a real `TaskSelectionEvidence`, and this driver has no source for
-//! one: the repository's sole production constructor of that receipt,
-//! `eliot_workscope::ColdStartController::compile`, is reached only through
-//! `eliot_workscope::OnboardingSingleFlight::compile_and_publish` and therefore
-//! only through the uncalled
-//! `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`.
-//! Manufacturing a receipt here — a task revision, an acceptance digest, a
-//! governance profile, a lease — would fabricate exactly the authority the
-//! admission gate exists to verify, so it was not done. The owner of that
-//! receipt is the attach/onboarding ingress, not this driver. See
-//! `eliotd::task_binding_admission`'s "Measured reachability" section.
+//! which exchanges Governor-owned canonical legs over the neutral
+//! `KernelTransitionPort`. The live #1929 transport gate now preserves cold
+//! capture and requires exact owner selection for task-relative writes.
+//! Task Controller Apply obtains `TaskSelectionAdmissionBinding` from the
+//! retained active WorkLease/WorkItem and original TaskContract acceptance
+//! read, joins the independent WorkScope snapshot to a fresh Host observation,
+//! embeds the original evidence in the immutable prepared operation, and uses
+//! the reusable owner-selection port before transport. Generic task-relative
+//! callers without that bundle fail closed. The separate Observe capture
+//! producer remains on the existing claim/serve flight and must use the same
+//! gate; it is not replaced by a new scheduler. This module still has no
+//! production caller of `commit_canonical_and_refresh`, so it does not invent
+//! an onboarding receipt or selection to create one.
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -5555,6 +5546,7 @@ async fn run_task_controller_poll(
     let prepared = eliotd::campaign_task_controller::prepare_task_controller_claim(
         &reads,
         kernel.as_ref(),
+        composition.as_ref(),
         claimed,
     )
     .await
@@ -7104,11 +7096,18 @@ async fn dispatch_agent_activation_result(
     // asynchronous flight was published. The submit path reuses both values
     // verbatim; it never performs a second Governor read.
     match kernel
-        .submit_agent_activation_result(&result, owner_readback)
+        .submit_agent_activation_result(&result, owner_readback.clone())
         .await
     {
         Ok(ack) => {
             classify_submit_ack(ticket, &result, &ack)?;
+            retain_accepted_activation_workspace_locator(
+                &composition,
+                ticket,
+                &result,
+                owner_readback.as_ref(),
+            )
+            .await;
             trigger_accepted_cold_start(
                 &kernel,
                 Arc::clone(&composition),
@@ -7150,6 +7149,13 @@ async fn dispatch_agent_activation_result(
                     ))
                 })?;
             classify_reconcile_ack(ticket, &result, &ack, &submit_detail)?;
+            retain_accepted_activation_workspace_locator(
+                &composition,
+                ticket,
+                &result,
+                owner_readback.as_ref(),
+            )
+            .await;
             trigger_accepted_cold_start(
                 &kernel,
                 Arc::clone(&composition),
@@ -7159,6 +7165,31 @@ async fn dispatch_agent_activation_result(
             .await;
             Ok(())
         }
+    }
+}
+
+/// Retains the exact explicit Host selector only after Kernel accepted the
+/// resolved owner result. The selector stays a locator; task admission later
+/// repeats the resource observation at the live request fence.
+async fn retain_accepted_activation_workspace_locator(
+    composition: &SharedComposition,
+    ticket: &AgentActivationResolutionTicket,
+    result: &AgentActivationResolutionResult,
+    owner_readback: Option<&eliot_protocol::AgentActivationOwnerReadback>,
+) {
+    if !matches!(result.disposition, AgentActivationResolutionDisposition::Resolved { .. }) {
+        return;
+    }
+    let outcome = composition
+        .lock()
+        .await
+        .note_activation_workspace_locator(ticket, result, owner_readback);
+    if let Err(error) = outcome {
+        tracing::warn!(
+            ticket = %eliotd::diagnostics::sanitize_identity(&ticket.ticket_id),
+            error = %error,
+            "accepted activation workspace locator was not retained for later task-bound observation"
+        );
     }
 }
 
