@@ -40,6 +40,7 @@ mod capability_evidence;
 mod capability_evidence_commit;
 mod composition;
 mod context_inputs;
+mod coordination_work_identity;
 mod cue_composition;
 mod epistemic_composition;
 mod experience_commit;
@@ -53,6 +54,16 @@ pub use context_inputs::{
 pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
+};
+// The coordination work-item/lease identity issuer. It is a sibling module, not
+// a composition descendant, because it needs no private composition field: it
+// derives identity from the Kernel-issued attempt and the admitted request
+// identity, and persists nothing.
+pub use coordination_work_identity::{
+    COORDINATION_RESULT_ARTIFACT_NAMESPACE, COORDINATION_RESULT_NAMESPACE,
+    COORDINATION_WORK_IDENTITY_REVISION, COORDINATION_WORK_ITEM_NAMESPACE,
+    COORDINATION_WORK_LEASE_NAMESPACE, CoordinationIdentityError, CoordinationLegIdentity,
+    IssuedCoordinationWork, issue_coordination_work,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};

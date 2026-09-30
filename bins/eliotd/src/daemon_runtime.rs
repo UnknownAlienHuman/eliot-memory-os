@@ -5311,6 +5311,11 @@ async fn run_task_controller_poll(
     let Some(claimed) = claimed else {
         return Ok(TaskControllerPollOutcome::IdleBackoff);
     };
+    // Projected before the claim is consumed by preparation, so the
+    // coordination leg is driven by the same Kernel-issued attempt that carried
+    // the task transition. Nothing here derives coordination identity.
+    let coordination_source =
+        eliotd::campaign_task_controller::task_controller_coordination_source(&claimed);
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     let prepared = eliotd::campaign_task_controller::prepare_task_controller_claim(
         &reads,
@@ -5347,7 +5352,37 @@ async fn run_task_controller_poll(
         }
     };
     match kernel.submit_task_controller_result_async(&body).await {
-        Ok(TaskControllerSubmitOutcome::Accepted) => Ok(TaskControllerPollOutcome::Accepted),
+        Ok(TaskControllerSubmitOutcome::Accepted) => {
+            // The Kernel durably admitted this result body, so the coordination
+            // owner may now record the candidate reference for it. A refusal
+            // here is the coordination owner's own typed verdict on a
+            // candidate *reference*; it must not be laundered into a Task
+            // Controller failure, because the Kernel result is already durable
+            // and reporting an error would replay the whole transition. It is
+            // logged instead, at the boundary that produced it.
+            let now = unix_ms(SystemTime::now())?;
+            let mut guard = composition.lock().await;
+            match eliotd::campaign_task_controller::record_task_controller_coordination_candidate(
+                &mut guard,
+                &coordination_source,
+                &body.result_digest,
+                now,
+            )
+            .await
+            {
+                Ok((admitted, lease)) => tracing::debug!(
+                    canonical_work_lease = ?lease.issuance.work_lease_id(),
+                    evidence_commitment = lease.issuance.evidence_commitment_sha256(),
+                    coordination_image = %admitted.image_digest,
+                    "Task Controller coordination candidate reference was admitted"
+                ),
+                Err(error) => tracing::warn!(
+                    reason = %error,
+                    "Task Controller coordination candidate reference was not recorded"
+                ),
+            }
+            Ok(TaskControllerPollOutcome::Accepted)
+        }
         Ok(TaskControllerSubmitOutcome::Expired) => Ok(TaskControllerPollOutcome::Expired),
         Ok(TaskControllerSubmitOutcome::StaleAttempt) => {
             Ok(TaskControllerPollOutcome::StaleAttempt)

@@ -167,7 +167,8 @@ mod coordination_owner_commit;
 // are inherent methods on `GovernorComposition<P>`, not free items, so they are
 // reached as method calls and have no module path to re-export.
 pub use coordination_owner_commit::{
-    CommittedCoordinationResult, CoordinationCommitError, CoordinationEventContext,
+    CommittedCoordinationLease, CommittedCoordinationResult, CoordinationCommitError,
+    CoordinationEventContext,
 };
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,

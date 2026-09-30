@@ -61,6 +61,37 @@ pub struct PreparedTaskControllerExecution {
     transition: PreparedTaskTransition,
 }
 
+/// The admitted, Kernel-issued material the coordination lifecycle leg consumes.
+///
+/// This is the exact claim material, projected without derivation: the attempt
+/// is the Kernel-issued fenced capability and the identity is the admitted
+/// request identity for the same claim. The coordination work-item and lease
+/// identity is issued from these by
+/// [`eliot_governor::issue_coordination_work`](eliot_governor::issue_coordination_work);
+/// nothing in this adapter mints it.
+#[derive(Clone, Debug)]
+pub struct TaskControllerCoordinationSource {
+    /// The Kernel-issued fenced attempt for this claim.
+    pub attempt: eliot_protocol::TaskControllerAttempt,
+    /// The admitted request identity the Kernel issued the attempt under.
+    pub identity: eliot_protocol::RequestIdentity,
+}
+
+/// Projects the coordination source out of one admitted claim.
+///
+/// Called before the claim is consumed by preparation, so the coordination leg
+/// is driven by the same admitted attempt that carried the task transition
+/// rather than by anything re-read afterwards.
+#[must_use]
+pub fn task_controller_coordination_source(
+    claimed: &TaskControllerClaimedInvocation,
+) -> TaskControllerCoordinationSource {
+    TaskControllerCoordinationSource {
+        attempt: claimed.attempt.clone(),
+        identity: claimed.request_identity.clone(),
+    }
+}
+
 pub enum TaskControllerTransitionPreparation {
     Rejected(Box<TaskControllerResultBody>),
     Failed(String),
@@ -616,4 +647,61 @@ pub async fn exchange_task_controller_transition(
         &execution.claimed,
         json!({ "status": "committed", "receipt": receipt }),
     )
+}
+
+/// Records the coordination candidate reference for one admitted Task
+/// Controller result (issue #370 R1).
+///
+/// The coordination owner is a candidate *reference* owner: what it records is
+/// that one exact Kernel-admitted attempt produced one exact bounded result
+/// artifact, addressed by the Kernel-validated `result_digest` of the response
+/// bytes. The admitted receipt is capped at `CandidateArtifact` by the owner
+/// itself. This records no provider disposition, no verifier outcome, no
+/// acceptance satisfaction, and no Task finish input — a Task result is never
+/// derived from it here.
+///
+/// The identity is issued by the Governor, not here: `source` is the exact
+/// Kernel-issued attempt and admitted request identity, and
+/// [`eliot_governor::issue_coordination_work`] derives the work item, lease,
+/// result, and per-leg transport identities from them. This adapter mints
+/// nothing and defaults nothing; an attempt with no remaining window, a fence
+/// or task disagreement between the attempt and the admitted identity, and an
+/// invalid attempt are each refused by the issuer before any owner is touched.
+///
+/// Call this only after the Kernel has accepted the result body, so the
+/// coordination reference never records a result the Kernel refused to durably
+/// admit.
+pub async fn record_task_controller_coordination_candidate(
+    composition: &mut DaemonComposition,
+    source: &TaskControllerCoordinationSource,
+    result_digest: &str,
+    now: u64,
+) -> Result<
+    (
+        eliot_governor::CommittedCoordinationResult,
+        eliot_governor::CommittedCoordinationLease,
+    ),
+    String,
+> {
+    let issued = eliot_governor::issue_coordination_work(&source.attempt, &source.identity, now)
+        .map_err(|error| format!("coordination work identity issuance: {error}"))?;
+    let ingress = crate::coordination_owner_ingress::CoordinationResultIngress {
+        request_id: issued.result_leg.request_id.as_str().to_owned(),
+        result_id: issued.result_id.clone(),
+        session_id: issued.lease.session_id.clone(),
+        work_item_id: issued.lease.work_item_id.clone(),
+        lease_id: issued.lease.lease_id.clone(),
+        authority_epoch: source.attempt.authority_epoch.clone(),
+        state_fence: source.attempt.state_fence.clone(),
+        result_ref: format!(
+            "{}:{}",
+            eliot_governor::COORDINATION_RESULT_ARTIFACT_NAMESPACE,
+            result_digest
+        ),
+        now,
+    };
+    composition
+        .commit_coordination_candidate_lifecycle(issued, ingress)
+        .await
+        .map_err(|error| format!("coordination lifecycle commit: {error}"))
 }

@@ -37,6 +37,12 @@
 //! This module also grants no admission: the persisted coordination image caps
 //! every admitted result at `CandidateArtifact`, which is stamped by the owner
 //! itself, not by this path.
+//!
+//! The four legs are the whole lifecycle: a registered session, a ready work
+//! item, the fenced lease that moves that item to `Claimed`, and the candidate
+//! result admitted under that lease. A result cannot be admitted without the
+//! preceding three, which is why this route is a lifecycle and not four
+//! independent entry points.
 
 #![forbid(unsafe_code)]
 
@@ -46,6 +52,7 @@ use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{ClockReading, OperationId, canonical_json_bytes, sha256_hex};
 use eliot_coordination::{
     AgentResultDraft, AgentResultReceipt, CoordinationOwner, RegisterSession, WorkItem,
+    WorkLeaseIssuanceFailure, WorkLeaseIssuanceResult, WorkLeaseRequest,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
@@ -75,6 +82,12 @@ pub enum CoordinationCommitError {
     /// The coordination image could not be serialized or canonicalized.
     #[error("coordination owner image could not be encoded: {0}")]
     Serialization(String),
+    /// Canonical `WorkLeaseId` issuance refused the acquisition. This is the
+    /// #368 issuance owner's own typed failure — an exact replay, a changed
+    /// input under one request id, or a refused promotion of a legacy
+    /// acquisition — carried unchanged rather than flattened into a string.
+    #[error("canonical WorkLease issuance refused the claim: {0}")]
+    Issuance(#[from] WorkLeaseIssuanceFailure),
 }
 
 /// The committed receipt plus the coordination owner's own admission receipt.
@@ -91,6 +104,24 @@ pub struct CommittedCoordinationResult {
     /// The owner-stamped candidate admission receipt, when this commit admitted
     /// a result. `None` for a leg that only registered a session or work item.
     pub result: Option<AgentResultReceipt>,
+}
+
+/// The committed receipt plus the canonical lease identity the owner issued.
+///
+/// The canonical `WorkLeaseId` is produced by the owner inside the same call
+/// that acquires the lease ([`CoordinationOwner::acquire_work_with_issuance`]),
+/// never by this path, so the identity is content-bound to the exact admitted
+/// request and decision the owner itself validated.
+#[derive(Clone, Debug)]
+pub struct CommittedCoordinationLease {
+    /// SHA-256 over the exact canonical `owner/coordination` image bytes this
+    /// commit published.
+    pub image_digest: String,
+    /// The Kernel/store `WriteReceipt`, returned unmodified.
+    pub receipt: WriteReceipt,
+    /// The owner's own issuance result, carrying the canonical `WorkLeaseId`
+    /// and its evidence commitment.
+    pub issuance: WorkLeaseIssuanceResult,
 }
 
 /// The observed event context for one coordination lifecycle registration.
@@ -251,14 +282,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<CommittedCoordinationResult, CoordinationCommitError> {
         let mut image = self.owners().coordination.clone();
         image.register_session(session)?;
-        self.publish_coordination_image(
-            identity,
-            operation_id,
-            expected_coordination_revision,
-            image,
-            None,
-        )
-        .await
+        let (image_digest, receipt) = self
+            .publish_coordination_image(
+                identity,
+                operation_id,
+                expected_coordination_revision,
+                &image,
+            )
+            .await?;
+        Ok(CommittedCoordinationResult {
+            image_digest,
+            receipt,
+            result: None,
+        })
     }
 
     /// Registers one ready work item and durably publishes the resulting owner
@@ -282,14 +318,59 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &context.actor_id,
             context.observed_at,
         )?;
-        self.publish_coordination_image(
-            identity,
-            operation_id,
-            expected_coordination_revision,
-            image,
-            None,
-        )
-        .await
+        let (image_digest, receipt) = self
+            .publish_coordination_image(
+                identity,
+                operation_id,
+                expected_coordination_revision,
+                &image,
+            )
+            .await?;
+        Ok(CommittedCoordinationResult {
+            image_digest,
+            receipt,
+            result: None,
+        })
+    }
+
+    /// Claims one ready work item under a fenced lease and durably publishes
+    /// the resulting owner image.
+    ///
+    /// This is the durable leg that moves a registered work item to
+    /// `WorkState::Claimed`, which is the state
+    /// [`CoordinationOwner::admit_candidate_result`] requires. It calls
+    /// [`CoordinationOwner::acquire_work_with_issuance`] rather than the legacy
+    /// `acquire_work`, so the canonical `WorkLeaseId` is issued by its owner in
+    /// the same call that acquires the lease; a post-hoc promotion of a legacy
+    /// acquisition is refused by that owner with
+    /// `WorkLeaseIssuanceError::PostHocIssuanceRejected`.
+    ///
+    /// The request's `lease_id`, `work_item_id`, and `session_id` arrive from
+    /// admitted ingress. This path persists the image and interprets nothing:
+    /// the owner re-checks the active session, the ready work item, the lease
+    /// window, the authority epoch, the fence, and the event idempotency.
+    pub async fn commit_coordination_lease(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: OperationId,
+        expected_coordination_revision: u64,
+        request: WorkLeaseRequest,
+    ) -> Result<CommittedCoordinationLease, CoordinationCommitError> {
+        let mut image = self.owners().coordination.clone();
+        let issuance = image.acquire_work_with_issuance(request)?;
+        let (image_digest, receipt) = self
+            .publish_coordination_image(
+                identity,
+                operation_id,
+                expected_coordination_revision,
+                &image,
+            )
+            .await?;
+        Ok(CommittedCoordinationLease {
+            image_digest,
+            receipt,
+            issuance,
+        })
     }
 
     /// Admits one candidate result reference against a live coordination lease
@@ -312,14 +393,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<CommittedCoordinationResult, CoordinationCommitError> {
         let mut image = self.owners().coordination.clone();
         let admitted = image.admit_candidate_result(draft)?;
-        self.publish_coordination_image(
-            identity,
-            operation_id,
-            expected_coordination_revision,
-            image,
-            Some(admitted),
-        )
-        .await
+        let (image_digest, receipt) = self
+            .publish_coordination_image(
+                identity,
+                operation_id,
+                expected_coordination_revision,
+                &image,
+            )
+            .await?;
+        Ok(CommittedCoordinationResult {
+            image_digest,
+            receipt,
+            result: Some(admitted),
+        })
     }
 
     /// Commits one coordination image through the sole retained Kernel port.
@@ -335,23 +421,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         identity: &RequestIdentity,
         operation_id: OperationId,
         expected_coordination_revision: u64,
-        image: CoordinationOwner,
-        result: Option<AgentResultReceipt>,
-    ) -> Result<CommittedCoordinationResult, CoordinationCommitError> {
+        image: &CoordinationOwner,
+    ) -> Result<(String, WriteReceipt), CoordinationCommitError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady.into());
         }
         let (envelope, image_digest) = coordination_owner_envelope(
             identity,
             operation_id,
-            &image,
+            image,
             expected_coordination_revision,
         )?;
         let receipt = self.commit_canonical(identity, envelope).await?;
-        Ok(CommittedCoordinationResult {
-            image_digest,
-            receipt,
-            result,
-        })
+        Ok((image_digest, receipt))
     }
 }
