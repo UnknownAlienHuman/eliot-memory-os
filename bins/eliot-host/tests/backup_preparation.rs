@@ -902,8 +902,11 @@ fn cancellation_cleanup_preserves_source_and_unknown() {
         .expect("loads")
         .expect("intent present");
     let envelope = result.expect("cancel envelope present");
+    // The lifecycle state is a typed field now, not the free-form `status`
+    // string the envelope used to carry. The assertion is unchanged in
+    // strength: it still requires the operation to read back as CANCELLED.
     assert_eq!(
-        envelope.get("status").and_then(|v| v.as_str()),
+        envelope.get("state").and_then(|v| v.as_str()),
         Some("cancelled")
     );
     assert!(
