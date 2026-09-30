@@ -352,6 +352,82 @@ fn native_worker_registry_digest(
         })
 }
 
+/// Worker-owned claim/fence tuple presented with one lifecycle operation.
+/// Registration has no claim identity yet, so the authenticated peer resolves
+/// its exact retained claim through the Kernel launch receipt.
+struct NativeWorkerPresentedCurrentness {
+    claim_id: Option<String>,
+    worker_generation: u64,
+    state_fence: StateFence,
+    registration: Option<serde_json::Value>,
+}
+
+fn native_worker_presented_currentness(
+    operation: &str,
+    payload: &serde_json::Value,
+) -> Result<NativeWorkerPresentedCurrentness, NativeWorkerRouteError> {
+    let (owner, claim_id, registration) = match operation {
+        NATIVE_WORKER_REGISTRATION_OPERATION => (payload, None, Some(payload.clone())),
+        NATIVE_WORKER_CLAIM_OPERATION => {
+            let (claim, registration) = KernelComposition::split_claim_presentation(payload)?;
+            (
+                claim,
+                Some(require_op_id(claim, "claim_id")?),
+                Some(registration.clone()),
+            )
+        }
+        NATIVE_WORKER_READY_OPERATION => {
+            let claim = payload
+                .get("claim")
+                .filter(|claim| claim.is_object())
+                .ok_or(NativeWorkerRouteError::Shape { field: "claim" })?;
+            let registration = payload
+                .get("registration")
+                .filter(|registration| registration.is_object())
+                .ok_or(NativeWorkerRouteError::Shape {
+                    field: "registration",
+                })?;
+            (
+                claim,
+                Some(require_op_id(claim, "claim_id")?),
+                Some(registration.clone()),
+            )
+        }
+        NATIVE_WORKER_RECONCILE_OPERATION => {
+            let claim = payload
+                .get("claim")
+                .filter(|claim| claim.is_object())
+                .ok_or(NativeWorkerRouteError::Shape { field: "claim" })?;
+            (claim, Some(require_op_id(claim, "claim_id")?), None)
+        }
+        _ => {
+            let binding = payload
+                .get("binding")
+                .filter(|binding| binding.is_object())
+                .ok_or(NativeWorkerRouteError::Shape { field: "binding" })?;
+            (
+                binding,
+                Some(require_op_id(binding, "claim_id")?),
+                None,
+            )
+        }
+    };
+    let worker_generation = require_nonzero_u64(owner, "worker_generation")?;
+    let state_fence = owner
+        .get("state_fence")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or(NativeWorkerRouteError::Shape {
+            field: "state_fence",
+        })?;
+    Ok(NativeWorkerPresentedCurrentness {
+        claim_id,
+        worker_generation,
+        state_fence,
+        registration,
+    })
+}
+
 /// Reads one lowercase SHA-256 digest field.
 pub(crate) fn require_digest(
     value: &serde_json::Value,
@@ -782,6 +858,54 @@ fn native_worker_operation_allows_degraded(operation: &str, payload: &serde_json
 }
 
 impl KernelComposition {
+    /// Awaits only the exact native-worker registration launch marker before
+    /// synchronous frame dispatch. The marker is not authority: dispatch
+    /// still requires the completed ProcessExecutor receipt and exact peer.
+    pub(crate) async fn await_native_worker_registration_start(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<(), TransportError> {
+        let operation = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload
+                .get("operation")
+                .and_then(serde_json::Value::as_str),
+            _ => None,
+        };
+        if operation != Some(NATIVE_WORKER_REGISTRATION_OPERATION) {
+            return Ok(());
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let peer = session
+            .peer
+            .process_binding()
+            .cloned()
+            .ok_or(TransportError::PeerIdentityUnavailable)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity_value =
+            serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?;
+        let request_deadline_unix_ms =
+            require_nonzero_u64(&identity_value, "deadline_unix_ms")
+                .map_err(NativeWorkerRouteError::into_transport)?;
+        let launch_nonce = session.launch_nonce.clone();
+        tokio::task::spawn_blocking(move || {
+            super::dispatch_launch::wait_for_native_worker_process_start(
+                &peer,
+                &launch_nonce,
+                request_deadline_unix_ms,
+            )
+        })
+        .await
+        .map_err(|_| TransportError::SessionFenced)?
+        .map_err(|_| TransportError::SessionFenced)
+    }
+
     /// Dispatches one native-worker lifecycle frame.
     ///
     /// The caller ([`crate::KernelComposition::dispatch_frame`]) has already
@@ -850,8 +974,18 @@ impl KernelComposition {
             self.admit_material_authority_for_governor_issued_fence(&presented_fence)
                 .map_err(|_| TransportError::SessionFenced)?;
         }
+        let current_proof = self
+            .native_worker_cell_current_proof(
+                session,
+                operation,
+                &request_id,
+                &payload,
+                &presented_fence,
+            )
+            .map_err(NativeWorkerRouteError::into_transport)?;
         if operation == NATIVE_WORKER_RECONCILE_OPERATION {
-            return self.dispatch_native_worker_reconcile(session, frame);
+            let action = self.dispatch_native_worker_reconcile(session, frame)?;
+            return Self::attach_native_worker_proof_to_action(action, current_proof);
         }
         if operation == NATIVE_WORKER_CANCEL_OBSERVE_OPERATION {
             let (operation_id, session_binding) = self
@@ -885,8 +1019,209 @@ impl KernelComposition {
             _ => Err(NativeWorkerRouteError::Shape { field: "operation" }),
         }
         .map_err(NativeWorkerRouteError::into_transport)?;
+        let receipt = Self::attach_native_worker_proof_to_receipt(receipt, current_proof)?;
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
         frame.request_id = Some(request_id);
+        frame
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(frame))
+    }
+
+    /// Joins a worker lifecycle presentation to its exact admitted claim,
+    /// retained ProcessExecutor start receipt, authenticated peer, and live
+    /// Kernel activation before any route handler can admit an effect.
+    fn native_worker_cell_current_proof(
+        &self,
+        session: &Session,
+        operation: &str,
+        request_id: &str,
+        payload: &serde_json::Value,
+        presented_fence: &StateFence,
+    ) -> Result<serde_json::Value, NativeWorkerRouteError> {
+        let presented = native_worker_presented_currentness(operation, payload)?;
+        let peer = session
+            .peer
+            .process_binding()
+            .ok_or(NativeWorkerRouteError::Fence {
+                field: "authenticated_process_binding",
+            })?;
+        let process_start = super::dispatch_launch::native_worker_process_start_binding_for_peer(
+            peer,
+            presented.claim_id.as_deref(),
+        )
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "process_start_receipt",
+        })?;
+        let request = &process_start.request;
+        let claim_receipt = &process_start.claim_receipt;
+        let process_receipt = &process_start.receipt;
+        let process_identity = process_receipt.identity();
+        let physical = process_identity.physical();
+        let executable_binding = request
+            .executable_binding
+            .as_ref()
+            .ok_or(NativeWorkerRouteError::Fence {
+                field: "executable_binding",
+            })?;
+        request
+            .validate()
+            .and_then(|()| request.validate_canonical_digest())
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "claim_request",
+            })?;
+        claim_receipt
+            .validate()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "claim_receipt",
+            })?;
+        process_receipt
+            .validate()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "process_start_receipt",
+            })?;
+        let registry_digest = native_worker_registry_digest(&executable_binding.capability_cell)?;
+        let durable = self.load_claim_record(&request.claim_id)?;
+        durable
+            .validate()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "durable_claim",
+            })?;
+        let claim_fence_digest = Self::presenting_fence_digest(&request.state_fence)?;
+        let (live_epoch, live_activation_generation) = {
+            let service = self.service_guard()?;
+            let live_epoch = service.authority_epoch();
+            let live_activation_generation = service
+                .activation_receipt()
+                .map_or(0, |receipt| receipt.generation.value());
+            (live_epoch, live_activation_generation)
+        };
+        if presented
+            .claim_id
+            .as_deref()
+            .is_some_and(|claim_id| claim_id != request.claim_id)
+            || presented.worker_generation != request.worker_generation
+            || presented.state_fence != request.state_fence
+            || *presented_fence != request.state_fence
+            || session.authority_epoch != request.authority_epoch
+            || session.module_generation.module_id.as_str()
+                != super::front_door_session::NATIVE_MODULE_ID
+            || session.module_generation.generation.value() != request.worker_generation
+            || session.module_generation.artifact_id.as_str()
+                != request.worker_artifact_digest
+            || session.module_generation.state_fence != request.state_fence
+            || session.launch_nonce != process_start.launch_nonce
+            || process_start.launch_nonce != executable_binding.launch_nonce
+            || process_start.activation_epoch != request.authority_epoch
+            || !process_start
+                .activation_epoch
+                .is_same_authority(&live_epoch)
+            || process_start.activation_generation.get() != live_activation_generation
+            || live_activation_generation == 0
+            || peer.process_id() != physical.process_id()
+            || peer.start_time_100ns() != physical.start_time_100ns()
+            || peer.executable_file_identity() != Some(process_start.executable_file_identity)
+            || !peer
+                .image_path()
+                .eq_ignore_ascii_case(physical.image_path())
+            || process_identity.executable_sha256() != request.worker_artifact_digest
+            || durable.claim_id.as_str() != request.claim_id
+            || durable.registration_id.as_str() != request.registration_id
+            || durable.attempt_id.as_str() != request.attempt_id
+            || durable.operation_id.as_str() != request.operation_id
+            || durable.worker_generation != request.worker_generation
+            || durable.authority_epoch != request.authority_epoch.sequence.get()
+            || durable.fence_digest != claim_fence_digest
+            || durable.binding_digest != request.binding_digest
+            || durable.request_digest != request.request_digest
+            || durable.receipt_digest.as_deref() != Some(claim_receipt.receipt_digest.as_str())
+            || durable.state == NativeWorkerClaimState::Requested
+            || durable.capability_cell.as_ref().map(|cell| cell.as_str())
+                != Some(executable_binding.capability_cell.as_str())
+            || durable.capability_cell_registry_digest.as_deref()
+                != Some(registry_digest.as_str())
+            || executable_binding.capability_cell_registry_digest != registry_digest
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "native_worker_cell_process_currentness",
+            });
+        }
+        if let Some(registration) = presented.registration.as_ref() {
+            let (registered_cell, module_catalog_revision) =
+                native_worker_catalog_binding(registration)?;
+            if registered_cell != executable_binding.capability_cell
+                || module_catalog_revision != executable_binding.module_catalog_revision
+            {
+                return Err(NativeWorkerRouteError::Fence {
+                    field: "native_worker_registration_cell",
+                });
+            }
+        }
+        let proof_body = serde_json::json!({
+            "kind": "native_worker_capability_cell_process_proof",
+            "operation": operation,
+            "request_id": request_id,
+            "connection_id": session.connection_id,
+            "session_epoch": session.session_epoch,
+            "claim_id": request.claim_id,
+            "claim_request_digest": request.request_digest,
+            "claim_binding_digest": request.binding_digest,
+            "claim_receipt_digest": claim_receipt.receipt_digest,
+            "state_fence_digest": claim_fence_digest,
+            "authority_epoch": request.authority_epoch,
+            "worker_generation": request.worker_generation,
+            "capability_cell": executable_binding.capability_cell,
+            "capability_cell_registry_digest": registry_digest,
+            "registry_resolution": "validated_kernel_embedded_registry",
+            "launch_nonce": process_start.launch_nonce,
+            "process_operation_id": process_receipt.operation_id().as_str(),
+            "process_request_digest": process_receipt.request_digest(),
+            "owner_process_invocation_digest": executable_binding.process_invocation_digest,
+            "activation_epoch": process_start.activation_epoch,
+            "activation_generation": process_start.activation_generation.get(),
+            "artifact_sha256": request.worker_artifact_digest,
+            "process_executable_sha256": process_identity.executable_sha256(),
+            "process_id": physical.process_id(),
+            "process_start_100ns": physical.start_time_100ns(),
+            "process_image_path": physical.image_path(),
+            "launch_executable_file_identity": process_start.executable_file_identity,
+            "peer_executable_file_identity": peer.executable_file_identity(),
+        });
+        let proof_digest = sha256_json(&proof_body).map_err(|_| NativeWorkerRouteError::Shape {
+            field: "capability_cell_proof",
+        })?;
+        let mut proof = proof_body;
+        proof["proof_digest"] = serde_json::Value::String(proof_digest);
+        Ok(proof)
+    }
+
+    fn attach_native_worker_proof_to_receipt(
+        mut receipt: serde_json::Value,
+        proof: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let issued_route_receipt = receipt.clone();
+        let object = receipt
+            .as_object_mut()
+            .ok_or(TransportError::SessionFenced)?;
+        object.remove("receipt_digest");
+        object.insert("issued_route_receipt".to_owned(), issued_route_receipt);
+        object.insert("capability_cell_proof".to_owned(), proof);
+        seal_route_receipt(receipt)
+    }
+
+    fn attach_native_worker_proof_to_action(
+        action: KernelFrameAction,
+        proof: serde_json::Value,
+    ) -> Result<KernelFrameAction, TransportError> {
+        let KernelFrameAction::Reply(mut frame) = action else {
+            return Err(TransportError::SessionFenced);
+        };
+        let ProtocolPayload::Json(receipt) = frame.payload else {
+            return Err(TransportError::SessionFenced);
+        };
+        frame.payload = ProtocolPayload::Json(Self::attach_native_worker_proof_to_receipt(
+            receipt, proof,
+        )?);
         frame
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
