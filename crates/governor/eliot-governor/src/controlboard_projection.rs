@@ -47,6 +47,11 @@ use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_coordination::{
     AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding,
 };
+use eliot_evaluation_contracts::{
+    ComparisonBasis, EvaluatorRole, HumanAttentionClaim, HumanAttentionEvaluation,
+    HumanAttentionMetric, HumanAttentionMetricGroupKind, HumanAttentionMetricObservation,
+    ObservationWindowStatus,
+};
 use eliot_observation::ObservationJournal;
 use eliot_store_api::ScopeRevisionView;
 use eliot_task::TaskLifecycleOwner;
@@ -68,6 +73,9 @@ pub enum ControlBoardProjectionError {
     /// Owner state could not be serialized for the binding digest.
     #[error("controlboard projection owner state is invalid: {0}")]
     Owner(String),
+    /// An attention-evaluation row could not be assembled honestly.
+    #[error("controlboard attention evaluation is invalid: {0}")]
+    Evaluation(String),
 }
 
 /// One provider-issued identity binding assembled from a real owner read.
@@ -319,6 +327,603 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
                 .collect(),
         })
         .collect()
+}
+
+/// Rendered currency of one evaluation revision on the board.
+///
+/// The persist leg remains the authority for commit decisions; this enum is the
+/// board's display of the same record facts plus the chain and window context
+/// the commit leg cannot see: supersession by a newer linked revision, and
+/// whether the observation window matured enough for current tuning. It grants
+/// no policy authority, resolves no Problem, and offers no ranking. There is
+/// deliberately no `From`/`Into` bridge to the persist leg's validity verdict:
+/// the commit gate and the board rendering stay separate types on purpose.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlBoardAttentionValidity {
+    /// Usable for current tuning and citation.
+    Current,
+    /// A newer linked revision exists; this revision is history only.
+    Superseded {
+        /// Revision that supersedes the viewed revision.
+        successor_revision: u64,
+    },
+    /// Past its declared expiry; retained for history, unusable for current use.
+    Expired,
+    /// Invalidated with reason and affected scope; retained for history,
+    /// unusable for current use. Notification and approval obligations bound
+    /// as evidence are unchanged by this verdict.
+    Invalidated {
+        /// Why the revision was invalidated.
+        reason: String,
+        /// Scope, evidence, or policy coordinates the invalidation covers.
+        affected_scope_refs: Vec<String>,
+    },
+    /// The observation window did not mature: still open, regressed, or
+    /// censored/inconclusive. Readable as history, unusable for current tuning.
+    WindowNotMatured {
+        /// Window status that blocks current tuning use.
+        status: ObservationWindowStatus,
+        /// Why the window cannot support current tuning.
+        detail: String,
+    },
+}
+
+impl ControlBoardAttentionValidity {
+    /// Whether this revision may inform current tuning or policy citation.
+    /// Only [`Self::Current`] qualifies; every other variant names its own
+    /// reason and stays visibly unusable.
+    #[must_use]
+    pub const fn usable_for_current_tuning(&self) -> bool {
+        matches!(self, Self::Current)
+    }
+}
+
+/// Evaluated profile revision cited by one evaluation row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardAttentionProfileRef {
+    /// Profile identity bound by the record.
+    pub profile_id: String,
+    /// Profile revision bound by the record.
+    pub revision: String,
+}
+
+/// One required I11.10 metric group reproduced verbatim from the record.
+///
+/// Values keep their explicit missingness: an observed zero is an observed
+/// number, while missing follow-up or collection stays `Unknown` with its
+/// reason and is never zero-filled here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardAttentionMetricGroupRow {
+    /// Which I11.10 group these observations belong to.
+    pub group: HumanAttentionMetricGroupKind,
+    /// Every observation the record carries for the group, in record order.
+    pub metrics: Vec<HumanAttentionMetricObservation>,
+}
+
+/// Alert volume displayed only alongside missed risk, harm, and task costs.
+///
+/// The bundle carries all six load-bearing observations together so a surface
+/// cannot render lower alert volume as an automatic positive badge: fewer
+/// notifications next to more missed critical harm, final harm, or false
+/// blocks is not superior, and this struct offers no ranking, score, or
+/// `better` predicate to claim otherwise.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardAttentionVolumeVsHarm {
+    /// Deduplicated inbox items the evaluated profile produced.
+    pub deduplicated_inbox_items: HumanAttentionMetricObservation,
+    /// Delivery attempts the evaluated profile produced.
+    pub delivery_attempts: HumanAttentionMetricObservation,
+    /// Critical risk events the evaluated profile missed.
+    pub missed_critical_risk_events: HumanAttentionMetricObservation,
+    /// Final harm events observed on the evaluated profile.
+    pub final_harm_events: HumanAttentionMetricObservation,
+    /// Benign tasks the evaluated profile falsely blocked.
+    pub benign_false_block_tasks: HumanAttentionMetricObservation,
+    /// Work abandoned under the evaluated profile.
+    pub abandoned_work_tasks: HumanAttentionMetricObservation,
+}
+
+/// One evaluation revision rendered honestly for the board.
+///
+/// Identity, scope, window, observations, limitations, comparison basis, and
+/// validity travel together; evidence travels as bound handles only, resolved
+/// through a separate authorized expansion. A row neither resolves a Problem,
+/// grants an approval, nor changes policy: a separate authorized policy change
+/// may cite the evaluation identity and revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardAttentionEvaluationRow {
+    /// Evaluation identity this revision belongs to.
+    pub evaluation_id: String,
+    /// Monotonic revision within the evaluation identity.
+    pub revision: u64,
+    /// Immediately preceding revision, absent only on revision one.
+    pub predecessor_revision: Option<u64>,
+    /// Principal that assembled the record, exactly as the record names it.
+    pub evaluator_principal_id: String,
+    /// Evaluator role as recorded; descriptive, confers no access.
+    pub evaluator_role: EvaluatorRole,
+    /// Authorized scope refs the evaluator declared.
+    pub authorized_scope_refs: Vec<String>,
+    /// Task population refs the evaluator declared.
+    pub task_population_refs: Vec<String>,
+    /// Risk population refs the evaluator declared.
+    pub risk_population_refs: Vec<String>,
+    /// Observation window identity bound by the record.
+    pub window_id: String,
+    /// Window open instant in Unix milliseconds, absent when unknown.
+    pub window_opened_at_ms: Option<i64>,
+    /// Window close instant in Unix milliseconds, absent while open.
+    pub window_closed_at_ms: Option<i64>,
+    /// Observation window status bound by the record.
+    pub window_status: ObservationWindowStatus,
+    /// Censoring reason, present exactly on censored windows.
+    pub censoring_reason: Option<String>,
+    /// Evaluated policy profile revision.
+    pub policy_revision: ControlBoardAttentionProfileRef,
+    /// Evaluated notification profile revision.
+    pub notification_revision: ControlBoardAttentionProfileRef,
+    /// Evaluated approval profile revision.
+    pub approval_revision: ControlBoardAttentionProfileRef,
+    /// Evaluated telemetry profile revision.
+    pub telemetry_revision: ControlBoardAttentionProfileRef,
+    /// All ten I11.10 metric groups in I11.10 field order.
+    pub metric_groups: Vec<ControlBoardAttentionMetricGroupRow>,
+    /// Volume shown only beside harm and task costs, never as a badge.
+    pub volume_vs_harm: ControlBoardAttentionVolumeVsHarm,
+    /// Explicit limitations and gaps from the record uncertainty assessment.
+    pub limitations: Vec<String>,
+    /// Basis text of the uncertainty assessment.
+    pub uncertainty_assessment_basis: String,
+    /// Declared comparison basis; descriptive records carry none.
+    pub comparison_basis: ComparisonBasis,
+    /// Comparator profiles the record method declares.
+    pub comparator_profile_refs: Vec<String>,
+    /// Reason when comparison is unavailable or inapplicable.
+    pub comparison_reason: Option<String>,
+    /// Conclusions exactly as the record states them; conditional claims keep
+    /// their comparator, applicability, and caveats.
+    pub claims: Vec<HumanAttentionClaim>,
+    /// Evidence manifest identity bound by the record.
+    pub evidence_manifest_id: String,
+    /// Evidence manifest revision bound by the record.
+    pub evidence_manifest_revision: String,
+    /// Bound evidence handles for citation and authorized expansion. Handles
+    /// only: the projection resolves no evidence bytes.
+    pub bound_evidence_refs: Vec<String>,
+    /// Always false from the projection. Evidence expansion is the separate
+    /// authorized [`expand_attention_evidence`] call, never an implicit read.
+    pub evidence_expanded: bool,
+    /// Rendered currency of this revision.
+    pub validity: ControlBoardAttentionValidity,
+    /// Digest over the canonical bytes of the exact record revision. It equals
+    /// the committed revision identity: any substitution, including a zero
+    /// written where the producer recorded unknown, changes it.
+    pub record_digest: String,
+}
+
+/// Admitted viewer asking for the attention board.
+///
+/// Scope refs reuse the record's own `authorized_scope_refs` vocabulary: no
+/// new role, visibility, or privacy fact is invented here. The viewer proves
+/// nothing by presenting these; the owning surface authenticates the binding
+/// (I11.8) and this projection only filters on exact cover.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlBoardAttentionViewer {
+    /// Principal asking for the view, exactly as the authenticated binding names it.
+    pub principal_id: String,
+    /// Scope refs the viewer is admitted to.
+    pub scope_refs: Vec<String>,
+}
+
+impl ControlBoardAttentionViewer {
+    /// Names an admitted viewer. A blank principal fails closed: anonymous
+    /// callers receive no rows, full or withheld.
+    pub fn new(
+        principal_id: String,
+        scope_refs: Vec<String>,
+    ) -> Result<Self, ControlBoardProjectionError> {
+        if principal_id.trim().is_empty() || principal_id.chars().any(char::is_control) {
+            return Err(ControlBoardProjectionError::Evaluation(
+                "attention viewer principal must be non-blank and free of control characters"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            principal_id,
+            scope_refs,
+        })
+    }
+}
+
+/// Role-filtered attention board: one entry per supplied record revision.
+///
+/// Governance facts (identity, scope, window, validity, limitations,
+/// comparison basis) stay visible on every entry. Full observations and
+/// evidence handles appear only under authorized scope cover; anything else is
+/// an explicit withheld marker, never a silent omission or a synthesized row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardAttentionBoard {
+    /// One entry per supplied record revision, in caller order.
+    pub rows: Vec<ControlBoardAttentionBoardRow>,
+}
+
+/// One board entry: full observations under authorized cover, or an explicit
+/// withheld marker carrying only identity and validity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ControlBoardAttentionBoardRow {
+    /// Full row: the viewer covers the record scope or is its evaluator.
+    Full(ControlBoardAttentionEvaluationRow),
+    /// Observations and evidence handles withheld for lack of scope cover.
+    ScopeWithheld {
+        /// Evaluation identity of the withheld revision.
+        evaluation_id: String,
+        /// Revision of the withheld record.
+        revision: u64,
+        /// Currency stays visible so a withheld row can never read as usable.
+        validity: ControlBoardAttentionValidity,
+        /// Why observations are withheld.
+        reason: String,
+    },
+}
+
+/// Derives the rendered validity of one record revision.
+///
+/// Order is fail-visible: invalidation first, then supersession by a newer
+/// linked revision, then declared expiry, then window maturity. Expiry follows
+/// the persist leg exactly: when either the declared expiry or the observation
+/// instant is unknown, expiry cannot be established and the record is not
+/// expired by default. Only a matured window with a close reading supports
+/// current tuning; open, regressed, and censored windows stay readable
+/// history.
+#[must_use]
+pub fn attention_board_validity(
+    record: &HumanAttentionEvaluation,
+    successor_revision: Option<u64>,
+    now_unix_ms: i64,
+) -> ControlBoardAttentionValidity {
+    let flags = &record.evaluator_scope_uncertainty_and_invalidation;
+    if let Some(invalidation) = &flags.invalidation {
+        return ControlBoardAttentionValidity::Invalidated {
+            reason: invalidation.reason.clone(),
+            affected_scope_refs: invalidation.affected_scope_refs.clone(),
+        };
+    }
+    if let Some(successor) = successor_revision {
+        return ControlBoardAttentionValidity::Superseded {
+            successor_revision: successor,
+        };
+    }
+    if record
+        .expires_at
+        .known_time_ms
+        .is_some_and(|expires_ms| now_unix_ms >= expires_ms)
+    {
+        return ControlBoardAttentionValidity::Expired;
+    }
+    let window = &record.observation_window;
+    if window.specification.status != ObservationWindowStatus::Matured || window.closed_at.is_none()
+    {
+        let detail = match window.specification.status {
+            ObservationWindowStatus::Open => "observation window is still open".to_owned(),
+            ObservationWindowStatus::Regressed => {
+                "observation window regressed after maturing".to_owned()
+            }
+            ObservationWindowStatus::CensoredOrInconclusive => window
+                .censoring_reason
+                .clone()
+                .unwrap_or_else(|| "observation window is censored or inconclusive".to_owned()),
+            ObservationWindowStatus::Matured => {
+                "matured observation window carries no close reading".to_owned()
+            }
+        };
+        return ControlBoardAttentionValidity::WindowNotMatured {
+            status: window.specification.status,
+            detail,
+        };
+    }
+    ControlBoardAttentionValidity::Current
+}
+
+/// Whether the viewer may see full observations and expand evidence.
+///
+/// The evaluator who assembled the record always may. Anyone else must cover
+/// every authorized scope ref the record declares; a record declaring no
+/// authorized scope is covered by nobody. Foreign expansion fails closed here,
+/// and byte resolution stays with the owning surface's authorized reads.
+#[must_use]
+pub fn attention_evidence_expansion_permitted(
+    record: &HumanAttentionEvaluation,
+    viewer: &ControlBoardAttentionViewer,
+) -> bool {
+    let flags = &record.evaluator_scope_uncertainty_and_invalidation;
+    if viewer.principal_id == flags.evaluator.principal_id {
+        return true;
+    }
+    if flags.authorized_scope.authorized_scope_refs.is_empty() {
+        return false;
+    }
+    flags
+        .authorized_scope
+        .authorized_scope_refs
+        .iter()
+        .all(|scope| viewer.scope_refs.iter().any(|held| held == scope))
+}
+
+/// Authorizes evidence-handle expansion for one record revision.
+///
+/// Returns the manifest's bound handles when
+/// [`attention_evidence_expansion_permitted`] holds, and fails closed
+/// otherwise. The projection resolves no bytes: the owning surface resolves
+/// these handles through its own authorized reads, so a suppressed toast's
+/// persistent obligation and every cited artifact stay under their owners'
+/// access rules.
+pub fn expand_attention_evidence(
+    record: &HumanAttentionEvaluation,
+    viewer: &ControlBoardAttentionViewer,
+) -> Result<Vec<String>, ControlBoardProjectionError> {
+    record
+        .validate()
+        .map_err(|error| ControlBoardProjectionError::Evaluation(error.to_string()))?;
+    if !attention_evidence_expansion_permitted(record, viewer) {
+        return Err(ControlBoardProjectionError::Evaluation(
+            "foreign evidence expansion is denied: the viewer does not cover the record scope"
+                .to_owned(),
+        ));
+    }
+    Ok(record
+        .evidence_manifest
+        .evidence_refs
+        .iter()
+        .map(ToString::to_string)
+        .collect())
+}
+
+/// Finds one metric observation across all ten record groups.
+fn observation_for(
+    record: &HumanAttentionEvaluation,
+    metric: HumanAttentionMetric,
+) -> Option<HumanAttentionMetricObservation> {
+    [
+        &record.policy_and_task_risk_profile,
+        &record.notification_approval_and_telemetry_profile,
+        &record.missed_critical_and_false_critical_counts,
+        &record.pre_exposure_prevention_and_conditional_intervention,
+        &record.final_harm_and_residual_risk,
+        &record.benign_false_blocks_and_abandoned_work,
+        &record.interruption_and_resumption_time_quality,
+        &record.task_correctness_rework_and_human_attention,
+        &record.overtrust_undertrust_and_recoverability_observations,
+        &record.privacy_purpose_retention_and_disclosure_cost,
+    ]
+    .iter()
+    .flat_map(|group| group.metrics.iter())
+    .find(|observation| observation.metric == metric)
+    .cloned()
+}
+
+/// Requires one volume-bundle observation by metric key.
+///
+/// The bundle is all-or-nothing: a missing load-bearing observation fails the
+/// row instead of rendering volume without its harm context.
+fn attention_volume_metric(
+    record: &HumanAttentionEvaluation,
+    metric: HumanAttentionMetric,
+) -> Result<HumanAttentionMetricObservation, ControlBoardProjectionError> {
+    observation_for(record, metric).ok_or_else(|| {
+        ControlBoardProjectionError::Evaluation(format!(
+            "attention volume bundle is missing metric {metric:?}"
+        ))
+    })
+}
+
+/// Renders one profile revision ref bound by the record.
+fn attention_profile_ref(
+    profile_id: &eliot_contracts::ContractId,
+    revision: &str,
+) -> ControlBoardAttentionProfileRef {
+    ControlBoardAttentionProfileRef {
+        profile_id: profile_id.to_string(),
+        revision: revision.to_owned(),
+    }
+}
+
+/// Renders all ten I11.10 metric groups in I11.10 field order.
+fn attention_metric_group_rows(
+    record: &HumanAttentionEvaluation,
+) -> Vec<ControlBoardAttentionMetricGroupRow> {
+    [
+        (
+            &record.policy_and_task_risk_profile,
+            HumanAttentionMetricGroupKind::PolicyAndTaskRiskProfile,
+        ),
+        (
+            &record.notification_approval_and_telemetry_profile,
+            HumanAttentionMetricGroupKind::NotificationApprovalAndTelemetryProfile,
+        ),
+        (
+            &record.missed_critical_and_false_critical_counts,
+            HumanAttentionMetricGroupKind::MissedCriticalAndFalseCriticalCounts,
+        ),
+        (
+            &record.pre_exposure_prevention_and_conditional_intervention,
+            HumanAttentionMetricGroupKind::PreExposurePreventionAndConditionalIntervention,
+        ),
+        (
+            &record.final_harm_and_residual_risk,
+            HumanAttentionMetricGroupKind::FinalHarmAndResidualRisk,
+        ),
+        (
+            &record.benign_false_blocks_and_abandoned_work,
+            HumanAttentionMetricGroupKind::BenignFalseBlocksAndAbandonedWork,
+        ),
+        (
+            &record.interruption_and_resumption_time_quality,
+            HumanAttentionMetricGroupKind::InterruptionAndResumptionTimeQuality,
+        ),
+        (
+            &record.task_correctness_rework_and_human_attention,
+            HumanAttentionMetricGroupKind::TaskCorrectnessReworkAndHumanAttention,
+        ),
+        (
+            &record.overtrust_undertrust_and_recoverability_observations,
+            HumanAttentionMetricGroupKind::OvertrustUndertrustAndRecoverabilityObservations,
+        ),
+        (
+            &record.privacy_purpose_retention_and_disclosure_cost,
+            HumanAttentionMetricGroupKind::PrivacyPurposeRetentionAndDisclosureCost,
+        ),
+    ]
+    .into_iter()
+    .map(|(group, kind)| ControlBoardAttentionMetricGroupRow {
+        group: kind,
+        metrics: group.metrics.clone(),
+    })
+    .collect()
+}
+
+/// Bundles the six load-bearing volume/harm observations of one record.
+///
+/// All-or-nothing: a missing observation fails the bundle instead of rendering
+/// volume without its harm context.
+fn attention_volume_vs_harm(
+    record: &HumanAttentionEvaluation,
+) -> Result<ControlBoardAttentionVolumeVsHarm, ControlBoardProjectionError> {
+    Ok(ControlBoardAttentionVolumeVsHarm {
+        deduplicated_inbox_items: attention_volume_metric(
+            record,
+            HumanAttentionMetric::DeduplicatedInboxItems,
+        )?,
+        delivery_attempts: attention_volume_metric(
+            record,
+            HumanAttentionMetric::DeliveryAttempts,
+        )?,
+        missed_critical_risk_events: attention_volume_metric(
+            record,
+            HumanAttentionMetric::MissedCriticalRiskEvents,
+        )?,
+        final_harm_events: attention_volume_metric(record, HumanAttentionMetric::FinalHarmEvents)?,
+        benign_false_block_tasks: attention_volume_metric(
+            record,
+            HumanAttentionMetric::BenignFalseBlockTasks,
+        )?,
+        abandoned_work_tasks: attention_volume_metric(
+            record,
+            HumanAttentionMetric::AbandonedWorkTasks,
+        )?,
+    })
+}
+
+/// Projects one record revision into its board row.
+///
+/// The record is structurally validated first: a malformed record fails the
+/// row instead of rendering a partial one. Unknowns travel as unknowns; the
+/// volume bundle fails the row when any of its six observations is absent.
+fn project_attention_row(
+    record: &HumanAttentionEvaluation,
+    successor_revision: Option<u64>,
+    now_unix_ms: i64,
+) -> Result<ControlBoardAttentionEvaluationRow, ControlBoardProjectionError> {
+    record
+        .validate()
+        .map_err(|error| ControlBoardProjectionError::Evaluation(error.to_string()))?;
+    let flags = &record.evaluator_scope_uncertainty_and_invalidation;
+    let record_bytes = canonical_json_bytes(record)
+        .map_err(|error| ControlBoardProjectionError::Evaluation(error.to_string()))?;
+    Ok(ControlBoardAttentionEvaluationRow {
+        evaluation_id: record.evaluation_id.to_string(),
+        revision: record.revision,
+        predecessor_revision: record.predecessor.as_ref().map(|link| link.revision),
+        evaluator_principal_id: flags.evaluator.principal_id.clone(),
+        evaluator_role: flags.evaluator.role,
+        authorized_scope_refs: flags.authorized_scope.authorized_scope_refs.clone(),
+        task_population_refs: flags.authorized_scope.task_population_refs.clone(),
+        risk_population_refs: flags.authorized_scope.risk_population_refs.clone(),
+        window_id: record.observation_window.specification.window_id.to_string(),
+        window_opened_at_ms: record.observation_window.opened_at.known_time_ms,
+        window_closed_at_ms: record
+            .observation_window
+            .closed_at
+            .as_ref()
+            .and_then(|closed| closed.known_time_ms),
+        window_status: record.observation_window.specification.status,
+        censoring_reason: record.observation_window.censoring_reason.clone(),
+        policy_revision: attention_profile_ref(
+            &record.policy_revision.profile_id,
+            &record.policy_revision.revision,
+        ),
+        notification_revision: attention_profile_ref(
+            &record.notification_revision.profile_id,
+            &record.notification_revision.revision,
+        ),
+        approval_revision: attention_profile_ref(
+            &record.approval_revision.profile_id,
+            &record.approval_revision.revision,
+        ),
+        telemetry_revision: attention_profile_ref(
+            &record.telemetry_revision.profile_id,
+            &record.telemetry_revision.revision,
+        ),
+        metric_groups: attention_metric_group_rows(record),
+        volume_vs_harm: attention_volume_vs_harm(record)?,
+        limitations: flags.uncertainty.limitations.clone(),
+        uncertainty_assessment_basis: flags.uncertainty.assessment_basis.clone(),
+        comparison_basis: record.method.comparison_basis,
+        comparator_profile_refs: record.method.comparator_profile_refs.clone(),
+        comparison_reason: record.method.comparison_reason.clone(),
+        claims: record.claims.clone(),
+        evidence_manifest_id: record.evidence_manifest.manifest_id.to_string(),
+        evidence_manifest_revision: record.evidence_manifest.revision.clone(),
+        bound_evidence_refs: record
+            .evidence_manifest
+            .evidence_refs
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        evidence_expanded: false,
+        validity: attention_board_validity(record, successor_revision, now_unix_ms),
+        record_digest: sha256_hex(&record_bytes),
+    })
+}
+
+/// Projects the role-filtered attention board over supplied record revisions.
+///
+/// Every full row is validated; any malformed record fails the whole board
+/// instead of rendering a partial one. `successors` maps
+/// `(evaluation_id, revision)` to its newer linked revision when the viewed
+/// set knows one; records absent from the map render without supersession.
+/// `now_unix_ms` is caller-observed wall time: the projection owns no clock.
+///
+/// The composition snapshot join and the Store readback path supply the
+/// revisions once the persist leg lands (STITCH): this function is pure over
+/// already-read revisions and performs no Store, Kernel, or owner reads
+/// itself.
+pub fn project_attention_board(
+    records: &[HumanAttentionEvaluation],
+    viewer: &ControlBoardAttentionViewer,
+    successors: &BTreeMap<(String, u64), u64>,
+    now_unix_ms: i64,
+) -> Result<ControlBoardAttentionBoard, ControlBoardProjectionError> {
+    let mut rows = Vec::with_capacity(records.len());
+    for record in records {
+        let successor = successors
+            .get(&(record.evaluation_id.to_string(), record.revision))
+            .copied();
+        if attention_evidence_expansion_permitted(record, viewer) {
+            rows.push(ControlBoardAttentionBoardRow::Full(project_attention_row(
+                record, successor, now_unix_ms,
+            )?));
+        } else {
+            rows.push(ControlBoardAttentionBoardRow::ScopeWithheld {
+                evaluation_id: record.evaluation_id.to_string(),
+                revision: record.revision,
+                validity: attention_board_validity(record, successor, now_unix_ms),
+                reason: "the viewer does not cover the record authorized scope".to_owned(),
+            });
+        }
+    }
+    Ok(ControlBoardAttentionBoard { rows })
 }
 
 #[cfg(test)]

@@ -159,8 +159,13 @@ pub use capability_evidence_commit::{
 };
 pub use composition::*;
 pub use controlboard_projection::{
-    ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
-    ControlBoardReviewBatch, ControlBoardReviewBatchObligation,
+    ControlBoardAttentionBoard, ControlBoardAttentionBoardRow, ControlBoardAttentionEvaluationRow,
+    ControlBoardAttentionMetricGroupRow, ControlBoardAttentionProfileRef,
+    ControlBoardAttentionValidity, ControlBoardAttentionViewer, ControlBoardAttentionVolumeVsHarm,
+    ControlBoardGovernorSnapshot,
+    ControlBoardOwnerBinding, ControlBoardProjectionError, ControlBoardReviewBatch,
+    ControlBoardReviewBatchObligation, attention_board_validity,
+    attention_evidence_expansion_permitted, expand_attention_evidence, project_attention_board,
 };
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
@@ -237,7 +242,10 @@ pub use operator_intent_execution::{
     OperatorIntentEffectDisposition, OperatorIntentEpistemic, OperatorIntentExecutionError,
     OperatorIntentExecutionLink,
 };
-pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
+pub use operator_reconciliation::{
+    GovernorOperatorReconciliation, attention_evaluation_command_envelope,
+    operator_command_envelope,
+};
 pub use owner_closure_feed::{
     OwnerPublishPort, publish_owner_feed, synchronize_owner_feed,
     synchronize_owner_feed_with_canonical_receipts,

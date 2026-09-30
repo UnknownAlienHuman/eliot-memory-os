@@ -427,6 +427,266 @@ impl<P: KernelTransitionPort + ?Sized> GovernorOperatorReconciliation<'_, P> {
     }
 }
 
+/// Closed attention-evaluation command actions bound into the canonical envelope.
+///
+/// The literals match the persist leg's closed operation set exactly: `create`
+/// opens revision one with no predecessor, `correct` appends the next linked
+/// revision, and `invalidate` appends the linked invalidation revision. There
+/// is deliberately no delete literal: invalidation removes current
+/// applicability while the revision history is retained, and nothing here can
+/// rewrite notification or approval state.
+const ATTENTION_EVALUATION_ACTION_CREATE: &str = "create";
+/// Append-the-next-linked-revision action for corrections.
+const ATTENTION_EVALUATION_ACTION_CORRECT: &str = "correct";
+/// Append-the-linked-invalidation-revision action.
+const ATTENTION_EVALUATION_ACTION_INVALIDATE: &str = "invalidate";
+
+/// Lowercase SHA-256 shape check for bound attention digests.
+///
+/// Mirrors the projection receipt check; byte-shape authority stays with the
+/// surface owner and the commit validator, this only refuses malformed
+/// bindings before they reach the envelope.
+fn validates_as_lower_attention_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Builds the canonical envelope binding one authorized attention-evaluation command.
+///
+/// This is the A1 operator path: an authorized evaluator creates (revision one
+/// with no predecessor) or reopens (a correction or invalidation appending the
+/// next linked revision) a record carrying all required metric groups with
+/// explicit unknowns. The envelope binds the exact evidence commitment and
+/// record digest the commit validator re-derives from the presented record
+/// revision, so a substituted record, manifest, or revision link fails the
+/// receipt identity instead of persisting.
+///
+/// The envelope reuses the exact canonical shape of
+/// [`operator_command_envelope`]: the same Governor scope, the same
+/// `CaptureCandidate`/`Candidate` ceiling, the same production adapter manifest
+/// digest, the same `AppendAuditEvent` operation with attention-namespaced
+/// parameters, and the same ordering-head expectation. Admission flows through
+/// the existing
+/// [`GovernorOperatorReconciliation::admit_operator_command`]: the same
+/// operation identity with identical bytes replays the stored receipt (one
+/// accepted revision; lost acknowledgements reconcile through the receipt
+/// route), while changed bytes under the same identity conflict and commit
+/// nothing. History is append-only by construction: corrections link their
+/// predecessor and invalidation carries its reason, and no code path here can
+/// delete a revision.
+///
+/// Evaluator role and scope authority are enforced by admission and the commit
+/// validator, not here; this adapter binds the claims (`session_id`,
+/// `evaluator_principal_id`, the exact revision link, and the exact digests)
+/// so a substituted claim fails closed before any commit.
+///
+/// Fail-closed order mirrors [`operator_command_envelope`], then the attention
+/// binding: the action literal, non-blank evaluator/evaluation/manifest
+/// bindings, a non-zero revision, the exact predecessor linkage (`create`
+/// requires revision one with no predecessor; `correct` and `invalidate`
+/// require `predecessor + 1 == revision`), and well-formed digests.
+pub fn attention_evaluation_command_envelope(
+    identity: &RequestIdentity,
+    operation_id: &OperationId,
+    session_id: &str,
+    access_digest: &str,
+    action: &str,
+    evaluator_principal_id: &str,
+    evaluation_id: &str,
+    revision: u64,
+    predecessor_revision: Option<u64>,
+    record_digest: &str,
+    evidence_commitment: &str,
+    manifest_id: &str,
+    manifest_revision: &str,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    identity
+        .validate()
+        .map_err(|error| identity_refused(error.to_string()))?;
+    let fence = &identity.request.metadata.state_fence;
+    if identity.request.state_fence != *fence {
+        return Err(identity_refused(
+            "admitted request fence does not match the request binding fence".to_owned(),
+        ));
+    }
+    let identity_session = identity
+        .request
+        .metadata
+        .session_id
+        .as_ref()
+        .map(SessionId::as_str)
+        .unwrap_or_default();
+    if identity_session != session_id {
+        return Err(identity_refused(
+            "operator session does not match the admitted request session".to_owned(),
+        ));
+    }
+    if session_id.trim().is_empty() || session_id.chars().any(char::is_control) {
+        return Err(owner_refused(
+            "operator session binding is blank or contains control characters".to_owned(),
+        ));
+    }
+    if access_digest.trim().is_empty() {
+        return Err(owner_refused(
+            "operator binding digests must not be blank".to_owned(),
+        ));
+    }
+    if action != ATTENTION_EVALUATION_ACTION_CREATE
+        && action != ATTENTION_EVALUATION_ACTION_CORRECT
+        && action != ATTENTION_EVALUATION_ACTION_INVALIDATE
+    {
+        return Err(owner_refused(
+            "attention evaluation action must be create, correct, or invalidate".to_owned(),
+        ));
+    }
+    for (field, value) in [
+        ("evaluator principal", evaluator_principal_id),
+        ("evaluation identity", evaluation_id),
+        ("evidence manifest identity", manifest_id),
+        ("evidence manifest revision", manifest_revision),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(owner_refused(format!(
+                "attention evaluation {field} binding is blank or contains control characters"
+            )));
+        }
+    }
+    if revision == 0 {
+        return Err(owner_refused(
+            "attention evaluation revision must be non-zero".to_owned(),
+        ));
+    }
+    let revision_linked = match predecessor_revision {
+        None => action == ATTENTION_EVALUATION_ACTION_CREATE && revision == 1,
+        Some(predecessor) => {
+            (action == ATTENTION_EVALUATION_ACTION_CORRECT
+                || action == ATTENTION_EVALUATION_ACTION_INVALIDATE)
+                && predecessor.checked_add(1) == Some(revision)
+        }
+    };
+    if !revision_linked {
+        return Err(owner_refused(
+            "attention evaluation revision link does not match the action".to_owned(),
+        ));
+    }
+    for (field, value) in [
+        ("record digest", record_digest),
+        ("evidence commitment", evidence_commitment),
+    ] {
+        if !validates_as_lower_attention_digest(value) {
+            return Err(owner_refused(format!(
+                "attention evaluation {field} is not a lowercase SHA-256 value"
+            )));
+        }
+    }
+    let manifest_digest = production_manifest_digest()?;
+    let attention_action_digest = canonical_digest(&(
+        action,
+        evaluator_principal_id,
+        evaluation_id,
+        revision,
+        predecessor_revision,
+        record_digest,
+        evidence_commitment,
+        manifest_id,
+        manifest_revision,
+        operation_id.as_str(),
+        identity.idempotency_key.clone(),
+    ))?;
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("operation_id", operation_id.as_str().to_owned()),
+        ("idempotency_key", identity.idempotency_key.clone()),
+        ("session_id", session_id.to_owned()),
+        ("access_digest", access_digest.to_owned()),
+        ("expected_revision", revision.to_string()),
+        ("attention_evaluation.action", action.to_owned()),
+        (
+            "attention_evaluation.evaluator_principal_id",
+            evaluator_principal_id.to_owned(),
+        ),
+        (
+            "attention_evaluation.evaluation_id",
+            evaluation_id.to_owned(),
+        ),
+        (
+            "attention_evaluation.revision",
+            revision.to_string(),
+        ),
+        (
+            "attention_evaluation.record_digest",
+            record_digest.to_owned(),
+        ),
+        (
+            "attention_evaluation.evidence_commitment",
+            evidence_commitment.to_owned(),
+        ),
+        (
+            "attention_evaluation.manifest_id",
+            manifest_id.to_owned(),
+        ),
+        (
+            "attention_evaluation.manifest_revision",
+            manifest_revision.to_owned(),
+        ),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    if let Some(predecessor) = predecessor_revision {
+        parameters.insert(
+            "attention_evaluation.predecessor_revision".to_owned(),
+            serde_json::Value::String(predecessor.to_string()),
+        );
+    }
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: operation_id.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: identity.idempotency_key.clone(),
+        // Reuses the Governor scope vocabulary from the observation/skill
+        // precedent; no new scope is introduced.
+        scope_id: ScopeId::new("governor").map_err(|error| owner_refused(error.to_string()))?,
+        task_id: identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: canonical_digest(&(
+            session_id,
+            access_digest,
+            attention_action_digest,
+            revision,
+            operation_id.as_str(),
+            identity.idempotency_key.clone(),
+        ))?,
+        operation_manifest_digest: manifest_digest,
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::AppendAuditEvent,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: Vec::new(),
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope:governor")
+                .map_err(|error| owner_refused(error.to_string()))?,
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }],
+    };
+    envelope.validate()?;
+    Ok(envelope)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
