@@ -1276,6 +1276,7 @@ fn maintenance_replay_plan(
 /// read this intake already performed instead of performing a second one. Only
 /// the three fields that route needs to bind are reachable; everything else
 /// stays private to this module's own brief and evidence projection.
+#[derive(Clone, Debug)]
 pub struct ObservedClosure {
     /// Durable lineage handle and canonical digest the record committed.
     pub lineage_artifact: String,
