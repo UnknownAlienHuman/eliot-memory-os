@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Caller-owned immutable parameters for one A-18 projection.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct AssemblyPolicy {
     /// Digest of the state fence used by the admission decision.
     pub fence_digest: String,

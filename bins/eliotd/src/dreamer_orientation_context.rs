@@ -6,9 +6,7 @@
 //! owner, and leaves incomplete projection members explicit.
 
 use eliot_agent_api::RouteFingerprint;
-use eliot_context::campaign_publication::{
-    ContextPublicationError, context_recipe_body_digest,
-};
+use eliot_context::campaign_publication::{ContextPublicationError, context_recipe_body_digest};
 use eliot_context_contracts::OmissionRecord;
 use eliot_governor::{
     GovernorProjectionSet, OrientationProjectionOwnerInput, OrientationProjectionOwnerOutput,
@@ -82,7 +80,12 @@ pub struct DreamerOrientationContextOwnerReadback<'owner, 'source> {
 pub fn compile_dreamer_orientation_context<'owner, 'source>(
     reconstruction: &'owner ContextReconstructionOwnerReadback<'source>,
 ) -> Result<ContextCompilationOwnerReadback<'owner>, DreamerOrientationCompilationError> {
-    let Some(suppliers) = reconstruction.context_recipe.body.compiler_suppliers.as_ref() else {
+    let Some(suppliers) = reconstruction
+        .context_recipe
+        .body
+        .compiler_suppliers
+        .as_ref()
+    else {
         return Err(DreamerOrientationCompilationError::MissingSuppliers);
     };
     let Some(tool_policy) = reconstruction.context_tool_policy.as_ref() else {

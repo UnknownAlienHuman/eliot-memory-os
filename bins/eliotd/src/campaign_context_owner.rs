@@ -352,7 +352,9 @@ pub(crate) fn validate_context_tool_policy_source_record(
     )
     .map_err(|error| error.to_string())?;
     if *source != expected {
-        return Err("ContextToolPolicy row does not match its original typed recipe source".to_owned());
+        return Err(
+            "ContextToolPolicy row does not match its original typed recipe source".to_owned(),
+        );
     }
     Ok(recipe_body.compiler_suppliers.clone())
 }
