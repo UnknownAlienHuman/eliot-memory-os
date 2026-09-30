@@ -158,6 +158,15 @@ pub use genesis_owner_packet::{
 };
 #[path = "native_worker_binding.rs"]
 mod native_worker_binding;
+// Issue #370 R1: the durable coordination-owner commit needs the composition's
+// own private `owners`, `recovery` and `readiness` fields, so it is declared
+// here as a descendant module rather than as a sibling of `composition`.
+#[path = "coordination_owner_commit.rs"]
+mod coordination_owner_commit;
+pub use coordination_owner_commit::{
+    CommittedCoordinationResult, CoordinationCommitError, commit_coordination_candidate_result,
+    commit_coordination_session, commit_coordination_work, coordination_owner_readback,
+};
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
     NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
