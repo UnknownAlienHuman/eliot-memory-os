@@ -516,12 +516,14 @@ impl StaleLocalReadReason {
 
 /// Disposition of one daemon-produced local-read result submission.
 ///
-/// `Persisted` is the single completion for the current fencing generation;
-/// `StaleAttempt` is the quarantined noncanonical observation. There is no
-/// third outcome: exactly one completion per current generation.
+/// `Persisted` is the single terminal result for the current fencing
+/// generation; `StagedWrite` is a verified nonterminal acceptance backed by
+/// the original ORS reservation; `StaleAttempt` is the quarantined
+/// noncanonical observation.
 #[derive(Clone, Debug)]
 pub(crate) enum LocalReadSubmitDisposition {
     Persisted(Box<HostRequestRecord>),
+    StagedWrite(Box<eliot_store_api::WriteSubmission>),
     StaleAttempt(StaleLocalReadObservation),
 }
 
@@ -6341,7 +6343,6 @@ impl KernelComposition {
                 return Err(TransportError::IdentityConflict);
             }
         }
-        drop(admission_owner);
         self.publish_observe_reservation_in_queue(
             envelope,
             tool,
@@ -6351,6 +6352,7 @@ impl KernelComposition {
             current,
             executable,
             retained_result,
+            &admission_owner,
         )
     }
 
@@ -6364,6 +6366,7 @@ impl KernelComposition {
         current: HostRequestRecord,
         executable: bool,
         retained_result: bool,
+        _admission_owner: &std::sync::MutexGuard<'_, super::AgentActivationPendingState>,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         let mut index = self
             .host_request_connection_index
@@ -6718,17 +6721,15 @@ impl KernelComposition {
     /// Submits one daemon-produced observe result for its waiting host request.
     ///
     /// Mirrors [`Self::submit_local_read_result`] over the observe queue:
-    /// exact replay first (canonical readback, never a new completion), then
-    /// the absolute deadline bound, then attempt currency (lease replacement,
-    /// restart, epoch rotation, and revocation project as stale before any
-    /// fence join), then the presenting daemon session fence, then
-    /// persistence through the ORS result path (which walks the mechanical
-    /// `Admitted -> Routed -> Submitted -> ResultReceived` lifecycle — no new
-    /// edge). Neither expiry nor staleness ever binds a result. A changed
+    /// exact replay first, then the absolute deadline and attempt-owner joins,
+    /// then the presenting daemon session fence. A terminal receipt persists
+    /// through the ORS result path (`Submitted -> ResultReceived`). A staged
+    /// `WriteSubmission` is checked against the original protected operation
+    /// and its durable ORS reservation, returned as nonterminal `StagedWrite`,
+    /// and leaves the Host request pending while its queue claim retires. It
+    /// never creates a receipt or advances Host to `ResultReceived`. A changed
     /// body under the same identity is [`TransportError::IdentityConflict`];
-    /// an unknown operation is [`TransportError::UnknownRequest`]. The shared
-    /// governed-attempt vehicle carries the disposition; the wire capability
-    /// disambiguates through its admitted `facet_method`.
+    /// an unknown operation is [`TransportError::UnknownRequest`].
     #[allow(
         clippy::too_many_lines,
         reason = "the submit gate keeps replay, deadline, currency, fence, and persistence joins in one audited order"
@@ -6864,7 +6865,64 @@ impl KernelComposition {
         // complete the operation as its retained semantic outcome.
         body.validate_observe_submission()
             .map_err(|_| TransportError::SessionFenced)?;
-        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+        let staged_submission = Self::staged_observe_submission(&body.response)?;
+        // Governed attempt currency: only the live (attempt_id, generation,
+        // owner) triple completes a new result. Once an exact durable write
+        // reservation exists, a later stage/readback or terminal-receipt
+        // continuation is instead bound to that original claim and plan; the
+        // consumed queue entry cannot be claimed or executed again.
+        let live =
+            self.live_observe_attempt_under_transition(&body.operation_id, &body.request_sha256)?;
+        let durable_attempt_matches = stored.attempt.as_ref().is_some_and(|durable| {
+            durable.phase == HostRequestAttemptPhase::Claimed
+                && durable.owner_connection_ref.as_str() == session.connection_id
+                && durable.owner_launch_nonce.as_str() == session.launch_nonce
+                && durable.owner_session_epoch == session.session_epoch
+                && durable.input_commitment_sha256.as_deref()
+                    == stored
+                        .executable_input
+                        .as_ref()
+                        .map(|input| input.commitment_sha256.as_str())
+                && body.attempt.as_ref().is_some_and(|presented| {
+                    presented.attempt_id == durable.attempt_id.as_str()
+                        && presented.fencing_generation == durable.generation
+                        && presented.expires_at_unix_ms == stored.deadline_unix_ms
+                        && presented.authority_epoch.is_same_authority(&stored.authority_epoch)
+                })
+        });
+        let staged_continuation = if (live.is_none()
+            || staged_submission.is_some()
+            || activation_deadline_expired(unix_ms(), stored.deadline_unix_ms))
+            && durable_attempt_matches
+            && stored.executable_input.is_some()
+        {
+            let reservation = self
+                .generation_gateway
+                .ors
+                .load_write_reservation_by_operation(&operation_id)
+                .map_err(|_| TransportError::SessionFenced)?;
+            if reservation.is_some() {
+                Self::validate_staged_observe_attempt(session, body, &stored)?;
+                Some(
+                    self.validate_original_staged_observe_plan(
+                        &stored,
+                        stored
+                            .executable_input
+                            .as_ref()
+                            .ok_or(TransportError::SessionFenced)?,
+                        &operation_id,
+                    )?
+                    .0,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms)
+            && staged_continuation.is_none()
+        {
             return self.expired_claim_timeout(ExpiredClaimObservation {
                 session: Some(session),
                 stored: &stored,
@@ -6881,10 +6939,6 @@ impl KernelComposition {
                     .map(|attempt| attempt.fencing_generation),
             });
         }
-        // Governed attempt currency: only the live (attempt_id, generation,
-        // owner) triple completes.
-        let live =
-            self.live_observe_attempt_under_transition(&body.operation_id, &body.request_sha256)?;
         match (&body.attempt, live) {
             (Some(attempt), Some(state))
                 if attempt.attempt_id == state.attempt_id
@@ -6964,6 +7018,7 @@ impl KernelComposition {
                     },
                 ));
             }
+            (Some(_), None) if staged_continuation.is_some() => {}
             (presented, current) => {
                 // Issue #1837: durable audit evidence for quarantine.
                 self.audit_observe(AuditEventDraft::result_stale_quarantined(
@@ -6992,7 +7047,9 @@ impl KernelComposition {
                 ));
             }
         }
-        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms)
+            && staged_continuation.is_none()
+        {
             return self.expired_claim_timeout(ExpiredClaimObservation {
                 session: Some(session),
                 stored: &stored,
@@ -7105,6 +7162,44 @@ impl KernelComposition {
             })
             .cloned()
             .ok_or(TransportError::SessionFenced)?;
+        if let Some(submission) = staged_submission {
+            let lineage = retained
+                .result_lineage
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            Self::validate_staged_observe_attempt(session, body, &stored)?;
+            Self::validate_staged_observe_lineage(&stored, body, lineage)?;
+            let operation = match staged_continuation {
+                Some(operation) => operation,
+                None => self
+                    .validate_original_staged_observe_plan(
+                        &stored,
+                        stored
+                            .executable_input
+                            .as_ref()
+                            .ok_or(TransportError::SessionFenced)?,
+                        &operation_id,
+                    )?
+                    .0,
+            };
+            self.validate_staged_observe_submission(
+                &stored,
+                &operation,
+                &submission,
+                &body.response,
+            )?;
+            // The stage ACK is backed by the durable reservation and remains
+            // nonterminal in the Host lifecycle. Retiring only the consumed
+            // claim prevents this same admitted operation from being executed
+            // or admitted a second time while its canonical receipt is polled.
+            self.retire_observe_pair_under_transition(
+                &body.operation_id,
+                &body.request_sha256,
+            );
+            return Ok(LocalReadSubmitDisposition::StagedWrite(Box::new(
+                submission,
+            )));
+        }
         let result_lineage = retained
             .result_lineage
             .as_ref()
@@ -7200,10 +7295,227 @@ impl KernelComposition {
             record,
             input,
             &receipt,
-            &transition,
+            &transition.transition,
             &canonical_request_sha256,
         )?;
         Ok(prepared_transition_sha256)
+    }
+
+    fn staged_observe_submission(
+        response: &serde_json::Value,
+    ) -> Result<Option<eliot_store_api::WriteSubmission>, TransportError> {
+        let is_stage = response.get("status").and_then(serde_json::Value::as_str)
+            == Some("accepted_pending")
+            || response.get("submission").is_some();
+        if !is_stage {
+            return Ok(None);
+        }
+        let object = response.as_object().ok_or(TransportError::SessionFenced)?;
+        if object.len() != 3
+            || !object.contains_key("status")
+            || !object.contains_key("response_mode")
+            || !object.contains_key("submission")
+            || object.get("status").and_then(serde_json::Value::as_str)
+                != Some("accepted_pending")
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let submission = serde_json::from_value(
+            object
+                .get("submission")
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        submission
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(Some(submission))
+    }
+
+    fn validate_staged_observe_lineage(
+        record: &HostRequestRecord,
+        body: &HostRequestResultBody,
+        lineage: &HostRequestRetainedLineage,
+    ) -> Result<(), TransportError> {
+        let input = record
+            .executable_input
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if body.evidence.is_some()
+            || lineage.output_artifact_ref.is_some()
+            || lineage.output_digest != body.result_digest
+            || lineage.producer_ref.is_some()
+            || lineage.source_revisions.is_some()
+            || lineage.source_state_fence.is_some()
+            || lineage.input_refs.is_some()
+            || lineage.transformation_lineage.is_some()
+            || lineage.closure_refs.is_some()
+            || lineage.policy_fence.is_some()
+            || lineage.origin_evidence_refs.is_some()
+            || lineage.semantic_receipt_ref.is_some()
+            || lineage.result_class != HostRequestRetainedResultClass::Unclassified
+            || lineage.proof_ceiling.is_some()
+            || lineage.influence_state != eliot_security_contracts::InfluenceState::Unknown
+            || lineage.instruction_taint
+                != Some(
+                    input
+                        .protected_envelope
+                        .privacy_and_visibility_class
+                        .instruction_taint,
+                )
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_staged_observe_attempt(
+        session: &Session,
+        body: &HostRequestResultBody,
+        record: &HostRequestRecord,
+    ) -> Result<(), TransportError> {
+        let input = record
+            .executable_input
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let durable = record.attempt.as_ref().ok_or(TransportError::SessionFenced)?;
+        let presented = body.attempt.as_ref().ok_or(TransportError::SessionFenced)?;
+        let host_peer_origin = input
+            .application_binding
+            .observation_policy_binding
+            .get("origin")
+            .and_then(|origin| origin.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("HOST_PEER");
+        let expected_session = input
+            .application_binding
+            .session_ref
+            .as_ref()
+            .map(OpaqueLabel::as_str);
+        if durable.phase != HostRequestAttemptPhase::Claimed
+            || durable.owner_connection_ref.as_str() != session.connection_id
+            || durable.owner_launch_nonce.as_str() != session.launch_nonce
+            || durable.owner_session_epoch != session.session_epoch
+            || durable.input_commitment_sha256.as_deref()
+                != Some(input.commitment_sha256.as_str())
+            || presented.operation_id != record.operation_id.as_str()
+            || presented.attempt_id != durable.attempt_id.as_str()
+            || presented.fencing_generation != durable.generation
+            || presented.expires_at_unix_ms != record.deadline_unix_ms
+            || presented.facet_method != record.capability_ref.as_str()
+            || presented.scope_id
+                != record
+                    .scope_ref
+                    .as_ref()
+                    .map(OpaqueLabel::as_str)
+                    .unwrap_or_default()
+            || !presented
+                .authority_epoch
+                .is_same_authority(&record.authority_epoch)
+            || (host_peer_origin
+                && (presented.wire_version != LocalReadAttempt::HOST_ORIGIN_CONTRACT_VERSION
+                    || presented.session_id.is_some()))
+            || (!host_peer_origin
+                && (presented.wire_version != LocalReadAttempt::CONTRACT_VERSION
+                    || presented.session_id.as_deref() != expected_session))
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_staged_observe_submission(
+        &self,
+        record: &HostRequestRecord,
+        operation: &super::daemon_request_dispatch::StoreApplyOperation,
+        submitted: &eliot_store_api::WriteSubmission,
+        response: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        use eliot_store_api::{
+            STAGED_NEXT_ALLOWED_ACTION, STAGED_RETRY_IDENTITY_RULE, WriteSubmissionState,
+            derive_submission_id,
+        };
+
+        let input = record
+            .executable_input
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let (envelope, tool) = self.read_observe_executable_input(record)?;
+        let operation_identity = OperationIdentity::new(
+            operation.transition.identity.operation_id.as_str().to_owned(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let reservation = self
+            .generation_gateway
+            .ors
+            .load_write_reservation_by_operation(&operation_identity)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        let write_binding = reservation
+            .token
+            .write_binding
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let original_source: RequestIdentity = serde_json::from_value(
+            input.application_binding.source_request_identity.clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let original_submission = Self::original_write_submission_from_tool_request(&tool)?;
+        let response_mode = response
+            .get("response_mode")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let transition = &operation.transition;
+        let expected = eliot_store_api::WriteSubmission {
+            submission_id: derive_submission_id(
+                &transition.identity.operation_id,
+                &transition.identity.canonical_request_hash,
+            )
+            .map_err(|_| TransportError::SessionFenced)?,
+            operation_id: transition.identity.operation_id.clone(),
+            request_hash: transition.identity.canonical_request_hash.clone(),
+            state: WriteSubmissionState::Staged,
+            reason_codes: Vec::new(),
+            ors_stage_ref: Some(reservation.token.reservation_id.as_str().to_owned()),
+            canonical_receipt_ref: None,
+            retry_identity_rule: STAGED_RETRY_IDENTITY_RULE.to_owned(),
+            next_allowed_action: STAGED_NEXT_ALLOWED_ACTION.to_owned(),
+        };
+        expected
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if operation.context != original_source.request.metadata
+            || operation.original_write_submission.as_ref() != Some(&original_submission)
+            || reservation.token.reservation_id.as_str()
+                != submitted.ors_stage_ref.as_deref().unwrap_or_default()
+            || reservation.token.operation_id != operation_identity
+            || reservation.token.prepared_transition_sha256
+                != write_binding.prepared_transition_sha256
+            || write_binding.operation_id != operation_identity
+            || write_binding.idempotency_key.as_str() != record.idempotency_key.as_str()
+            || write_binding.canonical_request_sha256 != transition.identity.canonical_request_hash
+            || transition.identity.operation_id.as_str() != record.operation_id.as_str()
+            || transition.identity.idempotency_key.as_str() != record.idempotency_key.as_str()
+            || transition.state_fence != input.application_binding.state_fence
+            || operation.context.state_fence != transition.state_fence
+            || transition.scope_id.as_str()
+                != record
+                    .scope_ref
+                    .as_ref()
+                    .map(OpaqueLabel::as_str)
+                    .ok_or(TransportError::SessionFenced)?
+            || response_mode != original_submission.response_mode
+            || submitted != &expected
+            || submitted.operation_id.as_str() != host_request_operation_id(&envelope)
+            || original_source.request.metadata.request_id.as_str() != record.request_id.as_str()
+            || original_source.idempotency_key.as_str() != record.idempotency_key.as_str()
+            || original_source.deadline_unix_ms != record.deadline_unix_ms
+            || original_source.cancellation_id.as_str() != record.cancellation_id.as_str()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
     }
 
     fn validate_observe_result_receipt(
@@ -7239,7 +7551,11 @@ impl KernelComposition {
         record: &HostRequestRecord,
         input: &HostRequestExecutableInput,
         operation_identity: &OperationIdentity,
-    ) -> Result<(eliot_store_api::PreparedTransition, String, String), TransportError> {
+    ) -> Result<(
+        super::daemon_request_dispatch::StoreApplyOperation,
+        String,
+        String,
+    ), TransportError> {
         let gateway = self.retained_store_gateway()?;
         let staged = gateway
             .verify_staged_envelope(&input.application_binding.state_fence, &operation_identity)
@@ -7289,7 +7605,13 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         };
         if write_binding.recovery_access_class != staged.privacy_and_visibility_class
+            || staged.privacy_and_visibility_class
+                != input.protected_envelope.privacy_and_visibility_class
+            || staged.payload_length != write_binding.protected_payload_length
+            || staged.payload_sha256 != write_binding.protected_payload_sha256
             || key != &write_binding.payload_key_reference
+            || key.provider.as_str() != "dpapi"
+            || key.key.as_str() != "current-user"
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -7306,16 +7628,29 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let transition: eliot_store_api::PreparedTransition =
+        let operation: super::daemon_request_dispatch::StoreApplyOperation =
             serde_json::from_slice(bytes).map_err(|_| TransportError::SessionFenced)?;
-        if canonical_json_bytes(&transition).map_err(|_| TransportError::SessionFenced)? != bytes {
+        if canonical_json_bytes(&operation).map_err(|_| TransportError::SessionFenced)? != bytes {
             return Err(TransportError::SessionFenced);
         }
+        let transition = &operation.transition;
         transition
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        let original_source: RequestIdentity = serde_json::from_value(
+            input.application_binding.source_request_identity.clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let (_, original_tool_request) = self.read_observe_executable_input(record)?;
+        let original_submission =
+            Self::original_write_submission_from_tool_request(&original_tool_request)?;
+        if operation.context != original_source.request.metadata
+            || operation.original_write_submission.as_ref() != Some(&original_submission)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         let computed_prepared_transition_sha256 =
-            eliot_store_api::prepared_transition_digest(&transition)
+            eliot_store_api::prepared_transition_digest(transition)
                 .map_err(|_| TransportError::SessionFenced)?;
         if computed_prepared_transition_sha256 != token.prepared_transition_sha256
             || computed_prepared_transition_sha256 != write_binding.prepared_transition_sha256
@@ -7323,7 +7658,7 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         Ok((
-            transition,
+            operation,
             token.prepared_transition_sha256.clone(),
             write_binding.canonical_request_sha256.clone(),
         ))
