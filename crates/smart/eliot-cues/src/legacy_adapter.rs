@@ -25,7 +25,46 @@ use serde_json::Value;
 
 use crate::{
     FacadeError, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration, is_blank_or_control,
+    validate_legacy_row_id,
 };
+
+/// The single owner of the bound-identity check for a parsed legacy row.
+///
+/// "The id the caller bound these bytes to is not the id inside them" was
+/// written out twice in this module with the same comparison, the same typed
+/// refusal and the same `what = "migration.row_id"` pointer. Two copies of one
+/// identity rule are two owners that can drift into accepting a mismatched
+/// envelope. Both sites read this owner now and the pointer a caller receives
+/// is unchanged.
+///
+/// The digest binding below stays at its own call site: it compares the row id
+/// against a value recomputed from the row's own fields rather than against
+/// the caller's id, and it carries its own
+/// `what = "migration.row_id.digest"` pointer. Folding it in here would make
+/// one function own two different rules behind one `what` label.
+fn require_bound_row_id(row_id: &str, expected_id: &str) -> Result<(), FacadeError> {
+    if row_id != expected_id {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_id",
+        });
+    }
+    Ok(())
+}
+
+/// The single owner of "non-empty and parseable as one complete JSON value".
+///
+/// The empty-bytes refusal followed by `serde_json::from_slice` was written
+/// out once per bound envelope in this module, differing only by the field
+/// prefix each site reports. Empty input is a parse failure anyway, so the
+/// explicit refusal is kept as the clearer message. The `field` each site
+/// reports is a stable wire-visible path naming its own bytes, so it stays a
+/// parameter here and no refusal path changes.
+fn parse_json_bytes(bytes: &[u8], field: &'static str) -> Result<Value, FacadeError> {
+    if bytes.is_empty() {
+        return Err(FacadeError::LegacyBytesInvalid { field });
+    }
+    serde_json::from_slice(bytes).map_err(|_| FacadeError::LegacyBytesInvalid { field })
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,11 +90,7 @@ fn parse_legacy_index_row(
         serde_json::from_value(value.clone()).map_err(|_| FacadeError::LegacyBytesInvalid {
             field: "row.legacy_index_payload",
         })?;
-    if legacy.row_id != expected_id {
-        return Err(FacadeError::ResponseIdentityMismatch {
-            what: "migration.row_id",
-        });
-    }
+    require_bound_row_id(&legacy.row_id, expected_id)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(
         format!(
@@ -143,11 +178,7 @@ fn parse_row_value(value: &Value, expected_id: &str) -> Result<LegacyEliotCuesV1
             })?;
         (row_id, Value::Object(fields))
     };
-    if row_id != expected_id {
-        return Err(FacadeError::ResponseIdentityMismatch {
-            what: "migration.row_id",
-        });
-    }
+    require_bound_row_id(&row_id, expected_id)?;
     serde_json::from_value(row_value).map_err(|_| FacadeError::LegacyBytesInvalid {
         field: "row.payload",
     })
@@ -157,11 +188,7 @@ pub(crate) fn parse_bound_v1_row(
     bytes: &[u8],
     expected_id: &str,
 ) -> Result<LegacyEliotCuesV1Row, FacadeError> {
-    if bytes.is_empty() {
-        return Err(FacadeError::LegacyBytesInvalid { field: "row.bytes" });
-    }
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|_| FacadeError::LegacyBytesInvalid { field: "row.bytes" })?;
+    let value = parse_json_bytes(bytes, "row.bytes")?;
     parse_row_value(&value, expected_id)
 }
 
@@ -169,15 +196,7 @@ pub(crate) fn parse_bound_v1_snapshot(
     bytes: &[u8],
     expected_id: &str,
 ) -> Result<Vec<(String, LegacyEliotCuesV1Row)>, FacadeError> {
-    if bytes.is_empty() {
-        return Err(FacadeError::LegacyBytesInvalid {
-            field: "snapshot.bytes",
-        });
-    }
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|_| FacadeError::LegacyBytesInvalid {
-            field: "snapshot.bytes",
-        })?;
+    let value = parse_json_bytes(bytes, "snapshot.bytes")?;
     let object = value.as_object().ok_or(FacadeError::LegacyBytesInvalid {
         field: "snapshot.object",
     })?;
@@ -576,11 +595,7 @@ pub fn convert_v1_row(
 ) -> Result<V1RowMigration, FacadeError> {
     row.validate_for_conversion()?;
     crate::bind_v1_row_payload(legacy_row_id, row, legacy_bytes)?;
-    if is_blank_or_control(legacy_row_id) {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_row_id",
-        });
-    }
+    validate_legacy_row_id(legacy_row_id)?;
     if legacy_bytes.is_empty() {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_bytes",
