@@ -16,7 +16,7 @@ use super::{
 use eliot_contracts::EpochId;
 use eliot_ipc::{
     ApplicationSession, PeerIdentity, ServerFirstConnection, ServerHandshakePolicy, Session,
-    TransportError, TransportKind, agent_bridge_admission_receipt_frame,
+    SessionState, TransportError, TransportKind, agent_bridge_admission_receipt_frame,
 };
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_platform_windows::{
@@ -34,6 +34,17 @@ use eliot_protocol::{
     OpenAgentBridgeActivationDisposition, OpenAgentBridgeActivationResponse, ProtocolPayload,
     RequestIdentity,
 };
+
+/// Current authenticated bridge connection facts needed by the post-ACK
+/// readiness read. The ticket identity comes only from the retained Kernel
+/// activation binding, never from the request payload.
+pub(crate) struct ActiveAgentBridgeReadBinding {
+    pub ticket_id: String,
+    pub session_id: String,
+    pub descriptor_sha256: String,
+    pub peer_admission_receipt_sha256: String,
+    pub state_fence: eliot_contracts::StateFence,
+}
 
 fn canonical_activation_denial(
     detail: &AgentActivationResolutionDisposition,
@@ -1787,6 +1798,67 @@ impl KernelComposition {
             resolved_binding: binding.clone(),
             kernel_owner_revision: kernel_owner.revision,
             kernel_owner_bundle_sha256: kernel_owner.bundle_sha256.clone(),
+        })
+    }
+
+    /// Resolves the exact current ticket from the authenticated live Bridge
+    /// Session. A request cannot select another ticket by presenting a
+    /// caller-owned ticket ID, digest, or workspace key.
+    #[cfg(windows)]
+    pub(crate) fn current_agent_bridge_read_binding(
+        &self,
+        session: &Session,
+    ) -> Result<ActiveAgentBridgeReadBinding, TransportError> {
+        if session.state != SessionState::Open
+            || session.module_generation.module_id.as_str() != super::ACTIVE_DAEMON_CALLER
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let connection = connections
+            .get(&session.connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        let retained_session = connection
+            .session
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let accepted = connection
+            .accepted_transport
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let receipt = accepted.admission_receipt();
+        let binding = connection
+            .activated_binding
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if retained_session != session
+            || !connection.activation_completed
+            || connection.peer != session.peer
+            || accepted.connection_id() != session.connection_id
+            || accepted.peer() != &session.peer
+            || receipt.connection_id != session.connection_id
+            || receipt.state_fence != session.module_generation.state_fence
+            || receipt.descriptor_sha256.trim().is_empty()
+            || binding.activation_ticket_id.trim().is_empty()
+            || binding.session_id != binding.resolved_binding.session_id
+            || binding.authority_epoch != receipt.state_fence.authority_epoch
+            || binding.activation_generation != receipt.state_fence.resource_generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(ActiveAgentBridgeReadBinding {
+            ticket_id: binding.activation_ticket_id.clone(),
+            session_id: binding.session_id.clone(),
+            descriptor_sha256: receipt.descriptor_sha256.clone(),
+            peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+            state_fence: receipt.state_fence.clone(),
         })
     }
 

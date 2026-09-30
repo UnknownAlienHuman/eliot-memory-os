@@ -254,6 +254,13 @@ const COLD_START_READINESS_HEADS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cold_start_readiness_heads_v1");
 const COLD_START_READINESS_BINDINGS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cold_start_readiness_bindings_v1");
+/// Exact activation-ticket to cold-start revision linkage (issue #1790).
+///
+/// Written in the same transaction as the claim row so the authenticated
+/// post-ACK reader can resolve only the readiness revision actually claimed
+/// for that ticket, including after process restart.
+const COLD_START_READINESS_ACTIVATIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_cold_start_readiness_activations_v1");
 /// Durable owner-backed `backup.verify` results (issue #2802; I5.27, I14.21).
 ///
 /// One row per public request operation identity, so an exact replay of the same
@@ -4329,6 +4336,41 @@ struct ColdStartReadinessBindingIndex {
     record_revision: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessActivationIndex {
+    contract_version: u16,
+    activation_ticket_id: String,
+    binding_digest: String,
+    record_key: String,
+    record_revision: u64,
+    state_fence: eliot_contracts::StateFence,
+}
+
+impl ColdStartReadinessActivationIndex {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        crate::model::validate_text(
+            &self.activation_ticket_id,
+            "cold_start_activation_ticket_id",
+        )?;
+        crate::model::validate_digest(&self.binding_digest, "cold_start_binding_digest")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        crate::model::validate_text(&self.record_key, "cold_start_activation_record_key")?;
+        if self.record_revision == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start activation index has an invalid row address".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl ColdStartReadinessBindingIndex {
     fn validate(&self) -> Result<(), OrsError> {
         if self.contract_version != crate::CONTRACT_VERSION {
@@ -6094,6 +6136,29 @@ impl RedbRecoveryStore {
         claim: &crate::ColdStartReadinessClaim,
         now: u64,
     ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
+        self.claim_cold_start_readiness_inner(None, claim, now)
+    }
+
+    /// Atomically claims one cold-start readiness revision and binds that
+    /// exact revision to the authenticated activation ticket that requested
+    /// it. Replaying the same ticket and claim is idempotent; a ticket can
+    /// never be rebound to another key or revision.
+    pub fn claim_cold_start_readiness_for_activation(
+        &self,
+        activation_ticket_id: &str,
+        claim: &crate::ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
+        crate::model::validate_text(activation_ticket_id, "cold_start_activation_ticket_id")?;
+        self.claim_cold_start_readiness_inner(Some(activation_ticket_id), claim, now)
+    }
+
+    fn claim_cold_start_readiness_inner(
+        &self,
+        activation_ticket_id: Option<&str>,
+        claim: &crate::ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
         claim.validate()?;
         if now == 0 || now > claim.lease_deadline {
             return Err(OrsError::InvalidField {
@@ -6108,22 +6173,74 @@ impl RedbRecoveryStore {
         };
         validate_cold_start_installation(claim, &store_identity)?;
 
-        if let Some(existing) = Self::load_cold_start_binding(&write, claim, &store_identity)?
-            .filter(|existing| now <= existing.claim.lease_deadline)
+        let outcome = if let Some(existing) =
+            Self::load_cold_start_binding(&write, claim, &store_identity)?
+                .filter(|existing| now <= existing.claim.lease_deadline)
         {
-            write.commit().map_err(storage)?;
-            return Ok(crate::ColdStartReadinessStageOutcome::AlreadyBound {
+            crate::ColdStartReadinessStageOutcome::AlreadyBound {
                 record: Box::new(existing),
-            });
+            }
+        } else {
+            let revision = Self::next_cold_start_revision(&write, claim)?;
+            let record = crate::ColdStartReadinessOrsRecord::leased(claim.clone(), revision);
+            Self::persist_cold_start_claim(&write, claim, &record)?;
+            crate::ColdStartReadinessStageOutcome::Stored {
+                record: Box::new(record),
+            }
+        };
+        if let Some(activation_ticket_id) = activation_ticket_id {
+            let record = match &outcome {
+                crate::ColdStartReadinessStageOutcome::Stored { record }
+                | crate::ColdStartReadinessStageOutcome::AlreadyBound { record } => record,
+            };
+            Self::bind_cold_start_activation(&write, activation_ticket_id, record)?;
         }
-
-        let revision = Self::next_cold_start_revision(&write, claim)?;
-        let record = crate::ColdStartReadinessOrsRecord::leased(claim.clone(), revision);
-        Self::persist_cold_start_claim(&write, claim, &record)?;
         write.commit().map_err(storage)?;
-        Ok(crate::ColdStartReadinessStageOutcome::Stored {
-            record: Box::new(record),
-        })
+        Ok(outcome)
+    }
+
+    fn bind_cold_start_activation(
+        write: &redb::WriteTransaction,
+        activation_ticket_id: &str,
+        record: &crate::ColdStartReadinessOrsRecord,
+    ) -> Result<(), OrsError> {
+        let index = ColdStartReadinessActivationIndex {
+            contract_version: crate::CONTRACT_VERSION,
+            activation_ticket_id: activation_ticket_id.to_owned(),
+            binding_digest: record.claim.binding_digest.clone(),
+            record_key: record.record_key.clone(),
+            record_revision: record.record_revision,
+            state_fence: record.claim.key.state_fence.clone(),
+        };
+        index.validate()?;
+        let bytes = encode(&index)?;
+        let mut activations = write
+            .open_table(COLD_START_READINESS_ACTIVATIONS)
+            .map_err(storage)?;
+        if let Some(existing) = activations
+            .get(activation_ticket_id)
+            .map_err(storage)?
+        {
+            let existing: ColdStartReadinessActivationIndex = decode(existing.value())?;
+            existing.validate()?;
+            if existing.activation_ticket_id != activation_ticket_id
+                || existing.binding_digest != index.binding_digest
+                || existing.record_key != index.record_key
+                || existing.record_revision != index.record_revision
+                || existing.state_fence != index.state_fence
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "activation ticket is already bound to another cold-start revision"
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        }
+        activations
+            .insert(activation_ticket_id, bytes.as_str())
+            .map_err(storage)?;
+        Ok(())
     }
 
     fn load_cold_start_binding(
@@ -6451,6 +6568,75 @@ impl RedbRecoveryStore {
             return Err(OrsError::IntegrityProblem {
                 record_type: crate::COLD_START_READINESS_RECORD_TYPE,
                 reason: "cold-start binding index does not match its durable revision".to_owned(),
+            });
+        }
+        Ok(Some(record))
+    }
+
+    /// Loads the exact cold-start readiness revision atomically associated
+    /// with one current activation ticket. The caller supplies the fence from
+    /// the authenticated retained ticket; stale-fence and malformed indexes
+    /// fail closed instead of falling back to a workspace-wide lookup.
+    pub fn load_cold_start_readiness_for_activation(
+        &self,
+        activation_ticket_id: &str,
+        current_state_fence: &eliot_contracts::StateFence,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        crate::model::validate_text(activation_ticket_id, "cold_start_activation_ticket_id")?;
+        current_state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        let index = {
+            let activations = read
+                .open_table(COLD_START_READINESS_ACTIVATIONS)
+                .map_err(storage)?;
+            activations
+                .get(activation_ticket_id)
+                .map_err(storage)?
+                .map(|raw| decode::<ColdStartReadinessActivationIndex>(raw.value()))
+                .transpose()?
+        };
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        index.validate()?;
+        if index.activation_ticket_id != activation_ticket_id
+            || &index.state_fence != current_state_fence
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "activation readiness index is stale or names another ticket".to_owned(),
+            });
+        }
+        let record = {
+            let records = read
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
+            let raw = records
+                .get(index.record_key.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "activation readiness index points to a missing revision".to_owned(),
+                })?;
+            decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+        };
+        record.validate()?;
+        validate_cold_start_installation(&record.claim, &store_identity)?;
+        if record.claim.binding_digest != index.binding_digest
+            || record.claim.key.state_fence != index.state_fence
+            || record.record_key != index.record_key
+            || record.record_revision != index.record_revision
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "activation readiness index does not match its exact durable revision"
+                    .to_owned(),
             });
         }
         Ok(Some(record))

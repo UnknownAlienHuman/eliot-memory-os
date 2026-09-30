@@ -137,6 +137,30 @@ pub const AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID: &str =
 pub const AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_VERSION: u16 = 2;
 /// Stable Kernel operation used for agent-bridge activation.
 pub const AGENT_BRIDGE_ACTIVATION_OPERATION: &str = "eliot.agent-bridge.activate";
+/// Stable authenticated post-ACK read for the current Bridge activation's
+/// durable cold-start readiness state.
+pub const AGENT_BRIDGE_READINESS_STATUS_OPERATION: &str =
+    "agent_bridge_readiness_status";
+/// Exact status-query payload schema carried by the observation-only envelope.
+pub const AGENT_BRIDGE_READINESS_STATUS_PAYLOAD_SCHEMA_ID: &str =
+    "eliot.agent-bridge-readiness-status.v1";
+/// Stable wire identity for the bounded cold-start readiness status result.
+pub const AGENT_BRIDGE_READINESS_STATUS_WIRE_ID: &str =
+    "eliot.protocol.agent-bridge-readiness-status";
+/// Current cold-start readiness status result wire version.
+pub const AGENT_BRIDGE_READINESS_STATUS_WIRE_VERSION: u16 = 1;
+
+/// Computes the digest of the fixed, selector-only readiness query body.
+///
+/// The envelope's identity and digest cover this fixed body; no ticket,
+/// binding digest, workspace key, or caller-selected lookup enters it.
+pub fn agent_bridge_readiness_status_payload_digest() -> Result<String, ProtocolError> {
+    let bytes = canonical_json_bytes(
+        &serde_json::json!({"operation": AGENT_BRIDGE_READINESS_STATUS_OPERATION}),
+    )
+    .map_err(|error| ProtocolError::Json(error.to_string()))?;
+    Ok(eliot_contracts::sha256_hex(&bytes))
+}
 /// Stable wire identity for a pre-semantic agent-bridge activation request.
 pub const AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-request";
@@ -2500,6 +2524,148 @@ impl AgentBridgeAuthenticatedBinding {
             return Err(ProtocolError::InvalidField {
                 field: "agent_bridge_activation_response.activation_generation",
                 reason: "must match the semantic state fence generation",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Owner state returned by the live post-ACK cold-start readiness read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBridgeReadinessOwnerState {
+    /// No durable readiness claim is associated with the current ticket.
+    Unclaimed,
+    /// The exact ticket owns an active durable claim without a terminal receipt.
+    Claimed,
+    /// The exact ticket owns a durable terminal readiness receipt.
+    Terminal,
+    /// The ticket's exact durable revision exists but its lease has expired.
+    Expired,
+}
+
+/// Closed lifecycle vocabulary copied from the Governor terminal receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentBridgeReadinessLifecycle {
+    Unseen,
+    Scanning,
+    NeedsScope,
+    NeedsTask,
+    NeedsSources,
+    ReadyReadOnly,
+    ReadyMaterial,
+    Degraded,
+    Conflicted,
+}
+
+/// Minimal agent- and Human-facing projection of the exact readiness owner
+/// record read for the current authenticated activation ticket.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeReadinessStatus {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub owner_state: AgentBridgeReadinessOwnerState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<AgentBridgeReadinessLifecycle>,
+    /// Governor's smallest missing question, or the exact scanner question
+    /// while no durable terminal surface exists yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smallest_missing_question: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_deadline: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_safe_action: Option<String>,
+}
+
+impl AgentBridgeReadinessStatus {
+    pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_READINESS_STATUS_WIRE_VERSION;
+
+    /// Validates the bounded projection and its claim/terminal coherence.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_BRIDGE_READINESS_STATUS_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_readiness_status.wire",
+                reason: "unsupported readiness status response",
+            });
+        }
+        if let Some(question) = &self.smallest_missing_question {
+            bounded_text(
+                question,
+                "agent_bridge_readiness_status.smallest_missing_question",
+                4096,
+            )?;
+        }
+        if let Some(lease_ref) = &self.lease_ref {
+            bounded_text(
+                lease_ref,
+                "agent_bridge_readiness_status.lease_ref",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        if let Some(receipt_ref) = &self.receipt_ref {
+            bounded_text(
+                receipt_ref,
+                "agent_bridge_readiness_status.receipt_ref",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        if let Some(next_safe_action) = &self.next_safe_action {
+            bounded_text(
+                next_safe_action,
+                "agent_bridge_readiness_status.next_safe_action",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        let coherent = match self.owner_state {
+            AgentBridgeReadinessOwnerState::Unclaimed => {
+                self.record_revision.is_none()
+                    && self.readiness.is_none()
+                    && self.lease_ref.is_none()
+                    && self.lease_deadline.is_none()
+                    && self.receipt_ref.is_none()
+                    && self.next_safe_action.is_none()
+            }
+            AgentBridgeReadinessOwnerState::Claimed => {
+                self.record_revision.is_some_and(|revision| revision != 0)
+                    && self.readiness.is_none()
+                    && self.lease_ref.is_some()
+                    && self.lease_deadline.is_some_and(|deadline| deadline != 0)
+                    && self.receipt_ref.is_none()
+                    && self.next_safe_action.is_none()
+            }
+            AgentBridgeReadinessOwnerState::Terminal => {
+                self.record_revision.is_some_and(|revision| revision != 0)
+                    && self.readiness.is_some()
+                    && self.lease_ref.is_some()
+                    && self.lease_deadline.is_some_and(|deadline| deadline != 0)
+                    && self.receipt_ref.is_some()
+                    && self.next_safe_action.is_some()
+            }
+            AgentBridgeReadinessOwnerState::Expired => {
+                self.record_revision.is_some_and(|revision| revision != 0)
+                    && self.lease_ref.is_some()
+                    && self.lease_deadline.is_some_and(|deadline| deadline != 0)
+                    && if self.readiness.is_some() {
+                        self.receipt_ref.is_some() && self.next_safe_action.is_some()
+                    } else {
+                        self.receipt_ref.is_none() && self.next_safe_action.is_none()
+                    }
+            }
+        };
+        if !coherent {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_readiness_status",
+                reason: "owner state does not match its readiness projection",
             });
         }
         Ok(())

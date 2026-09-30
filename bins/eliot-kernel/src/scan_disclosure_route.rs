@@ -362,7 +362,11 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         let outcome = self
             .p07_ors
-            .claim_cold_start_readiness(claim, super::unix_ms())
+            .claim_cold_start_readiness_for_activation(
+                &current.ticket.ticket_id,
+                claim,
+                super::unix_ms(),
+            )
             .map_err(|_| TransportError::SessionFenced)?;
         match &outcome {
             ColdStartReadinessStageOutcome::Stored { record }

@@ -1503,6 +1503,11 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "agent_host_request_cancel"
             | "agent_host_request_reconcile"
             | "agent_host_request_rehydrate"
+            // Issue #1790 W6: the observation-only post-ACK read is a
+            // separate Bridge-facing operation. It still enters the
+            // authenticated daemon gateway, which selects the ticket from
+            // the current retained Bridge Session rather than the request.
+            | eliot_protocol::AGENT_BRIDGE_READINESS_STATUS_OPERATION
             | "activate_grant"
             | "revoke_grant"
             | "activate_introduction"
