@@ -103,49 +103,49 @@ impl SourceArtifactBlobPolicy {
 /// snapshot. Blob derives the content digest from the exact bytes it stages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceArtifactResidencyDomains {
-    scope_domain_id: String,
-    access_domain_id: String,
-    confidentiality_domain_id: String,
-    encryption_key_domain_id: String,
-    retention_domain_id: String,
-    erasure_domain_id: String,
+    scope: String,
+    access: String,
+    confidentiality: String,
+    encryption_key: String,
+    retention: String,
+    erasure: String,
 }
 
 impl SourceArtifactResidencyDomains {
     /// Explicit scope domain identity.
     #[must_use]
     pub fn scope_domain_id(&self) -> &str {
-        &self.scope_domain_id
+        &self.scope
     }
 
     /// Explicit access domain identity.
     #[must_use]
     pub fn access_domain_id(&self) -> &str {
-        &self.access_domain_id
+        &self.access
     }
 
     /// Explicit confidentiality domain identity.
     #[must_use]
     pub fn confidentiality_domain_id(&self) -> &str {
-        &self.confidentiality_domain_id
+        &self.confidentiality
     }
 
     /// Explicit encryption-key domain identity.
     #[must_use]
     pub fn encryption_key_domain_id(&self) -> &str {
-        &self.encryption_key_domain_id
+        &self.encryption_key
     }
 
     /// Explicit retention domain identity.
     #[must_use]
     pub fn retention_domain_id(&self) -> &str {
-        &self.retention_domain_id
+        &self.retention
     }
 
     /// Explicit erasure domain identity.
     #[must_use]
     pub fn erasure_domain_id(&self) -> &str {
-        &self.erasure_domain_id
+        &self.erasure
     }
 }
 
@@ -250,16 +250,16 @@ impl SourceArtifactBlobProfile {
             })?,
         };
         let residency_domains = SourceArtifactResidencyDomains {
-            scope_domain_id: domain(SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING)?,
-            access_domain_id: domain(SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING)?,
-            confidentiality_domain_id: domain(
+            scope: domain(SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING)?,
+            access: domain(SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING)?,
+            confidentiality: domain(
                 SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING,
             )?,
-            encryption_key_domain_id: domain(
+            encryption_key: domain(
                 SOURCE_ARTIFACT_BLOB_ENCRYPTION_KEY_DOMAIN_SETTING,
             )?,
-            retention_domain_id: domain(SOURCE_ARTIFACT_BLOB_RETENTION_DOMAIN_SETTING)?,
-            erasure_domain_id: domain(SOURCE_ARTIFACT_BLOB_ERASURE_DOMAIN_SETTING)?,
+            retention: domain(SOURCE_ARTIFACT_BLOB_RETENTION_DOMAIN_SETTING)?,
+            erasure: domain(SOURCE_ARTIFACT_BLOB_ERASURE_DOMAIN_SETTING)?,
         };
         let profile = Self {
             policy,
@@ -342,7 +342,7 @@ impl SourceArtifactBlobProfile {
     ) -> Result<(), SourceArtifactBlobProfileError> {
         self.validate_admission_binding(admission)?;
         if active_key_lineage.trim().is_empty()
-            || self.residency_domains.encryption_key_domain_id != active_key_lineage
+            || self.residency_domains.encryption_key != active_key_lineage
         {
             return Err(SourceArtifactBlobProfileError::KeyLineageMismatch);
         }
@@ -370,7 +370,7 @@ impl SourceArtifactBlobProfile {
         if !binding_matches {
             return Err(SourceArtifactBlobProfileError::AdmissionMismatch);
         }
-        if self.residency_domains.scope_domain_id != admission.work_scope().scope_id.as_str() {
+        if self.residency_domains.scope != admission.work_scope().scope_id.as_str() {
             return Err(SourceArtifactBlobProfileError::ScopeDomainMismatch);
         }
         Ok(())
@@ -392,13 +392,13 @@ pub enum SourceArtifactBlobProfileError {
     /// The retained Policy snapshot failed its own owner validation.
     #[error("retained source-artifact Policy snapshot is invalid: {0}")]
     InvalidPolicySnapshot(#[source] eliot_config::ConfigError),
-    /// Policy owner snapshot does not match this exact admitted WorkScope/fence/revision.
+    /// Policy owner snapshot does not match this exact admitted `WorkScope`/fence/revision.
     #[error("source-artifact Policy snapshot does not bind the admitted WorkScope and fence")]
     PolicyBindingMismatch,
     /// Profile was presented with an admission other than its original one.
     #[error("source-artifact profile does not bind this exact Governor admission")]
     AdmissionMismatch,
-    /// The configured scope domain is not the admitted WorkScope identity.
+    /// The configured scope domain is not the admitted `WorkScope` identity.
     #[error("source-artifact scope domain differs from the admitted WorkScope")]
     ScopeDomainMismatch,
     /// The configured encryption domain does not match the live key lineage.

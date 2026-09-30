@@ -1970,6 +1970,7 @@ impl DaemonKernelClient {
         &self,
         request: eliot_kernel_service::ProcessExecutionRequest,
         identity: RequestIdentity,
+        admitted_task_id: eliot_contracts::TaskId,
     ) -> Result<eliot_kernel_service::ProcessExecutionResponse, KernelClientError> {
         request
             .validate()
@@ -1984,9 +1985,8 @@ impl DaemonKernelClient {
         })?;
         let binding = &identity.request;
         let current = &self.snapshot;
-        if binding.metadata.task_id.is_none()
+        if binding.metadata.task_id.as_ref() != Some(&admitted_task_id)
             || binding.metadata.request_id.as_str() != operation_id.as_str()
-            || identity.idempotency_key != operation_id.as_str()
             || binding.state_fence != current.state_fence()
         {
             return Err(KernelClientError::Contract(
@@ -2012,7 +2012,10 @@ impl DaemonKernelClient {
         let value = self
             .transact_async_with_identity(
                 "execute_current_source_process",
-                serde_json::json!({ "request": request }),
+                serde_json::json!({
+                    "request": request,
+                    "admitted_task_id": admitted_task_id,
+                }),
                 identity,
             )
             .await?;
