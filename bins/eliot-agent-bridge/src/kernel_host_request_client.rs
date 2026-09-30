@@ -33,7 +33,7 @@ use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_mcp::{
     HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
     HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, PortFailure,
-    ToolRequest,
+    ProofCeiling, ResponseKind, ToolRequest,
 };
 use eliot_protocol::{
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
@@ -46,6 +46,7 @@ use eliot_protocol::{
     RequestIdentity, host_request_operation_id, restore_correlation,
 };
 use eliot_receipts::RequestBinding;
+use eliot_store_api::{WriteSubmission, WriteSubmissionState};
 use serde::Deserialize;
 
 use crate::{ActivatedTaskBinding, KernelTransportOwner, SharedTransport};
@@ -389,6 +390,9 @@ pub(crate) struct AdmittedReplyView {
     /// Exact payload commitment on full rows.
     #[serde(default)]
     pub(crate) payload_digest: Option<String>,
+    /// Original absolute operation deadline on full durable rows.
+    #[serde(default)]
+    pub(crate) deadline_unix_ms: Option<u64>,
     /// Retained result lineage the Kernel bound to this row's own result
     /// (issue #1809 items 2 and 7). Decoded as the SHARED
     /// [`HostRequestResultLineage`] contract, not as a local projection of it:
@@ -402,6 +406,11 @@ pub(crate) struct AdmittedReplyView {
     /// as an admitted record.
     #[serde(default)]
     pub(crate) result_lineage: Option<HostRequestResultLineage>,
+    /// Owner-read original WriteSubmission projection. This is decoded only
+    /// from authenticated rehydrate/resolve replies and is never a host-request
+    /// record field or a substitute for the result receipt path.
+    #[serde(skip)]
+    pub(crate) staged_write_submission: Option<WriteSubmission>,
 }
 
 /// Mirror of the kernel-owned durable host-request states for outcome mapping.
@@ -1141,6 +1150,54 @@ impl KernelHostRequestClient {
             LogicalOwnerOutcome::LegacyUnresolved => Err(PortFailure::LegacyCorrelationUnresolved),
             LogicalOwnerOutcome::Unavailable => Err(unknown_cancel_outcome(&handle)),
         }
+    }
+
+    /// Re-reads one exact original invocation by its Kernel-issued handle.
+    /// This is the existing owner resolve continuation used after a probe;
+    /// it creates no receipt and returns the stage only when the durable row
+    /// still joins every immutable field of the original envelope.
+    fn resolve_original_invocation(
+        &mut self,
+        envelope: &HostRequestEnvelope,
+        facts: &TransportFacts,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<AdmittedReplyView, PortFailure> {
+        let handle = host_request_operation_id(envelope);
+        let digest = envelope.envelope_sha256.as_str();
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_request_label(digest),
+            Some(handle.as_str()),
+            facts,
+            session_id,
+            RESOLVE_HANDLE_CAPABILITY_FILLER,
+            RESOLVE_HANDLE_PAYLOAD_FILLER,
+            now_ms,
+        )?;
+        let query = resolve_handle_query(&handle);
+        let frame = host_request_resolve_frame(&query, &resolve_envelope, facts)?;
+        let reply = self
+            .exchange(&frame)
+            .map_err(|error| retain_agent_response(error, unknown_outcome(digest)))?;
+        let record = match decode_resolve_reply(
+            &reply,
+            &resolve_envelope,
+            &ResolveQuery::OperationHandle {
+                handle: handle.clone(),
+            },
+        ) {
+            LogicalOwnerOutcome::Resolved(record) => *record,
+            LogicalOwnerOutcome::LegacyUnresolved => {
+                return Err(PortFailure::LegacyCorrelationUnresolved);
+            }
+            LogicalOwnerOutcome::Absent
+            | LogicalOwnerOutcome::Conflict
+            | LogicalOwnerOutcome::Unavailable => return Err(unknown_outcome(digest)),
+        };
+        if !record_matches_original_envelope(&record, envelope) {
+            return Err(unknown_outcome(digest));
+        }
+        Ok(record)
     }
 
     /// Resolves the exact parent operation after a cancellation result and
@@ -2722,7 +2779,57 @@ fn decode_rehydrated_reply(
     if value.get("operation_id")?.as_str()? != expected {
         return None;
     }
-    decode_record_view(value, &expected, &envelope.envelope_sha256)
+    let mut record = decode_record_view(value, &expected, &envelope.envelope_sha256)?;
+    if !record_matches_original_envelope(&record, envelope) {
+        return None;
+    }
+    record.staged_write_submission = decode_stage_field(value)?;
+    Some(record)
+}
+
+/// Joins the full owner row back to every immutable field carried by the
+/// original admitted envelope before its stage projection can be consumed.
+fn record_matches_original_envelope(
+    record: &AdmittedReplyView,
+    envelope: &HostRequestEnvelope,
+) -> bool {
+    record.operation_id == host_request_operation_id(envelope)
+        && record.request_digest.as_deref() == Some(envelope.envelope_sha256.as_str())
+        && record.kind.as_deref() == Some(envelope.kind.as_str())
+        && record.request_id.as_deref() == Some(envelope.identity.request_id.as_str())
+        && record.session_ref.as_deref() == envelope.identity.session_id.as_deref()
+        && record.task_ref.as_deref() == envelope.identity.task_id.as_deref()
+        && record.scope_ref.as_deref() == envelope.identity.work_scope_id.as_deref()
+        && record.capability_ref.as_deref() == Some(envelope.identity.capability.as_str())
+        && record.payload_digest.as_deref() == Some(envelope.identity.payload_sha256.as_str())
+        && record.deadline_unix_ms == Some(envelope.identity.deadline_unix_ms)
+        && record.parent_operation_id.as_deref()
+            == envelope.identity.parent_operation_id.as_deref()
+        && record.correlation_projection.as_ref()
+            == envelope.identity.correlation_projection.as_ref()
+}
+
+/// Reads the explicit stage projection carried beside an owner-resolved
+/// durable host request row. An absent field is a legacy readback with no
+/// stage proof; a present typed value is still validated before use.
+fn decode_stage_field(value: &serde_json::Value) -> Option<Option<WriteSubmission>> {
+    match value.get("stage") {
+        None => Some(None),
+        Some(value) if value.is_null() => Some(None),
+        Some(value) => Some(Some(decode_staged_write_submission(value)?)),
+    }
+}
+
+/// Decodes only the shared store API contract, then applies its owner-defined
+/// validation unchanged. A stage projection must be nonterminal and carry its
+/// exact retained reservation identity with no canonical receipt.
+fn decode_staged_write_submission(value: &serde_json::Value) -> Option<WriteSubmission> {
+    let submission: WriteSubmission = serde_json::from_value(value.clone()).ok()?;
+    submission.validate().ok()?;
+    (submission.state == WriteSubmissionState::Staged
+        && submission.ors_stage_ref.is_some()
+        && submission.canonical_receipt_ref.is_none())
+        .then_some(submission)
 }
 
 /// What the bridge asked the resolve entry to prove (issue #2571).
@@ -2839,7 +2946,13 @@ fn decode_resolve_value(value: &serde_json::Value, query: &ResolveQuery) -> Logi
         };
         let coherence = coherence.to_owned();
         return match decode_record_view(value, operation_id, &coherence) {
-            Some(record) => LogicalOwnerOutcome::Resolved(Box::new(record)),
+            Some(mut record) => match decode_stage_field(value) {
+                Some(stage) => {
+                    record.staged_write_submission = stage;
+                    LogicalOwnerOutcome::Resolved(Box::new(record))
+                }
+                None => LogicalOwnerOutcome::Unavailable,
+            },
             None => LogicalOwnerOutcome::Unavailable,
         };
     }
@@ -3345,6 +3458,120 @@ fn terminal_without_result_outcome(
     }
 }
 
+/// True only for the original capture request whose immutable write envelope
+/// asks the caller to return after durable ORS staging.
+fn accepts_after_stage(request: &HostInvocationRequest) -> bool {
+    matches!(
+        &request.tool,
+        ToolRequest::Observe(observation)
+            if observation.write_submission.response_mode == "accept_after_stage"
+    )
+}
+
+fn waits_for_commit(request: &HostInvocationRequest) -> bool {
+    matches!(
+        &request.tool,
+        ToolRequest::Observe(observation)
+            if observation.write_submission.response_mode == "wait_for_commit"
+    )
+}
+
+/// Projects an owner-read stage as the correlated response to the original
+/// `eliot.observe` request. Its request identities come from the immutable
+/// admitted envelope; the stage object itself is returned verbatim and does
+/// not claim a canonical receipt or semantic completion.
+fn staged_observe_outcome(
+    operation_handle: HostOperationHandle,
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    stage: WriteSubmission,
+) -> Result<HostInvocationPortOutcome, PortFailure> {
+    stage
+        .validate()
+        .map_err(|_| unknown_outcome(&envelope.envelope_sha256))?;
+    if stage.state != WriteSubmissionState::Staged
+        || stage.operation_id.as_str() != operation_handle.as_str()
+        || stage.ors_stage_ref.is_none()
+        || stage.canonical_receipt_ref.is_some()
+    {
+        return Err(unknown_outcome(&envelope.envelope_sha256));
+    }
+    let response = McpResponse {
+        request_id: envelope.identity.request_id.as_str().to_owned(),
+        idempotency_key: envelope.identity.idempotency_key.clone(),
+        canonical_request_sha256: expected_canonical_request_digest(envelope)?,
+        kind: ResponseKind::Projection,
+        canonical_tool_name: request.tool.canonical_name().to_owned(),
+        content: serde_json::to_value(stage)
+            .map_err(|_| unknown_outcome(&envelope.envelope_sha256))?,
+        artifacts: Vec::new(),
+        proof_ceiling: ProofCeiling::Observation,
+        resource: None,
+        job: None,
+    };
+    Ok(HostInvocationPortOutcome::Responded {
+        operation_handle,
+        response: Box::new(response),
+    })
+}
+
+/// Stage response for an owner-resolved replay, where the original envelope
+/// is represented by its retained request digest and occurrence identity.
+fn staged_resolved_observe_outcome(
+    record: &AdmittedReplyView,
+    request: &HostInvocationRequest,
+    occurrence: &str,
+    stage: WriteSubmission,
+    logical_key: &str,
+) -> Result<HostInvocationPortOutcome, PortFailure> {
+    let limitation = || unknown_resolve_outcome(logical_key);
+    stage.validate().map_err(|_| limitation())?;
+    if stage.state != WriteSubmissionState::Staged
+        || stage.operation_id.as_str() != record.operation_id.as_str()
+        || stage.ors_stage_ref.is_none()
+        || stage.canonical_receipt_ref.is_some()
+    {
+        return Err(limitation());
+    }
+    let handle = HostOperationHandle::new(record.operation_id.clone()).map_err(|_| limitation())?;
+    let idempotency_key = format!("{occurrence}:invoke");
+    let request_digest = record.request_digest.as_deref().ok_or_else(limitation)?;
+    let canonical_request_sha256 = expected_canonical_request_digest_by_parts(
+        request_digest,
+        occurrence,
+        &idempotency_key,
+    )?;
+    let response = McpResponse {
+        request_id: occurrence.to_owned(),
+        idempotency_key,
+        canonical_request_sha256,
+        kind: ResponseKind::Projection,
+        canonical_tool_name: request.tool.canonical_name().to_owned(),
+        content: serde_json::to_value(stage).map_err(|_| limitation())?,
+        artifacts: Vec::new(),
+        proof_ceiling: ProofCeiling::Observation,
+        resource: None,
+        job: None,
+    };
+    Ok(HostInvocationPortOutcome::Responded {
+        operation_handle: handle,
+        response: Box::new(response),
+    })
+}
+
+fn is_nonterminal_request_state(state: HostRequestRecordState) -> bool {
+    matches!(
+        state,
+        HostRequestRecordState::Requested
+            | HostRequestRecordState::Admitted
+            | HostRequestRecordState::Routed
+            | HostRequestRecordState::Submitted
+            | HostRequestRecordState::PossiblyEffected
+            | HostRequestRecordState::Unknown
+            | HostRequestRecordState::Reconciling
+    )
+}
+
 fn submit_outcome(
     receipt: &HostRequestAdmissionReceipt,
     record: &AdmittedReplyView,
@@ -3523,6 +3750,35 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                     .request_id
                     .clone()
                     .unwrap_or_else(|| correlation.clone());
+                if is_nonterminal_request_state(record.state)
+                    && (accepts_after_stage(request) || waits_for_commit(request))
+                {
+                    if let Some(stage) = record.staged_write_submission.clone() {
+                        let deadline_reached = record
+                            .deadline_unix_ms
+                            .is_some_and(|deadline| now_ms >= deadline);
+                        if waits_for_commit(request)
+                            && record.deadline_unix_ms.is_none()
+                        {
+                            return Err(unknown_resolve_outcome(logical_key.as_str()));
+                        }
+                        if accepts_after_stage(request) || deadline_reached {
+                            return staged_resolved_observe_outcome(
+                                &record,
+                                request,
+                                occurrence.as_str(),
+                                stage,
+                                logical_key.as_str(),
+                            );
+                        }
+                    } else if waits_for_commit(request)
+                        && record
+                            .deadline_unix_ms
+                            .is_some_and(|deadline| now_ms >= deadline)
+                    {
+                        return Err(unknown_resolve_outcome(logical_key.as_str()));
+                    }
+                }
                 return submit_outcome_for_resolved(
                     &record,
                     occurrence.as_str(),
@@ -3541,7 +3797,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // unknown-outcome error is returned unchanged and MUST NOT be
             // rewritten into DeadlineExceeded. Only the Kernel-owned Expired
             // record state maps to an owner timeout.
-            return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+            return self.probe_settles_invocation(request, &facts, &session, &envelope, now_ms);
         }
         let frame = match canonical_dispatch_entry(&request.tool) {
             CanonicalDispatchEntry::InvokeRead => {
@@ -3587,7 +3843,15 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         let reply = match self.exchange(&frame) {
             Ok(reply) => reply,
             Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
-            Err(_) => return self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+            Err(_) => {
+                return self.probe_settles_invocation(
+                    request,
+                    &facts,
+                    &session,
+                    &envelope,
+                    now_ms,
+                );
+            }
         };
         if is_legacy_correlation_unresolved_reply(&reply, &envelope) {
             return Err(PortFailure::LegacyCorrelationUnresolved);
@@ -3597,26 +3861,60 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         }
         match decode_admitted_reply(&reply, &envelope) {
             Some((receipt, record)) => {
-                // Unresolved durable states are re-read from the Kernel-owned
-                // record instead of assumed: the admitted pair is presented
-                // unchanged to the rehydrate entry and the refreshed state is
-                // mapped. A failed re-read keeps the admitted record the owner
-                // already returned; its handle stays the typed reconcile path.
-                let record = match record.state {
-                    HostRequestRecordState::PossiblyEffected
-                    | HostRequestRecordState::Unknown
-                    | HostRequestRecordState::Reconciling => {
-                        match self.rehydrate_operation(&envelope, &receipt) {
-                            Ok(refreshed) => refreshed,
-                            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
-                            Err(_) => record,
+                // Unresolved states are re-read as before. Both observe modes
+                // read the Kernel's separately validated durable stage when
+                // the operation remains nonterminal; `accept_after_stage` may
+                // return it immediately, while `wait_for_commit` waits for
+                // the retained original deadline. `Submitted` alone is never
+                // a stage ACK.
+                let needs_stage_view = (accepts_after_stage(request) || waits_for_commit(request))
+                    && is_nonterminal_request_state(record.state);
+                let (record, stage) = if needs_stage_view
+                    || matches!(
+                        record.state,
+                        HostRequestRecordState::PossiblyEffected
+                            | HostRequestRecordState::Unknown
+                            | HostRequestRecordState::Reconciling
+                    )
+                {
+                    match self.rehydrate_operation(&envelope, &receipt) {
+                        Ok(mut refreshed) => {
+                            let stage = refreshed.staged_write_submission.take();
+                            (refreshed, stage)
                         }
+                        Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
+                        Err(_) if accepts_after_stage(request) => {
+                            return Err(unknown_outcome(&envelope.envelope_sha256));
+                        }
+                        Err(_) => (record, None),
                     }
-                    _ => record,
+                } else {
+                    (record, None)
                 };
+                let wait_deadline_reached = if waits_for_commit(request)
+                    && is_nonterminal_request_state(record.state)
+                {
+                    let deadline = record
+                        .deadline_unix_ms
+                        .ok_or_else(|| unknown_outcome(&envelope.envelope_sha256))?;
+                    unix_ms()? >= deadline
+                } else {
+                    false
+                };
+                if (accepts_after_stage(request) || wait_deadline_reached)
+                    && is_nonterminal_request_state(record.state)
+                {
+                    if let Some(stage) = stage {
+                        let handle = HostOperationHandle::new(receipt.operation_id.clone())
+                            .map_err(|_| request_failure())?;
+                        return staged_observe_outcome(handle, request, &envelope, stage);
+                    } else if wait_deadline_reached {
+                        return Err(unknown_outcome(&envelope.envelope_sha256));
+                    }
+                }
                 submit_outcome(&receipt, &record, request, &envelope)
             }
-            None => self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+            None => self.probe_settles_invocation(request, &facts, &session, &envelope, now_ms),
         }
     }
 
@@ -3884,12 +4182,14 @@ impl KernelHostRequestClient {
     /// only that invocation. It is never a readiness label and introduces no
     /// readiness state.
     ///
-    /// The probe carries the exact parent handle: success proves the kernel
-    /// staged the operation, so the invoke settles as `Accepted` with the
-    /// kernel-derived handle. Failure stays an unknown outcome with the exact
-    /// digest for re-attach reconciliation. The submit itself is never resent.
+    /// The probe carries the exact parent handle. On a stage-response boundary,
+    /// success is followed by an owner resolve of that original handle so the
+    /// stage or terminal result is validated against the original record.
+    /// Failure stays an unknown outcome with the exact digest for re-attach
+    /// reconciliation. The submit itself is never resent.
     fn probe_settles_invocation(
         &mut self,
+        request: &HostInvocationRequest,
         facts: &TransportFacts,
         session_id: &str,
         envelope: &HostRequestEnvelope,
@@ -3905,6 +4205,52 @@ impl KernelHostRequestClient {
             .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
         match decode_admitted_reply(&reply, &probe) {
             Some(_) => {
+                let stage_is_due = accepts_after_stage(request)
+                    || (waits_for_commit(request)
+                        && now_ms >= envelope.identity.deadline_unix_ms);
+                if stage_is_due {
+                    let record = self.resolve_original_invocation(
+                        envelope,
+                        facts,
+                        session_id,
+                        now_ms,
+                    )?;
+                    let occurrence = record
+                        .request_id
+                        .clone()
+                        .unwrap_or_else(|| request.correlation_id.as_str().to_owned());
+                    let logical_key = request
+                        .correlation_projection
+                        .as_ref()
+                        .and_then(|projection| {
+                            logical_invocation_key(projection, session_id).ok()
+                        })
+                        .ok_or_else(|| unknown_outcome(&digest))?;
+                    if !is_nonterminal_request_state(record.state) {
+                        return submit_outcome_for_resolved(
+                            &record,
+                            occurrence.as_str(),
+                            request.tool.canonical_name(),
+                            logical_key.as_str(),
+                        );
+                    }
+                    if let Some(stage) = record.staged_write_submission.clone() {
+                        return staged_resolved_observe_outcome(
+                            &record,
+                            request,
+                            occurrence.as_str(),
+                            stage,
+                            logical_key.as_str(),
+                        );
+                    }
+                    if waits_for_commit(request) {
+                        return Err(unknown_outcome(&digest));
+                    }
+                    return Ok(HostInvocationPortOutcome::Accepted {
+                        operation_handle: HostOperationHandle::new(record.operation_id.clone())
+                            .map_err(|_| unknown_outcome(&digest))?,
+                    });
+                }
                 let handle = HostOperationHandle::new(host_request_operation_id(envelope))
                     .map_err(|_| request_failure())?;
                 Ok(HostInvocationPortOutcome::Accepted {
@@ -4301,7 +4647,9 @@ mod tests {
             scope_ref: None,
             capability_ref: None,
             payload_digest: None,
+            deadline_unix_ms: None,
             result_lineage: None,
+            staged_write_submission: None,
         };
         let (request_for_outcome, _, envelope_for_outcome) = test_envelope();
         let outcome_for = |state| {
@@ -4362,7 +4710,9 @@ mod tests {
             scope_ref: None,
             capability_ref: None,
             payload_digest: None,
+            deadline_unix_ms: None,
             result_lineage: None,
+            staged_write_submission: None,
         };
         match submit_outcome(&receipt, &received, &request, &envelope) {
             Ok(HostInvocationPortOutcome::Responded {
