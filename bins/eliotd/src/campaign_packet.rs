@@ -529,8 +529,9 @@ fn candidate_request_for_packet(
         .map_err(|_| CampaignPacketError::InvalidInvocation)?;
     check_campaign_learning_state_view(&request, recipe, view, context_recipe_body_digest)
         .map_err(|error| match error {
-            ContextError::MissingField("campaign_view.context_recipe")
-            | ContextError::MissingField("campaign_view.context_reference")
+            ContextError::MissingField(
+                "campaign_view.context_recipe" | "campaign_view.context_reference",
+            )
             | ContextError::InvalidField("campaign_view.completeness")
             | ContextError::InvalidDigest("campaign_view.context_recipe")
             | ContextError::InvalidFence
