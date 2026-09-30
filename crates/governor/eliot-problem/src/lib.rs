@@ -1027,6 +1027,16 @@ impl Problem {
     /// ownership epoch must be greater than the epoch currently held so I13.8's
     /// "new Authority Epoch" cannot be a reuse, and the grant must be bound to
     /// the record's live fence.
+    ///
+    /// This is also the reassignment half of the fenced owner-loss workflow, so
+    /// it is admitted on an already-unassigned record: that is the state
+    /// [`Self::record_owner_loss`] leaves behind, and admitting a successor is
+    /// how the outstanding obligation is discharged. Clearing that obligation
+    /// here is what makes the loss a reassignment rather than a delete — the
+    /// phase, evidence, hypotheses and repair history all survive, and only the
+    /// expired assignment is replaced. The epoch floor is read from whichever
+    /// ownership variant the record holds, so the successor still has to clear
+    /// the fenced epoch rather than restart from nothing.
     pub fn assign_owner(
         &mut self,
         expected_fence: &StateFence,
@@ -1041,7 +1051,12 @@ impl Problem {
         if !lease.is_bound_to(&self.state_fence) {
             return Err(ProblemError::FenceMismatch);
         }
-        let current_epoch = self.ownership.assigned()?.ownership_epoch;
+        // The epoch is read from whichever variant this record holds, not from
+        // the live assignment: a record that lost its owner retains the fenced
+        // epoch, and refusing to read it here would make every recorded owner
+        // loss permanent, because no successor could ever clear the epoch
+        // floor and the outstanding obligation could never be discharged.
+        let current_epoch = self.ownership.retained_epoch();
         if grant.ownership_epoch <= current_epoch {
             return Err(ProblemError::InvalidField {
                 field: "lease.ownership_epoch",
@@ -1820,6 +1835,11 @@ impl Incident {
     /// is named by the lease owner, the lease must be current at `now_ms`, and
     /// the grant's ownership epoch must exceed the epoch currently held, so a
     /// renewal is a new epoch rather than a reuse.
+    ///
+    /// As on the Problem, this is also how the owner-loss obligation is
+    /// discharged on an already-unassigned Incident: the promotion, its reason,
+    /// its admitting authority and its retained review requests all survive and
+    /// only the expired assignment is replaced.
     pub fn assign_owner(
         &mut self,
         expected_fence: &StateFence,
@@ -1834,7 +1854,7 @@ impl Incident {
         if !lease.is_bound_to(&self.state_fence) {
             return Err(ProblemError::FenceMismatch);
         }
-        let current_epoch = self.ownership.assigned()?.ownership_epoch;
+        let current_epoch = self.ownership.retained_epoch();
         if grant.ownership_epoch <= current_epoch {
             return Err(ProblemError::InvalidField {
                 field: "lease.ownership_epoch",
@@ -2679,6 +2699,11 @@ impl CriticalAttention {
     /// epoch currently held, and the grant must be bound to the record's live
     /// fence, so a renewal is a new epoch rather than a reuse. The blocking
     /// action set is retained in full.
+    ///
+    /// This is also the reassignment half of the fenced owner-loss workflow, so
+    /// it is admitted on an already-unassigned record: the blocking actions, the
+    /// evidence, the review condition and the expected closure set all survive
+    /// and only the expired assignment is replaced.
     pub fn assign_owner(
         &mut self,
         expected_fence: &StateFence,
@@ -2696,7 +2721,7 @@ impl CriticalAttention {
         if !lease.is_bound_to(&self.state_fence) {
             return Err(ProblemError::FenceMismatch);
         }
-        let current_epoch = self.ownership.assigned()?.ownership_epoch;
+        let current_epoch = self.ownership.retained_epoch();
         if grant.ownership_epoch <= current_epoch {
             return Err(ProblemError::InvalidField {
                 field: "lease.ownership_epoch",
