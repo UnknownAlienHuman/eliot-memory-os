@@ -1423,7 +1423,8 @@ impl GenerationPackagePlanner {
     ///
     /// Returns [`InstallationError::ProfileViolation`] for an invalid or
     /// unsupported profile, a missing anchor, a write into the immutable
-    /// binaries root, or a selection that cannot prove it depends on no
+    /// binaries root, a profiled staging root that differs from the canonical
+    /// packages root, or a selection that cannot prove it depends on no
     /// service-only authority.
     pub fn resolve_profile_selection(
         selection: &ProfileSelectionInput,
@@ -1466,6 +1467,17 @@ impl GenerationPackagePlanner {
             }
         };
         let runtime_state_roots = runtime_state_roots?;
+        if let Some(expected_staging_root) = runtime_state_roots.expected_staging_root()?
+            && !crate::same_windows_root(
+                selection.staging_root.as_str(),
+                expected_staging_root.as_str(),
+            )?
+        {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService/UserMode staging_root must equal profile_anchor_root\\Eliot\\packages"
+                    .to_owned(),
+            ));
+        }
         let no_service_authority_proof = if governed.profile.requires_admin() {
             None
         } else {
