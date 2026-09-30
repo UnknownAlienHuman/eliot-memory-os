@@ -3462,11 +3462,6 @@ const RECOVERY_INVENTORY_REVISION_SCHEMA_V1: &str = "1";
 /// state of a store written before this counter existed; the family's streamed
 /// content root is what additionally binds that state.
 const PROCESS_STREAM_RECOVERY_FAMILY_REVISION: &str = "process_stream_recovery_family_revision";
-/// Maximum rows returned by one complete process-stream source snapshot.
-///
-/// The live-set consumer must see the whole family under one read fence; an
-/// over-bound family is unavailable rather than silently truncated.
-const MAX_PROCESS_STREAM_RECOVERY_LIVE_SET_ROWS: usize = 8_192;
 /// Durable monotone revision of the versioned-artifact family (issue #1971).
 ///
 /// The exact counterpart of [`PROCESS_STREAM_RECOVERY_FAMILY_REVISION`] for the
@@ -24534,61 +24529,6 @@ impl RedbRecoveryStore {
             projections.push(projection);
         }
         Ok(projections)
-    }
-
-    /// Reads every process-stream recovery row and the family's exact revision
-    /// from one redb read transaction.
-    ///
-    /// This is the ORS source side of the I05-12 Blob live-set union. The
-    /// returned rows are the original persisted projections, each decoded,
-    /// validated and checked against its canonical `(operation, stream)` key;
-    /// callers may collect only the existing `source` handles they find. The
-    /// revision and rows share the same redb snapshot, and a family larger
-    /// than the bounded scan ceiling fails closed instead of yielding a
-    /// partial live set.
-    pub fn load_process_stream_recovery_snapshot(
-        &self,
-    ) -> Result<(u64, Vec<ProcessStreamRecoveryProjection>), ProcessStreamRecoveryLoadError> {
-        let read = self
-            .database
-            .begin_read()
-            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
-        let revision = Self::process_stream_recovery_family_revision(&read)
-            .map_err(Self::stream_recovery_load_error)?;
-        let table = read
-            .open_table(PROCESS_STREAM_RECOVERY)
-            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
-        let mut projections = Vec::new();
-        for row in table
-            .iter()
-            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?
-        {
-            if projections.len() == MAX_PROCESS_STREAM_RECOVERY_LIVE_SET_ROWS {
-                return Err(ProcessStreamRecoveryLoadError::InterruptedRead {
-                    reason:
-                        "process-stream recovery family exceeds the bounded complete live-set scan"
-                            .to_owned(),
-                });
-            }
-            let (key, value) =
-                row.map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
-            let projection: ProcessStreamRecoveryProjection =
-                decode(value.value()).map_err(Self::stream_recovery_load_error)?;
-            projection
-                .validate()
-                .map_err(Self::stream_recovery_load_error)?;
-            let canonical = projection
-                .record_key()
-                .map_err(Self::stream_recovery_load_error)?;
-            if canonical != key.value() {
-                return Err(ProcessStreamRecoveryLoadError::InterruptedRead {
-                    reason: "durable row does not match its canonical operation/stream key"
-                        .to_owned(),
-                });
-            }
-            projections.push(projection);
-        }
-        Ok((revision, projections))
     }
 
     /// Revalidates both stream projections for one operation and persists only
