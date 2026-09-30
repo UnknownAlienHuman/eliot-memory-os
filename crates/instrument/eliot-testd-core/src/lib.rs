@@ -4426,7 +4426,9 @@ impl TestdStore {
         // the job that must own it, so a restart cannot execute under a lease
         // another job holds or under a malformed tuple.
         if let Some(envelope) = job.work_envelope.as_ref() {
-            envelope.requalify().map_err(|_| TestdError::InvalidBinding)?;
+            envelope
+                .requalify()
+                .map_err(|_| TestdError::InvalidBinding)?;
         }
         let request = permit.request();
         request
@@ -4919,8 +4921,7 @@ fn running_lease_allocator(jobs: &[TestJob]) -> ResourceLeaseAllocator {
     let mut allocator = ResourceLeaseAllocator::new();
     for job in jobs.iter().filter(|job| {
         job.state == JobState::Running
-            || (job.state == JobState::Cancelled
-                && job.execution == Some(ExecutionStatus::Running))
+            || (job.state == JobState::Cancelled && job.execution == Some(ExecutionStatus::Running))
     }) {
         let leases = job
             .scheduling
