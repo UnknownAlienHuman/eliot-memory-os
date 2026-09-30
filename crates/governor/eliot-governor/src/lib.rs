@@ -119,6 +119,7 @@ mod problem_owner_transitions;
 mod quality_applicability;
 mod reactive_admission;
 mod route_registry;
+mod source_artifact_admission;
 mod scan_disclosure_owner;
 mod scope_identity_admission;
 mod selection_chain;
@@ -268,6 +269,10 @@ pub use route_registry::{
     RouteEvidenceSummary, RouteIdentityLayer, RouteInstallationIdentity, RouteOutcomeCounts,
     RouteOutcomeProfile, RouteOutcomeProfileIndex, RouteRefusalReason, RouteRegistryError,
     RuntimeRoute, diverging_scope_layers, effective_route_key,
+};
+pub use source_artifact_admission::{
+    SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
+    issue_source_artifact_admission,
 };
 pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 pub use scope_identity_admission::{

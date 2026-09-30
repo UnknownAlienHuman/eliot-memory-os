@@ -42,7 +42,8 @@ use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
     FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt, GovernorState,
-    QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
+    QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation, SourceArtifactAdmission,
+    SourceArtifactAdmissionError, SourceArtifactAdmissionRequest, issue_source_artifact_admission,
 };
 use eliot_authority::{
     CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
@@ -6857,6 +6858,87 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// a task, or any scope's memory, and it never re-binds silently: a
     /// relocation still needs its explicit owner receipt through
     /// [`Self::admit_scope_relocation`].
+    ///
+    /// Source-effect admission reads the current WorkScope, task, and session
+    /// owners before invoking the original GrantGraph/EffectAuthorizer path.
+    /// Its result is non-Serde and remains in the same request stack through
+    /// source capture and the Kernel P-03 handoff.
+    pub fn admit_source_artifact_effect(
+        &mut self,
+        input: SourceArtifactAdmissionRequest,
+    ) -> Result<SourceArtifactAdmission, SourceArtifactAdmissionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "Governor composition is not ready".to_owned(),
+            ));
+        }
+        let state_fence = self.snapshot.state_fence();
+        let work_scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            SourceArtifactAdmissionError::Owner("current WorkScope owner is unbound".to_owned())
+        })?;
+        let current_scope = work_scope_owner
+            .read_current(&state_fence)
+            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+        ensure_snapshot_fresh(&current_scope, "source-effect WorkScope is not fresh")
+            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+        let current_binding = &current_scope.binding;
+        if input.work_scope.scope_id.as_str() != current_binding.scope.scope_ref
+            || input.work_scope.resource_generation.value() != current_binding.scope.generation
+            || input.work_scope.state_fence != state_fence
+            || input.work_scope.product_id != input.request_identity.request.metadata.product_id
+        {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "source-effect WorkScope differs from the current retained binding/request product"
+                    .to_owned(),
+            ));
+        }
+        let task = self
+            .owners
+            .task
+            .task(&input.task.task_id)
+            .ok_or_else(|| SourceArtifactAdmissionError::Owner("task is absent".to_owned()))?;
+        if task.revision != input.task.task_revision.value()
+            || task.state_fence != state_fence
+            || input.task.state_fence != state_fence
+            || !task.state.is_active()
+        {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "source-effect task binding is stale".to_owned(),
+            ));
+        }
+        let session = self
+            .owners
+            .session
+            .session(&input.session.session_id)
+            .ok_or_else(|| SourceArtifactAdmissionError::Owner("session is absent".to_owned()))?;
+        if session.status != eliot_session::SessionState::Active
+            || session.state_fence != state_fence
+            || session.authority_epoch != input.session.authority_epoch
+            || session.authority_epoch != state_fence.authority_epoch
+            || session.expires_at <= input.request_identity.deadline_unix_ms
+            || session
+                .task_scope
+                .as_deref()
+                .is_some_and(|task_scope| task_scope != input.task.task_id.to_string())
+        {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "source-effect session is not the exact active current session".to_owned(),
+            ));
+        }
+        let authority_snapshot = self
+            .owners
+            .authority
+            .snapshot()
+            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+        if authority_snapshot.state_fence != state_fence {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "source-effect AuthorityOwner is stale against the current Governor fence"
+                    .to_owned(),
+            ));
+        }
+        issue_source_artifact_admission(&mut self.owners.authority, input)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "use-boundary guard joins the observation, privacy, source closure, and trigger in one fail-closed entry"
