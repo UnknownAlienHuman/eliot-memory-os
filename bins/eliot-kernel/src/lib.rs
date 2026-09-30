@@ -56,7 +56,6 @@ mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
-mod module_build_provenance_owner;
 /// Kernel problem-diagnostic projection (issue #1844; I16.7): the bounded
 /// `LogWindowRef`/`DiagnosticBrief` compiler over the canonical audit chain
 /// and the captured operational log windows. It emits references, gaps, and
@@ -78,6 +77,7 @@ mod kernel_config;
 /// once here and imported by the binary; later leaves extend through their
 /// own serialized turns, never a second copy.
 pub mod kernel_diagnostics;
+mod module_build_provenance_owner;
 mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
@@ -309,13 +309,13 @@ use daemon_supervision::{
     daemon_restart_refusal_reason,
 };
 use generation_recovery::OrsGenerationCoordinator;
-use module_build_provenance_owner::ModuleBuildProvenanceOwner;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
 #[cfg(windows)]
 use host_request_route::HostRequestOperationRef;
 #[cfg(windows)]
 use host_request_route::WATCHDOG_INTENT_SUBMIT_OPERATION;
+use module_build_provenance_owner::ModuleBuildProvenanceOwner;
 use runtime_identity::stable_owner_principal_digest;
 #[cfg(windows)]
 use runtime_identity::{
@@ -392,9 +392,8 @@ use eliot_kernel_service::{
     HostStartupEvidence, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
     KernelActivationPermit, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
     KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
-    ModuleBuildProvenanceRecord,
-    KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
-    ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
+    KernelServiceState, ModuleBuildProvenanceRecord, ProcessAuthorityHandoffDescriptor,
+    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
     USER_AUTOMATION_KERNEL_CAPABILITY, USER_AUTOMATION_KERNEL_MODULE_ID,
     USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING, USER_AUTOMATION_KERNEL_PRIVACY_CLASS,
 };

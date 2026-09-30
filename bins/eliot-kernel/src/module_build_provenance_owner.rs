@@ -161,7 +161,11 @@ fn validate_row_scope(
 ) -> Result<(), KernelServiceError> {
     if row.fence.host.installation != candidate.installation_id
         || row.fence.host.epoch.current.lineage_id.as_str()
-            != candidate.supervision_incarnation.host_epoch.lineage_id.as_str()
+            != candidate
+                .supervision_incarnation
+                .host_epoch
+                .lineage_id
+                .as_str()
         || row.fence.host.epoch.current.sequence.get() != candidate.host_epoch.value()
         || row.fence.activation_id != candidate.activation_id
         || row.fence.activation_generation.current.lineage_id.as_str()

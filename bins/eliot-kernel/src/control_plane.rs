@@ -396,20 +396,12 @@ impl KernelComposition {
                         .map_err(|_| TransportError::SessionFenced)?;
                 } else {
                     provenance_owner
-                        .observe_scope(
-                            &request.candidate,
-                            request.generation,
-                            &active_state_fence,
-                        )
+                        .observe_scope(&request.candidate, request.generation, &active_state_fence)
                         .map_err(|_| TransportError::SessionFenced)?;
                 }
             } else {
                 provenance_owner
-                    .observe_scope(
-                        &request.candidate,
-                        request.generation,
-                        &active_state_fence,
-                    )
+                    .observe_scope(&request.candidate, request.generation, &active_state_fence)
                     .map_err(|_| TransportError::SessionFenced)?;
             }
             active_state_fence
