@@ -162,9 +162,8 @@ pub use controlboard_projection::{
     ControlBoardAttentionBoard, ControlBoardAttentionBoardRow, ControlBoardAttentionEvaluationRow,
     ControlBoardAttentionMetricGroupRow, ControlBoardAttentionProfileRef,
     ControlBoardAttentionValidity, ControlBoardAttentionViewer, ControlBoardAttentionVolumeVsHarm,
-    ControlBoardGovernorSnapshot,
-    ControlBoardOwnerBinding, ControlBoardProjectionError, ControlBoardReviewBatch,
-    ControlBoardReviewBatchObligation, attention_board_validity,
+    ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
+    ControlBoardReviewBatch, ControlBoardReviewBatchObligation, attention_board_validity,
     attention_evidence_expansion_permitted, expand_attention_evidence, project_attention_board,
 };
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so

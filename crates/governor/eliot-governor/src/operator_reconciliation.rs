@@ -611,10 +611,7 @@ pub fn attention_evaluation_command_envelope(
             "attention_evaluation.evaluation_id",
             evaluation_id.to_owned(),
         ),
-        (
-            "attention_evaluation.revision",
-            revision.to_string(),
-        ),
+        ("attention_evaluation.revision", revision.to_string()),
         (
             "attention_evaluation.record_digest",
             record_digest.to_owned(),
@@ -623,10 +620,7 @@ pub fn attention_evaluation_command_envelope(
             "attention_evaluation.evidence_commitment",
             evidence_commitment.to_owned(),
         ),
-        (
-            "attention_evaluation.manifest_id",
-            manifest_id.to_owned(),
-        ),
+        ("attention_evaluation.manifest_id", manifest_id.to_owned()),
         (
             "attention_evaluation.manifest_revision",
             manifest_revision.to_owned(),

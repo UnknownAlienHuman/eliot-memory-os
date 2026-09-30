@@ -795,10 +795,7 @@ fn attention_volume_vs_harm(
             record,
             HumanAttentionMetric::DeduplicatedInboxItems,
         )?,
-        delivery_attempts: attention_volume_metric(
-            record,
-            HumanAttentionMetric::DeliveryAttempts,
-        )?,
+        delivery_attempts: attention_volume_metric(record, HumanAttentionMetric::DeliveryAttempts)?,
         missed_critical_risk_events: attention_volume_metric(
             record,
             HumanAttentionMetric::MissedCriticalRiskEvents,
@@ -840,7 +837,11 @@ fn project_attention_row(
         authorized_scope_refs: flags.authorized_scope.authorized_scope_refs.clone(),
         task_population_refs: flags.authorized_scope.task_population_refs.clone(),
         risk_population_refs: flags.authorized_scope.risk_population_refs.clone(),
-        window_id: record.observation_window.specification.window_id.to_string(),
+        window_id: record
+            .observation_window
+            .specification
+            .window_id
+            .to_string(),
         window_opened_at_ms: record.observation_window.opened_at.known_time_ms,
         window_closed_at_ms: record
             .observation_window
@@ -912,7 +913,9 @@ pub fn project_attention_board(
             .copied();
         if attention_evidence_expansion_permitted(record, viewer) {
             rows.push(ControlBoardAttentionBoardRow::Full(project_attention_row(
-                record, successor, now_unix_ms,
+                record,
+                successor,
+                now_unix_ms,
             )?));
         } else {
             rows.push(ControlBoardAttentionBoardRow::ScopeWithheld {
