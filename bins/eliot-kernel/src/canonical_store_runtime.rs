@@ -52,6 +52,8 @@ use eliot_platform_windows::ProtectedSecret;
 #[cfg(windows)]
 use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
 #[cfg(windows)]
+use eliot_kernel_service::{RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER};
+#[cfg(windows)]
 use std::fmt;
 
 /// Maps one Store bootstrap/build failure to its stable owner-typed code.
@@ -558,13 +560,12 @@ impl KernelComposition {
         }
         let operation_identity = eliot_ors::OperationIdentity::new(token.operation_id.as_str())
             .map_err(|error| error.to_string())?;
-        let envelope = gateway
-            .verify_staged_envelope(&state_fence, &operation_identity)
-            .await?;
+        let envelope = gateway.verify_staged_envelope(&state_fence, &operation_identity)?;
         let staged_access = envelope.privacy_and_visibility_class.clone();
         let ciphertext = match envelope.payload {
             RecoveryPayload::Encrypted { key, ciphertext }
-                if key.provider.as_str() == "dpapi" && key.key.as_str() == "current-user" =>
+                if key.provider.as_str() == RESERVATION_KEY_PROVIDER
+                    && key.key.as_str() == RESERVATION_KEY_NAME =>
             {
                 ciphertext
             }
@@ -582,8 +583,10 @@ impl KernelComposition {
             .unprotect_secret(&protected)
             .map_err(|error| error.to_string())?;
         let operation: super::daemon_request_dispatch::StoreApplyOperation =
-            serde_json::from_slice(&original_bytes).map_err(|error| error.to_string())?;
-        if canonical_json_bytes(&operation).map_err(|error| error.to_string())? != original_bytes
+            serde_json::from_slice(original_bytes.expose())
+                .map_err(|error| error.to_string())?;
+        if canonical_json_bytes(&operation).map_err(|error| error.to_string())?
+            != original_bytes.expose()
             || eliot_store_api::prepared_transition_digest(&operation.transition)
                 .map_err(|error| error.to_string())?
                 != token.prepared_transition_sha256
@@ -592,11 +595,7 @@ impl KernelComposition {
         {
             return Err("retained Observe operation differs from its reservation token".to_owned());
         }
-        let input =
-            super::daemon_request_dispatch::KernelComposition::retained_observe_reservation_input(
-                &host_record,
-                &operation,
-            )?
+        let input = Self::retained_observe_reservation_input(&host_record, &operation)?
             .ok_or_else(|| "retained Observe operation has no executable input".to_owned())?;
         let original_submission = operation
             .original_write_submission
@@ -637,7 +636,8 @@ impl KernelComposition {
                 &original_submission,
                 token.clone(),
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
