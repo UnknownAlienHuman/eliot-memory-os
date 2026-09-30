@@ -7,7 +7,9 @@ license.workspace = true
 description = "One-shot rust-analyzer/SCIP semantic-navigation and diagnostics bridge with observation receipts"
 
 [dependencies]
+eliot-artifact = { path = "../../instrument/eliot-artifact", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-git-bridge.workspace = true
 eliot-build-test-graph = { path = "../../instrument/eliot-build-test-graph", version = "0.1.0" }
 eliot-evidence.workspace = true
 eliot-instrument-api.workspace = true

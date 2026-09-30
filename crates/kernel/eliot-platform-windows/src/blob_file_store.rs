@@ -441,8 +441,10 @@ impl BlobFileStore {
 
     /// Replaces a regular file only when its identity and digest still match
     /// the values observed by the caller. The original no-follow handle is
-    /// retained, denies concurrent writers, and remains live through the
-    /// handle-relative atomic rename and parent-directory flush.
+    /// retained without write or delete sharing, so its pathname cannot be
+    /// replaced between the final comparison and the handle-relative atomic
+    /// rename. POSIX rename semantics let that original handle remain live
+    /// until publication is durable.
     pub fn replace_durable_if_matches(
         &self,
         path: &WorkScopePath,
@@ -453,7 +455,7 @@ impl BlobFileStore {
         #[cfg(windows)]
         {
             use windows_sys::Win32::Storage::FileSystem::{
-                DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                DELETE, FILE_GENERIC_READ, FILE_SHARE_READ,
             };
 
             if !valid_sha256(expected_sha256) {
@@ -464,7 +466,7 @@ impl BlobFileStore {
                 &parent,
                 path_leaf(path)?,
                 FILE_GENERIC_READ | DELETE,
-                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                FILE_SHARE_READ,
             ) {
                 Ok(file) => file,
                 Err(BlobFileStoreError::NotFound) => {
@@ -493,7 +495,8 @@ impl BlobFileStore {
                     return Err(BlobFileStoreError::InvalidPath);
                 }
                 // Recheck the retained original immediately before the atomic
-                // name operation. Its open handle also prevents write opens.
+                // name operation. Its share mode also prevents ordinary
+                // write, delete, and rename opens while staging completes.
                 if crate::file_identity_for_open_handle(&original).map_err(map_protected)?
                     != expected_identity
                     || digest_open_file(&original)? != expected_sha256.to_ascii_lowercase()
@@ -1266,6 +1269,9 @@ fn native_replace_from_handle(
     leaf: &str,
 ) -> Result<(), BlobFileStoreError> {
     use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+    };
 
     validate_leaf(leaf)?;
     let name = leaf.encode_utf16().collect::<Vec<_>>();
@@ -1273,7 +1279,7 @@ fn native_replace_from_handle(
         .len()
         .checked_mul(std::mem::size_of::<u16>())
         .ok_or(BlobFileStoreError::InvalidPath)?;
-    let header_bytes = std::mem::size_of::<BlobNativeFileRenameInformation>()
+    let header_bytes = std::mem::size_of::<BlobNativeFileRenameInformationEx>()
         .checked_sub(std::mem::size_of::<u16>())
         .ok_or_else(|| BlobFileStoreError::Io("invalid native rename layout".to_owned()))?;
     let total_bytes = header_bytes
@@ -1284,12 +1290,18 @@ fn native_replace_from_handle(
         .ok_or_else(|| BlobFileStoreError::Io("native rename buffer overflow".to_owned()))?
         / std::mem::size_of::<usize>();
     let mut storage = vec![0_usize; word_count];
-    let information = storage.as_mut_ptr().cast::<BlobNativeFileRenameInformation>();
+    let information = storage
+        .as_mut_ptr()
+        .cast::<BlobNativeFileRenameInformationEx>();
     unsafe {
         // SAFETY: the aligned storage has enough room for the native header
         // and UTF-16 leaf; both handles remain live for the synchronous call.
-        (*information).replace_if_exists = 1;
-        (*information).padding = [0; 7];
+        // POSIX replace semantics permit replacing the destination while its
+        // original handle remains open. That handle's share mode denies
+        // competing ordinary pathname replacements before this operation.
+        (*information).flags =
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*information).padding = 0;
         (*information).root_directory = destination_parent.as_raw_handle().cast();
         (*information).file_name_length =
             u32::try_from(name_bytes).map_err(|_| BlobFileStoreError::InvalidPath)?;
@@ -1312,7 +1324,7 @@ fn native_replace_from_handle(
             information.cast(),
             u32::try_from(total_bytes)
                 .map_err(|_| BlobFileStoreError::InvalidPath)?,
-            10,
+            65, // FileRenameInformationEx
         )
     };
     if status >= 0 {
@@ -1320,7 +1332,7 @@ fn native_replace_from_handle(
     } else {
         Err(BlobFileStoreError::Platform(
             BlobFileStorePlatformFailure::Native {
-                operation: "NtSetInformationFile(FileRenameInformation)",
+                operation: "NtSetInformationFile(FileRenameInformationEx)",
                 status: status as u32,
             },
         ))
@@ -1329,9 +1341,9 @@ fn native_replace_from_handle(
 
 #[cfg(windows)]
 #[repr(C)]
-struct BlobNativeFileRenameInformation {
-    replace_if_exists: u8,
-    padding: [u8; 7],
+struct BlobNativeFileRenameInformationEx {
+    flags: u32,
+    padding: u32,
     root_directory: windows_sys::Win32::Foundation::HANDLE,
     file_name_length: u32,
     file_name: [u16; 1],

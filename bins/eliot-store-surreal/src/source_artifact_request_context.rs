@@ -8,6 +8,7 @@ use eliot_protocol::{
     Frame, ProtocolModuleGeneration, ProtocolVersion, RequestIdentity, RequestId, StateFence,
 };
 use eliot_store_api::{ExactJsonBytes, Request, decode_request_frame_with_authority};
+use std::collections::BTreeSet;
 
 /// Authenticated Store session identity retained after request admission.
 ///
@@ -21,6 +22,7 @@ pub struct AdmittedStoreSessionProjection {
     state_fence: StateFence,
     session_principal_binding: String,
     authenticated_peer_principal_binding: String,
+    capabilities: BTreeSet<String>,
 }
 
 impl AdmittedStoreSessionProjection {
@@ -36,6 +38,7 @@ impl AdmittedStoreSessionProjection {
         state_fence: StateFence,
         session_principal_binding: String,
         authenticated_peer_principal_binding: String,
+        capabilities: BTreeSet<String>,
     ) -> Result<Self, String> {
         if connection_id.trim().is_empty()
             || session_principal_binding.trim().is_empty()
@@ -53,6 +56,7 @@ impl AdmittedStoreSessionProjection {
             state_fence,
             session_principal_binding,
             authenticated_peer_principal_binding,
+            capabilities,
         })
     }
 
@@ -78,6 +82,12 @@ impl AdmittedStoreSessionProjection {
 
     pub(crate) fn authenticated_peer_principal_binding(&self) -> &str {
         &self.authenticated_peer_principal_binding
+    }
+
+    /// Reports whether the live session negotiated one exact capability.
+    /// This records transport admission only; it does not grant a Blob effect.
+    pub(crate) fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.contains(capability)
     }
 
 }
