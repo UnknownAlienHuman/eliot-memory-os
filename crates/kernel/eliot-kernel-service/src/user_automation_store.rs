@@ -43,12 +43,16 @@ use eliot_contracts::{ArtifactId, ContractId, ProductId, TransactionSequence};
 use eliot_kernel_core::user_automation::{
     AutomationReconciliationCause, AutomationReconciliationReference,
     UserAutomationExecutionProjection, UserAutomationInvocation, UserAutomationOperation,
-    UserAutomationRevision,
+    UserAutomationRevision, USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID,
+    USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER,
+    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
+    USER_AUTOMATION_NORMALIZATION_VERIFIER_ID,
+    USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION,
 };
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling,
     ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding, SessionBinding,
-    TaskBinding, WorkScopeBinding, WorkScopeId,
+    TaskBinding, VerifierBinding, WorkScopeBinding, WorkScopeId,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, NamedReadOperation, NamedReadRequest,
@@ -2187,17 +2191,6 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
     }
 }
 
-/// Closed operation kind recorded on the owner-issued schedule normalization
-/// receipt.
-///
-/// It names the work the receipt attests — compiling the declared expression
-/// under the declared calendar against the pinned zone table — and never a
-/// mutation, an admission or a scheduling authority.
-const AUTOMATION_NORMALIZATION_OPERATION_KIND: &str = "user-automation.schedule.normalize";
-
-/// Stable authority identity of the schedule normalizer on this leg.
-const AUTOMATION_NORMALIZATION_AUTHORITY_ID: &str = "eliot-user-automation:schedule-normalizer";
-
 /// Owner-issued task and session bindings for the normalization envelope.
 ///
 /// The task/session bindings mirror the canonical Store receipt owner: a
@@ -2237,44 +2230,28 @@ fn owner_normalization_bindings(
     Ok((task, session))
 }
 
-/// Returns the immutable revision with the owner-issued schedule normalization
-/// receipt this Store leg mints over exactly that revision's compiled occurrence
-/// set, together with the canonical envelope that receipt projects out of.
+/// Returns the immutable revision with a normalization receipt issued only
+/// after the in-process calendar compiler independently verifies the schedule
+/// expression against its pinned-zone occurrence projection. The receipt binds
+/// that verified result to the immutable revision artifact, source and
+/// occurrence digests, work scope, verifier contract and original state fence.
+/// The compiler accepts only `gregorian-utc` expressions of the form
+/// `utc:<canonical UTC instant>` or
+/// `utc-interval:<canonical UTC instant>/<positive seconds>`; unrecognized
+/// calendars or recurrence syntax fail closed instead of receiving a success
+/// receipt.
+/// The authenticated request is admitted upstream, and `revision.owner_principal`
+/// remains on the immutable revision; receipt authority attribution names the
+/// stable schedule-compiler service. A caller-supplied receipt is replaced
+/// rather than trusted.
 ///
-/// I11.12:31 makes the normalized schedule the trigger contract and forbids
-/// silently guessing an ambiguous calendar phrase, and I05.19:96 says a new
-/// domain `*Receipt` name is only a typed payload inside the one versioned
-/// envelope its owning subsystem issues — never a second receipt store, writer
-/// or lifecycle root. So this is the owner: it builds the
-/// [`ReceiptCore`](eliot_receipts::ReceiptCore) whose single artifact is the
-/// revision's own `compiled_occurrences_digest` and hands it to the existing
-/// `NormalizedSchedule::issue_normalization_receipt`, the only constructor of
-/// that receipt. The digest is read back out of the
-/// revision, never recomputed here, and a caller-supplied
-/// `normalization_receipt` on the submitted revision is replaced rather than
-/// trusted: a revision that arrives with somebody else's receipt id is
-/// re-bound by its owner instead of persisting a claim nobody issued.
-///
-/// The core is a pure function of the admitted request and the submitted
-/// revision — no clock, environment, locale or random source — so the sealing
-/// call in [`CanonicalUserAutomationStore::build_transition`] and the dispatch
-/// call in `execute_mutation` mint the identical envelope identity for one
-/// operation, exactly as the canonical Store does when it re-derives its own
-/// receipt envelope.
-///
-/// ASSUMPTION: the compiled occurrence set reaches this leg from the
-/// authenticated principal's request, because no calendar adapter is a
-/// production dependency of this crate; the issuing authority is therefore
-/// named as that principal rather than as an adapter that does not exist here.
-/// The receipt still proves nothing Kernel does not re-derive: the envelope
-/// identity is content-derived, and the two envelopes minted here from one core
-/// are required to carry that identical identity, so the retained bytes and the
-/// id the revision names cannot come apart.
+/// The core is a pure function of the admitted request and verified revision,
+/// so the sealing call in `build_transition` and dispatch call in
+/// `execute_mutation` derive the same envelope identity for one operation.
 ///
 /// ## Retention rides the revision row, because it cannot ride the Store's own
 ///
-/// Minting is not retention, and this leg now does both — because the
-/// measurement that split them is closed. The retained set a run-now read
+/// The retained set a run-now read
 /// selects from cannot be the canonical Store's `WriteReceipt` history:
 /// `receipt_artifacts` emits exactly two artifacts, `store-transition:{op}`
 /// (the digest of the committed `PreparedTransition`) and
@@ -2299,8 +2276,23 @@ fn revision_with_owner_normalization_receipt(
     request: &UserAutomationStoreRequest,
     revision: &UserAutomationRevision,
 ) -> Result<(UserAutomationRevision, ReceiptEnvelope), StoreError> {
+    super::user_automation_compiler::verify_compiled_schedule(&revision.schedule)
+        .map_err(schedule_compilation_store_error)?;
+
     let state_fence = request.context.state_fence.clone();
     let (task, session) = owner_normalization_bindings(request, &state_fence)?;
+    let artifact_id = ArtifactId::new(format!(
+        "compiled-occurrences:{}:{}",
+        revision.automation_id, revision.revision
+    ))
+    .map_err(StoreError::Foundation)?;
+    let occurrences_digest = revision
+        .schedule
+        .compiled_occurrences_digest()
+        .map_err(|_| StoreError::InvalidField {
+            field: "automation.schedule.next_occurrences",
+            reason: "compiled occurrence set could not be digested",
+        })?;
     let core = ReceiptCore {
         contract: eliot_receipts::contract_identity().map_err(StoreError::Receipt)?,
         kind: ReceiptKind::Verification,
@@ -2330,38 +2322,35 @@ fn revision_with_owner_normalization_receipt(
             operation_id: request.identity.operation_id.clone(),
             request_id: request.context.request_id.clone(),
             idempotency_key: request.identity.idempotency_key.clone(),
-            operation_kind: AUTOMATION_NORMALIZATION_OPERATION_KIND.to_owned(),
+            operation_kind: USER_AUTOMATION_NORMALIZATION_OPERATION_KIND.to_owned(),
             effect: EffectClass::Read,
             state_fence: state_fence.clone(),
         },
         authority: AuthorityBinding {
-            authority_id: ContractId::new(AUTOMATION_NORMALIZATION_AUTHORITY_ID)
+            authority_id: ContractId::new(USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID)
                 .map_err(StoreError::Foundation)?,
-            authority_owner: request.authenticated_principal.clone(),
+            authority_owner: USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER.to_owned(),
             authority_epoch: state_fence.authority_epoch.clone(),
             state_fence: state_fence.clone(),
             allowed_effect: EffectClass::Read,
             proof_ceiling: ProofCeiling::ScopedVerification,
         },
         artifacts: vec![ArtifactBinding {
-            artifact_id: ArtifactId::new(format!(
-                "compiled-occurrences:{}:{}",
-                revision.automation_id, revision.revision
-            ))
-            .map_err(StoreError::Foundation)?,
-            sha256: revision
-                .schedule
-                .compiled_occurrences_digest()
-                .map_err(|_| StoreError::InvalidField {
-                    field: "automation.schedule.next_occurrences",
-                    reason: "compiled occurrence set could not be digested",
-                })?,
+            artifact_id: artifact_id.clone(),
+            sha256: occurrences_digest,
             role: ReceiptKind::Artifact,
             source_revision: Some(
                 eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
             ),
         }],
-        verifier: None,
+        verifier: Some(VerifierBinding {
+            verifier_id: ContractId::new(USER_AUTOMATION_NORMALIZATION_VERIFIER_ID)
+                .map_err(StoreError::Foundation)?,
+            verifier_revision: USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION,
+            artifact_ids: vec![artifact_id],
+            proof_ceiling: ProofCeiling::ScopedVerification,
+            state_fence: state_fence.clone(),
+        }),
         problem: None,
         coordination: None,
         disposition: ReceiptDisposition::Success {
@@ -2378,7 +2367,7 @@ fn revision_with_owner_normalization_receipt(
     let retained = ReceiptEnvelope::issue(core.clone()).map_err(StoreError::Receipt)?;
     let receipt = revision
         .schedule
-        .issue_normalization_receipt(core, &request.authenticated_principal)
+        .issue_normalization_receipt(core, revision)
         .map_err(|_| StoreError::InvalidField {
             field: "automation.schedule.normalization_receipt",
             reason: "owner-issued normalization receipt was refused",
@@ -2392,6 +2381,99 @@ fn revision_with_owner_normalization_receipt(
     let mut owned = revision.clone();
     owned.schedule.normalization_receipt = receipt;
     Ok((owned, retained))
+}
+
+/// Preserves the causal category of compiler and pinned-zone failures at the
+/// Store boundary, whose public error type carries static field and reason
+/// labels only.
+fn schedule_compilation_store_error(
+    error: eliot_kernel_core::user_automation::UserAutomationError,
+) -> StoreError {
+    use eliot_kernel_core::user_automation::UserAutomationError;
+
+    match error {
+        UserAutomationError::Invalid(field) | UserAutomationError::LimitExceeded(field) => {
+            let (field, reason) = if field.starts_with("schedule.calendar") {
+                (
+                    "automation.schedule.calendar",
+                    "calendar is unsupported, ambiguous, or invalid",
+                )
+            } else if field.starts_with("schedule.expression") {
+                (
+                    "automation.schedule.expression",
+                    "expression is unsupported, ambiguous, or invalid",
+                )
+            } else if field.contains("zone") || field.contains("timezone") || field.contains("dst")
+            {
+                (
+                    "automation.schedule.timezone",
+                    "pinned timezone evidence or policy is invalid",
+                )
+            } else if field.starts_with("schedule.next_occurrences")
+                || field.starts_with("schedule.occurrence")
+            {
+                (
+                    "automation.schedule.next_occurrences",
+                    "occurrence projection is invalid or disagrees with the expression",
+                )
+            } else if field.starts_with("schedule.start_at")
+                || field.starts_with("schedule.end_at")
+            {
+                (
+                    "automation.schedule.interval",
+                    "schedule interval bounds are invalid",
+                )
+            } else if field.starts_with("schedule.normalization_receipt") {
+                (
+                    "automation.schedule.normalization_receipt",
+                    "normalization receipt binding is invalid",
+                )
+            } else {
+                ("automation.schedule", "schedule validation failed")
+            };
+            StoreError::InvalidField { field, reason }
+        }
+        UserAutomationError::UnknownZone(_) => StoreError::InvalidField {
+            field: "automation.schedule.timezone",
+            reason: "zone is not present in the pinned zone table",
+        },
+        UserAutomationError::ZoneDatabaseRevision(_) => StoreError::InvalidField {
+            field: "automation.schedule.zone_database_revision",
+            reason: "zone database revision does not match the pinned release",
+        },
+        UserAutomationError::SubMinuteZoneOffset { .. } => StoreError::InvalidField {
+            field: "automation.schedule.timezone",
+            reason: "pinned zone offset cannot be represented by the occurrence contract",
+        },
+        UserAutomationError::ZoneTableWindow { .. } => StoreError::InvalidField {
+            field: "automation.schedule.timezone",
+            reason: "occurrence is outside the pinned zone table coverage",
+        },
+        UserAutomationError::ZoneTableIntegrity => StoreError::InvalidField {
+            field: "automation.schedule.timezone",
+            reason: "pinned zone table integrity validation failed",
+        },
+        UserAutomationError::ZoneEvidence(_) => StoreError::InvalidField {
+            field: "automation.schedule.timezone",
+            reason: "occurrence zone evidence disagrees with the pinned table",
+        },
+        UserAutomationError::LegacyScheduleEncoding(_) | UserAutomationError::OccurrenceMismatch => {
+            StoreError::InvalidField {
+                field: "automation.schedule.next_occurrences",
+                reason: "occurrence projection requires re-normalization or does not match",
+            }
+        }
+        UserAutomationError::Receipt(_) | UserAutomationError::ReceiptBinding => {
+            StoreError::InvalidField {
+                field: "automation.schedule.normalization_receipt",
+                reason: "normalization receipt binding failed",
+            }
+        }
+        _ => StoreError::InvalidField {
+            field: "automation.schedule",
+            reason: "schedule compiler or contract validation failed",
+        },
+    }
 }
 
 /// Renders the owner-issued normalization envelope for the Store to retain.
