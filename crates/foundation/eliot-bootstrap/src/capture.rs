@@ -11,7 +11,7 @@
 
 use std::{
     collections::HashSet,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -20,6 +20,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use cap_fs_ext::{ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{
+    Dir as CapabilityDir, File as CapabilityFile, OpenOptions as CapabilityOpenOptions,
+};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -139,7 +143,9 @@ pub enum CaptureError {
     Serialization(String),
     #[error("normative pair receipt is unavailable at {path}: {detail}")]
     NormativePairReceipt { path: PathBuf, detail: String },
-    #[error("workspace source candidate is not an exact member of the fixed path/kind allowlist: {0}")]
+    #[error(
+        "workspace source candidate is not an exact member of the fixed path/kind allowlist: {0}"
+    )]
     InvalidWorkspaceSourceCandidate(String),
     #[error("workspace source selection contains the same path more than once: {0}")]
     DuplicateWorkspaceSourceCandidate(String),
@@ -896,7 +902,9 @@ pub enum WorkspaceSourceContentUnavailableReason {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspaceSourceContentObservation {
-    Observed { original_content_sha256: String },
+    Observed {
+        original_content_sha256: String,
+    },
     Unavailable {
         reason: WorkspaceSourceContentUnavailableReason,
     },
@@ -1072,13 +1080,13 @@ pub fn observe_selected_workspace_source_contents(
         return Err(CaptureError::RepositoryRootMissing(root.to_owned()));
     }
     let canonical_root = fs::canonicalize(root)?;
+    let root_capability = CapabilityDir::open_ambient_dir(&canonical_root, ambient_authority())?;
     let mut seen = HashSet::with_capacity(selected_candidates.len());
-    let mut observations = Vec::with_capacity(selected_candidates.len());
-
     for candidate in selected_candidates {
-        if !WORKSPACE_SOURCE_DOCUMENT_PATHS.iter().any(|(path, kind)| {
-            candidate.relative_path == *path && candidate.kind == *kind
-        }) {
+        if !WORKSPACE_SOURCE_DOCUMENT_PATHS
+            .iter()
+            .any(|(path, kind)| candidate.relative_path == *path && candidate.kind == *kind)
+        {
             return Err(CaptureError::InvalidWorkspaceSourceCandidate(
                 candidate.relative_path.clone(),
             ));
@@ -1088,46 +1096,24 @@ pub fn observe_selected_workspace_source_contents(
                 candidate.relative_path.clone(),
             ));
         }
+    }
 
+    let mut observations = Vec::with_capacity(selected_candidates.len());
+    for candidate in selected_candidates {
         let relative_path = Path::new(&candidate.relative_path);
-        let observation = match root_relative_file_disposition(&canonical_root, relative_path)? {
-            RootRelativeFileDisposition::Missing => {
-                WorkspaceSourceContentObservation::Unavailable {
-                    reason: WorkspaceSourceContentUnavailableReason::Missing,
-                }
-            }
-            RootRelativeFileDisposition::NotRegularFile => {
+        let observation = match open_root_relative_file(&root_capability, relative_path)? {
+            RootRelativeFileOpen::Missing => WorkspaceSourceContentObservation::Unavailable {
+                reason: WorkspaceSourceContentUnavailableReason::Missing,
+            },
+            RootRelativeFileOpen::NotRegularFile => {
                 WorkspaceSourceContentObservation::Unavailable {
                     reason: WorkspaceSourceContentUnavailableReason::NotRegularFile,
                 }
             }
-            RootRelativeFileDisposition::Symlink => {
-                WorkspaceSourceContentObservation::Unavailable {
-                    reason: WorkspaceSourceContentUnavailableReason::SymlinkRefused,
-                }
-            }
-            RootRelativeFileDisposition::RegularFile => {
-                let path = canonical_root.join(relative_path);
-                let file = match File::open(&path) {
-                    Ok(file) => file,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                        ) =>
-                    {
-                        observations.push(WorkspaceSourceDocumentContentObservation {
-                            relative_path: candidate.relative_path.clone(),
-                            kind: candidate.kind,
-                            observation: WorkspaceSourceContentObservation::Unavailable {
-                                reason: WorkspaceSourceContentUnavailableReason::Missing,
-                            },
-                        });
-                        continue;
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-
+            RootRelativeFileOpen::Symlink => WorkspaceSourceContentObservation::Unavailable {
+                reason: WorkspaceSourceContentUnavailableReason::SymlinkRefused,
+            },
+            RootRelativeFileOpen::Opened(file) => {
                 if !file.metadata()?.is_file() {
                     WorkspaceSourceContentObservation::Unavailable {
                         reason: WorkspaceSourceContentUnavailableReason::NotRegularFile,
@@ -1137,36 +1123,13 @@ pub fn observe_selected_workspace_source_contents(
                     file.take((normative::MAX_RECEIPT_BYTES + 1) as u64)
                         .read_to_end(&mut bytes)?;
 
-                    match root_relative_file_disposition(&canonical_root, relative_path)? {
-                        RootRelativeFileDisposition::Symlink => {
-                            WorkspaceSourceContentObservation::Unavailable {
-                                reason: WorkspaceSourceContentUnavailableReason::SymlinkRefused,
-                            }
+                    if bytes.len() > normative::MAX_RECEIPT_BYTES {
+                        WorkspaceSourceContentObservation::Unavailable {
+                            reason: WorkspaceSourceContentUnavailableReason::Oversized,
                         }
-                        RootRelativeFileDisposition::Missing => {
-                            WorkspaceSourceContentObservation::Unavailable {
-                                reason: WorkspaceSourceContentUnavailableReason::Missing,
-                            }
-                        }
-                        RootRelativeFileDisposition::NotRegularFile => {
-                            WorkspaceSourceContentObservation::Unavailable {
-                                reason: WorkspaceSourceContentUnavailableReason::NotRegularFile,
-                            }
-                        }
-                        RootRelativeFileDisposition::RegularFile
-                            if bytes.len() > normative::MAX_RECEIPT_BYTES =>
-                        {
-                            WorkspaceSourceContentObservation::Unavailable {
-                                reason: WorkspaceSourceContentUnavailableReason::Oversized,
-                            }
-                        }
-                        RootRelativeFileDisposition::RegularFile => {
-                            WorkspaceSourceContentObservation::Observed {
-                                original_content_sha256: format!(
-                                    "sha256:{}",
-                                    sha256_hex(&bytes)
-                                ),
-                            }
+                    } else {
+                        WorkspaceSourceContentObservation::Observed {
+                            original_content_sha256: format!("sha256:{}", sha256_hex(&bytes)),
                         }
                     }
                 }
@@ -1180,6 +1143,83 @@ pub fn observe_selected_workspace_source_contents(
     }
 
     Ok(observations)
+}
+
+enum RootRelativeFileOpen {
+    Missing,
+    NotRegularFile,
+    Symlink,
+    Opened(CapabilityFile),
+}
+
+fn open_root_relative_file(
+    root: &CapabilityDir,
+    relative: &Path,
+) -> Result<RootRelativeFileOpen, CaptureError> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(components) = components.filter(|components| !components.is_empty()) else {
+        return Ok(RootRelativeFileOpen::NotRegularFile);
+    };
+    open_root_relative_components(root, &components)
+}
+
+fn open_root_relative_components(
+    directory: &CapabilityDir,
+    components: &[OsString],
+) -> Result<RootRelativeFileOpen, CaptureError> {
+    let Some((component, remaining)) = components.split_first() else {
+        return Ok(RootRelativeFileOpen::NotRegularFile);
+    };
+    if remaining.is_empty() {
+        let mut options = CapabilityOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        return match directory.open_with(component, &options) {
+            Ok(file) => Ok(RootRelativeFileOpen::Opened(file)),
+            Err(error) => classify_root_relative_open_error(directory, component, error, false),
+        };
+    }
+
+    match directory.open_dir_nofollow(component) {
+        Ok(child) => open_root_relative_components(&child, remaining),
+        Err(error) => classify_root_relative_open_error(directory, component, error, true),
+    }
+}
+
+fn classify_root_relative_open_error(
+    directory: &CapabilityDir,
+    component: &OsStr,
+    open_error: io::Error,
+    require_directory: bool,
+) -> Result<RootRelativeFileOpen, CaptureError> {
+    match directory.symlink_metadata(component) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(RootRelativeFileOpen::Symlink),
+        Ok(metadata) if require_directory && !metadata.is_dir() => {
+            Ok(RootRelativeFileOpen::NotRegularFile)
+        }
+        Ok(metadata) if !require_directory && !metadata.is_file() => {
+            Ok(RootRelativeFileOpen::NotRegularFile)
+        }
+        Ok(_) if is_missing_path_error(&open_error) => Ok(RootRelativeFileOpen::Missing),
+        Ok(_) => Err(open_error.into()),
+        Err(metadata_error) if is_missing_path_error(&metadata_error) => {
+            Ok(RootRelativeFileOpen::Missing)
+        }
+        Err(_) if is_missing_path_error(&open_error) => Ok(RootRelativeFileOpen::Missing),
+        Err(_) => Err(open_error.into()),
+    }
+}
+
+fn is_missing_path_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
 }
 
 fn root_relative_regular_file(root: &Path, relative: &Path) -> Result<bool, CaptureError> {
@@ -1216,9 +1256,9 @@ fn root_relative_file_disposition(
             Ok(metadata) => metadata,
             Err(error)
                 if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
             {
                 return Ok(RootRelativeFileDisposition::Missing);
             }

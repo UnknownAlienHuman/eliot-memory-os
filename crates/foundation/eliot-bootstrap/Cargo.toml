@@ -25,6 +25,8 @@ contract_refs = [
 component_contract_ref = ""
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 eliot-agent-api.workspace = true
 eliot-conformance-contracts = { path = "../eliot-conformance-contracts", version = "0.1.0" }
 eliot-contracts.workspace = true
