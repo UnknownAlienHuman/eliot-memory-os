@@ -1721,7 +1721,7 @@ impl fmt::Display for WriteSubmission {
 pub enum PreparedWriteOutcome {
     /// ORS durably accepted the exact operation; the caller may poll and must
     /// not submit a duplicate.
-    Staged(WriteSubmission),
+    Staged(Box<WriteSubmission>),
     /// The canonical store returned the terminal receipt for this operation.
     Receipt(Box<WriteReceipt>),
 }
