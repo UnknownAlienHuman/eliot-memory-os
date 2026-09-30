@@ -169,10 +169,14 @@ fn main() {
         // `WasmHostResultFrame` and rejects with the producer's own validator
         // instead of re-deriving a weaker local check. That consumer must be
         // written against the current `WASM_HOST_RESULT_WIRE_VERSION`:
-        // every event now names the command that produced it
-        // (`command_sequence`, the #2785 handover token), and a control event
-        // admitted from an owner delivery names that exact delivery and the
-        // acknowledgement the child staged for it (`delivery_ack`, #2786).
+        // every event now names the handover correlation token of the command
+        // whose reply it observes (`command_sequence`, a process-local counter
+        // that distinguishes which handover an event came from within one
+        // recorded stream), and a control event admitted from an owner delivery
+        // names that exact delivery and the acknowledgement the child staged for
+        // it (`delivery_ack`, #2786). The durable order of one operation's
+        // observations is `sequence` together with the complete
+        // `observation_predecessors` prefix, not that token and not arrival.
         // `emit_receipt` stays for the separate experimental describe mode
         // only.
         Ok(_) => {}
