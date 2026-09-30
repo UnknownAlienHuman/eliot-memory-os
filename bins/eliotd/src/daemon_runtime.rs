@@ -3147,7 +3147,8 @@ async fn run_owner_feed_sync(
 /// recorded publish baseline survives every pass and no second baseline can
 /// exist. Mirrors [`OwnerFeedFlight`].
 struct GovernorAuthorityFlightState {
-    future: Pin<Box<dyn std::future::Future<Output = (GovernorAuthorityDriver, RepeatedFailureGuard)>>>,
+    future:
+        Pin<Box<dyn std::future::Future<Output = (GovernorAuthorityDriver, RepeatedFailureGuard)>>>,
 }
 
 /// Sole owner of governor-authority drive state in `run_loop`, mirroring
