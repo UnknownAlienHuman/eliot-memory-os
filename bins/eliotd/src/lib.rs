@@ -266,7 +266,8 @@ pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
 pub use maintenance_trigger_evaluator::{
-    MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
+    MaintenanceObservation, MaintenanceTriggerIntakeError, MaintenanceTriggerIntakeParts,
+    MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
 };
 pub use negative_memory_action_gate::{
     NegativeMemoryActionError, NegativeMemoryActionOutcome, NegativeMemoryPendingAction,

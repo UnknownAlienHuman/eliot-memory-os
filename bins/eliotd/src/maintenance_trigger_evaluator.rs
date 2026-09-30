@@ -40,7 +40,9 @@ use eliot_maintenance::{
     AutomationTriggerDecision, CONTRACT_NAME, CONTRACT_VERSION, MaintenanceBrokerEvidence,
     MaintenanceBudgetEvidence, MaintenanceError, MaintenanceFamily, MaintenancePolicyEvidence,
     MaintenanceRouteEvidence, MaintenanceSafetyEvidence, MaintenanceScheduleEvidence,
-    MaintenanceTrigger, MaintenanceTriggerInput,
+    MaintenanceTrigger, MaintenanceTriggerInput, MaintenanceTriggerIntake, TriggerIntakeClasses,
+    TriggerIntakeOperation, TriggerIntakePayload, TriggerIntakeRequest, TriggerIntakeRouting,
+    TriggerIntakeWindow, derive_trigger_intake,
 };
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
@@ -207,6 +209,63 @@ impl DaemonComposition {
                 eliot_governor::CompositionError::NotReady,
             ));
         }
+        let (input, notification_evidence) = self.observed_trigger_input(&observation)?;
+        let entry = crate::maintenance_family_catalog::entry_for(observation.family);
+        let decision = self
+            .governor
+            .owners()
+            .maintenance
+            .evaluate_trigger(&input)?;
+        let _ = crate::diagnostics::emit_maintenance_trigger_decision(&input, &decision);
+        // The catalog's half of the record: which registered family this was,
+        // where its start would have to go, and the exact unavailable
+        // dependency or absent Durable Job route that stops it today. A
+        // triggered family is therefore never silently ignored, and no family
+        // is ever reported as having run.
+        //
+        // The observed evidence is bound separately from the Governor
+        // projection: the trigger event, the evidence identities actually
+        // seen at this call site, and the selected policy revision travel
+        // beside the decision rather than being projected from the catalog's
+        // requirement lists, and each missing binding stays explicit.
+        let observed = crate::maintenance_family_catalog::MaintenanceObservedEvidence {
+            trigger_event: observation.origin.as_str(),
+            observed_refs: input.evidence_refs.clone(),
+            policy_revision: notification_evidence.policy.revision,
+        };
+        let family_decision = entry.record_start_route(&decision, observed);
+        crate::maintenance_dispatch::MaintenanceDispatch::for_decision(&decision, &family_decision)
+            .record(&decision);
+        Ok((decision, notification_evidence))
+    }
+
+    /// Evaluates one durable maintenance trigger and never fails the caller.
+    ///
+    /// This is the entry the daemon runtime loop uses. A trigger that cannot
+    /// be evaluated — the Governor is not ready yet, or the owner rejected the
+    /// input — is recorded as an explicit typed gap through the same minimal
+    /// operational diagnostics and the daemon continues. A maintenance
+    /// observation is never allowed to become a startup gate, a readiness
+    /// gate, or a silent drop: I14.22 keeps the trigger durable and surfaces
+    /// it on the next eligible startup instead.
+    pub fn note_maintenance_trigger(&self, observation: MaintenanceObservation) {
+        if let Err(error) = self.evaluate_maintenance_trigger(observation) {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+        }
+    }
+
+    /// Builds the deterministic trigger input from live observations for
+    /// evaluation (#1688) and intake derivation (#1694 W2). The live fence is
+    /// read here, never taken from the caller, and no caller-supplied flag
+    /// enters the input.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Maintenance`] when the catalog cannot key the trigger.
+    fn observed_trigger_input(
+        &self,
+        observation: &MaintenanceObservation,
+    ) -> Result<(MaintenanceTriggerInput, MaintenanceNotificationEvidence), DaemonError> {
         // The registered entry for the observed family. The lookup is total
         // over `MaintenanceFamily`, so no family can be unregistered here and
         // no caller-supplied family is ever treated as unrecognised.
@@ -264,7 +323,7 @@ impl DaemonComposition {
             let safety = MaintenanceSafetyEvidence::unpublished();
             let input = MaintenanceTriggerInput {
                 trigger_id,
-                evidence_refs: observation.evidence_refs,
+                evidence_refs: observation.evidence_refs.clone(),
                 family: observation.family,
                 scope_ref,
                 mode: policy.mode(),
@@ -286,47 +345,116 @@ impl DaemonComposition {
             };
             (input, MaintenanceNotificationEvidence { policy, route })
         };
-        let decision = self
-            .governor
-            .owners()
-            .maintenance
-            .evaluate_trigger(&input)?;
-        let _ = crate::diagnostics::emit_maintenance_trigger_decision(&input, &decision);
-        // The catalog's half of the record: which registered family this was,
-        // where its start would have to go, and the exact unavailable
-        // dependency or absent Durable Job route that stops it today. A
-        // triggered family is therefore never silently ignored, and no family
-        // is ever reported as having run.
-        //
-        // The observed evidence is bound separately from the Governor
-        // projection: the trigger event, the evidence identities actually
-        // seen at this call site, and the selected policy revision travel
-        // beside the decision rather than being projected from the catalog's
-        // requirement lists, and each missing binding stays explicit.
-        let observed = crate::maintenance_family_catalog::MaintenanceObservedEvidence {
-            trigger_event: observation.origin.as_str(),
-            observed_refs: input.evidence_refs.clone(),
-            policy_revision: notification_evidence.policy.revision,
-        };
-        let family_decision = entry.record_start_route(&decision, observed);
-        crate::maintenance_dispatch::MaintenanceDispatch::for_decision(&decision, &family_decision)
-            .record(&decision);
-        Ok((decision, notification_evidence))
+        Ok((input, notification_evidence))
     }
+}
 
-    /// Evaluates one durable maintenance trigger and never fails the caller.
+/// Caller-attested intake dimensions the daemon cannot observe (I14.22, issue #1694 W2).
+///
+/// This is not a second [`TriggerIntakeRequest`]: it deliberately carries no
+/// [`MaintenanceTriggerInput`], so a caller cannot smuggle a stale fence, a
+/// borrowed session, or invented policy into derivation. The input is always
+/// built here from live observations. Every field below must be attested by
+/// its owning source: the producer operation and position by the source
+/// owner, the payload by the durable source (a retained canonical reference
+/// the ORS owner resolves, or the complete opaque bytes — never a pointer, a
+/// path, or an inaccessible handle), the classes by their issuing owner, the
+/// routing by its classification owner, and the window by the applicable
+/// eligibility policy. [`derive_trigger_intake`] validates all of them; any
+/// refusal keeps the producer's retry identity and advances no cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceTriggerIntakeParts {
+    /// Producer operation that yielded the trigger, without its content hash.
+    pub operation: TriggerIntakeOperation,
+    /// Complete durable payload for the intake.
+    pub payload: TriggerIntakePayload,
+    /// Opaque privacy/visibility references carried through staging.
+    pub classes: TriggerIntakeClasses,
+    /// Routing classification with its owner-issued binding.
+    pub routing: TriggerIntakeRouting,
+    /// Creation/applicability window.
+    pub window: TriggerIntakeWindow,
+}
+
+/// Fail-closed refusals of the owner-side maintenance trigger intake derivation.
+///
+/// Every variant keeps its owner's own typed failure: the maintenance owner
+/// refusal stays a [`MaintenanceError`], and the daemon composition refusal
+/// stays a [`DaemonError`] unchanged, so the owner-session denial keeps its
+/// exact shape. No code is folded into prose between layers. Envelope
+/// staging, intake admission, claims, receipts, and delivery acknowledgement
+/// belong to the Kernel front-door slice (#1694 STITCH): derivation performs
+/// none of them, so they have no variant here.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerIntakeError {
+    /// The daemon composition refused derivation (owner session not bound).
+    #[error("maintenance trigger intake daemon: {0}")]
+    Daemon(#[from] DaemonError),
+    /// The maintenance owner refused the intake derivation.
+    #[error("maintenance trigger intake owner: {0}")]
+    Maintenance(#[from] MaintenanceError),
+}
+
+impl DaemonComposition {
+    /// Derives the persist-before-ack intake statement for one observed trigger
+    /// (I14.22, issue #1694 W2).
     ///
-    /// This is the entry the daemon runtime loop uses. A trigger that cannot
-    /// be evaluated — the Governor is not ready yet, or the owner rejected the
-    /// input — is recorded as an explicit typed gap through the same minimal
-    /// operational diagnostics and the daemon continues. A maintenance
-    /// observation is never allowed to become a startup gate, a readiness
-    /// gate, or a silent drop: I14.22 keeps the trigger durable and surfaces
-    /// it on the next eligible startup instead.
-    pub fn note_maintenance_trigger(&self, observation: MaintenanceObservation) {
-        if let Err(error) = self.evaluate_maintenance_trigger(observation) {
-            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+    /// This is the production caller of
+    /// [`eliot_maintenance::derive_trigger_intake`]: the deterministic intake
+    /// statement the STITCH Kernel front-door slice stages through the ORS
+    /// owner and admits before any acknowledgement advances the producer
+    /// cursor. This method stages nothing, admits nothing, and transports
+    /// nothing; envelope staging plus `handle_maintenance_trigger_intake`
+    /// admission stay with that slice.
+    ///
+    /// The gate is the retained Kernel-issued owner session only, mirroring
+    /// [`Self::commit_maintenance_trigger_decision`]. Governor readiness
+    /// deliberately does not gate intake: evaluator outage is the point of W2
+    /// (I14.22 keeps the trigger durable while the evaluator is unavailable;
+    /// A13.11 keeps fencing, ORS, and the recovery view live while Governor
+    /// application authority is down). An unauthenticated daemon derives
+    /// nothing.
+    ///
+    /// The trigger input is built from live observations by
+    /// [`Self::observed_trigger_input`] — the live admitted fence, the
+    /// registered family catalog, the caller-observed evidence — never from
+    /// caller-supplied fields, so a transported fence claim or a borrowed
+    /// session grants nothing. The remaining dimensions arrive in `parts`
+    /// already attested by their owners ([`MaintenanceTriggerIntakeParts`])
+    /// and are validated by derivation itself.
+    ///
+    /// Derivation is deterministic: an exact identity/hash replay converges on
+    /// the same statement, while changed content conflicts downstream instead
+    /// of replaying.
+    ///
+    /// # Errors
+    ///
+    /// [`MaintenanceTriggerIntakeError::Daemon`] when no owner session is
+    /// bound, or [`MaintenanceTriggerIntakeError::Maintenance`] carrying the
+    /// owner's own `MaintenanceError` unchanged. Either way the producer keeps
+    /// its retry identity and its cursor must not advance.
+    pub fn derive_maintenance_trigger_intake(
+        &self,
+        observation: MaintenanceObservation,
+        parts: MaintenanceTriggerIntakeParts,
+    ) -> Result<MaintenanceTriggerIntake, MaintenanceTriggerIntakeError> {
+        if self.owner_session.is_none() {
+            return Err(MaintenanceTriggerIntakeError::Daemon(
+                DaemonError::Lifecycle(
+                    "owner session is not bound; drop and re-run authenticated connect+start"
+                        .to_owned(),
+                ),
+            ));
         }
+        let (input, _) = self.observed_trigger_input(&observation)?;
+        Ok(derive_trigger_intake(&TriggerIntakeRequest {
+            input,
+            operation: parts.operation,
+            payload: parts.payload,
+            classes: parts.classes,
+            routing: parts.routing,
+            window: parts.window,
+        })?)
     }
 }
 
