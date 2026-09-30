@@ -18,6 +18,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::guard_outcome::GuardOutcomeError;
 use super::{PlatformHandle, WorkScopePath};
 
 /// A reference to provider-held secret material. The contract contains no bytes.
@@ -114,6 +115,55 @@ pub enum PortError {
         error: ProviderError,
         reference: PlatformHandle,
     },
+}
+
+/// Carries a rejected guard-revert composite through the neutral typed
+/// observation without a second error registry.
+///
+/// A package-staging/installation caller that receives a `GuardRevertOutcome`
+/// it cannot accept validates the composite first: the composite itself
+/// travels to the durable transaction record before any dependent retry or
+/// rollback, and only the typed rejection travels through `PortOutcome::Error`
+/// via this conversion. Each arm maps one `GuardOutcomeError` variant onto
+/// the one existing `PortError` shape that already means the same thing, so
+/// no new variant, crate, or error-code registry is introduced.
+///
+/// I2.6 requires that "An error preserves: operation identity; ...
+/// known/unknown effect status; raw evidence handle" together with
+/// retryability semantics. The operation identity and the raw evidence handle
+/// stay with the retained composite; this conversion preserves the effect
+/// status as a typed error and carries explicit retryability on each
+/// provider arm. I7.20 requires a stable disposition plus an exact
+/// machine-readable cause on every non-success response: the stable
+/// `ProviderErrorCode` below is the disposition callers switch on, while the
+/// originating `GuardOutcomeError` variant named on each arm is the exact
+/// cause. I5.19 states "Unknown commit is never retried blindly" and forbids
+/// fabricating a final receipt while an effect is unknown, and A13.2 turns
+/// repeated failure into a Problem State "rather than an endless restart
+/// loop"; both provider arms are therefore `retryable: false`, and #1148
+/// step 3 authorizes no new automatic retry from this payload. In
+/// particular an unproven-safe OS state surfaces as `Failed`, never as a
+/// success observation, and must reconcile retained evidence.
+///
+/// This is a pure stack mapping: it performs no IO, acquires no resource,
+/// spawns nothing, and carries no secret or protected payload bytes.
+impl From<GuardOutcomeError> for PortError {
+    fn from(error: GuardOutcomeError) -> Self {
+        match error {
+            GuardOutcomeError::InvalidOperationContext => PortError::InvalidRequestMetadata,
+            GuardOutcomeError::InvalidReference => PortError::InvalidText {
+                field: "guard_outcome.reference".to_owned(),
+            },
+            GuardOutcomeError::InvalidRestorationAttempt => PortError::Provider(ProviderError {
+                code: ProviderErrorCode::InvalidRequest,
+                retryable: false,
+            }),
+            GuardOutcomeError::UnsafeContinuation => PortError::Provider(ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            }),
+        }
+    }
 }
 
 pub(super) fn validate_text(value: &str, field: &'static str) -> Result<(), PortError> {
