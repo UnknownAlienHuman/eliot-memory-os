@@ -36,6 +36,7 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::OperationId;
+use eliot_store_api::OriginalWriteSubmission;
 
 use super::{CanonicalError, CanonicalWriteEnvelope, WriteResponseMode};
 
@@ -157,6 +158,22 @@ impl VersionedWriteSubmission {
     /// Stable idempotency key shared across retries of one logical transition.
     pub fn idempotency_key(&self) -> &str {
         &self.envelope.idempotency_key
+    }
+
+    /// Projects the exact admitted public source metadata into the neutral
+    /// carrier used beside the prepared transition. The operation and
+    /// idempotency identities remain in the envelope/RequestIdentity.
+    #[must_use]
+    pub fn original_source(&self) -> OriginalWriteSubmission {
+        OriginalWriteSubmission {
+            protocol_version: self.protocol_version,
+            write_intent_id: self.write_intent_id.clone(),
+            response_mode: match self.response_mode {
+                WriteResponseMode::WaitForCommit => WAIT_FOR_COMMIT_MODE,
+                WriteResponseMode::AcceptAfterStage => ACCEPT_AFTER_STAGE_MODE,
+            }
+            .to_owned(),
+        }
     }
 }
 

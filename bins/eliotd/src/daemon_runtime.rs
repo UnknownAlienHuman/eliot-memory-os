@@ -5306,6 +5306,14 @@ async fn prepare_governed_capture(
     admitted: &AdmittedObserveCapture,
 ) -> Result<eliot_governor::PreparedMcpObservation, String> {
     let content = observe_content_value(&retained.claimed.tool)?;
+    let original_write_submission: eliot_store_api::OriginalWriteSubmission =
+        serde_json::from_value(
+            content
+                .get("write_submission")
+                .cloned()
+                .ok_or_else(|| "Observation capture omits original write submission".to_owned())?,
+        )
+        .map_err(|error| format!("Observation write submission is invalid: {error}"))?;
     let operation_id = OperationId::new(host_request_operation_id(&retained.claimed.envelope))
         .map_err(|error| format!("Observe operation identity is invalid: {error}"))?;
     let guard = services.composition.lock().await;
@@ -5335,6 +5343,7 @@ async fn prepare_governed_capture(
         identity: admitted.identity.clone(),
         operation_id,
         original_content: content,
+        original_write_submission,
         capture_clock: retained.capture_clock.clone(),
         owner_binding: current,
         task_selection: admitted.selection.clone(),
@@ -5378,13 +5387,13 @@ async fn exchange_governed_capture(
         );
         prepared
             .exchange()
-            .exchange(&port)
+            .exchange_with_original_submission(&port)
             .await
             .map_err(|error| format!("Governor Observe capture exchange: {error}"))?
     } else {
         prepared
             .exchange()
-            .exchange(services.kernel)
+            .exchange_with_original_submission(services.kernel)
             .await
             .map_err(|error| format!("Governor cold Observe capture exchange: {error}"))?
     };
@@ -5460,7 +5469,12 @@ fn observe_content_value(tool: &serde_json::Value) -> Result<serde_json::Value, 
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "Observe tool arguments are not an object".to_owned())?;
     let mut content = serde_json::Map::new();
-    for field in ["content", "affected_resources", "source_handles"] {
+    for field in [
+        "content",
+        "affected_resources",
+        "source_handles",
+        "write_submission",
+    ] {
         if let Some(value) = arguments.get(field) {
             content.insert(field.to_owned(), value.clone());
         }

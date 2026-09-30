@@ -719,6 +719,53 @@ pub struct ReservedWriteRequest {
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
     /// Preserved ordering-head expectations covering the reserved scopes.
     pub expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    /// Original public write-submission values for a versioned Observe
+    /// capture. This is kept beside the prepared transition: it is source
+    /// metadata, not part of Governor semantic planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_write_submission: Option<OriginalWriteSubmission>,
+}
+
+/// Exact user-supplied write identity metadata retained from the original
+/// public Observe capture request. Operation and idempotency identities remain
+/// owned by the authenticated request and prepared transition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalWriteSubmission {
+    /// Public write-envelope protocol version.
+    pub protocol_version: u32,
+    /// Stable user/agent intent carried across typed correction attempts.
+    pub write_intent_id: String,
+    /// Original agent response preference as an exact closed protocol token.
+    pub response_mode: String,
+}
+
+impl OriginalWriteSubmission {
+    /// Validates the public source values without deriving or aliasing any
+    /// other request identity.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.protocol_version != 1 {
+            return Err(StoreError::InvalidField {
+                field: "original_write_submission.protocol_version",
+                reason: "unsupported write envelope version",
+            });
+        }
+        if self.write_intent_id.trim().is_empty()
+            || self.write_intent_id.chars().any(char::is_control)
+        {
+            return Err(StoreError::InvalidField {
+                field: "original_write_submission.write_intent_id",
+                reason: "must be non-blank and contain no control characters",
+            });
+        }
+        if !matches!(self.response_mode.as_str(), "wait_for_commit" | "accept_after_stage") {
+            return Err(StoreError::InvalidField {
+                field: "original_write_submission.response_mode",
+                reason: "must be wait_for_commit or accept_after_stage",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ReservedWriteRequest {
@@ -737,6 +784,19 @@ impl ReservedWriteRequest {
         self.context.validate().map_err(StoreError::Foundation)?;
         self.transition.validate()?;
         self.admission.validate_shape()?;
+        if let Some(source) = &self.original_write_submission {
+            source.validate()?;
+            if self.transition.transition_class != TransitionClass::CaptureCandidate
+                || self.transition.named_operations.len() != 1
+                || self.transition.named_operations[0].operation
+                    != NamedMutationOperation::CaptureObservation
+            {
+                return Err(StoreError::InvalidField {
+                    field: "original_write_submission",
+                    reason: "is only valid for a single CaptureObservation transition",
+                });
+            }
+        }
         if self.admission.state_fence != self.context.state_fence
             || self.transition.state_fence != self.context.state_fence
         {

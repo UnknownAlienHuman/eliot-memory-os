@@ -233,6 +233,25 @@ pub trait KernelTransitionPort: Send + Sync {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt>;
 
+    /// Applies a prepared transition with the immutable user/agent source
+    /// metadata admitted by Governor for an original versioned write.
+    /// Implementations must preserve this carrier beside the transition; the
+    /// default refuses so an older port can never silently drop it.
+    fn apply_prepared_with_original_submission<'a>(
+        &'a self,
+        _identity: &RequestIdentity,
+        _transition: PreparedTransition,
+        _expected_revision_heads: Vec<RevisionHeadExpectation>,
+        _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        _original_write_submission: eliot_store_api::OriginalWriteSubmission,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "versioned original-write submission is not admitted".to_owned(),
+            ))
+        })
+    }
+
     /// Reconciles one operation by its exact canonical identity.
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>>;
 
