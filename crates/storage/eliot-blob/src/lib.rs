@@ -1,11 +1,11 @@
-//! C3 S-04 blob implementation over injected platform, codec, key, AEAD and
-//! canonical-live-set ports.
+//! C3 S-04 blob implementation over injected platform, codec, key and AEAD
+//! ports. Reachability, recovery and collection additionally require a
+//! canonical-live-set port; source staging and verified reads do not.
 //!
-//! This crate intentionally contains no direct filesystem or cryptographic
-//! implementation. The current P-01 filesystem surface cannot express
-//! durable create/replace/no-replace rename plus Windows reparse containment,
-//! so those exact obligations are represented by [`BlobPlatformPort`]. A
-//! composition lacking that adapter receives a typed `PLAN_GAP`.
+//! Filesystem and cryptographic effects are provided through typed ports. The
+//! production Windows physical adapter lives in `physical_ports` and delegates
+//! no-follow, durable filesystem operations to the platform-owned Blob file
+//! store. Tests continue to inject deterministic ports.
 //!
 //! # Ownership and concurrency
 //!
@@ -43,6 +43,7 @@ pub use eliot_blob_api::{
     BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
     BlobPublicationFence, BlobPublicationObligation, PublishState,
 };
+use eliot_contracts::StateFence;
 pub mod backup_io;
 pub use backup_io::{
     BACKUP_MAX_PLAINTEXT_BYTES, CaptureOutcome, CapturePorts, ConsumerEvidencePack, ExportedPage,
@@ -52,6 +53,7 @@ pub use backup_io::{
 };
 pub mod demand;
 pub mod key_ports;
+mod physical_ports;
 pub mod publication_owner;
 pub mod stream_sink;
 pub use demand::{
@@ -67,15 +69,16 @@ use eliot_blob_api::{
     BlobReachabilityView, BlobReadChunk, BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding,
     BlobReceiptContext, BlobReferenceObservation, BlobReferenceRequest, BlobRootLease,
     BlobStageRequest, BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState,
-    SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path,
-    verify_receipt,
+    ObjectResidencyKey, SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt,
+    VersionedContentDigest, metadata_path, payload_path, verify_receipt,
 };
-use eliot_platform::WorkScopePath;
+use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_receipts::{
     ArtifactBinding, OperationId, ProofCeiling, Receipt, ReceiptCore, ReceiptDisposition,
-    ReceiptKind, contract_identity,
+    ReceiptKind, RequestBinding, contract_identity,
 };
 pub use key_ports::{DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION};
+pub use physical_ports::{WindowsBlobPlatform, ZstdBlobCompression};
 pub use publication_owner::{BlobArchivePublicationBinding, BlobArchivePublicationOwner};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -86,6 +89,8 @@ pub use stream_sink::{
 
 const FORMAT_ID: &str = "eliot-blob-envelope";
 const FORMAT_VERSION: u32 = 1;
+const CONTENT_DIGEST_ALGORITHM: &str = "blake3";
+const CONTENT_DIGEST_VERSION: u32 = 1;
 const PATH_GENERATION: u32 = 1;
 const MAX_BLOB_ENVELOPE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BLOB_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
@@ -116,6 +121,9 @@ pub struct BlobRootOwner {
     owner_id: BlobId,
     process_id: u32,
     claim_id: String,
+    /// Store/Kernel lifecycle fence that admitted this physical root claim.
+    /// Reference/test owners may omit it; production service leases cannot.
+    lifecycle_fence: Option<StateFence>,
     /// Normalized configured-root key shared with the service claim path.
     /// [`owns_service_root`] is the only public comparison over it.
     registry_key: String,
@@ -306,6 +314,7 @@ impl fmt::Debug for BlobRootOwner {
             .field("owner_id", &self.owner_id)
             .field("process_id", &self.process_id)
             .field("claim_id", &self.claim_id)
+            .field("lifecycle_fence", &self.lifecycle_fence)
             .field("registry_key", &self.registry_key)
             .field("lease", &self.lease)
             .finish()
@@ -318,6 +327,7 @@ impl PartialEq for BlobRootOwner {
             && self.owner_id == other.owner_id
             && self.process_id == other.process_id
             && self.claim_id == other.claim_id
+            && self.lifecycle_fence == other.lifecycle_fence
     }
 }
 
@@ -332,6 +342,30 @@ impl BlobRootOwner {
         root_id: impl Into<String>,
         owner_id: impl Into<String>,
         process_id: u32,
+    ) -> Result<Self, BlobError> {
+        Self::claim_inner(root_id, owner_id, process_id, None)
+    }
+
+    /// Claims one root and binds it to the exact admitted Store/Kernel
+    /// lifecycle fence. Production compositions use this constructor so the
+    /// root generation is derived from its real launch owner, not a literal.
+    pub fn claim_with_lifecycle_fence(
+        root_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        process_id: u32,
+        lifecycle_fence: StateFence,
+    ) -> Result<Self, BlobError> {
+        lifecycle_fence
+            .validate()
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        Self::claim_inner(root_id, owner_id, process_id, Some(lifecycle_fence))
+    }
+
+    fn claim_inner(
+        root_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        process_id: u32,
+        lifecycle_fence: Option<StateFence>,
     ) -> Result<Self, BlobError> {
         let configured_root = root_id.into();
         if configured_root.trim().is_empty()
@@ -421,6 +455,7 @@ impl BlobRootOwner {
             owner_id,
             process_id,
             claim_id,
+            lifecycle_fence,
             registry_key,
             lease,
         })
@@ -441,6 +476,17 @@ impl BlobRootOwner {
         self.process_id
     }
 
+    /// Returns the resource generation from this owner's admitted lifecycle
+    /// fence. Production physical providers use this exact owner-issued value
+    /// to fence their backend view; an owner claimed without a lifecycle fence
+    /// cannot issue that production binding.
+    #[must_use]
+    pub fn lifecycle_resource_generation(&self) -> Option<u64> {
+        self.lifecycle_fence
+            .as_ref()
+            .map(|fence| fence.resource_generation.value())
+    }
+
     #[must_use]
     pub fn claim_id(&self) -> &str {
         &self.claim_id
@@ -455,6 +501,53 @@ impl BlobRootOwner {
     #[must_use]
     pub fn owns_service_root(&self, lease_root_id: &str) -> bool {
         ownership_key(lease_root_id) == self.registry_key
+    }
+
+    /// Issues a request-bound service lease from the original authenticated
+    /// Store/Kernel request binding and this retained OS root claim.
+    ///
+    /// The caller supplies the exact binding already admitted for the
+    /// operation. This owner copies its state fence and request identity; it
+    /// never accepts a root identity or generation from an untrusted Blob
+    /// payload. A missing/failed OS lease heartbeat or a malformed or
+    /// mismatched request refuses issuance.
+    pub fn lease_for_request(&self, request: &RequestBinding) -> Result<BlobRootLease, BlobError> {
+        if self.heartbeat_failure().is_some() {
+            return Err(BlobError::OwnerConflict);
+        }
+        request
+            .metadata
+            .validate()
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        request
+            .state_fence
+            .validate()
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        if request.metadata.state_fence != request.state_fence {
+            return Err(BlobError::StaleFence);
+        }
+        if self.lifecycle_fence.as_ref() != Some(&request.state_fence) {
+            return Err(BlobError::StaleFence);
+        }
+        let root_generation = request.state_fence.resource_generation.value();
+        if root_generation == 0 {
+            return Err(BlobError::StaleFence);
+        }
+        let root_id = PlatformHandle::new(self.root_id.clone())
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let lease_id = BlobId::new(format!("request-{}", request.metadata.request_id.as_str()))?;
+        let lease = BlobRootLease {
+            root_id,
+            owner_id: self.owner_id.clone(),
+            lease_id,
+            root_generation,
+            fence_binding: request.clone(),
+        };
+        lease.validate()?;
+        if !self.owns_service_root(lease.root_id.as_str()) {
+            return Err(BlobError::OwnerConflict);
+        }
+        Ok(lease)
     }
 
     /// Returns the last bounded heartbeat failure observed by the native lease
@@ -2386,7 +2479,7 @@ where
     C: BlobCompressionPort,
     K: BlobKeyPort,
     A: BlobAeadPort,
-    L: BlobLiveSetPort,
+    L: Send + Sync,
 {
     fn claim(
         lease: BlobRootLease,
@@ -2794,7 +2887,10 @@ where
     fn live_sets_revalidate(
         &self,
         proof: &BlobLiveSetProof,
-    ) -> Result<LiveSetRevalidation, BlobError> {
+    ) -> Result<LiveSetRevalidation, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
@@ -2808,7 +2904,10 @@ where
         locator: &BlobLocator,
         intent_revision: u64,
         residency_sha256: &str,
-    ) -> Result<BlobDeletionReconciliation, BlobError> {
+    ) -> Result<BlobDeletionReconciliation, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
@@ -2829,7 +2928,10 @@ where
         intent_revision: u64,
         residency_sha256: &str,
         delete: &mut dyn FnMut() -> Result<(), BlobError>,
-    ) -> Result<BlobDeletionReconciliation, BlobError> {
+    ) -> Result<BlobDeletionReconciliation, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
@@ -3609,7 +3711,10 @@ where
     fn reconcile_tombstone_path(
         &self,
         path: &WorkScopePath,
-    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+    ) -> Result<ConditionalDeleteOutcome, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.contained(path)?;
         let bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
         let mut tombstone = decode_tombstone(&bytes)?;
@@ -4376,7 +4481,10 @@ where
     fn reachability(
         &self,
         request: BlobReachabilityRequest,
-    ) -> Result<BlobReachabilityView, BlobError> {
+    ) -> Result<BlobReachabilityView, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
         // Coherent reachability (T3-B): the view is bound to a freshly
@@ -4464,7 +4572,10 @@ where
         request: &BlobGcRequest,
         locator: &BlobLocator,
         tombstone_path: &WorkScopePath,
-    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+    ) -> Result<ConditionalDeleteOutcome, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.contained(tombstone_path)?;
         let bytes = self.read_bounded_file(tombstone_path, MAX_JOURNAL_BYTES)?;
         let tombstone = decode_tombstone(&bytes)?;
@@ -4513,7 +4624,10 @@ where
         locator: &BlobLocator,
         scoped: &ScopedObject,
         now: u64,
-    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+    ) -> Result<ConditionalDeleteOutcome, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         let operation_id = request.context.operation.operation_id.to_string();
         let tombstone_path = tombstone_scope_path(&operation_id, locator, &scoped.scope)?;
         self.contained(&tombstone_path)?;
@@ -4588,7 +4702,10 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    fn gc(&self, request: BlobGcRequest) -> Result<BlobGcReceipt, BlobError> {
+    fn gc(&self, request: BlobGcRequest) -> Result<BlobGcReceipt, BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
         let observed = self.live_sets_revalidate(&request.live_set)?;
@@ -4684,7 +4801,10 @@ where
         )
     }
 
-    fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+    fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.ensure_lease(lease)?;
         let transactions = WorkScopePath::new("transactions")
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
@@ -4957,6 +5077,67 @@ pub struct BlobStoreService<P, C, K, A, L> {
     core: Arc<BlobStoreCore<P, C, K, A, L>>,
 }
 
+/// Explicit six-domain residency profile supplied by the original policy
+/// owner. It contains no content digest; the Blob owner derives that identity
+/// from the exact bytes it stages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobResidencyDomains {
+    /// Lawful `WorkScope` or source namespace binding.
+    pub scope_domain_id: BlobId,
+    /// Principal/access binding.
+    pub access_domain_id: BlobId,
+    /// Disclosure/confidentiality binding.
+    pub confidentiality_domain_id: BlobId,
+    /// Permitted key-lineage binding.
+    pub encryption_key_domain_id: BlobId,
+    /// Lifecycle/retention binding.
+    pub retention_domain_id: BlobId,
+    /// Purge-closure/erasure binding.
+    pub erasure_domain_id: BlobId,
+}
+
+impl BlobResidencyDomains {
+    /// Creates a complete source residency profile from six explicit domain
+    /// identities. No value is inferred or defaulted here.
+    #[must_use]
+    pub fn new(
+        scope_domain_id: BlobId,
+        access_domain_id: BlobId,
+        confidentiality_domain_id: BlobId,
+        encryption_key_domain_id: BlobId,
+        retention_domain_id: BlobId,
+        erasure_domain_id: BlobId,
+    ) -> Self {
+        Self {
+            scope_domain_id,
+            access_domain_id,
+            confidentiality_domain_id,
+            encryption_key_domain_id,
+            retention_domain_id,
+            erasure_domain_id,
+        }
+    }
+
+    fn bind_exact_bytes(self, bytes: &[u8]) -> Result<ObjectResidencyKey, BlobError> {
+        let digest = BlobHash::new(blake3::hash(bytes).to_hex().to_string())?;
+        let residency = ObjectResidencyKey {
+            scope_domain_id: self.scope_domain_id,
+            access_domain_id: self.access_domain_id,
+            confidentiality_domain_id: self.confidentiality_domain_id,
+            encryption_key_domain_id: self.encryption_key_domain_id,
+            retention_domain_id: self.retention_domain_id,
+            erasure_domain_id: self.erasure_domain_id,
+            content_digest: VersionedContentDigest {
+                algorithm: BlobId::new(CONTENT_DIGEST_ALGORITHM)?,
+                version: CONTENT_DIGEST_VERSION,
+                digest,
+            },
+        };
+        residency.validate()?;
+        Ok(residency)
+    }
+}
+
 /// Construction bundle for [`BlobStoreService`] (T3-B): the six injected
 /// dependencies travel as one value so constructors stay within the argument
 /// ceiling without hiding any dependency. Every field is still supplied by
@@ -4982,7 +5163,7 @@ where
     C: BlobCompressionPort,
     K: BlobKeyPort,
     A: BlobAeadPort,
-    L: BlobLiveSetPort,
+    L: Send + Sync,
 {
     pub fn new(
         lease: BlobRootLease,
@@ -5052,8 +5233,53 @@ where
         self.core.reference(request)
     }
 
+    /// Stages exact source bytes through the canonical `BlobStoreCore` path.
+    /// This owner-only entry point is available to a source-only composition
+    /// whose `L` has no live-set implementation; it cannot perform GC or
+    /// reachability operations.
+    pub fn stage_source(&self, request: BlobStageRequest) -> Result<BlobReadyReceipt, BlobError> {
+        self.core.stage_sync(request)
+    }
+
+    /// Stages source bytes using the six explicit policy-owner residency
+    /// domains and derives the versioned content digest over these exact
+    /// bytes inside the Blob owner. The usual stage core still validates the
+    /// request, key lineage, physical publication, and ready receipt.
+    pub fn stage_source_with_domains(
+        &self,
+        context: BlobReceiptContext,
+        root_lease: BlobRootLease,
+        bytes: &[u8],
+        policy: BlobPolicyBinding,
+        domains: BlobResidencyDomains,
+    ) -> Result<BlobReadyReceipt, BlobError> {
+        if bytes.len() as u64 > MAX_BLOB_PLAINTEXT_BYTES {
+            return Err(BlobError::InvalidContract(
+                "blob plaintext exceeds canonical hard ceiling".to_owned(),
+            ));
+        }
+        let residency = domains.bind_exact_bytes(bytes)?;
+        self.stage_source(BlobStageRequest {
+            context,
+            root_lease,
+            bytes: bytes.to_vec(),
+            policy,
+            residency,
+        })
+    }
+
+    /// Reads and verifies exact plaintext bytes through the canonical
+    /// `BlobStoreCore` path. The returned chunk carries the original
+    /// independently verifiable Blob read receipt.
+    pub fn read_source(&self, request: &BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
+        self.core.read_sync(request)
+    }
+
     /// Startup recovery helper; it is not part of the public `BlobStoreClient` contract.
-    pub fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+    pub fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError>
+    where
+        L: BlobLiveSetPort,
+    {
         self.core.reconcile(lease)
     }
 }

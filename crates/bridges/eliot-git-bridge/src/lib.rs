@@ -62,12 +62,16 @@ use std::fmt;
 use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+
+mod source_snapshot;
+pub use source_snapshot::{GitSnapshotError, SourceTreeSnapshot};
 
 use eliot_process::{
     ExitDisposition as KernelExitDisposition, ExitStatus, ProcessEvidenceSink, ProcessExecutor,
@@ -292,6 +296,97 @@ pub trait ProcessRunner: Send + Sync {
         cwd: &Path,
         stdin: &[u8],
     ) -> Result<ProcessOutcome, String>;
+
+    /// Runs a Git invocation under one typed, operation-owned execution
+    /// profile. Runners that do not implement the selected profile fail
+    /// closed instead of silently dropping its environment binding.
+    fn run_profiled(
+        &self,
+        exe: &str,
+        args: &[&str],
+        cwd: &Path,
+        stdin: &[u8],
+        profile: &GitProcessProfile,
+    ) -> Result<ProcessOutcome, String> {
+        if profile.index_file().is_some() {
+            return Err(
+                "process runner does not support the isolated Git index profile".to_owned(),
+            );
+        }
+        self.run(exe, args, cwd, stdin)
+    }
+}
+
+/// Typed failure returned by an asynchronous original-owner Git runner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitProcessRunError {
+    /// Stable owner rejection or execution failure code.
+    pub code: String,
+    /// Bounded owner or execution detail.
+    pub detail: String,
+}
+
+impl fmt::Display for GitProcessRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.detail)
+    }
+}
+
+/// Sendable future returned by an asynchronous original-owner Git runner.
+pub type GitProcessRunFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProcessOutcome, GitProcessRunError>> + Send + 'a>>;
+
+/// Asynchronous Git process port backed by the original admitted Kernel owner.
+///
+/// Implementations validate each exact command and profile against an
+/// owner-created admission and route it through that owner. The Git bridge
+/// never creates dispatch authority or starts a private child. A successful
+/// outcome must contain complete stdout and stderr; adapters fail closed when
+/// original process evidence contains only a truncated preview.
+pub trait AsyncProcessRunner: Send + Sync {
+    /// Runs one exact Git invocation under its typed isolated-index profile.
+    fn run_profiled<'a>(
+        &'a self,
+        exe: &'a str,
+        args: &'a [&'a str],
+        cwd: &'a Path,
+        stdin: &'a [u8],
+        profile: &'a GitProcessProfile,
+    ) -> GitProcessRunFuture<'a>;
+}
+
+/// The only process-profile override currently used by Git source capture.
+///
+/// The index file is created inside a directory owned by the capture
+/// operation. The profile is passed through the same admitted process request
+/// as every other Git invocation; it does not launch a private child.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GitProcessProfile {
+    index_file: Option<PathBuf>,
+}
+
+impl GitProcessProfile {
+    /// Creates the ordinary inherited Git profile.
+    #[must_use]
+    pub const fn inherited() -> Self {
+        Self { index_file: None }
+    }
+
+    pub(crate) fn isolated_index(path: PathBuf) -> Result<Self, String> {
+        if !path.is_absolute() {
+            return Err("isolated Git index path must be absolute".to_owned());
+        }
+        Ok(Self {
+            index_file: Some(path),
+        })
+    }
+
+    /// Returns the operation-owned index path, when this is an isolated-index
+    /// invocation.
+    #[must_use]
+    pub fn index_file(&self) -> Option<&Path> {
+        self.index_file.as_deref()
+    }
 }
 
 /// Local `std::process`-backed [`ProcessRunner`] for tests/standalone hosts.
@@ -306,8 +401,20 @@ impl ProcessRunner for StdProcessRunner {
         cwd: &Path,
         stdin: &[u8],
     ) -> Result<ProcessOutcome, String> {
+        self.run_profiled(exe, args, cwd, stdin, &GitProcessProfile::inherited())
+    }
+
+    fn run_profiled(
+        &self,
+        exe: &str,
+        args: &[&str],
+        cwd: &Path,
+        stdin: &[u8],
+        profile: &GitProcessProfile,
+    ) -> Result<ProcessOutcome, String> {
         validate_invocation(exe, args).map_err(|e| e.to_string())?;
-        let mut child = Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .args(args)
             .current_dir(cwd)
             .stdin(if stdin.is_empty() {
@@ -316,9 +423,11 @@ impl ProcessRunner for StdProcessRunner {
                 Stdio::piped()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn {exe}: {e}"))?;
+            .stderr(Stdio::piped());
+        if let Some(index_file) = profile.index_file() {
+            command.env("GIT_INDEX_FILE", index_file);
+        }
+        let mut child = command.spawn().map_err(|e| format!("spawn {exe}: {e}"))?;
         if !stdin.is_empty() {
             child
                 .stdin
@@ -362,6 +471,23 @@ pub trait ExecutorRequestPort: Send + Sync {
     /// # Errors
     /// Returns a message when the request cannot be minted for this call.
     fn bind(&self, exe: &str, args: &[&str], cwd: &Path) -> Result<ProcessRequest, String>;
+
+    /// Binds a typed Git execution profile into the same admitted process
+    /// request. The default implementation admits only the inherited profile.
+    fn bind_profiled(
+        &self,
+        exe: &str,
+        args: &[&str],
+        cwd: &Path,
+        profile: &GitProcessProfile,
+    ) -> Result<ProcessRequest, String> {
+        if profile.index_file().is_some() {
+            return Err(
+                "executor request port does not bind the isolated Git index profile".to_owned(),
+            );
+        }
+        self.bind(exe, args, cwd)
+    }
 }
 
 /// Default bound for the terminal-lifecycle wait (matches the `s04` executor
@@ -437,15 +563,16 @@ impl std::fmt::Debug for ExecutorRunner {
 }
 
 impl ExecutorRunner {
-    fn run_via_executor(
+    fn run_profiled_via_executor(
         &self,
         exe: &str,
         args: &[&str],
         cwd: &Path,
+        profile: &GitProcessProfile,
     ) -> Result<ProcessOutcome, String> {
         let request = self
             .port
-            .bind(exe, args, cwd)
+            .bind_profiled(exe, args, cwd, profile)
             .map_err(|e| format!("executor request binding failed: {e}"))?;
         request
             .validate()
@@ -503,12 +630,23 @@ impl ProcessRunner for ExecutorRunner {
         cwd: &Path,
         stdin: &[u8],
     ) -> Result<ProcessOutcome, String> {
+        self.run_profiled(exe, args, cwd, stdin, &GitProcessProfile::inherited())
+    }
+
+    fn run_profiled(
+        &self,
+        exe: &str,
+        args: &[&str],
+        cwd: &Path,
+        stdin: &[u8],
+        profile: &GitProcessProfile,
+    ) -> Result<ProcessOutcome, String> {
         validate_invocation(exe, args).map_err(|e| e.to_string())?;
         if !stdin.is_empty() {
             return Err("executor binding refuses stdin-fed invocations: P-03 carries no stdin channel; patch operations stay on the local port"
                 .to_owned());
         }
-        self.run_via_executor(exe, args, cwd)
+        self.run_profiled_via_executor(exe, args, cwd, profile)
     }
 }
 
