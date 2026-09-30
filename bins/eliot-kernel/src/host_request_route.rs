@@ -258,6 +258,30 @@ const BRIDGE_EVENT_WITHHELD_RECIPIENT_GRANT_EMPTY: &str = "recipient_grant_admit
 /// disclosure class is proven for these exact bytes and no grant membership
 /// can hold. Raw persistence is withheld on the source side.
 const BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED: &str = "source_class_not_admitted";
+/// Closed retention term for one bridge event's bytes (issue #1934, I7.23):
+/// durable delivery classes are retained until acknowledged and reconciled,
+/// while best-effort telemetry is received as a transport observation only
+/// and never retained. The term is the event's retention requirement; the
+/// applicable WorkScope contract decides whether raw bytes may be kept under
+/// it. Same closed vocabulary `eliot-ors` validates.
+const BRIDGE_EVENT_RETENTION_RETAIN_UNTIL_ACKNOWLEDGED: &str = "retain_until_acknowledged";
+const BRIDGE_EVENT_RETENTION_OBSERVE_WITHOUT_RETENTION: &str = "observe_without_retention";
+
+/// Applicable WorkScope privacy/retention contract inputs for one bridge
+/// event (issue #1934, I7.23). Every field is owner-resolved or wire-proven,
+/// never caller-claimed: `work_scope_id` is the Governor-resolved scope from
+/// the retained activation binding, `provider_id` is the envelope's producer
+/// identity, `retention_term` is the event's retention requirement from its
+/// delivery class, and the activation refs bind the exact owner decision
+/// (ticket plus result digest) the ORS owner re-verifies against its own
+/// durable activation row before anything is persisted.
+struct BridgeEventPrivacyContract<'a> {
+    work_scope_id: &'a str,
+    provider_id: &'a str,
+    retention_term: &'a str,
+    activation_ticket_id: &'a str,
+    resolution_result_sha256: &'a str,
+}
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -5757,17 +5781,19 @@ impl KernelComposition {
                         &event,
                         &identity.request.state_fence,
                         identity.deadline_unix_ms,
+                        None,
                     )?
                 } else {
                     self.with_live_bridge_application_binding(
                         session,
                         &identity.request.state_fence,
-                        || {
+                        |retained| {
                             self.admit_bridge_event_envelope(
                                 session,
                                 &event,
                                 &identity.request.state_fence,
                                 identity.deadline_unix_ms,
+                                Some(retained),
                             )
                         },
                     )?
@@ -5786,7 +5812,7 @@ impl KernelComposition {
                 self.with_live_bridge_application_binding(
                     session,
                     &identity.request.state_fence,
-                    || self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
+                    |_| self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
                 )?
             }
             AGENT_BRIDGE_EVENT_RECONCILE_OPERATION => {
@@ -5794,7 +5820,7 @@ impl KernelComposition {
                 self.with_live_bridge_application_binding(
                     session,
                     &identity.request.state_fence,
-                    || {
+                    |_| {
                         self.answer_bridge_event_reconcile_under_transition(
                             session,
                             &scope,
@@ -5832,7 +5858,7 @@ impl KernelComposition {
         &self,
         session: &Session,
         frame_fence: &eliot_contracts::StateFence,
-        operation: impl FnOnce() -> Result<T, TransportError>,
+        operation: impl FnOnce(&super::ActivatedApplicationBinding) -> Result<T, TransportError>,
     ) -> Result<T, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         let (retained, _pending) =
@@ -5882,7 +5908,13 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
 
-        operation()
+        // The operation receives the exact retained binding proven live
+        // above, so downstream privacy/retention resolution reads the
+        // Governor-resolved `work_scope_id` (and the owner-decision refs)
+        // from retained owner state rather than caller claims. The
+        // pending-result guard stays held through the call, so the proof
+        // above still covers the read.
+        operation(&retained)
     }
 
     /// Reads the exact accepted activation and proves its fence is still
@@ -5974,6 +6006,7 @@ impl KernelComposition {
         event: &EventEnvelope,
         frame_fence: &eliot_contracts::StateFence,
         deadline_unix_ms: u64,
+        retained: Option<&super::ActivatedApplicationBinding>,
     ) -> Result<serde_json::Value, TransportError> {
         // Authority check against the retained Session, never caller text:
         // the event must cohere with the presenting live fence (same
@@ -6003,25 +6036,52 @@ impl KernelComposition {
         let envelope_bytes = eliot_contracts::canonical_json_bytes(event)
             .map_err(|_| TransportError::SessionFenced)?;
         let envelope_sha = eliot_contracts::sha256_hex(&envelope_bytes);
-        // Privacy decision precedes persistence: the ORS owner decides the
-        // disclosure disposition over these exact bytes, and the stage entry
-        // re-verifies the presented decision before any durable write. The
-        // decision object travels into the durable stage below.
+        // Privacy decision precedes persistence: the disclosure disposition
+        // over these exact bytes is resolved through the ORS persistence
+        // owner, and the stage entry re-verifies the presented verdict
+        // against its own durable activation row before any durable write.
+        // The decision object travels into the durable stage below.
         //
-        // Issue #1934: the ORS owner no longer DECIDES, and neither does this
-        // route. Disclosure is resolved by the privacy owner over the
-        // `WorkScope` / source / recipient / provider policy and must arrive
-        // bound to these exact source bytes, the scope, and the policy revision
-        // it was decided at. No such owner decision reaches this live route
-        // (see [`Self::bridge_event_privacy_authorization`]), so the resolution
-        // is a rejection: the event stages as the deterministic redacted
-        // representation plus its redaction receipt and never as verbatim raw.
-        // The ORS deny scan stays a conservative detector that can only deny.
-        let privacy_authorization =
-            Self::bridge_event_privacy_authorization(session, frame_fence, event, &envelope_bytes)?;
+        // Issue #1934: neither the ORS owner nor this route mints a
+        // disclosure grant — no disclosure owner reaches this live route
+        // (see [`Self::bridge_event_privacy_authorization`]). The verdict is
+        // therefore resolved over the applicable contract inputs (the
+        // retained Governor-resolved `work_scope_id`, the provider identity,
+        // the retention term) and bound to the exact owner decision that
+        // admitted this scope (ticket plus result digest), which the store
+        // re-verifies independently. The event stages as the deterministic
+        // redacted representation plus its redaction receipt and never as
+        // verbatim raw. The ORS deny scan stays a conservative detector that
+        // can only deny.
+        let retention_term = match event.delivery_class {
+            DeliveryClass::DurableControl | DeliveryClass::DurableObservation => {
+                BRIDGE_EVENT_RETENTION_RETAIN_UNTIL_ACKNOWLEDGED
+            }
+            DeliveryClass::BestEffortTelemetry => BRIDGE_EVENT_RETENTION_OBSERVE_WITHOUT_RETENTION,
+        };
+        let privacy_authorization = match retained {
+            Some(retained) => Some(Self::bridge_event_privacy_authorization(
+                session,
+                frame_fence,
+                event,
+                &envelope_bytes,
+                &BridgeEventPrivacyContract {
+                    work_scope_id: retained.work_scope_id.as_str(),
+                    provider_id: event.producer_id.as_str(),
+                    retention_term,
+                    activation_ticket_id: retained.activation_ticket_id.as_str(),
+                    resolution_result_sha256: retained.resolution_result_sha256.as_str(),
+                },
+            )?),
+            // Best-effort telemetry is received without a durability claim
+            // and without an application binding, so no verdict is resolved
+            // for it. The decision below takes the absent arm; the
+            // observation response carries no persistence claim either way.
+            None => None,
+        };
         let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
             &envelope_bytes,
-            Some(&privacy_authorization),
+            privacy_authorization.as_ref(),
         );
         let now = unix_ms();
         let expired = activation_deadline_expired(now, deadline_unix_ms);
@@ -6042,6 +6102,10 @@ impl KernelComposition {
                     ));
                 }
                 let evidence = bridge_owner_evidence(session, frame_fence)?;
+                // The durable arm runs only under the live binding proven by
+                // `with_live_bridge_application_binding`; without it there is
+                // no Governor-resolved scope to stage under.
+                let binding = retained.ok_or(TransportError::SessionFenced)?;
                 self.stage_bridge_event_durable(
                     session,
                     event,
@@ -6049,6 +6113,7 @@ impl KernelComposition {
                     &envelope_sha,
                     &privacy,
                     expired,
+                    binding,
                 )
             }
             DeliveryClass::BestEffortTelemetry => {
@@ -6080,18 +6145,24 @@ impl KernelComposition {
     /// the owner verdict, never a mint of it.
     ///
     /// What the live transport does carry, and what this entry therefore binds
-    /// (issue #2729 owner read, unchanged):
+    /// (issue #2729 owner read, plus the retained activation binding the
+    /// live-binding gate proven just above the call):
     ///
     /// - the immutable source digest of the canonical envelope bytes;
     /// - the retained `Session`'s owner evidence — principal, authority
     ///   lineage, connection, launch nonce, session epoch — through
     ///   [`bridge_owner_evidence`], the same owner legs the stage entry
     ///   persists;
-    /// - the scope the ORS stage entry is about to bind for this stream,
-    ///   derived through the owner's own namespace digest;
-    /// - the privacy policy revision: the presenting live generation, already
-    ///   required nonzero and equal on the event, its state fence, and the
-    ///   retained session.
+    /// - the Governor-resolved `work_scope_id` from the retained
+    ///   `ActivatedApplicationBinding`, bound with the stream owner legs
+    ///   into the scope through the owner's own namespace digest;
+    /// - the provider identity (`producer_id`) and the retention term from
+    ///   the event's delivery class;
+    /// - the exact owner decision refs (activation ticket plus result
+    ///   digest) the ORS owner re-verifies against its own durable
+    ///   activation row. No fencing generation is recorded as a policy
+    ///   revision: the store resolves the applicable owner-decision
+    ///   revision from its own row.
     ///
     /// What the transport does NOT carry is the positive privacy grant, and it
     /// was measured rather than assumed. `EventEnvelope`
@@ -6118,14 +6189,18 @@ impl KernelComposition {
     /// `declared_class` naming the withholding the evaluated evidence
     /// determined: an empty recipient grant withholds on the recipient side,
     /// while a non-empty grant still withholds because the event proves no
-    /// admittable source class. [`RedbRecoveryStore::bridge_event_privacy_decision`]
+    /// admittable source class. The verdict varies with the resolved
+    /// contract — scope, owner decision refs, retention term — so the same
+    /// bytes under another `WorkScope` resolve another disposition, never a
+    /// shared constant. [`RedbRecoveryStore::bridge_event_privacy_decision`]
     /// takes the rejection arm, the event stages as the deterministic redacted
     /// representation plus its redaction receipt, and the conservative
     /// seven-token deny scan still runs inside the ORS owner — where it can
     /// only narrow the recorded reason and classes, never grant. Ingestion
     /// stays available; no unproven byte is persisted, and the store's
-    /// re-verification of the presented verdict can no longer be satisfied by
-    /// an echo of its own derivation.
+    /// re-verification compares the presented verdict against the scope and
+    /// owner revision it resolves independently from its own durable
+    /// activation row rather than an echo of the presenter's derivation.
     ///
     /// The `admitted` arm is deliberately unreachable here and is not a
     /// placeholder for a future one: emitting it requires an owner decision
@@ -6138,27 +6213,37 @@ impl KernelComposition {
         frame_fence: &eliot_contracts::StateFence,
         event: &EventEnvelope,
         envelope_bytes: &[u8],
+        contract: &BridgeEventPrivacyContract<'_>,
     ) -> Result<serde_json::Value, TransportError> {
+        if contract.work_scope_id.trim().is_empty()
+            || contract.work_scope_id.chars().any(char::is_control)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if contract.provider_id != event.producer_id.as_str() {
+            return Err(TransportError::SessionFenced);
+        }
+        match contract.retention_term {
+            BRIDGE_EVENT_RETENTION_RETAIN_UNTIL_ACKNOWLEDGED
+            | BRIDGE_EVENT_RETENTION_OBSERVE_WITHOUT_RETENTION => {}
+            _ => return Err(TransportError::SessionFenced),
+        }
         let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
-        // The scope is the very owner namespace the ORS stage entry binds for
-        // this stream, derived through the owner's own namespace digest so the
-        // recorded verdict and the row it describes cannot drift.
+        // The scope binds the Governor-resolved `WorkScope` the connection
+        // was activated under together with the stream owner legs, derived
+        // through the ORS owner's own namespace digest so the recorded
+        // verdict and the row it describes cannot drift. The same bytes
+        // presented under another scope resolve another scope, another owner
+        // decision, another disposition — never a shared constant.
         let evidence = bridge_owner_evidence(session, frame_fence)?;
         let scope = RedbRecoveryStore::bridge_event_privacy_scope(
             &evidence.authority_lineage,
             &evidence.principal,
-            &event.producer_id,
+            contract.provider_id,
             &event.stream_id,
+            contract.work_scope_id,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        // The retained session's own generation is the privacy policy revision
-        // the verdict is recorded against; zero is never an admissible
-        // revision, and the caller above already refused a zero generation, so
-        // a zero here is a fence failure rather than a silent downgrade.
-        let policy_revision = frame_fence.resource_generation.value();
-        if policy_revision == 0 {
-            return Err(TransportError::SessionFenced);
-        }
         // Resolve the withholding through the actual admission evidence for
         // THIS event. The session owner's recipient grant admits a class only
         // by name; the event proves no source class for these exact bytes, so
@@ -6172,11 +6257,23 @@ impl KernelComposition {
         } else {
             BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED
         };
+        // The rejection binds the resolved contract and the exact owner
+        // decision refs the ORS owner re-verifies against its own durable
+        // activation row (ticket plus result digest) before anything is
+        // persisted. There is deliberately no `policy_revision` leg here: the
+        // fencing generation is not a privacy policy revision, and a revision
+        // minted on this route would be self-asserted. The store resolves the
+        // applicable owner-decision revision from its own row and records it;
+        // a disclosure-contract revision will travel the same owner-verified
+        // way once a disclosure owner is wired to this route.
         Ok(serde_json::json!({
             "verdict": BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED,
             "source_sha256": source_sha256,
             "scope": scope,
-            "policy_revision": policy_revision,
+            "work_scope_id": contract.work_scope_id,
+            "retention_term": contract.retention_term,
+            "activation_ticket_id": contract.activation_ticket_id,
+            "activation_result_sha256": contract.resolution_result_sha256,
             "declared_class": declared_class,
         }))
     }
@@ -6238,6 +6335,7 @@ impl KernelComposition {
         envelope_sha: &str,
         privacy: &serde_json::Value,
         expired: bool,
+        binding: &super::ActivatedApplicationBinding,
     ) -> Result<serde_json::Value, TransportError> {
         let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
         let staged = serde_json::json!({
@@ -6251,6 +6349,14 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
             "envelope_sha256": envelope_sha,
             "staging_connection": session.connection_id,
+            // Issue #1934: the Governor-resolved scope and the exact owner
+            // decision refs travel as separate staged legs beside the
+            // verdict, so the ORS stage entry can resolve the scope and the
+            // owner revision from its own durable activation row instead of
+            // trusting the verdict's own scope claim.
+            "work_scope_id": binding.work_scope_id,
+            "activation_ticket_id": binding.activation_ticket_id,
+            "activation_result_sha256": binding.resolution_result_sha256,
             "privacy_disposition": privacy_legs.disposition,
             "redacted_classes": privacy_legs.classes,
             "redaction_reason": privacy_legs.reason,
