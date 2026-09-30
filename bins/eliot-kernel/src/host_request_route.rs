@@ -584,6 +584,7 @@ impl<'a> ExpiredClaimObservation<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct ObserveInputAdmission<'a> {
     envelope: &'a HostRequestEnvelope,
     tool: &'a serde_json::Value,
@@ -618,6 +619,36 @@ struct ObserveApplicationOwnerSource<'a> {
     host_result: Option<AgentActivationResolutionResult>,
     host_ticket: Option<eliot_protocol::AgentActivationResolutionTicket>,
     retained_receipt: &'a AgentBridgePeerAdmissionReceipt,
+}
+
+struct ObserveInputSeal<'a> {
+    envelope: &'a HostRequestEnvelope,
+    record: &'a HostRequestRecord,
+    bytes: &'a [u8],
+    payload_length: u64,
+    descriptor: &'a AgentBridgeAdmissionDescriptor,
+    receipt: &'a AgentBridgePeerAdmissionReceipt,
+    source_request_identity: &'a RequestIdentity,
+    projection: ObserveApplicationOwnerProjection,
+}
+
+struct HostOriginObserveRowSource<'a> {
+    record: &'a HostRequestRecord,
+    envelope: &'a HostRequestEnvelope,
+    app: &'a HostRequestApplicationBinding,
+    readback: &'a eliot_protocol::AgentActivationObservationHostPolicyReadback,
+    result: &'a AgentActivationResolutionResult,
+    ticket: &'a eliot_protocol::AgentActivationResolutionTicket,
+    receipt: &'a AgentBridgePeerAdmissionReceipt,
+}
+
+struct ObserveReservationPublication {
+    token: u64,
+    had_reference: bool,
+    admitted: (HostRequestAdmissionReceipt, HostRequestRecord),
+    current: HostRequestRecord,
+    executable: bool,
+    retained_result: bool,
 }
 
 struct HostRequestDispatchContext<'a> {
@@ -872,7 +903,7 @@ impl KernelComposition {
         if expired {
             if !stored.state.is_terminal() {
                 match self.generation_gateway.ors.advance_host_request(
-                    &operation_id,
+                    operation_id,
                     &envelope.envelope_sha256,
                     HostRequestState::Expired,
                     None,
@@ -892,7 +923,7 @@ impl KernelComposition {
             self.generation_gateway
                 .ors
                 .advance_host_request(
-                    &operation_id,
+                    operation_id,
                     &envelope.envelope_sha256,
                     HostRequestState::Admitted,
                     None,
@@ -907,13 +938,13 @@ impl KernelComposition {
 
         match envelope.kind {
             HostRequestKind::Cancellation => {
-                self.advance_host_request_parent(envelope, &descriptor)?;
+                self.advance_host_request_parent(envelope, descriptor)?;
             }
             HostRequestKind::Status => {
-                self.require_known_host_request_parent(envelope, &descriptor)?;
+                self.require_known_host_request_parent(envelope, descriptor)?;
             }
             HostRequestKind::Reconciliation => {
-                self.reconcile_host_request_parent(envelope, &descriptor)?;
+                self.reconcile_host_request_parent(envelope, descriptor)?;
             }
             HostRequestKind::Activation | HostRequestKind::Invocation => {}
         }
@@ -2776,7 +2807,7 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        self.validate_host_request_application_session(envelope, &retained)?;
+        self.validate_host_request_application_session(envelope, retained)?;
         if let Some(claimed) = envelope.identity.task_id.as_deref()
             && claimed != retained.task_id
         {
@@ -5384,16 +5415,16 @@ impl KernelComposition {
                 host_ticket,
                 retained_receipt: &retained_receipt,
             })?;
-        self.seal_observe_executable_input(
+        self.seal_observe_executable_input(ObserveInputSeal {
             envelope,
             record,
-            bytes,
+            bytes: &bytes,
             payload_length,
             descriptor,
             receipt,
             source_request_identity,
             projection,
-        )
+        })
     }
 
     fn observe_application_owner_projection(
@@ -5409,7 +5440,7 @@ impl KernelComposition {
             retained_receipt,
         } = source;
         if let Some(retained) = retained {
-            return self.observe_resolved_application_owner_projection(envelope, &retained);
+            return Self::observe_resolved_application_owner_projection(envelope, &retained);
         }
 
         if envelope.identity.session_id.is_some()
@@ -5483,7 +5514,6 @@ impl KernelComposition {
     }
 
     fn observe_resolved_application_owner_projection(
-        &self,
         envelope: &HostRequestEnvelope,
         retained: &super::ActivatedApplicationBinding,
     ) -> Result<ObserveApplicationOwnerProjection, TransportError> {
@@ -5537,7 +5567,7 @@ impl KernelComposition {
         );
         let resolved_binding = serde_json::to_value(&retained.resolved_binding)
             .map_err(|_| TransportError::SessionFenced)?;
-        return Ok(ObserveApplicationOwnerProjection {
+        Ok(ObserveApplicationOwnerProjection {
             policy_value: policy_value.clone(),
             policy_sha256: policy_sha256.to_owned(),
             principal_ref: Some(
@@ -5578,15 +5608,18 @@ impl KernelComposition {
 
     fn seal_observe_executable_input(
         &self,
-        envelope: &HostRequestEnvelope,
-        record: &HostRequestRecord,
-        bytes: Vec<u8>,
-        payload_length: u64,
-        descriptor: &AgentBridgeAdmissionDescriptor,
-        receipt: &AgentBridgePeerAdmissionReceipt,
-        source_request_identity: &RequestIdentity,
-        projection: ObserveApplicationOwnerProjection,
+        source: ObserveInputSeal<'_>,
     ) -> Result<HostRequestExecutableInput, TransportError> {
+        let ObserveInputSeal {
+            envelope,
+            record,
+            bytes,
+            payload_length,
+            descriptor,
+            receipt,
+            source_request_identity,
+            projection,
+        } = source;
         let (app_binding, known_time_ms) = Self::observe_application_binding(
             envelope,
             source_request_identity,
@@ -5594,7 +5627,7 @@ impl KernelComposition {
             projection,
         )?;
         let protected_envelope =
-            self.protect_observe_payload(envelope, record, &bytes, known_time_ms, &app_binding)?;
+            self.protect_observe_payload(envelope, record, bytes, known_time_ms, &app_binding)?;
         let mut commitment_record = record.clone();
         commitment_record
             .scope_ref
@@ -5605,7 +5638,7 @@ impl KernelComposition {
             schema_id: OpaqueLabel::new(envelope.identity.payload_schema_id.clone())
                 .map_err(|_| TransportError::SessionFenced)?,
             encoding: HostRequestExecutableInputEncoding::CanonicalJsonV1,
-            payload_sha256: sha256_hex(&bytes),
+            payload_sha256: sha256_hex(bytes),
             payload_length,
             authenticated_principal_ref: OpaqueLabel::new(receipt.observed_sid.clone())
                 .map_err(|_| TransportError::SessionFenced)?,
@@ -5928,35 +5961,37 @@ impl KernelComposition {
             )
         };
         let receipt = receipt.ok_or(TransportError::SessionFenced)?;
-        self.validate_observe_row_request_identity(envelope, app, &receipt)?;
+        Self::validate_observe_row_request_identity(envelope, app, &receipt)?;
         if let Some(retained) = retained {
-            self.validate_retained_application_observe_row(record, envelope, app, &retained)
+            Self::validate_retained_application_observe_row(record, envelope, app, &retained)
         } else {
-            self.validate_host_origin_observe_row(
+            let readback = host_policy.ok_or(TransportError::SessionFenced)?;
+            let result = host_result.ok_or(TransportError::SessionFenced)?;
+            let ticket = host_ticket.ok_or(TransportError::SessionFenced)?;
+            self.validate_host_origin_observe_row(HostOriginObserveRowSource {
                 record,
                 envelope,
                 app,
-                host_policy.ok_or(TransportError::SessionFenced)?,
-                host_result.ok_or(TransportError::SessionFenced)?,
-                host_ticket.ok_or(TransportError::SessionFenced)?,
-                &receipt,
-            )
+                readback: &readback,
+                result: &result,
+                ticket: &ticket,
+                receipt: &receipt,
+            })
         }
     }
 
     fn validate_observe_row_request_identity(
-        &self,
         envelope: &HostRequestEnvelope,
         app: &HostRequestApplicationBinding,
         receipt: &AgentBridgePeerAdmissionReceipt,
     ) -> Result<(), TransportError> {
-        let identity_value =
-            serde_json::to_value(&envelope.identity).map_err(|_| TransportError::SessionFenced)?;
+        let identity_value = serde_json::to_value(&envelope.identity)
+            .map_err(|_| TransportError::SessionFenced)?;
         let identity_sha = sha256_hex(
             &canonical_json_bytes(&identity_value).map_err(|_| TransportError::SessionFenced)?,
         );
         let exact_receipt =
-            serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::to_value(receipt).map_err(|_| TransportError::SessionFenced)?;
         if app.host_peer_admission_receipt != exact_receipt
             || app.request_identity != identity_value
             || app.request_identity_sha256 != identity_sha
@@ -5968,7 +6003,6 @@ impl KernelComposition {
     }
 
     fn validate_retained_application_observe_row(
-        &self,
         record: &HostRequestRecord,
         _envelope: &HostRequestEnvelope,
         app: &HostRequestApplicationBinding,
@@ -6032,26 +6066,29 @@ impl KernelComposition {
 
     fn validate_host_origin_observe_row(
         &self,
-        record: &HostRequestRecord,
-        envelope: &HostRequestEnvelope,
-        app: &HostRequestApplicationBinding,
-        readback: eliot_protocol::AgentActivationObservationHostPolicyReadback,
-        result: AgentActivationResolutionResult,
-        ticket: eliot_protocol::AgentActivationResolutionTicket,
-        receipt: &AgentBridgePeerAdmissionReceipt,
+        source: HostOriginObserveRowSource<'_>,
     ) -> Result<(), TransportError> {
+        let HostOriginObserveRowSource {
+            record,
+            envelope,
+            app,
+            readback,
+            result,
+            ticket,
+            receipt,
+        } = source;
         readback
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         result
-            .validate_against(&ticket)
+            .validate_against(ticket)
             .map_err(|_| TransportError::SessionFenced)?;
         let scope = observation_owner_scope_ref(&readback.owner_projection_value)?;
         let exact_receipt =
             serde_json::to_value(receipt).map_err(|_| TransportError::SessionFenced)?;
         if ticket.peer_admission_receipt.as_ref() != Some(receipt)
             || ticket.state_fence != envelope.state_fence
-            || result.observation_host_policy_readback.as_ref() != Some(&readback)
+            || result.observation_host_policy_readback.as_ref() != Some(readback)
             || readback.kernel_owner != self.current_kernel_owner_readback()?
             || app.host_peer_admission_receipt != exact_receipt
             || record.scope_ref.as_ref().map(OpaqueLabel::as_str) != Some(scope)
@@ -6066,9 +6103,9 @@ impl KernelComposition {
             || app.activation_owner_evidence_sha256.is_some()
             || app.activation_result_sha256.is_some()
             || app.source_activation_result
-                != serde_json::to_value(&result).map_err(|_| TransportError::SessionFenced)?
+                != serde_json::to_value(result).map_err(|_| TransportError::SessionFenced)?
             || app.source_activation_ticket
-                != serde_json::to_value(&ticket).map_err(|_| TransportError::SessionFenced)?
+                != serde_json::to_value(ticket).map_err(|_| TransportError::SessionFenced)?
             || app.p07_revision != Some(readback.kernel_owner.revision)
             || app.p07_bundle_sha256.as_deref()
                 != Some(readback.kernel_owner.bundle_sha256.as_str())
@@ -6343,12 +6380,14 @@ impl KernelComposition {
         self.publish_observe_reservation_in_queue(
             envelope,
             tool,
-            token,
-            had_reference,
-            admitted,
-            current,
-            executable,
-            retained_result,
+            ObserveReservationPublication {
+                token,
+                had_reference,
+                admitted,
+                current,
+                executable,
+                retained_result,
+            },
             &admission_owner,
         )
     }
@@ -6357,14 +6396,17 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
-        token: u64,
-        had_reference: bool,
-        admitted: (HostRequestAdmissionReceipt, HostRequestRecord),
-        current: HostRequestRecord,
-        executable: bool,
-        retained_result: bool,
+        publication: ObserveReservationPublication,
         _admission_owner: &std::sync::MutexGuard<'_, super::AgentActivationPendingState>,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        let ObserveReservationPublication {
+            token,
+            had_reference,
+            admitted,
+            current,
+            executable,
+            retained_result,
+        } = publication;
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -7562,12 +7604,12 @@ impl KernelComposition {
     > {
         let gateway = self.retained_store_gateway()?;
         let staged = gateway
-            .verify_staged_envelope(&input.application_binding.state_fence, &operation_identity)
+            .verify_staged_envelope(&input.application_binding.state_fence, operation_identity)
             .map_err(|_| TransportError::SessionFenced)?;
         let reservation = self
             .generation_gateway
             .ors
-            .load_write_reservation_by_operation(&operation_identity)
+            .load_write_reservation_by_operation(operation_identity)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::SessionFenced)?;
         let token = &reservation.token;
@@ -7634,24 +7676,12 @@ impl KernelComposition {
         if canonical_json_bytes(&operation).map_err(|_| TransportError::SessionFenced)? != bytes {
             return Err(TransportError::SessionFenced);
         }
-        let transition = &operation.transition;
-        transition
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let original_source: RequestIdentity =
-            serde_json::from_value(input.application_binding.source_request_identity.clone())
-                .map_err(|_| TransportError::SessionFenced)?;
-        let (_, original_tool_request) = self.read_observe_executable_input(record)?;
-        let original_submission =
-            Self::original_write_submission_from_tool_request(&original_tool_request)?;
-        if operation.context != original_source.request.metadata
-            || operation.original_write_submission.as_ref() != Some(&original_submission)
-        {
-            return Err(TransportError::IdentityConflict);
-        }
-        let computed_prepared_transition_sha256 =
-            eliot_store_api::prepared_transition_digest(transition)
-                .map_err(|_| TransportError::SessionFenced)?;
+        let computed_prepared_transition_sha256 = self.validate_original_staged_operation_source(
+            record,
+            input,
+            &operation,
+            &original_submission,
+        )?;
         if computed_prepared_transition_sha256 != token.prepared_transition_sha256
             || computed_prepared_transition_sha256 != write_binding.prepared_transition_sha256
         {
@@ -7662,6 +7692,76 @@ impl KernelComposition {
             token.prepared_transition_sha256.clone(),
             write_binding.canonical_request_sha256.clone(),
         ))
+    }
+
+    fn validate_original_staged_operation_source(
+        &self,
+        record: &HostRequestRecord,
+        input: &HostRequestExecutableInput,
+        operation: &super::daemon_request_dispatch::StoreApplyOperation,
+        original_submission: &eliot_store_api::OriginalWriteSubmission,
+    ) -> Result<String, TransportError> {
+        let transition = &operation.transition;
+        transition
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let original_source: RequestIdentity =
+            serde_json::from_value(input.application_binding.source_request_identity.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_staged_transition_owner_binding(
+            transition,
+            record,
+            &input.application_binding,
+            &original_source,
+        )?;
+        if operation.context != original_source.request.metadata
+            || operation.original_write_submission.as_ref() != Some(original_submission)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        eliot_store_api::prepared_transition_digest(transition)
+            .map_err(|_| TransportError::SessionFenced)
+    }
+
+    fn validate_staged_transition_owner_binding(
+        transition: &eliot_store_api::PreparedTransition,
+        record: &HostRequestRecord,
+        binding: &HostRequestApplicationBinding,
+        source: &RequestIdentity,
+    ) -> Result<(), TransportError> {
+        // The admission owner validates full task-selection evidence before
+        // preparing this immutable transition. Kernel independently joins the
+        // staged plan to the retained Host fence, scope, task, and revision.
+        let retained_scope = binding
+            .scope_ref
+            .as_ref()
+            .map(OpaqueLabel::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let source_task = source
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(eliot_contracts::TaskId::as_str);
+        if transition.state_fence != binding.state_fence
+            || transition.scope_id.as_str() != retained_scope
+            || transition.scope_id.as_str()
+                != record
+                    .scope_ref
+                    .as_ref()
+                    .map(OpaqueLabel::as_str)
+                    .ok_or(TransportError::SessionFenced)?
+            || source_task.is_some_and(|task| transition.task_id.as_deref() != Some(task))
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        if let Some(task) = transition.task_id.as_deref()
+            && (binding.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(task)
+                || binding.task_revision != transition.state_fence.task_revision)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
     }
 
     fn validate_observe_receipt_against_plan(
