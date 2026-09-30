@@ -572,22 +572,18 @@ pub(crate) fn completion_exposure_draft(
             reason: "completion seam observes only digest-bound full delivery",
         });
     }
-    let produced =
-        receipt
-            .produced_result
-            .as_ref()
-            .ok_or(eliot_receipts::ToolExposureError::InvalidField {
-                field: "history.result_delivery",
-                reason: "completion delivery requires the produced result it evidences",
-            })?;
-    let delivered =
-        receipt
-            .delivered_representation
-            .as_ref()
-            .ok_or(eliot_receipts::ToolExposureError::InvalidField {
-                field: "history.delivery_source_ref",
-                reason: "full delivery requires rendered representation evidence",
-            })?;
+    let produced = receipt.produced_result.as_ref().ok_or(
+        eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.result_delivery",
+            reason: "completion delivery requires the produced result it evidences",
+        },
+    )?;
+    let delivered = receipt.delivered_representation.as_ref().ok_or(
+        eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.delivery_source_ref",
+            reason: "full delivery requires rendered representation evidence",
+        },
+    )?;
     if produced.result_digest != delivered.representation_digest {
         return Err(eliot_receipts::ToolExposureError::InvalidField {
             field: "history.delivery_source_ref",
