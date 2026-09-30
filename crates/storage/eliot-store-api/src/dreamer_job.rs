@@ -54,11 +54,12 @@ pub fn map_durable_error(error: DurableJobError) -> StoreError {
         DurableJobError::LimitExceeded(_) => StoreError::PayloadTooLarge,
         DurableJobError::Serialization(reason) => StoreError::Serialization(reason),
         DurableJobError::FenceMismatch => StoreError::FenceMismatch,
-        DurableJobError::OperationMismatch => StoreError::IdentityConflict,
+        DurableJobError::OperationMismatch | DurableJobError::SemanticInputMismatch => {
+            StoreError::IdentityConflict
+        }
         DurableJobError::SemanticInputUnavailable => StoreError::Empty {
             field: "semantic_input",
         },
-        DurableJobError::SemanticInputMismatch => StoreError::IdentityConflict,
         DurableJobError::CapabilityDenied => StoreError::UnknownOperation,
         DurableJobError::LeaseInvalid | DurableJobError::TerminalImmutable => {
             StoreError::RevisionConflict

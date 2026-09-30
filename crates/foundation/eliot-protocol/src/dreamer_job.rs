@@ -255,10 +255,7 @@ impl OpaqueContentRef {
 
     /// Verifies optional original semantic-input bytes against this exact
     /// owner-issued reference without interpreting their content.
-    pub fn validate_semantic_input_bytes(
-        &self,
-        bytes: &[u8],
-    ) -> Result<(), DurableJobError> {
+    pub fn validate_semantic_input_bytes(&self, bytes: &[u8]) -> Result<(), DurableJobError> {
         let byte_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if self.byte_length != byte_length || self.sha256 != sha256_hex(bytes) {
             return Err(DurableJobError::SemanticInputMismatch);
@@ -331,8 +328,14 @@ fn canonical_operation_payload(operation: &JobOperation) -> serde_json::Value {
             let mut payload = serde_json::Map::from_iter([
                 ("operation".to_owned(), serde_json::json!("SUBMIT_JOB")),
                 ("job_id".to_owned(), serde_json::json!(submission.job_id)),
-                ("attempt_id".to_owned(), serde_json::json!(submission.attempt_id)),
-                ("work_scope".to_owned(), serde_json::json!(submission.work_scope)),
+                (
+                    "attempt_id".to_owned(),
+                    serde_json::json!(submission.attempt_id),
+                ),
+                (
+                    "work_scope".to_owned(),
+                    serde_json::json!(submission.work_scope),
+                ),
                 (
                     "semantic_input".to_owned(),
                     serde_json::json!(submission.semantic_input),
@@ -341,17 +344,17 @@ fn canonical_operation_payload(operation: &JobOperation) -> serde_json::Value {
                     "output_contract".to_owned(),
                     serde_json::json!(submission.output_contract),
                 ),
-                ("admission".to_owned(), serde_json::json!(submission.admission)),
+                (
+                    "admission".to_owned(),
+                    serde_json::json!(submission.admission),
+                ),
                 (
                     "cancellation_id".to_owned(),
                     serde_json::json!(submission.cancellation_id),
                 ),
             ]);
             if let Some(bytes) = &submission.semantic_input_bytes {
-                payload.insert(
-                    "semantic_input_bytes".to_owned(),
-                    serde_json::json!(bytes),
-                );
+                payload.insert("semantic_input_bytes".to_owned(), serde_json::json!(bytes));
             }
             serde_json::Value::Object(payload)
         }
@@ -2007,9 +2010,7 @@ pub enum DurableJobError {
     OperationMismatch,
     #[error("original semantic input reference is unavailable")]
     SemanticInputUnavailable,
-    #[error(
-        "semantic input reference or supplied bytes differ from the original owner record"
-    )]
+    #[error("semantic input reference or supplied bytes differ from the original owner record")]
     SemanticInputMismatch,
     #[error("role does not have the requested capability")]
     CapabilityDenied,

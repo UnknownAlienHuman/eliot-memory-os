@@ -179,7 +179,7 @@ pub(crate) struct DreamerDispatchedEnvelope {
     pub(crate) semantic_input: Option<OpaqueContentRef>,
     /// Exact inline bytes retained beside the opaque owner reference, when
     /// present. The child transports and verifies them without interpreting
-    /// UserAutomation content as a Dreamer orientation payload.
+    /// `UserAutomation` content as a Dreamer orientation payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job (never caller bytes).
