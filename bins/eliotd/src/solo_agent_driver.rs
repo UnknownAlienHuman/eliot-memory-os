@@ -81,7 +81,9 @@ use eliot_agent_coordinator::{
     load_runtime_scheduling_profile,
 };
 #[cfg(not(test))]
-use eliot_agent_coordinator::{AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial};
+use eliot_agent_coordinator::{
+    AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial,
+};
 use eliot_contracts::{fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 
