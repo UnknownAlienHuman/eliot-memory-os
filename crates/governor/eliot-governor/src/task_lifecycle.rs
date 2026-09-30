@@ -85,8 +85,6 @@ pub struct PreparedTaskTransition {
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    fence: StateFence,
-    manifest_digest: OperationManifestDigest,
     failure_context: StoreFailureIdentityContext,
 }
 
@@ -130,14 +128,7 @@ impl PreparedTaskTransition {
             },
             Err(other) => return Err(TaskLifecycleError::Kernel(other)),
         };
-        check_committed_receipt(
-            &receipt,
-            &self.operation_id,
-            &self.fence,
-            &self.identity.idempotency_key,
-            &self.manifest_digest,
-            &self.failure_context,
-        )?;
+        check_committed_receipt(&receipt, &self.transition, &self.failure_context)?;
         Ok(receipt)
     }
 }
@@ -522,8 +513,6 @@ fn prepare_task_exchange(
         transition,
         expected_revision_heads: envelope.expected_revision_heads,
         expected_ordering_heads: envelope.expected_ordering_heads,
-        fence: canonical.state_fence().clone(),
-        manifest_digest,
         failure_context,
     })
 }
@@ -1446,8 +1435,19 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         envelope: CanonicalWriteEnvelope,
         manifest_digest: OperationManifestDigest,
     ) -> Result<WriteReceipt, TaskLifecycleError> {
-        let fence = identity.request.metadata.state_fence.clone();
         let ctx = store_failure_ctx(identity, &operation_id);
+        // Retain the exact immutable plan that Canonical will dispatch so a
+        // reconciled receipt is checked against the original request digest,
+        // rather than only against its operation id and manifest.
+        let transition = self.canonical.prepare(&envelope)?;
+        if transition.identity.operation_id != operation_id
+            || transition.operation_manifest_digest != manifest_digest
+        {
+            return Err(TaskLifecycleError::Composition(CompositionError::Provider(
+                "prepared task transition does not match its admitted operation and manifest"
+                    .to_owned(),
+            )));
+        }
         let receipt = match self.canonical.commit(self.kernel, identity, envelope).await {
             Ok(receipt) => receipt,
             Err(CompositionError::Kernel(KernelPortError::Unknown(_))) => {
@@ -1472,14 +1472,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             }
             Err(other) => return Err(TaskLifecycleError::Composition(other)),
         };
-        check_committed_receipt(
-            &receipt,
-            &operation_id,
-            &fence,
-            &identity.idempotency_key,
-            &manifest_digest,
-            &ctx,
-        )?;
+        check_committed_receipt(&receipt, &transition, &ctx)?;
         Ok(receipt)
     }
 }
@@ -1492,18 +1485,16 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
 /// pending as a typed [`StoreFailure`], never reported as executed.
 fn check_committed_receipt(
     receipt: &WriteReceipt,
-    operation_id: &OperationId,
-    fence: &StateFence,
-    idempotency_key: &str,
-    manifest_digest: &OperationManifestDigest,
+    transition: &PreparedTransition,
     ctx: &StoreFailureIdentityContext,
 ) -> Result<(), TaskLifecycleError> {
     receipt
         .validate()
         .map_err(|error| map_store_error(error, ctx))?;
-    if receipt.operation_id != *operation_id
-        || receipt.state_fence != *fence
-        || receipt.idempotency_key != idempotency_key
+    if receipt.operation_id != transition.identity.operation_id
+        || receipt.state_fence != transition.state_fence
+        || receipt.idempotency_key != transition.identity.idempotency_key
+        || receipt.canonical_request_hash != transition.identity.canonical_request_hash
     {
         let failure = store_failure(
             StoreFailureDisposition::DeterministicRejection,
@@ -1515,8 +1506,14 @@ fn check_committed_receipt(
         )?;
         return Err(TaskLifecycleError::Store(Box::new(failure)));
     }
-    if receipt.transition_class != TransitionClass::TaskControl
-        || receipt.operation_manifest_digest != *manifest_digest
+    if receipt.transition_class != transition.transition_class
+        || receipt.transition_class != TransitionClass::TaskControl
+        || receipt.operation_manifest_digest != transition.operation_manifest_digest
+        || receipt.admission_digest != transition.admission_digest
+        || receipt.mutation_plan_digest != transition.mutation_plan_digest
+        || receipt.semantic_source_revisions != transition.semantic_source_revisions
+        || receipt.policy_config_schema_versions
+            != eliot_store_api::PolicyConfigSchemaVersions::bound_to(transition)
     {
         let failure = store_failure(
             StoreFailureDisposition::DeterministicRejection,
