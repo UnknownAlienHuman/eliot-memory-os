@@ -273,6 +273,48 @@ pub(crate) fn admit_sealed_drive_claim(
 /// Drives one claimed job against the presented admission to a deterministic
 /// disposition. The job is already leased to this shot; every path below ends
 /// in `finish` or `cancel` so the lease is always released.
+/// Finishes one refused drive as unknown and reads back its receipt.
+fn finish_unknown_receipt(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &mut Lease,
+    collector: &EvidenceCollector,
+    reason: String,
+    disappeared: &str,
+) -> Result<TestReceipt, TestdError> {
+    finish_unknown(store, job, lease, collector, reason)?;
+    Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+        || TestdError::Corrupt(disappeared.to_owned()),
+    )?))
+}
+
+/// Refuses one drive the presented admission already disqualifies.
+fn refuse_unstartable(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &mut Lease,
+    presented: &PresentedAdmission,
+    owner: &str,
+) -> Result<Option<TestReceipt>, TestdError> {
+    if let Err(binding) = check_presented_job_binding(job, presented) {
+        return Ok(Some(finish_unknown_receipt(
+            store,
+            job,
+            lease,
+            &EvidenceCollector::default(),
+            format!("refused foreign or stale presentation without executing: {binding}"),
+            "job disappeared after refusal",
+        )?));
+    }
+    if presented.cancelled {
+        store.cancel(&job.job_id, Some(lease), owner, current_clock_ms())?;
+        return Ok(Some(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+            || TestdError::Corrupt("job disappeared after cancellation".to_owned()),
+        )?)));
+    }
+    Ok(None)
+}
+
 fn drive_claimed<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,
@@ -282,23 +324,8 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     owner: &str,
     lease_ms: u64,
 ) -> Result<TestReceipt, TestdError> {
-    if let Err(binding) = check_presented_job_binding(job, &presented) {
-        finish_unknown(
-            store,
-            job,
-            lease,
-            &EvidenceCollector::default(),
-            format!("refused foreign or stale presentation without executing: {binding}"),
-        )?;
-        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-            || TestdError::Corrupt("job disappeared after refusal".to_owned()),
-        )?));
-    }
-    if presented.cancelled {
-        store.cancel(&job.job_id, Some(lease), owner, current_clock_ms())?;
-        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-            || TestdError::Corrupt("job disappeared after cancellation".to_owned()),
-        )?));
+    if let Some(receipt) = refuse_unstartable(store, job, lease, &presented, owner)? {
+        return Ok(receipt);
     }
     // Fresh bound admission: rebuild the Kernel request from the CLAIMED
     // durable job and seal it with the single-use replay of the presented
@@ -328,16 +355,14 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     let permit = match issue_process_admission(&provider, &admission_request) {
         Ok(permit) => permit,
         Err(error) => {
-            finish_unknown(
+            return finish_unknown_receipt(
                 store,
                 job,
                 lease,
                 &EvidenceCollector::default(),
                 format!("fresh admission refused without executing: {error}"),
-            )?;
-            return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
-            )?));
+                "job disappeared after admission refusal",
+            );
         }
     };
     // Shared admission boundary (issue #1814): the seal above proves
@@ -350,16 +375,14 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     let admitted = match admit_sealed_drive_claim(&job.invocation, permit.request()) {
         Ok(admitted) => admitted,
         Err(error) => {
-            finish_unknown(
+            return finish_unknown_receipt(
                 store,
                 job,
                 lease,
                 &EvidenceCollector::default(),
                 format!("shared admission refused without executing: {error}"),
-            )?;
-            return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
-            )?));
+                "job disappeared after admission refusal",
+            );
         }
     };
     let collector = Arc::new(EvidenceCollector::default());
@@ -367,7 +390,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         let observation = match observe_tool_identity(permit.request(), &admitted) {
             Ok(observation) => observation,
             Err(error) => {
-                finish_unknown(
+                return finish_unknown_receipt(
                     store,
                     job,
                     lease,
@@ -375,10 +398,8 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                     format!(
                         "productive tool identity was not owner-observed; no process started: {error}"
                     ),
-                )?;
-                return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                    || TestdError::Corrupt("job disappeared after tool observation".to_owned()),
-                )?));
+                    "job disappeared after tool observation",
+                );
             }
         };
         collector.record_tool_observation(observation)?;

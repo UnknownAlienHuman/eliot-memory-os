@@ -1550,6 +1550,11 @@ pub(crate) async fn submit_testd_owner_job(
         .process_tool
         .validate_for_roots(&target_roots.target_root, &target_roots.cache_root)
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    // Shared admission boundary (issue #1814): digest the validated
+    // environment before it moves into the process intent below.
+    let environment_sha256 = canonical_json_bytes(&environment)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
 
     let profile = testd_profile_binding(
         TESTD_PRODUCTIVE_PROFILE,
@@ -1627,9 +1632,7 @@ pub(crate) async fn submit_testd_owner_job(
         request.process_tool.observation.nextest_path.clone(),
         request.process_tool.observation.nextest_sha256.clone(),
         None,
-        canonical_json_bytes(&environment)
-            .map(|bytes| sha256_hex(&bytes))
-            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+        environment_sha256,
         profile.fixed_argv.clone(),
     )
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
