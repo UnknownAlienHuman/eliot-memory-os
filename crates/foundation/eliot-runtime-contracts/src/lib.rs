@@ -41,8 +41,10 @@ pub use activation_lifecycle::{
 };
 pub use control_reserve::{
     BottleneckCapacityProfile, BottleneckCoverageState, BottleneckOwnerBinding, CapacityBottleneck,
-    CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
-    ControlReserveProfile, EmergencyOperationClass, NormalWorkClass, frozen_bottleneck_owner_map,
+    CapacityClass, CapacityEnforcement, CapacityLimit, CapacityPermitBinding,
+    CapacityReleaseEvidence, CapacityRequest, CapacityUnit, ControlOperationClass,
+    ControlReserveProfile, EmergencyOperationClass, NormalWorkClass, PermitTerminalDisposition,
+    RequestedOperationClass, frozen_bottleneck_owner_map,
 };
 pub use hot_artifact_map::{
     HotArtifactKind, HotArtifactMap, HotArtifactRecord, admitted_hot_artifact_map,

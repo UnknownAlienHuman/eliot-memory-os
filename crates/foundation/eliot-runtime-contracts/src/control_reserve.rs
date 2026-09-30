@@ -5,7 +5,7 @@
 
 use std::num::NonZeroU64;
 
-use eliot_contracts::EpochId;
+use eliot_contracts::{EpochId, ResourceGeneration};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -727,6 +727,358 @@ impl ControlReserveProfile {
             }
         }
         Ok(())
+    }
+}
+
+/// Closed tag selecting the only admissible capacity class for one request.
+///
+/// The tag is the class: a normal Store write ([`NormalWorkClass::CanonicalWrite`]),
+/// named read ([`NormalWorkClass::Interactive`]), verification, background, model,
+/// swarm/agent ([`NormalWorkClass::Swarm`]), reporting or maintenance task can only
+/// name [`NormalWorkClass`], which admits exactly [`CapacityClass::NormalWorkload`].
+/// There is no independent class or priority override, so protected or emergency
+/// capacity is unreachable by relabelling (issue #1679, A5).
+#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RequestedOperationClass {
+    /// Ordinary workload operation.
+    Normal(NormalWorkClass),
+    /// Protected control/recovery operation.
+    Protected(ControlOperationClass),
+    /// Emergency last-resort operation.
+    Emergency(EmergencyOperationClass),
+}
+
+impl RequestedOperationClass {
+    /// Returns the only capacity class this operation may draw from.
+    #[must_use]
+    pub const fn capacity_class(self) -> CapacityClass {
+        match self {
+            Self::Normal(_) => CapacityClass::NormalWorkload,
+            Self::Protected(_) => CapacityClass::ProtectedControl,
+            Self::Emergency(_) => CapacityClass::EmergencyLastResort,
+        }
+    }
+
+    /// Returns the exact frozen contract identifier of the inner class.
+    #[must_use]
+    pub const fn as_contract_str(self) -> &'static str {
+        match self {
+            Self::Normal(class) => class.as_contract_str(),
+            Self::Protected(class) => class.as_contract_str(),
+            Self::Emergency(class) => class.as_contract_str(),
+        }
+    }
+}
+
+/// One typed capacity request: the exact bottleneck, unit and amount under
+/// exactly one operation class (frozen `[types.CapacityRequest]`).
+///
+/// The [`RequestedOperationClass`] tag determines the only admissible
+/// [`CapacityClass`]; the caller cannot provide an independent class override.
+/// The request carries no authority by itself: the bottleneck owner validates
+/// it against the current row, acquires atomically under its own
+/// implementation, and returns the owner-produced [`CapacityPermitBinding`].
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityRequest {
+    /// Closed operation tag; the only admissible capacity class derives from it.
+    pub operation: RequestedOperationClass,
+    /// Operation identity the permit would be bound to.
+    pub operation_id: String,
+    /// Exact bottleneck dimension requested.
+    pub requested_bottleneck: CapacityBottleneck,
+    /// Exact amount in the bottleneck unit ([`CapacityBottleneck::unit`]).
+    pub requested_limit: CapacityLimit,
+    /// Owner requesting admission.
+    pub requesting_owner_ref: String,
+    /// Requester generation at request time.
+    pub requesting_generation_ref: ResourceGeneration,
+    /// Authority Epoch the request is bound to.
+    pub authority_epoch_ref: EpochId,
+    /// Profile identity the request was compiled against.
+    pub profile_id: String,
+    /// Profile revision the request was compiled against.
+    pub profile_revision: String,
+    /// Caller deadline in Unix milliseconds; recorded, never authority.
+    pub deadline_ms: u64,
+}
+
+impl CapacityRequest {
+    /// Returns the only capacity class this request may draw from.
+    #[must_use]
+    pub const fn capacity_class(&self) -> CapacityClass {
+        self.operation.capacity_class()
+    }
+
+    /// Validates request legality without granting authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeContractError::InvalidField`] naming the first violated
+    /// invariant of `[types.CapacityRequest]`.
+    pub fn validate(&self) -> Result<(), RuntimeContractError> {
+        if self.operation_id.trim().is_empty() {
+            return Err(invalid(
+                "operation_id",
+                "MISSING_OPERATION_IDENTITY: a request names one operation identity",
+            ));
+        }
+        if self.requesting_owner_ref.trim().is_empty() {
+            return Err(invalid(
+                "requesting_owner_ref",
+                "MISSING_REQUESTER: a request names one requesting owner",
+            ));
+        }
+        if self.profile_id.trim().is_empty() || self.profile_revision.trim().is_empty() {
+            return Err(invalid(
+                "profile_revision",
+                "STALE_PROFILE: a request binds one profile identity and revision",
+            ));
+        }
+        if self.requested_limit.unit != self.requested_bottleneck.unit() {
+            return Err(invalid(
+                "requested_limit",
+                "UNIT_MISMATCH: a request uses exactly the bottleneck unit",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One owner-issued non-clone permit binding (frozen `[types.CapacityPermitBinding]`).
+///
+/// The binding exactly matches one validated [`CapacityRequest`] and one current
+/// bottleneck row: same operation tag and identity, same capacity class, same
+/// bottleneck with the same unit and granted amount, same owner and requester
+/// generations, same Authority Epoch and profile revision. Any changed content
+/// fails closed instead of replaying (issue #1679, A7). The binding is evidence
+/// only; the non-clone permit handle held by the issuing owner is what releases
+/// the capacity exactly once.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityPermitBinding {
+    /// Owner-minted permit identity.
+    pub permit_id: String,
+    /// Operation identity the permit was granted for.
+    pub operation_id: String,
+    /// Capacity class the permit draws from.
+    pub capacity_class: CapacityClass,
+    /// Typed operation class; must admit exactly `capacity_class`.
+    pub operation: RequestedOperationClass,
+    /// Exact bottleneck dimension granted.
+    pub bottleneck: CapacityBottleneck,
+    /// Granted amount in the bottleneck unit.
+    pub granted_limit: CapacityLimit,
+    /// Runtime owner that issued the permit.
+    pub capacity_owner_ref: String,
+    /// Issuing owner generation.
+    pub capacity_owner_generation_ref: ResourceGeneration,
+    /// Owner the permit was granted to.
+    pub requesting_owner_ref: String,
+    /// Requester generation the permit was granted to.
+    pub requesting_generation_ref: ResourceGeneration,
+    /// Authority Epoch the permit is bound to.
+    pub authority_epoch_ref: EpochId,
+    /// Profile identity the permit was issued under.
+    pub profile_id: String,
+    /// Profile revision the permit was issued under.
+    pub profile_revision: String,
+    /// Issue time in Unix milliseconds.
+    pub issued_at_ms: u64,
+    /// Expiry time in Unix milliseconds.
+    pub expires_at_ms: u64,
+    /// Owner evidence references supporting the grant.
+    pub owner_evidence_refs: Vec<String>,
+}
+
+impl CapacityPermitBinding {
+    /// Validates binding legality without consulting any owner counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeContractError::InvalidField`] naming the first violated
+    /// invariant of `[types.CapacityPermitBinding]`.
+    pub fn validate(&self) -> Result<(), RuntimeContractError> {
+        if self.permit_id.trim().is_empty() {
+            return Err(invalid(
+                "permit_id",
+                "MISSING_PERMIT_IDENTITY: a binding names one owner-minted permit",
+            ));
+        }
+        if self.operation_id.trim().is_empty() {
+            return Err(invalid(
+                "operation_id",
+                "MISSING_OPERATION_IDENTITY: a binding names one operation identity",
+            ));
+        }
+        if self.operation.capacity_class() != self.capacity_class {
+            return Err(invalid(
+                "operation",
+                "CLASS_MISMATCH: the operation tag admits exactly the bound capacity class",
+            ));
+        }
+        if self.granted_limit.unit != self.bottleneck.unit() {
+            return Err(invalid(
+                "granted_limit",
+                "UNIT_MISMATCH: a binding grants exactly the bottleneck unit",
+            ));
+        }
+        if self.capacity_owner_ref.trim().is_empty() || self.requesting_owner_ref.trim().is_empty()
+        {
+            return Err(invalid(
+                "capacity_owner_ref",
+                "MISSING_CAPACITY_OWNER: a binding names the issuing owner and the requester",
+            ));
+        }
+        if self.profile_id.trim().is_empty() || self.profile_revision.trim().is_empty() {
+            return Err(invalid(
+                "profile_revision",
+                "STALE_PROFILE: a binding carries one profile identity and revision",
+            ));
+        }
+        if self.expires_at_ms <= self.issued_at_ms {
+            return Err(invalid(
+                "expires_at_ms",
+                "EXPIRED_AT_ISSUE: a binding expires strictly after it is issued",
+            ));
+        }
+        validate_canonical_refs("owner_evidence_refs", &self.owner_evidence_refs)
+    }
+
+    /// Returns `true` only when the binding exactly matches the request it was
+    /// issued for: same operation tag and identity, same bottleneck with the
+    /// same unit and amount, same requester owner and generation, same Authority
+    /// Epoch and same profile identity and revision. Changed content never
+    /// matches; it conflicts instead of replaying.
+    #[must_use]
+    pub fn matches_request(&self, request: &CapacityRequest) -> bool {
+        self.operation == request.operation
+            && self.operation_id == request.operation_id
+            && self.bottleneck == request.requested_bottleneck
+            && self.granted_limit == request.requested_limit
+            && self.requesting_owner_ref == request.requesting_owner_ref
+            && self.requesting_generation_ref == request.requesting_generation_ref
+            && self
+                .authority_epoch_ref
+                .is_same_authority(&request.authority_epoch_ref)
+            && self.profile_id == request.profile_id
+            && self.profile_revision == request.profile_revision
+    }
+}
+
+/// Terminal disposition of one permit (frozen `[types.PermitTerminalDisposition]`).
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PermitTerminalDisposition {
+    /// Released by its holder; capacity returned exactly once.
+    Released,
+    /// Released through owner reconciliation after restart or doubt.
+    ReconciledReleased,
+    /// Possibly leaked; excluded until the owner reconciles it.
+    LeakSuspected,
+    /// Owner is stale; excluded until the current owner reconciles it.
+    StaleOwner,
+    /// Terminal state is unknown; excluded until reconciled.
+    Unknown,
+}
+
+impl PermitTerminalDisposition {
+    /// Returns the exact frozen contract identifier.
+    #[must_use]
+    pub const fn as_contract_str(self) -> &'static str {
+        match self {
+            Self::Released => "RELEASED",
+            Self::ReconciledReleased => "RECONCILED_RELEASED",
+            Self::LeakSuspected => "LEAK_SUSPECTED",
+            Self::StaleOwner => "STALE_OWNER",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// One owner-produced release record (frozen `[types.CapacityReleaseEvidence]`).
+///
+/// The record never exceeds or changes the granted unit and quantity: only a
+/// record whose released limit equals the granted limit matches its binding
+/// (see [`Self::matches_binding`]). Stale or unknown ownership never silently
+/// increases available capacity; restart reconciliation replays this durable
+/// operation/permit evidence rather than resetting a counter.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityReleaseEvidence {
+    /// Permit identity being released.
+    pub permit_id: String,
+    /// Operation identity the permit was granted for.
+    pub operation_id: String,
+    /// How the permit reached its terminal state.
+    pub terminal_disposition: PermitTerminalDisposition,
+    /// Released amount; must equal the granted limit of the binding.
+    pub released_limit: CapacityLimit,
+    /// Owner generation observed at release.
+    pub observed_owner_generation_ref: ResourceGeneration,
+    /// Authority Epoch observed at release.
+    pub authority_epoch_ref: EpochId,
+    /// Profile identity observed at release.
+    pub profile_id: String,
+    /// Profile revision observed at release.
+    pub profile_revision: String,
+    /// Release time in Unix milliseconds.
+    pub released_at_ms: u64,
+    /// Evidence references supporting the release.
+    pub evidence_refs: Vec<String>,
+    /// Reconciliation reference for restart/doubt releases.
+    pub reconciliation_ref: String,
+}
+
+impl CapacityReleaseEvidence {
+    /// Validates release-record legality without moving any owner counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeContractError::InvalidField`] naming the first violated
+    /// invariant of `[types.CapacityReleaseEvidence]`.
+    pub fn validate(&self) -> Result<(), RuntimeContractError> {
+        if self.permit_id.trim().is_empty() {
+            return Err(invalid(
+                "permit_id",
+                "MISSING_PERMIT_IDENTITY: a release names one permit",
+            ));
+        }
+        if self.operation_id.trim().is_empty() {
+            return Err(invalid(
+                "operation_id",
+                "MISSING_OPERATION_IDENTITY: a release names one operation identity",
+            ));
+        }
+        if self.profile_id.trim().is_empty()
+            || self.profile_revision.trim().is_empty()
+            || self.reconciliation_ref.trim().is_empty()
+        {
+            return Err(invalid(
+                "reconciliation_ref",
+                "STALE_PROFILE: a release carries one profile identity, revision and reconciliation reference",
+            ));
+        }
+        validate_canonical_refs("evidence_refs", &self.evidence_refs)
+    }
+
+    /// Returns `true` only when the release exactly matches the binding it
+    /// closes: same permit and operation identities, released limit equal to
+    /// the granted limit, same observed owner generation, same Authority Epoch
+    /// and same profile identity and revision. A release that changes the
+    /// unit, quantity, owner, epoch or profile never matches.
+    #[must_use]
+    pub fn matches_binding(&self, binding: &CapacityPermitBinding) -> bool {
+        self.permit_id == binding.permit_id
+            && self.operation_id == binding.operation_id
+            && self.released_limit == binding.granted_limit
+            && self.observed_owner_generation_ref == binding.capacity_owner_generation_ref
+            && self
+                .authority_epoch_ref
+                .is_same_authority(&binding.authority_epoch_ref)
+            && self.profile_id == binding.profile_id
+            && self.profile_revision == binding.profile_revision
     }
 }
 

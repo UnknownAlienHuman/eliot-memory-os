@@ -40,12 +40,30 @@
 //! needs the W3 owner adapters (same disclosed limit as the profile
 //! compiler): the front-door slice binds the epoch, not a second generation
 //! scheme.
+//!
+//! Owner-issued permit evidence (issue #1679, W4) rides on the same binding:
+//! [`FrontDoor::issue_permit`] validates one [`CapacityRequest`] carrying the
+//! exact bottleneck, unit and amount under its typed
+//! [`RequestedOperationClass`] tag, acquires exactly one slot from the tagged
+//! partition, and returns the non-clone [`ControlPermit`] together with the
+//! owner-minted [`CapacityPermitBinding`]. The tag alone selects the partition,
+//! so a normal Store write (`CANONICAL_WRITE`), named read (`INTERACTIVE`),
+//! verification, background, model, swarm/agent (`SWARM`), reporting or
+//! maintenance operation can never acquire a protected or emergency permit by
+//! relabelling priority or class (A5): relabelling is unrepresentable, not
+//! merely refused. Replay and release stay content-bound (A7): the binding
+//! matches its request only through
+//! [`CapacityPermitBinding::matches_request`], and release consumes the permit
+//! exactly once. The front-door fence is the single-lineage
+//! [`KernelAuthority`] sequence, so the request epoch is compared by sequence
+//! exactly like [`KernelAuthority::consume`]; full lineage-tuple fencing
+//! belongs to the I6.10 authority owner (STITCH).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use eliot_contracts::AuthorityEpoch;
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
 use eliot_receipts::ProofCeiling;
 
 use crate::RouteScope;
@@ -53,9 +71,15 @@ use crate::authority::{AuthorityGrant, AuthorityReceipt, KernelAuthority};
 use crate::error::{KernelError, validate_id};
 
 pub use eliot_runtime_contracts::{
-    CapacityBottleneck, CapacityClass, ControlOperationClass, EmergencyOperationClass,
-    NormalWorkClass,
+    CapacityBottleneck, CapacityClass, CapacityPermitBinding, CapacityRequest,
+    ControlOperationClass, EmergencyOperationClass, NormalWorkClass, RequestedOperationClass,
 };
+
+/// Runtime owner reference minted on every front-door permit binding.
+///
+/// Names the [`frozen_bottleneck_owner_map`][eliot_runtime_contracts::frozen_bottleneck_owner_map]
+/// row for [`FRONT_DOOR_BOTTLENECK`] ("Kernel front-door/control-channel owner").
+pub const FRONT_DOOR_OWNER: &str = "kernel-front-door";
 
 /// The exact bottleneck enforced by [`FrontDoor`] in this slice.
 pub const FRONT_DOOR_BOTTLENECK: CapacityBottleneck = CapacityBottleneck::KernelControlChannel;
@@ -140,6 +164,9 @@ struct PartitionedInner {
     /// Epoch observed at the restart seal; unsealing requires the epoch to
     /// have advanced past it (stale ownership fenced).
     sealed_epoch: Mutex<Option<AuthorityEpoch>>,
+    /// Owner-minted permit sequence; never reset, including across restarts,
+    /// so two issuances never share a permit identity.
+    permit_sequence: AtomicU64,
 }
 
 /// A single held capacity permit, bound to class, bottleneck, operation, owner
@@ -358,6 +385,7 @@ impl ControlReserve {
                 emergency_in_flight: AtomicUsize::new(0),
                 restart_sealed: AtomicBool::new(false),
                 sealed_epoch: Mutex::new(None),
+                permit_sequence: AtomicU64::new(0),
             }),
         })
     }
@@ -1260,6 +1288,153 @@ impl FrontDoor {
         self.lock_ledger().note_restart();
         self.reserve
             .seal_after_restart(self.authority.current_epoch());
+    }
+
+    /// Issues one owner-bound permit for a validated capacity request.
+    ///
+    /// The W4 request/issue path for [`FRONT_DOOR_BOTTLENECK`]: the request
+    /// names the exact bottleneck, unit and amount under its typed
+    /// [`RequestedOperationClass`] tag, and the owner returns the non-clone
+    /// [`ControlPermit`] together with the minted [`CapacityPermitBinding`].
+    /// The tag alone selects the partition — `Normal` draws only the normal
+    /// partition, `Protected` only the protected partition, `Emergency` only
+    /// the preallocated slot — so no priority or class relabelling can move a
+    /// normal Store write, named read, agent, model, swarm, report or
+    /// maintenance operation onto protected or emergency capacity (A5). The
+    /// binding matches its request only through
+    /// [`CapacityPermitBinding::matches_request`]; changed content conflicts
+    /// instead of replaying (A7).
+    ///
+    /// The caller supplies its clock (`now_ms`, as in [`Self::authorize`])
+    /// and the issuing owner generation: the front door owns no generation
+    /// counter, so generation binding arrives with the call (STITCH: the
+    /// kernel generation owner). The request deadline is recorded, never
+    /// enforced: issuance is synchronous. The binding carries no wall-clock
+    /// expiry (`u64::MAX`); the permit lifetime is the handle lifetime
+    /// (release-or-drop) and staleness is fenced by epoch, profile revision
+    /// and generations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed contract refusal for an illegal request, or
+    /// [`KernelError::InvalidField`] when the request names another owner's
+    /// bottleneck or an amount other than one slot (this owner issues
+    /// single-slot permits; larger holdings need one permit per slot),
+    /// [`KernelError::StaleEpoch`] when the request epoch sequence differs
+    /// from the current fence, or the tagged saturation disposition
+    /// ([`KernelError::NormalCapacityExhausted`],
+    /// [`KernelError::ProtectedReserveExhausted`],
+    /// [`KernelError::EmergencySlotUnavailable`]/
+    /// [`KernelError::ControlGuaranteeLost`]) naming the exact bottleneck.
+    pub fn issue_permit(
+        &self,
+        request: &CapacityRequest,
+        owner_generation: ResourceGeneration,
+        now_ms: i64,
+    ) -> Result<(ControlPermit, CapacityPermitBinding), KernelError> {
+        request.validate()?;
+        if request.requested_bottleneck != FRONT_DOOR_BOTTLENECK {
+            return Err(KernelError::InvalidField {
+                field: "capacity_request.requested_bottleneck",
+                reason: "this owner enforces only KERNEL_CONTROL_CHANNEL; no other dimension is issuable here",
+            });
+        }
+        let current = self.authority.current_epoch();
+        if request.authority_epoch_ref.sequence.get() != current.value() {
+            return Err(KernelError::StaleEpoch {
+                observed: request.authority_epoch_ref.sequence.get(),
+                active: current.value(),
+            });
+        }
+        if request.requested_limit.quantity.get() != 1 {
+            return Err(KernelError::InvalidField {
+                field: "capacity_request.requested_limit",
+                reason: "the front door issues single-slot permits; hold one permit per slot",
+            });
+        }
+        let issued_at_ms = u64::try_from(now_ms).map_err(|_| KernelError::InvalidField {
+            field: "capacity_request.issued_at_ms",
+            reason: "the issuing clock must be non-negative",
+        })?;
+        let permit = match request.operation {
+            RequestedOperationClass::Normal(work) => self.reserve.try_acquire_normal(
+                work,
+                &request.requesting_owner_ref,
+                &request.operation_id,
+                current,
+            )?,
+            RequestedOperationClass::Protected(operation) => self.reserve.try_acquire_protected(
+                operation,
+                &request.requesting_owner_ref,
+                &request.operation_id,
+                current,
+            )?,
+            RequestedOperationClass::Emergency(operation) => self.reserve.try_acquire_emergency(
+                operation,
+                &request.requesting_owner_ref,
+                &request.operation_id,
+                current,
+            )?,
+        };
+        let sequence = self
+            .reserve
+            .inner
+            .permit_sequence
+            .fetch_add(1, Ordering::AcqRel);
+        let binding = CapacityPermitBinding {
+            permit_id: format!(
+                "FD-{}-{sequence}-{}",
+                request.operation.as_contract_str(),
+                request.operation_id
+            ),
+            operation_id: request.operation_id.clone(),
+            capacity_class: request.operation.capacity_class(),
+            operation: request.operation,
+            bottleneck: FRONT_DOOR_BOTTLENECK,
+            granted_limit: request.requested_limit,
+            capacity_owner_ref: FRONT_DOOR_OWNER.to_owned(),
+            capacity_owner_generation_ref: owner_generation,
+            requesting_owner_ref: request.requesting_owner_ref.clone(),
+            requesting_generation_ref: request.requesting_generation_ref,
+            authority_epoch_ref: request.authority_epoch_ref.clone(),
+            profile_id: request.profile_id.clone(),
+            profile_revision: request.profile_revision.clone(),
+            issued_at_ms,
+            expires_at_ms: u64::MAX,
+            owner_evidence_refs: vec![self.issue_evidence(request.operation.capacity_class())],
+        };
+        debug_assert!(
+            binding.validate().is_ok(),
+            "front-door minted permit binding must satisfy the contract"
+        );
+        debug_assert!(
+            binding.matches_request(request),
+            "front-door minted permit binding must match its request"
+        );
+        Ok((permit, binding))
+    }
+
+    /// Records the owner's contemporaneous partition observation for one issuance.
+    fn issue_evidence(&self, class: CapacityClass) -> String {
+        let (capacity, in_flight) = match class {
+            CapacityClass::NormalWorkload => (
+                self.reserve.normal_capacity(),
+                self.reserve.normal_capacity() - self.reserve.available_normal(),
+            ),
+            CapacityClass::ProtectedControl => (
+                self.reserve.protected_capacity(),
+                self.reserve.protected_capacity() - self.reserve.available_protected(),
+            ),
+            CapacityClass::EmergencyLastResort => (
+                self.reserve.emergency_capacity(),
+                self.reserve.emergency_capacity() - self.reserve.available_emergency(),
+            ),
+        };
+        format!(
+            "front-door:{}:{} capacity {capacity} in-flight {in_flight}",
+            FRONT_DOOR_BOTTLENECK.as_contract_str(),
+            class.as_contract_str(),
+        )
     }
 
     /// Reconciles held capacity after the durable recovery epoch is
