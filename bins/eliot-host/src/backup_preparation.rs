@@ -2345,6 +2345,13 @@ fn destination_from_result(
 /// recorded destination; changed inputs conflict by field) → record intent →
 /// admit parent → create root → pin identity → record result. The source root
 /// is only ever read for comparison, never modified.
+///
+/// A record whose reclamation already COMPLETED is refused here as a terminal
+/// identity, not as an unknown one: its absence was observed, so there is
+/// nothing to prepare, reuse or reclaim under it, and calling its outcome
+/// unknown would send the caller into a reconcile loop for finished work. A
+/// record whose reclamation is only AUTHORIZED still refuses as the unknown it
+/// is, and is never retried.
 #[allow(
     clippy::too_many_lines,
     reason = "the preparation order (validate, replay, intent, admit, effect, identity, result) stays in one boundary so no phase observation can be skipped between neighbors"
@@ -2417,6 +2424,30 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
                 PreparationError::UnknownState {
                     operation: admission.operation_id.clone(),
                     reason: "result record malformed; preserved for inspection".to_owned(),
+                },
+                generation,
+            ));
+        }
+        // A record already carrying the owner's terminal `Reclaimed`
+        // disposition is NOT a crash between intent and result, and it must not
+        // fall through to the refusal below. `Reclaimed` is retained only after
+        // the absence was observed, so this operation FINISHED: reporting it as
+        // an unestablished unknown is false for work that completed, and it
+        // would invite a caller to reconcile or retry a terminal identity.
+        //
+        // `CleanupPending` deliberately still falls through, because there the
+        // removal effect was never observed and the outcome genuinely is
+        // unknown - which is exactly what that refusal says.
+        if matches!(projected_disposition(&intent), Some(BackupPreparationState::Reclaimed)) {
+            return Err(note_prepare_error(
+                OP_PREPARE,
+                "replay_check",
+                PreparationError::InvalidRequest {
+                    field: "operation_id",
+                    reason: "this operation identity already reclaimed its destination and the \
+                              absence was observed; it is finished, so no destination is prepared, \
+                              reused or reclaimed again under it"
+                        .to_owned(),
                 },
                 generation,
             ));
