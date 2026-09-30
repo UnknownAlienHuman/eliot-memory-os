@@ -5,9 +5,8 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_epistemic_contracts::{
-    ClaimAuditOutcome, ClaimEntry, ClaimVerdict,
-    CurrentEpistemicPosition as AdmittedPosition, Currentness, EpistemicPositionCandidate,
-    PositionAssertability, SupportRecord, SupportResult,
+    ClaimAuditOutcome, ClaimEntry, ClaimVerdict, CurrentEpistemicPosition as AdmittedPosition,
+    Currentness, EpistemicPositionCandidate, PositionAssertability, SupportRecord, SupportResult,
 };
 use eliot_evidence::{
     EpistemicStatus, EvidenceAuthority, EvidenceFreshness, LifecycleState, ObservationRecord,

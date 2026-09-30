@@ -7,14 +7,14 @@
 //! creates no claim, admission receipt, launch, or Task Controller attempt.
 
 #[cfg(windows)]
-use eliot_kernel_service::{
-    NativeWorkerExecutionAdmissionEvidence, NativeWorkerExecutionAdmissionPhase,
-    NativeWorkerExecutionAdmissionReadRequest, NativeWorkerExecutionAdmissionReadResponse,
-    NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_ID,
-    NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_VERSION,
-};
-#[cfg(windows)]
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
+#[cfg(windows)]
+use eliot_kernel_service::{
+    NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_ID,
+    NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_VERSION, NativeWorkerExecutionAdmissionEvidence,
+    NativeWorkerExecutionAdmissionPhase, NativeWorkerExecutionAdmissionReadRequest,
+    NativeWorkerExecutionAdmissionReadResponse,
+};
 #[cfg(windows)]
 use eliot_protocol::{TaskControllerAttempt, TaskControllerInvocation};
 #[cfg(windows)]
@@ -179,20 +179,16 @@ fn validate_original_orientation_job_binding(
                 .ok_or(TransportError::SessionFenced)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let byte_length = u64::try_from(runtime_bytes.len()).map_err(|_| TransportError::SessionFenced)?;
-    if runtime_reference
-        .get("byte_length")
-        .and_then(Value::as_u64)
-        != Some(byte_length)
-        || runtime_reference
-            .get("sha256")
-            .and_then(Value::as_str)
+    let byte_length =
+        u64::try_from(runtime_bytes.len()).map_err(|_| TransportError::SessionFenced)?;
+    if runtime_reference.get("byte_length").and_then(Value::as_u64) != Some(byte_length)
+        || runtime_reference.get("sha256").and_then(Value::as_str)
             != Some(sha256_hex(&runtime_bytes).as_str())
     {
         return Err(TransportError::SessionFenced);
     }
-    let runtime: Value = serde_json::from_slice(&runtime_bytes)
-        .map_err(|_| TransportError::SessionFenced)?;
+    let runtime: Value =
+        serde_json::from_slice(&runtime_bytes).map_err(|_| TransportError::SessionFenced)?;
     if canonical_json_bytes(&runtime).map_err(|_| TransportError::SessionFenced)? != runtime_bytes {
         return Err(TransportError::SessionFenced);
     }
@@ -239,8 +235,8 @@ fn validate_original_orientation_job_binding(
     let request_metadata_fence = request_metadata
         .get("state_fence")
         .ok_or(TransportError::SessionFenced)?;
-    let state_fence = serde_json::to_value(&attempt.state_fence)
-        .map_err(|_| TransportError::SessionFenced)?;
+    let state_fence =
+        serde_json::to_value(&attempt.state_fence).map_err(|_| TransportError::SessionFenced)?;
     let runtime_scope = runtime
         .get("work_scope")
         .and_then(|scope| scope.get("scope_id"))
@@ -267,7 +263,9 @@ fn validate_original_orientation_job_binding(
         || native.task_id != attempt.task_id.as_str()
         || native.work_scope_id != attempt.scope_id
         || native.state_fence != attempt.state_fence
-        || !native.authority_epoch.is_same_authority(&attempt.authority_epoch)
+        || !native
+            .authority_epoch
+            .is_same_authority(&attempt.authority_epoch)
     {
         return Err(TransportError::SessionFenced);
     }

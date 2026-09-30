@@ -100,7 +100,8 @@ pub use negative_memory_read::{
 };
 pub use orientation_projection_owner::{
     OrientationProjectionMemberStates, OrientationProjectionOwnerInput,
-    OrientationProjectionOwnerOutput, bind_orientation_projections,
+    OrientationProjectionOwnerOutput, OrientationProjectionSourceClosure,
+    bind_orientation_projections,
 };
 mod controlboard_projection;
 mod learning_admission;

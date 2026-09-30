@@ -108,9 +108,9 @@ use eliot_kernel_service::{
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
     KernelService, KernelServiceError, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID,
     NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
-    NativeWorkerExecutionAdmissionPhase, TestdAdmission,
-    TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
-    advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
+    NativeWorkerExecutionAdmissionPhase, TestdAdmission, TestdAdmissionAttemptRequest,
+    TestdAdmissionEnvelope, TestdAdmissionResponse, advertise_doctor_repair,
+    advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
     handle_doctor_repair_cancellation, handle_testd_admission_attempt, handle_testd_cancellation,
     reconcile_testd_admission,
 };

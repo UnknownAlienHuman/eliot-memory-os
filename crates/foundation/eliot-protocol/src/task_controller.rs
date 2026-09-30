@@ -243,8 +243,7 @@ impl TaskControllerOrientationInput {
         )?;
         if runtime_input.semantic_source != self.semantic_source
             || runtime_input.output_contract != submission.output_contract
-            || runtime_input.context_reconstruction_result
-                != self.context_reconstruction_result
+            || runtime_input.context_reconstruction_result != self.context_reconstruction_result
             || runtime_input.context_compilation_input != self.context_compilation_input
             || runtime_input.orientation_classification_source_readback
                 != self.orientation_classification_source_readback

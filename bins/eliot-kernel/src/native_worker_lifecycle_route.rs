@@ -1178,8 +1178,8 @@ impl KernelComposition {
         .map_err(|_| NativeWorkerRouteError::Fence {
             field: "process_start_receipt",
         })?;
-        let (registry_digest, claim_fence_digest, durable_record) =
-            self.validate_native_worker_cell_currentness(
+        let (registry_digest, claim_fence_digest, durable_record) = self
+            .validate_native_worker_cell_currentness(
                 session,
                 &presented,
                 presented_fence,

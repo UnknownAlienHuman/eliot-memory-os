@@ -319,8 +319,7 @@ pub struct DurableJobRuntimeOwnerExecutionInput {
     /// Original output-contract reference.
     pub output_contract: OpaqueContentRef,
     /// Original recipe's `OutputSchema` tuple.
-    pub output_schema_recipe:
-        crate::task_controller::TaskControllerOrientationOutputSchemaRecipe,
+    pub output_schema_recipe: crate::task_controller::TaskControllerOrientationOutputSchemaRecipe,
     /// Original named-read claim for the output schema artifact.
     pub schema_source: crate::task_controller::TaskControllerOrientationSourceClaim,
     /// Original bounded evidence-material claims.
@@ -635,8 +634,14 @@ fn canonical_submit_payload(submission: &JobSubmission) -> serde_json::Value {
     let mut payload = serde_json::Map::from_iter([
         ("operation".to_owned(), serde_json::json!("SUBMIT_JOB")),
         ("job_id".to_owned(), serde_json::json!(submission.job_id)),
-        ("attempt_id".to_owned(), serde_json::json!(submission.attempt_id)),
-        ("work_scope".to_owned(), serde_json::json!(submission.work_scope)),
+        (
+            "attempt_id".to_owned(),
+            serde_json::json!(submission.attempt_id),
+        ),
+        (
+            "work_scope".to_owned(),
+            serde_json::json!(submission.work_scope),
+        ),
         (
             "semantic_input".to_owned(),
             serde_json::json!(submission.semantic_input),
@@ -645,17 +650,17 @@ fn canonical_submit_payload(submission: &JobSubmission) -> serde_json::Value {
             "output_contract".to_owned(),
             serde_json::json!(submission.output_contract),
         ),
-        ("admission".to_owned(), serde_json::json!(submission.admission)),
+        (
+            "admission".to_owned(),
+            serde_json::json!(submission.admission),
+        ),
         (
             "cancellation_id".to_owned(),
             serde_json::json!(submission.cancellation_id),
         ),
     ]);
     if let Some(bytes) = &submission.semantic_input_bytes {
-        payload.insert(
-            "semantic_input_bytes".to_owned(),
-            serde_json::json!(bytes),
-        );
+        payload.insert("semantic_input_bytes".to_owned(), serde_json::json!(bytes));
     }
     if let Some(reference) = &submission.runtime_owner_execution_input {
         payload.insert(
@@ -2306,10 +2311,7 @@ impl DurableJobResponse {
         }
     }
 
-    fn validate_submit_response(
-        &self,
-        submission: &JobSubmission,
-    ) -> Result<(), DurableJobError> {
+    fn validate_submit_response(&self, submission: &JobSubmission) -> Result<(), DurableJobError> {
         if self.job_id != submission.job_id || self.attempt_id != submission.attempt_id {
             return Err(DurableJobError::OperationMismatch);
         }
@@ -2333,8 +2335,12 @@ impl DurableJobResponse {
             self.runtime_owner_execution_input_bytes.as_ref(),
         ) {
             (None, None, None, None) => {}
-            (Some(expected_ref), Some(expected_bytes), Some(observed_ref), Some(observed_bytes))
-                if expected_ref == observed_ref && expected_bytes == observed_bytes => {}
+            (
+                Some(expected_ref),
+                Some(expected_bytes),
+                Some(observed_ref),
+                Some(observed_bytes),
+            ) if expected_ref == observed_ref && expected_bytes == observed_bytes => {}
             (Some(_), Some(_), None, None) => {
                 return Err(DurableJobError::RuntimeOwnerExecutionInputUnavailable);
             }
