@@ -886,8 +886,7 @@ pub fn produce_and_commit_attention_evaluation(
         pre_exposure_prevention_and_conditional_intervention: assembled
             .pre_exposure_prevention_and_conditional_intervention,
         final_harm_and_residual_risk: assembled.final_harm_and_residual_risk,
-        benign_false_blocks_and_abandoned_work: assembled
-            .benign_false_blocks_and_abandoned_work,
+        benign_false_blocks_and_abandoned_work: assembled.benign_false_blocks_and_abandoned_work,
         interruption_and_resumption_time_quality: assembled
             .interruption_and_resumption_time_quality,
         task_correctness_rework_and_human_attention: assembled
