@@ -3618,6 +3618,16 @@ pub struct InstallationEffectExecution {
     /// `StartService` call when the service is already fully Running.
     #[serde(skip)]
     pub service_runtime_lineage: Option<InstallationServiceProcessLineage>,
+    /// Exact guard-revert composite a guard owner returned during this call.
+    ///
+    /// `None` means no guarded OS-state operation reported a composite; it is
+    /// never read as a completed cleanup and never authorizes retry. Only the
+    /// Windows guard owners (#860) produce this value through the effect port;
+    /// installation producers always retain `None` and never fabricate one.
+    /// The coordinator persists a carried composite into the durable
+    /// transaction record before any dependent reconcile, retry, or rollback.
+    #[serde(default)]
+    pub guard_revert: Option<GuardRevertOutcome>,
 }
 
 /// Object-safe adapter seam for bounded installation effects.
@@ -4348,6 +4358,7 @@ impl WindowsInstallationEffectPort {
                 phase_b_receipt: Some(receipt),
                 service_start_disposition: None,
                 service_runtime_lineage: None,
+                guard_revert: None,
             }),
             PortOutcome::Unknown(reason) => PortOutcome::Unknown(reason),
             PortOutcome::Partial { .. } => PortOutcome::Unknown(UnknownReason::Indeterminate),
@@ -5163,6 +5174,7 @@ impl WindowsInstallationEffectPort {
                                 InstallationServiceStartDisposition::AlreadyStarting,
                             ),
                             service_runtime_lineage: None,
+                            guard_revert: None,
                         });
                     }
                     let identity =
@@ -5197,6 +5209,7 @@ impl WindowsInstallationEffectPort {
                         } else {
                             None
                         },
+                        guard_revert: None,
                     });
                 }
                 ServiceRegistrationRuntimeInspection::Matching { observation }
@@ -5227,6 +5240,7 @@ impl WindowsInstallationEffectPort {
                                     Ok(lineage) => lineage,
                                     Err(error) => return PortOutcome::Error(error),
                                 },
+                            guard_revert: None,
                         });
                     }
                     let identity = match Self::service_runtime_identity_evidence(
@@ -5261,6 +5275,7 @@ impl WindowsInstallationEffectPort {
                         } else {
                             None
                         },
+                        guard_revert: None,
                     })
                 }
                 Ok(ServiceStartOutcome::AlreadyRunning { observation }) => {
@@ -5290,6 +5305,7 @@ impl WindowsInstallationEffectPort {
                                 Err(error) => return PortOutcome::Error(error),
                             },
                         ),
+                        guard_revert: None,
                     })
                 }
                 Ok(ServiceStartOutcome::AlreadyStarting { .. }) => {
@@ -5311,6 +5327,7 @@ impl WindowsInstallationEffectPort {
                             InstallationServiceStartDisposition::AlreadyStarting,
                         ),
                         service_runtime_lineage: None,
+                        guard_revert: None,
                     })
                 }
                 Ok(ServiceStartOutcome::EffectUnknown) => {
@@ -5346,6 +5363,7 @@ impl WindowsInstallationEffectPort {
                     phase_b_receipt: None,
                     service_start_disposition: None,
                     service_runtime_lineage: None,
+                    guard_revert: None,
                 });
             }
             ServiceRegistrationRuntimeInspection::Matching { ref observation }
@@ -5372,6 +5390,7 @@ impl WindowsInstallationEffectPort {
                 phase_b_receipt: None,
                 service_start_disposition: None,
                 service_runtime_lineage: None,
+                guard_revert: None,
             }),
             Ok(ServiceStopOutcome::EffectUnknown) => {
                 PortOutcome::Unknown(UnknownReason::Indeterminate)
@@ -5567,6 +5586,7 @@ impl WindowsInstallationEffectPort {
                     phase_b_receipt: None,
                     service_start_disposition: None,
                     service_runtime_lineage: None,
+                    guard_revert: None,
                 })
             }
             Ok(HostCredentialControlResponse::Deleted { absence_digest })
@@ -5592,6 +5612,7 @@ impl WindowsInstallationEffectPort {
                     phase_b_receipt: None,
                     service_start_disposition: None,
                     service_runtime_lineage: None,
+                    guard_revert: None,
                 })
             }
             Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {
@@ -5820,6 +5841,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 phase_b_receipt: None,
                 service_start_disposition: None,
                 service_runtime_lineage: None,
+                guard_revert: None,
             }),
             WindowsRootOperation::Create => {
                 let Some(expected) = request.precondition.os_snapshot.as_ref() else {
@@ -5848,6 +5870,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                         phase_b_receipt: None,
                         service_start_disposition: None,
                         service_runtime_lineage: None,
+                        guard_revert: None,
                     });
                 }
                 let Some(root) = created.root else {
@@ -5879,6 +5902,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                                 phase_b_receipt: None,
                                 service_start_disposition: None,
                                 service_runtime_lineage: None,
+                                guard_revert: None,
                             },
                             missing: vec![pending],
                         };
@@ -5894,6 +5918,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     phase_b_receipt: None,
                     service_start_disposition: None,
                     service_runtime_lineage: None,
+                    guard_revert: None,
                 })
             }
             WindowsRootOperation::Rollback => {
@@ -5949,6 +5974,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     phase_b_receipt: None,
                     service_start_disposition: None,
                     service_runtime_lineage: None,
+                    guard_revert: None,
                 })
             }
         }
@@ -6023,6 +6049,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 phase_b_receipt: None,
                 service_start_disposition: None,
                 service_runtime_lineage: None,
+                guard_revert: None,
             });
         }
         let configuration_digest = registration.expected_configuration_digest();
@@ -6105,6 +6132,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             staging_receipt: None,
             phase_b_receipt: None,
             service_start_disposition: None,
+            guard_revert: None,
             service_runtime_lineage: None,
         })
     }
@@ -7598,6 +7626,7 @@ fn map_root_create_attempt(
                     phase_b_receipt: None,
                     service_start_disposition: None,
                     service_runtime_lineage: None,
+                    guard_revert: None,
                 },
                 missing: vec![pending],
             }))
@@ -8710,6 +8739,33 @@ where
                     }
                     other => return self.persist_unknown(transaction, index, port_pending(other)),
                 };
+                // A mutating call that returns a guard-revert composite has a
+                // safe-return failure to persist, not a success to reconcile.
+                // The composite is retained verbatim through the sealed
+                // compare-and-save below before any dependent reconcile, retry,
+                // or rollback runs. An invalid composite is a typed
+                // `IncompleteObservation` recorded as durable uncertainty; a
+                // persistence failure returns the store error with the durable
+                // record untouched, so the original effects are preserved and
+                // no retry is authorized here.
+                if let Some(outcome) = execution.guard_revert.clone() {
+                    if outcome.validate().is_err() {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:guard-revert-invalid")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    }
+                    let expected = TransactionVersion::of(&transaction)?;
+                    transaction.record_guard_revert(outcome)?;
+                    self.store.compare_and_save(expected, &transaction)?;
+                    if transaction.guard_revert_blocks_adoption() {
+                        return Ok(InstallationStepOutcome::RollbackRequired {
+                            pending_refs: transaction.pending_external_changes.clone(),
+                        });
+                    }
+                }
                 let is_start_apply = matches!(
                     transaction.installer_effects[index],
                     InstallerEffectPlan::StartService { .. }
@@ -9492,10 +9548,18 @@ where
                         InstallerEffectPlan::ProvisionStoreCredential { .. }
                     );
                     match self.port.execute(&request) {
-                        PortOutcome::Known(InstallationEffectExecution {
-                            create_disposition: None,
-                            ..
-                        }) => {}
+                        PortOutcome::Known(execution)
+                            if execution.create_disposition.is_none() =>
+                        {
+                            // The dependent rollback is already running, so the
+                            // composite is retained verbatim without touching
+                            // the rollback disposition; the rollback loop's own
+                            // compare-and-save persists it. A second, different
+                            // composite stays a typed identity conflict.
+                            if let Some(outcome) = execution.guard_revert.clone() {
+                                transaction.retain_guard_revert_during_rollback(outcome)?;
+                            }
+                        }
                         PortOutcome::Unknown(reason) if credential_effect => {
                             return Ok(InstallationStepOutcome::RollbackRequired {
                                 pending_refs: vec![port_pending(PortOutcome::<()>::Unknown(
@@ -9965,6 +10029,35 @@ where
         Ok(readback)
     }
 
+    /// Prepares the retained terminal-evidence reference for one exact
+    /// transaction without mutating it.
+    ///
+    /// A guard caller or restart reader calls this before acquiring the
+    /// bounded terminal sink or adopting the protected object: the returned
+    /// reference names the exact bounded record the guard owner bound into
+    /// the retained composite. `None` means this transaction retained no
+    /// composite; absence is never a completed cleanup and never authorizes
+    /// retry. This performs no readback and synthesizes no receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::TransactionNotFound`] when no such
+    /// transaction exists, and any error from the transaction's own invariants.
+    pub(crate) fn retained_guard_evidence_ref(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<Option<PlatformHandle>, InstallationError> {
+        let transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        Ok(transaction
+            .guard_revert()
+            .map(|retained| retained.evidence_ref().clone()))
+    }
+
     /// Recovery-only readback reconciliation for a first-install service-start
     /// timeout, called before the Host registry abort in
     /// `rollback_with_activation_owner`.
@@ -10266,8 +10359,9 @@ where
     /// it never discards the original effects and never invents a cleanup.
     ///
     /// The guard owners in `eliot-platform-windows` are the producers of this
-    /// composite (#860). Until they are wired, no in-tree caller exists and
-    /// this seam is the published entry point they call.
+    /// composite (#860) and call this seam directly. Composites that arrive
+    /// inside a mutating-call observation are instead retained by the effect
+    /// drive itself before any dependent reconcile, retry, or rollback.
     ///
     /// # Errors
     ///
@@ -10303,6 +10397,27 @@ where
     ) -> Result<TerminalContainmentReadback, InstallationError> {
         self.inner
             .reconcile_retained_guard_evidence(transaction_id, retained_record)
+    }
+
+    /// Prepares the retained terminal-evidence reference for one exact
+    /// transaction without mutating it.
+    ///
+    /// A guard caller or restart reader calls this before acquiring the
+    /// bounded terminal sink or adopting the protected object: the returned
+    /// reference names the exact bounded record the guard owner bound into
+    /// the retained composite. `None` means this transaction retained no
+    /// composite; absence is never a completed cleanup and never authorizes
+    /// retry. This performs no readback and synthesizes no receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::TransactionNotFound`] when no such
+    /// transaction exists, and any error from the transaction's own invariants.
+    pub fn retained_guard_evidence_ref(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<Option<PlatformHandle>, InstallationError> {
+        self.inner.retained_guard_evidence_ref(transaction_id)
     }
 
     /// Borrows only the durable store; the mutating port remains sealed.

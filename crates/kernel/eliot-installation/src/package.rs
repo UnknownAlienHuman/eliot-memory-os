@@ -1108,6 +1108,10 @@ pub(super) fn execute_package(
                     phase_b_receipt: None,
                     service_start_disposition: None,
                     service_runtime_lineage: None,
+                    // Package staging performs no guarded OS-state mutation, so
+                    // it never produces a composite; the slot is preserved here
+                    // so a carried value can never be dropped or fabricated.
+                    guard_revert: None,
                 }),
                 Err(error) => package_staging_outcome(&error),
             }
@@ -1156,6 +1160,11 @@ pub(super) fn execute_package(
                         phase_b_receipt: None,
                         service_start_disposition: None,
                         service_runtime_lineage: None,
+                        // Package staging performs no guarded OS-state
+                        // mutation, so it never produces a composite; the slot
+                        // is preserved here so a carried value can never be
+                        // dropped or fabricated.
+                        guard_revert: None,
                     })
                 }
                 Err(error) => package_staging_outcome(&error),

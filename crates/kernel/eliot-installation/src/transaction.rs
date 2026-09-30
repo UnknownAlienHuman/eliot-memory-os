@@ -2577,6 +2577,45 @@ impl InstallationTransaction {
         })
     }
 
+    /// Retains a guard-revert composite observed while the dependent rollback
+    /// was already running, without touching the rollback disposition.
+    ///
+    /// Unlike [`Self::record_guard_revert`], this never moves the stage and
+    /// never rewrites `pending_external_changes`: the rollback already owns
+    /// the uncertainty disposition, so the composite is only retained verbatim
+    /// for restart. A composite is refused as an identity conflict when one is
+    /// already retained; an absent composite is never a completed cleanup and
+    /// never authorizes retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::IdentityConflict`] when a composite is
+    /// already retained, and any error from the composite's own `validate()`
+    /// or the transaction's own invariants.
+    pub(crate) fn retain_guard_revert_during_rollback(
+        &mut self,
+        outcome: GuardRevertOutcome,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        if self.guard_revert.is_some() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let retained = RetainedGuardRevert {
+            outcome,
+            reconciliation: None,
+        };
+        retained.validate()?;
+        self.guard_revert = Some(retained);
+        self.revision =
+            self.revision
+                .checked_add(1)
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "overflow".to_owned(),
+                })?;
+        self.validate()
+    }
+
     /// Reconciles the exact retained bounded terminal record against the exact
     /// operation this transaction's composite names, and releases the block
     /// only when that record is complete and belongs to that operation.

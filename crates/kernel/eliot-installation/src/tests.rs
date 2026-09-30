@@ -498,6 +498,7 @@ impl InstallationEffectPort for FakeEffectPort {
             phase_b_receipt: None,
             service_start_disposition: None,
             service_runtime_lineage: None,
+            guard_revert: None,
         })
     }
 
@@ -1248,6 +1249,7 @@ fn secret_bytes_are_absent_from_json_debug_and_evidence() {
         phase_b_receipt: None,
         service_start_disposition: None,
         service_runtime_lineage: None,
+        guard_revert: None,
     })
     .unwrap_or_else(|_| unreachable!());
     assert!(!json.contains(&secret_hex));
@@ -2531,6 +2533,7 @@ fn configure_start_runtime_receipt(port: &mut FakeEffectPort, external_identity:
                 start_time_100ns: 23,
                 image_path: test_handle(r"C:\Eliot\host.exe"),
             }),
+            guard_revert: None,
         }));
 }
 
@@ -2548,6 +2551,7 @@ fn configure_start_already_running_execution(port: &mut FakeEffectPort, external
             phase_b_receipt: None,
             service_start_disposition: Some(InstallationServiceStartDisposition::AlreadyRunning),
             service_runtime_lineage: None,
+            guard_revert: None,
         }));
 }
 
@@ -2562,6 +2566,7 @@ fn configure_start_already_starting_execution(port: &mut FakeEffectPort) {
             phase_b_receipt: None,
             service_start_disposition: Some(InstallationServiceStartDisposition::AlreadyStarting),
             service_runtime_lineage: None,
+            guard_revert: None,
         }));
 }
 
@@ -2576,6 +2581,7 @@ fn configure_start_waiting_execution(port: &mut FakeEffectPort) {
             phase_b_receipt: None,
             service_start_disposition: Some(InstallationServiceStartDisposition::StartedByCaller),
             service_runtime_lineage: None,
+            guard_revert: None,
         }));
 }
 
@@ -2593,6 +2599,7 @@ fn configure_start_waiting_execution_with_lineage(
             phase_b_receipt: None,
             service_start_disposition: Some(InstallationServiceStartDisposition::StartedByCaller),
             service_runtime_lineage: Some(lineage),
+            guard_revert: None,
         }));
 }
 
@@ -4044,6 +4051,7 @@ fn partial_created_root_persists_disposition_and_never_resends_apply() {
             phase_b_receipt: None,
             service_start_disposition: None,
             service_runtime_lineage: None,
+            guard_revert: None,
         },
         missing: vec![test_handle("installer-root-win32-v2:readback:00000005")],
     });
