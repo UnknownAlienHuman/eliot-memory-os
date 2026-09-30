@@ -20,6 +20,8 @@ pub mod execution;
 pub mod kernel_client;
 pub mod protocol;
 
+use std::collections::BTreeMap;
+
 use eliot_contracts::StateFence;
 use eliot_process::{ExitDisposition, OperationId};
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
@@ -29,8 +31,8 @@ use eliot_research_exchange_api::{
 };
 use eliot_researcher::{
     AcquisitionOutcome, CandidateEvidence, InquiryGovernance, InquiryHorizon, InquiryObservation,
-    InquiryRisk, InquirySelectionFeatures, InquiryUncertainty, Researcher,
-    SpecialistDiscoverability, StreamEvidence, VerifierStrength,
+    InquiryRisk, InquirySelectionFeatures, InquiryUncertainty, Researcher, RetainedSourceRevision,
+    RetainedSourceRevisionParams, SpecialistDiscoverability, StreamEvidence, VerifierStrength,
 };
 use thiserror::Error;
 
@@ -535,6 +537,16 @@ struct SubmittedState {
     outcome: SubmittedOutcome,
     /// Immutable raw evidence when the attempt reached materialization.
     evidence: Option<RawProviderEvidence>,
+    /// The provider's exact captured stdout PREFIX, retained beside the raw
+    /// evidence rather than being reduced to the `StreamRecord` digest.
+    ///
+    /// W2 (`#1765`) requires the retained ORIGINAL, and `StreamRecord` carries
+    /// only a digest and a byte count. This is the byte string that digest was
+    /// computed over, kept here so the governance projection can retain the real
+    /// bytes instead of a hash of bytes nobody holds. `None` when the stream was
+    /// never captured, which the `StreamRecord`'s own `StreamOmission::NoHandle`
+    /// states independently.
+    retained_stdout: Option<Vec<u8>>,
     /// Provider-local job reference when the ack decoded.
     provider_job_ref: Option<String>,
     /// Cancellation receipt fragment when a cancellation was issued.
@@ -953,6 +965,30 @@ impl AdmittedResearchBridge {
         self.submitted().and_then(|state| state.evidence.as_ref())
     }
 
+    /// Returns the provider's exact retained stdout PREFIX for this attempt, when
+    /// one was captured.
+    ///
+    /// W2 (`#1765`) requires the retained ORIGINAL to be retained before
+    /// synthesis is admitted, and names the refused substitutes explicitly: "An
+    /// in-memory clone or hash of unavailable bytes is insufficient."
+    /// [`RawProviderEvidence::stdout`] is a `StreamRecord` — a digest and a byte
+    /// count with no content — so it cannot answer "retain their exact bytes" on
+    /// its own. These are the very bytes the executor drained and that the
+    /// `StreamRecord` digests were computed over in
+    /// [`crate::evidence::StreamRecord::capture`], so the retained revision and
+    /// the receipt's recorded content digest are two statements about one byte
+    /// string rather than two independent claims.
+    ///
+    /// `None` when the stream was never captured (`StreamOmission::NoHandle`) or
+    /// when the attempt never reached materialization. The omission state stays
+    /// on the `StreamRecord`, so a caller cannot mistake "no bytes retained" for
+    /// "an empty stream was observed".
+    #[must_use]
+    pub fn last_retained_stdout(&self) -> Option<&[u8]> {
+        self.submitted()
+            .and_then(|state| state.retained_stdout.as_deref())
+    }
+
     /// Returns the retained cancellation receipt fragment, when one was issued.
     ///
     /// Present after a deadline overrun and after an explicit cancel: a
@@ -1131,6 +1167,7 @@ impl ResearchBridge for AdmittedResearchBridge {
                 self.phase = BridgePhase::Submitted(Box::new(SubmittedState {
                     outcome,
                     evidence: Some(execution.evidence),
+                    retained_stdout: execution.retained_stdout,
                     provider_job_ref: Some(execution.provider_job_ref),
                     cancellation: execution.cancellation,
                     submission: Some(SubmissionRecord {
@@ -1189,6 +1226,15 @@ impl ResearchBridge for AdmittedResearchBridge {
                 self.phase = BridgePhase::Submitted(Box::new(SubmittedState {
                     outcome: terminal,
                     evidence: error.evidence().cloned(),
+                    // A failed attempt retains the `StreamRecord` digests and
+                    // byte counts the `BridgeError` variants carry, not the
+                    // captured bytes themselves. `None` here is therefore the
+                    // honest state rather than a gap in this record: the retained
+                    // original is exactly what was not retained on this path, and
+                    // W2 says a digest in place of content is insufficient — so
+                    // the governance projection retains nothing for this handle
+                    // instead of pretending the digest is the original.
+                    retained_stdout: None,
                     provider_job_ref: None,
                     cancellation: error.cancellation().cloned(),
                     submission,
@@ -1387,6 +1433,14 @@ pub const RELEASE_GATE_BLOCKED: &str = "blocked";
 /// acquisition code, and the `R6` domain keeps that inquiry open with its
 /// preserved explicit unknown and next probe.
 ///
+/// `retained_stdout` is the provider's exact captured stdout PREFIX, as drained
+/// by the executor, for the run this receipt terminates. W2 (`#1765`) requires the
+/// retained ORIGINAL to be retained before synthesis is admitted, and a hash of
+/// bytes nobody holds is explicitly not enough — so the bytes travel beside the
+/// receipt rather than being reconstructed from it. `None` is a real, reported
+/// state: a run whose readback did not yield the provider's bytes retains no
+/// original, which is the W2 finding rather than a silent pass.
+///
 /// # Errors
 ///
 /// Returns [`R6ProjectionError::UnboundAdmission`] when the admitted request and
@@ -1401,6 +1455,7 @@ pub fn project_admitted_inquiry(
     admission: &ProviderAdmission,
     receipt: &ProviderExecutionReceipt,
     failure: Option<&TerminalFailure>,
+    retained_stdout: Option<&[u8]>,
 ) -> Result<InquiryGovernance, crate::R6ProjectionError> {
     if receipt.operation_id.is_empty()
         || receipt.exchange_id != request.exchange_id
@@ -1473,20 +1528,29 @@ pub fn project_admitted_inquiry(
     // and an exhausted budget is neither.
     let degradation = acquisition_coverage_degradation(failure);
     // W2 (`#1765`): this projection carries the admitted request, the provider
-    // admission and the terminal receipt — and no retained source bytes. The
-    // crate that owns the observation states that a handle absent from
-    // `retained_revisions` is "a real finding rather than a skip", so the
-    // honest value here is the EMPTY map: every excerpt offered from a source
-    // this projection admitted then fails verification with
-    // `NoRetainedRevision`, which is the truthful W2 outcome for a run that did
-    // not persist before synthesis.
+    // admission and the terminal receipt — AND the provider's exact retained
+    // stdout bytes. The previous state hardcoded an empty map here, which made
+    // the whole downstream surface unreachable rather than fail-closed:
+    // `commit_freeze_through_source_admission` found no retained original for
+    // any record, produced an empty commit-request vector, and
+    // `CommittedFreeze::commit` refused that empty vector — so `record` returned
+    // `Err` on every real run and `main.rs` reported only
+    // `INQUIRY_GOVERNANCE_REFUSED` while still exiting zero.
     //
-    // It is deliberately NOT populated from the receipt, and no artifact
-    // reference is invented: this subtree has no canonical-store write
-    // authority, so a digest of bytes nobody holds is not a retained original.
-    // The provider path that DOES persist before synthesis supplies this map
-    // through the governed source-admission owner.
-    let retained_revisions = std::collections::BTreeMap::new();
+    // The bytes are NOT read from the receipt's `StreamRecord`, which holds a
+    // digest and a byte count and no content, and NOT fabricated here. They are
+    // the exact `CapturedStream` prefix the executor drained, handed in by
+    // `main.rs` from the same `finish_terminal` readback that produced the
+    // receipt's own stdout digest. `RetainedSourceRevision::retain` re-hashes the
+    // bytes it is given and refuses any that do not hash to the `content_digest`
+    // the record declares, so a byte set that was not this run's cannot be
+    // retained under this handle even if a caller tried.
+    //
+    // The artifact reference is the immutable identity the executor's own
+    // stream transport is filed under, not an invented locator: it names the
+    // captured stdout's content digest under this run's operation, which is a
+    // reference a reader can resolve back to the bytes.
+    let retained_revisions = retained_source_revisions(receipt, retained_stdout)?;
     let observation = InquiryObservation {
         inquiry_id: receipt.exchange_id.clone(),
         evidence_set_id: request.allowed_references.run_id.clone(),
@@ -1594,6 +1658,112 @@ fn admitted_selection_features(request: &ResearchQueryRequest) -> InquirySelecti
     }
 }
 
+/// Retains the exact admitted bytes of every source this run froze, keyed by the
+/// very handle the freeze looks them up under.
+///
+/// W2 (`#1765`) requires the governed source-admission owner to "retain their
+/// exact bytes or immutable accessible artifacts ... An in-memory clone or hash
+/// of unavailable bytes is insufficient." This is the retaining side of that, and
+/// it is deliberately constructed through the crate's only constructor,
+/// [`RetainedSourceRevision::retain`], rather than by struct literal, so the bytes
+/// are checked against the revision identity at construction instead of being
+/// taken on trust downstream.
+///
+/// # The key matches the freeze by construction, not by coincidence
+///
+/// [`retained_provider_material`] mints the candidate handle
+/// `provider-artifact:<receipt.raw.stdout.sha256>`, and
+/// `assess_sources` carries that handle straight onto the `SourceRecord` whose
+/// `content_digest` is that same stdout digest. `evidence_freeze` then collects
+/// exactly the eligible records' handles into `included_evidence_refs`, and
+/// `commit_freeze_through_source_admission` looks the retained original up by
+/// `record.record.handle`.
+///
+/// So the key here is built from `retained_provider_material`'s own handle
+/// expression rather than from a second, independently written format string:
+/// if the candidate handle moved, this map would miss the lookup instead of
+/// silently retaining bytes under a key nothing reads. The `content_digest`
+/// handed to `retain` is the receipt's own recorded stdout digest, which is
+/// `SourceRecord::content_digest`, and `retain` re-hashes the supplied bytes and
+/// refuses any set that does not reproduce it — so a retained original and the
+/// admitted record cannot disagree about what the bytes are.
+///
+/// # Why a missing capture yields no entry rather than an empty one
+///
+/// `retain` refuses blank bytes' digest pairing and the crate refuses an empty
+/// revision, so a run with no retained stdout produces no entry. That leaves the
+/// freeze commit-request vector empty again and the honest `CommittedFreeze`
+/// refusal stands — which is the correct outcome: a run that captured no bytes
+/// genuinely has no retained original, and I21.8 forbids admitting synthesis for
+/// it. The empty-vector refusal in `CommittedFreeze::commit` is therefore still
+/// doing its job here; this function only makes it reachable for a run that
+/// really did retain bytes.
+///
+/// # Snippet regions
+///
+/// The provider stdout is the provider process's own stdout bytes as the Kernel
+/// drained them — this boundary fetched nothing from a web page and ran no
+/// search engine, so there is no search-result excerpt to declare. The set is
+/// empty because the retaining owner has asserted there are none, which is what
+/// an empty set means on this type, and it is not a widened region that would
+/// make the snippet arm permanently pass.
+///
+/// # Errors
+///
+/// Returns [`R6ProjectionError::Domain`] when the retained bytes do not reproduce
+/// the receipt's own recorded stdout digest. That refusal is not softened: it
+/// means the bytes offered are not the bytes the receipt admits, and no retained
+/// original may be minted from them.
+fn retained_source_revisions(
+    receipt: &ProviderExecutionReceipt,
+    retained_stdout: Option<&[u8]>,
+) -> Result<BTreeMap<String, RetainedSourceRevision>, crate::R6ProjectionError> {
+    // The candidate's own handle and content digest, read off the same receipt
+    // fields `retained_provider_material` reads. Absent stdout means there is no
+    // candidate to retain an original for, so there is no entry to add.
+    let Some(content_digest) = receipt.raw.stdout.sha256.clone() else {
+        return Ok(BTreeMap::new());
+    };
+    // A run whose stream was never captured, or whose readback did not yield the
+    // provider's bytes, has no original to retain. That is the W2 finding, not a
+    // reason to retain something else under this handle.
+    let Some(bytes) = retained_stdout else {
+        return Ok(BTreeMap::new());
+    };
+    let handle = retained_provider_material_handle(&content_digest);
+    // The artifact reference names the immutable identity these bytes were
+    // committed under: the admitted operation, the stream kind, and the content
+    // digest they hash to. All three are this run's own recorded facts, so the
+    // reference resolves back to the bytes rather than pointing at nothing.
+    let artifact_ref = format!(
+        "provider-stream/{}/stdout/{content_digest}",
+        receipt.operation_id
+    );
+    let revision = RetainedSourceRevision::retain(RetainedSourceRevisionParams {
+        source_handle: handle.clone(),
+        artifact_ref,
+        content_digest,
+        bytes: bytes.to_vec(),
+        snippet_regions: Vec::new(),
+    })
+    .map_err(|error| {
+        crate::R6ProjectionError::Domain(eliot_researcher::InquiryError::Portfolio(error))
+    })?;
+    Ok(BTreeMap::from([(handle, revision)]))
+}
+
+/// The handle a retained provider artifact is frozen under.
+///
+/// Owned by this one function and read by both [`retained_provider_material`]
+/// (which mints the candidate) and [`retained_source_revisions`] (which retains
+/// the original for it), because the freeze looks the retained original up by
+/// exactly the handle the candidate published. Two format strings here would let
+/// the retained bytes be filed under a key the freeze never queries, which is a
+/// silent hole rather than a loud failure.
+fn retained_provider_material_handle(content_digest: &str) -> String {
+    format!("provider-artifact:{content_digest}")
+}
+
 /// Projects the retained provider material of one run into the candidate source
 /// material the `R6` boundary assesses.
 ///
@@ -1617,7 +1787,7 @@ fn retained_provider_material(
         |record| record.transport_sha256.clone(),
     );
     Some(CandidateEvidence {
-        handle: format!("provider-artifact:{content_digest}"),
+        handle: retained_provider_material_handle(&content_digest),
         class: request
             .source_classes
             .first()
