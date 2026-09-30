@@ -3996,7 +3996,7 @@ impl BoundedRequestLoop {
     /// sequence actually holds and therefore cannot let a frame's
     /// `observation_predecessors` name an event the sequence does not retain.
     fn retain_slot_available(&self, digest: &str) -> bool {
-        let held = self.retained.get(digest).map_or(0, |events| events.len());
+        let held = self.retained.get(digest).map_or(0, Vec::len);
         u64::try_from(held).is_ok_and(|count| count < MAX_RESULT_SEQUENCE)
     }
 
@@ -5650,6 +5650,35 @@ fn seal_served_outcome(
     Ok(())
 }
 
+/// Republishes one complete retained result-event sequence on this process's
+/// new transport, through the ordinary result owner's own serializer,
+/// validator and emitter (#2787 audit defect 1).
+///
+/// The owner here is [`DeliverySetChannel::replay_only`], so this path admits
+/// no request, issues no permit, spawns no guest worker, and deletes no staged
+/// evidence: it is the original sequence, in order, emitted by the same owner
+/// that emits a freshly observed event.
+///
+/// Tracked termination of that emission runs on BOTH edges. A publication
+/// failure can leave a still blocked writer in `pending_helper` — a bounded
+/// caller timeout is a timeout, never bounded termination of the writer — so
+/// the failure edge runs the same tracked cleanup the success edge does instead
+/// of returning into the drop, which would discard a live helper handle and
+/// report a clean stop. A contained helper is reported to the process owner and
+/// outranks the publication error it arrived with, exactly as the ordinary
+/// terminal edge does.
+fn republish_retained_sequence(
+    events: &[WasmHostResultFrame],
+) -> Result<OrdinaryOutcome, OrdinaryDriveError> {
+    let mut replay_owner = DeliverySetChannel::replay_only();
+    let terminal = replay_owner.publish_retained_sequence(events);
+    let containment = replay_owner.cleanup_output_helper();
+    match (terminal, containment) {
+        (Ok(terminal), Ok(())) => Ok(terminal),
+        (Ok(_) | Err(_), Err(error)) | (Err(error), Ok(())) => Err(OrdinaryDriveError::Loop(error)),
+    }
+}
+
 /// Hands the exact retained sequence to the claim-bound result owner one
 /// last time on the failure edge (#2787 audit defect 3).
 ///
@@ -5965,30 +5994,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                     && let ServedResultReadback::Complete { events } =
                         read_back_served_result(&directory, &identity)
                 {
-                    let mut replay_owner = DeliverySetChannel::replay_only();
-                    // The tracked cleanup runs on both edges of this one
-                    // emission. A publication failure can retain a still
-                    // blocked writer in `pending_helper` (a bounded caller
-                    // timeout is a timeout, never bounded termination of the
-                    // writer), so the failure edge runs the same cleanup the
-                    // success edge does instead of returning into the drop
-                    // below, which would discard a live helper handle and
-                    // report a clean stop. Containment outranks the bare
-                    // publication error, exactly as the ordinary edge does.
-                    let terminal = replay_owner.publish_retained_sequence(&events);
-                    // Tracked termination of the replay emission: a helper
-                    // still holding stdout is reported to the process owner
-                    // rather than reported as a clean republication. A
-                    // contained helper outranks the publication error it came
-                    // with, as it does on the ordinary terminal edge.
-                    let containment = replay_owner.cleanup_output_helper();
-                    return match (terminal, containment) {
-                        (Ok(terminal), Ok(())) => Ok(terminal),
-                        (Ok(_), Err(error)) | (Err(_), Err(error)) => {
-                            Err(OrdinaryDriveError::Loop(error))
-                        }
-                        (Err(error), Ok(())) => Err(OrdinaryDriveError::Loop(error)),
-                    };
+                    return republish_retained_sequence(&events);
                 }
                 // The classifier also treats a differing identity under the
                 // same spent grant as Replay, and an InFlight-named set as
