@@ -2561,11 +2561,7 @@ fn restore_test_receipt(response: &Value) -> Result<RestoreTestEvidence, BackupC
 fn restore_evidence_level_name(level: RestoreEvidenceLevel) -> String {
     serde_json::to_value(level)
         .ok()
-        .and_then(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-        })
+        .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{level:?}"))
 }
 
@@ -2677,7 +2673,11 @@ fn require_restore_receipt_claim(
     // passes it. What the validator cannot know is that this route could not have
     // produced one, and that is the relation this arm adds — read off the owner's
     // own predicate rather than off a table of rung names kept beside it.
-    if evidence.receipt.evidence_level.permits_operational_readiness() {
+    if evidence
+        .receipt
+        .evidence_level
+        .permits_operational_readiness()
+    {
         let level_name = restore_evidence_level_name(evidence.receipt.evidence_level);
         return Err(UnprovenClaim {
             obligation: format!(
@@ -3186,9 +3186,7 @@ fn rehearsal_ceiling(
     receipt_id: &str,
 ) -> Result<(ProofCeiling, EffectClass), UnprovenClaim> {
     match level {
-        RestoreEvidenceLevel::ArchiveValid => {
-            Ok((ProofCeiling::Observation, EffectClass::Read))
-        }
+        RestoreEvidenceLevel::ArchiveValid => Ok((ProofCeiling::Observation, EffectClass::Read)),
         RestoreEvidenceLevel::IsolatedImportComplete
         | RestoreEvidenceLevel::ReconciliationRequired => {
             Ok((ProofCeiling::CandidateArtifact, EffectClass::Candidate))
