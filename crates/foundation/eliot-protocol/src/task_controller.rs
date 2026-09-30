@@ -390,6 +390,8 @@ pub struct TaskControllerOrientationPrepareInputV1 {
     pub admitted_orientation_job: TaskControllerCanonicalSourcePublication,
     /// Original K0 job-attempt identity issued for this job publication.
     pub job_attempt_id: eliot_contracts::ArtifactId,
+    /// Original Artifact-owner publication of the complete runtime execution input.
+    pub runtime_owner_execution_input: TaskControllerCanonicalSourcePublication,
     /// Original admitted WorkScope binding, checked again by Governor.
     pub work_scope: eliot_receipts::WorkScopeBinding,
     /// Original OutputSchema artifact reference from the job recipe.
@@ -537,6 +539,9 @@ impl TaskControllerOrientationPrepareInputV1 {
             "task_controller_invocation.orientation_prepare.classification_source_readback",
         )?;
         self.cue_admission_input.validate()?;
+        self.runtime_owner_execution_input.validate(
+            "task_controller_invocation.orientation_prepare.runtime_owner_execution_input",
+        )?;
         self.provider_staffing_source
             .validate("task_controller_invocation.orientation_prepare.provider_staffing_source")?;
         Ok(())
