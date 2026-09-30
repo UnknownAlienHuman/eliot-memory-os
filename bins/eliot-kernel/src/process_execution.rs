@@ -136,7 +136,9 @@ fn record_process_owner_operation_context(
     record_process_context_field(
         context,
         "authority_epoch",
-        authority_epoch.as_ref().map(|epoch| epoch.as_str()),
+        authority_epoch
+            .as_ref()
+            .map(eliot_contracts::LowercaseSha256::as_str),
     );
 }
 
@@ -152,7 +154,9 @@ fn record_process_start_request_context(
     record_process_context_field(
         context,
         "authority_epoch",
-        owner_authority_epoch.as_ref().map(|epoch| epoch.as_str()),
+        owner_authority_epoch
+            .as_ref()
+            .map(eliot_contracts::LowercaseSha256::as_str),
     );
     if admission.validate().is_err() {
         return;
@@ -2871,41 +2875,6 @@ impl ProcessExecutionGateway {
         }
     }
 
-    #[cfg(windows)]
-    pub(crate) async fn inspect_exact_running_receipt(
-        &self,
-        receipt: &ProcessStartReceipt,
-    ) -> Result<(), ProcessExecutionError> {
-        receipt.validate()?;
-        let record = self
-            .replay_store
-            .load_process_start(receipt.operation_id())
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
-            .ok_or(ProcessExecutionError::NotFound)?;
-        if record.state != ProcessExecutionReplayState::Completed
-            || record.receipt.as_ref() != Some(receipt)
-        {
-            return Err(ProcessExecutionError::UnknownOutcome);
-        }
-        let view = match self
-            .inspect(&record.owner, receipt.operation_id().clone())
-            .await
-        {
-            Ok(view) => view,
-            Err(ProcessExecutionError::NotFound | ProcessExecutionError::UnknownOutcome) => {
-                return Err(ProcessExecutionError::UnknownOutcome);
-            }
-            Err(error) => return Err(error),
-        };
-        if view.lifecycle() != ProcessLifecycle::Running
-            || view.binding() != receipt.binding()
-            || view.identity() != Some(receipt.identity())
-        {
-            return Err(ProcessExecutionError::UnknownOutcome);
-        }
-        Ok(())
-    }
-
     /// Validates a live receipt under its caller's operation span without
     /// assigning a terminal. The live-receipt owner remains responsible for
     /// the one terminal covering both receipt validation and physical inspect.
@@ -3253,24 +3222,23 @@ impl ProcessExecutionGateway {
         eliot_process::OperationId,
         Result<DescendantClosureReceipt, ProcessExecutionError>,
     )> {
-        let registered = match self.descendants.lock() {
-            Ok(registry) => registry.registered_operation_ids(),
-            Err(_) => {
-                let context = super::kernel_diagnostics::operation_context(None, None, None, None);
-                let error = ProcessExecutionError::Unavailable(
-                    "descendant registry lock poisoned".to_owned(),
-                );
-                observe_process_in_context(
-                    &context,
-                    "kernel.process.descendant_close_failed",
-                    "unavailable",
-                );
-                super::kernel_diagnostics::observe_terminal_error_in_context(
-                    process_terminal_code(&error),
-                    &context,
-                );
-                return Vec::new();
-            }
+        let registered = if let Ok(registry) = self.descendants.lock() {
+            registry.registered_operation_ids()
+        } else {
+            let context = super::kernel_diagnostics::operation_context(None, None, None, None);
+            let error = ProcessExecutionError::Unavailable(
+                "descendant registry lock poisoned".to_owned(),
+            );
+            observe_process_in_context(
+                &context,
+                "kernel.process.descendant_close_failed",
+                "unavailable",
+            );
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                &context,
+            );
+            return Vec::new();
         };
         let mut outcomes = Vec::with_capacity(registered.len());
         for operation_id in registered {
@@ -4101,6 +4069,10 @@ impl KernelComposition {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the compatibility request entry keeps admission, dispatch, and response projection in one ordered boundary"
+    )]
     pub async fn execute_process_request(
         &self,
         session: &Session,
