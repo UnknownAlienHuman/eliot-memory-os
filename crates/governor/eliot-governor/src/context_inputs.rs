@@ -909,7 +909,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         };
         Ok(retain_negative_memory_response(
             named_request,
-            named_response,
+            &named_response,
             response.identity,
             &request.scope_id,
             &ctx.state_fence,
@@ -1115,7 +1115,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
 
 fn retain_negative_memory_response(
     named_request: NamedReadRequest,
-    named_response: NamedReadResponse,
+    named_response: &NamedReadResponse,
     identity: ReadIdentity,
     expected_scope: &ScopeId,
     expected_fence: &eliot_contracts::StateFence,

@@ -4640,6 +4640,7 @@ impl MemoryStore {
                 "receipt_state_fence".to_owned(),
                 json!(&receipt.state_fence),
             );
+            current.insert("write_receipt".to_owned(), json!(receipt));
             Some(Value::Object(current))
         } else {
             None
