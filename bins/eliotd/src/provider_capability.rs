@@ -8,7 +8,7 @@
 //! never from caller strings.
 //!
 //! I10.15: "admission is a fail-closed saga rather than a fictitious
-//! cross-store transaction" — "1. AgentCoordinator revalidates dependencies,
+//! cross-store transaction" — "1. `AgentCoordinator` revalidates dependencies,
 //! State Fence, recipe, route evidence and policy. 2. Kernel stages an
 //! inactive `AdmissionReservation` in ORS for the exact work item". I10.11:
 //! each adapter "returns candidate artifact, raw native events and provider
@@ -30,7 +30,9 @@
 //! diagnostics. Issue #265 catalogue/quota/liveness observations ride only in
 //! the health half: selection/health input, never admission.
 
-use eliot_agent_coordinator::{AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial};
+use eliot_agent_coordinator::{
+    AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial,
+};
 use eliot_contracts::fences_match_exact;
 
 use crate::agent_fabric::FabricError;

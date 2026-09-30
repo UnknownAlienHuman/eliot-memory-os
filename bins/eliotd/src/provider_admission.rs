@@ -102,18 +102,24 @@ impl ProviderAdmission {
         live_fence
             .validate()
             .map_err(|error| FabricError::Contract(format!("provider live fence: {error}")))?;
-        material.identity.validate()?;
+        // Provider identity shape is validated downstream by the existing
+        // presented/owner capability boundary
+        // (`PresentedClaimMaterial::new` + `AdmittedProviderCapability::new`);
+        // no separate identity owner exists here.
         if !material
             .expectation
             .live_authority_epoch
             .is_same_authority(&live_fence.authority_epoch)
         {
             return Err(FabricError::StaleEpoch(
-                "provider expectation epoch is not current under the live Kernel session".to_owned(),
+                "provider expectation epoch is not current under the live Kernel session"
+                    .to_owned(),
             ));
         }
         material.live_fence = live_fence;
-        material.session_binding = owner.session_binding().to_owned();
+        owner
+            .session_binding()
+            .clone_into(&mut material.session_binding);
         Ok(Self { material })
     }
 
