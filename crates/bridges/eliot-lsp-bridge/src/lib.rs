@@ -2187,7 +2187,8 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
             started.build_fingerprint.as_ref(),
             candidate_identity_after_run,
             build_fingerprint_after_run,
-        ) && process_succeeded(process_completed, exit_code)
+        ) && source_artifact_can_claim_current(&started.operation)
+            && process_succeeded(process_completed, exit_code)
             && !process_truncated
             && matches!(&result.receipt().disposition, FailureDisposition::Success)
         {
@@ -3464,8 +3465,21 @@ fn source_binding_matches_current(
 }
 
 fn bridge_result_is_current_candidate(result: &NormalizedResult) -> bool {
-    matches!(&result.receipt().disposition, FailureDisposition::Success)
+    matches!(
+        result,
+        NormalizedResult::Diagnostics { .. } | NormalizedResult::Version { .. }
+    ) && matches!(&result.receipt().disposition, FailureDisposition::Success)
         && !result.receipt().output_handles.is_empty()
+}
+
+fn source_artifact_can_claim_current(operation: &SemanticOperation) -> bool {
+    // SCIP output paths still lack the existing admitted output-layout receipt
+    // that proves the file lane belongs to this process operation. An
+    // operation-id directory and a prelaunch-absent path alone cannot prove it.
+    matches!(
+        operation,
+        SemanticOperation::Diagnostics | SemanticOperation::ProbeVersion
+    )
 }
 
 fn validate_recorded_freshness(
@@ -3489,7 +3503,8 @@ fn validate_recorded_freshness(
             binding.build_fingerprint_at_dispatch.as_ref(),
             binding.candidate_identity_after_run.as_ref(),
             binding.build_fingerprint_after_run.as_ref(),
-        ) || !process_succeeded(completed, exit_code)
+        ) || !source_artifact_can_claim_current(&record.operation)
+            || !process_succeeded(completed, exit_code)
             || truncated
             || !matches!(
                 &record.result.receipt().disposition,
