@@ -366,6 +366,11 @@ impl DurableJobRuntimeOwnerExecutionInput {
             || !self.context_campaign_recipe.is_object()
             || !self.context_campaign_recipe_policy.is_object()
             || !self.context_compilation_input.is_object()
+            || self
+                .context_compilation_input
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                != Some(1)
             || !self.orientation_classification_source_readback.is_object()
             || self.native_worker_claim_id.trim().is_empty()
             || self.native_worker_claim_id.chars().any(char::is_control)
