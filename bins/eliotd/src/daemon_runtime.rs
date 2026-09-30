@@ -31,9 +31,9 @@
 //! embeds the original evidence in the immutable prepared operation, and uses
 //! the reusable owner-selection port before transport. Generic task-relative
 //! callers without that bundle fail closed. The separate Observe capture
-//! producer remains on the existing claim/serve flight and must use the same
-//! gate; it is not replaced by a new scheduler. This module still has no
-//! production caller of `commit_canonical_and_refresh`, so it does not invent
+//! producer uses the same owner selection and observed-scope admission on the
+//! existing claim/serve flight; it is not replaced by a new scheduler. This
+//! module still has no production caller of `commit_canonical_and_refresh`, so it does not invent
 //! an onboarding receipt or selection to create one.
 
 use std::cell::RefCell;
@@ -48,10 +48,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_governor::{
     KernelGenerationSnapshotProvider, KernelTransitionPort, McpObservationCaptureInput,
+    ObservationCaptureOwnerBinding, ObservationCaptureOwnerOrigin,
 };
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
-    AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
+    AgentActivationKernelOwnerReadback, AgentActivationObservationHostPolicyReadback,
+    AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile, HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestResultBody,
@@ -3484,6 +3486,64 @@ fn resolve_valid_ticket(
     } else {
         result
     };
+    let result = if matches!(
+        &result.disposition,
+        AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+            | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+            | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+    ) {
+        let peer_receipt = ticket.peer_admission_receipt.as_ref().ok_or_else(|| {
+            format!(
+                "negative activation ticket {} has no retained Host peer receipt",
+                ticket.ticket_id
+            )
+        })?;
+        let owner_binding = composition
+            .host_origin_observation_owner_binding(peer_receipt)
+            .map_err(|error| {
+                format!(
+                    "daemon Host-origin observation owner ticket {}: {error}",
+                    ticket.ticket_id
+                )
+            })?;
+        let owner_projection_value = owner_binding
+            .canonical_value()
+            .map_err(|error| format!("Host-origin observation projection: {error}"))?;
+        let owner_projection_sha256 = owner_binding
+            .canonical_digest()
+            .map_err(|error| format!("Host-origin observation projection digest: {error}"))?;
+        let kernel_owner = kernel_owner
+            .as_ref()
+            .map_err(|error| {
+                format!(
+                    "daemon activation Kernel owner readback ticket {}: {error}",
+                    ticket.ticket_id
+                )
+            })?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "cold Host-origin observation policy has no exact P-07 owner readback for ticket {}",
+                    ticket.ticket_id
+                )
+            })?;
+        result
+            .with_observation_host_policy_readback(AgentActivationObservationHostPolicyReadback {
+                owner_projection_value,
+                owner_projection_sha256,
+                observed_at_unix_ms: now,
+                kernel_owner,
+            })
+            .map_err(|error| {
+                format!(
+                    "daemon Host-origin observation projection ticket {}: {error}",
+                    ticket.ticket_id
+                )
+            })?
+    } else {
+        result
+    };
     let semantic_owner = if matches!(
         &result.disposition,
         AgentActivationResolutionDisposition::Resolved { .. }
@@ -4824,12 +4884,14 @@ async fn submit_local_read_result_idempotent(
 /// superseded capability (the next claim mints the current generation anew).
 /// Every outcome idles until the next tick; only a step failure fails the
 /// daemon closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObservePollOutcome {
     IdleBackoff,
     Deferred,
     Settled,
     Expired,
     StaleAttempt,
+    ReconciliationRequired,
 }
 
 /// Completion of one in-flight observe step. Claim, serve, and defer share
@@ -4953,6 +5015,7 @@ fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
         ObservePollOutcome::Settled => "settled",
         ObservePollOutcome::Expired => "expired",
         ObservePollOutcome::StaleAttempt => "stale_attempt",
+        ObservePollOutcome::ReconciliationRequired => "reconciliation_required",
     }
 }
 
@@ -4997,7 +5060,8 @@ async fn run_observe_poll(
         suboperation: Some(deferral.suboperation.as_str()),
         owner_capability: Some(deferral.owner_capability),
         residual_owner: Some(deferral.residual_owner),
-        resume: Some(deferral.resume),
+        resume: (outcome != ObservePollOutcome::ReconciliationRequired)
+            .then_some(deferral.resume),
     };
     if deferral.suboperation == eliotd::governor_observe_serve::ObserveSuboperation::Observation {
         let body = prepare_observation_capture(kernel, composition, claimed).await?;
@@ -5015,6 +5079,9 @@ async fn run_observe_poll(
             ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,
             ObserveDeferOutcome::Expired => ObservePollOutcome::Expired,
             ObserveDeferOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
+            ObserveDeferOutcome::ReconciliationRequired => {
+                ObservePollOutcome::ReconciliationRequired
+            }
         };
     Ok(step(outcome))
 }
@@ -5035,17 +5102,87 @@ async fn prepare_observation_capture(
         .as_ref()
         .ok_or_else(|| "Observe claim has no retained executable input".to_owned())?;
     let application = &executable.application_binding;
-    let principal_ref = application.principal_ref.as_str().to_owned();
     let retained_policy_value = &application.observation_policy_binding;
     let retained_policy_digest = &application.observation_policy_binding_sha256;
     let retained_capture_clock = application.clock_reading.clone();
     let semantic_fence = application.state_fence.clone();
     if application.request_identity != serde_json::to_value(host_identity)
         .map_err(|error| format!("Host Observe identity cannot encode: {error}"))?
-        || application.session_ref.as_str()
-            != host_identity.session_id.as_deref().unwrap_or_default()
     {
         return Err("Observe application binding differs from its admitted identity".to_owned());
+    }
+    if claimed.peer_admission_receipt != serde_json::from_value(
+        application.host_peer_admission_receipt.clone(),
+    )
+    .map_err(|error| format!("retained Host peer receipt cannot decode: {error}"))?
+        || claimed.source_activation_ticket
+            != serde_json::from_value(application.source_activation_ticket.clone())
+                .map_err(|error| format!("retained activation ticket cannot decode: {error}"))?
+    {
+        return Err("Observe ORS row differs from its exact peer receipt or activation ticket".to_owned());
+    }
+    let retained_owner_binding: ObservationCaptureOwnerBinding =
+        serde_json::from_value(retained_policy_value.clone()).map_err(|error| {
+            format!("retained Observe owner projection cannot decode: {error}")
+        })?;
+    let policy_origin = retained_owner_binding.origin.clone();
+    let principal_ref = match &policy_origin {
+        ObservationCaptureOwnerOrigin::ApplicationSession {
+            authenticated_principal_ref,
+            authenticated_session_ref,
+            ..
+        } => {
+            if !matches!(
+                &claimed.source_activation_result.disposition,
+                AgentActivationResolutionDisposition::Resolved { .. }
+            )
+                || application.principal_ref.as_ref().map(|value| value.as_str())
+                != Some(authenticated_principal_ref.as_str())
+                || application.session_ref.as_ref().map(|value| value.as_str())
+                    != Some(authenticated_session_ref.as_str())
+                || host_identity
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|session| session != authenticated_session_ref)
+            {
+                return Err("Observe application owner identity differs from the retained Policy origin".to_owned());
+            }
+            Some(authenticated_principal_ref.clone())
+        }
+        ObservationCaptureOwnerOrigin::HostPeer {
+            domain,
+            peer_admission_receipt,
+        } => {
+            let host_policy_readback = claimed
+                .source_activation_result
+                .observation_host_policy_readback
+                .as_ref()
+                .ok_or_else(|| "Host-origin capture has no retained negative-result policy readback".to_owned())?;
+            if *domain != eliot_governor::ObservationCaptureHostOriginDomain::AgentBridge
+                || peer_admission_receipt != &claimed.peer_admission_receipt
+                || application.principal_ref.is_some()
+                || application.session_ref.is_some()
+                || application.task_ref.is_some()
+                || matches!(
+                    &claimed.source_activation_result.disposition,
+                    AgentActivationResolutionDisposition::Resolved { .. }
+                )
+                || host_policy_readback.owner_projection_value != *retained_policy_value
+                || host_policy_readback.owner_projection_sha256 != *retained_policy_digest
+            {
+                return Err("Observe Host-origin binding contains an unrelated app selection".to_owned());
+            }
+            None
+        }
+    };
+    if application.scope_ref.as_ref().map(|scope| scope.as_str())
+        .is_some_and(|scope| scope != retained_owner_binding.authenticated_scope_ref)
+        || host_identity
+            .work_scope_id
+            .as_deref()
+            .is_some_and(|scope| scope != retained_owner_binding.authenticated_scope_ref)
+    {
+        return Err("Observe scope claim differs from the current retained WorkScope owner".to_owned());
     }
     let capture_binding = {
         let guard = composition.lock().await;
@@ -5053,33 +5190,19 @@ async fn prepare_observation_capture(
         if live_fence != semantic_fence {
             return Err("Observe request fence is no longer current".to_owned());
         }
-        let binding = guard
-            .current_activation_observation_owner_binding(unix_ms(SystemTime::now())?)
-            .map_err(|error| format!("Observe current owner binding: {error}"))?;
-        if binding.authenticated_principal_ref != principal_ref
-            || binding.authenticated_session_ref != host_identity.session_id.as_deref().unwrap_or_default()
-            || application.scope_ref.as_ref().map(|scope| scope.as_str())
-                != Some(binding.authenticated_scope_ref.as_str())
-            || host_identity
-                .work_scope_id
-                .as_deref()
-                .is_some_and(|scope| scope != binding.authenticated_scope_ref)
-            || binding.authenticated_task_ref.is_some()
-            || binding.state_fence != semantic_fence
-        {
-            return Err("Observe current activation owners do not match the request".to_owned());
-        }
-        let retained_digest = sha256_hex(
-            &canonical_json_bytes(retained_policy_value)
-                .map_err(|error| format!("retained Observe policy binding: {error}"))?,
-        );
+        let binding = current_observation_owner_binding(
+            &guard,
+            &policy_origin,
+            unix_ms(SystemTime::now())?,
+        )?;
         let current_value = binding
             .canonical_value()
             .map_err(|error| format!("current Observe owner binding: {error}"))?;
         let current_digest = binding
             .canonical_digest()
             .map_err(|error| format!("current Observe owner binding digest: {error}"))?;
-        if &retained_digest != retained_policy_digest
+        if binding.state_fence != semantic_fence
+            || claimed.attempt.scope_id != binding.authenticated_scope_ref
             || current_value != *retained_policy_value
             || &current_digest != retained_policy_digest
         {
@@ -5090,11 +5213,17 @@ async fn prepare_observation_capture(
         binding
     };
     let work_scope = capture_binding.work_scope_binding.clone();
-    let task_selection = if let Some(task_ref) = host_identity.task_id.as_deref() {
-        let session_ref = host_identity
-            .session_id
-            .as_deref()
-            .ok_or_else(|| "task-relative Observe request has no authenticated session".to_owned())?;
+    let app_session = match &policy_origin {
+        ObservationCaptureOwnerOrigin::ApplicationSession {
+            authenticated_principal_ref,
+            authenticated_session_ref,
+            ..
+        } => Some((authenticated_principal_ref.as_str(), authenticated_session_ref.as_str())),
+        ObservationCaptureOwnerOrigin::HostPeer { .. } => None,
+    };
+    let task_selection = if let (Some((principal_ref, session_ref)), Some(task_ref)) =
+        (app_session, host_identity.task_id.as_deref())
+    {
         let scope_ref = capture_binding.authenticated_scope_ref.as_str();
         let now = unix_ms(SystemTime::now())?;
         let pending = {
@@ -5102,7 +5231,7 @@ async fn prepare_observation_capture(
             guard
                 .prepare_task_selection_for_request(
                     now,
-                    &principal_ref,
+                    principal_ref,
                     session_ref,
                     task_ref,
                     scope_ref,
@@ -5159,15 +5288,22 @@ async fn prepare_observation_capture(
         None
     };
     let mut identity = claimed.source_request_identity.clone();
-    let session_ref = capture_binding.authenticated_session_ref.as_str();
-    let session_id = eliot_contracts::SessionId::new(session_ref.to_owned())
-        .map_err(|error| format!("Observe owner session id is invalid: {error}"))?;
+    let session_id = match &policy_origin {
+        ObservationCaptureOwnerOrigin::ApplicationSession {
+            authenticated_session_ref,
+            ..
+        } => Some(
+            eliot_contracts::SessionId::new(authenticated_session_ref.clone())
+                .map_err(|error| format!("Observe owner session id is invalid: {error}"))?,
+        ),
+        ObservationCaptureOwnerOrigin::HostPeer { .. } => None,
+    };
     let task_id = task_selection
         .as_ref()
         .map(|selection| eliot_contracts::TaskId::new(selection.task_ref().to_owned()))
         .transpose()
         .map_err(|error| format!("selected Observe task id is invalid: {error}"))?;
-    identity.request.metadata.session_id = Some(session_id);
+    identity.request.metadata.session_id = session_id;
     identity.request.metadata.task_id = task_id;
     identity.request.metadata.state_fence = semantic_fence.clone();
     identity.request.state_fence = semantic_fence.clone();
@@ -5180,16 +5316,33 @@ async fn prepare_observation_capture(
         if live_fence != semantic_fence {
             return Err("Observe request fence moved before Host scope observation".to_owned());
         }
-        let session_ref = identity.request.metadata.session_id.as_ref()
-            .map(eliot_contracts::SessionId::as_str)
-            .unwrap_or_default();
         match task_selection.as_ref() {
             Some(owner) => guard
                 .activation_workspace_locator_for_selection(owner)
                 .map_err(|error| format!("Observe retained task workspace locator: {error}"))?,
-            None => guard
-                .activation_workspace_locator_for_scope(&principal_ref, session_ref, &work_scope)
-                .map_err(|error| format!("Observe retained scope workspace locator: {error}"))?,
+            None => match &policy_origin {
+                ObservationCaptureOwnerOrigin::ApplicationSession {
+                    authenticated_principal_ref,
+                    authenticated_session_ref,
+                    ..
+                } => guard
+                    .activation_workspace_locator_for_scope(
+                        authenticated_principal_ref,
+                        authenticated_session_ref,
+                        &work_scope,
+                    )
+                    .map_err(|error| format!("Observe retained scope workspace locator: {error}"))?,
+                ObservationCaptureOwnerOrigin::HostPeer {
+                    peer_admission_receipt,
+                    ..
+                } => guard
+                    .host_origin_workspace_locator_for_scope(
+                        peer_admission_receipt,
+                        claimed.source_activation_ticket.activation_request_id.as_str(),
+                        &work_scope,
+                    )
+                    .map_err(|error| format!("Observe retained Host-origin workspace locator: {error}"))?,
+            },
         }
     };
     let live_fence = semantic_fence.clone();
@@ -5208,9 +5361,11 @@ async fn prepare_observation_capture(
         return Err("Observe fresh Host scope does not match the retained WorkScope".to_owned());
     }
     let task_selection = if let Some(previous) = task_selection.as_ref() {
-        let session_ref = identity.request.metadata.session_id.as_ref()
-            .map(eliot_contracts::SessionId::as_str)
-            .unwrap_or_default();
+        let (Some((principal_ref, session_ref)), Some(_)) =
+            (app_session, identity.request.metadata.task_id.as_ref())
+        else {
+            return Err("task-bound Observe selection lost its authenticated app owner".to_owned());
+        };
         let task_ref = previous.task_ref();
         let scope_ref = capture_binding.authenticated_scope_ref.as_str();
         let pending = {
@@ -5218,7 +5373,7 @@ async fn prepare_observation_capture(
             guard
                 .prepare_task_selection_for_request(
                     unix_ms(SystemTime::now())?,
-                    &principal_ref,
+                    principal_ref,
                     session_ref,
                     task_ref,
                     scope_ref,
@@ -5259,15 +5414,13 @@ async fn prepare_observation_capture(
         .map_err(|error| format!("Observe operation identity is invalid: {error}"))?;
     let prepared = {
         let guard = composition.lock().await;
-        let current = guard
-            .current_activation_observation_owner_binding(unix_ms(SystemTime::now())?)
-            .map_err(|error| format!("Observe owner revalidation before prepare: {error}"))?;
-        if current
-            .canonical_value()
-            .map_err(|error| error.to_string())?
-            != capture_binding
-                .canonical_value()
-                .map_err(|error| error.to_string())?
+        let current = current_observation_owner_binding(
+            &guard,
+            &policy_origin,
+            unix_ms(SystemTime::now())?,
+        )?;
+        if current.canonical_value().map_err(|error| error.to_string())?
+            != capture_binding.canonical_value().map_err(|error| error.to_string())?
             || guard.governor_kernel_fence() != live_fence
         {
             return Err("Observe owners changed before capture preparation".to_owned());
@@ -5277,8 +5430,7 @@ async fn prepare_observation_capture(
             operation_id,
             original_content,
             capture_clock: retained_capture_clock,
-            authenticated_principal_ref: principal_ref.clone(),
-            work_scope: work_scope.clone(),
+            owner_binding: current,
             task_selection: task_selection.clone(),
         };
         guard
@@ -5288,16 +5440,14 @@ async fn prepare_observation_capture(
             .map_err(|error| format!("Governor Observe capture preparation: {error}"))?
     };
     let receipt = if let Some(owner) = task_selection.as_ref() {
-        let session_ref = identity.request.metadata.session_id.as_ref()
-            .map(eliot_contracts::SessionId::as_str)
-            .unwrap_or_default();
+        let session_ref = owner.session_ref();
         let task_ref = identity.request.metadata.task_id.as_ref()
             .map(eliot_contracts::TaskId::as_str)
             .unwrap_or_default();
         let scope_ref = capture_binding.authenticated_scope_ref.as_str();
         let port = OwnerSelectionKernelPort::new(
             kernel,
-            (&principal_ref, session_ref, task_ref, scope_ref),
+            (owner.principal_ref(), session_ref, task_ref, scope_ref),
             owner,
             &observed_scope,
             &live_fence,
@@ -5317,7 +5467,56 @@ async fn prepare_observation_capture(
     if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
         return Err("Governor Observe capture did not produce a committed receipt".to_owned());
     }
-    observe_result_body(&claimed.envelope, &claimed.attempt, &receipt)
+    let completion = {
+        let guard = composition.lock().await;
+        guard
+            .observation_reconciliation()
+            .map_err(|error| format!("Observe reconciliation owner after exchange: {error}"))?
+            .accept_prepared_mcp_observation(&prepared, receipt)
+            .map_err(|error| format!("Governor Observe completion acceptance: {error}"))?
+    };
+    let semantic_receipt_ref = completion
+        .semantic_receipt_ref()
+        .map_err(|error| format!("Governor Observe receipt reference: {error}"))?
+        .to_owned();
+    let (receipt, instruction_taint, stale_context) = match completion {
+        eliot_governor::McpObservationCompletion::Committed {
+            receipt,
+            capture_access,
+            ..
+        } => (receipt, capture_access.instruction_taint, false),
+        eliot_governor::McpObservationCompletion::CommittedWithStaleContext {
+            receipt,
+            capture_access,
+            ..
+        } => (receipt, capture_access.instruction_taint, true),
+    };
+    observe_result_body(
+        &claimed.envelope,
+        &claimed.attempt,
+        &receipt,
+        &semantic_receipt_ref,
+        instruction_taint,
+        stale_context,
+    )
+}
+
+fn current_observation_owner_binding(
+    composition: &DaemonComposition,
+    origin: &ObservationCaptureOwnerOrigin,
+    now: u64,
+) -> Result<ObservationCaptureOwnerBinding, String> {
+    match origin {
+        ObservationCaptureOwnerOrigin::ApplicationSession { .. } => composition
+            .current_activation_observation_owner_binding(now)
+            .map_err(|error| format!("current app observation owner: {error}")),
+        ObservationCaptureOwnerOrigin::HostPeer {
+            peer_admission_receipt,
+            ..
+        } => composition
+            .host_origin_observation_owner_binding(peer_admission_receipt)
+            .map_err(|error| format!("current Host-origin observation owner: {error}")),
+    }
 }
 
 fn observe_content_value(tool: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -5341,18 +5540,58 @@ fn observe_result_body(
     envelope: &eliot_protocol::HostRequestEnvelope,
     attempt: &eliot_protocol::LocalReadAttempt,
     receipt: &WriteReceipt,
+    semantic_receipt_ref: &str,
+    instruction_taint: eliot_security_contracts::InstructionTaint,
+    stale_context: bool,
 ) -> Result<HostRequestResultBody, String> {
-    let response = serde_json::json!({"status": "committed", "receipt": receipt});
+    let reconciliation_envelope = receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| format!("Observe receipt has no reconciliation envelope: {error}"))?;
+    if reconciliation_envelope.identity.receipt_id.as_str() != semantic_receipt_ref
+        || !reconciliation_envelope
+            .core
+            .authority
+            .proof_ceiling
+            .is_at_most(eliot_receipts::ProofCeiling::Observation)
+    {
+        return Err("Observe completion does not retain a capture-only canonical receipt".to_owned());
+    }
+    let response = if stale_context {
+        serde_json::json!({
+            "status": "committed",
+            "context_status": "stale",
+            "receipt": receipt
+        })
+    } else {
+        serde_json::json!({"status": "committed", "receipt": receipt})
+    };
     let bytes = canonical_json_bytes(&response)
         .map_err(|error| format!("Observe result response cannot canonicalize: {error}"))?;
+    let result_digest = sha256_hex(&bytes);
     let body = HostRequestResultBody {
         wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
         wire_version: HostRequestResultBody::CONTRACT_VERSION,
         operation_id: attempt.operation_id.clone(),
         request_sha256: envelope.envelope_sha256.clone(),
-        result_digest: sha256_hex(&bytes),
+        result_digest: result_digest.clone(),
         response,
-        lineage: None,
+        lineage: Some(eliot_protocol::HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: None,
+            source_revisions: None,
+            source_state_fence: None,
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: Some(semantic_receipt_ref.to_owned()),
+            result_class: eliot_protocol::HostRequestResultClass::CanonicalWriteReceipt,
+            proof_ceiling: Some(reconciliation_envelope.core.authority.proof_ceiling),
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: Some(instruction_taint),
+        }),
         attempt: Some(attempt.clone()),
         evidence: None,
     };
@@ -7477,6 +7716,7 @@ async fn dispatch_agent_activation_result(
                 owner_readback.as_ref(),
             )
             .await;
+            retain_accepted_host_origin_workspace_locator(&composition, ticket, &result).await;
             trigger_accepted_cold_start(
                 &kernel,
                 Arc::clone(&composition),
@@ -7525,6 +7765,7 @@ async fn dispatch_agent_activation_result(
                 owner_readback.as_ref(),
             )
             .await;
+            retain_accepted_host_origin_workspace_locator(&composition, ticket, &result).await;
             trigger_accepted_cold_start(
                 &kernel,
                 Arc::clone(&composition),
@@ -7562,6 +7803,48 @@ async fn retain_accepted_activation_workspace_locator(
             ticket = %eliotd::diagnostics::sanitize_identity(&ticket.ticket_id),
             error = %error,
             "accepted activation workspace locator was not retained for later task-bound observation"
+        );
+    }
+}
+
+/// Retains a cold Host-origin selector only after Kernel accepts the exact
+/// negative result and its current owner-policy readback. The selector remains
+/// a locator and is re-observed against WorkScope at capture ingress.
+async fn retain_accepted_host_origin_workspace_locator(
+    composition: &SharedComposition,
+    ticket: &AgentActivationResolutionTicket,
+    result: &AgentActivationResolutionResult,
+) {
+    if result.observation_host_policy_readback.is_none() {
+        return;
+    }
+    let Some(peer_receipt) = ticket.peer_admission_receipt.as_ref() else {
+        tracing::warn!(
+            ticket = %eliotd::diagnostics::sanitize_identity(&ticket.ticket_id),
+            "accepted cold result omitted its peer admission receipt"
+        );
+        return;
+    };
+    let outcome = {
+        let mut guard = composition.lock().await;
+        let binding = match guard.host_origin_observation_owner_binding(peer_receipt) {
+            Ok(binding) => binding,
+            Err(error) => {
+                tracing::warn!(
+                    ticket = %eliotd::diagnostics::sanitize_identity(&ticket.ticket_id),
+                    error = %error,
+                    "accepted Host-origin observation owner could not be re-read"
+                );
+                return;
+            }
+        };
+        guard.note_host_origin_workspace_locator(ticket, result, &binding)
+    };
+    if let Err(error) = outcome {
+        tracing::warn!(
+            ticket = %eliotd::diagnostics::sanitize_identity(&ticket.ticket_id),
+            error = %error,
+            "accepted Host-origin workspace locator was not retained"
         );
     }
 }
@@ -8150,6 +8433,7 @@ mod tests {
             demand_id: "demand-1".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
+            peer_admission_receipt: None,
             connection_id: "connection-1".to_owned(),
             workspace_selector: None,
             cancellation_id: "cancellation-1".to_owned(),
@@ -8228,6 +8512,7 @@ mod tests {
             demand_id: "demand-23".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
+            peer_admission_receipt: None,
             connection_id: "connection-23".to_owned(),
             workspace_selector: None,
             cancellation_id: "cancellation-23".to_owned(),
@@ -8316,6 +8601,7 @@ mod tests {
             demand_id: "demand-24".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
+            peer_admission_receipt: None,
             connection_id: "connection-24".to_owned(),
             workspace_selector: None,
             cancellation_id: "cancellation-24".to_owned(),
@@ -8417,6 +8703,7 @@ mod tests {
             demand_id: "demand-25".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
+            peer_admission_receipt: None,
             connection_id: "connection-25".to_owned(),
             workspace_selector: None,
             cancellation_id: "cancellation-25".to_owned(),
