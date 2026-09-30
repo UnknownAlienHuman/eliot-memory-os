@@ -283,6 +283,9 @@ _STDERR_PRE_WINDOW: Final = 8192
 _STDERR_TAIL_CHARS: Final = 4096
 _COMPILER_MESSAGE_BYTES: Final = 65536
 _COMPILER_MESSAGE_COUNT: Final = 8
+_LINKER_DIAGNOSTIC_LINE: Final = re.compile(
+    r"(?:.{0,512}:\s*)?((?:fatal error|error|warning)\s+LNK[0-9]{4}:.*)"
+)
 
 
 def _redact_detail(text: str) -> str:
@@ -314,6 +317,20 @@ def _compiler_failure_detail(stdout: bytes, stderr: bytes) -> str:
             continue
         # Redact complete bounded fields before truncation can split a secret.
         messages.append(_redact_detail(message)[:_STDERR_TAIL_CHARS])
+        children = diagnostic.get("children")
+        if isinstance(children, list):
+            for child in children[:_COMPILER_MESSAGE_COUNT]:
+                if not isinstance(child, dict) or child.get("level") != "note":
+                    continue
+                note = child.get("message")
+                if not isinstance(note, str):
+                    continue
+                # Rustc puts MSVC's concrete LNK cause in a child note. Keep
+                # only its diagnostic line, not the adjacent command or source.
+                for note_line in _redact_detail(note).splitlines():
+                    match = _LINKER_DIAGNOSTIC_LINE.fullmatch(note_line)
+                    if match and len(messages) < _COMPILER_MESSAGE_COUNT:
+                        messages.append(match.group(1)[:_STDERR_TAIL_CHARS])
         if len(messages) >= _COMPILER_MESSAGE_COUNT:
             break
     tail = _redact_detail(stderr[-_STDERR_PRE_WINDOW:].decode("utf-8", errors="replace"))
