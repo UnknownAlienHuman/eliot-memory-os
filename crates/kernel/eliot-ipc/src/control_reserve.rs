@@ -404,9 +404,7 @@ impl IpcReserve {
             }),
             Some(_) => {
                 self.inner.normal_in_flight.store(0, Ordering::Release);
-                self.inner
-                    .protected_in_flight
-                    .store(0, Ordering::Release);
+                self.inner.protected_in_flight.store(0, Ordering::Release);
                 *sealed = None;
                 self.inner.restart_sealed.store(false, Ordering::Release);
                 Ok(())

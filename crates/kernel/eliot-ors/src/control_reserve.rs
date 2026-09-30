@@ -47,8 +47,8 @@ use std::sync::{Arc, Mutex};
 use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId, ReceiptId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
-    CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
+    CapacityBottleneck, CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
     EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
     I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
     I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
@@ -425,12 +425,10 @@ impl OrsReserve {
         self.inner
             .durable_normal_in_flight_bytes
             .fetch_max(self.inner.durable_normal_capacity_bytes, Ordering::AcqRel);
-        self.inner
-            .durable_protected_in_flight_bytes
-            .fetch_max(
-                self.inner.durable_protected_capacity_bytes,
-                Ordering::AcqRel,
-            );
+        self.inner.durable_protected_in_flight_bytes.fetch_max(
+            self.inner.durable_protected_capacity_bytes,
+            Ordering::AcqRel,
+        );
         *self
             .inner
             .sealed_epoch
