@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      operator_store_diagnostic:
+        description: Bounded disposable pinned Store provider smoke and component tests
+        required: false
+        default: false
+        type: boolean
       operator_runtime_edges:
         description: Restrict audit diagnostics to bounded Kernel shutdown and WASM runtime edges
         required: false
@@ -33,7 +38,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.operator_runtime_edges && '-runtime-edges' || inputs.operator_linker_probe && '-linker-probe' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.operator_store_diagnostic && '-store-diagnostic' || inputs.operator_runtime_edges && '-runtime-edges' || inputs.operator_linker_probe && '-linker-probe' || '' }}
   cancel-in-progress: false
 
 env:
@@ -43,7 +48,7 @@ env:
 
 jobs:
   source-candidate-gate:
-    if: ${{ !inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic && !inputs.operator_runtime_edges }}
+    if: ${{ !inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic && !inputs.operator_runtime_edges && !inputs.operator_store_diagnostic }}
     runs-on: windows-latest
     timeout-minutes: 180
 
@@ -405,7 +410,7 @@ jobs:
   # Explicit user-authorized temporary audit mode. Never a Review, MergeCompile,
   # release, installed-runtime or Product acceptance receipt. Normal job unchanged.
   operator-audit-diagnostic:
-    if: ${{ inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    if: ${{ inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic && !inputs.operator_store_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
     timeout-minutes: ${{ inputs.operator_runtime_edges && 45 || 180 }}
     env:
@@ -436,7 +441,7 @@ jobs:
           retention-days: 14
 
   operator-audit-ref-guard:
-    if: ${{ ((inputs.operator_audit_diagnostic || inputs.operator_linker_probe || inputs.operator_ui_diagnostic || inputs.operator_runtime_edges) && (github.ref != 'refs/heads/Operator_tests' || inputs.require_live_windows_scenarios)) || (inputs.operator_audit_diagnostic && inputs.operator_linker_probe) || (inputs.operator_ui_diagnostic && !inputs.operator_linker_probe) || (inputs.operator_runtime_edges && !inputs.operator_audit_diagnostic) }}
+    if: ${{ ((inputs.operator_audit_diagnostic || inputs.operator_linker_probe || inputs.operator_ui_diagnostic || inputs.operator_runtime_edges || inputs.operator_store_diagnostic) && (github.ref != 'refs/heads/Operator_tests' || inputs.require_live_windows_scenarios)) || (inputs.operator_audit_diagnostic && inputs.operator_linker_probe) || (inputs.operator_ui_diagnostic && !inputs.operator_linker_probe) || (inputs.operator_runtime_edges && !inputs.operator_audit_diagnostic) || (inputs.operator_store_diagnostic && (inputs.operator_audit_diagnostic || inputs.operator_runtime_edges || inputs.operator_linker_probe || inputs.operator_ui_diagnostic)) }}
     runs-on: windows-latest
     timeout-minutes: 2
     steps:
@@ -448,7 +453,7 @@ jobs:
 
 
   operator-linker-probe:
-    if: ${{ inputs.operator_linker_probe && !inputs.operator_audit_diagnostic && !inputs.operator_runtime_edges && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    if: ${{ inputs.operator_linker_probe && !inputs.operator_audit_diagnostic && !inputs.operator_runtime_edges && !inputs.operator_store_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -472,7 +477,7 @@ jobs:
 
 
   operator-ui-diagnostic:
-    if: ${{ inputs.operator_linker_probe && inputs.operator_ui_diagnostic && !inputs.operator_audit_diagnostic && !inputs.operator_runtime_edges && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    if: ${{ inputs.operator_linker_probe && inputs.operator_ui_diagnostic && !inputs.operator_audit_diagnostic && !inputs.operator_runtime_edges && !inputs.operator_store_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -491,5 +496,36 @@ jobs:
         with:
           name: operator-ui-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/operator-ui-diagnostic-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+
+  operator-store-diagnostic:
+    if: ${{ inputs.operator_store_diagnostic && !inputs.operator_audit_diagnostic && !inputs.operator_runtime_edges && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Disposable pinned Store provider diagnostics (not installed acceptance)
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'eliot-operator-store-target'
+          python scripts/operator-store-diagnostic.py --output "$env:RUNNER_TEMP\eliot-operator-store-evidence"
+          exit $LASTEXITCODE
+      - name: Preserve provider identity, exact commands, outcomes and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: operator-store-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/eliot-operator-store-evidence/
           if-no-files-found: error
           retention-days: 14
