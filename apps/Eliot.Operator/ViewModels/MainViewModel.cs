@@ -1348,12 +1348,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    /// Reads one owner-bound command receipt. The receipt is accepted only when
-    /// it is bound to this exact operation identity, this exact expected
-    /// revision, carries a typed terminal disposition, and — when it claims a
-    /// durable mutation — carries a canonical receipt. A refusal whose outcome
-    /// is the owner's `STALE_STATE_FENCE` reason code is terminal and distinct
-    /// from a plain rejection and from an unknown outcome.
+    /// Reads one owner-bound command receipt. The receipt is read only when it is
+    /// bound to this exact operation identity, this exact expected revision, and
+    /// carries a typed terminal disposition. A claim of an executed durable
+    /// mutation must be consistent with the canonical receipt it carries, except
+    /// for the one accepted-but-unproven shape — executed, accepted, and no
+    /// canonical receipt — which is returned so the caller can explain it
+    /// actionably; it is never treated as a success. A refusal whose outcome is
+    /// the owner's `STALE_STATE_FENCE` reason code is terminal and distinct from
+    /// a plain rejection and from an unknown outcome.
     private static (bool Accepted, bool Executed, bool StaleFence, string Outcome, string? ReceiptId) ReadCommandReceipt(
         JsonElement receipt,
         OperatorPendingOperation pending)
@@ -1436,7 +1439,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
             if (string.IsNullOrWhiteSpace(receiptId)) receiptId = null;
         }
 
-        if (executed != (receiptId is not null) || (executed && !accepted))
+        // A claimed durable mutation that carries no canonical receipt is not a
+        // refused disposition: it is the owner's accepted-but-unproven answer,
+        // and the caller turns it into an actionable reconciliation instruction
+        // rather than a bare "inconsistent" refusal. Only that one shape is
+        // exempted. An unexecuted operation that still carries a receipt, and an
+        // executed one the owner did not accept, remain refusals — the second
+        // disjunct is never exempted, so that arm refuses every executed receipt
+        // the owner did not accept, with or without a receipt id.
+        var executedWithoutCanonicalReceipt = executed && receiptId is null;
+        if ((!executedWithoutCanonicalReceipt && executed != (receiptId is not null))
+            || (executed && !accepted))
         {
             throw new InvalidOperationException("operator command receipt has an inconsistent canonical disposition");
         }
