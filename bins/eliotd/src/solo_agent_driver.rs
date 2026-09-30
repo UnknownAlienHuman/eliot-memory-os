@@ -1348,7 +1348,11 @@ async fn drive_solo_delegate_verified_async(
     // future that awaits this wrapper stays small: the intake would
     // otherwise be counted in both frames across the seam await.
     Box::pin(drive_admitted_material_async(
-        composition, kernel, intake, material, now_unix_ms,
+        composition,
+        kernel,
+        intake,
+        material,
+        now_unix_ms,
     ))
     .await
 }
