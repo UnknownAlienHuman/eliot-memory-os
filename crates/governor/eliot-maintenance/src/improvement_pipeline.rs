@@ -34,6 +34,16 @@
 //! refusals with a typed relation identity, so an experiment cannot be executed
 //! by a self-chosen principal or evaluated by the party proposing it.
 //!
+//! The independent admission review is held to the same principal relation
+//! through the same shared predicate. The two records may name different
+//! verifiers, and their identities are never compared with each other, but
+//! neither reviewer may be the experiment executor, the admitting Governor
+//! owner, or the rollback owner. The admission review is the record the decision
+//! leans on hardest — it carries the pulse outcome, the harm observation, and the
+//! pass verdict — so a review written by the party that executed the experiment
+//! is the party grading its own work, and both records' own `independent` flag is
+//! a caller-set boolean that establishes nothing by itself.
+//!
 //! Activation evidence carries the I0.5 `EvidenceExecutionStatus` dimension
 //! rather than a boolean. Only `EXECUTED` may support admission:
 //! `NOT_EXECUTED` and `SIMULATED` can never become accepted improvement, and
@@ -2585,6 +2595,7 @@ fn join_improvement_inputs(
         inputs.evidence,
         inputs.proposal,
         inputs.experiment,
+        inputs.policy,
     )?;
     check_rollback_join(
         inputs.rollback,
@@ -2744,22 +2755,46 @@ fn check_evaluator_independence(
             relation: "experiment-evaluation: evaluator-is-not-the-instrument-verifier-family",
         });
     }
-    for (relation, evaluator, principal) in [
-        (
+    check_evaluator_distinct_from_owners(
+        evidence.verifier_id.as_str(),
+        experiment,
+        policy,
+        [
             "experiment-evaluation: evaluator-is-the-experiment-executor",
-            evidence.verifier_id.as_str(),
-            experiment.testd_owner_id.as_str(),
-        ),
-        (
             "experiment-evaluation: evaluator-is-the-governor-admission-owner",
-            evidence.verifier_id.as_str(),
-            policy.external_owner_id.as_str(),
-        ),
-        (
             "experiment-evaluation: evaluator-is-the-rollback-owner",
-            evidence.verifier_id.as_str(),
-            policy.rollback_owner_id.as_str(),
-        ),
+        ],
+    )
+}
+
+/// Requires one named evaluator to be a principal distinct from the experiment
+/// executor, the admitting Governor owner, and the rollback owner.
+///
+/// The one distinctness comparison this module makes about an evaluator, shared
+/// by the experiment evaluation ([`check_evaluator_independence`]) and the
+/// independent admission review (`check_admission_evidence_join`). Sharing it is
+/// the point: the two evaluators are different records that may legitimately be
+/// different people, but neither may be a principal whose interest the evidence
+/// serves, and a second hand-written copy of these three relations is a place
+/// where the two could drift apart and quietly disagree about who may evaluate.
+///
+/// The three principals are read from the records that already carry them — the
+/// experiment's declared Testd executor, the policy's admission owner, and the
+/// policy's rollback owner — never from a caller-set independence boolean.
+/// `relations` supplies the three refusal identities, in the fixed order
+/// executor, admission owner, rollback owner, so each caller reports under its
+/// own relation namespace instead of sharing one another's wording.
+fn check_evaluator_distinct_from_owners(
+    evaluator: &str,
+    experiment: &ExperimentPlan,
+    policy: &ImprovementAdmissionPolicy,
+    relations: [&'static str; 3],
+) -> Result<(), PipelineError> {
+    let [executor, admission_owner, rollback_owner] = relations;
+    for (relation, principal) in [
+        (executor, experiment.testd_owner_id.as_str()),
+        (admission_owner, policy.external_owner_id.as_str()),
+        (rollback_owner, policy.rollback_owner_id.as_str()),
     ] {
         if evaluator == principal {
             return Err(PipelineError::UnboundRelation { relation });
@@ -2970,17 +3005,30 @@ fn check_experiment_evaluation_join(
 }
 
 /// Requires the admission-review evidence to name the same candidate, the same
-/// experiment, and the same content revision the experiment evaluation did.
+/// experiment, and the same content revision the experiment evaluation did, and
+/// to have been produced by a principal distinct from the experiment executor,
+/// the admitting Governor owner, and the rollback owner.
 ///
 /// A later independent admission review may legitimately carry a different
 /// verifier identity, so verifier identities are never compared with each
 /// other. The typed relationship to the same candidate, experiment, and content
-/// revision is what is required.
+/// revision is what is required of the two records together.
+///
+/// The reviewer itself is a different matter, and it is the record this gate
+/// leans on hardest: the admission review is what carries the pulse outcome, the
+/// harm observation, and the pass verdict the decision is made from, so a review
+/// written by the party that executed the experiment, by the owner that admits
+/// it, or by the rollback owner is the party grading its own work. That is the
+/// same relation [`check_evaluator_independence`] already refuses for the
+/// experiment evaluation, and it is refused here through the same shared
+/// predicate rather than through the review's own `independent` flag, which is
+/// a caller-set boolean and establishes nothing on its own.
 fn check_admission_evidence_join(
     admission: &ImprovementEvidenceView,
     evaluation: &ActivationEvidence,
     proposal: &ImprovementProposal,
     experiment: &ExperimentPlan,
+    policy: &ImprovementAdmissionPolicy,
 ) -> Result<(), PipelineError> {
     if admission.bound_candidate_id != proposal.candidate_id {
         return Err(PipelineError::UnboundRelation {
@@ -2997,6 +3045,16 @@ fn check_admission_evidence_join(
             relation: "admission-evidence: content-revision-mismatch",
         });
     }
+    check_evaluator_distinct_from_owners(
+        admission.verifier_id.as_str(),
+        experiment,
+        policy,
+        [
+            "admission-evidence: reviewer-is-the-experiment-executor",
+            "admission-evidence: reviewer-is-the-governor-admission-owner",
+            "admission-evidence: reviewer-is-the-rollback-owner",
+        ],
+    )?;
     bounded_text(
         &admission.run_ref,
         "admission_evidence.run_ref",
