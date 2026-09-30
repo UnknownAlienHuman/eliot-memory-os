@@ -4656,8 +4656,85 @@ impl HostRequestResultLineage {
                     })?;
             }
         }
+        self.validate_taint_claim()?;
         self.validate_class()?;
         Ok(())
+    }
+
+    /// Refuses an unsupported CLEAN instruction-taint claim (issue #1809
+    /// item 2).
+    ///
+    /// `instruction_taint` is optional, and `None` keeps its whole documented
+    /// meaning: **unknown, not cleared**. That is why the default is honest.
+    /// The hazard is the other direction — a record that affirmatively asserts
+    /// [`InstructionTaint::Cleared`] while naming no derivation that could
+    /// have cleared anything. Such a record claims clean taint on the strength
+    /// of the claim itself, which is exactly what I15.6/I15.12 forbid: a
+    /// sanitizer reference, a successful serialization, or a bare metadata
+    /// field is not proof that taint was removed.
+    ///
+    /// The rule is deliberately narrow and one-directional. It does not decide
+    /// what any real result's taint IS — that stays with the owner that
+    /// produced the transformation — it only refuses a clearance no named
+    /// transformation supports. A record whose own transformation chain ends
+    /// in [`InstructionTaint::Cleared`] passes, and
+    /// [`TransformationLineage::validate`] has already required of every step
+    /// in that chain that any taint downgrade carry its exact
+    /// `declassification_receipt_ref`. So an asserted clearance is always
+    /// reachable only through a verified declassification, and a chain that
+    /// laundered taint without one is refused before this point.
+    ///
+    /// No producer on the live path is affected: every current result producer
+    /// submits `None`, which stays the explicit unknown.
+    fn validate_taint_claim(&self) -> Result<(), ProtocolError> {
+        if !matches!(self.instruction_taint, Some(InstructionTaint::Cleared)) {
+            return Ok(());
+        }
+        let cleared_by_named_transformation =
+            self.transformation_lineage
+                .as_ref()
+                .is_some_and(|transformations| {
+                    transformations
+                        .last()
+                        .is_some_and(|last| last.output_taint == InstructionTaint::Cleared)
+                });
+        if !cleared_by_named_transformation {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage.instruction_taint",
+                reason: "a cleared taint claim must be carried by the final named transformation",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates one RETAINED lineage against the result digest recorded
+    /// beside it (issue #1809 items 2 and 7).
+    ///
+    /// The retained readback path carries the lineage, the result digest and
+    /// the result bytes as three separate fields of one owner record, so
+    /// nothing inside the lineage proves it describes THOSE bytes. This is the
+    /// single shared entry that closes that gap for every consumer: it
+    /// compares the ORIGINALLY RECORDED `output_digest` with the ORIGINALLY
+    /// RECORDED `result_digest` and then applies [`Self::validate_class`].
+    ///
+    /// Nothing is recomputed over the bytes a reader happens to be holding. A
+    /// fresh checksum would replace the recorded proof with a new one instead
+    /// of checking it, which is the substitution this entry exists to refuse.
+    ///
+    /// The check is one-directional, exactly like the submission path: it can
+    /// only withhold a retained lineage that does not describe its own result
+    /// or that claims a class its own evidence does not support. It never mints
+    /// a class, a receipt or a permission, and it never reads a matching
+    /// content hash, a `trusted` producer flag or a caller-selected proof
+    /// ceiling as semantic truth (I15.19, I15.6).
+    pub fn validate_retained(&self, result_digest: &str) -> Result<(), ProtocolError> {
+        if self.output_digest != result_digest {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage.output_digest",
+                reason: "retained lineage does not bind the exact retained result digest",
+            });
+        }
+        self.validate_class()
     }
 
     /// Refuses a class the lineage's own evidence does not support.

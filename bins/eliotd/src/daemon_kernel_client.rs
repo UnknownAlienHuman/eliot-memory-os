@@ -2771,11 +2771,11 @@ impl DaemonKernelClient {
                 )
             })?;
         // The retained lineage is carried only when the owner actually recorded
-        // one, and only when it describes THIS result: the recorded
-        // `output_digest` must equal this row's recorded `result_digest`. A
-        // lineage that names a different output, or one that cannot be decoded
-        // at all, is refused rather than adopted, and a row with no lineage
-        // stays `None`.
+        // one, and only when it passes the shared retained-lineage rule against
+        // THIS row's recorded result digest. A lineage that names a different
+        // output, claims a class its own evidence does not support, or cannot be
+        // decoded at all is refused rather than adopted, and a row with no
+        // lineage stays `None`.
         let body_lineage = match admitted
             .get("record")
             .and_then(|record| record.get("result_lineage"))
@@ -2788,12 +2788,17 @@ impl DaemonKernelClient {
                             "Kernel local read admission carries an undecodable retained lineage: {error}"
                         ))
                     })?;
-                if lineage.output_digest != body_digest {
-                    return Err(KernelPortError::Contract(
-                        "Kernel local read admission carries a retained lineage that does not describe this result"
-                            .to_owned(),
-                    ));
-                }
+                // The SHARED retained-lineage rule, not a local digest compare:
+                // it binds the recorded `output_digest` to this row's recorded
+                // result digest AND refuses a class the row's own evidence does
+                // not support, so an unrelated receipt reference cannot ride in
+                // on a lineage whose bytes check out.
+                lineage.validate_retained(body_digest).map_err(|error| {
+                    KernelPortError::Contract(format!(
+                        "Kernel local read admission carries a retained lineage \
+that does not describe this result: {error}"
+                    ))
+                })?;
                 Some(lineage)
             }
         };

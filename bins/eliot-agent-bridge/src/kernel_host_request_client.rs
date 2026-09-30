@@ -39,10 +39,10 @@ use eliot_protocol::{
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
     HARD_STRUCTURED_RESPONSE_BYTES, HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID,
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
-    HostRequestResultBody, HostRequestResultClass, MessageType, ProtocolPayload, ProtocolVersion,
-    REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID,
-    ReactiveRestoreQuery, ReactiveRestoreReply, RequestIdentity, host_request_operation_id,
-    restore_correlation,
+    HostRequestResultBody, HostRequestResultClass, HostRequestResultLineage, MessageType,
+    ProtocolPayload, ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
+    REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply,
+    RequestIdentity, host_request_operation_id, restore_correlation,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -200,8 +200,34 @@ struct ResourceAuthorizationPreimage<'a> {
     payload_digest: &'a str,
     result_digest: &'a str,
     result_response: &'a serde_json::Value,
+    /// The result class the owner recorded for these exact bytes (issue #1809
+    /// item 7).
+    ///
+    /// Carried as the owner's own wire spelling, rendered through the protocol
+    /// crate's `Serialize` derive, so the authorization binding commits to the
+    /// recorded claim verbatim rather than to a bridge-local projection of it. A
+    /// resource captured under one recorded provenance claim therefore cannot be
+    /// expanded under a different one: the class is part of what the read
+    /// re-proves, which is what keeps a candidate-versus-admitted distinction
+    /// from being decided by the resource surface's own memory.
+    result_class: String,
     task_ref: Option<&'a str>,
     scope_ref: Option<&'a str>,
+}
+
+/// Renders one result class in the exact wire spelling the durable row carries
+/// (issue #1809 item 7).
+///
+/// The class is an owner claim about provenance, so the authorization preimage
+/// must bind the OWNER's spelling of it. This serializes through the protocol
+/// crate's own `Serialize` derive instead of repeating a mapping here: a
+/// hand-written table would be a second place to forget a variant, and a
+/// mismatch would silently bind a different string than the row records.
+fn result_class_wire_name(class: &HostRequestResultClass) -> Result<String, PortFailure> {
+    serde_json::to_value(class)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(request_failure)
 }
 
 /// Exact parent reference resolved from the replay cache for cancel/probe envelopes.
@@ -365,44 +391,18 @@ pub(crate) struct AdmittedReplyView {
     #[serde(default)]
     pub(crate) payload_digest: Option<String>,
     /// Retained result lineage the Kernel bound to this row's own result
-    /// (issue #1809 item 7). Carried, not interpreted: the bridge reads the
-    /// declared class so a delivery consumer can tell an existing evidence
-    /// read from a newly produced candidate, and refuses to present any other
-    /// class as an admitted record. `None` on a row that predates retained
-    /// lineage, which stays an explicit unknown rather than defaulting to
-    /// allowed.
+    /// (issue #1809 items 2 and 7). Decoded as the SHARED
+    /// [`HostRequestResultLineage`] contract, not as a local projection of it:
+    /// the durable row serialises exactly those fields, so the bridge reads the
+    /// same owner rule a submission and the Kernel replay leg read, instead of
+    /// re-deciding the class/receipt relationship in a second dialect.
+    ///
+    /// `None` on a row that predates retained lineage. That stays an explicit
+    /// unknown rather than defaulting to allowed: the resource surfaces below
+    /// refuse an absent lineage outright, and an unknown class never presents
+    /// as an admitted record.
     #[serde(default)]
-    pub(crate) result_lineage: Option<RetainedResultLineageView>,
-}
-
-/// Tolerant read-only view of the retained result lineage the Kernel bound to
-/// one durable row (issue #1809).
-///
-/// Deliberately minimal: the bridge needs the class and the semantic receipt
-/// reference, nothing else. Every other lineage field stays owned by the
-/// Kernel/ORS record and is not copied into the bridge. The `output_digest` is
-/// NOT re-checked here — the ORS row's own `validate` already compared the
-/// originally recorded `output_digest` with the originally recorded
-/// `result_digest`, and recomputing a checksum over the bytes the bridge holds
-/// would replace that proof with a fresh one instead of checking it.
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct RetainedResultLineageView {
-    /// Which kind of record these retained bytes are. Unknown for a row whose
-    /// lineage was written before the class existed; never an admitted class.
-    #[serde(default = "unclassified_result_class")]
-    pub(crate) result_class: HostRequestResultClass,
-    /// Exact admitted semantic receipt, present only for
-    /// [`HostRequestResultClass::CanonicalWriteReceipt`].
-    #[serde(default)]
-    pub(crate) semantic_receipt_ref: Option<String>,
-}
-
-/// Missing class means the row predates the field: unknown provenance, which is
-/// exactly [`HostRequestResultClass::Unclassified`] and never an admitted
-/// class. The bridge repeats the protocol crate's own defaulting rule instead of
-/// treating an absent field as a class it may pick.
-const fn unclassified_result_class() -> HostRequestResultClass {
-    HostRequestResultClass::Unclassified
+    pub(crate) result_lineage: Option<HostRequestResultLineage>,
 }
 
 /// Mirror of the kernel-owned durable host-request states for outcome mapping.
@@ -805,6 +805,23 @@ impl KernelHostRequestClient {
                 return Err(resource_source_refused());
             }
             Some(_) => {}
+        }
+        // The recorded lineage must describe THIS row's own recorded result
+        // before the bytes are expanded. The comparison is over the ORIGINALLY
+        // RECORDED digests on the same row: nothing is recomputed over the
+        // response the bridge holds, because a fresh checksum would replace the
+        // owner's proof with a new one instead of checking it. The shared rule
+        // (`HostRequestResultLineage::validate_retained`) also refuses a class
+        // the row's own evidence does not support, so a substituted output
+        // digest or an unrelated receipt reference cannot qualify the result
+        // here.
+        if let Some(lineage) = &record.result_lineage {
+            let Some(result_digest) = record.result_digest.as_deref() else {
+                return Err(resource_source_refused());
+            };
+            lineage
+                .validate_retained(result_digest)
+                .map_err(|_| resource_source_refused())?;
         }
         Ok((facts, record))
     }
@@ -2761,20 +2778,15 @@ fn decode_record_view(
         }
         .validate()
         .ok()?;
-        // The retained class the Kernel bound to THIS row is checked against
-        // the exact result pair on the same row. A class claimed for one
-        // result must not be adopted by another, and a canonical class without
-        // its admitted receipt is refused here rather than presented to a
-        // consumer as an admitted record. The digest comparison below uses the
-        // ORIGINALLY RECORDED values on the row; nothing is recomputed.
+        // The retained lineage the Kernel bound to THIS row is checked by the
+        // SHARED owner rule, against the exact result pair recorded on the same
+        // row. A class claimed for one result must not be adopted by another,
+        // and a canonical class without its admitted receipt is refused here
+        // rather than presented to a consumer as an admitted record. Both
+        // comparisons below use ORIGINALLY RECORDED values; nothing is
+        // recomputed over the bytes in hand.
         if let Some(lineage) = &record.result_lineage {
-            let claimed = match lineage.result_class {
-                HostRequestResultClass::CanonicalWriteReceipt => {
-                    lineage.semantic_receipt_ref.is_some()
-                }
-                _ => lineage.semantic_receipt_ref.is_none(),
-            };
-            if !claimed {
+            if lineage.validate_retained(digest).is_err() {
                 return None;
             }
         }
@@ -2827,8 +2839,24 @@ fn resource_authorization_digest(
     {
         return Err(resource_source_refused());
     }
+    // A resource whose owner named no provenance cannot be authorized at all:
+    // the caller's own check refuses that record, and spelling `UNCLASSIFIED`
+    // here would let an unknown claim ride inside a binding that other checks
+    // read as evidence. The spelling is the owner's recorded one.
+    let recorded_class = record
+        .result_lineage
+        .as_ref()
+        .map(|lineage| lineage.result_class)
+        .ok_or_else(resource_source_refused)?;
+    let result_class = result_class_wire_name(&recorded_class)?;
     let preimage = ResourceAuthorizationPreimage {
-        version: "eliot.bridge.resource-source.v1",
+        // Version 2 binds the owner-recorded result class (issue #1809 item 7).
+        // A binding captured before the class was part of the preimage can no
+        // longer be recomputed, so it fails the re-authorization on the read
+        // leg instead of silently authorizing under a weaker commitment. There
+        // is no live caller holding a version-1 binding: this digest is
+        // captured and re-derived inside one bridge process.
+        version: "eliot.bridge.resource-source.v2",
         operation_handle: operation_handle.as_str(),
         connection_id: facts.connection_id.as_str(),
         session_id: session,
@@ -2841,6 +2869,7 @@ fn resource_authorization_digest(
         payload_digest,
         result_digest,
         result_response,
+        result_class,
         task_ref: record.task_ref.as_deref(),
         scope_ref: record.scope_ref.as_deref(),
     };
