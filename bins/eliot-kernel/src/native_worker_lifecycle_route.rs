@@ -911,12 +911,8 @@ impl KernelComposition {
             NATIVE_WORKER_REGISTRATION_OPERATION => {
                 self.handle_native_worker_registration(identity, payload)
             }
-            NATIVE_WORKER_CLAIM_OPERATION => {
-                self.handle_native_worker_claim(identity, payload)
-            }
-            NATIVE_WORKER_READY_OPERATION => {
-                self.handle_native_worker_ready(identity, payload)
-            }
+            NATIVE_WORKER_CLAIM_OPERATION => self.handle_native_worker_claim(identity, payload),
+            NATIVE_WORKER_READY_OPERATION => self.handle_native_worker_ready(identity, payload),
             NATIVE_WORKER_HEARTBEAT_OPERATION => {
                 self.handle_native_worker_heartbeat(identity, payload)
             }

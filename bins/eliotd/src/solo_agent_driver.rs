@@ -1731,8 +1731,7 @@ async fn validate_solo_poll_readback(
         eliot_governor::NativeWorkerBindingObservation::Revoked { .. }
             | eliot_governor::NativeWorkerBindingObservation::UnknownOutcome { .. }
     );
-    if !historical_non_effect
-        && !fences_match_exact(&expected_kernel_fence, &kernel.kernel_fence())
+    if !historical_non_effect && !fences_match_exact(&expected_kernel_fence, &kernel.kernel_fence())
     {
         return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
             "Kernel fence changed while the solo binding readback was in flight".to_owned(),

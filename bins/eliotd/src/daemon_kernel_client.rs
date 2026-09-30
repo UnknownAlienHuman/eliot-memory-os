@@ -269,8 +269,7 @@ fn adopt_pending_binding_readback(
         || observed_at_unix_ms == 0
     {
         return Err(KernelClientError::Unknown(
-            "Kernel pending executable binding readback does not match the lookup tuple"
-                .to_owned(),
+            "Kernel pending executable binding readback does not match the lookup tuple".to_owned(),
         ));
     }
     Ok(NativeWorkerExecutableBindingReadbackOutcome::Pending {
@@ -328,8 +327,7 @@ fn adopt_found_binding_readback(
     let (claim_id, attempt_id, operation_id, task_id) = expected;
     let (observed_claim_id, observed_attempt_id, observed_operation_id, observed_task_id) =
         observed;
-    let (binding, executable_binding_digest, executable_binding_projection, claim_state) =
-        record;
+    let (binding, executable_binding_digest, executable_binding_projection, claim_state) = record;
     check_found_binding_record(
         &binding,
         &executable_binding_digest,
@@ -1864,8 +1862,7 @@ impl DaemonKernelClient {
         let readback = match outcome {
             NativeWorkerExecutableBindingReadbackOutcome::Pending { .. } => {
                 return Err(KernelClientError::Contract(
-                    "provider binding has no owner-published executable binding yet"
-                        .to_owned(),
+                    "provider binding has no owner-published executable binding yet".to_owned(),
                 ));
             }
             NativeWorkerExecutableBindingReadbackOutcome::Found(readback) => readback,
@@ -1888,12 +1885,10 @@ impl DaemonKernelClient {
             NativeWorkerBindingClaimDisposition::Terminal => Err(KernelClientError::Contract(
                 "provider binding claim is terminal and cannot verify".to_owned(),
             )),
-            NativeWorkerBindingClaimDisposition::UnknownOutcome => {
-                Err(KernelClientError::Unknown(
-                    "provider binding claim outcome is unknown; reconcile the original operation"
-                        .to_owned(),
-                ))
-            }
+            NativeWorkerBindingClaimDisposition::UnknownOutcome => Err(KernelClientError::Unknown(
+                "provider binding claim outcome is unknown; reconcile the original operation"
+                    .to_owned(),
+            )),
             NativeWorkerBindingClaimDisposition::GovernorCurrentnessRequired => Ok(()),
         }
     }
