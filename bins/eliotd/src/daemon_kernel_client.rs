@@ -421,6 +421,11 @@ pub enum LocalReadSubmitOutcome {
 pub struct TaskControllerClaimedInvocation {
     pub invocation: TaskControllerInvocation,
     pub envelope: HostRequestEnvelope,
+    /// Kernel-retained authenticated application principal for this claim.
+    /// This is distinct from the daemon's authenticated transport principal
+    /// and is required to join the request to the Governor's active owner
+    /// selection without deriving authority from caller-controlled labels.
+    pub authenticated_principal: String,
     pub tool: serde_json::Value,
     pub request_identity: RequestIdentity,
     pub operation_id: OperationId,
@@ -589,6 +594,13 @@ pub fn parse_task_controller_claimed_pair(
     envelope
         .validate()
         .map_err(|error| format!("Kernel Task Controller envelope is invalid: {error}"))?;
+    let authenticated_principal = decode("authenticated_principal")?
+        .as_str()
+        .filter(|principal| !principal.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "Kernel Task Controller claim has no authenticated principal".to_owned()
+        })?;
     let tool = decode("tool")?;
     let request_identity: RequestIdentity = match pair.get("identity") {
         Some(value) => serde_json::from_value(value.clone())
@@ -640,6 +652,7 @@ pub fn parse_task_controller_claimed_pair(
     Ok(Some(TaskControllerClaimedInvocation {
         invocation,
         envelope,
+        authenticated_principal,
         tool,
         request_identity,
         operation_id,

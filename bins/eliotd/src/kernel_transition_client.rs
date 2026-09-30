@@ -29,6 +29,13 @@ use tracing::Instrument as _;
 
 use super::{DaemonKernelClient, kernel_port_error, kind_value};
 
+struct OwnerTaskSelectionContext<'a> {
+    request_identity: (&'a str, &'a str, &'a str, &'a str),
+    owner: &'a eliot_governor::TaskSelectionAdmissionBinding,
+    observed_scope: &'a eliot_workscope::ObservedScopeResources,
+    live_fence: &'a StateFence,
+}
+
 /// Checks the admitted identity against the immutable transition before any
 /// transport is touched.
 ///
@@ -44,56 +51,67 @@ fn check_identity_binding(
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<(), KernelPortError> {
+    check_identity_binding_with_selection(
+        identity,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        None,
+    )
+}
+
+fn check_identity_binding_with_selection(
+    identity: &RequestIdentity,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    task_selection: Option<&OwnerTaskSelectionContext<'_>>,
+) -> Result<(), KernelPortError> {
     identity
         .validate()
         .map_err(|error| KernelPortError::Contract(error.to_string()))?;
     transition
         .validate()
         .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-    // Issue #1929 (I5.5 capture/promotion split): the daemon is the admission
-    // edge, not a bypass around the store gate. Before any transport is
-    // touched, a `CaptureObservation` that names no task on either the
-    // admitted context or the transition has no unique task selection, so it
-    // is admitted here as a cold unbound candidate and can never leave the
-    // daemon with task activation, support/influence promotion, or finish
-    // relevance. A capture that names a task is task-relative and its binding
-    // belongs to the ingress that owns the exact selection evidence; it is
-    // reported, never downgraded to a cold capture and never admitted here.
-    // There is no latest-task/open-task/resolver-guess fallback.
-    //
-    // `KernelPortError` has no task-binding variant, so the typed rejection
-    // travels as its `Contract` detail, which is exactly
-    // `TASK_SELECTION_REQUIRED: …` / `TASK_SCOPE_INCOMPATIBLE: …` — the
-    // stable code is preserved verbatim, not reduced to prose. The store gate
-    // independently re-derives the same two codes as a typed
-    // `StoreError::InvalidField { field: "task_binding", reason: <code> }`,
-    // so neither layer depends on the other's encoding.
-    //
-    // # Why no selection is passed here (issue #1929)
-    //
-    // The identity and the transition carry no compiled readiness receipt and
-    // no `TaskSelectionEvidence`, and neither does `self`: a
-    // `TaskSelectionEvidence` needs a non-zero `task_revision` and an
-    // `acceptance_digest` that this edge has no legitimate source for, and the
-    // repository's only production constructor of the receipt
-    // (`eliot_workscope::ColdStartController::compile`, reached only through
-    // `OnboardingSingleFlight::compile_and_publish` and therefore only through
-    // the uncalled `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`)
-    // has no caller. So `admit_named_mutation_capture` is called without one
-    // and this edge reports `ColdUnbound`, which is the complete and honest
-    // answer for a task-free capture: it asserts no compatibility it did not
-    // compute and manufactures no authority. The two stable codes are still
-    // enforced on the real write path by
-    // `eliot_store_surreal::task_binding_gate::gate_apply`, which re-derives
-    // them from the opaque proof handles the transition actually carries.
-    // Threading a real selection onto this edge requires that receipt owner to
-    // exist first; see `task_binding_admission`'s "Measured reachability"
-    // section.
+    // Issue #1929 (I5.5 capture/promotion split): task-free capture remains a
+    // cold unbound candidate. Every task-relative transition must arrive on
+    // the owner-selection path with the original evidence, independent current
+    // WorkScope snapshot, observed Host scope, authenticated request identity,
+    // and live fence. Generic callers have no such context and fail closed;
+    // selected callers validate it against the immutable prepared operation
+    // before any transport. There is no latest-task/open-task/resolver-guess
+    // fallback or silent task-relative-to-cold downgrade.
     let admission = super::task_binding_admission::admit_named_mutation_capture(
         &identity.request.metadata,
         transition,
     )
     .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    match (&admission, task_selection) {
+        (super::task_binding_admission::TaskBindingAdmission::TaskRelative, Some(selection)) => {
+            super::task_binding_admission::admit_prepared_transition_with_owner_selection(
+                &identity.request.metadata,
+                transition,
+                selection.request_identity,
+                selection.owner,
+                selection.observed_scope,
+                selection.live_fence,
+            )
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        }
+        (super::task_binding_admission::TaskBindingAdmission::TaskRelative, None) => {
+            return Err(KernelPortError::Contract(
+                "TASK_SELECTION_REQUIRED: task-relative transition has no retained owner selection at daemon ingress"
+                    .to_owned(),
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(KernelPortError::Contract(
+                "TASK_SELECTION_REQUIRED: selected Task Controller transition is not task-relative"
+                    .to_owned(),
+            ));
+        }
+        (_, None) => {}
+    }
     // Issue #1929: the durable retention of this cold unbound candidate is not
     // this log line. The store admits it as `GateDisposition::ColdUnbound` and
     // its adapter persists one `EvidenceRecord` per `CaptureObservation`
@@ -224,6 +242,98 @@ async fn read_task_controller_source_head(
         CampaignSourceReadStatus::Blocked => Err(KernelPortError::Contract(
             "Task Controller source head read was blocked".to_owned(),
         )),
+    }
+}
+
+impl DaemonKernelClient {
+    /// Applies one selection-bound Task Controller transition through the
+    /// normal authenticated transport after validating original owner evidence
+    /// against the immutable prepared transition and fresh Host observation.
+    pub(crate) fn apply_prepared_with_owner_selection<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        request_identity: (&'a str, &'a str, &'a str, &'a str),
+        owner: &'a eliot_governor::TaskSelectionAdmissionBinding,
+        observed_scope: &'a eliot_workscope::ObservedScopeResources,
+        live_fence: &'a StateFence,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        let context = OwnerTaskSelectionContext {
+            request_identity,
+            owner,
+            observed_scope,
+            live_fence,
+        };
+        self.apply_prepared_with_owner_selection_context(
+            identity,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            context,
+        )
+    }
+
+    fn apply_prepared_with_owner_selection_context<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        task_selection: OwnerTaskSelectionContext<'a>,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        let identity = identity.clone();
+        let span = tracing::info_span!(
+            "eliotd.transition_handoff",
+            operation = %super::diagnostics::sanitize_identity(&identity.idempotency_key)
+        );
+        Box::pin(
+            async move {
+                check_identity_binding_with_selection(
+                    &identity,
+                    &transition,
+                    &expected_revision_heads,
+                    &expected_ordering_heads,
+                    Some(&task_selection),
+                )?;
+                let _ = super::diagnostics::emit_handoff(
+                    super::diagnostics::HandoffKind::Prepared,
+                    identity.idempotency_key.as_str(),
+                    identity.request.metadata.request_id.as_str(),
+                );
+                let expected_transition = transition.clone();
+                let value = self
+                    .transact_async_with_identity(
+                        "apply_prepared",
+                        serde_json::json!({
+                            "context": identity.request.metadata.clone(),
+                            "transition": transition,
+                            "expected_revision_heads": expected_revision_heads,
+                            "expected_ordering_heads": expected_ordering_heads,
+                        }),
+                        identity.clone(),
+                    )
+                    .await
+                    .map_err(kernel_port_error)?;
+                let value = kind_value(&value, "write_receipt")?;
+                let receipt: WriteReceipt = serde_json::from_value(value)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                validate_store_receipt_envelope(
+                    &identity.request.metadata,
+                    &expected_transition,
+                    &receipt,
+                )
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                let _ = super::diagnostics::emit_handoff(
+                    super::diagnostics::HandoffKind::Committed,
+                    identity.idempotency_key.as_str(),
+                    receipt.operation_id.as_str(),
+                );
+                Ok(receipt)
+            }
+            .instrument(span),
+        )
     }
 }
 
@@ -444,6 +554,85 @@ impl KernelTransitionPort for DaemonKernelClient {
     }
 }
 
+/// Reusable exact-owner admission port for any production ingress that carries
+/// owner-issued task selection evidence and an independent Host observation.
+/// The wrapped transport remains the same authenticated daemon client; only
+/// the pre-transport gate receives the retained selection bundle.
+pub(crate) struct OwnerSelectionKernelPort<'a> {
+    kernel: &'a DaemonKernelClient,
+    request_identity: (&'a str, &'a str, &'a str, &'a str),
+    owner: &'a eliot_governor::TaskSelectionAdmissionBinding,
+    observed_scope: &'a eliot_workscope::ObservedScopeResources,
+    live_fence: &'a StateFence,
+}
+
+impl<'a> OwnerSelectionKernelPort<'a> {
+    pub(crate) fn new(
+        kernel: &'a DaemonKernelClient,
+        request_identity: (&'a str, &'a str, &'a str, &'a str),
+        owner: &'a eliot_governor::TaskSelectionAdmissionBinding,
+        observed_scope: &'a eliot_workscope::ObservedScopeResources,
+        live_fence: &'a StateFence,
+    ) -> Self {
+        Self {
+            kernel,
+            request_identity,
+            owner,
+            observed_scope,
+            live_fence,
+        }
+    }
+}
+
+impl KernelTransitionPort for OwnerSelectionKernelPort<'_> {
+    fn apply_prepared<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        self.kernel.apply_prepared_with_owner_selection(
+            identity,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            self.request_identity,
+            self.owner,
+            self.observed_scope,
+            self.live_fence,
+        )
+    }
+
+    fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
+        self.kernel.receipt(operation_id)
+    }
+
+    fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
+        self.kernel.health()
+    }
+
+    fn campaign_source_heads(
+        &self,
+        task_id: &TaskId,
+        scope_id: &str,
+        state_fence: &StateFence,
+    ) -> KernelPortFuture<'_, TaskControllerCampaignSourceHeads> {
+        self.kernel
+            .campaign_source_heads(task_id, scope_id, state_fence)
+    }
+
+    fn task_contract_acceptance_set(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+        state_fence: &StateFence,
+    ) -> KernelPortFuture<'_, TaskContractAcceptanceSet> {
+        self.kernel
+            .task_contract_acceptance_set(task_id, task_revision, state_fence)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,3 +841,4 @@ mod tests {
         );
     }
 }
+
