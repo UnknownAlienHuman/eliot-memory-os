@@ -154,11 +154,11 @@ pub fn resolve_quality_applicability(
 
     let resolutions = QualityApplicabilityResolutionSet {
         task_acceptance: task_acceptance?,
-        route: route?,
+        route,
         impact: impact?,
         governance_profile: governance_profile?,
         protected_floor: protected_floor?,
-        active_directive: active_directive?,
+        active_directive,
     };
     // The answers are checked against the contract owner's own shape rules
     // before they are handed on, so a blank owner or answer identity cannot
@@ -359,14 +359,14 @@ fn resolve_task_acceptance(
 fn resolve_route(
     binding: &ContextBinding,
     retained_read: Option<&ReadIdentity>,
-) -> Result<QualityApplicabilityResolution, QualityApplicabilityError> {
+) -> QualityApplicabilityResolution {
     let Some(identity) = retained_read else {
-        return Ok(unknown(ROUTE_OWNER));
+        return unknown(ROUTE_OWNER);
     };
     if identity.state_fence() != &binding.state_fence {
-        return Ok(unknown(ROUTE_OWNER));
+        return unknown(ROUTE_OWNER);
     }
-    Ok(resolved(
+    resolved(
         ROUTE_OWNER,
         format!(
             "read:{}:{}:{}",
@@ -374,7 +374,7 @@ fn resolve_route(
             identity.source().manifest_name,
             identity.source().manifest_digest
         ),
-    ))
+    )
 }
 
 /// Impact is resolved for every classification the action model can admit.
@@ -460,9 +460,7 @@ fn resolve_protected_floor(
 /// packet with an instruction-shaped atom that the owner issued as merely
 /// informational has no active governing directive, and reports `Unknown`
 /// rather than passing the dimension on the strength of a role label.
-fn resolve_active_directive(
-    admitted: &AdmittedContextSet,
-) -> Result<QualityApplicabilityResolution, QualityApplicabilityError> {
+fn resolve_active_directive(admitted: &AdmittedContextSet) -> QualityApplicabilityResolution {
     let mut governing: Vec<String> = admitted
         .records
         .iter()
@@ -479,7 +477,7 @@ fn resolve_active_directive(
         .collect();
     governing.sort_unstable();
     if governing.is_empty() {
-        return Ok(unknown(ACTIVE_DIRECTIVE_OWNER));
+        return unknown(ACTIVE_DIRECTIVE_OWNER);
     }
-    Ok(resolved(ACTIVE_DIRECTIVE_OWNER, governing.join(",")))
+    resolved(ACTIVE_DIRECTIVE_OWNER, governing.join(","))
 }
