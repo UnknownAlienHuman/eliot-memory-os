@@ -111,6 +111,23 @@ pub struct CaptureRequest {
     pub blobs: Vec<BackupBlob>,
     /// Purge ledger entries carried by the capture.
     pub purge_ledger: Vec<PurgeLedgerEntry>,
+    /// The purge OWNER's own declared ledger-wide revision at the moment this
+    /// capture observed it — the value
+    /// `RedbRecoveryStore::purge_ledger_revision` (or the read-only
+    /// `eliot_ors::read_purge_ledger_revision_read_only` answering read) issues
+    /// for the durable counter it commits with each purge row.
+    ///
+    /// This is the PRODUCER'S DECLARATION, carried verbatim and never derived
+    /// here: it is the owner's own original value, not a count of
+    /// `purge_ledger`, not a maximum over `entry.revision`, and not an
+    /// arithmetic stand-in. `I5.13:44` requires the manifest to bind the
+    /// purge-ledger revision, and `A13.7` requires a restore to verify purge
+    /// closure against the current owner; the restore performs exactly that
+    /// comparison against the owner it applies the ledger through
+    /// (`bins/eliot-kernel/src/backup_restore.rs::check_purge_revision_closure`),
+    /// so an archive that declares anything other than the owner's own value
+    /// refuses there instead of passing on a local coincidence.
+    pub purge_ledger_revision: u64,
     /// Logical ORS snapshot fence, when the class carries one.
     pub ors_snapshot: Option<OrsSnapshotFence>,
     /// Count of suspended recovery entries derived from the ORS snapshot.
@@ -135,10 +152,21 @@ pub struct CaptureRequest {
 /// shapes through the bundle, then crosses the owned request into `capture`.
 /// This keeps the ref-borrowed adapter (`CapturePorts`) on the production
 /// path instead of beside it.
+///
+/// `purge_ledger_revision` is the purge owner's own declared ledger-wide
+/// revision, read by the caller from
+/// `RedbRecoveryStore::purge_ledger_revision` (or the read-only
+/// `eliot_ors::read_purge_ledger_revision_read_only`). It is taken as an
+/// argument rather than derived from `ports.purge_ledger` because this owner
+/// has no purge owner to ask: a count of the carried entries is the caller's
+/// own list, not the owner's value, and an archive that carried a count
+/// instead of the owner's revision can never be cross-checked by a restore
+/// against the owner it applies the ledger through (#960, A14).
 pub fn request_from_ports(
     ports: &CapturePorts<'_>,
     plan: FrozenCapturePlan,
     suspended_count: u64,
+    purge_ledger_revision: u64,
 ) -> Result<CaptureRequest, KernelCaptureError> {
     ports.validate_shapes()?;
     Ok(CaptureRequest {
@@ -151,6 +179,7 @@ pub fn request_from_ports(
         receipts: ports.receipts.to_vec(),
         blobs: ports.blobs.to_vec(),
         purge_ledger: ports.purge_ledger.to_vec(),
+        purge_ledger_revision,
         ors_snapshot: ports.ors_snapshot.cloned(),
         suspended_count,
         artifacts: ports.artifacts.to_vec(),
@@ -1808,20 +1837,27 @@ fn check_budgets(request: &CaptureRequest) -> Result<(), KernelCaptureError> {
 /// Assembles the exact `BackupInput` from validated request fields: the
 /// archive identity binds the canonical export identity (nothing invented),
 /// class, source, and schema come from the frozen plan, and every evidence
-/// section crosses byte-identical. The purge revision binds the carried
-/// ledger: zero with an empty ledger, the entry count otherwise.
+/// section crosses byte-identical. The purge revision is the purge OWNER's own
+/// declared value, carried on the request and copied here unchanged.
 ///
-/// ASSUMPTION (purge-ledger revision). I5.13:44 requires the manifest to bind
-/// the "purge-ledger revision", and `eliot-backup` leaves that value to the
-/// producer: it only refuses a nonzero revision with no ledger and a zero
-/// revision with a non-empty one (`BackupBundle::validate`, "the purge revision
-/// binds the purge ledger carried here"). No accepted owner-neutral purge API
-/// reachable from this owner publishes a ledger-wide revision — the closest
-/// thing, Host's `BackupConfigProjection::purge_ledger_revision`, lives in
-/// `bins/eliot-host`, which this composition root may not depend on. The
-/// carried entry count is therefore used as the binding over the ledger this
-/// owner actually validated, and it is stated here rather than presented as the
-/// purge owner's own declared revision.
+/// The manifest's purge-ledger revision is not computed, counted or derived
+/// here. `I5.13:44` requires the manifest to bind the purge-ledger revision,
+/// and `elipt_backup` leaves that value to the producer: it only refuses a
+/// nonzero revision with no ledger and a zero revision with a non-empty one
+/// (`BackupBundle::validate`, "the purge revision binds the purge ledger
+/// carried here"). The carried entry count this owner used to substitute is
+/// the caller's own list, not the owner's value, so a restore could never
+/// cross-check it against the owner that applies the ledger — and did not:
+/// `RedbRecoveryStore::apply_purge_ledger_entry` allocates each returned
+/// revision INSIDE the write transaction that makes the row durable, so on a
+/// store whose counter had already advanced the two numbers disagreed by
+/// exactly that prior count and the purge phase refused every archive carrying
+/// a non-empty ledger, passing only on a virgin store where they agreed
+/// arithmetically (#960, A14). The value is therefore taken from the owner
+/// (`RedbRecoveryStore::purge_ledger_revision`, or the read-only
+/// `elipt_ors::read_purge_ledger_revision_read_only` answering read) and
+/// declared by the producer; this owner re-derives neither it nor any
+/// substitute.
 fn assemble_input(request: &CaptureRequest) -> BackupInput {
     BackupInput {
         backup_id: request.export_fence.export_id.clone(),
@@ -1839,10 +1875,6 @@ fn assemble_input(request: &CaptureRequest) -> BackupInput {
         watchdog_spool: request.watchdog_spool.clone(),
         host_audit: request.host_audit.clone(),
         missing_features: Vec::new(),
-        purge_ledger_revision: if request.purge_ledger.is_empty() {
-            0
-        } else {
-            request.purge_ledger.len() as u64
-        },
+        purge_ledger_revision: request.purge_ledger_revision,
     }
 }

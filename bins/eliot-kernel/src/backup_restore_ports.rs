@@ -303,6 +303,18 @@ pub enum StagedCleanupRefusal {
     BudgetReached,
     /// A staged path could not be unlinked; it is preserved.
     RemovalFailed,
+    /// Published phase material a still-present phase receipt attests was
+    /// preserved instead of unlinked, so the destination still holds restored
+    /// canonical history this cleanup declined to destroy.
+    ///
+    /// This is deliberately its own reason rather than a reuse of
+    /// [`Self::RemovalFailed`] or [`Self::BudgetReached`]: those say a removal
+    /// could not happen, while this says the bytes were correctly NOT removed
+    /// because a durable journal row and a retained receipt still account for
+    /// them. A caller deciding whether the destination is empty, or whether to
+    /// retry, is deciding on different facts in the two cases and must be able
+    /// to tell them apart (`ARCH-RES-03`, A13.7; #960 W13/A18).
+    AttestedPhaseMaterialPreserved,
 }
 
 impl std::fmt::Display for StagedCleanupRefusal {
@@ -314,6 +326,9 @@ impl std::fmt::Display for StagedCleanupRefusal {
             Self::PathNotOurs => "a staged path is not a plain file under the destination",
             Self::BudgetReached => "the derived removal budget was reached",
             Self::RemovalFailed => "a staged path could not be removed",
+            Self::AttestedPhaseMaterialPreserved => {
+                "published phase material a phase receipt still attests was preserved"
+            }
         };
         formatter.write_str(reason)
     }
