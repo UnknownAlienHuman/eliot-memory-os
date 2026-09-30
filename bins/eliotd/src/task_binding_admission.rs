@@ -553,6 +553,13 @@ pub enum CanonicalOperationRequirement {
 /// the name is not a canonical operation and is refused upstream, never
 /// defaulted to a weaker class.
 ///
+/// Frozen against the shared MCP contract (`crates/surfaces/eliot-mcp`
+/// `ADMITTED_TOOL_NAMES` / `ToolRequest::canonical_name` carry exactly these
+/// eight hot tools; the `eliot_user_automation`, `skill.inject`, and
+/// `skill.display` non-hot carriers are not canonical operations and stay
+/// `None`). Re-verify against that contract before changing this table; a
+/// renamed tool never smuggles a weaker class past the gate.
+///
 /// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher
 /// maps tool names through this table before submitting; the daemon write path
 /// re-derives its own requirement from the typed [`NamedMutationOperation`]
@@ -579,6 +586,10 @@ pub fn classify_canonical_operation(operation: &str) -> Option<CanonicalOperatio
 /// capture becomes task-bound is decided by the exact selection evidence in
 /// [`admit_capture`], never by the suboperation name.
 ///
+/// Frozen against the exact five `ObserveInput` kinds in the shared MCP
+/// contract (`tag = "kind"`, `snake_case`); an unknown suboperation stays
+/// `None` and is refused upstream, never defaulted.
+///
 /// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher,
 ///
 /// together with [`classify_canonical_operation`].
@@ -598,6 +609,10 @@ pub fn classify_observe_suboperation(suboperation: &str) -> Option<CanonicalOper
 /// `inspect`/`wait` are read-only orientation over run lineage and durable
 /// state; `delegate`/`audit`/`compare`/`cancel`/`send` create or reconcile
 /// execution effects and are task-relative.
+///
+/// Frozen against the exact `CoordinateInput` discriminators in the shared
+/// MCP contract (`snake_case` `operation` tag); an unknown discriminator stays
+/// `None` and is refused upstream, never defaulted.
 ///
 /// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher,
 /// together with [`classify_canonical_operation`].
@@ -1268,6 +1283,15 @@ pub fn refuse_ready_string_without_evidence(
 /// task-bound effect here: scope uncertainty permits only the quarantined
 /// capture route ([`admit_capture`] `ColdUnbound`, conflicting lineage
 /// preserved).
+///
+/// Reference (read-only, Governor-owned; issue #1746, W3): the retained-data
+/// leg is `GovernorComposition::require_scope_guard_for_observed` /
+/// `require_fresh_matched_binding`, and the canonical-write trigger is
+/// `GovernorComposition::check_canonical_write_work_scope` (already joined in
+/// `DaemonComposition::commit_canonical_and_refresh` after
+/// [`admit_canonical_write`]). This entry is the daemon's observation-derived
+/// legs over the same owner primitives — it mints no receipt and installs no
+/// binding.
 ///
 /// Called by [`admit_task_bound_with_observed_scope`].
 pub fn scope_guard_disposition(
