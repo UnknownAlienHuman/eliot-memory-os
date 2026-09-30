@@ -829,10 +829,18 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     /// envelope and checks it against the admitted identity, so the caller may
     /// release its composition borrow before
     /// [`PreparedKernelExchange::exchange`].
+    ///
+    /// No operation identity is taken here because none is needed at this call
+    /// site: `prepare_exchange` binds the exchange's operation from
+    /// `envelope.operation_id` alone, which is the same binding the sibling
+    /// owner legs rely on. The identity is therefore already committed upstream
+    /// by `current_plan_envelope` (from the caller's `<operation>/current-plan`
+    /// id) and travels inside the envelope, exactly as the finish-evidence leg's
+    /// identity does. Accepting a second copy here would create a second source
+    /// for one identity and could let the two disagree.
     pub(crate) fn prepare_current_plan_exchange(
         &self,
         identity: &RequestIdentity,
-        operation_id: &OperationId,
         envelope: CanonicalWriteEnvelope,
     ) -> Result<PreparedKernelExchange, FinishAttemptError> {
         prepare_exchange(self.canonical, identity, envelope)

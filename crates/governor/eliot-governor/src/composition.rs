@@ -5894,11 +5894,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         let snapshot = self.owners.canonical.prepare_current_plan(plan)?;
         let envelope = current_plan_envelope(identity, operation_id, &snapshot, task_id)?;
-        Ok(Some(service.prepare_current_plan_exchange(
-            identity,
-            operation_id,
-            envelope,
-        )?))
+        Ok(Some(service.prepare_current_plan_exchange(identity, envelope)?))
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
