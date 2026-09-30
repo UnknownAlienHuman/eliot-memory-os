@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_ors::{
-    OrsError, SCAN_DISCLOSURE_RECORD_TYPE, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner,
+    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
+    ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
+    SCAN_DISCLOSURE_RECORD_TYPE, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner,
     ScanDisclosureRecordState, ScanDisclosureStageOutcome,
 };
 use eliot_workscope::{
@@ -92,6 +94,23 @@ impl InstallationScanContour {
         self.ors_generation
     }
 
+    /// Binds a distinct durable readiness owner to this installation.
+    ///
+    /// Readiness leases and terminal receipts use their own ORS row family;
+    /// they never share scan-disclosure lifecycle records. The returned port
+    /// checks installation identity on every claim, publication, and readback
+    /// before forwarding to the canonical owner.
+    pub fn bind_cold_start_readiness_owner(
+        &self,
+        owner: Arc<dyn ColdStartReadinessRecordOwner>,
+    ) -> Result<Arc<dyn ColdStartReadinessRecordOwner>, WorkScopeError> {
+        self.validate()?;
+        Ok(Arc::new(InstallationColdStartReadinessOwner {
+            installation_id: self.installation_id.clone(),
+            owner,
+        }))
+    }
+
     fn validate(&self) -> Result<(), WorkScopeError> {
         nonblank(&self.installation_id, "scan_contour.installation_id")?;
         nonblank(&self.ors_object_ref, "scan_contour.ors_object_ref")?;
@@ -110,6 +129,125 @@ impl InstallationScanContour {
             return Err(WorkScopeError::ScanContourNotAdmitted);
         }
         Ok(())
+    }
+}
+
+/// Installation boundary around the separate ORS cold-start readiness table.
+///
+/// This adapter admits only the contour's installation identity and delegates
+/// every durability/atomicity decision to the canonical ORS owner.
+struct InstallationColdStartReadinessOwner {
+    installation_id: String,
+    owner: Arc<dyn ColdStartReadinessRecordOwner>,
+}
+
+impl InstallationColdStartReadinessOwner {
+    fn validate_key(&self, key: &eliot_ors::ColdStartReadinessOwnerKey) -> Result<(), OrsError> {
+        key.validate()?;
+        if key.installation_id != self.installation_id {
+            return Err(OrsError::Contract(
+                "cold-start readiness key is outside the admitted installation contour".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_record(&self, record: &ColdStartReadinessOrsRecord) -> Result<(), OrsError> {
+        record.validate()?;
+        self.validate_key(&record.claim.key)
+    }
+}
+
+impl ColdStartReadinessRecordOwner for InstallationColdStartReadinessOwner {
+    fn claim_cold_start_readiness(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<ColdStartReadinessStageOutcome, OrsError> {
+        claim.validate()?;
+        self.validate_key(&claim.key)?;
+        let outcome = self.owner.claim_cold_start_readiness(claim, now)?;
+        match &outcome {
+            ColdStartReadinessStageOutcome::Stored { record }
+            | ColdStartReadinessStageOutcome::AlreadyBound { record } => {
+                self.validate_record(record)?;
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        let existing = self
+            .owner
+            .load_cold_start_readiness(record_key)?
+            .ok_or_else(|| {
+                OrsError::Contract(
+                    "cold-start readiness publication has no retained lease row".to_owned(),
+                )
+            })?;
+        self.validate_record(&existing)?;
+        if existing.record_key != record_key
+            || existing.claim.binding_digest != binding_digest
+            || existing.claim.lease_ref != lease_ref
+        {
+            return Err(OrsError::Contract(
+                "cold-start readiness publication disagrees with the retained lease row".to_owned(),
+            ));
+        }
+        let record = self.owner.publish_cold_start_readiness(
+            record_key,
+            binding_digest,
+            lease_ref,
+            disposition,
+            receipt_ref,
+            receipt_bytes,
+        )?;
+        if let Some(record) = record.as_ref() {
+            self.validate_record(record)?;
+        }
+        Ok(record)
+    }
+
+    fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        let record = self.owner.load_cold_start_readiness(record_key)?;
+        if let Some(record) = record.as_ref() {
+            self.validate_record(record)?;
+            if record.record_key != record_key {
+                return Err(OrsError::Contract(
+                    "cold-start readiness row key disagrees with the requested key".to_owned(),
+                ));
+            }
+        }
+        Ok(record)
+    }
+
+    fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        let record = self
+            .owner
+            .load_cold_start_readiness_for_binding(binding_digest)?;
+        if let Some(record) = record.as_ref() {
+            self.validate_record(record)?;
+            if record.claim.binding_digest != binding_digest {
+                return Err(OrsError::Contract(
+                    "cold-start readiness binding digest disagrees with its row".to_owned(),
+                ));
+            }
+        }
+        Ok(record)
     }
 }
 

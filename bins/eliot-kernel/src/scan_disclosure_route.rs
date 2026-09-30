@@ -16,7 +16,10 @@ use eliot_contracts::StateFence;
 #[cfg(windows)]
 use eliot_ipc::ApplicationSessionState;
 use eliot_ipc::{Session, TransportError};
-use eliot_ors::{ScanDisclosureOrsRecord, ScanDisclosureStageOutcome};
+use eliot_ors::{
+    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessStageOutcome,
+    ColdStartReadinessTerminalDisposition, ScanDisclosureOrsRecord, ScanDisclosureStageOutcome,
+};
 
 use super::{ACTIVE_DAEMON_CALLER, KernelComposition};
 #[cfg(windows)]
@@ -27,8 +30,8 @@ pub(crate) const OPERATION: &str = "scan_disclosure_owner";
 
 const WIRE_VERSION: u16 = 1;
 
-/// Closed typed request envelope for contour/binding issuance and the five
-/// durable ORS scan-disclosure operations.
+/// Closed typed request envelope for contour/binding issuance, durable
+/// scan-disclosure operations, and durable cold-start readiness operations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScanDisclosureOwnerRequest {
@@ -77,6 +80,21 @@ pub(crate) enum ScanDisclosureOwnerAction {
         binding: ScanDisclosureOwnerBinding,
         limit: u16,
     },
+    /// Atomically claim or join one exact durable cold-start lease key.
+    ReadinessClaim { claim: Box<ColdStartReadinessClaim> },
+    /// Publish one immutable terminal readiness receipt revision.
+    ReadinessPublish {
+        record_key: String,
+        binding_digest: String,
+        lease_ref: String,
+        disposition: ColdStartReadinessTerminalDisposition,
+        receipt_ref: String,
+        receipt_bytes: String,
+    },
+    /// Read one exact durable readiness lease revision.
+    ReadinessLoad { record_key: String },
+    /// Read the latest revision for one complete readiness binding digest.
+    ReadinessLoadForBinding { binding_digest: String },
 }
 
 /// Kernel-neutral wire projection of `ScanDisclosureOwnerBinding`.
@@ -151,6 +169,12 @@ pub(crate) enum ScanDisclosureOwnerValue {
     },
     Records {
         records: Vec<ScanDisclosureOrsRecord>,
+    },
+    ReadinessClaimed {
+        outcome: ColdStartReadinessStageOutcome,
+    },
+    ReadinessRecord {
+        record: Option<ColdStartReadinessOrsRecord>,
     },
 }
 
@@ -232,7 +256,12 @@ impl KernelComposition {
     ) -> Result<(), TransportError> {
         if matches!(
             action,
-            ScanDisclosureOwnerAction::IssueContour | ScanDisclosureOwnerAction::IssueBinding
+            ScanDisclosureOwnerAction::IssueContour
+                | ScanDisclosureOwnerAction::IssueBinding
+                | ScanDisclosureOwnerAction::ReadinessClaim { .. }
+                | ScanDisclosureOwnerAction::ReadinessPublish { .. }
+                | ScanDisclosureOwnerAction::ReadinessLoad { .. }
+                | ScanDisclosureOwnerAction::ReadinessLoadForBinding { .. }
         ) {
             if super::unix_ms() > current.ticket.kernel_deadline_unix_ms {
                 return Err(TransportError::Timeout);
@@ -293,7 +322,162 @@ impl KernelComposition {
             ScanDisclosureOwnerAction::List { binding, limit } => {
                 self.list_scan_disclosure_owner(current, &binding, limit)
             }
+            ScanDisclosureOwnerAction::ReadinessClaim { claim } => {
+                self.claim_cold_start_readiness_owner(current, claim.as_ref())
+            }
+            ScanDisclosureOwnerAction::ReadinessPublish {
+                record_key,
+                binding_digest,
+                lease_ref,
+                disposition,
+                receipt_ref,
+                receipt_bytes,
+            } => self.publish_cold_start_readiness_owner(
+                current,
+                &record_key,
+                &binding_digest,
+                &lease_ref,
+                disposition,
+                &receipt_ref,
+                &receipt_bytes,
+            ),
+            ScanDisclosureOwnerAction::ReadinessLoad { record_key } => {
+                self.load_cold_start_readiness_owner(current, &record_key)
+            }
+            ScanDisclosureOwnerAction::ReadinessLoadForBinding { binding_digest } => {
+                self.load_cold_start_readiness_owner_for_binding(current, &binding_digest)
+            }
         }
+    }
+
+    #[cfg(windows)]
+    fn claim_cold_start_readiness_owner(
+        &self,
+        current: &CurrentScanDisclosureActivation,
+        claim: &ColdStartReadinessClaim,
+    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+        Self::validate_cold_start_readiness_key(current, &claim.key)?;
+        claim
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let outcome = self
+            .p07_ors
+            .claim_cold_start_readiness(claim, super::unix_ms())
+            .map_err(|_| TransportError::SessionFenced)?;
+        match &outcome {
+            ColdStartReadinessStageOutcome::Stored { record }
+            | ColdStartReadinessStageOutcome::AlreadyBound { record } => {
+                Self::validate_cold_start_readiness_record(current, record)?;
+            }
+        }
+        Ok(ScanDisclosureOwnerValue::ReadinessClaimed { outcome })
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn publish_cold_start_readiness_owner(
+        &self,
+        current: &CurrentScanDisclosureActivation,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+        let existing = self
+            .p07_ors
+            .load_cold_start_readiness(record_key)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::IdentityConflict)?;
+        Self::validate_cold_start_readiness_record(current, &existing)?;
+        if existing.claim.binding_digest != binding_digest || existing.claim.lease_ref != lease_ref
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let record = self
+            .p07_ors
+            .publish_cold_start_readiness(
+                record_key,
+                binding_digest,
+                lease_ref,
+                disposition,
+                receipt_ref,
+                receipt_bytes,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::IdentityConflict)?;
+        Self::validate_cold_start_readiness_record(current, &record)?;
+        Ok(ScanDisclosureOwnerValue::ReadinessRecord {
+            record: Some(record),
+        })
+    }
+
+    #[cfg(windows)]
+    fn load_cold_start_readiness_owner(
+        &self,
+        current: &CurrentScanDisclosureActivation,
+        record_key: &str,
+    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+        let record = self
+            .p07_ors
+            .load_cold_start_readiness(record_key)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if let Some(record) = record.as_ref() {
+            Self::validate_cold_start_readiness_record(current, record)?;
+            if record.record_key != record_key {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
+        Ok(ScanDisclosureOwnerValue::ReadinessRecord { record })
+    }
+
+    #[cfg(windows)]
+    fn load_cold_start_readiness_owner_for_binding(
+        &self,
+        current: &CurrentScanDisclosureActivation,
+        binding_digest: &str,
+    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+        let record = self
+            .p07_ors
+            .load_cold_start_readiness_for_binding(binding_digest)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if let Some(record) = record.as_ref() {
+            Self::validate_cold_start_readiness_record(current, record)?;
+            if record.claim.binding_digest != binding_digest {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
+        Ok(ScanDisclosureOwnerValue::ReadinessRecord { record })
+    }
+
+    #[cfg(windows)]
+    fn validate_cold_start_readiness_key(
+        current: &CurrentScanDisclosureActivation,
+        key: &eliot_ors::ColdStartReadinessOwnerKey,
+    ) -> Result<(), TransportError> {
+        key.validate().map_err(|_| TransportError::SessionFenced)?;
+        if key.installation_id != current.installation_id
+            || key.state_fence != current.ticket.state_fence
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn validate_cold_start_readiness_record(
+        current: &CurrentScanDisclosureActivation,
+        record: &ColdStartReadinessOrsRecord,
+    ) -> Result<(), TransportError> {
+        record
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_cold_start_readiness_key(current, &record.claim.key)?;
+        if super::unix_ms() > record.claim.lease_deadline {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
