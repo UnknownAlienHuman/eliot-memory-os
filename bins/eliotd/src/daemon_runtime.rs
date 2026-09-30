@@ -5006,7 +5006,14 @@ struct ImprovementIntakeFlightState {
 /// at all and it disposes of that as its own `NoRetainedPrior` case.
 enum ImprovementIntakeFlight {
     Idle {
-        retained: Option<eliot_maintenance::RetainedImprovementProposal>,
+        /// Boxed for the same storage reason the operation is boxed on the
+        /// `UserAutomationOperation` boundary: the retained record is far
+        /// larger than the in-flight handle, and leaving it inline made this
+        /// enum's `Idle` and `InFlight` arms differ by more than three times
+        /// their own size. It is a storage detail only — the record is read
+        /// through a reference on the next pass exactly as before, and no
+        /// value is copied to make it fit.
+        retained: Option<Box<eliot_maintenance::RetainedImprovementProposal>>,
     },
     InFlight(ImprovementIntakeFlightState),
 }
@@ -5190,7 +5197,7 @@ async fn run_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     observation: MaintenanceObservation,
-    retained: Option<eliot_maintenance::RetainedImprovementProposal>,
+    retained: Option<&eliot_maintenance::RetainedImprovementProposal>,
 ) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     let prepared = {
         let guard = composition.lock().await;
@@ -5207,7 +5214,7 @@ async fn run_improvement_intake(
             .emit();
             // A pass that never assembled a candidate reached no route, so it
             // retains nothing new; the prior admitted record stays.
-            return retained;
+            return retained.cloned();
         }
     };
     // The deduplication registry, read back from the records this daemon
@@ -5230,7 +5237,7 @@ async fn run_improvement_intake(
                 &error.to_string(),
             )
             .emit();
-            return retained;
+            return retained.cloned();
         }
     };
     let restored = rows.len();
@@ -5250,7 +5257,7 @@ async fn run_improvement_intake(
             // The route step is not attempted: it routes the artifact this pass
             // was about to admit, and nothing was admitted. The prior admitted
             // record stays.
-            return retained;
+            return retained.cloned();
         }
     };
     let committed = {
@@ -5366,14 +5373,14 @@ async fn route_and_reconcile_improvement_candidate(
     artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
     policy: &eliot_maintenance::ImprovementAdmissionPolicy,
     fence: &eliot_contracts::StateFence,
-    retained: Option<eliot_maintenance::RetainedImprovementProposal>,
+    retained: Option<&eliot_maintenance::RetainedImprovementProposal>,
 ) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     let routed = eliotd::improvement_candidate_dispatch::dispatch_improvement_candidate_route(
         eliotd::improvement_candidate_dispatch::ImprovementRouteDispatch {
             artifact,
             policy,
             state_fence: fence,
-            retained: retained.as_ref(),
+            retained,
         },
     );
     // Phase 6 — the external effect this disposition names, read from the effect
@@ -5449,7 +5456,7 @@ fn report_improvement_candidate_route(
         eliotd::improvement_candidate_dispatch::ImprovementRouteOutcome,
         eliot_maintenance::PipelineError,
     >,
-    retained: Option<eliot_maintenance::RetainedImprovementProposal>,
+    retained: Option<&eliot_maintenance::RetainedImprovementProposal>,
 ) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     match routed {
         Ok(outcome) => {
@@ -5561,7 +5568,7 @@ fn report_improvement_candidate_route(
             // NEW. The previously retained record stays in the flight: a refused
             // pass is not evidence that the prior admitted record stopped
             // existing.
-            retained
+            retained.cloned()
         }
     }
 }
@@ -5731,6 +5738,9 @@ fn maybe_start_improvement_intake(
     flight: &mut ImprovementIntakeFlight,
 ) {
     let retained = match flight {
+        // The clone is a pointer copy: the flight's record is already boxed, so
+        // the future carries the reference-sized handle rather than a second
+        // inline copy of the record. The record the step reads is the same one.
         ImprovementIntakeFlight::Idle { retained } => retained.clone(),
         ImprovementIntakeFlight::InFlight(_) => return,
     };
@@ -5740,7 +5750,8 @@ fn maybe_start_improvement_intake(
     *flight = ImprovementIntakeFlight::InFlight(ImprovementIntakeFlightState {
         future: Box::pin(async move {
             let retained_next =
-                run_improvement_intake(&kernel, &composition, observation, retained).await;
+                run_improvement_intake(&kernel, &composition, observation, retained.as_deref())
+                    .await;
             ImprovementIntakeCompletion::Settled(retained_next)
         }),
     });
@@ -5769,7 +5780,13 @@ fn settle_improvement_intake_completion(
     completion: ImprovementIntakeCompletion,
 ) {
     let ImprovementIntakeCompletion::Settled(retained) = completion;
-    *flight = ImprovementIntakeFlight::Idle { retained };
+    *flight = ImprovementIntakeFlight::Idle {
+        // Boxed for the enum's arm-size balance only; the stored value and the
+        // value the step returns are the same record, and boxing moves no
+        // boundary — `run_improvement_intake` and the next pass's repeat
+        // assessment both read it through a plain reference.
+        retained: retained.map(Box::new),
+    };
 }
 
 /// Pure tick gate: the `TestD` owner timer starts work only when the flight
