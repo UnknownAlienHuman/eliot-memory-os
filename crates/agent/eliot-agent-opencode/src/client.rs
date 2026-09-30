@@ -224,7 +224,10 @@ pub enum OpenCodeRunError {
         cause: String,
         reconciliation: String,
     },
-    #[error("OpenCode output was observed but route reconciliation failed: {reconciliation}")]
+    #[error(
+        "OpenCode output was observed but route reconciliation failed: {}",
+        .0.reconciliation
+    )]
     ObservedOutputFailure(Box<ObservedOutputFailure>),
 }
 
