@@ -946,11 +946,28 @@ pub trait McpForwardingPort {
     /// live swap on either side, so the core publish that follows a success
     /// cannot strand one half committed.
     ///
-    /// Every implementation must state how it commits those effects. The
-    /// production Kernel forwarding port swaps the exact proposed owner ack
-    /// bases, only owner-confirmed held-sequence pruning, and the retained
-    /// offer disposition proved by this same import; fixtures with
-    /// no process-local cursor cache implement this as an explicit no-op.
+    /// This call is the single commit cut for the acknowledgement half. The
+    /// port's `reconcile_external` performs no terminal acknowledgement or
+    /// offer write ahead of it: it retains the reply's acknowledgement
+    /// receipt as evidence only, leaving every ack base, held receipt, and
+    /// offer disposition for this call. Every implementation must state how
+    /// it commits those effects. The production Kernel forwarding port swaps
+    /// the exact proposed owner ack bases, only owner-confirmed held-sequence
+    /// pruning, and the retained offer disposition proved by this same import;
+    /// fixtures with no process-local cursor cache implement this as an
+    /// explicit no-op.
+    ///
+    /// The core always invokes this call with the complete offer-proof
+    /// inputs: the result carries the exact echoed consumed legs, the staged
+    /// candidate's owner/identity stream facts are attached for every
+    /// non-pure read, and the live binding plus the reconcile-key and
+    /// continuation relation were validated before the candidate was staged.
+    /// The port retires a retained #2800 offer to its terminal disposition
+    /// only on that exact proof (echoed legs, this offer's own
+    /// connection/generation binding, and an owner-confirmed cursor at or
+    /// beyond the offered frontier for every offered leg under the adopted
+    /// owner tuple); a lower or foreign reply leaves the offer unresolved,
+    /// and a windowless answer never reaches this call at all.
     /// A borrow conflict or stale continuity commits nothing and returns a
     /// typed retry/recovery refusal; silent success after a skipped update
     /// is forbidden on this path.
@@ -4563,10 +4580,28 @@ impl AgentBridgeCore {
     /// candidate recovery window off to the side and then commit through
     /// this one writer: the transport ack-cache half swaps first, and only
     /// then does the candidate core window publish through infallible field
-    /// moves. A borrow conflict or stale continuity fails here with both
-    /// halves untouched; reversing the order would strand a published core
-    /// window next to an uncommitted transport cache. Returns the import
-    /// disposition, or `None` when the answer carried no window to import.
+    /// moves. Reversing the order would strand a published core window next
+    /// to an uncommitted transport cache.
+    ///
+    /// Audit clauses 2-4 hold inside this writer: every fallible step (the
+    /// staged candidate's owner/identity facts, the live-attach continuity
+    /// recheck, and the port acquisition) completes before the joint swap,
+    /// so a borrow conflict or stale continuity fails here with both halves
+    /// untouched and stays typed, never silent. After the port swap succeeds,
+    /// the candidate publishes through field moves only: liveness was proven
+    /// by the recheck and the port cannot detach the attach, so no parsing,
+    /// allocation, owner call, validation, or other fallible work remains
+    /// after the first live mutation.
+    ///
+    /// The candidate facts attached below are the per-leg frontier input of
+    /// the #2800 offer proof the port evaluates inside the same swap, so the
+    /// commit's terminal offer write stays gated on the exact echoed legs,
+    /// the offer's own connection/generation binding, and an owner-confirmed
+    /// cursor at or beyond every offered frontier. A windowless answer never
+    /// reaches the swap, leaving a retained offer unresolved.
+    ///
+    /// Returns the import disposition, or `None` when the answer carried no
+    /// window to import.
     #[allow(clippy::result_large_err)]
     fn import_reconciliation_page(
         &mut self,
@@ -4574,21 +4609,38 @@ impl AgentBridgeCore {
         result: &ReconciliationPortResult,
         prepared: Option<(Option<RecoveryWindow>, RecoveryDisposition)>,
     ) -> Result<Option<RecoveryDisposition>, BridgeError> {
+        // Fallible preparation first, while both halves are untouched: the
+        // staged candidate's owner/identity facts are validated here, before
+        // any live state moves.
         let mut import_result = result.clone();
         if let (false, Some((Some(candidate), _))) = (result.is_pure_recovery_read(), &prepared) {
             import_result = import_result
                 .with_recovery_candidate_stream_facts(candidate.owner_candidate_stream_facts()?);
         }
-        // Joint commit (issue #2799): the transport half swaps first; the
-        // core half below publishes through infallible field moves, so a
-        // failure here leaves both halves untouched.
         if prepared.is_some() {
+            // Pre-swap continuity recheck: the live attach must still carry
+            // the exact binding this page was prepared against. A missing
+            // attach or a moved binding commits nothing and stays typed.
+            let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
+            if active.binding != *binding {
+                return Err(BridgeError::StaleAuthority);
+            }
+            // Joint commit (issue #2799): the transport half swaps first; the
+            // core half below publishes through infallible field moves, so a
+            // failure here leaves both halves untouched.
             self.forwarder()?
                 .reconciliation_imported(binding, &import_result)
                 .map_err(BridgeError::from_forwarding_failure)?;
         }
         if let Some((candidate, disposition)) = prepared {
-            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+            // Infallible publish: liveness was proven by the recheck above
+            // and the port swap cannot detach the attach, so no fallible
+            // operator remains after the first live mutation. The typed
+            // refusal below is unreachable in a single synchronous import;
+            // it exists so a skipped publish can never report success.
+            let Some(active) = self.active.as_mut() else {
+                return Err(BridgeError::NotAttached);
+            };
             active.recovery = candidate;
             return Ok(Some(disposition));
         }
@@ -4687,7 +4739,10 @@ impl AgentBridgeCore {
         pending
     }
 
-    /// Validates one windowed owner answer whole, then imports it.
+    /// Validates one windowed owner answer whole, then imports it into the
+    /// caller-supplied staged candidate only: the live recovery window is
+    /// never touched here, so every fallible check below completes before
+    /// the joint commit publishes anything.
     ///
     /// Nothing is applied until every leg passes: the presenting connection
     /// and live generation must still match the live binding (a late
