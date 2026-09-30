@@ -14,7 +14,8 @@
 //! `eliot_context_candidates::check_campaign_learning_state_view` against this
 //! compilation's request identity,
 //! `eliot_context_admission::check_campaign_view_for_admission` against the
-//! binding the admission decision would be made under, and
+//! binding the admission decision would be made under and the owner-issued
+//! Decision Safety Floor for that boundary, and
 //! `eliot_context_assembly::check_campaign_view_for_assembly` against the
 //! admitted set it is about to render. Every one of them re-derives the
 //! State-Fence, task/scope identity and load-bearing Context recipe owner
@@ -198,19 +199,6 @@ enum CampaignPacketGapCode {
     /// `PacketAdmissionBundle::build`, and the per-identity account of what this
     /// tree can and cannot supply today is:
     ///
-    /// The candidate stage is reached today only as far as
-    /// `eliot_context_candidates::check_campaign_learning_state_view`, which
-    /// owns the campaign view's State Fence, identity and load-bearing Context
-    /// recipe revision joins. The admission cell reaches its own join from this
-    /// route through
-    /// `eliot_context_admission::check_campaign_view_for_admission`, which
-    /// re-derives the join from the binding admission decides under rather than
-    /// inheriting the candidate cell's verdict. The assembly cell's join is
-    /// reached from `KernelContextReadClient::compile_context_packet`, which is
-    /// the only place an actual `AdmittedContextSet` exists to join against;
-    /// this route produces none because `admit_context` has no callable
-    /// argument set. Both full decisions stay unreachable for that same reason.
-    ///
     /// - `SafetyFloorIdentity` — SUPPLIED. The Context owner record already
     ///   carries the floor: `GoverningContextRequirements::floor` holds the
     ///   `DecisionSafetyFloor` itself and the resolved policy revision names the
@@ -221,13 +209,13 @@ enum CampaignPacketGapCode {
     ///   (`eliot_context_admission::check_campaign_view_for_admission`), which
     ///   checks the floor's binding, its decision identity and its coverage of
     ///   the recipe's mandatory roles.
-    /// - `PriorityPolicyIdentity` — ABSENT. It needs one
-    ///   `CandidatePriority` per candidate atom, with a class and an ordinal.
-    ///   No owner record in this tree declares a per-candidate priority class,
-    ///   and no candidate atom exists on this route: `construct_context_candidates`
-    ///   is unreachable because the seven role projections have no production
-    ///   owner here, so the atom identities the policy must be keyed by do not
-    ///   exist yet. An ordinal is available from the owner-declared order in
+    /// - `PriorityPolicyIdentity` — ABSENT. It needs one `CandidatePriority` per
+    ///   candidate atom, with a class and an ordinal. No owner record in this
+    ///   tree declares a per-candidate priority class, and no candidate atom
+    ///   exists on this route: `construct_context_candidates` is unreachable
+    ///   because the seven role projections have no production owner here, so the
+    ///   atom identities the policy must be keyed by do not exist yet. An ordinal
+    ///   is available from the owner-declared order in
     ///   `RecipeLayoutPolicy::role_positions`, but that is a per-ROLE position,
     ///   and a per-atom ordinal taken from the caller's own list order is the
     ///   caller-list fabrication the contract forbids. I12.13's
@@ -239,8 +227,8 @@ enum CampaignPacketGapCode {
     ///   (`RecipeAdmissionPolicy::admission_rule`) and the recipe carries the
     ///   decision revision, but the rule's own record — and therefore the
     ///   `rule_sha256` digest the identity must carry — is deliberately not a
-    ///   copy in the recipe body. The missing owner is the admission-rule
-    ///   record I12.13's `admission_and_suppression_policy` names as "owner
+    ///   copy in the recipe body. The missing owner is the admission-rule record
+    ///   I12.13's `admission_and_suppression_policy` names as "owner
     ///   references, not copies"; no such record is read or published here.
     /// - `MeasurementCompositionProfile` — ABSENT. It needs a serializer
     ///   identity and version, a serializer-options digest, a route id and a
@@ -248,6 +236,12 @@ enum CampaignPacketGapCode {
     ///   own inputs are caller-owned `MeasurementParams`; no route in this tree
     ///   issues that record, and the Context owner body carries none of these
     ///   fields.
+    /// - `AdmissionMeasurement` (per candidate atom/representation) — ABSENT.
+    ///   `AdmissionInput::validate` forces these to equal the candidate atom set
+    ///   exactly, and each names the candidate's own subject and measurement
+    ///   digests, so no record can exist before the candidate stage produces
+    ///   that set. None of the seven role projections has a production owner on
+    ///   this route, so the set they would be keyed by does not exist.
     /// - `AssemblyPolicy` — ABSENT, for the same missing serializer/route/model
     ///   identity as the measurement profile, plus a route byte ceiling no owner
     ///   publishes for this packet.
@@ -256,6 +250,28 @@ enum CampaignPacketGapCode {
     ///   ABSENT for the same reason: each needs owner evidence (per-dimension
     ///   rule revision and observed evidence, role acquisitions, a route
     ///   serializer identity) that has no producer on this route.
+    ///
+    /// The composition's own shape is no longer part of the obstacle:
+    /// `KernelContextReadClient::compile_context_packet` now takes the
+    /// atom-keyed admission pieces and the quality card as owner suppliers
+    /// invoked after the candidate and admission stages that produce what they
+    /// are keyed by, so it is callable in principle rather than uncallable by
+    /// construction. What remains absent is the owner supply above, which no
+    /// amount of reshaping can substitute for.
+    ///
+    /// The candidate stage is reached today only as far as
+    /// `eliot_context_candidates::check_campaign_learning_state_view`, which
+    /// owns the campaign view's State Fence, identity and load-bearing Context
+    /// recipe revision joins; `construct_context_candidates` itself is still
+    /// unreachable because the seven role projections have no production
+    /// owner. The admission cell reaches its own join from this route through
+    /// `eliot_context_admission::check_campaign_view_for_admission`, which
+    /// re-derives the join from the binding admission decides under rather than
+    /// inheriting the candidate cell's verdict. The assembly cell's join is
+    /// reached from `KernelContextReadClient::compile_context_packet`, which is
+    /// the only place an actual `AdmittedContextSet` exists to join against;
+    /// this route produces none because `admit_context` has no callable
+    /// argument set. Both full decisions stay unreachable for that same reason.
     ///
     /// Minting any of the absent pieces here from a constant, a CLI flag, an env
     /// var, or a caller-supplied string would fabricate the exact selection
@@ -322,8 +338,8 @@ struct DeliveredMaterialTrace {
 /// `FusedRankTrace` handle field the contract asks for; it is `None` here
 /// because the daemon closes over no COMPLETE owner-minted admission closure —
 /// it now holds the owner-issued Decision Safety Floor, but not the priority
-/// policy, admission rule, measurement profile, quality card or assembly policy
-/// the traced join also needs — and
+/// policy, admission rule, measurement profile, per-atom measurements, quality
+/// card or assembly policy the traced join also needs — and
 /// [`CampaignPacketGapCode::AdmissionClosureUnbound`] is delivered alongside it
 /// to say so. The handle slot is present and typed precisely so an unbound
 /// handle can never be read as "nothing was withheld".
@@ -567,14 +583,18 @@ pub fn validate_campaign_packet_pair(
 ///
 /// The returned request is the proof artifact the compile edge will consume
 /// once its remaining owner suppliers land (STITCH-2564-PACKET-SUPPLY: seven
-/// roles, candidate policy, admission bundle pieces, quality card, assembly
-/// policy, measurement). Today its success signal gates the product path: the
-/// value proves the owner recipe binds the admitted packet and that the
-/// candidate cell accepted the campaign view, and a failure takes the typed
-/// gap named by the failing join. The request is not yet handed to
+/// roles, candidate policy, priority policy, admission rule record,
+/// measurement profile, per-atom measurements, quality card, assembly policy,
+/// measurement). Today its success signal gates the product path: the value
+/// proves the owner recipe binds the admitted packet and that the candidate
+/// cell accepted the campaign view, and a failure takes the typed gap named by
+/// the failing join. The request is not yet handed to
 /// `construct_context_candidates` because the seven role projections have no
 /// production owner; that composition is reported as
-/// `AdmissionClosureUnbound` rather than faked.
+/// `AdmissionClosureUnbound` rather than faked. The compile edge itself is no
+/// longer the obstacle: `compile_context_packet` now takes the atom-keyed
+/// admission pieces and the quality card as suppliers invoked after the stages
+/// that produce what they are keyed by.
 fn candidate_request_for_packet(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
@@ -1223,15 +1243,15 @@ async fn resolve_compile_and_bind_result(
     // `context_recipe_digest`, which the Context owner re-derived from the exact
     // recipe body its own publication validator accepted.
     //
-    // The protected floor is resolved here, from the same authenticated Context
-    // owner row, through the Context owner's own publication
-    // (`eliot_context::campaign_publication::context_safety_floor_identity`).
-    // That owner reads the floor record out of the catalogue's
+    // The protected floor this decision is made under is resolved here, from the
+    // same authenticated Context owner row, through the Context owner's own
+    // publication (`eliot_context::campaign_publication::context_safety_floor_identity`).
+    // That resolver reads the floor record out of the catalogue's
     // `GoverningContextRequirements` and the resolved revision's own
     // `RecipeAdmissionPolicy::safety_floor` reference, and refuses unless the two
-    // agree and the floor is bound to this recipe. Nothing here mints it, and a
-    // body that does not carry a usable floor is refused as a Context gap rather
-    // than admitted with an empty floor.
+    // agree and the floor is bound to this recipe. Nothing on this route mints
+    // it, and a body carrying no usable floor is refused as a Context gap rather
+    // than admitted with an empty one.
     let admission_floor = match context_safety_floor_identity(&context_recipe_body) {
         Ok(floor) => floor,
         Err(_) => {

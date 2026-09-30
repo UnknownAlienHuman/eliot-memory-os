@@ -327,13 +327,17 @@ pub fn context_safety_floor_identity(
     body: &ContextCampaignRecipeBody,
 ) -> Result<SafetyFloorIdentity, ContextPublicationError> {
     let resolved = body.catalogue.resolve()?;
-    body.catalogue.governing.authorize(&resolved, &body.recipe)?;
+    body.catalogue
+        .governing
+        .authorize(&resolved, &body.recipe)?;
     let identity = SafetyFloorIdentity {
         floor_id: resolved.policy.admission.safety_floor.clone(),
         decision: body.recipe.decision.clone(),
         floor: body.catalogue.governing.floor.clone(),
     };
-    identity.validate().map_err(ContextPublicationError::SafetyFloor)?;
+    identity
+        .validate()
+        .map_err(ContextPublicationError::SafetyFloor)?;
     Ok(identity)
 }
 
