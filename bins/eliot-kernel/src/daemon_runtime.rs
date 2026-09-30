@@ -17,8 +17,8 @@ use eliot_platform_windows::{
     current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
 use eliot_process::{
-    CancellationStatus, Generation, ProcessExecutionError, ProcessExecutionView,
-    ProcessLifecycle, ProcessOwnerBinding, ProcessStartReceipt,
+    CancellationStatus, Generation, ProcessExecutionError, ProcessExecutionView, ProcessLifecycle,
+    ProcessOwnerBinding, ProcessStartReceipt,
 };
 
 use super::diagnostic_brief::DiagnosticTrigger;
@@ -585,14 +585,9 @@ impl KernelComposition {
                 Err(error) => return Err(self.daemon_failure_error(error.to_string())),
             };
             if let Some(refusal) = daemon_refuses_replacement(service_state, &closed) {
-                observe_daemon_runtime(
-                    "kernel.daemon.restart_refused",
-                    daemon_restart_refusal_reason(refusal),
-                );
-                let reason = format!(
-                    "eliotd automatic restart refused: {}",
-                    daemon_restart_refusal_reason(refusal)
-                );
+                let reason = daemon_restart_refusal_reason(&refusal);
+                observe_daemon_runtime("kernel.daemon.restart_refused", reason);
+                let reason = format!("eliotd automatic restart refused: {reason}");
                 return Err(self.daemon_failure_error(reason));
             }
         } else if !matches!(

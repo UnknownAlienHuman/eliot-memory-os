@@ -7,15 +7,15 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
-use eliot_kernel_service::{KernelActivationReceipt, KernelServiceError};
 #[cfg(windows)]
 use eliot_kernel_service::KernelServiceState;
+use eliot_kernel_service::{KernelActivationReceipt, KernelServiceError};
 use eliot_ors::{SupervisionLeaseOperation, SupervisionLeaseSnapshot};
 #[cfg(not(windows))]
 use eliot_process::ProcessStartReceipt;
 #[cfg(windows)]
 use eliot_process::{
-    ExitDisposition, EliotdLiveReadyEvidence, EliotdLiveReceipt, ProcessExecutionView,
+    EliotdLiveReadyEvidence, EliotdLiveReceipt, ExitDisposition, ProcessExecutionView,
     ProcessStartReceipt,
 };
 #[cfg(windows)]
@@ -155,9 +155,7 @@ pub(crate) fn daemon_refuses_replacement(
 /// Bounded reason for a refusal, for the diagnostics facade. It is a fixed
 /// vocabulary, so no owner payload can reach an observation.
 #[cfg(windows)]
-pub(crate) const fn daemon_restart_refusal_reason(
-    refusal: DaemonRestartRefusal,
-) -> &'static str {
+pub(crate) const fn daemon_restart_refusal_reason(refusal: &DaemonRestartRefusal) -> &'static str {
     match refusal {
         DaemonRestartRefusal::OwnerLifecycle => "owner_lifecycle_suppressed",
         DaemonRestartRefusal::ExitIdentityNotProved => "exit_identity_not_proved",
