@@ -4065,6 +4065,12 @@ impl KernelComposition {
     /// exact prepared transition. The route therefore creates no authority, no
     /// principal, and no second canonical writer.
     ///
+    /// The closed vocabulary is not the same set as `UserAutomationOperation`:
+    /// the I12.24:65 owner decision appears in the latter and is refused at this
+    /// boundary, because the automation Store has no automation identity to
+    /// commit it under and this route will not report a durable outcome for a
+    /// decision it cannot record.
+    ///
     /// The answer is one post-commit orchestration transition. The canonical
     /// Store commit, the wake publication/cancellation handoff over the
     /// authenticated `USER_AUTOMATION_RUNTIME_OPERATION` channel, and the
@@ -4174,6 +4180,37 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
+        // I12.24:65's "decision owner selects reject / investigate / work item /
+        // experiment" is a closed operation on this boundary, and this route is
+        // not the seam that can record one. The operation carries `brief_id`
+        // and no `automation_id`, while every row, ordering scope and mutation
+        // projection the canonical Store below owns is keyed by an automation
+        // identity. Admitting it here would force one of two fabrications:
+        // hang the decision on an invented automation so it could reach a
+        // writer that cannot interpret it, or let it fall through to a Store
+        // refusal after this route had already reported a reconcilable outcome
+        // that no Store call ever backed. The second is the worse one, because
+        // the recoverable answer this route hands back asserts "prior_attempt_
+        // may_have_committed" about a Store that was never entered.
+        //
+        // Refusing here changes nothing about the brief, the candidate or
+        // their authority: I12.24:82 makes the advisory class "default;
+        // changes nothing until owner acts" and I12.24:3 states that ELIOT
+        // "never silently rewrites code, policy or memory authority". What is
+        // refused is only this route's claim to own a decision it cannot
+        // durably record. The improvement owner is the single writer of that
+        // record, and it must take the deciding principal from an
+        // authenticated Session of its own — A12.02:3's "Identity is not a
+        // model's self-declared string" is why the decision cannot be
+        // forwarded over a payload and re-attributed there, and why an ingress
+        // that could not bind the session principal has no honest way to
+        // complete the selection at all.
+        if matches!(
+            route.payload.operation,
+            eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
         let principal = authenticated_user_automation_principal(session)?;
         let operation_id = eliot_contracts::OperationId::new(format!(
             "user-automation-operation:{}",
@@ -9221,7 +9258,7 @@ enum UserAutomationDueWakeRead {
 /// `run-now`, `remove`, and `pause` cross into an execution or cancellation
 /// owner. A read or a configuration query owns none, so it composes no runtime
 /// channel and reports both handoff phases as not applicable instead of implying
-/// an absent owner.
+/// an absent owner. The I12.24:65 owner decision is in that last group.
 #[cfg(windows)]
 fn user_automation_runtime_handoff_need(
     operation: &eliot_kernel_core::UserAutomationOperation,
@@ -9237,10 +9274,23 @@ fn user_automation_runtime_handoff_need(
         | eliot_kernel_core::UserAutomationOperation::Edit { .. } => {
             UserAutomationRuntimeHandoffNeed::Effect
         }
+        // I12.24:65's "decision owner selects reject / investigate / work item
+        // / experiment" joins the reads here, and for the same structural
+        // reason. It selects one disposition against one brief and owns no
+        // wake horizon, because a recurring horizon belongs to a committed
+        // automation configuration revision and this operation names none. It
+        // publishes nothing, cancels nothing and crosses into no execution
+        // owner; I12.24:82 makes the advisory class "default; changes nothing
+        // until owner acts" and I12.24:3 states that ELIOT "never silently
+        // rewrites code, policy or memory authority", so recording a
+        // disposition emits no effect to hand off. `None` is therefore the
+        // honest classification, and it keeps the Host contour out of an
+        // answer that owes no runtime owner anything.
         eliot_kernel_core::UserAutomationOperation::List { .. }
         | eliot_kernel_core::UserAutomationOperation::Status { .. }
         | eliot_kernel_core::UserAutomationOperation::History { .. }
-        | eliot_kernel_core::UserAutomationOperation::InspectLastFailure { .. } => {
+        | eliot_kernel_core::UserAutomationOperation::InspectLastFailure { .. }
+        | eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. } => {
             UserAutomationRuntimeHandoffNeed::None
         }
     }
