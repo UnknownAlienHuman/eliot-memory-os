@@ -1574,7 +1574,7 @@ function Invoke-StoreStart {
                 startState           = 'ReconciliationRequired'
                 requested            = @{ requestKey = $launchInput['requestKey']; endpoint = $launchInput['endpoint']; namespace = $launchInput['namespace']; database = $launchInput['database']; schemaDigest = $Script:StoreRequiredSchemaDigest }
                 observed             = $null
-                invocation           = @{ argvCount = $fixedArgv.Count; bindEndpoint = $launchInput['endpoint'] }
+                invocation           = @{ argvCount = $fixedArgv.Count; bindEndpoint = $launchInput['endpoint']; imagePath = $storePath }
                 binary               = @{ version = $version; digest = [string]$receipt['digest']; provenance = $provenance }
                 credentialHandle     = [string]$credential['credentialHandle']
                 retryPermitted       = $false
@@ -1606,19 +1606,37 @@ function Invoke-StoreStart {
     if ($observedNonce -ceq $nonce) {
         throw [System.InvalidOperationException]::new('STORE-LAUNCH-FAILED: requested and observed nonces must be distinct handles.')
     }
+    # Two identities are deliberately kept apart and neither is inferred from the
+    # other. The launched image is a fact of this step's own launch input: argv[0]
+    # is the digest- and provenance-verified store binary this step created, so it
+    # is carried unconditionally and never depends on a launcher volunteering it.
+    # The observed image/start time are a fact only of the launcher's own
+    # observation of the process it created; a process start time is not knowable
+    # before that process exists. When the launcher does not report them the
+    # receipt says so through an explicit named disposition instead of a silently
+    # absent field that a later step would have to guess about. Readiness and
+    # stop both already fail closed on an unobserved identity, so the disposition
+    # names that condition rather than changing it.
     $observedIdentity = @{ pid = $observedPid; nonce = $observedNonce; endpoint = $launchInput['endpoint'] }
+    $observedIdentityComplete = $true
     foreach ($extra in @('imagePath', 'startTimeUtc', 'jobName')) {
         if ($observed.ContainsKey($extra) -and -not [string]::IsNullOrWhiteSpace([string]$observed[$extra])) {
             $observedIdentity[$extra] = [string]$observed[$extra]
         }
+        elseif ($extra -ne 'jobName') {
+            # jobName is a bounded handle binding, not part of the process
+            # identity that ownership and PID-reuse proofs depend on.
+            $observedIdentityComplete = $false
+        }
     }
+    $observedIdentity['identityState'] = $(if ($observedIdentityComplete) { 'Observed' } else { 'Unobserved' })
     return @{
         runId      = $runId
         runRoot    = $runRoot
         startState = 'StartRequested'
         requested  = @{ requestKey = $launchInput['requestKey']; endpoint = $launchInput['endpoint']; namespace = $launchInput['namespace']; database = $launchInput['database']; nonce = $nonce; schemaDigest = $Script:StoreRequiredSchemaDigest }
         observed   = $observedIdentity
-        invocation = @{ argvCount = $fixedArgv.Count; bindEndpoint = $launchInput['endpoint']; artifact = $Script:StoreArtifact }
+        invocation = @{ argvCount = $fixedArgv.Count; bindEndpoint = $launchInput['endpoint']; artifact = $Script:StoreArtifact; imagePath = $storePath }
         binary     = @{ version = $version; architecture = $Script:StoreArchitecture; peMachine = $Script:StorePeMachine; digest = [string]$receipt['digest']; provenance = $provenance }
         credentialHandle = [string]$credential['credentialHandle']
         reservationIdentity = (Get-StorePortReservationReceipt -Identity $reservationIdentity)
@@ -1667,8 +1685,16 @@ function Invoke-StoreObserveReadiness {
         throw [System.InvalidOperationException]::new('STORE-RECEIPT-STALE: start receipt carries no observed process handle.')
     }
     $observed = $StartReceipt['observed']
-    if (-not $observed.ContainsKey('pid') -or -not $observed.ContainsKey('endpoint') -or
-        -not $observed.ContainsKey('imagePath') -or -not $observed.ContainsKey('startTimeUtc')) {
+    if (-not $observed.ContainsKey('pid') -or -not $observed.ContainsKey('endpoint')) {
+        throw [System.InvalidOperationException]::new('STORE-RECEIPT-STALE: start receipt observation is incomplete.')
+    }
+    if ($observed.ContainsKey('identityState') -and [string]$observed['identityState'] -ceq 'Unobserved') {
+        # The launcher returned no observation of the process it created, so the
+        # started image/start time is unproven. Liveness, port ownership and auth
+        # could not be bound to the launched process without it.
+        throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: start receipt carries no observed launched-process identity.')
+    }
+    if (-not $observed.ContainsKey('imagePath') -or -not $observed.ContainsKey('startTimeUtc')) {
         throw [System.InvalidOperationException]::new('STORE-RECEIPT-STALE: start receipt observation is incomplete.')
     }
     $ownedPid = [int]$observed['pid']
@@ -1953,9 +1979,16 @@ function Invoke-StoreStop {
     $hasImage = ($observed.ContainsKey('imagePath') -and -not [string]::IsNullOrWhiteSpace([string]$observed['imagePath']))
     $hasStart = ($observed.ContainsKey('startTimeUtc') -and -not [string]::IsNullOrWhiteSpace([string]$observed['startTimeUtc']))
     if (-not $hasImage -or -not $hasStart) {
+        # The receipt states whether the launcher observed the launched process.
+        # An unobserved identity is named as such; the started image and start
+        # time are never reconstructed from the requested launch input, because
+        # the start time of a process is not knowable before it exists.
+        $identityDetail = 'STORE-PROCESS-IDENTITY-UNPROVEN: start receipt carries no live-verifiable process identity.'
+        if ($observed.ContainsKey('identityState') -and [string]$observed['identityState'] -ceq 'Unobserved') {
+            $identityDetail = 'STORE-PROCESS-IDENTITY-UNPROVEN: launcher observed no launched-process image/start-time identity.'
+        }
         return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
-            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
-            -Detail 'STORE-PROCESS-IDENTITY-UNPROVEN: start receipt carries no live-verifiable process identity.'
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail $identityDetail
     }
     $rootIdentity = @{
         pid          = $ownedPid
