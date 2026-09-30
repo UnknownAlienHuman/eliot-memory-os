@@ -236,7 +236,7 @@ fn leg_identity(
                 product_id: admitted.request.metadata.product_id.clone(),
                 source_id: admitted.request.metadata.source_id.clone(),
                 state_fence: attempt.state_fence.clone(),
-                clock: admitted.request.metadata.clock.clone(),
+                clock: admitted.request.metadata.clock,
             },
             state_fence: attempt.state_fence.clone(),
         },
@@ -329,7 +329,7 @@ pub fn issue_coordination_work(
             heartbeat_deadline: attempt.expires_at_unix_ms,
         },
         work_item: WorkItem {
-            work_item_id,
+            work_item_id: work_item_id.clone(),
             task_id: attempt.task_id.to_string(),
             state: WorkState::Ready,
             state_fence: attempt.state_fence.clone(),
@@ -354,6 +354,6 @@ pub fn issue_coordination_work(
             lease_duration,
         },
         result_id,
-        observed_clock: admitted.request.metadata.clock.clone(),
+        observed_clock: admitted.request.metadata.clock,
     })
 }

@@ -5643,11 +5643,13 @@ async fn run_task_controller_poll(
             // logged instead, at the boundary that produced it.
             let now = unix_ms(SystemTime::now())?;
             let mut guard = composition.lock().await;
-            match eliotd::campaign_task_controller::record_task_controller_coordination_candidate(
-                &mut guard,
-                &coordination_source,
-                &body.result_digest,
-                now,
+            match Box::pin(
+                eliotd::campaign_task_controller::record_task_controller_coordination_candidate(
+                    &mut guard,
+                    &coordination_source,
+                    &body.result_digest,
+                    now,
+                ),
             )
             .await
             {

@@ -63,8 +63,8 @@ pub mod cell_declaration_registry;
 /// calls `KernelContextReadClient::reconstruct_context_inputs`, the existing
 /// Governor composition edge over `GovernorContextInputs`.
 pub mod context_reconstruction_route;
-pub mod coordination_owner_ingress;
 mod controlboard_adapters;
+pub mod coordination_owner_ingress;
 /// Issue #1720 A12: the fire-side cue activation drive. This composition root
 /// evaluates the Governor-reconstructed cue candidate with the R5
 /// `eliot-cue-activation` owner and attaches the deterministic summary to the
@@ -1625,9 +1625,7 @@ impl DaemonComposition {
         // written, so a structural mistake never reaches the compare-and-set
         // read or the owner. The draft it lowers to is still the owner's own
         // type and is still re-checked by the owner on the way in.
-        let draft = ingress
-            .into_draft()
-            .map_err(DaemonError::Composition)?;
+        let draft = ingress.into_draft().map_err(DaemonError::Composition)?;
         // The predecessor revision is read here, from the refresh-consistent
         // named read, rather than inside the owner: a caller-presented integer
         // would be exactly the substituted compare-and-set the fenced CAS
@@ -1708,9 +1706,7 @@ impl DaemonComposition {
             result_id: _,
             observed_clock,
         } = issued;
-        let draft = ingress
-            .into_draft()
-            .map_err(DaemonError::Composition)?;
+        let draft = ingress.into_draft().map_err(DaemonError::Composition)?;
         // The work registration records the registered coordination session as
         // its registrant, so the persisted event names the actor that owns the
         // item rather than a label. Read before `session` is moved into the
