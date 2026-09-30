@@ -27,7 +27,7 @@ use super::{
     InstallerServiceRole, ManagedEnvironmentChangeRequest, PlannedChange, PlatformHandle,
     ProfileGovernedRoots, ProfileSelectionResolution, RetainedGuardRevert, RuntimeStateRoots,
     SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
-    StoreCredentialProgress, candidate_manifest_digest, handle, handles,
+    StoreCredentialProgress, UserModeTaskRunHostAck, candidate_manifest_digest, handle, handles,
     ownership_secret_absence_evidence, phase_b_scm_digest,
     prove_no_service_profile_authority_dependency, sha256_handle, sha256_hex,
     validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
@@ -808,6 +808,11 @@ pub struct InstallationEffectProgress {
     /// This is not Host readiness; runtime readiness remains independently
     /// observed by the Host process handshake.
     pub current_user_task_run_receipt: Option<CurrentUserTaskRunReceipt>,
+    /// Exact registry-validated Host readiness acknowledgement for the
+    /// retained task receipt and one-shot `RunEx` intent. It can satisfy active
+    /// readiness when the `RunEx` response was lost, but never manufactures an
+    /// engine process ID or claims Task Scheduler acceptance.
+    pub current_user_task_run_host_ack: Option<UserModeTaskRunHostAck>,
     /// Current durable effect state.
     pub state: InstallationEffectProgressState,
 }
@@ -1489,6 +1494,7 @@ impl InstallationTransaction {
                 current_user_task_unknown: None,
                 current_user_task_run_intent: None,
                 current_user_task_run_receipt: None,
+                current_user_task_run_host_ack: None,
                 state: InstallationEffectProgressState::Pending,
             })
             .collect();
@@ -1624,10 +1630,10 @@ impl InstallationTransaction {
                 .get(positions.task)
                 .ok_or(InstallationError::IdentityConflict)?;
             if progress.current_user_task_receipt.is_none()
-                || progress.current_user_task_run_receipt.is_none()
+                || progress.current_user_task_run_host_ack.is_none()
             {
                 return Err(InstallationError::IncompleteObservation(
-                    "UserMode activation requires the exact Task registration and one-shot run receipts"
+                    "UserMode activation requires the exact Task registration receipt and Host readiness acknowledgement"
                         .to_owned(),
                 ));
             }
@@ -2154,7 +2160,8 @@ impl InstallationTransaction {
                     || progress.current_user_task_receipt.is_some()
                     || progress.current_user_task_unknown.is_some()
                     || progress.current_user_task_run_intent.is_some()
-                    || progress.current_user_task_run_receipt.is_some())
+                    || progress.current_user_task_run_receipt.is_some()
+                    || progress.current_user_task_run_host_ack.is_some())
             {
                 return Err(InstallationError::IncompleteObservation(
                     "pending UserMode task effect must not carry a synthetic receipt or unknown result"
@@ -2194,6 +2201,20 @@ impl InstallationTransaction {
             .find_map(|(effect, progress)| {
                 matches!(effect, InstallerEffectPlan::RegisterCurrentUserTask { .. })
                     .then_some(progress.current_user_task_run_receipt.as_ref())
+                    .flatten()
+            })
+    }
+
+    /// Returns the exact registry-validated Host readiness acknowledgement for
+    /// the planned `UserMode` task.
+    #[must_use]
+    pub fn current_user_task_run_host_ack(&self) -> Option<&UserModeTaskRunHostAck> {
+        self.installer_effects
+            .iter()
+            .zip(&self.effect_progress)
+            .find_map(|(effect, progress)| {
+                matches!(effect, InstallerEffectPlan::RegisterCurrentUserTask { .. })
+                    .then_some(progress.current_user_task_run_host_ack.as_ref())
                     .flatten()
             })
     }
@@ -2339,6 +2360,62 @@ impl InstallationTransaction {
             None => {}
         }
         self.effect_progress[positions.task].current_user_task_run_receipt = Some(receipt);
+        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+            InstallationError::InvalidField {
+                field: "revision".to_owned(),
+                reason: "overflow".to_owned(),
+            }
+        })?;
+        self.validate()
+    }
+
+    /// Retains the exact Host readiness acknowledgement for the transaction's
+    /// already-committed current-user task and one-shot `RunEx` intent.
+    ///
+    /// The acknowledgement may satisfy active readiness when the Task
+    /// Scheduler response was lost. It does not synthesize or replace the
+    /// Task Scheduler engine receipt.
+    pub(crate) fn record_current_user_task_host_ack(
+        &mut self,
+        ack: UserModeTaskRunHostAck,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        let positions = self.user_mode_activation_effect_positions()?;
+        let progress = self
+            .effect_progress
+            .get(positions.task)
+            .ok_or(InstallationError::IdentityConflict)?;
+        if !matches!(progress.state, InstallationEffectProgressState::Applied { .. }) {
+            return Err(InstallationError::IncompleteObservation(
+                "Host readiness acknowledgement requires an Applied UserMode task registration"
+                    .to_owned(),
+            ));
+        }
+        let task_receipt = progress
+            .current_user_task_receipt
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?;
+        let run_intent = progress
+            .current_user_task_run_intent
+            .as_ref()
+            .ok_or_else(|| InstallationError::IncompleteObservation(
+                "Host readiness acknowledgement requires the exact persisted RunEx intent"
+                    .to_owned(),
+            ))?;
+        ack.validate()?;
+        Self::validate_current_user_task_run_intent(task_receipt, run_intent)?;
+        if ack.intent.task_receipt != *task_receipt || ack.intent.run_intent != *run_intent {
+            return Err(InstallationError::IdentityConflict);
+        }
+        match self.effect_progress[positions.task]
+            .current_user_task_run_host_ack
+            .as_ref()
+        {
+            Some(existing) if existing == &ack => return Ok(()),
+            Some(_) => return Err(InstallationError::IdentityConflict),
+            None => {}
+        }
+        self.effect_progress[positions.task].current_user_task_run_host_ack = Some(ack);
         self.revision = self.revision.checked_add(1).ok_or_else(|| {
             InstallationError::InvalidField {
                 field: "revision".to_owned(),
@@ -2818,7 +2895,8 @@ impl InstallationTransaction {
                     || progress.current_user_task_receipt.is_some()
                     || progress.current_user_task_unknown.is_some()
                     || progress.current_user_task_run_intent.is_some()
-                    || progress.current_user_task_run_receipt.is_some())
+                    || progress.current_user_task_run_receipt.is_some()
+                    || progress.current_user_task_run_host_ack.is_some())
             {
                 return Err(InstallationError::IncompleteObservation(
                     "pending PortableDev PhaseB effect must not carry synthetic task or Phase-B receipts"
@@ -3359,6 +3437,26 @@ impl InstallationTransaction {
         }
         self.validate_effect_progress()?;
         self.validate_stage_progress()?;
+        if self.profile == InstallationProfile::UserMode
+            && matches!(
+                self.stage,
+                InstallationStage::ActiveVerified
+                    | InstallationStage::Cleaning
+                    | InstallationStage::Completed
+            )
+        {
+            let positions = self.user_mode_activation_effect_positions()?;
+            if self
+                .effect_progress
+                .get(positions.task)
+                .is_none_or(|progress| progress.current_user_task_run_host_ack.is_none())
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "ActiveVerified UserMode transaction requires the exact Host readiness acknowledgement"
+                        .to_owned(),
+                ));
+            }
+        }
         if self.revision == 0 {
             return Err(InstallationError::InvalidField {
                 field: "revision".to_owned(),
@@ -3620,7 +3718,8 @@ impl InstallationTransaction {
                     || progress.current_user_task_receipt.is_some()
                     || progress.current_user_task_unknown.is_some()
                     || progress.current_user_task_run_intent.is_some()
-                    || progress.current_user_task_run_receipt.is_some())
+                    || progress.current_user_task_run_receipt.is_some()
+                    || progress.current_user_task_run_host_ack.is_some())
             {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -3632,9 +3731,11 @@ impl InstallationTransaction {
                     progress.current_user_task_unknown.as_ref(),
                     progress.current_user_task_run_intent.as_ref(),
                     progress.current_user_task_run_receipt.as_ref(),
+                    progress.current_user_task_run_host_ack.as_ref(),
                 ) {
                     (
                         InstallationEffectProgressState::Pending,
+                        None,
                         None,
                         None,
                         None,
@@ -3644,6 +3745,7 @@ impl InstallationTransaction {
                     (
                         InstallationEffectProgressState::Pending,
                         Some(request),
+                        None,
                         None,
                         None,
                         None,
@@ -3658,12 +3760,14 @@ impl InstallationTransaction {
                         None,
                         None,
                         None,
+                        None,
                     ) => self.validate_current_user_task_request(request)?,
                     (
                         InstallationEffectProgressState::Unknown { .. },
                         Some(request),
                         receipt,
                         Some(unknown),
+                        None,
                         None,
                         None,
                     ) => {
@@ -3679,6 +3783,7 @@ impl InstallationTransaction {
                         None,
                         run_intent,
                         run_receipt,
+                        host_ack,
                     ) => {
                         self.validate_current_user_task_receipt(request, receipt)?;
                         match (run_intent, run_receipt) {
@@ -3695,10 +3800,24 @@ impl InstallationTransaction {
                             }
                             (None, Some(_)) => return Err(InstallationError::IdentityConflict),
                         }
+                        if let Some(ack) = host_ack {
+                            let intent = run_intent.ok_or_else(|| {
+                                InstallationError::IncompleteObservation(
+                                    "Host readiness acknowledgement requires its exact RunEx intent"
+                                        .to_owned(),
+                                )
+                            })?;
+                            ack.validate()?;
+                            if ack.intent.task_receipt != *receipt
+                                || ack.intent.run_intent != *intent
+                            {
+                                return Err(InstallationError::IdentityConflict);
+                            }
+                        }
                     }
                     _ => {
                         return Err(InstallationError::IncompleteObservation(
-                            "current-user task progress must retain its exact request, registration receipt, and optional one-shot run receipt"
+                            "current-user task progress must retain its exact request, registration receipt, and optional one-shot intent, RunEx receipt, and Host acknowledgement"
                                 .to_owned(),
                         ));
                     }
@@ -5207,6 +5326,13 @@ fn validate_current_transaction_progress(
                 }
             }
         }
+        if !progress.contains_key("current_user_task_run_host_ack") {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "installation transaction effect progress entry {index} is missing the v31 current_user_task_run_host_ack member"
+                ),
+            });
+        }
         if let Some(ownership) = progress
             .get("ownership_secret")
             .filter(|ownership| !ownership.is_null())
@@ -5257,7 +5383,7 @@ fn validate_current_transaction_progress(
     Ok(())
 }
 
-fn prepare_transaction_json_for_current_wire(
+pub(super) fn prepare_transaction_json_for_current_wire(
     value: &mut serde_json::Value,
 ) -> Result<(), InstallationError> {
     let version = value.get("transaction_wire_version").ok_or_else(|| {
@@ -5265,7 +5391,7 @@ fn prepare_transaction_json_for_current_wire(
             reason: "installation transaction predates the required v29 discriminator".to_owned(),
         }
     })?;
-    let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
+    let mut version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
         InstallationError::MigrationRequired {
             reason: "installation transaction has an unsupported wire discriminator".to_owned(),
         }
@@ -5297,7 +5423,7 @@ fn prepare_transaction_json_for_current_wire(
                         })?;
                 object.insert(
                     "transaction_wire_version".to_owned(),
-                    serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(
+                    serde_json::to_value(ContractVersion::new(30, 0, 0)).map_err(
                         |error| InstallationError::CorruptRegistry {
                             reason: error.to_string(),
                         },
@@ -5307,6 +5433,7 @@ fn prepare_transaction_json_for_current_wire(
                     "system_service_host_root_receipt".to_owned(),
                     serde_json::Value::Null,
                 );
+                version = ContractVersion::new(30, 0, 0);
             }
             _ => {
                 return Err(InstallationError::MigrationRequired {
@@ -5315,7 +5442,61 @@ fn prepare_transaction_json_for_current_wire(
                 });
             }
         }
-    } else if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
+    }
+    if version == ContractVersion::new(30, 0, 0) {
+        let profile = value.get("profile").and_then(serde_json::Value::as_str);
+        let stage = value.get("stage").and_then(serde_json::Value::as_str);
+        if profile == Some("user_mode")
+            && matches!(stage, Some("ACTIVE_VERIFIED" | "CLEANING" | "COMPLETED"))
+        {
+            return Err(InstallationError::MigrationRequired {
+                reason: "v30 ActiveVerified UserMode transaction has no exact Host readiness acknowledgement; explicit recovery is required"
+                    .to_owned(),
+            });
+        }
+        let progress_entries = value
+            .get_mut("effect_progress")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| InstallationError::CorruptRegistry {
+                reason: "v30 installation transaction is missing its effect progress array"
+                    .to_owned(),
+            })?;
+        for (index, progress) in progress_entries.iter_mut().enumerate() {
+            let progress = progress
+                .as_object_mut()
+                .ok_or_else(|| InstallationError::CorruptRegistry {
+                    reason: format!(
+                        "v30 installation transaction effect progress entry {index} is not an object"
+                    ),
+                })?;
+            if progress.contains_key("current_user_task_run_host_ack") {
+                return Err(InstallationError::CorruptRegistry {
+                    reason: format!(
+                        "v30 installation transaction effect progress entry {index} contains a field outside its declared wire shape"
+                    ),
+                });
+            }
+            progress.insert(
+                "current_user_task_run_host_ack".to_owned(),
+                serde_json::Value::Null,
+            );
+        }
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| InstallationError::CorruptRegistry {
+                reason: "installation transaction wire is not an object".to_owned(),
+            })?;
+        object.insert(
+            "transaction_wire_version".to_owned(),
+            serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(|error| {
+                InstallationError::CorruptRegistry {
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        version = INSTALLATION_TRANSACTION_WIRE_VERSION;
+    }
+    if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
         return Err(InstallationError::MigrationRequired {
             reason: format!(
                 "installation transaction wire {version} requires explicit migration to {INSTALLATION_TRANSACTION_WIRE_VERSION}"
