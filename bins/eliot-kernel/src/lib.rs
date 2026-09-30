@@ -967,6 +967,9 @@ struct ActivatedApplicationBinding {
     activation_generation: ResourceGeneration,
     /// Exact Kernel-issued activation ticket the accepted result answered.
     activation_ticket_id: String,
+    /// Full original Kernel-issued activation ticket, including the exact
+    /// typed peer receipt and inert selector provenance.
+    activation_ticket: eliot_protocol::AgentActivationResolutionTicket,
     /// Digest of the exact ticket, which seals its request and admission receipt.
     activation_ticket_sha256: String,
     /// Request identity and digest copied from the exact validated ticket.
@@ -976,8 +979,18 @@ struct ActivatedApplicationBinding {
     peer_admission_receipt_sha256: String,
     /// Digest of the exact typed semantic resolution result that was accepted.
     resolution_result_sha256: String,
+    /// Exact typed resolution decision whose digest is retained above.
+    activation_result: eliot_protocol::AgentActivationResolutionResult,
     /// Full owner-resolved identity from the exact typed result.
     resolved_binding: eliot_protocol::AgentActivationResolvedBinding,
+    /// Exact application fence issued with the activation ticket. Retaining the
+    /// whole value lets Observe admissions bind every fence member rather than
+    /// reconstructing one from identity claims.
+    activation_state_fence: eliot_contracts::StateFence,
+    /// Authenticated semantic-owner evidence that issued `resolved_binding`.
+    activation_owner_evidence: eliot_protocol::AgentActivationOwnerEvidence,
+    /// Fresh owner readback joined to the accepted activation result.
+    activation_owner_readback: eliot_protocol::AgentActivationOwnerReadback,
     /// Current P-07 owner projection under which the result was accepted.
     kernel_owner_revision: u64,
     kernel_owner_bundle_sha256: String,
@@ -990,6 +1003,18 @@ struct AgentBridgeConnectionState {
     declaration: AgentBridgeClientDeclaration,
     peer: PeerIdentity,
     accepted_transport: Option<AcceptedAgentBridgeTransport>,
+    /// Exact original Kernel-issued peer observation retained at hello; this
+    /// remains transport identity and is never projected as an app Session.
+    peer_admission_receipt: Option<eliot_protocol::AgentBridgePeerAdmissionReceipt>,
+    /// Governor-owned raw host-origin policy decision returned with a
+    /// non-resolved activation result, if any.
+    observation_host_policy_readback:
+        Option<eliot_protocol::AgentActivationObservationHostPolicyReadback>,
+    /// Exact retained negative activation decision paired with the host
+    /// policy readback; this is provenance, never task authority.
+    observation_host_activation_result: Option<eliot_protocol::AgentActivationResolutionResult>,
+    /// Exact ticket whose negative result retained the raw host policy source.
+    observation_host_activation_ticket: Option<eliot_protocol::AgentActivationResolutionTicket>,
     /// Kernel-owned transport Session retained after successful activation.
     session: Option<Session>,
     activation_completed: bool,
