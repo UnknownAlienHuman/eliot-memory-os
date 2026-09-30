@@ -1482,6 +1482,7 @@ fn validate_retained_identity(
                     | HEARTBEAT_OPERATION
                     | AUTHORIZE_LAUNCH_OPERATION
                     | FENCE_OPERATION
+                    | VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION
                     | "eliot.user-broker.cancel"
                     | "eliot.user-broker.reconcile"
             );
@@ -1510,7 +1511,11 @@ fn validate_retained_identity(
     }
     let is_kernel_operation = matches!(
         retained.operation.as_str(),
-        REGISTER_OPERATION | HEARTBEAT_OPERATION | AUTHORIZE_LAUNCH_OPERATION | FENCE_OPERATION
+        REGISTER_OPERATION
+            | HEARTBEAT_OPERATION
+            | AUTHORIZE_LAUNCH_OPERATION
+            | FENCE_OPERATION
+            | VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION
     );
     let is_control_operation = matches!(
         retained.operation.as_str(),
