@@ -45,6 +45,10 @@ pub enum SecurityContractError {
     },
     #[error("security indicator evidence does not establish its own class: {field}")]
     IndicatorEvidenceUnproven { field: &'static str },
+    #[error("analysis reaches {reference}, which the request did not admit")]
+    AnalysisHandleOutsideAdmission { reference: String },
+    #[error("disclosure decision {decision} admits no analysis answer to its recipient")]
+    AnalysisRecipientNotAdmitted { decision: &'static str },
     #[error("revoked influence is still marked active")]
     RevokedInfluenceActive,
     #[error("revoked influence has no invalidation reason")]

@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admitted_analysis;
 mod injection_indicators;
 mod native_resource_lease;
 mod native_resource_selection;
@@ -13,6 +14,11 @@ mod revocation_digest;
 mod surface_types;
 mod validation;
 
+pub use admitted_analysis::{
+    AdmittedAnalysisAssertability, AdmittedAnalysisCandidate, AdmittedAnalysisLineage,
+    AdmittedAnalysisOutcome, AdmittedAnalysisOutputContract, AdmittedAnalysisRequest,
+    AdmittedAnalysisStopCondition, AdmittedAnalysisTrigger, admit_analysis,
+};
 pub use injection_indicators::{
     BroadExtractionEvidence, DroppedEvidenceKind, DroppedEvidenceRecord, ExternalContentRole,
     ExtractionScope, INDICATOR_CLASS_COUNT, IndicatorClass, IndicatorCoverage, IndicatorEvidence,

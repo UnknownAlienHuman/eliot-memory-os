@@ -262,15 +262,16 @@ pub(crate) fn assessment_text(
     Ok(())
 }
 
-fn assessment_digest(value: &str) -> Result<(), crate::SecurityContractError> {
+pub(crate) fn assessment_digest(
+    value: &str,
+    field: &'static str,
+) -> Result<(), crate::SecurityContractError> {
     if value.len() != 64
         || value
             .bytes()
             .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
-        return Err(crate::SecurityContractError::InvalidText {
-            field: "source.digest",
-        });
+        return Err(crate::SecurityContractError::InvalidText { field });
     }
     Ok(())
 }
@@ -456,25 +457,7 @@ impl SourceSecurityAssessment {
     /// per-dimension record is malformed.
     pub fn validate(&self) -> Result<(), crate::SecurityContractError> {
         assessment_text(&self.assessment_ref, "assessment_ref")?;
-        assessment_text(&self.source.source_ref, "source.source_ref")?;
-        assessment_text(&self.source.revision, "source.revision")?;
-        assessment_digest(&self.source.digest)?;
-        assessment_text(&self.source.scope.scope_ref, "source.scope.scope_ref")?;
-        assessment_refs(
-            &self.source.scope.included_refs,
-            "source.scope.included_refs",
-        )?;
-        if !self.source.scope.excluded_refs.is_empty() {
-            let mut seen = std::collections::BTreeSet::new();
-            for reference in &self.source.scope.excluded_refs {
-                assessment_text(reference, "source.scope.excluded_refs")?;
-                if !seen.insert(reference) {
-                    return Err(crate::SecurityContractError::DuplicateReference {
-                        field: "source.scope.excluded_refs",
-                    });
-                }
-            }
-        }
+        self.source.validate()?;
         if self.source_assurance.source_ref != self.source.source_ref {
             return Err(crate::SecurityContractError::InvalidText {
                 field: "source_assurance.source_ref",
