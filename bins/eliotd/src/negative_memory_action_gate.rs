@@ -702,15 +702,14 @@ pub async fn commit_gated_action<P: KernelGenerationPort + ?Sized>(
     let decision = evaluate_negative_memory_gate(&input);
     // The card is graded first and read back second, so the verdict covers the
     // negative-memory axis this dispatch produced rather than the card as it
-    // arrived. `scorecard.as_deref()` reborrows the caller's card for the
-    // duration of each call instead of moving the `Option` out of the
-    // parameter, so both calls see the same card.
-    let projection = project_action_response(
-        action,
-        &resolved,
-        scorecard.as_deref().map(|card| &mut *card as &mut QualityScorecard),
-    )?;
-    require_effect_ready(scorecard.as_deref().map(|card| &*card as &QualityScorecard))?;
+    // arrived. The caller's `Option<&mut _>` is reborrowed once, mutably, for
+    // the grading call; the readiness call then reborrows that same `&mut` as a
+    // shared reference. Both therefore see ONE card, and the caller's binding
+    // is left intact because the reborrow never moves out of the parameter.
+    let mut card = scorecard;
+    let projection =
+        project_action_response(action, &resolved, card.as_deref_mut().map(|it| &mut *it))?;
+    require_effect_ready(card.as_deref())?;
     let probe = probe_for(&decision, &resolved)?;
     if let Some(refusal) = negative_memory_gate_refusal_message(&decision) {
         let _ = append_matched_outcome(
