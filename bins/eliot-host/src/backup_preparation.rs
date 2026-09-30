@@ -1439,17 +1439,24 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
                 "config_projection_digest": record.config_projection_digest,
                 "audit_fence_note": serde_json::Value::Null,
             })),
-            // An admission with no recorded outcome, and a reclamation record
-            // whose root is not a usable destination: both report no result
-            // rather than a fabricated or stale receipt.
-            (BackupPreparationState::Pending, _)
-            | (BackupPreparationState::CleanupPending, _)
-            | (BackupPreparationState::Reclaimed, _) => None,
-            // Unreachable: the owner's record validation requires the pinned
-            // identity in every state at or after `Prepared`. Treated as no
-            // recorded result rather than trusted, so a corrupted projection
-            // cannot invent a receipt.
-            (BackupPreparationState::Prepared, None) => None,
+            // No recorded result, for two distinct reasons that must not
+            // produce a receipt either way.
+            //
+            // An admission with no outcome, and a reclamation record whose root
+            // is no longer a usable destination, are the same projection: there
+            // is nothing to hand back. The third case,
+            // `(Prepared, None)`, is unreachable — the owner's record
+            // validation requires the pinned identity in every state at or
+            // after `Prepared` — and is refused here as no recorded result
+            // rather than trusted, so a corrupted projection cannot invent a
+            // receipt.
+            (
+                BackupPreparationState::Pending
+                | BackupPreparationState::CleanupPending
+                | BackupPreparationState::Reclaimed,
+                _,
+            )
+            | (BackupPreparationState::Prepared, None) => None,
         };
         Ok(Some((intent, result)))
     }
@@ -2227,8 +2234,10 @@ fn recorded_outcome(
     let Some(transition) = result.get("transition") else {
         return Ok(BackupPreparationState::Prepared);
     };
-    let version = transition.get("version").and_then(serde_json::Value::as_u64);
-    if version != Some(CLEANUP_TRANSITION_VERSION) {
+    let version = transition
+        .get("version")
+        .and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(CLEANUP_TRANSITION_VERSION)) {
         return Err(PreparationError::InvalidRequest {
             field: "transition",
             reason: "cleanup transition does not carry the cleanup transition version this \
@@ -2974,7 +2983,7 @@ fn remove_reverified_destination<J: PreparationJournal>(
 /// [`PreparationError::ArbitraryPath`], and an unresolvable root yields
 /// [`PreparationError::FilesystemEffect`]. Owner error internals are never
 /// echoed. Staging admission and generation authority stay with
-/// [`prepare_isolated_destination`] and HostComposition delegation, and the
+/// [`prepare_isolated_destination`] and `HostComposition` delegation, and the
 /// owner lease reference a caller may present is a claim checked against
 /// [`OwnerEvidence::owner_lease_ref`] by the configuration projection rather
 /// than bound from the request.
@@ -3125,7 +3134,7 @@ pub struct PresentedPreparationRequest {
 /// HostComposition-side delegation handle for isolated destination
 /// preparation (issue #958).
 ///
-/// This is the exact sink interface the HostComposition owner binds: it owns
+/// This is the exact sink interface the `HostComposition` owner binds: it owns
 /// the installation/Host journal sink (`J`), takes inspected owner evidence
 /// ([`OwnerEvidence`]) plus one presented request, and runs the full
 /// owner-bound preparation lifecycle. [`OwnerEvidence`] has all-private fields
