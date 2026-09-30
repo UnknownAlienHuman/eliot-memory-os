@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 
+use eliot_context_contracts::CanonicalProjectionSet;
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::relation::{
     RelationPreservation, RelationPreservationDimension, RelationPreservationVerdict,
@@ -139,6 +140,46 @@ pub struct InertProbe {
     pub result_space: Option<String>,
 }
 
+/// Exact retained output of a mandatory native owner invocation.
+/// The original owner commitment is retained even when that owner exposes no
+/// canonical output encoding. Such a record cannot acquire a stronger ceiling.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationStageOutput {
+    pub stage: String,
+    pub input_digest: String,
+    pub output_digest: String,
+    pub canonical_output: Option<Vec<u8>>,
+}
+
+/// Borrowed semantic projections made from the actual returned owner values.
+#[derive(Serialize)]
+pub struct OrientationSemanticView<'a> {
+    pub interpretations: &'a [OrientationInterpretation],
+    pub rivals: &'a [OrientationResidue],
+    pub gaps: &'a [OrientationResidue],
+    pub probes: &'a [InertProbe],
+    pub stage_outputs: &'a [OrientationStageOutput],
+}
+
+/// Frozen CC-002, CC-004 and native outputs consumed by this packet.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationOwnerClosure {
+    pub model_request: eliot_dreamer_contracts::ModelRouteRequest,
+    pub model_outcome: eliot_dreamer_contracts::ModelRouteOutcome,
+    pub projections: CanonicalProjectionSet,
+    pub stage_outputs: Vec<OrientationStageOutput>,
+}
+
+/// Runtime-prepared owner values; this pure owner acquires none of them.
+pub struct OrientationOwnerProjection<'a> {
+    pub model_request: &'a eliot_dreamer_contracts::ModelRouteRequest,
+    pub model_outcome: &'a eliot_dreamer_contracts::ModelRouteOutcome,
+    pub projections: &'a CanonicalProjectionSet,
+    pub semantics: OrientationSemanticView<'a>,
+}
+
 /// Packet provenance proves projection inputs, not truth, delivery or effects.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -188,6 +229,10 @@ pub struct OrientationPacketCandidate {
     pub budget_usage: BudgetUsage,
     pub invalidation_conditions: Vec<String>,
     pub provenance: OrientationProvenance,
+    /// Absent only for the legacy five-input candidate projection. That
+    /// compatibility product cannot satisfy the production pulse denominator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_closure: Option<OrientationOwnerClosure>,
     pub sections: Vec<OrientationSection>,
     pub preservation: RelationPreservation,
     pub upstream_preservation: eliot_dreamer_contracts::PreservationReport,
@@ -322,6 +367,218 @@ impl OrientationPacketCandidate {
         }
         Ok(())
     }
+
+    /// Revalidates against the original owner records and returned semantics.
+    pub fn validate_against_owners(
+        &self,
+        admitted: &AdmittedOrientationJob,
+        bundle: &eliot_dreamer_contracts::DreamInputBundle,
+        candidate: &ValidatedCandidate,
+        handles: &[CurrentEpistemicPositionHandle],
+        policy: &OrientationPolicy,
+        owners: &OrientationOwnerProjection<'_>,
+    ) -> Result<(), OrientationError> {
+        let expected =
+            build_projection_with_owners(admitted, candidate, bundle, handles, policy, owners)?;
+        if &expected != self {
+            return Err(OrientationError::Binding("packet native owner inputs"));
+        }
+        Ok(())
+    }
+}
+
+/// Builds the production packet from the exact CC-002/CC-004 and native outputs.
+/// The compatibility candidate is independently validated before any projection.
+pub fn build_projection_with_owners(
+    admitted: &AdmittedOrientationJob,
+    candidate: &ValidatedCandidate,
+    bundle: &eliot_dreamer_contracts::DreamInputBundle,
+    handles: &[CurrentEpistemicPositionHandle],
+    policy: &OrientationPolicy,
+    owners: &OrientationOwnerProjection<'_>,
+) -> Result<OrientationPacketCandidate, OrientationError> {
+    validate_owner_projection(candidate, bundle, policy, owners)?;
+    validate_projection_inputs(admitted, candidate, bundle, handles, policy)?;
+    let ordered_handles = ordered_handles(handles);
+    let ordered_evidence = ordered_evidence(&admitted.admitted_evidence);
+    let data = project_values(admitted, candidate, handles, policy)?;
+    let mut packet = make_packet(
+        admitted,
+        candidate,
+        &ordered_handles,
+        &ordered_evidence,
+        policy,
+        data,
+    )?;
+    packet.input_digest = sha256_hex(
+        &canonical_json_bytes(&(
+            &packet.input_digest,
+            owners.model_request,
+            owners.model_outcome,
+            owners.projections,
+            &owners.semantics,
+        ))
+        .map_err(|_| OrientationError::Encoding("joined owner inputs"))?,
+    );
+    packet
+        .synthesized_interpretations
+        .extend_from_slice(owners.semantics.interpretations);
+    packet.rival_models_and_dissent = owners.semantics.rivals.to_vec();
+    packet
+        .unknowns_and_gaps
+        .extend_from_slice(owners.semantics.gaps);
+    packet.recommended_probes_or_next_actions = owners.semantics.probes.to_vec();
+    packet.owner_closure = Some(OrientationOwnerClosure {
+        model_request: owners.model_request.clone(),
+        model_outcome: owners.model_outcome.clone(),
+        projections: owners.projections.clone(),
+        stage_outputs: owners.semantics.stage_outputs.to_vec(),
+    });
+    packet.model_routes_and_cost = OrientationResidue {
+        kind: "model_route_usage".to_owned(),
+        text: String::from_utf8(
+            canonical_json_bytes(owners.model_outcome)
+                .map_err(|_| OrientationError::Encoding("model route provenance"))?,
+        )
+        .map_err(|_| OrientationError::Encoding("model route provenance"))?,
+        source: "cc_002_owner_outcome".to_owned(),
+    };
+    join_owner_sections(&mut packet)?;
+    if owners.model_outcome.disposition != eliot_dreamer_contracts::ModelRouteDisposition::Completed
+        || !owners.projections.omissions.is_empty()
+        || owners
+            .semantics
+            .stage_outputs
+            .iter()
+            .any(|output| output.canonical_output.is_none())
+    {
+        packet.disposition = crate::result::OrientationDisposition::Partial;
+    }
+    finalize_packet(packet, policy, &candidate.job.budget)
+}
+
+fn validate_owner_projection(
+    candidate: &ValidatedCandidate,
+    bundle: &eliot_dreamer_contracts::DreamInputBundle,
+    policy: &OrientationPolicy,
+    owners: &OrientationOwnerProjection<'_>,
+) -> Result<(), OrientationError> {
+    const EXPECTED_STAGES: [&str; 9] = [
+        "classification",
+        "cue_activation",
+        "epistemic_position",
+        "understanding",
+        "grounding",
+        "rivals",
+        "conflict",
+        "probes",
+        "candidates",
+    ];
+    owners
+        .model_request
+        .validate_binds_bundle(bundle)
+        .map_err(|_| OrientationError::Binding("model request bundle"))?;
+    owners
+        .model_outcome
+        .validate_binding(owners.model_request)
+        .map_err(|_| OrientationError::Binding("model owner outcome"))?;
+    if owners.model_outcome.draft.as_ref() != Some(&candidate.model)
+        || owners.model_outcome.receipt.model_calls > candidate.usage.model_calls
+        || owners.model_outcome.receipt.wall_ms > candidate.usage.wall_ms
+        || owners.model_outcome.receipt.input_bytes > candidate.usage.input_bytes
+        || owners.model_outcome.receipt.output_bytes > candidate.usage.output_bytes
+        || owners.model_request.privacy.as_str() != candidate.job.privacy_profile
+    {
+        return Err(OrientationError::Binding("candidate model owner content"));
+    }
+    owners
+        .projections
+        .validate()
+        .map_err(|_| OrientationError::Binding("canonical projection original records"))?;
+    let binding = &owners.projections.binding;
+    if binding.task_id.as_str() != candidate.job.task_id
+        || binding.scope_id.as_str() != candidate.job.scope_id
+        || binding
+            .operation_id
+            .as_ref()
+            .map(eliot_contracts::OperationId::as_str)
+            != Some(candidate.job.operation_id.as_str())
+        || !eliot_contracts::fences_match_exact(&binding.state_fence, &candidate.job.state_fence)
+    {
+        return Err(OrientationError::Binding("canonical projection identity"));
+    }
+    if owners.semantics.stage_outputs.len() != EXPECTED_STAGES.len() {
+        return Err(OrientationError::Binding("native output denominator"));
+    }
+    for (output, expected) in owners.semantics.stage_outputs.iter().zip(EXPECTED_STAGES) {
+        if output.stage != expected
+            || !eliot_dreamer_contracts::is_hex64_lower(&output.input_digest)
+            || !eliot_dreamer_contracts::is_hex64_lower(&output.output_digest)
+            || output
+                .canonical_output
+                .as_ref()
+                .is_some_and(|bytes| sha256_hex(bytes) != output.output_digest)
+            || (output.canonical_output.is_none() && expected != "conflict")
+        {
+            return Err(OrientationError::Binding(
+                "native original output commitment",
+            ));
+        }
+    }
+    bounded_json_size(
+        &(
+            owners.model_request,
+            owners.model_outcome,
+            owners.projections,
+            &owners.semantics,
+        ),
+        policy.max_input_bytes,
+    )?;
+    Ok(())
+}
+
+fn join_owner_sections(packet: &mut OrientationPacketCandidate) -> Result<(), OrientationError> {
+    for current in &mut packet.sections {
+        let items = match current.kind {
+            OrientationSectionKind::InterpretationsRivalsDissent => Some(
+                packet
+                    .synthesized_interpretations
+                    .iter()
+                    .map(|item| item.statement.clone())
+                    .chain(
+                        packet
+                            .rival_models_and_dissent
+                            .iter()
+                            .map(|item| item.text.clone()),
+                    )
+                    .collect(),
+            ),
+            OrientationSectionKind::UnknownsGaps => Some(
+                packet
+                    .unknowns_and_gaps
+                    .iter()
+                    .map(|item| item.text.clone())
+                    .collect(),
+            ),
+            OrientationSectionKind::InertProbes => Some(
+                packet
+                    .recommended_probes_or_next_actions
+                    .iter()
+                    .map(|item| item.text.clone())
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if let Some(items) = items {
+            *current = section(
+                current.kind,
+                items,
+                current.known,
+                current.denominator.clone(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Builds a packet from exactly the five admitted inputs. No I/O or mutation occurs.
@@ -1165,6 +1422,7 @@ fn make_packet(
         budget_usage: candidate.usage,
         invalidation_conditions: candidate.model.invalidation_conditions.clone(),
         provenance: data.provenance,
+        owner_closure: None,
         sections,
         preservation,
         upstream_preservation: candidate.preservation.clone(),

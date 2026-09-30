@@ -21,6 +21,7 @@ agent_order = 6
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-context-contracts.workspace = true
 eliot-evidence.workspace = true
 eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }

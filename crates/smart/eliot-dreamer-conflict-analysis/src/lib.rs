@@ -278,6 +278,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
+use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
+use eliot_dreamer_contracts::validation::ValidatedGroundingCandidate;
 use eliot_dreamer_contracts::{
     CurationRejectionCode, FailureCausalStatus, GroundedDreamDraft, PossibleResultSchema,
     PreservationDimension, ProbeObjective, ResultTarget, ResultUpdate, ValidatedCurationItem,
@@ -3689,11 +3691,48 @@ fn receipt_err(detail: &str) -> ConflictAnalysisError {
     }
 }
 
+/// Intrinsic owner view without converting or replacing a grounding record.
+trait ConflictGrounding {
+    fn validate_grounding(&self) -> Result<(), ConflictAnalysisError>;
+    fn job_id(&self) -> &str;
+    fn draft_digest(&self) -> &str;
+}
+
+impl ConflictGrounding for GroundedDreamDraft {
+    fn validate_grounding(&self) -> Result<(), ConflictAnalysisError> {
+        self.validate()
+            .map_err(|error| receipt_err(&error.to_string()))
+    }
+
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn draft_digest(&self) -> &str {
+        &self.draft_digest
+    }
+}
+
+impl ConflictGrounding for StructuredGroundedDreamDraft {
+    fn validate_grounding(&self) -> Result<(), ConflictAnalysisError> {
+        self.validate()
+            .map_err(|error| receipt_err(&error.to_string()))
+    }
+
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn draft_digest(&self) -> &str {
+        &self.draft_digest
+    }
+}
+
 /// Checks the A-05 receipts intrinsically plus item, draft, and grounding.
 fn intrinsic_receipt_checks(
     item: &ValidatedCurationItem,
     draft: &ValidatedDreamDraft,
-    grounded: &GroundedDreamDraft,
+    grounded: &impl ConflictGrounding,
     supplements: &ConflictSupplements,
 ) -> Result<(), ConflictAnalysisError> {
     item.receipt
@@ -3719,9 +3758,7 @@ fn intrinsic_receipt_checks(
         .map_err(|err| receipt_err(&err.to_string()))?;
     item.validate()
         .map_err(|err| receipt_err(&err.to_string()))?;
-    grounded
-        .validate()
-        .map_err(|err| receipt_err(&err.to_string()))?;
+    grounded.validate_grounding()?;
     if item.receipt.terminal_disposition != "accepted"
         && item.receipt.terminal_disposition != "partial"
     {
@@ -3738,7 +3775,7 @@ fn intrinsic_receipt_checks(
 fn intrinsic_binding_checks(
     item: &ValidatedCurationItem,
     draft: &ValidatedDreamDraft,
-    grounded: &GroundedDreamDraft,
+    grounded: &impl ConflictGrounding,
     conflict_set: &ConflictSet,
     supplements: &ConflictSupplements,
 ) -> Result<(), ConflictAnalysisError> {
@@ -3754,13 +3791,13 @@ fn intrinsic_binding_checks(
             detail: "frozen manifest digest drifts from the receipt binding".to_owned(),
         });
     }
-    if item.receipt.draft_digest != grounded.draft_digest {
+    if item.receipt.draft_digest != grounded.draft_digest() {
         return Err(ConflictAnalysisError::Binding {
             field: "draft_digest".to_owned(),
             detail: "grounded draft digest drifts from the receipt binding".to_owned(),
         });
     }
-    if grounded.job_id != item.receipt.job_id {
+    if grounded.job_id() != item.receipt.job_id {
         return Err(ConflictAnalysisError::Binding {
             field: "job_id".to_owned(),
             detail: "grounded job drifts from the receipt binding".to_owned(),
@@ -5795,11 +5832,52 @@ fn emit_candidate(
 /// Returns [`ConflictAnalysisError`] on any blank, controlled, overlong,
 /// unordered-where-required, duplicated, misshapen, mismatched, stale,
 /// over-budget, past-deadline, or unbound field.
-#[allow(clippy::too_many_lines)]
 pub fn analyze_conflict(
     item: &ValidatedCurationItem,
     draft: &ValidatedDreamDraft,
     grounded: &GroundedDreamDraft,
+    conflict_set: &ConflictSet,
+    supplements: &ConflictSupplements,
+    policy: &ConflictAnalysisPolicy,
+) -> Result<ConflictAnalysisCandidate, ConflictAnalysisError> {
+    analyze_conflict_bound(item, draft, grounded, conflict_set, supplements, policy)
+}
+
+/// Analyzes conflict using the original structured A03/A05 grounding handoff.
+///
+/// The original recorded A05 receipt is validated against its retained
+/// structured preimage. The item and supplements must carry that same receipt;
+/// a legacy grounding residue or a receipt for another draft cannot substitute.
+/// This remains candidate-only and does not qualify external owner proof gaps.
+///
+/// # Errors
+/// Returns the existing typed refusal for invalid structured receipt binding,
+/// mismatched owner records, or any boundary refused by [`analyze_conflict`].
+pub fn analyze_grounded_conflict(
+    item: &ValidatedCurationItem,
+    candidate: &ValidatedGroundingCandidate,
+    conflict_set: &ConflictSet,
+    supplements: &ConflictSupplements,
+    policy: &ConflictAnalysisPolicy,
+) -> Result<ConflictAnalysisCandidate, ConflictAnalysisError> {
+    candidate
+        .validate_binding()
+        .map_err(|error| receipt_err(&error.to_string()))?;
+    analyze_conflict_bound(
+        item,
+        &candidate.validated,
+        candidate.input.grounded.as_ref(),
+        conflict_set,
+        supplements,
+        policy,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn analyze_conflict_bound(
+    item: &ValidatedCurationItem,
+    draft: &ValidatedDreamDraft,
+    grounded: &impl ConflictGrounding,
     conflict_set: &ConflictSet,
     supplements: &ConflictSupplements,
     policy: &ConflictAnalysisPolicy,

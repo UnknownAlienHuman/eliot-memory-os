@@ -64,6 +64,7 @@ functional_cell_state_owners = [
 eliot-agent-api.workspace = true
 eliot-agent-bridge-core.workspace = true
 eliot-agent-contracts.workspace = true
+eliot-agent-opencode.workspace = true
 eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true
 eliot-bootstrap.workspace = true
