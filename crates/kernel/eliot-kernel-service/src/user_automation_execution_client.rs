@@ -735,6 +735,37 @@ impl UserAutomationHostExecutionRequest {
         &self.channel.state_fence
     }
 
+    /// Validates one manual-occurrence wake publication against the channel it
+    /// was routed on.
+    ///
+    /// The rule is that a wake carrier is valid only for the fence it was routed
+    /// on. A publication is bound to that fence twice on purpose: it names the
+    /// fence it is issued under as its own `state_fence` member as well as
+    /// carrying it in the authenticated request context, and a forged
+    /// publication could satisfy one and not the other. Every operation whose
+    /// payload carries such a member — the horizon publication and its readback
+    /// included — is bound this same way, so this is one rule with a named home
+    /// rather than a third spelling of it.
+    ///
+    /// The reason strings name the operation, so a refusal says which wake
+    /// carrier was routed on the wrong fence.
+    fn validate_wake_publication(
+        &self,
+        publication: &UserAutomationWakeOccurrencePublication,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        publication
+            .validate()
+            .map_err(|error| rejected(format!("occurrence wake publication: {error}")))?;
+        if publication.context.state_fence != self.channel.state_fence
+            || publication.state_fence != self.channel.state_fence
+        {
+            return Err(rejected(
+                "occurrence wake publication channel fence mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_without_digest(&self) -> Result<(), UserAutomationRuntimeError> {
         if self.wire_id != USER_AUTOMATION_HOST_EXECUTION_WIRE_ID
             || self.wire_version != USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION
@@ -786,16 +817,7 @@ impl UserAutomationHostExecutionRequest {
                 }
             }
             UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
-                request
-                    .validate()
-                    .map_err(|error| rejected(format!("occurrence wake publication: {error}")))?;
-                if request.context.state_fence != self.channel.state_fence
-                    || request.state_fence != self.channel.state_fence
-                {
-                    return Err(rejected(
-                        "occurrence wake publication channel fence mismatch",
-                    ));
-                }
+                request.validate_wake_publication(&self.channel)?;
             }
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 request
