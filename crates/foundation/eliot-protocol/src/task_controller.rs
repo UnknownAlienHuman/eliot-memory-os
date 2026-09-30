@@ -11,17 +11,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES, ProtocolError};
+use crate::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 
 /// Stable wire identity for one admitted Task Controller invocation.
 pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str = "eliot.protocol.task-controller-invocation";
 /// Current Task Controller invocation wire version.
 ///
-/// `2` adds the required `context_campaign_recipe_policy` member: an invocation
-/// that names a Context recipe must also name the approved reusable policy that
-/// recipe was issued under (#1724 W1). A `1` payload cannot decode into this
-/// shape, so the missing member is refused by version and by field rather than
-/// defaulted into an instance that claims no policy.
-pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 2;
+/// `3` adds the explicit `DREAMER_ORIENTATION` action and its typed payload.
+/// Version `2` remains accepted for the existing Propose/Apply actions, and
+/// still requires `context_campaign_recipe_policy` (#1724 W1). Orientation is
+/// accepted only at version `3`.
+pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 3;
+/// Previous invocation version retained for existing Propose and Apply claims.
+pub const TASK_CONTROLLER_INVOCATION_LEGACY_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for the Kernel-issued Task Controller attempt.
 pub const TASK_CONTROLLER_ATTEMPT_WIRE_ID: &str = "eliot.protocol.task-controller-attempt";
 /// Current Task Controller attempt wire version.
@@ -96,6 +98,215 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
+    /// Submit one already-sealed Orientation job with its declared semantic source.
+    DreamerOrientation,
+}
+
+/// A source claim carried by an explicit Orientation invocation.
+///
+/// This is a claim, not authority: the daemon resolves the exact handle through
+/// its authenticated named-read owner and checks the returned bytes against
+/// the original Durable Job reference before queueing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerOrientationSourceClaim {
+    /// Exact named-read source handle issued for this publication.
+    pub source_handle: String,
+    /// Owner-issued SHA-256 for the exact canonical source bytes.
+    pub expected_digest: String,
+    /// Owner-issued byte length for the exact canonical source bytes.
+    pub expected_byte_length: u64,
+    /// Closed source privacy class.
+    pub privacy_class: String,
+    /// Closed source route class.
+    pub route_class: String,
+}
+
+/// First-profile byte and material bounds for a declared Orientation submit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerOrientationMaterialBudget {
+    /// Maximum admitted source claims.
+    pub max_sources: u32,
+    /// Maximum resolved bytes across all claims.
+    pub max_total_bytes: u64,
+    /// Maximum resolved bytes per claim.
+    pub max_source_bytes: u64,
+}
+
+/// Exact OutputSchema recipe identity admitted by the original job source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerOrientationOutputSchemaRecipe {
+    /// Immutable schema artifact identity from the original recipe.
+    pub schema_id: eliot_contracts::ArtifactId,
+    /// Explicit source-owned schema version from the original recipe.
+    pub schema_version: u32,
+    /// Original schema-byte digest from the recipe.
+    pub schema_digest: String,
+}
+
+/// Typed Task Controller payload for the explicit Orientation operation.
+///
+/// The request is already sealed by its original publisher. Its reference and
+/// retained bytes are preserved verbatim; this invocation only carries a
+/// separately owner-issued named-read claim so the daemon can verify that
+/// publication before forwarding the original request to Kernel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerOrientationInput {
+    /// Original K0 request identity, admission reference and semantic bytes.
+    pub request: DurableJobRequest,
+    /// Exact owner-authenticated result of the original ContextReconstruction
+    /// query. Its response retains the selector-complete owner publication,
+    /// including the original `evidence_subject` and named-read receipts.
+    pub context_reconstruction_result: crate::HostRequestResultBody,
+    /// Distinct named-read claim for the semantic DreamJobInput publication.
+    pub semantic_source: TaskControllerOrientationSourceClaim,
+    /// Exact original OutputSchema role declaration from the job recipe.
+    pub output_schema_recipe: TaskControllerOrientationOutputSchemaRecipe,
+    /// Owner-admitted named-read claim for the original schema artifact bytes.
+    pub schema_source: TaskControllerOrientationSourceClaim,
+    /// Owner-admitted source claims used as ordinary evidence materials.
+    pub materials: Vec<TaskControllerOrientationSourceClaim>,
+    /// Independent source and byte bounds required by the daemon intake.
+    pub budget: TaskControllerOrientationMaterialBudget,
+}
+
+impl TaskControllerOrientationInput {
+    /// Checks the closed request and typed source envelope without granting
+    /// admission. The daemon performs task, scope, fence, readback and owner
+    /// checks against the authenticated claim before queue submission.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.request
+            .validate()
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.request",
+                reason: "must be a valid already-sealed Durable Job request",
+            })?;
+        if self.request.role != JobRole::Requester
+            || !matches!(&self.request.operation, JobOperation::Submit { .. })
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.request",
+                reason: "must be a requester SUBMIT_JOB operation",
+            });
+        }
+        let JobOperation::Submit { submission } = &self.request.operation else {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.request",
+                reason: "must be a requester SUBMIT_JOB operation",
+            });
+        };
+        let runtime_input = submission
+            .decode_runtime_owner_execution_input()
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.runtime_owner_execution_input",
+                reason: "must retain the original runtime owner reference and canonical bytes",
+            })?
+            .ok_or(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.runtime_owner_execution_input",
+                reason: "is required for an explicit Orientation request",
+            })?;
+        self.context_reconstruction_result
+            .validate_local_read_submission()?;
+        if runtime_input.semantic_source != self.semantic_source
+            || runtime_input.output_contract != submission.output_contract
+            || runtime_input.context_reconstruction_result
+                != self.context_reconstruction_result
+            || runtime_input.output_schema_recipe != self.output_schema_recipe
+            || runtime_input.schema_source != self.schema_source
+            || runtime_input.materials != self.materials
+            || runtime_input.budget != self.budget
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.runtime_owner_execution_input",
+                reason: "must exactly match the original sealed owner publication",
+            });
+        }
+        if self.semantic_source.expected_digest.as_str()
+            != submission.semantic_input.sha256.as_str()
+            || self.semantic_source.expected_byte_length != submission.semantic_input.byte_length
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.semantic_source",
+                reason: "must bind the original semantic input reference",
+            });
+        }
+        if self.output_schema_recipe.schema_version == 0
+            || self.output_schema_recipe.schema_digest.as_str()
+                != submission.output_contract.sha256.as_str()
+            || submission.output_contract.artifact_id.as_ref()
+                != Some(&self.output_schema_recipe.schema_id)
+            || self.schema_source.expected_digest.as_str()
+                != self.output_schema_recipe.schema_digest.as_str()
+            || self.schema_source.expected_byte_length != submission.output_contract.byte_length
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.output_schema",
+                reason: "must bind the original output-contract artifact and schema source",
+            });
+        }
+        for claim in std::iter::once(&self.semantic_source).chain(self.materials.iter()) {
+            if claim.source_handle.trim().is_empty()
+                || claim.source_handle.chars().any(char::is_control)
+                || claim.privacy_class.trim().is_empty()
+                || claim.privacy_class.chars().any(char::is_control)
+                || claim.route_class.trim().is_empty()
+                || claim.route_class.chars().any(char::is_control)
+                || claim.expected_byte_length == 0
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.orientation.source_claim",
+                    reason: "must carry a complete bounded source claim",
+                });
+            }
+            lowercase_sha256(
+                &claim.expected_digest,
+                "task_controller_invocation.orientation.source_claim.expected_digest",
+            )?;
+        }
+        let schema_claim = &self.schema_source;
+        if schema_claim.source_handle.trim().is_empty()
+            || schema_claim.source_handle.chars().any(char::is_control)
+            || schema_claim.privacy_class.trim().is_empty()
+            || schema_claim.privacy_class.chars().any(char::is_control)
+            || schema_claim.route_class.trim().is_empty()
+            || schema_claim.route_class.chars().any(char::is_control)
+            || schema_claim.expected_byte_length == 0
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.schema_source",
+                reason: "must carry a complete bounded source claim",
+            });
+        }
+        lowercase_sha256(
+            &schema_claim.expected_digest,
+            "task_controller_invocation.orientation.schema_source.expected_digest",
+        )?;
+        if schema_claim.source_handle.as_str() == self.semantic_source.source_handle.as_str()
+            || self.materials.iter().any(|claim| {
+                claim.source_handle.as_str() == schema_claim.source_handle.as_str()
+                    || claim.source_handle.as_str() == self.semantic_source.source_handle.as_str()
+            })
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.source_claims",
+                reason: "semantic, schema and evidence source handles must remain distinct",
+            });
+        }
+        let budget = self.budget;
+        if budget.max_sources == 0
+            || budget.max_total_bytes == 0
+            || budget.max_source_bytes == 0
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.budget",
+                reason: "must carry nonzero owner-issued bounds",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Owner-native material bundle used only for a complete campaign-owner
@@ -142,7 +353,7 @@ pub struct TaskControllerInvocation {
     pub task_id: TaskId,
     /// Exact work scope from the admitted request identity.
     pub work_scope_id: String,
-    /// Native proposal for `PROPOSE` or command-plus-context bundle for `APPLY`.
+    /// Action-specific typed proposal, command bundle, or Orientation submit.
     pub task_input: Value,
     /// Owner-native `LearningStateViewRecipe` selected for this task route.
     pub learning_state_view_recipe: Value,
@@ -167,9 +378,16 @@ impl TaskControllerInvocation {
     /// Validates the transport envelope and bounded JSON object fields.
     /// Semantic field/identity validation remains with the daemon owners.
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID
-            || self.wire_version != TASK_CONTROLLER_INVOCATION_WIRE_VERSION
-        {
+        let version_supported = match self.action {
+            TaskControllerAction::Propose | TaskControllerAction::Apply => {
+                self.wire_version == TASK_CONTROLLER_INVOCATION_LEGACY_WIRE_VERSION
+                    || self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
+            }
+            TaskControllerAction::DreamerOrientation => {
+                self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
+            }
+        };
+        if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID || !version_supported {
             return Err(ProtocolError::InvalidField {
                 field: "task_controller_invocation.wire",
                 reason: "unsupported Task Controller invocation",
@@ -200,6 +418,42 @@ impl TaskControllerInvocation {
             ),
         ] {
             structured_object(value, field)?;
+        }
+        if self.action == TaskControllerAction::DreamerOrientation {
+            let orientation: TaskControllerOrientationInput =
+                serde_json::from_value(self.task_input.clone()).map_err(|_| {
+                    ProtocolError::InvalidField {
+                        field: "task_controller_invocation.task_input",
+                        reason: "must match the typed Orientation submit contract",
+                    }
+                })?;
+            orientation.validate()?;
+            let JobOperation::Submit { submission } = &orientation.request.operation else {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.task_input",
+                    reason: "must carry the original Orientation submit request",
+                });
+            };
+            let runtime_input = submission
+                .decode_runtime_owner_execution_input()
+                .map_err(|_| ProtocolError::InvalidField {
+                    field: "task_controller_invocation.runtime_owner_execution_input",
+                    reason: "must retain the original runtime owner publication",
+                })?
+                .ok_or(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.runtime_owner_execution_input",
+                    reason: "is required for Orientation",
+                })?;
+            if runtime_input.context_input != self.context_input
+                || runtime_input.context_campaign_recipe != self.context_campaign_recipe
+                || runtime_input.context_campaign_recipe_policy
+                    != self.context_campaign_recipe_policy
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.runtime_owner_execution_input",
+                    reason: "must preserve exact original Context owner inputs",
+                });
+            }
         }
         if let Some(selector) = &self.prior_delivery_selector {
             structured_object(

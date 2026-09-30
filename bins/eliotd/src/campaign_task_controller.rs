@@ -18,7 +18,9 @@ use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
 };
 use eliot_protocol::{
-    TaskControllerAction, TaskControllerCampaignOwnerMaterials, TaskControllerResultBody,
+    dreamer_job::{JobOperation, JobRole}, TaskControllerAction,
+    TaskControllerCampaignOwnerMaterials, TaskControllerOrientationInput,
+    TaskControllerResultBody,
 };
 use eliot_store_api::{
     CampaignSourceDocumentSchema, CampaignSourceHead, CampaignSourcePublication,
@@ -48,11 +50,20 @@ enum PreparedTaskControllerAction {
     Apply(GuardedTaskCommand),
 }
 
+/// Already-sealed Orientation submit carried by an authentic Task Controller
+/// claim. The runtime resolves its original named source and submits the exact
+/// retained request through K0/K1/K2.
+pub struct PreparedTaskControllerOrientation {
+    pub(crate) claimed: TaskControllerClaimedInvocation,
+    pub(crate) input: TaskControllerOrientationInput,
+}
+
 /// Either a bounded rejection body or an owned claim ready for guarded
 /// semantic preparation.
 pub enum TaskControllerClaimPreparation {
     Rejected(Box<TaskControllerResultBody>),
     Ready(Box<PreparedTaskControllerClaim>),
+    Orientation(Box<PreparedTaskControllerOrientation>),
 }
 
 /// Canonical task plan plus the exact claim which will carry its result.
@@ -374,7 +385,7 @@ async fn read_authenticated_owner_publications(
     Ok(publications)
 }
 
-fn task_controller_result_body(
+pub(crate) fn task_controller_result_body(
     claimed: &TaskControllerClaimedInvocation,
     response: serde_json::Value,
 ) -> Result<TaskControllerResultBody, String> {
@@ -392,6 +403,50 @@ fn task_controller_result_body(
     body.validate()
         .map_err(|error| format!("Task Controller result validation failed: {error}"))?;
     Ok(body)
+}
+
+fn validate_orientation_task_binding(
+    claimed: &TaskControllerClaimedInvocation,
+    input: &TaskControllerOrientationInput,
+) -> Result<(), &'static str> {
+    let invocation = &claimed.invocation;
+    input
+        .validate()
+        .map_err(|_| "invalid_orientation_request")?;
+    let JobOperation::Submit { submission } = &input.request.operation else {
+        return Err("invalid_orientation_request");
+    };
+    if input.request.role != JobRole::Requester {
+        return Err("invalid_orientation_request");
+    }
+    let request_identity = &input.request.request_identity;
+    if request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id) {
+        return Err("orientation_task_mismatch");
+    }
+    if submission.work_scope.scope_id.as_str() != invocation.work_scope_id.as_str() {
+        return Err("orientation_scope_mismatch");
+    }
+    if request_identity.operation.state_fence != claimed.envelope.state_fence
+        || request_identity.request.state_fence != claimed.envelope.state_fence
+        || request_identity.request.metadata.state_fence != claimed.envelope.state_fence
+        || submission.work_scope.state_fence != claimed.envelope.state_fence
+    {
+        return Err("orientation_stale_fence");
+    }
+    if input.semantic_source.expected_digest.as_str() != submission.semantic_input.sha256.as_str()
+        || input.semantic_source.expected_byte_length != submission.semantic_input.byte_length
+    {
+        return Err("semantic_input_mismatch");
+    }
+    if submission.semantic_input_bytes.is_none() {
+        return Err("semantic_input_unavailable");
+    }
+    if input.materials.iter().any(|claim| {
+        claim.source_handle.as_str() == input.semantic_source.source_handle.as_str()
+    }) {
+        return Err("semantic_source_not_distinct");
+    }
+    Ok(())
 }
 
 fn task_controller_rejection(
@@ -416,6 +471,28 @@ pub async fn prepare_task_controller_claim(
     claimed: TaskControllerClaimedInvocation,
 ) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
+    if invocation.action == TaskControllerAction::DreamerOrientation {
+        let input: TaskControllerOrientationInput =
+            match serde_json::from_value(invocation.task_input.clone()) {
+                Ok(input) => input,
+                Err(_) => {
+                    return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                        task_controller_rejection(&claimed, "invalid_orientation_input")?,
+                    )));
+                }
+            };
+        if let Err(reason) = validate_orientation_task_binding(&claimed, &input) {
+            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                task_controller_result_body(
+                    &claimed,
+                    json!({ "status": "blocked", "reason": reason }),
+                )?,
+            )));
+        }
+        return Ok(TaskControllerClaimPreparation::Orientation(Box::new(
+            PreparedTaskControllerOrientation { claimed, input },
+        )));
+    }
     let recipe: LearningStateViewRecipe =
         match serde_json::from_value(invocation.learning_state_view_recipe.clone()) {
             Ok(recipe) => recipe,
@@ -531,6 +608,7 @@ fn decode_task_controller_action(
                 command: input.command,
             }))
         }
+        TaskControllerAction::DreamerOrientation => Err(()),
     }
 }
 

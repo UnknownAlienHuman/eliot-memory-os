@@ -9,7 +9,7 @@ use std::fmt;
 
 use eliot_contracts::{
     ArtifactId, ContractIdentity, ContractVersion, EpochId, OperationId, ReceiptId,
-    ResourceGeneration, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+    ResourceGeneration, StateFence, TaskId, canonical_json_bytes, contract_identity, sha256_hex,
 };
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, OperationBinding, ProofCeiling, SessionBinding,
@@ -22,9 +22,15 @@ use thiserror::Error;
 /// Stable identity of the `DurableJob` control family.
 pub const DURABLE_JOB_CONTRACT_NAME: &str = "eliot.foundation.protocol.durable-job";
 /// Current semantic revision of the `DurableJob` control family.
-pub const DURABLE_JOB_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 2, 0);
+pub const DURABLE_JOB_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 3, 0);
 /// Versioned namespace used when hashing a mutation request.
 pub const DURABLE_JOB_CANONICAL_ENCODING: &str = "eliot.durable-job.canonical.v1";
+/// Stable owner identity of the optional Orientation runtime execution input.
+pub const RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_NAME: &str =
+    "eliot.foundation.protocol.dreamer-runtime-owner-execution-input";
+/// Current semantic revision of the optional runtime owner input.
+pub const RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_VERSION: ContractVersion =
+    ContractVersion::new(1, 0, 0);
 /// Maximum bounded text field size in bytes.
 pub const DURABLE_JOB_MAX_TEXT_BYTES: usize = 16 * 1024;
 /// Maximum number of references in one bounded control value.
@@ -265,6 +271,205 @@ impl OpaqueContentRef {
         }
         Ok(())
     }
+
+    /// Verifies retained bytes against this exact opaque content reference.
+    pub fn validate_original_bytes(&self, bytes: &[u8]) -> Result<(), DurableJobError> {
+        let byte_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.byte_length != byte_length || self.sha256 != sha256_hex(bytes) {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Typed owner material retained for the exact submitted attempt and consumed
+/// by the claimed runtime. Its canonical bytes are carried beside an opaque
+/// content reference in `JobSubmission` and echoed by every durable response.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DurableJobRuntimeOwnerExecutionInput {
+    /// Original task identity from the admitted request metadata.
+    pub task_id: TaskId,
+    /// Original K0 job identity.
+    pub job_id: TaskId,
+    /// Original K0 attempt identity.
+    pub attempt_id: ArtifactId,
+    /// Original admitted scope, including its generation and fence.
+    pub work_scope: WorkScopeBinding,
+    /// Explicit duplicate fence for child-side direct comparison.
+    pub state_fence: StateFence,
+    /// Exact ContextInput value carried by the original authenticated
+    /// TaskController invocation.
+    pub context_input: serde_json::Value,
+    /// Exact rich ContextRecipe carried by the original invocation.
+    pub context_campaign_recipe: serde_json::Value,
+    /// Exact ContextRecipePolicy carried by the original invocation.
+    pub context_campaign_recipe_policy: serde_json::Value,
+    /// Exact authenticated result of the original ContextReconstruction query,
+    /// including its owner readback, source attempt, request selectors and
+    /// existing result digest.
+    pub context_reconstruction_result: crate::HostRequestResultBody,
+    /// Original semantic-source named-read claim.
+    pub semantic_source: crate::task_controller::TaskControllerOrientationSourceClaim,
+    /// Original output-contract reference.
+    pub output_contract: OpaqueContentRef,
+    /// Original recipe's OutputSchema tuple.
+    pub output_schema_recipe:
+        crate::task_controller::TaskControllerOrientationOutputSchemaRecipe,
+    /// Original named-read claim for the output schema artifact.
+    pub schema_source: crate::task_controller::TaskControllerOrientationSourceClaim,
+    /// Original bounded evidence-material claims.
+    pub materials: Vec<crate::task_controller::TaskControllerOrientationSourceClaim>,
+    /// Original source and byte limits admitted for this job.
+    pub budget: crate::task_controller::TaskControllerOrientationMaterialBudget,
+}
+
+impl DurableJobRuntimeOwnerExecutionInput {
+    /// Returns the declared content-addressed schema identity for this payload.
+    pub fn contract_identity() -> Result<ContractIdentity, DurableJobError> {
+        let shape = schemars::schema_for!(Self);
+        contract_identity(
+            RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_NAME,
+            RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_VERSION,
+            &shape,
+        )
+        .map_err(DurableJobError::Foundation)
+    }
+
+    /// Checks the publication's internal source and original-scope bindings.
+    pub fn validate(&self) -> Result<(), DurableJobError> {
+        self.output_contract.validate("output_contract.sha256")?;
+        self.state_fence
+            .validate()
+            .map_err(DurableJobError::Foundation)?;
+        if self.work_scope.state_fence != self.state_fence
+            || self.work_scope.resource_generation != self.state_fence.resource_generation
+            || !self.context_input.is_object()
+            || !self.context_campaign_recipe.is_object()
+            || !self.context_campaign_recipe_policy.is_object()
+            || self.output_schema_recipe.schema_version == 0
+            || self.output_schema_recipe.schema_digest != self.output_contract.sha256
+            || self.output_contract.artifact_id.as_ref()
+                != Some(&self.output_schema_recipe.schema_id)
+            || self.schema_source.expected_digest != self.output_schema_recipe.schema_digest
+            || self.schema_source.expected_byte_length != self.output_contract.byte_length
+            || self.semantic_source.source_handle == self.schema_source.source_handle
+            || self.budget.max_sources == 0
+            || self.budget.max_total_bytes == 0
+            || self.budget.max_source_bytes == 0
+        {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        self.context_reconstruction_result
+            .validate_local_read_submission()
+            .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?;
+        let result = &self.context_reconstruction_result;
+        let response = &result.response;
+        let owner_publication = response
+            .get("context_reconstruction_owner_publication")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(DurableJobError::RuntimeOwnerExecutionInputUnavailable)?;
+        let request = owner_publication
+            .get("request")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(DurableJobError::RuntimeOwnerExecutionInputUnavailable)?;
+        let task_plan = owner_publication
+            .get("task_plan")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(DurableJobError::RuntimeOwnerExecutionInputUnavailable)?;
+        let context_recipe = owner_publication
+            .get("context_recipe")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(DurableJobError::RuntimeOwnerExecutionInputUnavailable)?;
+        if response.get("operation").and_then(serde_json::Value::as_str)
+            != Some("context_reconstruction")
+            || response.get("task_id").and_then(serde_json::Value::as_str)
+                != Some(self.task_id.as_str())
+            || response.get("scope_id").and_then(serde_json::Value::as_str)
+                != Some(self.work_scope.scope_id.as_str())
+            || response.get("context_reconstruction").is_none()
+            || request.get("task_id").and_then(serde_json::Value::as_str)
+                != Some(self.task_id.as_str())
+            || request.get("scope_id").and_then(serde_json::Value::as_str)
+                != Some(self.work_scope.scope_id.as_str())
+            || request.get("evidence_subject").and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+            || owner_publication.get("source_envelope").is_none()
+            || owner_publication.get("source_attempt").is_none()
+            || task_plan.get("recipe").is_none()
+            || task_plan.get("read").is_none()
+            || task_plan.get("response").is_none()
+            || context_recipe.get("body").is_none()
+            || context_recipe.get("read").is_none()
+            || context_recipe.get("response").is_none()
+        {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        let envelope: crate::HostRequestEnvelope = serde_json::from_value(
+            owner_publication
+                .get("source_envelope")
+                .cloned()
+                .ok_or(DurableJobError::RuntimeOwnerExecutionInputUnavailable)?,
+        )
+        .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?;
+        let source_attempt: crate::LocalReadAttempt = serde_json::from_value(
+            owner_publication
+                .get("source_attempt")
+                .cloned()
+                .ok_or(DurableJobError::RuntimeOwnerExecutionInputUnavailable)?,
+        )
+        .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?;
+        envelope
+            .validate()
+            .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?;
+        source_attempt
+            .validate()
+            .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?;
+        if envelope.state_fence != self.state_fence
+            || envelope.envelope_sha256 != result.request_sha256
+            || envelope.identity.task_id.as_deref() != Some(self.task_id.as_str())
+            || envelope.identity.work_scope_id.as_deref()
+                != Some(self.work_scope.scope_id.as_str())
+            || envelope.identity.capability != "eliot.query"
+            || source_attempt.authority_epoch != self.state_fence.authority_epoch
+            || source_attempt != *result.attempt.as_ref().ok_or(
+                DurableJobError::RuntimeOwnerExecutionInputUnavailable,
+            )?
+            || source_attempt.scope_id != self.work_scope.scope_id.as_str()
+        {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        for claim in std::iter::once(&self.semantic_source)
+            .chain(std::iter::once(&self.schema_source))
+            .chain(self.materials.iter())
+        {
+            if claim.source_handle.trim().is_empty()
+                || claim.source_handle.chars().any(char::is_control)
+                || claim.privacy_class.trim().is_empty()
+                || claim.privacy_class.chars().any(char::is_control)
+                || claim.route_class.trim().is_empty()
+                || claim.route_class.chars().any(char::is_control)
+                || claim.expected_byte_length == 0
+                || claim.expected_digest.len() != 64
+                || claim
+                    .expected_digest
+                    .bytes()
+                    .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+            }
+        }
+        if self.semantic_source.expected_digest.len() != 64
+            || self.semantic_source.expected_byte_length == 0
+            || self.materials.iter().any(|claim| {
+                claim.source_handle == self.semantic_source.source_handle
+                    || claim.source_handle == self.schema_source.source_handle
+            })
+        {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Fresh transport correlation, separate from the stable mutation identity.
@@ -350,6 +555,18 @@ fn canonical_operation_payload(operation: &JobOperation) -> serde_json::Value {
             if let Some(bytes) = &submission.semantic_input_bytes {
                 payload.insert(
                     "semantic_input_bytes".to_owned(),
+                    serde_json::json!(bytes),
+                );
+            }
+            if let Some(reference) = &submission.runtime_owner_execution_input {
+                payload.insert(
+                    "runtime_owner_execution_input".to_owned(),
+                    serde_json::json!(reference),
+                );
+            }
+            if let Some(bytes) = &submission.runtime_owner_execution_input_bytes {
+                payload.insert(
+                    "runtime_owner_execution_input_bytes".to_owned(),
                     serde_json::json!(bytes),
                 );
             }
@@ -505,6 +722,13 @@ pub struct JobSubmission {
     /// opaque identity. Absence is preserved for legacy/non-inline sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Original runtime-owner publication reference, present only for jobs
+    /// whose claimed runtime requires that owner handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact original canonical bytes named by `runtime_owner_execution_input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_owner_execution_input_bytes: Option<Vec<u8>>,
     pub output_contract: OpaqueContentRef,
     pub admission: AdmissionRef,
     pub cancellation_id: String,
@@ -517,6 +741,7 @@ impl JobSubmission {
             self.semantic_input.validate_semantic_input_bytes(bytes)?;
         }
         self.output_contract.validate("output_contract.sha256")?;
+        let _ = self.decode_runtime_owner_execution_input()?;
         self.admission.validate()?;
         self.work_scope
             .state_fence
@@ -526,6 +751,50 @@ impl JobSubmission {
             return Err(DurableJobError::FenceMismatch);
         }
         bounded_text(&self.cancellation_id, "cancellation_id")
+    }
+
+    /// Decodes and validates an optional original runtime owner publication.
+    /// Legacy submissions preserve absence; incomplete pairs are refused.
+    pub fn decode_runtime_owner_execution_input(
+        &self,
+    ) -> Result<Option<DurableJobRuntimeOwnerExecutionInput>, DurableJobError> {
+        let (Some(reference), Some(bytes)) = (
+            self.runtime_owner_execution_input.as_ref(),
+            self.runtime_owner_execution_input_bytes.as_ref(),
+        ) else {
+            return if self.runtime_owner_execution_input.is_none()
+                && self.runtime_owner_execution_input_bytes.is_none()
+            {
+                Ok(None)
+            } else {
+                Err(DurableJobError::RuntimeOwnerExecutionInputUnavailable)
+            };
+        };
+        reference.validate("runtime_owner_execution_input.sha256")?;
+        reference.validate_original_bytes(bytes)?;
+        if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity()? {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        let input: DurableJobRuntimeOwnerExecutionInput = serde_json::from_slice(bytes)
+            .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?;
+        if canonical_json_bytes(&input)
+            .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?
+            != *bytes
+        {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        input.validate()?;
+        if input.job_id != self.job_id
+            || input.attempt_id != self.attempt_id
+            || input.work_scope != self.work_scope
+            || input.state_fence != self.work_scope.state_fence
+            || input.semantic_source.expected_digest != self.semantic_input.sha256
+            || input.semantic_source.expected_byte_length != self.semantic_input.byte_length
+            || input.output_contract != self.output_contract
+        {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        Ok(Some(input))
     }
 }
 
@@ -1405,6 +1674,17 @@ impl DurableJobRequest {
     pub fn validate(&self) -> Result<(), DurableJobError> {
         self.request_identity.validate()?;
         self.operation.validate()?;
+        if let JobOperation::Submit { submission } = &self.operation
+            && let Some(runtime_input) = submission.decode_runtime_owner_execution_input()?
+        {
+            let metadata = &self.request_identity.request.request.metadata;
+            if metadata.task_id.as_ref() != Some(&runtime_input.task_id)
+                || metadata.state_fence != runtime_input.state_fence
+                || self.request_identity.operation.state_fence != runtime_input.state_fence
+            {
+                return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+            }
+        }
         if !matches!(self.operation, JobOperation::Reconcile { .. })
             && self.request_identity.operation.operation_kind != self.operation.kind().as_str()
         {
@@ -1621,6 +1901,15 @@ pub struct DurableJobResponse {
     /// supplied them. Absence remains explicit for legacy/non-inline jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Original runtime-owner execution-input reference retained by the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact original runtime-owner execution-input bytes retained by the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_owner_execution_input_bytes: Option<Vec<u8>>,
+    /// Original output contract retained by the durable job owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_contract: Option<OpaqueContentRef>,
     /// Exact record revision observed for this response.
     pub revision: u64,
     /// Semantic lifecycle state, separate from the mutation disposition.
@@ -1682,6 +1971,58 @@ impl DurableJobResponse {
                 .as_ref()
                 .ok_or(DurableJobError::SemanticInputUnavailable)?;
             semantic_input.validate_semantic_input_bytes(bytes)?;
+        }
+        match (
+            self.runtime_owner_execution_input.as_ref(),
+            self.runtime_owner_execution_input_bytes.as_ref(),
+        ) {
+            (None, None) => {}
+            (Some(reference), Some(bytes)) => {
+                reference.validate("runtime_owner_execution_input.sha256")?;
+                reference.validate_original_bytes(bytes)?;
+                if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity()? {
+                    return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+                }
+                let input: DurableJobRuntimeOwnerExecutionInput = serde_json::from_slice(bytes)
+                    .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?;
+                if canonical_json_bytes(&input)
+                    .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?
+                    != *bytes
+                {
+                    return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+                }
+                input.validate()?;
+                if input.job_id != self.job_id
+                    || input.attempt_id != self.attempt_id
+                    || input.work_scope != self.scope
+                    || input.state_fence != self.scope.state_fence
+                {
+                    return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+                }
+                let semantic_input = self
+                    .semantic_input
+                    .as_ref()
+                    .ok_or(DurableJobError::SemanticInputUnavailable)?;
+                let semantic_input_bytes = self
+                    .semantic_input_bytes
+                    .as_ref()
+                    .ok_or(DurableJobError::SemanticInputUnavailable)?;
+                if input.semantic_source.expected_digest != semantic_input.sha256
+                    || input.semantic_source.expected_byte_length != semantic_input.byte_length
+                {
+                    return Err(DurableJobError::SemanticInputMismatch);
+                }
+                semantic_input.validate_semantic_input_bytes(semantic_input_bytes)?;
+                match self.output_contract.as_ref() {
+                    Some(output_contract) if output_contract == &input.output_contract => {}
+                    None => return Err(DurableJobError::OutputContractUnavailable),
+                    Some(_) => return Err(DurableJobError::OutputContractMismatch),
+                }
+            }
+            _ => return Err(DurableJobError::RuntimeOwnerExecutionInputUnavailable),
+        }
+        if let Some(output_contract) = &self.output_contract {
+            output_contract.validate("output_contract.sha256")?;
         }
         if self.revision == 0 {
             return Err(DurableJobError::InvalidField {
@@ -1847,6 +2188,25 @@ impl DurableJobResponse {
                 if self.semantic_input_bytes != submission.semantic_input_bytes {
                     return Err(DurableJobError::SemanticInputMismatch);
                 }
+                match (
+                    submission.runtime_owner_execution_input.as_ref(),
+                    submission.runtime_owner_execution_input_bytes.as_ref(),
+                    self.runtime_owner_execution_input.as_ref(),
+                    self.runtime_owner_execution_input_bytes.as_ref(),
+                ) {
+                    (None, None, None, None) => {}
+                    (Some(expected_ref), Some(expected_bytes), Some(observed_ref), Some(observed_bytes))
+                        if expected_ref == observed_ref && expected_bytes == observed_bytes => {}
+                    (Some(_), Some(_), None, None) => {
+                        return Err(DurableJobError::RuntimeOwnerExecutionInputUnavailable);
+                    }
+                    _ => return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch),
+                }
+                match self.output_contract.as_ref() {
+                    Some(output_contract) if output_contract == &submission.output_contract => {}
+                    None => return Err(DurableJobError::OutputContractUnavailable),
+                    Some(_) => return Err(DurableJobError::OutputContractMismatch),
+                }
                 // Any positive revision is admitted: an idempotent resubmit
                 // may return the already-advanced record.
                 Ok(())
@@ -2005,6 +2365,14 @@ pub enum DurableJobError {
     FenceMismatch,
     #[error("operation identity does not match its typed operation")]
     OperationMismatch,
+    #[error("runtime owner execution input reference or bytes are unavailable")]
+    RuntimeOwnerExecutionInputUnavailable,
+    #[error("runtime owner execution input does not match its original identity")]
+    RuntimeOwnerExecutionInputMismatch,
+    #[error("output contract does not match the original submission")]
+    OutputContractMismatch,
+    #[error("original output contract is unavailable")]
+    OutputContractUnavailable,
     #[error("original semantic input reference is unavailable")]
     SemanticInputUnavailable,
     #[error(

@@ -5304,6 +5304,15 @@ async fn run_task_controller_poll(
     .map_err(|error| format!("daemon Task Controller preparation: {error}"))?;
     let body = match prepared {
         eliotd::campaign_task_controller::TaskControllerClaimPreparation::Rejected(body) => *body,
+        eliotd::campaign_task_controller::TaskControllerClaimPreparation::Orientation(prepared) => {
+            eliotd::dreamer_orientation_runtime::dispatch_task_controller_orientation_claim(
+                &composition,
+                kernel,
+                *prepared,
+            )
+            .await
+            .map_err(|error| format!("daemon Task Controller Orientation dispatch: {error}"))?
+        }
         eliotd::campaign_task_controller::TaskControllerClaimPreparation::Ready(prepared) => {
             let transition = {
                 let guard = composition.lock().await;
