@@ -5975,11 +5975,20 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                     // below, which would discard a live helper handle and
                     // report a clean stop. Containment outranks the bare
                     // publication error, exactly as the ordinary edge does.
-                    let terminal = replay_owner
-                        .publish_retained_sequence(&events)
-                        .map_err(OrdinaryDriveError::Loop)
-                        .or_else(|| replay_owner.cleanup_output_helper().ok());
-                    return Ok(terminal?);
+                    let terminal = replay_owner.publish_retained_sequence(&events);
+                    // Tracked termination of the replay emission: a helper
+                    // still holding stdout is reported to the process owner
+                    // rather than reported as a clean republication. A
+                    // contained helper outranks the publication error it came
+                    // with, as it does on the ordinary terminal edge.
+                    let containment = replay_owner.cleanup_output_helper();
+                    return match (terminal, containment) {
+                        (Ok(terminal), Ok(())) => Ok(terminal),
+                        (Ok(_), Err(error)) | (Err(_), Err(error)) => {
+                            Err(OrdinaryDriveError::Loop(error))
+                        }
+                        (Err(error), Ok(())) => Err(OrdinaryDriveError::Loop(error)),
+                    };
                 }
                 // The classifier also treats a differing identity under the
                 // same spent grant as Replay, and an InFlight-named set as
