@@ -1677,7 +1677,7 @@ mod tests {
             operation_id: operation_id.clone(),
             attempt_id: format!("{operation_id}:attempt:test-boot:7:1"),
             fencing_generation: 1,
-            session_id: "kernel-session-1".to_owned(),
+            session_id: Some("kernel-session-1".to_owned()),
             authority_epoch: envelope.state_fence.authority_epoch.clone(),
             scope_id: "kernel-session-1".to_owned(),
             facet_method: "skill.inject".to_owned(),
