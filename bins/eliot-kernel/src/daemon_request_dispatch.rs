@@ -6823,59 +6823,115 @@ impl KernelComposition {
         // the schedule owner read back from its own journal. Nothing here is
         // recomputed or re-derived by spelling.
         //
-        // It is then submitted through the existing runtime execution join,
-        // `UserAutomationOperatorRuntime` — the production
-        // `UserAutomationRuntimePort` over this already-authenticated Host
-        // channel, the same join `run-now` composes in
-        // `dispatch_user_automation_operator_transition`. That join revalidates
-        // the exact admission, resolves the complete owner-issued
+        // It is then submitted through the same execution join a committed `run-now`
+        // occurrence crosses. `KernelStoreGateway::due_wake_execution_join`
+        // assembles the complete owner-issued preflight projection from the live
+        // owners and calls `UserAutomationService::execute_occurrence_with_durable_job`,
+        // which runs the deterministic preflight decision and the
+        // complete-denominator refusal immediately before it reaches an effect
+        // owner, and resolves the complete owner-issued
         // `UserAutomationDurableJobMaterial` through
-        // `UserAutomationDurableJobMaterial::from_admitted_occurrence` when this
-        // ingress carries none, and validates the owner's answer. Calling
+        // `UserAutomationDurableJobMaterial::from_admitted_occurrence`. The
+        // transport it submits over is `UserAutomationOperatorRuntime` — the
+        // production `UserAutomationRuntimePort` over this already-authenticated
+        // Host channel — and the owner's answer is validated there. Calling
         // `UserAutomationDurableJobPort::admit_occurrence` on the bare client,
-        // as this contour did, reached the Durable Job owner with no
-        // `UserAutomationDurableJobMaterial` at all and so could never reach
-        // `HostDurableJobOwner::dreamer_job`.
-        let execution =
-            match Self::user_automation_due_wake_join(client, &request, &resolution, &readback)
-                .await
-            {
-                Ok(execution) => execution,
-                // Item 6, terminal leg. A refusal the Durable Job owner answered
-                // before any owner effect is a decided disposition about this
-                // occurrence, exactly as an admission is: the occurrence will not be
-                // admitted now, so leaving the recurring horizon pinned to it would
-                // wedge every later occurrence of the revision behind one
-                // permanently-refused wake. It advances through the same
-                // owner-acknowledged path the admitted branch uses, and it is
-                // reported as its own disposition rather than as a success.
-                //
-                // `Unavailable`, `NotRetained`, `UnknownOutcome` and
-                // `OutcomeSettled` deliberately do not reach this arm: none of them
-                // is an owner-acknowledged disposition about this occurrence. They
-                // respectively mean the owner could not answer, it answered about
-                // another record, it cannot say whether the effect landed, and the
-                // effect provably landed. Those keep the pre-existing fail-closed
-                // projection and do not advance.
-                Err(error @ UserAutomationRuntimeError::Rejected(_)) => {
-                    return Self::user_automation_due_wake_terminal_response(
-                        session,
-                        &resolution,
-                        &occurrence_id,
-                        &request,
-                        &readback,
-                        client,
-                        error,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    // No owner acknowledged a disposition, so the recurring horizon
-                    // does not advance: this wake is still unconsumed and a later
-                    // owner-issued submission can admit it.
-                    return Ok(Self::user_automation_runtime_error_response(error));
-                }
-            };
+        // as this contour did, reached the Durable Job owner without ever running
+        // the deterministic preflight, which is the blind rerun I11.12:59 and
+        // I14.21 forbid.
+        let outcome = match Self::user_automation_due_wake_join(
+            self,
+            client,
+            &request,
+            &resolution,
+            &readback,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            // Item 6, terminal leg. A refusal the Durable Job owner answered
+            // before any owner effect is a decided disposition about this
+            // occurrence, exactly as an admission is: the occurrence will not be
+            // admitted now, so leaving the recurring horizon pinned to it would
+            // wedge every later occurrence of the revision behind one
+            // permanently-refused wake. It advances through the same
+            // owner-acknowledged path the admitted branch uses, and it is
+            // reported as its own disposition rather than as a success.
+            //
+            // `Unavailable`, `NotRetained`, `UnknownOutcome` and
+            // `OutcomeSettled` deliberately do not reach this arm: none of them
+            // is an owner-acknowledged disposition about this occurrence. They
+            // respectively mean the owner could not answer, it answered about
+            // another record, it cannot say whether the effect landed, and the
+            // effect provably landed. Those keep the pre-existing fail-closed
+            // projection and do not advance.
+            Err(UserAutomationRuntimeError::Rejected(reason)) => {
+                return Self::user_automation_due_wake_decided_response(
+                    session,
+                    &resolution,
+                    &occurrence_id,
+                    &request,
+                    &readback,
+                    client,
+                    "rejected",
+                    reason,
+                )
+                .await;
+            }
+            Err(error) => {
+                // No owner acknowledged a disposition, so the recurring horizon
+                // does not advance: this wake is still unconsumed and a later
+                // owner-issued submission can admit it.
+                return Ok(Self::user_automation_runtime_error_response(error));
+            }
+        };
+        // The deterministic preflight is a decided answer about this occurrence
+        // before any owner effect, exactly like an admission and exactly like a
+        // Durable Job refusal, so it reaches the same owner-acknowledged
+        // disposition arm. A deferral is reported under its own owner reason and
+        // never re-labelled as a rejection; a blocked configuration is reported
+        // under its stable failure fingerprint and never as a success. Neither
+        // carries a Durable Job reference, because none was issued.
+        let execution = match outcome {
+            eliot_kernel_service::UserAutomationExecutionOutcome::Admitted {
+                execution, ..
+            } => execution,
+            eliot_kernel_service::UserAutomationExecutionOutcome::Deferred { reason, .. } => {
+                return Self::user_automation_due_wake_decided_response(
+                    session,
+                    &resolution,
+                    &occurrence_id,
+                    &request,
+                    &readback,
+                    client,
+                    "deferred",
+                    format!(
+                        "the deterministic preflight deferred occurrence {occurrence_id} with \
+                         reason {reason:?}, before any model or provider call"
+                    ),
+                )
+                .await;
+            }
+            eliot_kernel_service::UserAutomationExecutionOutcome::BlockedConfig {
+                failure, ..
+            } => {
+                return Self::user_automation_due_wake_decided_response(
+                    session,
+                    &resolution,
+                    &occurrence_id,
+                    &request,
+                    &readback,
+                    client,
+                    "blocked_config",
+                    format!(
+                        "occurrence {occurrence_id} entered blocked_config under failure \
+                         fingerprint {} before any model call",
+                        failure.failure_fingerprint
+                    ),
+                )
+                .await;
+            }
+        };
         if let Err(error) = execution.validate() {
             return Ok(Self::user_automation_runtime_error_response(
                 UserAutomationRuntimeError::Rejected(error.to_string()),
@@ -6939,47 +6995,22 @@ impl KernelComposition {
         })
     }
 
-    /// Assembles the admission this delivery submits to the runtime join.
+    /// Submits one due occurrence to the deterministic execution join and
+    /// returns the owner's answer (issue #2806 items 5 and 6).
     ///
-    /// Every member is the owner-proven value from this delivery, not a field
-    /// forwarded from the caller's asserted carrier: the current canonical
-    /// revision and the occurrence `scheduled_invocation` re-derived from it,
-    /// plus the `WakeIntent` the schedule owner read back from its own journal.
-    /// `preflight` and any owner-issued Durable Job material are carried across
-    /// unchanged when the ingress supplies them, and the join resolves the
-    /// material itself when it does not.
-    #[cfg(windows)]
-    fn user_automation_due_wake_admission(
-        request: &UserAutomationRuntimeAdmission,
-        resolution: &UserAutomationDueWakeResolution,
-        readback: &UserAutomationWakeReadback,
-    ) -> UserAutomationRuntimeAdmission {
-        UserAutomationRuntimeAdmission {
-            context: request.context.clone(),
-            authenticated_principal: request.authenticated_principal.clone(),
-            identity: request.identity.clone(),
-            revision: resolution.revision.clone(),
-            invocation: resolution.invocation.clone(),
-            preflight: request.preflight.clone(),
-            wake_intent: readback.intent.clone(),
-            durable_job: request.durable_job.clone(),
-        }
-    }
-
-    /// Submits one due occurrence to the runtime execution join and returns the
-    /// owner's answer (issue #2806 items 5 and 6).
-    ///
-    /// The admission is assembled and the join is awaited entirely inside this
-    /// contour, so `user_automation_due_wake_operation` never holds the join's
-    /// own state across its awaits. The join resolves the complete owner-issued
-    /// `UserAutomationDurableJobMaterial` through
-    /// `UserAutomationDurableJobMaterial::from_admitted_occurrence` whenever the
-    /// ingress carries none, and that compiler holds a whole canonical-JSON K0
-    /// `JobSubmission` and its digest inputs on the stack. Awaiting it inline
-    /// made the calling contour's future exceed the bounded size even though the
-    /// caller only ever reads the returned reference, so the join's future is
-    /// polled through one box: the transient allocation is released as soon as
-    /// the answer is back, and the caller's future stays bounded.
+    /// The join runs entirely inside this contour, so
+    /// `user_automation_due_wake_operation` never holds the join's own state
+    /// across its awaits. It assembles the complete owner-issued preflight
+    /// projection for the resolved occurrence from the live owners the canonical
+    /// Store gateway already reads, completes the owner-issued
+    /// `UserAutomationDurableJobMaterial`, and then crosses
+    /// `UserAutomationService::execute_occurrence_with_durable_job` - the same
+    /// join a committed `run-now` occurrence crosses, and the one that runs the
+    /// deterministic preflight decision and the complete-denominator refusal
+    /// immediately before it reaches an effect owner. That compiler holds a
+    /// whole canonical-JSON K0 `JobSubmission` and its digest inputs on the
+    /// stack, so the gateway polls it through its own box; the transient
+    /// allocation is released as soon as the owner's answer is back.
     ///
     /// The transport is already authenticated and bound to the current State
     /// Fence by the caller, so this adds no channel, no retry and no second
@@ -6987,44 +7018,53 @@ impl KernelComposition {
     /// channel.
     #[cfg(windows)]
     async fn user_automation_due_wake_join(
+        &self,
         client: &UserAutomationHostExecutionClient<
             AuthenticatedUserAutomationHostExecutionTransport,
         >,
         request: &UserAutomationRuntimeAdmission,
         resolution: &UserAutomationDueWakeResolution,
         readback: &UserAutomationWakeReadback,
-    ) -> Result<
-        eliot_kernel_core::user_automation::AutomationExecutionReference,
-        UserAutomationRuntimeError,
-    > {
+    ) -> Result<eliot_kernel_service::UserAutomationExecutionOutcome, UserAutomationRuntimeError> {
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
         let runtime = UserAutomationOperatorRuntime::new(client);
-        Box::pin(
-            runtime.admit_occurrence(Self::user_automation_due_wake_admission(
-                request, resolution, readback,
-            )),
-        )
+        Box::pin(gateway.due_wake_execution_join(
+            request,
+            resolution,
+            readback.intent.clone(),
+            &runtime,
+        ))
         .await
     }
 
-    /// Advances the recurring horizon after an owner-acknowledged terminal
-    /// refusal and reports the occurrence as terminal (issue #2806 item 6).
+    /// Advances the recurring horizon after an owner-acknowledged decided
+    /// disposition and reports the occurrence under that disposition (issue #2806
+    /// item 6).
     ///
-    /// The Durable Job owner refused this occurrence before any owner effect, so
-    /// it issued a decided answer about it rather than a lost one. The horizon
-    /// therefore advances exactly as it does after an admission, through the
-    /// same `user_automation_due_wake_horizon` slice request, and its outcome
-    /// and replay handle travel beside the refusal.
+    /// Every disposition that reaches here is decided before any owner effect:
+    /// the deterministic preflight deferred or blocked this occurrence, or the
+    /// Durable Job owner refused it. None of them will be admitted now, so leaving
+    /// the recurring horizon pinned to it would wedge every later occurrence of
+    /// the revision behind one permanently-unadmitted wake. The horizon therefore
+    /// advances exactly as it does after an admission, through the same
+    /// `user_automation_due_wake_horizon` slice request, and its outcome and
+    /// replay handle travel beside the disposition.
     ///
-    /// The occurrence is reported as `accepted: false` with the owner's own
-    /// closed reason. It is not published, not admitted, and it carries no
-    /// Durable Job reference, so nothing here can be read as a success. The
+    /// The occurrence is reported as `accepted: false` under its own closed
+    /// `outcome` and the owner's own reason. It is not published, not admitted,
+    /// and it carries no Durable Job reference, so nothing here can be read as a
+    /// success, and one disposition is never re-labelled as another. The
     /// route-level `recovery` stays derived from the horizon alone and is never
-    /// fabricated: a decided refusal with a fully acknowledged horizon owes the
-    /// caller nothing, which is the same convention
+    /// fabricated: a decided disposition with a fully acknowledged horizon owes
+    /// the caller nothing, which is the same convention
     /// `user_automation_runtime_error_response` already uses for
     /// `UserAutomationRuntimeError::Rejected`.
     #[cfg(windows)]
-    async fn user_automation_due_wake_terminal_response(
+    async fn user_automation_due_wake_decided_response(
         session: &Session,
         resolution: &UserAutomationDueWakeResolution,
         occurrence_id: &str,
@@ -7033,11 +7073,9 @@ impl KernelComposition {
         client: &UserAutomationHostExecutionClient<
             AuthenticatedUserAutomationHostExecutionTransport,
         >,
-        error: UserAutomationRuntimeError,
+        outcome: &str,
+        reason: String,
     ) -> Result<serde_json::Value, TransportError> {
-        let UserAutomationRuntimeError::Rejected(reason) = error else {
-            return Ok(Self::user_automation_runtime_error_response(error));
-        };
         let horizon = Self::user_automation_due_wake_horizon(
             session,
             resolution,
@@ -7051,7 +7089,7 @@ impl KernelComposition {
             "status": if recovery.is_none() { "known" } else { "unknown" },
             "value": {
                 "accepted": false,
-                "outcome": "rejected",
+                "outcome": outcome,
                 "reason": reason,
                 "occurrence_id": occurrence_id,
                 "resolution": resolution,
