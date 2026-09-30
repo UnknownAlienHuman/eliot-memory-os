@@ -589,6 +589,7 @@ impl AuditEventKind {
             | Self::PROCESS_LAUNCH_FAILED
             | Self::PROCESS_FAILED
             | Self::PROCESS_CRASHED
+            | Self::PROCESS_RESTARTED
             | Self::PROCESS_RESTART_INTENSITY_EXHAUSTED
             | Self::PROCESS_QUARANTINED
             | Self::SHUTDOWN_DRAIN_REQUESTED
@@ -3029,6 +3030,35 @@ impl crate::KernelComposition {
     /// the cascade retention code (I16.11: silent success is forbidden).
     /// Lock order is chain-then-fallback, matching reconciliation.
     pub(crate) fn audit_observe(&self, draft: AuditEventDraft) -> Option<AuditRecord> {
+        // The admitted Kernel Event Log profile is an independent, best-effort
+        // observation of the original typed draft. Submit before either audit
+        // lock; this does not assert that the chain appended or that a state
+        // transition committed. Only the three already-present safe lineage
+        // references can accompany these four fixed event kinds.
+        let event = match draft.kind {
+            AuditEventKind::PROCESS_CRASHED => {
+                Some(eliot_platform_windows::AdmittedKernelEventLogEvent::Crash)
+            }
+            AuditEventKind::PROCESS_RESTARTED => {
+                Some(eliot_platform_windows::AdmittedKernelEventLogEvent::Recovery)
+            }
+            AuditEventKind::PROCESS_RESTART_INTENSITY_EXHAUSTED => {
+                Some(eliot_platform_windows::AdmittedKernelEventLogEvent::RestartExhausted)
+            }
+            AuditEventKind::PROCESS_QUARANTINED => {
+                Some(eliot_platform_windows::AdmittedKernelEventLogEvent::Quarantine)
+            }
+            _ => None,
+        };
+        if let Some(event) = event {
+            let lineage = &draft.lineage;
+            let _ = crate::windows_event_log::enqueue_audit_event(
+                event,
+                lineage.operation_id.as_deref(),
+                lineage.module_generation.as_deref(),
+                lineage.authority_epoch.as_deref(),
+            );
+        }
         let now = crate::unix_ms();
         let Ok(mut chain) = self.kernel_audit.lock() else {
             crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);

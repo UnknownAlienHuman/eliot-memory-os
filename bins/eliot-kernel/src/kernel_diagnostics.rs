@@ -18,11 +18,10 @@
 //! observation, authorize an effect, or promote liveness into
 //! readiness/completion.
 //!
-//! Delivery is workspace `tracing` only, written to stderr so protocol
-//! stdout framing is never contaminated. The Windows Event Log sink is an
-//! explicitly absent seam (see [`DiagnosticSink`]): issue #984 (safe Windows
-//! Event Log port) is still open and unlanded, so this facade must neither
-//! acquire Event Log FFI nor fake delivery through another sink.
+//! General diagnostic delivery is workspace `tracing`, written to stderr so
+//! protocol stdout framing is never contaminated. The separately admitted
+//! Kernel Event Log profile uses one bounded queue and worker; this facade
+//! owns only its capability status and never acquires Event Log FFI.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -67,9 +66,7 @@ pub enum KernelDiagnosticsError {
     /// Repeat installation is bounded and non-panicking: the first install
     /// stands and no second owner is created.
     AlreadyOwned,
-    /// Windows Event Log delivery was requested but is unavailable: issue
-    /// #984 (safe Windows Event Log port) is still open and unlanded, so
-    /// this facade has no Event Log sink and must not fake one.
+    /// The fixed Kernel Event Log queue has not been started or is unavailable.
     EventLogUnavailable,
 }
 
@@ -78,7 +75,7 @@ impl fmt::Display for KernelDiagnosticsError {
         match self {
             Self::AlreadyOwned => write!(f, "kernel diagnostics subscriber already owned"),
             Self::EventLogUnavailable => {
-                write!(f, "windows event log sink unavailable (see issue #984)")
+                write!(f, "kernel event log queue unavailable")
             }
         }
     }
@@ -91,19 +88,20 @@ impl std::error::Error for KernelDiagnosticsError {}
 pub enum DiagnosticSink {
     /// Workspace `tracing` subscriber writing to stderr. Available.
     TracingStderr,
-    /// Windows Event Log. Explicitly absent until #984 lands: requesting it
-    /// is a typed error, never silent delivery elsewhere and never FFI
-    /// acquired inside this facade.
+    /// The admitted Kernel Event Log queue. This reports queue capability,
+    /// never delivery; FFI remains on its single worker thread.
     WindowsEventLog,
 }
 
 /// Reports whether a sink can carry Kernel diagnostics.
 ///
-/// The Event Log arm always answers [`KernelDiagnosticsError::EventLogUnavailable`];
-/// absence of evidence remains missing, never a faked delivery.
+/// The Event Log arm answers successfully only after the bounded Kernel queue
+/// was initialized. That is not proof that the worker remains live or that
+/// any event was accepted or delivered.
 pub fn sink_status(sink: DiagnosticSink) -> Result<(), KernelDiagnosticsError> {
     match sink {
         DiagnosticSink::TracingStderr => Ok(()),
+        DiagnosticSink::WindowsEventLog if crate::windows_event_log::queue_initialized() => Ok(()),
         DiagnosticSink::WindowsEventLog => Err(KernelDiagnosticsError::EventLogUnavailable),
     }
 }
