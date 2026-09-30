@@ -1554,15 +1554,7 @@ impl ResearchQueryRequest {
         ) {
             (None, None) => {}
             (Some(prior), Some(reason)) => {
-                if prior.len() != 64
-                    || !prior
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err(ResearchContractError::InvalidDigest {
-                        field: "predecessor_freeze_digest",
-                    });
-                }
+                digest(prior, "predecessor_freeze_digest")?;
                 text(reason, "reopen_reason")?;
             }
             _ => {

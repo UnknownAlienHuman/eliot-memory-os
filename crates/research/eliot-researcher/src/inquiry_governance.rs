@@ -55,8 +55,8 @@ use crate::evidence_portfolio::{
     EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster, NoMatchEvaluation,
     ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
     SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
-    audit_claim, bool_text, check_precision, digest, fence_preimage, freeze, grade_name,
-    grade_rank, push_count, push_field, reject_vague, text,
+    bool_text, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
+    push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -5523,6 +5523,33 @@ pub struct InquiryObservation {
     /// without a stated cause states no reopen, and `EvidenceFreeze::freeze`
     /// refuses a half-present relation.
     pub reopen_reason: Option<String>,
+    /// The retained original bytes of each admitted source revision, keyed by
+    /// source handle.
+    ///
+    /// W2: "Resolve accepted sources through the governed source-admission
+    /// owner, retain their exact bytes or immutable accessible artifacts, and
+    /// commit the freeze before admitting synthesis. An in-memory clone or hash
+    /// of unavailable bytes is insufficient." This field is that retained
+    /// original, and it is the reason the excerpt obligation below is decidable
+    /// at all: without the actual bytes, the only evidence available about a
+    /// quotation is a digest of bytes nobody holds, which cannot distinguish an
+    /// exact quote from a fabricated one, a cropped negation from its absence,
+    /// or a page quote from a search snippet.
+    ///
+    /// It is an **immutable artifact reference plus the exact bytes that
+    /// artifact resolved to**, handed here by the governed source-admission and
+    /// persistence owner. This crate does not store them and does not claim to:
+    /// `crates/research/AGENTS.md` states this subtree "has no canonical-store
+    /// write authority", so the commit happened elsewhere and this value is the
+    /// reference to it, re-proved on every use.
+    ///
+    /// A handle absent from this map is a real finding rather than a skip: the
+    /// source was admitted without its original being retained, and every
+    /// excerpt offered from it therefore fails verification with
+    /// `NoRetainedRevision`. That is the honest W2 outcome for a run that did
+    /// not persist before synthesis, and it is what makes the persistence
+    /// observable rather than asserted.
+    pub retained_revisions: BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
 }
 
 /// The `R6` inquiry-governance record for one inquiry.
@@ -7885,9 +7912,16 @@ fn claim_audit_for_run(
         let identity = claim.freeze_identity().map_err(InquiryError::from)?;
         let claim = AuditedClaim {
             frozen_identities: vec![identity],
+            excerpts: retained_excerpts(observation, claim_id),
             ..claim
         };
-        let verdict = audit_claim(&claim, &portfolio, &binding, observation.assessment_time_ms);
+        let verdict = crate::evidence_portfolio::audit_claim_with_excerpts(
+            &claim,
+            &portfolio,
+            &binding,
+            observation.assessment_time_ms,
+            &observation.retained_revisions,
+        );
         records.push(ClaimAuditRecord::bind(
             &observation.inquiry_id,
             profile,
@@ -8012,11 +8046,7 @@ fn audit_binding(
 fn released_material_claim(observation: &InquiryObservation, claim_id: &str) -> AuditedClaim {
     AuditedClaim {
         claim_id: claim_id.to_owned(),
-        statement: format!(
-            "the retained provider artifact for inquiry {} contains evidence the question `{}` \
-             could be decided from within the admitted scope `{}`",
-            observation.inquiry_id, observation.question, observation.scope
-        ),
+        statement: released_material_statement(observation, claim_id),
         material: true,
         domain: observation.scope.clone(),
         citations: vec![claim_id.to_owned()],
@@ -8025,7 +8055,93 @@ fn released_material_claim(observation: &InquiryObservation, claim_id: &str) -> 
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: Vec::new(),
     }
+}
+
+/// The exact excerpt the released material statement for one admitted handle is
+/// verified against.
+///
+/// This is the producer that makes `excerpt_supports_requirement` decidable on
+/// the live path, and the two things it does are both required rather than
+/// convenient:
+///
+/// - it **reads the statement's own quoted span out of the retained original**,
+///   so the bytes being compared are the bytes the admitted revision actually
+///   holds. A claim whose declared statement contains no quoted span offers no
+///   excerpt, which leaves the obligation `Unsatisfied` with that reason — the
+///   honest state, and the one that blocks a `Supported` promotion.
+///
+/// - it **declares a byte offset only when it computed one from the retained
+///   bytes**, so an asserted position is a measurement and not a claim. This
+///   path always uses [`ExcerptPosition::Unpositioned`] for the span it found,
+///   because the offset is only meaningful for the exact window this function
+///   sliced, and asserting it would be asserting a position for a longer quote
+///   the source may not have presented that way.
+///
+/// A handle with no retained revision produces no excerpt. That is not a
+/// silent skip: the claim then has no verified excerpt at all, the obligation
+/// is `Unsatisfied`, and the residue names the missing retention.
+fn retained_excerpts(
+    observation: &InquiryObservation,
+    claim_id: &str,
+) -> Vec<crate::admitted_excerpt::AdmittedExcerpt> {
+    let Some(retained) = observation.retained_revisions.get(claim_id) else {
+        return Vec::new();
+    };
+    let Some(text) = retained.as_text() else {
+        return Vec::new();
+    };
+    let statement = released_material_statement(observation, claim_id);
+    match quoted_span(&statement) {
+        Some(quote) => crate::admitted_excerpt::AdmittedExcerpt::offer(
+            crate::admitted_excerpt::AdmittedExcerpt::Params {
+                source_handle: claim_id.to_owned(),
+                excerpt: quote,
+                position: crate::admitted_excerpt::ExcerptPosition::Unpositioned,
+            },
+        )
+        .ok()
+        .into_iter()
+        .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The exact released wording of one material claim.
+///
+/// One function so the statement [`released_material_claim`] publishes and the
+/// span [`retained_excerpts`] slices come from the **same** bytes. Two copies of
+/// this format string would let a later edit change the released wording while
+/// the excerpt kept pointing at the old one, which is exactly the
+/// post-audit-material-edit failure the issue names.
+fn released_material_statement(observation: &InquiryObservation, claim_id: &str) -> String {
+    format!(
+        "the retained provider artifact for inquiry {} contains evidence the question `{}` \
+         could be decided from within the admitted scope `{}`",
+        observation.inquiry_id, observation.question, observation.scope
+    )
+}
+
+/// The exact quoted span inside a statement, if it carries one.
+///
+/// The grammar is the narrow one a claim can actually use to present a
+/// quotation: a backtick-delimited or double-quote-delimited run of text.
+/// Nothing is interpreted — the bytes between the delimiters are returned
+/// verbatim, including any backticks or quotes inside them that do not close the
+/// span — and a statement with no such run yields `None` rather than a
+/// fabricated one.
+fn quoted_span(statement: &str) -> Option<String> {
+    for delimiter in ['`', '"'] {
+        let opening = statement.find(delimiter)?;
+        let after = opening + 1;
+        let closing = statement[after..].find(delimiter)? + after;
+        let span = statement[after..closing].trim();
+        if !span.is_empty() {
+            return Some(span.to_owned());
+        }
+    }
+    None
 }
 
 /// Observed degradation, coverage unknowns and the budget limitation of one run.
