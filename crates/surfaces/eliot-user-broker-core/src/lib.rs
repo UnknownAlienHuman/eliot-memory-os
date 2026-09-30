@@ -3828,10 +3828,10 @@ impl UserBroker {
         self.close(RegistrationStatus::Draining)
     }
     pub fn suspend(&mut self) -> Result<(), BrokerError> {
-        self.close(RegistrationStatus::Draining)
+        self.close(RegistrationStatus::Closed)
     }
     pub fn hibernate(&mut self) -> Result<(), BrokerError> {
-        self.close(RegistrationStatus::Draining)
+        self.close(RegistrationStatus::Closed)
     }
     pub fn revoke(&mut self) -> Result<(), BrokerError> {
         self.close(RegistrationStatus::Closed)

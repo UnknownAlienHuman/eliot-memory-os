@@ -28,6 +28,7 @@ use eliot_platform::ClockObservation;
 use eliot_platform::WorkScopePath;
 use eliot_platform_windows::{
     NamedPipePeerEvidence, ProcessIdentity, ProtectedPathLease, WindowsPlatform,
+    user_session_lifecycle::UserSessionLifecycleEvent,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
@@ -1225,6 +1226,14 @@ pub struct BrokerReadiness<'a> {
     pub generation_job: Option<&'a str>,
 }
 
+/// Whether the broker can continue serving after applying one authentic
+/// Windows lifecycle observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleDisposition {
+    Continue,
+    Stop(&'static str),
+}
+
 pub struct BrokerComposition {
     broker: UserBroker,
     snapshot: PathBuf,
@@ -1657,6 +1666,73 @@ impl BrokerComposition {
             Err(BrokerError::UnknownOutcome) => Err(self.lost_operation_error()),
             Err(error) => Err(CompositionError::Recovery(error)),
         }
+    }
+
+    /// Applies one event delivered by the process-local Windows observer to
+    /// this composition's exact Kernel-issued registration.
+    ///
+    /// Session IDs are joined against the retained registration before the
+    /// broker can fence it. Low-power broadcasts are sessionless OS messages;
+    /// both entry and resume close the same registration because Win32 does
+    /// not distinguish suspend from hibernate and a resumed process may not
+    /// reuse pre-sleep identity, lease, or child state.
+    pub fn apply_lifecycle_event(
+        &mut self,
+        event: UserSessionLifecycleEvent,
+    ) -> Result<LifecycleDisposition, CompositionError> {
+        self.verify_launch_lease()?;
+        let registration = self.broker.registration().cloned().ok_or_else(|| {
+            CompositionError::Launch(
+                "lifecycle event arrived without an exact broker registration".to_owned(),
+            )
+        })?;
+        let require_exact_session = |session_id: u32| {
+            if registration.interactive_session_id == session_id.to_string() {
+                Ok(())
+            } else {
+                Err(CompositionError::Launch(
+                    "Windows lifecycle session differs from the broker registration".to_owned(),
+                ))
+            }
+        };
+
+        let (result, disposition) = match event {
+            UserSessionLifecycleEvent::SessionLogoff { session_id }
+            | UserSessionLifecycleEvent::SessionTerminated { session_id } => {
+                require_exact_session(session_id)?;
+                (
+                    self.broker.logoff(),
+                    LifecycleDisposition::Stop("BROKER_SESSION_ENDED"),
+                )
+            }
+            UserSessionLifecycleEvent::SessionDisconnected { session_id } => {
+                require_exact_session(session_id)?;
+                (self.broker.drain(), LifecycleDisposition::Continue)
+            }
+            UserSessionLifecycleEvent::SystemSuspending
+            | UserSessionLifecycleEvent::SystemResuming => (
+                self.broker.suspend(),
+                LifecycleDisposition::Stop("BROKER_POWER_LIFECYCLE_ENDED"),
+            ),
+            UserSessionLifecycleEvent::SystemSessionEnding { session_id, logoff } => {
+                require_exact_session(session_id)?;
+                let result = if logoff {
+                    self.broker.logoff()
+                } else {
+                    self.broker.revoke()
+                };
+                (result, LifecycleDisposition::Stop("BROKER_SYSTEM_SESSION_ENDED"))
+            }
+        };
+        match result {
+            Ok(()) => {}
+            Err(BrokerError::UnknownOutcome) => return Err(self.lost_operation_error()),
+            Err(error) => return Err(CompositionError::Recovery(error)),
+        }
+        if disposition != LifecycleDisposition::Continue {
+            self.registration_digest = None;
+        }
+        Ok(disposition)
     }
 
     /// Reconciles a lost or unknown broker-owned Kernel acknowledgement by the

@@ -115,6 +115,7 @@ mod supervision_authority_key;
 mod tcp_listener_owner;
 mod terminal_containment;
 mod user_owned_leases;
+pub mod user_session_lifecycle;
 
 use crate::service_registration::{exact_path_text, utf16_text};
 

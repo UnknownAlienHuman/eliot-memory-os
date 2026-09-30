@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use eliot_process::OperationId;
 use eliot_user_broker::{
     BrokerComposition, BrokerConfig, CompositionError, HumanStateAuthority, NotifyAcknowledge,
-    NotifyDeliver, OperatorClientBinding, canonical_root, request_names_notify_image,
+    LifecycleDisposition, NotifyDeliver, OperatorClientBinding, canonical_root,
+    request_names_notify_image,
 };
 // There is exactly one operator pipe name. The minted `OperatorEndpoint` and
 // the pipe the broker serves are the same name, owned by the handoff contract
@@ -243,6 +244,8 @@ enum BrokerInput {
         response: tokio::sync::oneshot::Sender<OperatorPipeMessage>,
     },
     OperatorPipeFailure(String),
+    Lifecycle(eliot_platform_windows::user_session_lifecycle::UserSessionLifecycleEvent),
+    LifecycleObserverFailure(String),
 }
 
 // One loop owns heartbeat timing, request dispatch, and fail-closed shutdown accounting.
@@ -280,6 +283,19 @@ fn main() {
             error.to_string(),
         ),
     };
+    #[cfg(windows)]
+    let lifecycle_receiver = match eliot_platform_windows::user_session_lifecycle::start() {
+        Ok(receiver) => Some(receiver),
+        Err(error) => {
+            exit(
+                PROVIDER_REJECTED_EXIT,
+                "BROKER_LIFECYCLE_OBSERVER_REJECTED",
+                error.to_string(),
+            );
+        }
+    };
+    #[cfg(not(windows))]
+    let lifecycle_receiver = None;
     if let Err(error) = composition.self_register() {
         exit(
             PROVIDER_REJECTED_EXIT,
@@ -313,6 +329,24 @@ fn main() {
         map.insert("notify_launch".to_owned(), notify_launch_status.clone());
     }
     let (sender, receiver) = mpsc::channel::<BrokerInput>();
+    if let Some(lifecycle_receiver) = lifecycle_receiver {
+        let lifecycle_sender = sender.clone();
+        std::thread::spawn(move || {
+            while let Ok(notice) = lifecycle_receiver.recv() {
+                let input = match notice {
+                    eliot_platform_windows::user_session_lifecycle::UserSessionLifecycleNotice::Event(
+                        event,
+                    ) => BrokerInput::Lifecycle(event),
+                    eliot_platform_windows::user_session_lifecycle::UserSessionLifecycleNotice::ObserverFailed(
+                        error,
+                    ) => BrokerInput::LifecycleObserverFailure(error),
+                };
+                if lifecycle_sender.send(input).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     if let Err(error) = start_operator_pipe_server(sender.clone()) {
         exit(
             PROVIDER_REJECTED_EXIT,
@@ -384,6 +418,37 @@ fn main() {
                 "BROKER_OPERATOR_PIPE_FAILURE",
                 error,
             ),
+            BrokerInput::Lifecycle(event) => {
+                match composition.apply_lifecycle_event(event) {
+                    Ok(LifecycleDisposition::Continue) => continue,
+                    Ok(LifecycleDisposition::Stop(reason)) => {
+                        exit(
+                            PROVIDER_REJECTED_EXIT,
+                            reason,
+                            "Windows lifecycle fenced broker registration".to_owned(),
+                        )
+                    }
+                    Err(error) => exit(
+                        PROVIDER_REJECTED_EXIT,
+                        "BROKER_LIFECYCLE_FENCE_REJECTED",
+                        error.to_string(),
+                    ),
+                }
+            }
+            BrokerInput::LifecycleObserverFailure(error) => {
+                if let Err(close_error) = close_with_retry(&mut composition) {
+                    exit(
+                        PROVIDER_REJECTED_EXIT,
+                        "BROKER_LIFECYCLE_CLOSE_REJECTED",
+                        format!("observer failure: {error}; close failure: {close_error}"),
+                    );
+                }
+                exit(
+                    PROVIDER_REJECTED_EXIT,
+                    "BROKER_LIFECYCLE_OBSERVER_FAILED",
+                    error,
+                );
+            }
         };
         let stop = matches!(response, Message::Stopped);
         if stop {
