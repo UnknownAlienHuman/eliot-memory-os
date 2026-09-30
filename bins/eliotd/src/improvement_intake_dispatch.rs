@@ -138,9 +138,10 @@
 //! evidence lineages still OVERLAP, and the premise is narrower than "the
 //! decision's own refs are on both sides". Both are functions of the admitted
 //! state fence: [`maintenance_evidence_refs`] builds
-//! `maintenance-scope:{scope_ref}` from `scope_ref_for`, which is
-//! `{service}:{authority_epoch.lineage_id}@{authority_epoch.sequence}@{resource_generation}`
-//! (`maintenance_trigger_evaluator.rs:625-633`), and `trigger_id` embeds that
+//! `maintenance-scope:{scope_ref}` from `scope_ref_for`, which formats
+//! `{service}:{authority_epoch.lineage_id}@{authority_epoch.sequence}:{resource_generation}`
+//! — its `"{}:{}@{}:{}"` is at `maintenance_trigger_evaluator.rs:625-633`, note
+//! the COLON before the resource generation — and `trigger_id` embeds that
 //! same `scope_ref` through the catalog's `FamilyAndScope` dedup key
 //! (`maintenance_family_catalog.rs:191-197`). So BOTH decision refs change
 //! together on an `authority_epoch.sequence` or `resource_generation` move. While
@@ -150,9 +151,12 @@
 //! every pass from the committed rows. When the fence moves AND a new closure
 //! lands in the same interval, nothing is shared, `merge_target` returns `None`,
 //! and the candidate is admitted as a brand-new entry that can never merge with
-//! the old one — the daemon's own code treats fence movement as live
-//! (`daemon_runtime.rs:5270-5275`). Convergence across a fence move is therefore
-//! NOT claimed, and is not achievable by anything in this file.
+//! the old one — the daemon's own code treats fence movement as live and
+//! REFUSES mid-flight rather than proceeding on it: "daemon reconstruction
+//! fence moved before serve" (`daemon_runtime.rs:4395-4397`) and "the admitted
+//! state fence moved between the dedup registry read and the admission"
+//! (`daemon_runtime.rs:5465-5470`). Convergence across a fence move is
+//! therefore NOT claimed, and is not achievable by anything in this file.
 //!
 //! It did NOT previously converge to one STORE row, and this claim used to say
 //! it did. It does not, and the reason is the brief: the committed document
@@ -955,10 +959,11 @@ fn maintenance_trigger_text(decision: &eliot_maintenance::AutomationTriggerDecis
 /// Distinctness IS true here, and the argument is about the PREFIXES, which are
 /// this file's to choose, not about the record's validation:
 ///
-/// - the two refs cannot collide with each other, because `learning-closure:`
-///   and `learning-closure-digest:` differ at index 17 (`:` against `-`), so no
+/// - the two refs cannot collide with each other, because the prefixes
+///   `learning-closure:` and `learning-closure-digest:` first differ at
+///   0-BASED byte index 16 (`:` against `-`; index 17 is `d` in both), so no
 ///   choice of `delta_artifact` and `delta_digest` can make the two formatted
-///   strings equal;
+///   strings equal — distinct prefixes are never reconciled by any suffix;
 /// - neither can collide with a decision ref or the family trace ref, which are
 ///   spelled `maintenance-trigger:`, `maintenance-scope:` and `maintenance-family:`.
 ///   Those differ from `learning-closure:` within their first thirteen bytes, so
@@ -976,8 +981,10 @@ fn maintenance_trigger_text(decision: &eliot_maintenance::AutomationTriggerDecis
 /// `:1898`). So a committed closure whose artifact identity exceeds 1007 bytes
 /// — the 1024-byte bound less this file's 17-byte prefix — makes the CONFORMANCE
 /// arm refuse with a typed `SelfQualityError::Contract`, where before this
-/// change that same closure was accepted. The digest ref cannot trigger it: it is
-/// 24 bytes of prefix plus the record's own 64 lowercase hex characters.
+/// change that same closure was accepted. The digest ref cannot trigger it: it
+/// is a 24-byte prefix — a LENGTH, counted like the 17-byte prefix above and
+/// not an index into anything — plus the record's own 64 lowercase hex
+/// characters.
 ///
 /// That ceiling is disclosed, not removed. Truncating or re-hashing a committed
 /// identity to fit would be a second spelling for an identity the artifact owner
@@ -2559,11 +2566,75 @@ pub async fn commit_improvement_artifact(
         // a same-identity merge means the surviving entry's lineage already
         // CONTAINS the incoming one — `merge_into` unions into a set, and the
         // entry only ever grew, so the union is the entry's own lineage
-        // unchanged. What remains of `merge_into` is `merged_from` (rebuilt
-        // empty by `into_entry` on every restore anyway) and `revision += 1`
-        // (registry-local, and the next pass re-derives it). The durable
-        // artifact of such a pass is the candidate's own row, which is committed
-        // below under its own stable handle.
+        // unchanged.
+        //
+        // That is the FIRST of the NINE mutations `merge_into` performs on its
+        // local copy (`candidate_bounds.rs:1100-1132`). All nine are enumerated
+        // here rather than assumed away, because the justification for this arm
+        // is exactly that none of the remaining eight leaves durable
+        // consequence. Line references are `candidate_bounds.rs` unless stated.
+        //
+        // 1. `evidence_refs` union (`:1101-1104`) — unchanged. Equal
+        //    `candidate_id` implies equal identity content, because
+        //    `derive_candidate_id` hashes the canonical evidence lineage
+        //    (`lib.rs:782-792`, `:813-827`), so the absorbed set is already a
+        //    subset of the survivor's.
+        // 2. `source_trace_refs` union (`:1105-1108`) — unchanged on the same
+        //    citation: the identity digest hashes that field too (`:822-824`).
+        // 3. `merged_from` (`:1109-1111`) — the push DOES fire, and it pushes
+        //    the survivor's OWN id, because on a self-merge the absorbed id and
+        //    the surviving id are the same string read from the same candidate
+        //    (`:793-794`, and `admit_inner` `:931-932`). It reaches nothing
+        //    durable regardless: this arm writes no receipt, and `into_entry`
+        //    rebuilds `merged_from` empty on every restore (`:249`).
+        // 4. `value` (`:1112-1114`) — DOES fire whenever the incoming
+        //    assessment exceeds the restored floor, and it is a real raise, not
+        //    a no-op: a candidate row restores `value` at
+        //    `enforced_bound.min_value` (`improvement_dedup_read.rs:902`), and
+        //    the crate says so in as many words (`:603-605`). It is discarded
+        //    because the durable record carries no assessed value to carry it
+        //    — `DurableCandidateRecord` has `admitted_value_floor` and no
+        //    `value` (`:218-224`, `:212-217`). Only a merge receipt makes a
+        //    survivor's value durable, by re-reading it as the next floor
+        //    (`improvement_dedup_read.rs:653`), and this arm writes none.
+        // 5. `owner` (`:1115-1117`) — cannot fire on a restored entry. A
+        //    candidate row sets it `Some(candidate.owner_and_decision_authority)`
+        //    only AFTER that candidate validated
+        //    (`improvement_dedup_read.rs:894-900`), and `validate` refuses a
+        //    blank one (`lib.rs:771-774`, whose emptiness test trims, so
+        //    `lib.rs:1295-1300`); a
+        //    receipt row carries the PREVIOUS survivor's, re-validated at
+        //    `improvement_dedup_read.rs:634-642` and copied at `:651`. So the
+        //    entry is inductively never ownerless and the guard never opens.
+        // 6. `admitted_under_authority` (`:1118-1120`) — the same shape: a
+        //    candidate row sets it `Some(enforced_bound.governor_authority_ref)`
+        //    (`improvement_dedup_read.rs:901`) and a receipt row carries the
+        //    previous survivor's (`:652`). `into_entry` filters only a
+        //    trimmed-blank ref (`:250-253`), so the one way the guard can open
+        //    is a blank committed `governor_authority_ref` — and were it so,
+        //    the fill writes the CURRENT permit's `authority_ref` (`:786-787`),
+        //    which is the authority this very admission was verified under, so
+        //    it is a re-derivation and not a forged epoch.
+        // 7. `revision += 1` (`:1121`) — reaches nothing, and cannot move
+        //    identity either: `derive_candidate_id` deliberately EXCLUDES
+        //    `revision` (`lib.rs:788-789`). Only
+        //    `commit_lineage_merge_receipt` commits an advanced revision, and
+        //    this arm skips it, so the next pass restores the survivor at its
+        //    last committed revision and re-derives it.
+        // 8. `updated_at` (`:1122`) — the same fate: a wall-clock stamp into
+        //    the candidate, likewise excluded from the identity digest
+        //    (`lib.rs:788`), and likewise committed only by the receipt this
+        //    arm does not write.
+        // 9. the `lineage_digest` recompute (`:1123-1124`) — unchanged, because
+        //    it is taken over the union, and per (1) and (2) the union IS the
+        //    survivor's own lineage. It is in any case never accepted from a
+        //    caller: `into_entry` recomputes it from the candidate's own refs
+        //    (`:227-245`).
+        //
+        // So none of the nine leaves DURABLE CONSEQUENCE, and that is the whole
+        // reason this arm skips rather than refuses. The durable artifact of
+        // such a pass is the candidate's own row, which is committed below
+        // under its own stable handle.
         (
             AdmitOutcome::Merged {
                 absorbed_candidate_id,
