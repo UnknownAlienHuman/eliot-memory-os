@@ -304,7 +304,8 @@ use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_
 #[cfg(windows)]
 use daemon_supervision::{
     DaemonSupervisionContour, DaemonSupervisionProgressState, EliotdLiveReceiptDisposition,
-    classify_eliotd_live_receipt_transition,
+    classify_eliotd_live_receipt_transition, daemon_refuses_replacement,
+    daemon_restart_refusal_reason,
 };
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
