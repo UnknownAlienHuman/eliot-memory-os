@@ -56,20 +56,20 @@ fn record_live_receipt_context_field(context: &tracing::Span, field: &'static st
     context.record(field, value.text());
 }
 
-/// Builds a live-receipt context from the exact process receipt binding.
+/// Records only validated original receipt fields on the caller's shared span.
 #[cfg(windows)]
-fn process_receipt_context(process: &ProcessStartReceipt) -> tracing::Span {
+fn record_process_receipt_context(context: &tracing::Span, process: &ProcessStartReceipt) {
     if process.validate().is_err() {
-        return super::kernel_diagnostics::operation_context(None, None, None, None);
+        return;
     }
     let generation = process.accepted_generation().get().to_string();
     let epoch_digest = process.binding().state_fence().canonical_epoch_digest();
-    super::kernel_diagnostics::operation_context(
-        Some(process.operation_id().as_str()),
-        Some(&generation),
-        epoch_digest.as_deref(),
-        epoch_digest.as_deref(),
-    )
+    record_live_receipt_context_field(context, "operation", process.operation_id().as_str());
+    record_live_receipt_context_field(context, "generation", &generation);
+    if let Some(epoch) = epoch_digest.as_deref() {
+        record_live_receipt_context_field(context, "state_fence", epoch);
+        record_live_receipt_context_field(context, "authority_epoch", epoch);
+    }
 }
 
 /// Maps one live-receipt/readiness failure to its stable diagnostic code.
@@ -121,8 +121,9 @@ impl KernelComposition {
         ready: &EliotdLiveReadyEvidence,
         supervision_contour: &DaemonSupervisionContour,
         supervision_successor: Option<&SupervisionLeaseSnapshot>,
+        context: &tracing::Span,
     ) -> Result<EliotdLiveReceipt, KernelServiceError> {
-        let context = process_receipt_context(process);
+        record_process_receipt_context(context, process);
         // F-LOG-KERNEL-3 (#901): receipt publication boundary. Requested,
         // published, and validated stay distinct; an exact replay is read
         // back, not republished; exactly one terminal is emitted per failed
@@ -130,7 +131,7 @@ impl KernelComposition {
         observe_live_receipt(
             "kernel.live_receipt.publication_requested",
             "attempt",
-            &context,
+            context,
         );
         match self.publish_eliotd_live_receipt_inner(
             launch,
@@ -138,10 +139,10 @@ impl KernelComposition {
             ready,
             supervision_contour,
             supervision_successor,
-            &context,
+            context,
         ) {
             Ok(receipt) => {
-                observe_live_receipt("kernel.live_receipt.published", "success", &context);
+                observe_live_receipt("kernel.live_receipt.published", "success", context);
                 // Issue #1837: durable audit evidence for receipt issuance.
                 self.audit_observe(AuditEventDraft::receipt_live_published(
                     process,
@@ -156,11 +157,11 @@ impl KernelComposition {
                 observe_live_receipt(
                     "kernel.live_receipt.publication_rejected",
                     "fenced",
-                    &context,
+                    context,
                 );
                 super::kernel_diagnostics::observe_terminal_error_in_context(
                     live_receipt_terminal_code(&error),
-                    &context,
+                    context,
                 );
                 Err(error)
             }
@@ -470,6 +471,8 @@ impl KernelComposition {
     #[cfg(windows)]
     pub(crate) async fn validated_authenticated_daemon_ready_inputs(
         &self,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<(EliotdLaunchDescriptor, ProcessStartReceipt), KernelServiceError> {
         let launch = self
             .active_daemon_launch()?
@@ -481,8 +484,13 @@ impl KernelComposition {
             .receipt
             .clone()
             .ok_or(KernelServiceError::ReadinessNotProven)?;
-        self.validate_daemon_process_readiness(&launch, &receipt)
-            .await?;
+        if let Err(error) = self
+            .validate_daemon_process_readiness_in_context(&launch, &receipt, context, true)
+            .await
+        {
+            *terminal_owned = true;
+            return Err(error);
+        }
         Ok((launch, receipt))
     }
 
@@ -497,23 +505,14 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    pub(crate) async fn validate_daemon_process_readiness(
-        &self,
-        launch: &EliotdLaunchDescriptor,
-        receipt: &ProcessStartReceipt,
-    ) -> Result<(), KernelServiceError> {
-        let context = process_receipt_context(receipt);
-        self.validate_daemon_process_readiness_in_context(launch, receipt, &context)
-            .await
-    }
-
-    #[cfg(windows)]
     pub(crate) async fn validate_daemon_process_readiness_in_context(
         &self,
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
         context: &tracing::Span,
+        emit_terminal: bool,
     ) -> Result<(), KernelServiceError> {
+        record_process_receipt_context(context, receipt);
         // F-LOG-KERNEL-3 (#901): readiness boundary. A live OS handle is not
         // readiness; exactly one terminal is emitted per failed validation.
         observe_live_receipt(
@@ -531,10 +530,12 @@ impl KernelComposition {
             }
             Err(error) => {
                 observe_live_receipt("kernel.live_receipt.readiness_rejected", "fenced", context);
-                super::kernel_diagnostics::observe_terminal_error_in_context(
-                    live_receipt_terminal_code(&error),
-                    context,
-                );
+                if emit_terminal {
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        live_receipt_terminal_code(&error),
+                        context,
+                    );
+                }
                 Err(error)
             }
         }
@@ -862,7 +863,12 @@ impl KernelComposition {
                 .active_daemon_launch()?
                 .ok_or(KernelServiceError::ReadinessNotProven)?;
             if let Err(error) = self
-                .validate_daemon_process_readiness_in_context(&launch, &daemon_receipt, context)
+                .validate_daemon_process_readiness_in_context(
+                    &launch,
+                    &daemon_receipt,
+                    context,
+                    true,
+                )
                 .await
             {
                 *terminal_owned = true;

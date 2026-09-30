@@ -21,6 +21,7 @@
 //! its public API while the control-plane lifecycle gateway has a bounded home.
 
 use super::*;
+use tracing::Instrument;
 
 /// F-LOG-KERNEL-4 (#903): control-plane boundary observations.
 ///
@@ -175,25 +176,32 @@ impl KernelComposition {
         &self,
         command: KernelControlCommand,
     ) -> Result<KernelServiceState, KernelServiceError> {
-        self.apply_control_with_terminal(command, true)
+        let context = super::kernel_diagnostics::operation_context(None, None, None, None);
+        self.apply_control_with_terminal(command, true, &context)
     }
 
     fn apply_control_with_terminal(
         &self,
         command: KernelControlCommand,
         emit_terminal: bool,
+        context: &tracing::Span,
     ) -> Result<KernelServiceState, KernelServiceError> {
-        observe_control("kernel.control.transition_requested", "attempt");
+        observe_control_in_context("kernel.control.transition_requested", "attempt", context);
         match self.apply_control_inner(command) {
             Ok(state) => {
-                observe_control("kernel.control.transition_committed", "success");
+                observe_control_in_context(
+                    "kernel.control.transition_committed",
+                    "success",
+                    context,
+                );
                 Ok(state)
             }
             Err(error) => {
-                observe_control("kernel.control.transition_failed", "rejected");
+                observe_control_in_context("kernel.control.transition_failed", "rejected", context);
                 if emit_terminal {
-                    super::kernel_diagnostics::observe_terminal_error(
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
                         control_transition_terminal_code(&error),
+                        context,
                     );
                 }
                 Err(error)
@@ -250,6 +258,7 @@ impl KernelComposition {
         );
         observe_control_in_context("kernel.control.request_received", "attempt", &context);
         match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence, &context))
+            .instrument(context.clone())
             .await
         {
             Ok(response) => {
@@ -898,7 +907,7 @@ impl KernelComposition {
                 .launch_eliotd_in_context(context)
                 .await
                 .map_err(|_| ControlRequestFailure::TerminalOwned(TransportError::SessionFenced))?;
-            self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
+            self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout, context)
                 .await
                 .map_err(|_| TransportError::SessionFenced)?;
         }
@@ -953,7 +962,7 @@ impl KernelComposition {
                     self.revoke_runtime_lease(&query.state_fence, &query.lease_id)?;
                 }
                 command => {
-                    self.apply_control_with_terminal(command.clone(), false)
+                    self.apply_control_with_terminal(command.clone(), false, context)
                         .map_err(ControlRequestFailure::Transition)?;
                 }
             }

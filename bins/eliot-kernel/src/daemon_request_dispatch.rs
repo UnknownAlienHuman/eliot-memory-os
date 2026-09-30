@@ -12,6 +12,7 @@
 //! dispatch convention; the new Store carriers below are explicitly typed.
 
 use super::*;
+use tracing::Instrument;
 #[path = "store_receipt_dispatch.rs"]
 mod store_receipt_dispatch;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2940,8 +2941,15 @@ impl KernelComposition {
         payload: serde_json::Value,
         request_identity: Option<RequestIdentity>,
     ) -> Result<Frame, TransportError> {
-        observe_daemon_request("kernel.daemon_request_received", "attempt");
-        observe_daemon_operation(trusted_daemon_operation(operation), "received");
+        let context = super::kernel_diagnostics::operation_context(
+            Some(request_id.as_str()),
+            None,
+            None,
+            None,
+        );
+        context.in_scope(|| observe_daemon_request("kernel.daemon_request_received", "attempt"));
+        context
+            .in_scope(|| observe_daemon_operation(trusted_daemon_operation(operation), "received"));
         let mut subordinate_terminal_emitted = false;
         let result = Box::pin(self.execute_daemon_request_inner(
             session,
@@ -2951,13 +2959,22 @@ impl KernelComposition {
             request_identity.as_ref(),
             &mut subordinate_terminal_emitted,
         ))
+        .instrument(context.clone())
         .await;
         match &result {
             Ok(_) => {
-                observe_daemon_request("kernel.daemon_request_validated", "success");
-                observe_daemon_request("kernel.daemon_request_admitted", "success");
-                observe_daemon_operation(trusted_daemon_operation(operation), "dispatched");
-                observe_daemon_request("kernel.daemon_response_prepared", "success");
+                context.in_scope(|| {
+                    observe_daemon_request("kernel.daemon_request_validated", "success")
+                });
+                context.in_scope(|| {
+                    observe_daemon_request("kernel.daemon_request_admitted", "success")
+                });
+                context.in_scope(|| {
+                    observe_daemon_operation(trusted_daemon_operation(operation), "dispatched")
+                });
+                context.in_scope(|| {
+                    observe_daemon_request("kernel.daemon_response_prepared", "success")
+                });
                 // F-LOG-KERNEL-1 (#897 W3): prepared, delivered and unknown
                 // are three independent records. `delivered` marks the reply
                 // value delivered to the immediate caller at this dispatch
@@ -2966,19 +2983,31 @@ impl KernelComposition {
                 // `send_checked` write (`front_door_driver.rs`, outside #897
                 // scope), so the post-handoff transport outcome stays
                 // `unknown` at this boundary.
-                observe_daemon_request("kernel.daemon_response_delivered", "success");
-                observe_daemon_request("kernel.daemon_response_unknown", "unknown");
-                observe_daemon_request("kernel.daemon_request_cleanup", "complete");
+                context.in_scope(|| {
+                    observe_daemon_request("kernel.daemon_response_delivered", "success")
+                });
+                context.in_scope(|| {
+                    observe_daemon_request("kernel.daemon_response_unknown", "unknown")
+                });
+                context.in_scope(|| {
+                    observe_daemon_request("kernel.daemon_request_cleanup", "complete")
+                });
             }
             Err(error) => {
-                observe_daemon_request("kernel.daemon_request_validated", "fenced");
-                observe_daemon_operation(trusted_daemon_operation(operation), "fenced");
+                context.in_scope(|| {
+                    observe_daemon_request("kernel.daemon_request_validated", "fenced")
+                });
+                context.in_scope(|| {
+                    observe_daemon_operation(trusted_daemon_operation(operation), "fenced")
+                });
                 if matches!(error, TransportError::Cancelled) {
                     // F-LOG-KERNEL-1 (#897 W3): cancellation observed as the
                     // terminal disposition, distinct from the cancellation
                     // request (`kernel.daemon_cancel_requested`). Info only;
                     // the terminal below stays the single designated terminal.
-                    observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
+                    context.in_scope(|| {
+                        observe_daemon_request("kernel.daemon_cancel_observed", "cancelled")
+                    });
                 }
                 // F-LOG-KERNEL-1 (#897 T20): a failed receipt sub-dispatch
                 // already owns that operation's single designated terminal,
@@ -2988,9 +3017,13 @@ impl KernelComposition {
                 // terminalise here: exactly one terminal either way. The
                 // fenced observations above stay unconditional.
                 if !subordinate_terminal_emitted {
-                    super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        daemon_terminal_code(error),
+                        &context,
+                    );
                 }
-                observe_daemon_request("kernel.daemon_request_cleanup", "fenced");
+                context
+                    .in_scope(|| observe_daemon_request("kernel.daemon_request_cleanup", "fenced"));
             }
         }
         result
@@ -3039,6 +3072,7 @@ impl KernelComposition {
         request_identity: Option<&RequestIdentity>,
         subordinate_terminal_emitted: &mut bool,
     ) -> Result<Frame, TransportError> {
+        let context = tracing::Span::current();
         #[cfg(windows)]
         if operation == USER_AUTOMATION_OPERATOR_OPERATION {
             // The closed UserAutomation operator vocabulary is authenticated by
@@ -3122,11 +3156,19 @@ impl KernelComposition {
                 #[cfg(windows)]
                 let ready_supervision: Option<serde_json::Value> = {
                     let (launch, process) = self
-                        .validated_authenticated_daemon_ready_inputs()
+                        .validated_authenticated_daemon_ready_inputs(
+                            &context,
+                            subordinate_terminal_emitted,
+                        )
                         .await
                         .map_err(|_| TransportError::SessionFenced)?;
                     let (contour, snapshot) = self
-                        .establish_daemon_supervision(session, &process)
+                        .establish_daemon_supervision(
+                            session,
+                            &process,
+                            &context,
+                            subordinate_terminal_emitted,
+                        )
                         .map_err(|_| TransportError::SessionFenced)?;
                     if snapshot.record.lease_id.as_str() != contour.incarnation.supervision_lease_id
                     {
@@ -3163,8 +3205,13 @@ impl KernelComposition {
                             state.supervision_expired = false;
                         }
                     }
-                    self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, None)
-                        .map_err(|_| TransportError::SessionFenced)?;
+                    self.publish_eliotd_live_receipt(
+                        &launch, &process, &ready, &contour, None, &context,
+                    )
+                    .map_err(|_| {
+                        *subordinate_terminal_emitted = true;
+                        TransportError::SessionFenced
+                    })?;
                     let supervision = Self::daemon_ready_supervision_bundle(&contour, &snapshot)
                         .map_err(|_| TransportError::SessionFenced)?;
                     Some(supervision)
@@ -3187,12 +3234,22 @@ impl KernelComposition {
                     })
             }
             "origin_challenge_issue" => {
-                self.origin_challenge_issue_operation(session, payload.clone())
-                    .await
+                self.origin_challenge_issue_operation(
+                    session,
+                    payload.clone(),
+                    &context,
+                    subordinate_terminal_emitted,
+                )
+                .await
             }
             "origin_control_decide" => {
-                self.origin_control_decide_operation(session, payload.clone())
-                    .await
+                self.origin_control_decide_operation(
+                    session,
+                    payload.clone(),
+                    &context,
+                    subordinate_terminal_emitted,
+                )
+                .await
             }
             "origin_grant_reconcile" => {
                 self.origin_grant_reconcile_operation(session, payload.clone())
@@ -3326,6 +3383,7 @@ impl KernelComposition {
                 {
                     self.daemon_supervision_progress_operation(
                         payload.clone(),
+                        &context,
                         subordinate_terminal_emitted,
                     )
                 }
@@ -4486,8 +4544,13 @@ impl KernelComposition {
                 }
             }
             "publish_wasm_dispatch_bundle" => {
-                self.wasm_dispatch_bundle_operation(session, payload.clone())
-                    .await
+                self.wasm_dispatch_bundle_operation(
+                    session,
+                    payload.clone(),
+                    &context,
+                    subordinate_terminal_emitted,
+                )
+                .await
             }
             "bind_notify_launch_grant" => {
                 self.notify_launch_grant_operation(session, payload.clone())
@@ -4751,6 +4814,7 @@ impl KernelComposition {
     fn daemon_supervision_progress_operation(
         &self,
         payload: serde_json::Value,
+        context: &tracing::Span,
         subordinate_terminal_emitted: &mut bool,
     ) -> Result<serde_json::Value, TransportError> {
         let request_value = match payload {
@@ -4764,7 +4828,7 @@ impl KernelComposition {
         request
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        let context = daemon_progress_operation_context(&request);
+        record_daemon_progress_operation_context(context, &request);
         let lease_id = request.observation.lease_id.clone();
         let (contour, process, ready, launch, mut progress) = {
             let mut state = self
@@ -4808,7 +4872,7 @@ impl KernelComposition {
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             unix_ms(),
             artifact,
-            &context,
+            context,
             &mut child_terminal_owned,
         );
         let (snapshot, decision, receipt) = match renewal {
@@ -4829,15 +4893,36 @@ impl KernelComposition {
                 if child_terminal_owned {
                     *subordinate_terminal_emitted = true;
                 }
-                self.retain_supervision_progress(progress, None, None)?;
+                self.retain_supervision_progress(progress, None, None)
+                    .inspect_err(|_| {
+                        if child_terminal_owned {
+                            tracing::warn!(
+                                target: super::kernel_diagnostics::KERNEL_DIAGNOSTICS_TARGET,
+                                parent: context,
+                                event = "kernel.supervision.progress_cleanup_refused",
+                                outcome = "unavailable",
+                                "cleanup failed after an already-owned operation terminal"
+                            );
+                        }
+                    })?;
                 return Err(TransportError::SessionFenced);
             }
         };
         self.retain_supervision_progress(progress, Some(request.observation.clone()), Some(false))?;
         let receipt = if decision.outcome == DaemonSupervisionRenewalOutcome::Renewed {
             let published = self
-                .publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&snapshot))
-                .map_err(|_| TransportError::SessionFenced)?;
+                .publish_eliotd_live_receipt(
+                    &launch,
+                    &process,
+                    &ready,
+                    &contour,
+                    Some(&snapshot),
+                    context,
+                )
+                .map_err(|_| {
+                    *subordinate_terminal_emitted = true;
+                    TransportError::SessionFenced
+                })?;
             let live_sha256 = sha256_hex(
                 &canonical_json_bytes(&published).map_err(|_| TransportError::SessionFenced)?,
             );
@@ -8051,6 +8136,8 @@ impl KernelComposition {
         &self,
         session: &Session,
         payload: serde_json::Value,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: OriginChallengeIssueOperation =
             serde_json::from_value(without_daemon_routing_key(payload)?)
@@ -8063,9 +8150,12 @@ impl KernelComposition {
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
         let view = gateway
-            .inspect(&owner, operation.operation_id.clone())
+            .inspect_in_context(&owner, operation.operation_id.clone(), context)
             .await
-            .map_err(|_| TransportError::SessionFenced)?;
+            .map_err(|_| {
+                *terminal_owned = true;
+                TransportError::SessionFenced
+            })?;
         validate_origin_inspection(&view, &operation.operation_id, &operation.request)?;
         let challenge = gateway
             .issue_origin_challenge(&operation.request, operation.expires_at_unix_ms)
@@ -8090,6 +8180,8 @@ impl KernelComposition {
         &self,
         session: &Session,
         payload: serde_json::Value,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: OriginControlDecideOperation =
             serde_json::from_value(without_daemon_routing_key(payload)?)
@@ -8123,9 +8215,12 @@ impl KernelComposition {
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
         let view = gateway
-            .inspect(&owner, operation.operation_id.clone())
+            .inspect_in_context(&owner, operation.operation_id.clone(), context)
             .await
-            .map_err(|_| TransportError::SessionFenced)?;
+            .map_err(|_| {
+                *terminal_owned = true;
+                TransportError::SessionFenced
+            })?;
         validate_origin_inspection(&view, &operation.operation_id, presentation.request())?;
         let grant = gateway
             .decide_origin_control(&presentation)
@@ -8147,15 +8242,23 @@ impl KernelComposition {
             &grant,
         )?;
         let cancelled = gateway
-            .cancel_with_origin_grant(&owner, operation.operation_id.clone(), &grant)
+            .cancel_with_origin_grant_in_context(
+                &owner,
+                operation.operation_id.clone(),
+                Some(&grant),
+                context,
+            )
             .await
-            .map_err(|_| TransportError::SessionFenced)?;
+            .map_err(|_| {
+                *terminal_owned = true;
+                TransportError::SessionFenced
+            })?;
         // CHILD-1/CHILD-2 (#1918): closing the kill produces the
         // descendant-closure receipt as durable audit evidence. The kill
         // receipt stays authoritative: a close fault keeps its own terminal
         // diagnostic from the close boundary and never loses the kill.
         if let Ok(receipt) = gateway
-            .close_registered_descendant(&owner, operation.operation_id.clone())
+            .close_registered_descendant_in_context(&owner, operation.operation_id.clone(), context)
             .await
         {
             self.audit_observe(AuditEventDraft::descendant_closure(&receipt));
@@ -10065,6 +10168,8 @@ impl KernelComposition {
         &self,
         session: &Session,
         payload: serde_json::Value,
+        context: &tracing::Span,
+        subordinate_terminal_emitted: &mut bool,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: WasmDispatchBundleOperation =
             serde_json::from_value(without_daemon_routing_key(payload)?)
@@ -10257,6 +10362,8 @@ impl KernelComposition {
                 host_executable_path.as_str(),
                 host_artifact_digest.as_str(),
                 install_dir,
+                context,
+                subordinate_terminal_emitted,
             )
             .await?;
         Ok(serde_json::json!({
@@ -10308,6 +10415,8 @@ impl KernelComposition {
         host_executable_path: &str,
         host_artifact_digest: &str,
         install_dir: &std::path::Path,
+        context: &tracing::Span,
+        subordinate_terminal_emitted: &mut bool,
     ) -> Result<ProcessStartReceipt, TransportError> {
         let material = &bundle.material;
         let operation_id = OperationId::new(material.operation_id.clone())
@@ -10380,9 +10489,12 @@ impl KernelComposition {
             .retain_process_path_proof(&admission)
             .map_err(|_| TransportError::SessionFenced)?;
         gateway
-            .start(&owner, admission, proof, outer_binding)
+            .start_in_context(&owner, admission, proof, outer_binding, context)
             .await
-            .map_err(|_| TransportError::SessionFenced)
+            .map_err(|_| {
+                *subordinate_terminal_emitted = true;
+                TransportError::SessionFenced
+            })
     }
 
     /// Demand-start fails closed off the Windows process contour: the
@@ -10395,6 +10507,8 @@ impl KernelComposition {
         _host_executable_path: &str,
         _host_artifact_digest: &str,
         _install_dir: &std::path::Path,
+        _context: &tracing::Span,
+        _subordinate_terminal_emitted: &mut bool,
     ) -> Result<ProcessStartReceipt, TransportError> {
         Err(TransportError::SessionFenced)
     }
