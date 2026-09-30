@@ -132,7 +132,7 @@ impl SelectorMember {
 ///
 /// Every variant names the exact missing or unbound owner identity. None of
 /// them carries a substitute value, and none is reachable after a read starts.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum ReconstructionPrerequisite {
     /// The claimed pair is not the admitted `eliot.query` `ContextReconstruction`
     /// shape.
