@@ -17,6 +17,13 @@
 //! dispatch presentation and its sealed receipt
 //! ([`ProviderAdmission::bind_admitted_dispatch`]); carrying them is not the
 //! same as being bound to this operation.
+//!
+//! The same reasoning applies to the bounded submit projection the provider is
+//! actually given: it is a third record, not a restatement of the admission, so
+//! [`ProviderAdmission::validate_submit_binding`] re-proves the eight bound
+//! identities by value against this record before the executor is contacted.
+//! Without it the delivered digest would be identical for two operations that
+//! differ in exactly those identities.
 
 use eliot_contracts::{ContractVersion, EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::{ResearchProviderDispatch, ResearchProviderDispatchReceipt};
@@ -352,6 +359,69 @@ impl ProviderAdmission {
             || request.protocol_revision != self.protocol_revision
             || request.required_schema != self.required_schema
             || request.coverage_goal != self.coverage_goal
+        {
+            return Err(AdmissionRefusal::RequestMismatch);
+        }
+        Ok(())
+    }
+
+    /// Re-proves that a delivered submit binding carries exactly this admitted
+    /// operation's eight bound identities.
+    ///
+    /// [`ProviderAdmission::bind_admitted_dispatch`] proves this record against
+    /// the Kernel, and [`ProviderAdmission::validate_request`] proves an
+    /// exchange request against this record. Neither covers the third record in
+    /// the chain: the bounded submit projection whose canonical digest is the
+    /// value actually handed to the provider through the admitted argv. Before
+    /// this method the projection carried correlation and route only, so the
+    /// digest the provider was given was — arithmetically — the same digest for
+    /// two operations differing in artifact, config, protocol, Module Registry
+    /// evidence, generation, epoch, fence, privacy class, ceilings or
+    /// cancellation identity.
+    ///
+    /// Every field is therefore read from this record's own accessors and
+    /// compared by value, with the same comparison strength the Kernel-facing
+    /// proof uses: [`EpochId::is_same_authority`] for the exact lineage/sequence
+    /// tuple, [`fences_match_exact`] for the fence (both directions, no
+    /// one-directional `None` wildcard), and the crate's `admitted_disclosure_wire`
+    /// projection so the comparison reads the Kernel's own privacy vocabulary
+    /// rather than a second one. The two digests and the artifact digest are
+    /// compared as exact strings; no value is re-derived, defaulted or widened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionRefusal::RequestMismatch`] when any bound identity
+    /// disagrees with this record, and [`AdmissionRefusal::EpochFenceConflict`]
+    /// when the carried epoch disagrees with the carried fence authority epoch
+    /// (a binding whose own two fields contradict each other is refused before
+    /// either is compared to this record). There is no partial acceptance and no
+    /// second reason code.
+    pub fn validate_submit_binding(
+        &self,
+        binding: &crate::protocol::SubmitBinding,
+    ) -> Result<(), AdmissionRefusal> {
+        // The binding's own epoch/fence pair must be self-consistent before it
+        // is compared to this record, otherwise a binding could name one epoch
+        // and a fence admitted under another and still match on the epoch.
+        if !binding
+            .authority_epoch
+            .is_same_authority(&binding.state_fence.authority_epoch)
+        {
+            return Err(AdmissionRefusal::EpochFenceConflict);
+        }
+        if binding.operation_id != self.operation_id.as_str()
+            || binding.executable_sha256 != self.bridge.executable_sha256()
+            || binding.config_digest != self.config_digest
+            || binding.protocol_digest != self.protocol_digest
+            || binding.module_id != self.module_id
+            || binding.module_generation_id != self.module_generation_id
+            || binding.process_generation != self.process_generation.get()
+            || !binding.authority_epoch.is_same_authority(&self.epoch)
+            || !fences_match_exact(&binding.state_fence, &self.fence)
+            || binding.disclosure != admitted_disclosure_wire(self.disclosure)
+            || binding.budget_units != self.budget_units
+            || binding.deadline_ms != self.deadline_ms
+            || binding.cancellation_id != self.cancellation_id
         {
             return Err(AdmissionRefusal::RequestMismatch);
         }
