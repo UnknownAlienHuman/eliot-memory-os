@@ -119,6 +119,154 @@ pub async fn maintain_governor_authority_route_mismatch(
     Ok((revision, revoked))
 }
 
+/// Owner-issued observation bundle for one Governor authority feed pass
+/// (issue #1935 AUD1, I7.16).
+///
+/// The three inputs arrive as one named bundle threaded from live
+/// host/adapter, Watchdog, and trace observation owners; they are never
+/// synthesized here. On this base no production owner issues the bundle yet
+/// (STITCH: a verified [`IntegrationCoverageProfile`] for the exact active
+/// host/adapter fingerprint, typed [`WatchdogEvidence`], and
+/// [`TraceFreshness`] each need a production observation owner — the coverage
+/// crate's `candidate`/`verify` constructors are reached only by tests), so
+/// the daemon driver presents `None` and the first publish stays pending
+/// while every Material/Critical gate refuses closed.
+pub struct GovernorAuthorityObservation<'a> {
+    /// Exact active-fingerprint coverage as verified production observation.
+    pub coverage: &'a IntegrationCoverageProfile,
+    /// Watchdog supervision evidence: an input, never a substitute grade.
+    pub watchdog: &'a WatchdogEvidence,
+    /// Trace freshness at derivation time.
+    pub trace: TraceFreshness,
+}
+
+/// Typed outcome of one daemon-side Governor authority drive pass (issue
+/// #1935 AUD1).
+///
+/// Skips are normal steady-state results, never errors: with no
+/// owner-issued observation there is nothing to publish, with no recorded
+/// baseline there is no route to compare, and an unchanged route
+/// re-publishes nothing. Only a Kernel-recorded publish advances the
+/// revision the gates read.
+pub enum GovernorAuthorityDriveOutcome {
+    /// The feed derived and the Kernel recorded `revision`.
+    FeedPublished { revision: u64 },
+    /// The route mismatch derived and the Kernel recorded `revision`,
+    /// revoking every capability id in `revoked`.
+    RouteMismatchPublished { revision: u64, revoked: Vec<String> },
+    /// No owner-issued observation exists, so nothing was published.
+    SkippedNoObservation,
+    /// No revision was recorded yet, so there is no route to compare.
+    SkippedNoBaseline,
+    /// The live route still names the recorded fingerprint.
+    SkippedNoChange,
+}
+
+/// Daemon-side driver for the single live Governor-owned derivation instance
+/// (issue #1935 AUD1, I7.16).
+///
+/// Retains the exact fingerprint and revision of the last Kernel-recorded
+/// publish, so a later live route observation that no longer names that
+/// fingerprint drives the degraded mismatch revision that revokes everything
+/// issued under the old one. The driver holds no observation of its own: the
+/// feed arm publishes only caller-presented owner-issued observation, and the
+/// mismatch arm compares only the recorded baseline against the
+/// caller-presented live route. Constructed once per daemon run loop and
+/// travels with its drive flight, exactly like the owner-feed trigger.
+#[derive(Default)]
+pub struct GovernorAuthorityDriver {
+    last_published: Option<(String, u64)>,
+}
+
+impl GovernorAuthorityDriver {
+    /// Starts with no recorded publish: nothing is authorized until the first
+    /// feed publish records, and no route comparison runs until then.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drives one feed pass through the designated
+    /// [`maintain_governor_authority_feed`] driver and records its baseline.
+    ///
+    /// With no owner-issued observation the pass skips without touching the
+    /// composition or the Kernel: the first publish stays pending and the
+    /// gates keep refusing closed. On a recorded publish the baseline becomes
+    /// the presented coverage fingerprint at the recorded revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Owner`] when the presented coverage is not
+    /// verified production observation or an input is invalid, and
+    /// [`CompositionError::Recovery`] on transport failure or when the
+    /// receipt disagrees with the projected revision.
+    pub async fn drive_feed(
+        &mut self,
+        composition: &mut DaemonComposition,
+        kernel: &Arc<DaemonKernelClient>,
+        observation: Option<GovernorAuthorityObservation<'_>>,
+    ) -> Result<GovernorAuthorityDriveOutcome, CompositionError> {
+        let Some(observation) = observation else {
+            return Ok(GovernorAuthorityDriveOutcome::SkippedNoObservation);
+        };
+        let revision = maintain_governor_authority_feed(
+            composition,
+            kernel,
+            observation.coverage,
+            observation.watchdog,
+            observation.trace,
+        )
+        .await?;
+        self.last_published = Some((observation.coverage.fingerprint.clone(), revision));
+        Ok(GovernorAuthorityDriveOutcome::FeedPublished { revision })
+    }
+
+    /// Drives one route-mismatch pass through the designated
+    /// [`maintain_governor_authority_route_mismatch`] driver and records its
+    /// baseline.
+    ///
+    /// `live_route` is the caller-observed active route identity; the daemon
+    /// runtime presents the validated Kernel-issued owner session binding
+    /// (`DaemonKernelClient::owner_session_facts`), never a minted value.
+    /// With no live route the pass skips; with no recorded baseline there is
+    /// nothing to compare; with the live route still naming the recorded
+    /// fingerprint nothing re-publishes. Otherwise the degraded revision
+    /// publishes and the baseline advances to the observed route at the new
+    /// revision, so the lost guarantee revokes dependent authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Owner`] when either fingerprint is blank,
+    /// control-carrying, or the pair names no mismatch, and
+    /// [`CompositionError::Recovery`] on transport failure or when the
+    /// receipt disagrees with the projected revision.
+    pub async fn drive_route_mismatch(
+        &mut self,
+        composition: &mut DaemonComposition,
+        kernel: &Arc<DaemonKernelClient>,
+        live_route: Option<&str>,
+    ) -> Result<GovernorAuthorityDriveOutcome, CompositionError> {
+        let Some(live_route) = live_route else {
+            return Ok(GovernorAuthorityDriveOutcome::SkippedNoObservation);
+        };
+        let Some((baseline_fingerprint, _)) = self.last_published.clone() else {
+            return Ok(GovernorAuthorityDriveOutcome::SkippedNoBaseline);
+        };
+        if live_route == baseline_fingerprint {
+            return Ok(GovernorAuthorityDriveOutcome::SkippedNoChange);
+        }
+        let (revision, revoked) = maintain_governor_authority_route_mismatch(
+            composition,
+            kernel,
+            &baseline_fingerprint,
+            live_route,
+        )
+        .await?;
+        self.last_published = Some((live_route.to_owned(), revision));
+        Ok(GovernorAuthorityDriveOutcome::RouteMismatchPublished { revision, revoked })
+    }
+}
+
 /// Publishes one projected revision and verifies the Kernel receipt proves
 /// that exact revision.
 async fn publish_projection(

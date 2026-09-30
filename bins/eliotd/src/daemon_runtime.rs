@@ -80,7 +80,8 @@ use eliotd::testd_terminal_completion::{
 };
 use eliotd::{
     ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
-    DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome, KernelContextReadClient,
+    DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
+    GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
     LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
     PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
     forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
@@ -1614,6 +1615,17 @@ async fn run_loop(
     let mut owner_feed_failure_guard = RepeatedFailureGuard::new();
     let mut maintenance_failure_guard = RepeatedFailureGuard::new();
     let mut health_heartbeat_failure_guard = RepeatedFailureGuard::new();
+    // Issue #1935 AUD1: sole owner of governor-authority drive state. The
+    // driver retains the recorded publish baseline across passes so a later
+    // live route observation can revoke it; it travels with its own polled
+    // flight below, exactly like the owner-feed trigger above.
+    let mut governor_authority_driver = Some(GovernorAuthorityDriver::new());
+    // Sole owner of governor-authority drive sync state. One bounded feed +
+    // route-mismatch pass is outstanding at most; the health completion branch
+    // starts it when idle and its completion branch settles it back, exactly
+    // like the other flights. No second owner and no untracked spawn exist.
+    let mut governor_authority_flight = GovernorAuthorityFlight::Idle;
+    let mut governor_authority_failure_guard = RepeatedFailureGuard::new();
     // Sole owner of TestD owner drain state (issue #325). The same tick
     // drives it independently of the other flights: one bounded drain step
     // binds pending verifier dispatches, publishes terminal verifier facts,
@@ -1677,6 +1689,8 @@ async fn run_loop(
                     &mut testd_owner_flight,
                     &mut owner_feed_flight,
                     &mut owner_feed,
+                    &mut governor_authority_flight,
+                    &mut governor_authority_driver,
                     &mut maintenance_flight,
                     &mut improvement_intake_flight,
                     &mut health_heartbeat_flight,
@@ -1816,6 +1830,16 @@ async fn run_loop(
                     &mut owner_feed_failure_guard,
                 );
             }
+            governor_authority_completion =
+                next_governor_authority_completion(&mut governor_authority_flight) =>
+            {
+                settle_governor_authority_completion(
+                    governor_authority_completion,
+                    &mut governor_authority_driver,
+                    &mut governor_authority_flight,
+                    &mut governor_authority_failure_guard,
+                );
+            }
             maintenance_guard = next_maintenance_completion(&mut maintenance_flight) => {
                 settle_maintenance_completion(
                     maintenance_guard,
@@ -1842,6 +1866,18 @@ async fn run_loop(
                     &mut owner_feed,
                     &mut owner_feed_flight,
                     &mut owner_feed_failure_guard,
+                );
+                // Issue #1935 AUD1: drive the Governor authority feed after the
+                // owner-feed exchange starts, on the same supervision cadence.
+                // The pass publishes only owner-issued observation and revokes
+                // on a proven route change; it never gates readiness and never
+                // fails the daemon.
+                maybe_start_governor_authority_drive(
+                    &kernel,
+                    &composition,
+                    &mut governor_authority_driver,
+                    &mut governor_authority_flight,
+                    &mut governor_authority_failure_guard,
                 );
             }
             _ = cadence.health_heartbeat.tick() => {
@@ -2736,6 +2772,8 @@ async fn drain_flights_on_shutdown(
     testd_owner_flight: &mut TestdOwnerFlight,
     owner_feed_flight: &mut OwnerFeedFlight,
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
+    governor_authority_flight: &mut GovernorAuthorityFlight,
+    governor_authority_driver: &mut Option<eliotd::GovernorAuthorityDriver>,
     maintenance_flight: &mut MaintenanceFlight,
     improvement_intake_flight: &mut ImprovementIntakeFlight,
     health_heartbeat_flight: &mut HealthHeartbeatFlight,
@@ -2759,6 +2797,7 @@ async fn drain_flights_on_shutdown(
             && matches!(observe_flight, ObserveFlight::Idle)
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
+            && matches!(governor_authority_flight, GovernorAuthorityFlight::Idle)
             && matches!(maintenance_flight, MaintenanceFlight::Idle)
             && matches!(improvement_intake_flight, ImprovementIntakeFlight::Idle)
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
@@ -2847,6 +2886,16 @@ async fn drain_flights_on_shutdown(
                     &mut shutdown_failure_guard,
                 );
             }
+            governor_authority_completion =
+                next_governor_authority_completion(governor_authority_flight) =>
+            {
+                settle_governor_authority_completion(
+                    governor_authority_completion,
+                    governor_authority_driver,
+                    governor_authority_flight,
+                    &mut shutdown_failure_guard,
+                );
+            }
             maintenance_guard = next_maintenance_completion(maintenance_flight) => {
                 settle_maintenance_completion(
                     maintenance_guard,
@@ -2882,6 +2931,7 @@ async fn drain_flights_on_shutdown(
                 *observe_flight = ObserveFlight::Idle;
                 *testd_owner_flight = TestdOwnerFlight::Idle;
                 *owner_feed_flight = OwnerFeedFlight::Idle;
+                *governor_authority_flight = GovernorAuthorityFlight::Idle;
                 *maintenance_flight = MaintenanceFlight::Idle;
                 *improvement_intake_flight = ImprovementIntakeFlight::Idle;
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
@@ -3090,6 +3140,182 @@ async fn run_owner_feed_sync(
         }
     }
     trigger
+}
+
+/// The governor-authority driver travels with its in-flight drive step and
+/// returns on completion, so exactly one driver exists across passes: the
+/// recorded publish baseline survives every pass and no second baseline can
+/// exist. Mirrors [`OwnerFeedFlight`].
+struct GovernorAuthorityFlightState {
+    future:
+        Pin<Box<dyn std::future::Future<Output = (GovernorAuthorityDriver, RepeatedFailureGuard)>>>,
+}
+
+/// Sole owner of governor-authority drive state in `run_loop`, mirroring
+/// [`OwnerFeedFlight`]. `Idle` means no drive work is outstanding; `InFlight`
+/// holds the one pending bounded pass. No second owner and no second
+/// concurrent drive exist.
+enum GovernorAuthorityFlight {
+    Idle,
+    InFlight(GovernorAuthorityFlightState),
+}
+
+/// Starts one Governor authority drive pass (issue #1935 AUD1) on its own
+/// polled flight. The pass keeps its composition borrow inside the flight
+/// future (issue #2559): the bounded feed-plus-route-mismatch exchange the
+/// designated drivers perform runs there rather than awaited inside the
+/// health tick, so health and shutdown stay pollable while it is outstanding.
+/// The pass runs at most once per heartbeat: an in-flight drive is never
+/// replaced. The stream's repeated-failure guard travels with the future
+/// exactly like the owner-feed trigger (#740 A14), so a standing drive
+/// failure cannot emit unbounded records.
+fn maybe_start_governor_authority_drive(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    driver: &mut Option<GovernorAuthorityDriver>,
+    flight: &mut GovernorAuthorityFlight,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    if !matches!(flight, GovernorAuthorityFlight::Idle) {
+        return;
+    }
+    let Some(driver) = driver.take() else {
+        return;
+    };
+    let kernel_clone = Arc::clone(kernel);
+    let composition_clone = Arc::clone(composition);
+    let mut failure_guard = std::mem::replace(failure_guard, RepeatedFailureGuard::new());
+    *flight = GovernorAuthorityFlight::InFlight(GovernorAuthorityFlightState {
+        future: Box::pin(async move {
+            let driver = run_governor_authority_drive(
+                &kernel_clone,
+                composition_clone,
+                driver,
+                &mut failure_guard,
+            )
+            .await;
+            (driver, failure_guard)
+        }),
+    });
+}
+
+/// Polls the one in-flight governor-authority step, pending forever while idle
+/// so health and shutdown stay pollable with no step outstanding.
+async fn next_governor_authority_completion(
+    flight: &mut GovernorAuthorityFlight,
+) -> (GovernorAuthorityDriver, RepeatedFailureGuard) {
+    match flight {
+        GovernorAuthorityFlight::Idle => {
+            std::future::pending::<(GovernorAuthorityDriver, RepeatedFailureGuard)>().await
+        }
+        GovernorAuthorityFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed governor-authority drive step back to idle,
+/// returning its driver for the next pass. Every outcome idles until the next
+/// heartbeat: a recorded publish already advanced the Kernel revision, and a
+/// skipped or refused pass retries on a later tick. The drive never gates
+/// readiness and never fails the daemon.
+fn settle_governor_authority_completion(
+    completion: (GovernorAuthorityDriver, RepeatedFailureGuard),
+    driver: &mut Option<GovernorAuthorityDriver>,
+    flight: &mut GovernorAuthorityFlight,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    *driver = Some(completion.0);
+    *failure_guard = completion.1;
+    *flight = GovernorAuthorityFlight::Idle;
+}
+
+/// Runs one Governor authority drive pass (issue #1935 AUD1, I7.16) and
+/// records its outcome.
+///
+/// The feed arm runs first so a simultaneously arrived verified observation
+/// advances the recorded baseline before the route comparison; the mismatch
+/// arm runs last so a proven route change always has the final word and
+/// revokes dependent authority. A recorded publish emits the bound revision
+/// for diagnostics; a skipped pass stays silent exactly like the owner feed's
+/// unchanged pass; a refused pass emits a guard-gated error record and the
+/// loop continues, retrying on a later tick. The drive never gates readiness
+/// and never fails the daemon.
+///
+/// The composition borrow spans the bounded drive exchange inside this
+/// independently polled flight: the designated drivers borrow the single
+/// live Governor-owned derivation instance the composition root holds, and no
+/// second instance exists. Skipped passes perform no Kernel exchange at all.
+async fn run_governor_authority_drive(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+    mut driver: GovernorAuthorityDriver,
+    failure_guard: &mut RepeatedFailureGuard,
+) -> GovernorAuthorityDriver {
+    // The live route observation is the validated Kernel-issued owner session
+    // binding (`DaemonKernelClient::owner_session_facts`): the literal bytes
+    // the handshake validated, never a locally minted session. Absent before
+    // any validated handshake, which fails this arm closed to "no live route"
+    // rather than inventing one.
+    let live_route = kernel
+        .owner_session_facts()
+        .map(|facts| facts.session_binding().to_owned());
+    // STITCH (issue #1935 produce side): no production owner on this base
+    // issues the verified active-fingerprint coverage, Watchdog supervision
+    // evidence, or trace freshness the feed derives from — the coverage
+    // crate's `candidate`/`verify` constructors are reached only by tests —
+    // so the feed arm honestly observes nothing and skips. The first publish
+    // stays pending and every Material/Critical gate keeps refusing closed
+    // until that observation owner lands and threads its bundle through this
+    // call site.
+    let mut guard = composition.lock().await;
+    match driver.drive_feed(&mut guard, kernel, None).await {
+        Ok(GovernorAuthorityDriveOutcome::FeedPublished { revision }) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.governor_authority_published",
+                revision = revision,
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            // #740 A14: the drive retries on a later tick, so a standing
+            // refusal gates its record on this stream's guard instead of
+            // emitting unbounded repeats.
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "governor-authority-feed",
+                    &error.to_string(),
+                )
+                .emit();
+            }
+        }
+    }
+    match driver
+        .drive_route_mismatch(&mut guard, kernel, live_route.as_deref())
+        .await
+    {
+        Ok(GovernorAuthorityDriveOutcome::RouteMismatchPublished { revision, revoked }) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.governor_authority_route_mismatch_published",
+                revision = revision,
+                revoked = revoked.len(),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            // #740 A14: same guard-gated record as the feed arm above.
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "governor-authority-route-mismatch",
+                    &error.to_string(),
+                )
+                .emit();
+            }
+        }
+    }
+    driver
 }
 
 /// Starts one local-read poll step for the outbound-only poller (Implements

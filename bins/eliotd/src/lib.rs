@@ -262,6 +262,7 @@ pub use freshness_admission::{
     observed_publication, publication_serves_candidate,
 };
 pub use governor_authority_feed::{
+    GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, GovernorAuthorityObservation,
     maintain_governor_authority_feed, maintain_governor_authority_route_mismatch,
 };
 pub use governor_local_read::{
