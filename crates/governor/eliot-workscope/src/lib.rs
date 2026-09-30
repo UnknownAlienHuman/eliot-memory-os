@@ -1340,7 +1340,10 @@ impl OnboardingReadinessReceipt {
                 || evidence.task_revision != *task_revision
                 || evidence.acceptance_digest != *acceptance_digest
                 || evidence.work_scope_ref != self.scope.scope_ref
-                || self.state_fence.task_revision.map(|revision| revision.value())
+                || self
+                    .state_fence
+                    .task_revision
+                    .map(|revision| revision.value())
                     != Some(evidence.task_revision)
             {
                 return Err(WorkScopeError::BindingReceiptMismatch);
