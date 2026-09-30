@@ -2,7 +2,7 @@
 //!
 //! `I14.14` makes the active generation of a route registry state, and `I5.11`
 //! stage 8 the only transition that may change it: "commit the
-//! `canonical_store` CapabilityRouteScope cutover through Kernel Generation
+//! `canonical_store` `CapabilityRouteScope` cutover through Kernel Generation
 //! Registry". A route that has never been cut over therefore has no
 //! `GenerationCutoverOwnership` row to read, and "no committed cutover for this
 //! scope" is on its own indistinguishable from "any generation may own this
