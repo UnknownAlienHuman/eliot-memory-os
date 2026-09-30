@@ -301,9 +301,10 @@ use daemon_session_guard::caller_binding;
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
 #[cfg(windows)]
 use daemon_supervision::{
-    AdmittedDaemonRestartPolicy, DaemonSupervisionContour, DaemonSupervisionProgressState,
-    EliotdLiveReceiptDisposition, classify_eliotd_live_receipt_transition,
-    daemon_class_withholds_replacement, daemon_refuses_replacement, daemon_restart_refusal_reason,
+    AdmittedDaemonRestartPolicy, DaemonRestartRefusal, DaemonSupervisionContour,
+    DaemonSupervisionProgressState, EliotdLiveReceiptDisposition,
+    classify_eliotd_live_receipt_transition, daemon_class_withholds_replacement,
+    daemon_refuses_replacement, daemon_restart_refusal_reason,
 };
 use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
 use generation_recovery::OrsGenerationCoordinator;
@@ -598,8 +599,6 @@ const AGENT_BRIDGE_ACTIVATION_WINDOW_MS: u64 = 30_000;
 /// C4/A3). Reconsideration requires a retained typed transient result with a
 /// changed-dependency discriminator on the submit path, never the lease clock.
 const AGENT_ACTIVATION_CLAIM_LEASE_MS: u64 = 1_000;
-#[cfg(windows)]
-const ELIOTD_MAX_RECOVERY_ATTEMPTS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct KernelStoreRebindProductionBoundary;
@@ -648,8 +647,12 @@ pub struct KernelComposition {
     /// fence that generation was admitted with. `recover_eliotd` consults the
     /// shared class rule against this exact declaration on the reconciled exit
     /// evidence, and only while the retained policy digest is still bound to
-    /// the admitted generation being replaced. `None` means no versioned policy
-    /// was admitted, so the child is not automatically restarted at all.
+    /// the admitted generation being replaced. It is also the ONLY source of
+    /// this child's declared attempt threshold: a child with no admitted policy
+    /// has no declared restart budget at all, so its automatic restart is
+    /// withheld as `PolicyNotAdmitted` rather than given a synthesised
+    /// default. The budget's spent/unspent state is durable and lives in this
+    /// owner's ORS restart record, not in `daemon_recovery_attempts` below.
     /// Immutable after construction, like the launch descriptor it describes.
     #[cfg(windows)]
     daemon_restart_policy: Option<AdmittedDaemonRestartPolicy>,
@@ -690,6 +693,15 @@ pub struct KernelComposition {
     #[cfg(windows)]
     daemon_recovery_gate: tokio::sync::Mutex<()>,
     #[cfg(windows)]
+    /// Restart ordinal for this process lifetime. It names the replacement
+    /// generation and is compared against the threshold the admitted restart
+    /// policy declares; it is NOT the restart budget (I14.10, I08.12; #1682
+    /// W4). The budget decision is read from - and, at exhaustion, written to -
+    /// the owner's retained ORS restart record, keyed to the supervised child's
+    /// stable identity, so a daemon restart cannot reset the window. This
+    /// ordinal is process-local by construction and is retained only because it
+    /// is the generation input the existing launch-descriptor contract takes;
+    /// `KernelComposition::admit_daemon_restart_attempt` owns the decision.
     daemon_recovery_attempts: AtomicU64,
     #[cfg(windows)]
     store_handoff: Mutex<Option<StoreBootstrapHandoff>>,

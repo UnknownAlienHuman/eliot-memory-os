@@ -117,6 +117,18 @@ pub(crate) enum DaemonRestartRefusal {
     /// no class is read. Assembly already refuses such a value; this arm keeps
     /// the decision fail-closed if one ever reaches the replacement path.
     PolicyRejected,
+    /// This child's bounded restart budget is already recorded as spent in the
+    /// owner's durable ORS restart record, so no further automatic attempt is
+    /// admitted (I14.10, I08.12; #1682 W4/W7).
+    ///
+    /// The record is durable and is keyed to the supervised child's own stable
+    /// identity plus the admitted generation it governs, so this refusal is
+    /// read back by a RECREATED supervisor instead of being recomputed from a
+    /// counter that a daemon restart resets to zero. This is the refusal that
+    /// replaces a process-local budget: an absent record is an absence (the
+    /// budget was never recorded as spent) and is never widened into an
+    /// unlimited one.
+    RestartBudgetExhausted,
     /// The declared class does not permit a replacement for this classifiable
     /// exit under the rule's own verdict, carrying that verdict's fixed
     /// diagnostic code.
@@ -313,6 +325,32 @@ impl AdmittedDaemonRestartPolicy {
             .validate_for(&self.policy, &admitted_generation, state_fence)?;
         Ok(&self.policy)
     }
+
+    /// Returns the declared number of attempts this child may take before
+    /// automatic restart stops, only while the retained binding still proves
+    /// the exact admitted generation and state fence the caller observed.
+    ///
+    /// I14.10 makes "the declared quarantine threshold" the point at which
+    /// further automatic attempts stop, and I08.12 keeps every restart number
+    /// in the approved config and fault profile: this value is read out of the
+    /// admitted declaration and is not restated, defaulted or rounded here.
+    /// The caller that compares against it owns the count; this function owns
+    /// no counter and no window.
+    ///
+    /// A `None` policy has no declared threshold at all. It is never
+    /// substituted with a default: the absence is reported as
+    /// `DaemonRestartRefusal::PolicyNotAdmitted`, which withholds the child's
+    /// automatic restart entirely.
+    pub(crate) fn declared_attempt_threshold(
+        &self,
+        admitted_generation: ResourceGeneration,
+        state_fence: &StateFence,
+    ) -> Result<u32, RestartPolicyError> {
+        Ok(self
+            .policy_for_generation(admitted_generation, state_fence)?
+            .intensity
+            .quarantine_after_attempts)
+    }
 }
 
 /// Applies the declared restart class to one reconciled generation, and returns
@@ -381,6 +419,7 @@ pub(crate) const fn daemon_restart_refusal_reason(refusal: &DaemonRestartRefusal
             "restart_policy_not_bound_to_admitted_generation"
         }
         DaemonRestartRefusal::PolicyRejected => "restart_policy_rejected_by_contract",
+        DaemonRestartRefusal::RestartBudgetExhausted => "restart_budget_exhausted_durably",
         DaemonRestartRefusal::ClassWithholds(reason) => reason,
     }
 }
