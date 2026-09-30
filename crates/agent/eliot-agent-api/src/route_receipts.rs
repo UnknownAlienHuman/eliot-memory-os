@@ -1083,3 +1083,192 @@ impl PhysicalRouteObservationReceipt {
         }
     }
 }
+
+/// Schema identity of one versioned committed route-evidence relation
+/// (issue #2645 W5). The relation carries its version so rows admitted under
+/// an older staging predicate stay distinguishable from corrected rows; a
+/// version mismatch never silently upgrades to verified binding.
+pub const COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION: &str = "eliot-route-evidence/v1";
+
+/// Versioned validated route-evidence relation retained per execution-unit
+/// host event (issue #2645 W5).
+///
+/// Every reference is role-qualified: a fingerprint digest is route identity
+/// in exactly one role, and a receipt digest is owner identity, never route
+/// evidence by itself.
+///
+/// ```text
+/// admission_digest            owner identity: AdmittedRouteReceipt::self_digest
+///                             of the governing logical admission.
+/// requested_route_digest      logical-request identity:
+///                             route_fingerprint_digest_for of the admission's
+///                             original requested_route (never the admission
+///                             self-digest).
+/// physical_observation_digest owner identity:
+///                             PhysicalRouteObservationReceipt::self_digest of
+///                             the applicable observation; None exactly when no
+///                             observation applies yet (a valid pre-observation
+///                             event).
+/// actual_route_digest         observed-physical identity:
+///                             route_fingerprint_digest_for of the validated
+///                             observation's observed_route; None exactly when
+///                             no observation applies or the observation reports
+///                             Unobserved (absence is never synthesized from
+///                             requested/selected/admission bytes).
+/// route_state                 the validated observation's route axis
+///                             (Matched/Diverged/Unobserved); None exactly when
+///                             no observation applies.
+/// ```
+///
+/// Digests reuse the existing [`route_fingerprint_digest_for`] recipe and the
+/// existing receipt `self_digest` methods; no new hash recipe is introduced
+/// and historical columns are never reinterpreted.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedRouteEvidenceRelation {
+    /// Relation schema version; must equal
+    /// [`COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION`].
+    pub schema_version: String,
+    /// Owner-resolvable admission reference: the governing
+    /// [`AdmittedRouteReceipt::self_digest`](AdmittedRouteReceipt::self_digest).
+    pub admission_digest: LowercaseSha256,
+    /// Role-qualified requested column: [`route_fingerprint_digest_for`] of
+    /// the admission's original requested route.
+    pub requested_route_digest: LowercaseSha256,
+    /// Owner-resolvable observation reference: the applicable
+    /// [`PhysicalRouteObservationReceipt::self_digest`](PhysicalRouteObservationReceipt::self_digest);
+    /// `None` exactly when no observation applies yet.
+    pub physical_observation_digest: Option<LowercaseSha256>,
+    /// Role-qualified actual column: [`route_fingerprint_digest_for`] of the
+    /// validated observation's observed route; `None` exactly when no
+    /// observation applies or the observation reports `Unobserved`.
+    pub actual_route_digest: Option<LowercaseSha256>,
+    /// The validated observation's route axis; `None` exactly when no
+    /// observation applies.
+    pub route_state: Option<RouteObservationState>,
+}
+
+impl CommittedRouteEvidenceRelation {
+    /// Resolves the relation from validated owner material: the recorded #361
+    /// binding, the governing #369 admission, and the applicable #369
+    /// physical observation (or its explicit absence for a valid
+    /// pre-observation event).
+    ///
+    /// The admission and binding validate through their existing owners, and
+    /// a supplied observation fully validates with the existing
+    /// [`PhysicalRouteObservationReceipt::validate_against`] (which itself
+    /// runs the observation's [`PhysicalRouteObservationReceipt::validate`]
+    /// plus the exact embedded-binding, request-commitment, fence,
+    /// generation, selected-route and admission-linkage checks); the
+    /// requested column binds the admission's original requested route and
+    /// the actual column binds the observation's observed route, each
+    /// recomputed here with [`route_fingerprint_digest_for`] rather than
+    /// trusted as a caller string. Typed contract failures travel as
+    /// [`ContractError`]; digest-encoding failures as
+    /// [`ContractError::DigestMismatch`].
+    pub fn resolve(
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        physical_observation: Option<&PhysicalRouteObservationReceipt>,
+    ) -> Result<Self, ContractError> {
+        admission.validate()?;
+        binding.validate_internal()?;
+        let requested_route_digest = route_fingerprint_digest_for(&admission.requested_route)
+            .map_err(|_| ContractError::DigestMismatch)?;
+        let Some(observation) = physical_observation else {
+            return Ok(Self {
+                schema_version: COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION.to_owned(),
+                admission_digest: admission.self_digest.clone(),
+                requested_route_digest,
+                physical_observation_digest: None,
+                actual_route_digest: None,
+                route_state: None,
+            });
+        };
+        observation.validate_against(binding, admission)?;
+        let actual_route_digest = observation
+            .observed_route
+            .as_ref()
+            .map(route_fingerprint_digest_for)
+            .transpose()
+            .map_err(|_| ContractError::DigestMismatch)?;
+        Ok(Self {
+            schema_version: COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            admission_digest: admission.self_digest.clone(),
+            requested_route_digest,
+            physical_observation_digest: Some(observation.self_digest.clone()),
+            actual_route_digest,
+            route_state: Some(observation.route_state),
+        })
+    }
+
+    /// Validates relation shape: the schema version is exact, and absence is
+    /// explicit — no observation means no observation reference, no actual
+    /// digest and no route state; an `Unobserved` observation keeps its
+    /// observation reference and route state with no fabricated actual
+    /// fingerprint; `Matched`/`Diverged` carry the observed digest.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION {
+            return Err(ContractError::UnknownContractVersion);
+        }
+        match (
+            &self.physical_observation_digest,
+            &self.actual_route_digest,
+            &self.route_state,
+        ) {
+            (None, None, None) => Ok(()),
+            (Some(_), actual, Some(state)) => {
+                let expects_actual = matches!(
+                    *state,
+                    RouteObservationState::Matched | RouteObservationState::Diverged
+                );
+                if actual.is_some() != expects_actual {
+                    return Err(ContractError::InvalidRouteDisposition);
+                }
+                Ok(())
+            }
+            _ => Err(ContractError::InvalidRouteDisposition),
+        }
+    }
+
+    /// Readback-validates this retained relation against live owner material:
+    /// shape first, then exact equality with a fresh [`Self::resolve`] from
+    /// the same owners. A relation that drifted from its owners fails with
+    /// [`ContractError::BindingMismatch`], never as a silent overwrite.
+    pub fn verify_against(
+        &self,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        physical_observation: Option<&PhysicalRouteObservationReceipt>,
+    ) -> Result<(), ContractError> {
+        self.validate()?;
+        let expected = Self::resolve(binding, admission, physical_observation)?;
+        if *self == expected {
+            Ok(())
+        } else {
+            Err(ContractError::BindingMismatch)
+        }
+    }
+
+    /// Readback-validates this retained relation at the intake boundary,
+    /// where the owner receipts themselves are no longer at hand: the schema
+    /// version must hold, the retained admission reference must equal the
+    /// envelope-carried admission reference, and the retained role-qualified
+    /// columns must equal the retained record columns. Any drift fails with
+    /// [`ContractError::BindingMismatch`].
+    pub fn verify_retained(
+        &self,
+        admitted_route_digest: Option<&LowercaseSha256>,
+        requested_route_digest: Option<&LowercaseSha256>,
+        actual_route_digest: Option<&LowercaseSha256>,
+    ) -> Result<(), ContractError> {
+        self.validate()?;
+        if admitted_route_digest != Some(&self.admission_digest)
+            || requested_route_digest != Some(&self.requested_route_digest)
+            || actual_route_digest != self.actual_route_digest.as_ref()
+        {
+            return Err(ContractError::BindingMismatch);
+        }
+        Ok(())
+    }
+}

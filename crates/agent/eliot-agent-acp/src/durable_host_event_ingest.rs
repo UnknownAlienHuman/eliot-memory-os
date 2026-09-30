@@ -12,7 +12,8 @@
 //! normalized HostEventEnvelope;
 //! adapter and transformation versions;
 //! sequence/cursor and parent-child lineage;
-//! requested and actual route references;
+//! requested and actual route references plus the versioned validated
+//! route-evidence relation binding them to their owners;
 //! normalization warnings;
 //! EventEnvelope disposition.
 //! ```
@@ -50,6 +51,7 @@ use eliot_agent_api::{
     ProviderObservationLineage, QualifiedSourceDigest,
     host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM, route_fingerprint_digest_for,
 };
+use eliot_agent_api::route_receipts::CommittedRouteEvidenceRelation;
 use eliot_contracts::sha256_hex;
 use eliot_evaluation_contracts::{
     CoverageBlindInterval, CoverageCompleteness, DenominatorOrigin, EvaluationContractError,
@@ -349,6 +351,14 @@ pub struct DurableHostEventRecord {
     pub requested_route_digest: Option<LowercaseSha256>,
     /// Observed actual route reference digest, when one was observed.
     pub actual_route_digest: Option<LowercaseSha256>,
+    /// Versioned validated route-evidence relation (issue #2645 W5). `Some`
+    /// exactly for execution-unit lineage: resolved from the governing #369
+    /// admission and the applicable #369 physical observation (or its explicit
+    /// absence) by the staging gate before any mutation, carrying the
+    /// role-qualified requested/actual digests plus the exact
+    /// owner-resolvable admission and observation references. `None` exactly
+    /// for session-only lineage, which carries no route authority.
+    pub route_evidence: Option<CommittedRouteEvidenceRelation>,
     /// Causal predecessor event identities carried at ingest.
     pub predecessors: Vec<EventId>,
     /// Normalization warnings. Bounded; never raw provider content.
@@ -1033,14 +1043,20 @@ impl DurableHostEventJournal {
     /// plus the stable identity derived from the normalized input. The
     /// coordinator intake re-verifies every fact before observing.
     ///
-    /// Route-relation note (issue #2645): commit implies the record's
+    /// Route-relation contract (issue #2645 W5): commit implies the record's
     /// requested/actual route columns already passed owner-qualified staging
     /// validation (admission fingerprint for requested, validated physical
-    /// observation for actual, explicit absence otherwise). The envelope's
+    /// observation for actual, explicit absence otherwise), and this
+    /// projection readback-validates the retained versioned
+    /// [`CommittedRouteEvidenceRelation`] before converting: the relation's
+    /// owner references must bind the envelope-carried admission reference
+    /// and the relation's role-qualified columns must equal the retained
+    /// record columns, or conversion fails closed. A consumer that uses route
+    /// claims receives the validated relation through
+    /// [`Self::committed_route_evidence`]; the envelope's
     /// `admitted_route_digest` travels in this view as the exact
-    /// owner-resolvable admission reference; the fingerprint-level columns
-    /// remain readable on the committed record itself. No unused column is
-    /// declared proof of coordinator validation here.
+    /// owner-resolvable admission reference. No unused column is declared
+    /// proof of coordinator validation here.
     pub fn to_coordinator_intake(
         &self,
         key: &EventKey,
@@ -1052,8 +1068,71 @@ impl DurableHostEventJournal {
         if !record.disposition.committed {
             return Err(IngestError::NotCommitted);
         }
+        Self::check_retained_route_evidence(record)?;
         CommittedHostEventIntake::from_envelope(&record.envelope, record.disposition.acked)
             .map_err(IngestError::Contract)
+    }
+
+    /// Returns the retained versioned route-evidence relation for one
+    /// committed record (issue #2645 W5): `Some` exactly for execution-unit
+    /// lineage, carrying the role-qualified requested/actual digests plus the
+    /// exact owner-resolvable admission and observation references; `None`
+    /// exactly for session-only lineage, which carries no route authority.
+    ///
+    /// The retained relation is readback-validated before it is handed out
+    /// (see [`Self::check_retained_route_evidence`]): a relation that drifted
+    /// from the envelope-carried admission reference or the retained record
+    /// columns fails closed here instead of reaching a route-claim consumer.
+    /// A staged-but-uncommitted record reports [`IngestError::NotCommitted`].
+    pub fn committed_route_evidence(
+        &self,
+        key: &EventKey,
+    ) -> Result<Option<CommittedRouteEvidenceRelation>, IngestError> {
+        let record = self
+            .records
+            .get(&(key.stream_id.clone(), key.sequence))
+            .ok_or(IngestError::UnknownRecord)?;
+        if !record.disposition.committed {
+            return Err(IngestError::NotCommitted);
+        }
+        Self::check_retained_route_evidence(record)?;
+        Ok(record.route_evidence.clone())
+    }
+
+    /// Readback-validates the retained route-evidence relation of one record
+    /// (issue #2645 W5) without the owner receipts at hand: session-only
+    /// lineage must retain no relation and no route columns (it carries no
+    /// route authority); execution-unit lineage must retain a relation whose
+    /// admission reference equals the envelope-carried admission reference
+    /// and whose role-qualified columns equal the retained record columns
+    /// (see [`CommittedRouteEvidenceRelation::verify_retained`]). Any drift
+    /// fails closed with a typed error before the intake converts or the
+    /// relation reaches a consumer.
+    fn check_retained_route_evidence(record: &DurableHostEventRecord) -> Result<(), IngestError> {
+        match &record.envelope.lineage {
+            ProviderObservationLineage::SessionObservation(_) => {
+                if record.route_evidence.is_some() {
+                    return Err(IngestError::Contract(ContractError::BindingMismatch));
+                }
+                if record.requested_route_digest.is_some() || record.actual_route_digest.is_some() {
+                    return Err(IngestError::EnvelopeMismatch("route_digest"));
+                }
+                Ok(())
+            }
+            ProviderObservationLineage::ExecutionUnitObservation(_) => {
+                let evidence = record
+                    .route_evidence
+                    .as_ref()
+                    .ok_or(IngestError::Contract(ContractError::BindingMismatch))?;
+                evidence
+                    .verify_retained(
+                        record.envelope.admitted_route_digest.as_ref(),
+                        record.requested_route_digest.as_ref(),
+                        record.actual_route_digest.as_ref(),
+                    )
+                    .map_err(IngestError::Contract)
+            }
+        }
     }
 
     /// Returns every recorded best-effort drop gap for a stream, in record
@@ -1740,6 +1819,16 @@ impl DurableHostEventJournal {
             requested_route_digest.as_ref(),
             actual_route_digest.as_ref(),
         )?;
+        // Versioned route-evidence relation (issue #2645 W5): resolved from
+        // the same validated owners by the same gate, before any mutation,
+        // so the persisted record carries the exact owner-resolvable
+        // references alongside the columns.
+        let route_evidence = Self::retained_route_evidence(
+            &envelope,
+            binding,
+            admission,
+            physical_observation,
+        )?;
         Self::check_envelope_linkage(&envelope, sequence, &stored)?;
         let envelope_digest = envelope
             .compute_digest()
@@ -1757,6 +1846,7 @@ impl DurableHostEventJournal {
                 && existing.envelope_digest == envelope_digest
                 && existing.requested_route_digest.as_ref() == requested_route_digest.as_ref()
                 && existing.actual_route_digest.as_ref() == actual_route_digest.as_ref()
+                && existing.route_evidence == route_evidence
             {
                 return Ok(StageOutcome { key, fresh: false });
             }
@@ -1814,6 +1904,7 @@ impl DurableHostEventJournal {
                 transformation_version: transformation_version.to_owned(),
                 requested_route_digest,
                 actual_route_digest,
+                route_evidence,
                 predecessors,
                 warnings,
                 disposition: RecordDisposition {
@@ -1887,6 +1978,36 @@ impl DurableHostEventJournal {
             return Err(IngestError::EnvelopeMismatch("route_digest"));
         }
         Ok(())
+    }
+
+    /// Resolves the retained versioned route-evidence relation from the
+    /// validated staging owners (issue #2645 W5). Session-only lineage
+    /// carries no route authority and retains `None`; execution-unit lineage
+    /// retains the relation resolved from the governing admission and the
+    /// applicable physical observation (or its explicit absence) via
+    /// [`CommittedRouteEvidenceRelation::resolve`], which re-runs the owner
+    /// validation instead of trusting caller columns. Runs inside the shared
+    /// staging core after [`Self::check_staging_context`] and before any
+    /// mutation, so both the allowed and the redacted paths persist the same
+    /// relation; exact replay compares it along with the existing
+    /// source/envelope commitment, so changed route metadata under one event
+    /// identity conflicts instead of restaging silently.
+    fn retained_route_evidence(
+        envelope: &NormalizedHostEventEnvelope,
+        binding: Option<&ProviderExecutionBinding>,
+        admission: Option<&AdmittedRouteReceipt>,
+        physical_observation: Option<&PhysicalRouteObservationReceipt>,
+    ) -> Result<Option<CommittedRouteEvidenceRelation>, IngestError> {
+        match &envelope.lineage {
+            ProviderObservationLineage::SessionObservation(_) => Ok(None),
+            ProviderObservationLineage::ExecutionUnitObservation(_) => {
+                let binding = binding.ok_or(IngestError::InvalidInput("binding/lineage"))?;
+                let admission = admission.ok_or(IngestError::InvalidInput("admission/lineage"))?;
+                CommittedRouteEvidenceRelation::resolve(binding, admission, physical_observation)
+                    .map_err(IngestError::Contract)
+                    .map(Some)
+            }
+        }
     }
 
     /// Checks that the carried execution-unit route-reference digests each
