@@ -7770,10 +7770,12 @@ pub struct HostRequestApplicationBinding {
     pub source_request_identity: Value,
     /// Canonical digest of `source_request_identity`.
     pub source_request_identity_sha256: String,
-    /// Authenticated principal resolved from retained application binding.
-    pub principal_ref: OpaqueLabel,
-    /// Resolved durable `Session`.
-    pub session_ref: OpaqueLabel,
+    /// Authenticated principal resolved from an application session, absent
+    /// for a host-peer capture with no application session.
+    pub principal_ref: Option<OpaqueLabel>,
+    /// Resolved durable `Session`, absent for a host-peer capture with no
+    /// application session.
+    pub session_ref: Option<OpaqueLabel>,
     /// Resolved task, if one is selected.
     pub task_ref: Option<OpaqueLabel>,
     /// Exact owner-resolved `WorkScope` used for this capture, including when
@@ -7797,6 +7799,9 @@ pub struct HostRequestApplicationBinding {
     pub observation_policy_binding: Value,
     /// Canonical digest of the exact Governor policy-owner projection.
     pub observation_policy_binding_sha256: String,
+    /// Exact original authenticated host-peer receipt, independently retained
+    /// from the semantic application origin selected by Governor.
+    pub host_peer_admission_receipt: Value,
     /// Exact retained activation result digest.
     pub activation_result_sha256: Option<String>,
     /// P07 owner revision captured by the admission owner.
@@ -7857,17 +7862,24 @@ impl HostRequestApplicationBinding {
             Some(&self.observation_policy_binding_sha256),
             "host_request_observation_policy_binding",
         )?;
+        if !self.host_peer_admission_receipt.is_object() {
+            return Err(OrsError::InvalidField {
+                field: "host_request_peer_admission_receipt",
+                reason: "the exact original host-peer receipt must be retained as an object",
+            });
+        }
         if let Some(digest) = &self.activation_result_sha256 {
             validate_digest(digest, "host_request_activation_result_sha256")?;
         }
         if let Some(digest) = &self.p07_bundle_sha256 {
             validate_digest(digest, "host_request_p07_bundle_sha256")?;
         }
-        validate_text(self.principal_ref.as_str(), "host_request_principal_ref")?;
-        validate_text(
-            self.session_ref.as_str(),
-            "host_request_resolved_session_ref",
-        )?;
+        if let Some(principal_ref) = self.principal_ref.as_ref() {
+            validate_text(principal_ref.as_str(), "host_request_principal_ref")?;
+        }
+        if let Some(session_ref) = self.session_ref.as_ref() {
+            validate_text(session_ref.as_str(), "host_request_resolved_session_ref")?;
+        }
         self.validate_activation_projection()?;
         Ok(())
     }
@@ -7989,12 +8001,12 @@ impl HostRequestApplicationBinding {
             (
                 "host_request_application_principal",
                 binding.get("principal_id").and_then(Value::as_str),
-                Some(self.principal_ref.as_str()),
+                self.principal_ref.as_ref().map(OpaqueLabel::as_str),
             ),
             (
                 "host_request_application_session",
                 binding.get("session_id").and_then(Value::as_str),
-                Some(self.session_ref.as_str()),
+                self.session_ref.as_ref().map(OpaqueLabel::as_str),
             ),
             (
                 "host_request_application_scope",
@@ -8028,12 +8040,8 @@ impl HostRequestApplicationBinding {
         if sha256_hex(&fence_bytes) != record.fence_digest
             || self.state_fence.authority_epoch != record.authority_epoch
             || self.state_fence.resource_generation.value() != record.generation
-            || self.session_ref.as_str()
-                != record
-                    .session_ref
-                    .as_ref()
-                    .map(OpaqueLabel::as_str)
-                    .unwrap_or_default()
+            || self.session_ref.as_ref().map(OpaqueLabel::as_str)
+                != record.session_ref.as_ref().map(OpaqueLabel::as_str)
             || self.task_ref.as_ref().map(OpaqueLabel::as_str)
                 != record.task_ref.as_ref().map(OpaqueLabel::as_str)
             || self.scope_ref.as_ref().map(OpaqueLabel::as_str)
@@ -8205,37 +8213,11 @@ impl HostRequestApplicationBinding {
         record: &HostRequestRecord,
     ) -> Result<(), OrsError> {
         let policy = &self.observation_policy_binding;
-        for (_field, value, expected) in [
-            (
-                "host_request_observation_policy_principal",
-                policy
-                    .get("authenticated_principal_ref")
-                    .and_then(Value::as_str),
-                Some(self.principal_ref.as_str()),
-            ),
-            (
-                "host_request_observation_policy_session",
-                policy
-                    .get("authenticated_session_ref")
-                    .and_then(Value::as_str),
-                Some(self.session_ref.as_str()),
-            ),
-            (
-                "host_request_observation_policy_scope",
-                policy
-                    .get("authenticated_scope_ref")
-                    .and_then(Value::as_str),
-                self.scope_ref.as_ref().map(OpaqueLabel::as_str),
-            ),
-            (
-                "host_request_observation_policy_task",
-                policy.get("authenticated_task_ref").and_then(Value::as_str),
-                self.task_ref.as_ref().map(OpaqueLabel::as_str),
-            ),
-        ] {
-            if value != expected {
-                return Err(OrsError::FenceMismatch);
-            }
+        self.validate_observation_policy_origin(policy)?;
+        if policy.get("authenticated_scope_ref").and_then(Value::as_str)
+            != self.scope_ref.as_ref().map(OpaqueLabel::as_str)
+        {
+            return Err(OrsError::FenceMismatch);
         }
         let policy_fence = policy.get("state_fence").cloned().unwrap_or(Value::Null);
         let expected_fence = serde_json::to_value(&self.state_fence)
@@ -8247,6 +8229,61 @@ impl HostRequestApplicationBinding {
             != self.scope_ref.as_ref().map(OpaqueLabel::as_str)
         {
             return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_observation_policy_origin(&self, policy: &Value) -> Result<(), OrsError> {
+        let origin = policy.get("origin").ok_or(OrsError::InvalidField {
+            field: "host_request_observation_policy_origin",
+            reason: "the owner-resolved capture origin is required",
+        })?;
+        match origin.get("kind").and_then(Value::as_str) {
+            Some("APPLICATION_SESSION") => {
+                if self.principal_ref.as_ref().map(OpaqueLabel::as_str)
+                    != origin.get("authenticated_principal_ref").and_then(Value::as_str)
+                    || self.session_ref.as_ref().map(OpaqueLabel::as_str)
+                        != origin.get("authenticated_session_ref").and_then(Value::as_str)
+                    || self.principal_ref.is_none()
+                    || self.session_ref.is_none()
+                    || origin.get("authenticated_task_ref").is_none()
+                {
+                    return Err(OrsError::FenceMismatch);
+                }
+                let origin_task = origin
+                    .get("authenticated_task_ref")
+                    .and_then(Value::as_str);
+                if self.task_ref.as_ref().is_some_and(|task| Some(task.as_str()) != origin_task) {
+                    return Err(OrsError::FenceMismatch);
+                }
+                if origin.get("domain").is_some()
+                    || origin.get("peer_admission_receipt").is_some()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_observation_policy_origin",
+                        reason: "application-session origin cannot carry host-peer fields",
+                    });
+                }
+            }
+            Some("HOST_PEER") => {
+                if self.principal_ref.is_some()
+                    || self.session_ref.is_some()
+                    || self.task_ref.is_some()
+                    || origin.get("domain").and_then(Value::as_str) != Some("AGENT_BRIDGE")
+                    || origin.get("peer_admission_receipt")
+                        != Some(&self.host_peer_admission_receipt)
+                    || self.resolved_application_binding.is_some()
+                    || self.activation_owner_evidence.is_some()
+                {
+                    return Err(OrsError::FenceMismatch);
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_observation_policy_origin",
+                    reason: "the owner capture origin kind is unsupported",
+                });
+            }
         }
         Ok(())
     }
@@ -8348,13 +8385,6 @@ impl HostRequestApplicationBinding {
         }
         for (field, value, expected) in [
             (
-                "host_request_owner_session",
-                self.request_identity
-                    .get("session_id")
-                    .and_then(Value::as_str),
-                record.session_ref.as_ref().map(OpaqueLabel::as_str),
-            ),
-            (
                 "host_request_owner_task",
                 self.request_identity.get("task_id").and_then(Value::as_str),
                 record.task_ref.as_ref().map(OpaqueLabel::as_str),
@@ -8366,6 +8396,17 @@ impl HostRequestApplicationBinding {
                     reason: "original request selectors diverge from the retained row",
                 });
             }
+        }
+        if let Some(claimed_session) = self
+            .request_identity
+            .get("session_id")
+            .and_then(Value::as_str)
+            && Some(claimed_session) != record.session_ref.as_ref().map(OpaqueLabel::as_str)
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_owner_session",
+                reason: "an explicit request session claim must equal the owner-resolved session",
+            });
         }
         if let Some(claimed_scope) = self
             .request_identity
@@ -8613,10 +8654,33 @@ impl HostRequestExecutableInput {
             &self.peer_admission_receipt_sha256,
             "host_request_executable_input_peer_receipt_sha256",
         )?;
+        self.validate_host_peer_receipt(record)?;
         validate_digest(
             &self.commitment_sha256,
             "host_request_executable_input_commitment_sha256",
         )?;
+        Ok(())
+    }
+
+    fn validate_host_peer_receipt(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        let receipt = &self.application_binding.host_peer_admission_receipt;
+        let observed_session_id = receipt
+            .get("observed_session_id")
+            .and_then(Value::as_u64);
+        if receipt
+            .get("receipt_sha256")
+            .and_then(Value::as_str)
+            != Some(self.peer_admission_receipt_sha256.as_str())
+            || receipt.get("observed_sid").and_then(Value::as_str)
+                != Some(self.authenticated_principal_ref.as_str())
+            || observed_session_id != Some(u64::from(self.authenticated_host_session_id))
+            || receipt.get("connection_id").and_then(Value::as_str)
+                != Some(record.connection_ref.as_str())
+            || receipt.get("descriptor_sha256").and_then(Value::as_str)
+                != Some(self.descriptor_sha256.as_str())
+        {
+            return Err(OrsError::FenceMismatch);
+        }
         Ok(())
     }
 
