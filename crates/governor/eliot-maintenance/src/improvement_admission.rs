@@ -23,12 +23,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::AutomationDecision;
 use super::improvement_pipeline::{
     ImprovementCurrentProposal, ImprovementMaterialEquality, ImprovementReplayAssessment,
     ProposalCommitment, RetainedImprovementProposal, UncheckedRecordIdentity,
     UnestablishedPriorCause, assess_improvement_progress,
 };
-use super::AutomationDecision;
 
 /// Improvement closure cell identity (mirrors `meta.learning.closure`).
 pub const IMPROVEMENT_CLOSURE_MODULE: &str = "meta.learning.closure";
@@ -622,10 +622,7 @@ pub fn select_non_mutating_disposition(
             return Err(ImprovementDispositionError::PolicyNotOwnerIssued(field));
         }
     }
-    for (value, field) in [
-        (brief_id, "brief_id"),
-        (candidate_id, "candidate_id"),
-    ] {
+    for (value, field) in [(brief_id, "brief_id"), (candidate_id, "candidate_id")] {
         if value.trim().is_empty() {
             return Err(ImprovementDispositionError::MissingIdentity(field));
         }

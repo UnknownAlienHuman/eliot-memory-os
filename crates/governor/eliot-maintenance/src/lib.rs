@@ -68,11 +68,11 @@ pub use improvement_admission::{
     IMPROVEMENT_CANDIDATE_BOUNDS_REVISION, IMPROVEMENT_CLOSURE_MODULE, IMPROVEMENT_PRODUCT_PULSE,
     IMPROVEMENT_PROMOTION_MODULE, IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT,
     ImprovementAdmissionDecision, ImprovementAdmissionError, ImprovementAdmissionPolicy,
-    ImprovementBlockCause, ImprovementBlockRemedy, ImprovementBoundError, ImprovementCandidateView,
+    ImprovementBlockCause, ImprovementBlockRemedy, ImprovementBoundError,
+    ImprovementBriefDisposition, ImprovementCandidateView, ImprovementDispositionError,
     ImprovementEvidenceView, ImprovementPulseOutcome, ImprovementRejectCause,
-    ImprovementSurfaceBound, ImprovementTargetSurface, ImprovementBriefDisposition,
-    ImprovementDispositionError, OwnerDispositionSelection, admit_improvement_candidate,
-    improvement_admission_policy, resolve_candidate_surface_bound,
+    ImprovementSurfaceBound, ImprovementTargetSurface, OwnerDispositionSelection,
+    admit_improvement_candidate, improvement_admission_policy, resolve_candidate_surface_bound,
     select_non_mutating_disposition,
 };
 pub use improvement_pipeline::{
