@@ -6,12 +6,12 @@ pub(super) use readiness_append::{
 
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, EliotActivationRecord,
-    EpochTransition, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
-    HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend,
-    JournalError, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
-    KernelRecord, LifecycleTimestamps, PriorKernelDisposition, PriorKernelSource,
-    ReadinessEvidence, ReconcileOutcome, WakeDisposition, record_checksum,
+    ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
+    EliotActivationRecord, EpochTransition, FailureRecoveryDirective, HostInstallationEpoch,
+    HostKernelStoreLineage, HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION,
+    JournalBackend, JournalError, JournalManifest, KernelJobBinding,
+    KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps, PriorKernelDisposition,
+    PriorKernelSource, ReadinessEvidence, ReconcileOutcome, WakeDisposition, record_checksum,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -680,11 +680,38 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
 /// when the journal proves no lease or pending operation remains; callers
 /// must not substitute a placeholder. The `drain_generation` correlation
 /// binds this commit to the `Requested`/`Draining` records that precede it.
+///
+/// The commit is bound to the durable drain admission, not to a live
+/// observation: the journal must already carry the `DrainRecord` for this
+/// exact fence and `drain_generation`, with trigger evidence naming what
+/// opened it (idle-lease census evidence for an idle drain,
+/// `scm-stop-request` for a requested shutdown). A commit for an unadmitted
+/// generation is refused instead of persisted. `Pending`/`Unknown`
+/// store-rebind operations are retained in the snapshot by operation id;
+/// retention is the fence, never a terminal disposition.
 pub(super) fn drain_commit_record_for_stop(
     snapshot: &HostState,
     activation: &EliotActivationRecord,
     drain_generation: &EpochTransition,
 ) -> Result<DrainCommitRecord, HostError> {
+    let drain = snapshot.drain.as_ref().ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "Host DrainCommit has no durable drain admission for this generation; append the Requested/Draining drain records before the DrainCommit linearization"
+                .to_owned(),
+        )
+    })?;
+    if drain.fence != activation.fence || drain.drain_generation != *drain_generation {
+        return Err(HostError::RecoveryRequired(
+            "Host DrainCommit names a generation without a matching durable drain admission; re-drive the drain for this exact activation fence and generation before committing"
+                .to_owned(),
+        ));
+    }
+    if drain.evidence_refs.is_empty() {
+        return Err(HostError::RecoveryRequired(
+            "Host drain admission carries no trigger evidence; an idle drain and a requested shutdown stay distinguishable only through the bound admission evidence"
+                .to_owned(),
+        ));
+    }
     let mut lease_and_pending: Vec<PlatformHandle> = Vec::new();
     lease_and_pending.extend(activation.runtime_lease_refs.iter().cloned());
     lease_and_pending.extend(activation.supervision_lease_refs.iter().cloned());
@@ -716,6 +743,10 @@ pub(super) fn drain_commit_record_for_stop(
         last_admission_closed_at: fresh_identity("host-admission-closed-at")?,
         lease_and_pending_operation_snapshot: lease_and_pending,
         authority_epochs_fenced: vec![activation.lineage.kernel_epoch.clone()],
+        // I14.23 store-first order: the canonical-store branch stops before
+        // the kernel branch, and only after the marker gate below has proven
+        // no canonical-data/maintenance lease or pending Store operation
+        // remains outside the commit snapshot.
         processes_modules_and_store_branches_to_stop: vec![
             PlatformHandle::new("canonical-store-branch")
                 .map_err(|error| HostError::Platform(error.to_string()))?,
@@ -731,12 +762,135 @@ pub(super) fn drain_commit_record_for_stop(
     })
 }
 
+/// Names at most eight residual identities in a refusal; a longer set reports
+/// its exact remaining length instead of growing the error without bound.
+fn bounded_residual_list(handles: &[PlatformHandle]) -> String {
+    const MAX_LISTED: usize = 8;
+    let mut text = handles
+        .iter()
+        .take(MAX_LISTED)
+        .map(|handle| handle.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if handles.len() > MAX_LISTED {
+        text.push_str(&format!(", and {} more", handles.len() - MAX_LISTED));
+    }
+    text
+}
+
+/// Refuses a drain-shutdown clean marker unless the journal proves the exact
+/// combination #1686 requires before `StoppedClean`: the drain is still
+/// `Draining` (never cancelled, failed or stuck pre-commit), the
+/// `DrainCommit` linearization is present and bound to this activation fence
+/// and drain generation, the covered Kernel record (when present) belongs to
+/// this exact activation, no Store rebind operation is left
+/// `Pending`/`Unknown`, and every lease ref the activation still names is
+/// fenced inside the commit snapshot.
+///
+/// I14.23 orders "flush audit/outbox/ORS" and "stop store only when no
+/// canonical data lease remains" before "publish intentional shutdown state
+/// to Watchdog/Host", and I1.5 leaves a "failed or timed-out drain" as
+/// "`DEGRADED_RECOVERY` plus a WakeIntent/manual entrypoint rather than
+/// reporting `STOPPED_CLEAN`". The gate projects only facts the Host journal
+/// itself owns: the Kernel coordinator's own prepared/intentional publication
+/// lives kernel-side, live descendant termination (empty Job, reaped root) is
+/// enforced by the caller's store-first termination step and re-projected by
+/// `terminated_prior_kernel` on the next observe, and the sibling Watchdog
+/// stop with the Governor-owned checkpoint/flush acknowledgements are those
+/// owners' evidence. A missing piece therefore refuses the marker as explicit
+/// incomplete recovery with the exact residual and safe next action instead
+/// of completing a clean shutdown; per I14.13 no refusal claims rollback of
+/// an already executed external effect.
+fn refuse_clean_marker_without_drain_termination_evidence(
+    snapshot: &HostState,
+    activation: &EliotActivationRecord,
+    drain: &DrainRecord,
+) -> Result<(), HostError> {
+    if drain.state != DrainState::Draining {
+        return Err(HostError::RecoveryRequired(format!(
+            "Host drain ended as {:?}, not Draining; a cancelled, failed or unlinearized drain is never a clean stop; re-drive the drain to its commit or recover the degraded contour",
+            drain.state
+        )));
+    }
+    let commit = snapshot.drain_commit.as_ref().ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "Host drain has no DrainCommit linearization for this generation; append the DrainCommit before the clean marker; a pre-commit wake cancels the drain instead of completing it"
+                .to_owned(),
+        )
+    })?;
+    if commit.fence != activation.fence || commit.drain_generation != drain.drain_generation {
+        return Err(HostError::RecoveryRequired(
+            "Host DrainCommit is not bound to this activation fence and drain generation; append the DrainCommit linearization for this exact generation before the clean marker"
+                .to_owned(),
+        ));
+    }
+    if let Some(kernel) = snapshot.kernel.as_ref()
+        && (kernel.fence.activation_id != activation.activation_id
+            || kernel.fence.activation_generation != activation.fence.activation_generation
+            || kernel.activation_identity != activation.activation_id)
+    {
+        return Err(HostError::RecoveryRequired(
+            "Host clean marker covers a foreign Kernel contour; reconcile the current generation's Kernel record before claiming this generation clean"
+                .to_owned(),
+        ));
+    }
+    let open_rebinds: Vec<PlatformHandle> = snapshot
+        .store_rebinds
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.state,
+                eliot_host_state::StoreRebindState::Pending
+                    | eliot_host_state::StoreRebindState::Unknown
+            )
+        })
+        .map(|record| record.operation_id.clone())
+        .collect();
+    if !open_rebinds.is_empty() {
+        return Err(HostError::RecoveryRequired(format!(
+            "Store obligations remain without a terminal disposition: {}; reconcile each exact operation through the Store rebind owner before the clean marker",
+            bounded_residual_list(&open_rebinds)
+        )));
+    }
+    let unfenced: Vec<PlatformHandle> = activation
+        .runtime_lease_refs
+        .iter()
+        .chain(activation.supervision_lease_refs.iter())
+        .filter(|lease| !commit.lease_and_pending_operation_snapshot.contains(*lease))
+        .cloned()
+        .collect();
+    if !unfenced.is_empty() {
+        return Err(HostError::RecoveryRequired(format!(
+            "Authority remains outside the drain commit snapshot: {}; fence every live lease in the DrainCommit linearization before the clean marker",
+            bounded_residual_list(&unfenced)
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn clean_marker_record(
     snapshot: &HostState,
     host: &HostInstallationEpoch,
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
 ) -> Result<HostStateRecord, HostError> {
+    let activation = snapshot.activation.as_ref().ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "Host clean marker has no durable activation for this generation; start or recover the activation contour before claiming a clean stop"
+                .to_owned(),
+        )
+    })?;
+    if activation.activation_id != *activation_id
+        || activation.fence.activation_generation != *activation_generation
+    {
+        return Err(HostError::RecoveryRequired(
+            "Host clean marker names a superseded activation generation; reconcile the current activation contour before claiming a clean stop"
+                .to_owned(),
+        ));
+    }
+    if let Some(drain) = snapshot.drain.as_ref() {
+        refuse_clean_marker_without_drain_termination_evidence(snapshot, activation, drain)?;
+    }
     Ok(HostStateRecord::CleanMarker(CleanMarker {
         fence: record_fence(host, activation_id, activation_generation),
         operation: operation("host-clean-marker")?,
