@@ -1251,7 +1251,8 @@ where
     // foreign handoff, or no recorded handoff at all — cannot prove production
     // is safely served elsewhere, so the target is refused at the plan
     // boundary before any destructive path exists.
-    let retirement_barrier = observed_handoff_barrier(
+    let retirement_barrier = observed_retirement_barrier(
+    let retirement_barrier = observed_retirement_barrier(
         &projection,
         generation,
         &install.installation_epoch.installation,
@@ -1653,7 +1654,8 @@ fn observe_admission_fence(
                 .to_owned(),
         ));
     };
-    let observed = observed_handoff_barrier(
+    let observed = observed_retirement_barrier(
+    let observed = observed_retirement_barrier(
         projection,
         &plan.generation,
         &plan.installation_epoch.installation,
@@ -1775,7 +1777,8 @@ fn pending_external_change_count(
 /// means the registry records no settled safe serving handoff — a staged but
 /// uncommitted activation, an abort, a foreign handoff, or no handoff at
 /// all — and every caller refuses it rather than defaulting it.
-fn observed_handoff_barrier(
+fn observed_retirement_barrier(
+fn observed_retirement_barrier(
     projection: &ApprovedGenerationRegistry,
     generation: &PlatformHandle,
     installation: &PlatformHandle,
