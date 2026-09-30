@@ -818,15 +818,27 @@ fn apply(
                 .pending_cutover
                 .as_ref()
                 .is_none_or(|intent| intent.state != CutoverIntentState::Pending);
-            // A preparation with no recorded result is the same hazard for the
-            // same reason: the operation was admitted and its destination may
-            // exist, so closing a clean Host epoch lineage would re-base this
-            // journal and discard the only durable proof that it was admitted.
-            // A recorded result is settled history and does not block shutdown.
-            let preparations_settled = state
-                .backup_preparations
-                .iter()
-                .all(|record| record.state != BackupPreparationState::Pending);
+            // A preparation that has not reached a settled disposition is the
+            // same hazard for the same reason: the operation was admitted, or
+            // its reclamation was authorized, and in both cases the
+            // destination's actual fate is unobserved - so closing a clean Host
+            // epoch lineage would re-base this journal and discard the only
+            // durable proof of what was admitted or authorized.
+            //
+            // "Settled" is therefore a positive terminal set, not "anything
+            // that is not `Pending`": `CleanupPending` is an authorization
+            // retained before an irreversible effect whose outcome nobody
+            // observed, so it blocks exactly as `Pending` does, while `Prepared`
+            // (the root exists and is owned) and `Reclaimed` (its absence was
+            // observed) are settled history and must NOT block. Reading this as
+            // "any preparation at all" instead would let a reclaimed root keep
+            // Host shutdown blocked forever.
+            let preparations_settled = state.backup_preparations.iter().all(|record| {
+                matches!(
+                    record.state,
+                    BackupPreparationState::Prepared | BackupPreparationState::Reclaimed
+                )
+            });
             let reactive_context_clean = state
                 .reactive_context
                 .as_ref()
@@ -999,10 +1011,14 @@ fn apply(
             //    exactly that root;
             //  * a changed source, archive, class, admission, destination or
             //    owner-issued identity under one operation identity is a
-            //    conflict, not a re-scoped preparation;
-            //  * `Prepared` is terminal, so an unsettled admission is never
-            //    re-opened and a partial destination is never silently replaced
-            //    by a second outcome.
+            //    conflict, not a re-scoped preparation - and so is a changed
+            //    pinned destination identity, which is what keeps a
+            //    reclamation bound to the one directory this operation created;
+            //  * the only forward moves are the owner-authorized reclamation
+            //    steps `Prepared -> CleanupPending -> Reclaimed`, so an
+            //    unsettled admission is never re-opened, a partial destination
+            //    is never silently replaced by a second outcome, and a
+            //    reclaimed root is never reclaimed again.
             let index = state
                 .backup_preparations
                 .iter()
