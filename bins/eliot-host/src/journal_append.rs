@@ -5,7 +5,6 @@ pub(super) use readiness_append::{
 };
 
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
-use std::fmt::Write as _;
 use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
     EliotActivationRecord, EpochTransition, FailureRecoveryDirective, HostInstallationEpoch,
@@ -22,6 +21,7 @@ use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, ServiceProcessRecord, ServiceProcessState,
 };
+use std::fmt::Write as _;
 
 // F-LOG-HOST-6 (#981) journal-append observation helpers.
 //
