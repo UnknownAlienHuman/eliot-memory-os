@@ -6,6 +6,7 @@
 //! authority and no new default or retry; bytes/layout/recovery/high-water/fail-closed
 //! behavior is preserved verbatim from the reviewed production cell.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use eliot_contracts::sha256_hex;
@@ -18,6 +19,7 @@ use eliot_watchdog_core::{
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
+use crate::health_projection::{WatchdogHealthCorpus, encode_identity};
 use crate::{
     AdmittedIsolatedDestination, SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms,
 };
@@ -1992,6 +1994,229 @@ impl WatchdogSpool {
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(unbound_export_cursor()),
             Err(error) => Err(SpoolError::Database(error.to_string())),
         }
+    }
+
+    /// Measures this owner's retained observation bank for the I8.18 health
+    /// projection.
+    ///
+    /// One bounded read transaction over the retained records, plus the stored
+    /// export cursor and the submit-once receipt ledger this owner already
+    /// maintains. Nothing is written, no lease, epoch, or authority is read,
+    /// and no record is interpreted beyond the owner's own classification of
+    /// what it stored: a record's payload class, its gap reason, its sequence,
+    /// its recorded observation time, and the digest of its own encoded bytes.
+    ///
+    /// The comparison reaches the source rather than the visible final item:
+    /// every retained row is decoded through the existing
+    /// [`decode_entry`](codec::decode_entry) validator and every row
+    /// contributes to the content-digest, acknowledgement, receipt, and
+    /// deferred-reason counts, so an old duplicate, a stale record, or a
+    /// deferred gap buried anywhere in the retained set is counted rather than
+    /// hidden behind a later row.
+    ///
+    /// Bounded twice. The iteration refuses to exceed the spool's own
+    /// [`SPOOL_MAX_RECORDS`] retention ceiling rather than reporting a partial
+    /// corpus, and `freshness_window_ms` is the caller's declared owner policy
+    /// (this crate's own backup/export window), not a threshold chosen here.
+    /// A record is stale only when it is older than that declared window at the
+    /// owner clock the caller supplies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the database cannot be read, the retained
+    /// set exceeds the retention ceiling, any retained record fails the
+    /// existing decoder, or the stored cursor or receipt ledger is corrupt.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded corpus measurement keeps its row shape, its single-pass counts, and its evidence digest in one reviewable contour"
+    )]
+    pub(crate) fn health_corpus_summary(
+        &self,
+        now_ms: u64,
+        freshness_window_ms: u64,
+    ) -> Result<WatchdogHealthCorpus, SpoolError> {
+        struct RetainedRow {
+            sequence: u64,
+            observed_at_ms: u64,
+            encoded_len: usize,
+            content_digest: String,
+            payload_class: String,
+            gap_reason: Option<String>,
+            is_heartbeat: bool,
+            is_intent: bool,
+        }
+
+        fn payload_class(payload: &WatchdogSpoolPayload) -> String {
+            match payload {
+                WatchdogSpoolPayload::Heartbeat { .. } => "heartbeat".to_owned(),
+                WatchdogSpoolPayload::Gap { .. } => "gap".to_owned(),
+                WatchdogSpoolPayload::Recovery { .. } => "recovery".to_owned(),
+                WatchdogSpoolPayload::ProblemIntent { .. } => "problem_intent".to_owned(),
+                WatchdogSpoolPayload::IncidentIntent { .. } => "incident_intent".to_owned(),
+            }
+        }
+
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let mut rows: Vec<RetainedRow> = Vec::new();
+        match read.open_table(SPOOL_TABLE) {
+            Ok(table) => {
+                for item in table
+                    .iter()
+                    .map_err(|error| SpoolError::Database(error.to_string()))?
+                {
+                    let (key, value) =
+                        item.map_err(|error| SpoolError::Database(error.to_string()))?;
+                    if key.value() == SPOOL_HEADER_KEY {
+                        continue;
+                    }
+                    if rows.len() as u64 >= SPOOL_MAX_RECORDS {
+                        return Err(SpoolError::Corrupt(
+                            "watchdog health corpus read exceeds the declared retention ceiling"
+                                .to_owned(),
+                        ));
+                    }
+                    // The digest is taken over the ORIGINAL stored bytes and the
+                    // bytes are also passed through the existing decoder, so
+                    // neither the identity nor the validation is a recomputation
+                    // of a value this owner derived some other way.
+                    let stored = value.value();
+                    let entry = decode_entry(key.value(), stored)?;
+                    rows.push(RetainedRow {
+                        sequence: key.value(),
+                        observed_at_ms: entry.observed_at_ms,
+                        encoded_len: stored.len(),
+                        content_digest: sha256_hex(stored),
+                        payload_class: payload_class(&entry.payload),
+                        gap_reason: match &entry.payload {
+                            WatchdogSpoolPayload::Gap { reason, .. } => {
+                                Some(serde_json::to_string(reason).map_err(|error| {
+                                    SpoolError::Serialization(error.to_string())
+                                })?)
+                            }
+                            _ => None,
+                        },
+                        is_heartbeat: matches!(
+                            &entry.payload,
+                            WatchdogSpoolPayload::Heartbeat { .. }
+                        ),
+                        is_intent: intent::is_intent_payload(&entry.payload),
+                    });
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        }
+        rows.sort_by_key(|row| row.sequence);
+        drop(read);
+
+        let acknowledged_sequence = self.read_export_cursor()?.acknowledged_sequence;
+        let receipts: BTreeSet<u64> = self.read_intent_receipt_sequences()?.into_iter().collect();
+
+        let mut retained_records = 0_u64;
+        let mut retained_bytes = 0_u64;
+        let mut distinct_content = 0_u64;
+        let mut content_duplicates = 0_u64;
+        let mut reused_acknowledged_content = 0_u64;
+        let mut reactivated_after_receipt = 0_u64;
+        let mut unacknowledged_records = 0_u64;
+        let mut delivered_without_receipt = 0_u64;
+        let mut intents_without_receipt = 0_u64;
+        let mut stale_records = 0_u64;
+        let mut newest_heartbeat_sequence = 0_u64;
+        let mut newest_sequence = 0_u64;
+        let mut newest_payload_class = String::new();
+        let mut last_gap_by_reason: BTreeMap<String, u64> = BTreeMap::new();
+        let mut first_sequence_by_digest: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut digest_fields: Vec<String> = Vec::new();
+
+        for row in &rows {
+            retained_records += 1;
+            retained_bytes += row.encoded_len as u64;
+            digest_fields.push(row.sequence.to_string());
+            digest_fields.push(row.content_digest.clone());
+            if now_ms.saturating_sub(row.observed_at_ms) > freshness_window_ms {
+                stale_records += 1;
+            }
+            if row.sequence > acknowledged_sequence {
+                unacknowledged_records += 1;
+            } else if !receipts.contains(&row.sequence) {
+                delivered_without_receipt += 1;
+            }
+            if row.is_intent && !receipts.contains(&row.sequence) {
+                intents_without_receipt += 1;
+            }
+            if row.is_heartbeat {
+                newest_heartbeat_sequence = row.sequence;
+            }
+            if let Some(reason) = row.gap_reason.as_ref() {
+                last_gap_by_reason.insert(reason.clone(), row.sequence);
+            }
+            if row.sequence >= newest_sequence {
+                newest_sequence = row.sequence;
+                newest_payload_class.clone_from(&row.payload_class);
+            }
+            if let Some(first) = first_sequence_by_digest.get(row.content_digest.as_str()) {
+                content_duplicates += 1;
+                if *first <= acknowledged_sequence {
+                    reused_acknowledged_content += 1;
+                }
+                if receipts.contains(first) {
+                    reactivated_after_receipt += 1;
+                }
+            } else {
+                distinct_content += 1;
+                first_sequence_by_digest.insert(row.content_digest.as_str(), row.sequence);
+            }
+        }
+        // A gap reason is deferred when no accepted heartbeat was recorded at or
+        // after the newest gap carrying it, which is a measured position in the
+        // owner's own retained stream and not a judgement about any process.
+        let deferred_gap_reasons = last_gap_by_reason
+            .values()
+            .filter(|sequence| **sequence >= newest_heartbeat_sequence)
+            .count() as u64;
+
+        Ok(WatchdogHealthCorpus {
+            retained_records,
+            retained_bytes,
+            distinct_content,
+            content_duplicates,
+            reused_acknowledged_content,
+            reactivated_after_receipt,
+            acknowledged_sequence,
+            unacknowledged_records,
+            delivered_without_receipt,
+            intents_without_receipt,
+            stale_records,
+            deferred_gap_reasons,
+            newest_heartbeat_sequence,
+            newest_payload_class: newest_payload_class.clone(),
+            evidence_id: sha256_hex(
+                encode_identity(&[
+                    "watchdog_health_corpus".to_owned(),
+                    retained_records.to_string(),
+                    retained_bytes.to_string(),
+                    distinct_content.to_string(),
+                    content_duplicates.to_string(),
+                    reused_acknowledged_content.to_string(),
+                    reactivated_after_receipt.to_string(),
+                    acknowledged_sequence.to_string(),
+                    unacknowledged_records.to_string(),
+                    delivered_without_receipt.to_string(),
+                    intents_without_receipt.to_string(),
+                    stale_records.to_string(),
+                    deferred_gap_reasons.to_string(),
+                    newest_heartbeat_sequence.to_string(),
+                    newest_sequence.to_string(),
+                    newest_payload_class.clone(),
+                    encode_identity(&digest_fields),
+                ])
+                .as_bytes(),
+            ),
+        })
     }
 
     /// Builds one bounded immutable export batch for an exact acknowledgement.
