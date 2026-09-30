@@ -467,11 +467,14 @@ struct ActivatedMutationDescriptor {
 /// keyed `(skill_id, scope_key)` with the closed capability-evidence typed
 /// contract; the store issues the fenced row revision the Governor orders
 /// same-key evidence by, and the write itself grants no admission, support,
-/// influence, or lifecycle change). All
+/// influence, or lifecycle change); `RecordOrientationOwnerSources` persists
+/// the exact independent classification, admission, and cue-binding owner
+/// source set through the same candidate-only family, with immutable source
+/// rows and predecessor-head CAS in the canonical transaction. All
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 20] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 21] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -597,6 +600,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 20] = [
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordOrientationOwnerSources,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: READ_MAX_OUTPUT_BYTES,
     },
 ];
 
@@ -825,6 +834,7 @@ pub fn validate_read_against_catalogue(
 /// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
 /// `CommitExperienceBank`, `CommitAgentFeedback`,
 /// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`,
+/// `RecordOrientationOwnerSources`,
 /// `ApplyProblemOwnerState`, and
 /// `RecordModuleCatalogSnapshot` have activated
 /// mutation entries; any other named
@@ -921,6 +931,9 @@ pub fn validate_transition_against_catalogue(
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::decode_capability_evidence_mutation(command.operation, &command.parameters)
                     .map(|_| ())?;
+            }
+            NamedMutationOperation::RecordOrientationOwnerSources => {
+                crate::decode_orientation_owner_sources(&command.parameters).map(|_| ())?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);

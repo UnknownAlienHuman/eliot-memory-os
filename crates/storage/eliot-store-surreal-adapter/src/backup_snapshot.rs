@@ -519,7 +519,7 @@ pub(crate) enum CanonicalSourceClass {
     /// `GENERATION_V2` today, and the v2 baseline (`schema.rs`) defines exactly
     /// the eleven tables this enumeration reads: the two
     /// [`CanonicalSourceClass::CapturePoint`] rows plus the nine
-    /// [`CanonicalSourceClass::Member`] rows. The twelve classes below are not
+    /// [`CanonicalSourceClass::Member`] rows. The thirteen classes below are not
     /// among them. Reading a table the admitted generation does not define
     /// inside one `BEGIN … COMMIT` batch aborts the whole transaction (see the
     /// recorded provider observations in `apply/read_boundary.rs`), so capturing
@@ -548,7 +548,7 @@ pub(crate) enum CanonicalSourceClass {
 /// policy and configuration snapshots, required pending operational state,
 /// purge ledger, Architecture revision digest, manifest, and checksums." This
 /// enumeration is the bounded-surreal-adapter's share of that list: the nine
-/// admitted canonical tables, the two point singletons, and the twelve classes
+/// admitted canonical tables, the two point singletons, and the thirteen classes
 /// the admitted generation does not define.
 pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     CanonicalSourceClass::CapturePoint {
@@ -695,6 +695,9 @@ pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     },
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::LEARNING_RECORD,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::CAMPAIGN_SOURCE,
     },
 ];
 

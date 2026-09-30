@@ -52,6 +52,7 @@ pub(crate) mod surreal_learning;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 pub(crate) mod surreal_swarm;
+mod surreal_orientation_sources;
 use atomic_write::{TxLane, to_value, write_transaction};
 #[cfg(test)]
 use atomic_write::{ordering_write_template, revision_write_template};
@@ -1329,6 +1330,12 @@ async fn prepare_attempt_leg_writes(
     transition: &eliot_store_api::PreparedTransition,
     erasure_dispatched: &mut bool,
 ) -> Result<AttemptLegWrites, AdapterError> {
+    surreal_orientation_sources::prepare_orientation_owner_source_writes(
+        db,
+        &adapter.config,
+        transition,
+    )
+    .await?;
     if transition.transition_class == TransitionClass::Erasure && !*erasure_dispatched {
         let intent = surreal_intent_from_transition(transition)?;
         apply_surreal_erasure(adapter, &intent).await?;

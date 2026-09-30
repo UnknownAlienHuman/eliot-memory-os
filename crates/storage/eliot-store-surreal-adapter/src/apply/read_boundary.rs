@@ -478,6 +478,15 @@ async fn named_read_payload(
         NamedReadOperation::GetLearningRecordRange => {
             learning_record_range_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetCampaignSourceRevision => {
+            let read = super::surreal_orientation_sources::read_campaign_source_revision(
+                db,
+                &adapter.config,
+                query,
+            )
+            .await?;
+            Ok(json!({"campaign_source_revision": read}))
+        }
         NamedReadOperation::GetCapabilityEvidenceRecordRange => {
             capability_evidence_record_range_payload(db, &adapter.config, query, state_fence).await
         }
