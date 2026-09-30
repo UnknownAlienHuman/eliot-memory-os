@@ -1384,7 +1384,10 @@ impl KernelHostRequestClient {
 /// hardcoded `None`.
 fn live_task_refs(facts: &TransportFacts) -> (Option<&str>, Option<&str>) {
     match facts.task_binding.as_ref() {
-        Some(binding) => (Some(binding.task_id.as_str()), Some(binding.work_scope_id.as_str())),
+        Some(binding) => (
+            Some(binding.task_id.as_str()),
+            Some(binding.work_scope_id.as_str()),
+        ),
         None => (None, None),
     }
 }
@@ -1443,7 +1446,10 @@ fn build_invocation_envelope(
         .clone()
         .ok_or_else(request_failure)?;
     let (task_id, work_scope_id) = match facts.task_binding.as_ref() {
-        Some(binding) => (Some(binding.task_id.clone()), Some(binding.work_scope_id.clone())),
+        Some(binding) => (
+            Some(binding.task_id.clone()),
+            Some(binding.work_scope_id.clone()),
+        ),
         None => (None, None),
     };
     let identity = HostRequestIdentity {
@@ -1617,7 +1623,10 @@ fn build_resolve_envelope(
         return Err(request_failure());
     }
     let (task_id, work_scope_id) = match facts.task_binding.as_ref() {
-        Some(binding) => (Some(binding.task_id.clone()), Some(binding.work_scope_id.clone())),
+        Some(binding) => (
+            Some(binding.task_id.clone()),
+            Some(binding.work_scope_id.clone()),
+        ),
         None => (None, None),
     };
     let identity = HostRequestIdentity {
