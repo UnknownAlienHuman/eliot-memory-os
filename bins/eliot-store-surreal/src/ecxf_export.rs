@@ -296,20 +296,18 @@ fn projection_record(
 ///
 /// The vocabulary is the adapter's own `EcxfCaptureGap`
 /// (`crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`); this
-<<<<<<< HEAD
 /// maps each gap onto the static name of the already-existing
 /// [`CoherentSourceExport`] field it leaves unobserved, and adds no second gap
-/// type. Only `scope_id`, `store_generation`, `source_adapter` and `compression`
-/// are also source-view or manifest members under those names; the rest are
-/// named after the field the source view would have had to supply.
+/// type. Only `scope_id` is also an `ExportFence` member under that name; the
+/// rest are source-view and manifest members (`purge_ledger`,
+/// `reachable_blob_residency_keys`, `architecture_source_digest`,
+/// `export_receipt`), which is why they are named after the field the source view
+/// would have had to supply.
 /// `BlobStoreEvidenceUnavailable` names `reachable_blob_residency_keys`, which
 /// since issue #1871 A2 is no longer a source-view field at all: reachability is
 /// read through its own port call, so the name identifies the member that read
 /// cannot supply. That read refuses on the same gap under its own arm, and this
 /// arm stays because the coherent view is refused before that read is reached.
-/// `StoreResourceGenerationUnavailable` names `store_generation` rather than
-/// `state_fence.resource_generation` because the fence's resource generation is
-/// the generation relevant to one decision, not the store's own.
 fn unobserved_member(capture: &EcxfSourceCapture) -> Option<&'static str> {
     match capture.missing_evidence.first() {
         Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => Some("scope_id"),
