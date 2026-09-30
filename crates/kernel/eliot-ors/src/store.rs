@@ -126,6 +126,12 @@ impl persistence_codec::PersistedValue for VersionedArtifactEntry {
 }
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
+const STORE_OBJECT_IDENTITY_KEY: &str = "store_object_identity_v1";
+const STORE_OBJECT_IDENTITY_SCHEMA_KEY: &str = "store_object_identity_schema";
+const STORE_OBJECT_IDENTITY_SCHEMA_V1: &str = "ors_store_object_identity_v1";
+const STORE_OBJECT_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const MAX_STORE_OBJECT_IDENTITY_BYTES: usize = 1024;
+const MAX_STORE_OBJECT_IDENTITY_SCHEMA_BYTES: usize = 64;
 const ENVELOPES: TableDefinition<&str, &str> = TableDefinition::new("ors_envelopes_v1");
 const RESERVATIONS: TableDefinition<&str, &str> = TableDefinition::new("ors_reservations_v1");
 const RESERVATION_ORDERS: TableDefinition<&str, &str> =
@@ -268,6 +274,148 @@ const PURGE_LEDGER: TableDefinition<&str, &str> = TableDefinition::new("ors_purg
 /// instant and cannot be presented, retried or recomputed by the caller.
 const PURGE_LEDGER_REVISION_BINDINGS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_purge_ledger_revision_bindings_v1");
+
+/// Durable identity and open generation of this ORS database object.
+///
+/// This row lives in `ors_meta_v1`, outside the backup row-family denominator.
+/// The generation advances transactionally on every successful open, and the
+/// installation binding can be established once but never changed.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoreObjectIdentityRecord {
+    schema_version: u16,
+    installation_id: Option<String>,
+    ors_generation: u64,
+}
+
+impl StoreObjectIdentityRecord {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.schema_version != STORE_OBJECT_IDENTITY_SCHEMA_VERSION {
+            return Err(OrsError::MigrationRequired {
+                reason: "ORS store-object identity schema is unsupported".to_owned(),
+            });
+        }
+        if self.ors_generation == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "store-object generation must be non-zero".to_owned(),
+            });
+        }
+        if let Some(installation_id) = &self.installation_id {
+            if installation_id.len() > crate::MAX_BACKUP_ID_LEN
+                || installation_id.trim() != installation_id
+                || installation_id.chars().any(char::is_control)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "ors_installation_identity",
+                    reason: "installation identity must be exact, bounded text",
+                });
+            }
+            crate::model::validate_text(installation_id, "ors_installation_identity")?;
+        }
+        Ok(())
+    }
+
+    fn installed_identity(&self) -> Result<OrsStoreIdentity, OrsError> {
+        let installation_id = self.installation_id.clone().ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "ORS database is not bound to an installed identity".to_owned(),
+            }
+        })?;
+        Ok(OrsStoreIdentity {
+            installation_id,
+            ors_generation: self.ors_generation,
+        })
+    }
+}
+
+fn read_store_object_identity(
+    meta: &impl ReadableTable<&'static str, &'static str>,
+) -> Result<StoreObjectIdentityRecord, OrsError> {
+    let schema = match meta
+        .get(STORE_OBJECT_IDENTITY_SCHEMA_KEY)
+        .map_err(storage)?
+    {
+        Some(value) if value.value().len() > MAX_STORE_OBJECT_IDENTITY_SCHEMA_BYTES => {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Some(value) => Some(value.value().to_owned()),
+        None => None,
+    };
+    match schema.as_deref() {
+        Some(STORE_OBJECT_IDENTITY_SCHEMA_V1) => {}
+        Some(_) => {
+            return Err(OrsError::MigrationRequired {
+                reason: "ORS store-object identity schema marker is unsupported".to_owned(),
+            });
+        }
+        None => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "store-object identity schema marker is missing".to_owned(),
+            });
+        }
+    }
+    let raw = meta
+        .get(STORE_OBJECT_IDENTITY_KEY)
+        .map_err(storage)?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "ors_store_object_identity",
+            reason: "store-object identity row is missing".to_owned(),
+        })?;
+    if raw.value().len() > MAX_STORE_OBJECT_IDENTITY_BYTES {
+        return Err(OrsError::ProjectionLimitExceeded);
+    }
+    let raw = raw.value().to_owned();
+    let record: StoreObjectIdentityRecord = decode(&raw)?;
+    record.validate()?;
+    if encode(&record)? != raw {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "ors_store_object_identity",
+            reason: "store-object identity row is not canonically encoded".to_owned(),
+        });
+    }
+    Ok(record)
+}
+
+fn validate_scan_disclosure_installation(
+    record: &crate::ScanDisclosureOrsRecord,
+    identity: &OrsStoreIdentity,
+) -> Result<(), OrsError> {
+    if record.installation_id != identity.installation_id {
+        return Err(OrsError::IntegrityProblem {
+            record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+            reason: "scan disclosure installation does not match the durable ORS binding"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// ORS-owned installation binding and durable object generation read back on open.
+///
+/// Fields are intentionally private: callers can carry the identity ORS read
+/// from its durable metadata, but cannot mint or substitute its generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrsStoreIdentity {
+    installation_id: String,
+    ors_generation: u64,
+}
+
+impl OrsStoreIdentity {
+    /// Exact Host-injected installation identity bound to this ORS database.
+    #[must_use]
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    /// Durable ORS object generation read back after the open transaction.
+    #[must_use]
+    pub const fn ors_generation(&self) -> u64 {
+        self.ors_generation
+    }
+}
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
@@ -5725,6 +5873,11 @@ impl RedbRecoveryStore {
             });
         }
         let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        validate_scan_disclosure_installation(record, &store_identity)?;
         let key = record.operation_key.clone();
         let stored = {
             let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
@@ -5775,6 +5928,10 @@ impl RedbRecoveryStore {
         crate::model::validate_digest(request_hash, "scan_disclosure_request_hash")?;
         crate::model::validate_text(writer_receipt, "scan_disclosure_writer_receipt")?;
         let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
         let committed = {
             let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
             let staged_bytes = table
@@ -5788,6 +5945,7 @@ impl RedbRecoveryStore {
             };
             let mut next: crate::ScanDisclosureOrsRecord = decode(&bytes)?;
             next.validate()?;
+            validate_scan_disclosure_installation(&next, &store_identity)?;
             if next.request_hash != request_hash {
                 return Err(OrsError::IntegrityProblem {
                     record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
@@ -5830,6 +5988,10 @@ impl RedbRecoveryStore {
         operation_key: &str,
     ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
         let table = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
         table
             .get(operation_key)
@@ -5837,6 +5999,7 @@ impl RedbRecoveryStore {
             .map(|value| {
                 let record: crate::ScanDisclosureOrsRecord = decode(value.value())?;
                 record.validate()?;
+                validate_scan_disclosure_installation(&record, &store_identity)?;
                 if record.operation_key != operation_key {
                     return Err(OrsError::IntegrityProblem {
                         record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
@@ -5882,6 +6045,10 @@ impl RedbRecoveryStore {
             crate::model::validate_text(successor, "scan_disclosure_supersedes_ref")?;
         }
         let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
         let retired = {
             let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
             let staged_bytes = table
@@ -5895,6 +6062,7 @@ impl RedbRecoveryStore {
             };
             let mut next: crate::ScanDisclosureOrsRecord = decode(&bytes)?;
             next.validate()?;
+            validate_scan_disclosure_installation(&next, &store_identity)?;
             if next.request_hash != request_hash {
                 return Err(OrsError::IntegrityProblem {
                     record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
@@ -5955,12 +6123,24 @@ impl RedbRecoveryStore {
             return Err(OrsError::InvalidCursorLimit);
         }
         let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        if installation_id != store_identity.installation_id() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "scan disclosure listing does not match the durable ORS binding"
+                    .to_owned(),
+            });
+        }
         let table = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
         let mut records = Vec::new();
         for entry in table.iter().map_err(storage)? {
             let (_, value) = entry.map_err(storage)?;
             let record: crate::ScanDisclosureOrsRecord = decode(value.value())?;
             record.validate()?;
+            validate_scan_disclosure_installation(&record, &store_identity)?;
             if record.installation_id == installation_id {
                 records.push(record);
             }
@@ -24791,22 +24971,33 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
-    /// Opens or creates an ORS database and converts interrupted execution to reconciliation.
+    /// Opens or creates an unbound ORS database and advances its durable object generation.
+    ///
+    /// Production installation-scoped composition should use
+    /// [`Self::open_for_installation`], which also binds the Host-issued
+    /// installation identity before returning the store.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OrsError> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(storage)?;
-        }
-        let database = Database::create(path).map_err(storage)?;
-        let store = Self {
-            database,
-            evidence: Arc::new(RejectUnboundEvidence),
-            #[cfg(feature = "test-support")]
-            authority_handoff_failpoint: std::sync::Mutex::new(None),
-        };
-        store.initialize()?;
-        store.recover_interrupted_execution()?;
+        let (store, _) = Self::open_inner(path, Arc::new(RejectUnboundEvidence), None)?;
         Ok(store)
+    }
+
+    /// Opens ORS for one Host-authenticated installation and returns the
+    /// installation binding and generation read back from durable ORS metadata.
+    ///
+    /// The binding is set once. A later open for a different installation
+    /// fails closed. The object generation is allocated by ORS and increments
+    /// transactionally on every successful open; it is not accepted from the
+    /// caller, backup request, runtime artifact registry or P-07 revision.
+    pub fn open_for_installation(
+        path: impl AsRef<Path>,
+        installation_id: &str,
+    ) -> Result<(Self, OrsStoreIdentity), OrsError> {
+        let (store, record) = Self::open_inner(
+            path,
+            Arc::new(RejectUnboundEvidence),
+            Some(installation_id),
+        )?;
+        Ok((store, record.installed_identity()?))
     }
 
     /// Opens ORS with the composition-owned canonical/readback authenticator.
@@ -24814,6 +25005,25 @@ impl RedbRecoveryStore {
         path: impl AsRef<Path>,
         evidence: Arc<dyn CanonicalEvidenceProvider>,
     ) -> Result<Self, OrsError> {
+        let (store, _) = Self::open_inner(path, evidence, None)?;
+        Ok(store)
+    }
+
+    /// Reads the installed identity and object generation from durable ORS metadata.
+    ///
+    /// This is a readback of the store-owned binding, not a cached or caller-
+    /// supplied identity. It fails closed when the database is still unbound.
+    pub fn installed_store_identity(&self) -> Result<OrsStoreIdentity, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        read_store_object_identity(&meta)?.installed_identity()
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        evidence: Arc<dyn CanonicalEvidenceProvider>,
+        expected_installation_id: Option<&str>,
+    ) -> Result<(Self, StoreObjectIdentityRecord), OrsError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(storage)?;
@@ -24826,8 +25036,177 @@ impl RedbRecoveryStore {
             authority_handoff_failpoint: std::sync::Mutex::new(None),
         };
         store.initialize()?;
+        store.check_store_object_identity(expected_installation_id)?;
         store.recover_interrupted_execution()?;
-        Ok(store)
+        let identity = store.advance_store_object_generation(expected_installation_id)?;
+        Ok((store, identity))
+    }
+
+    fn check_store_object_identity(
+        &self,
+        expected_installation_id: Option<&str>,
+    ) -> Result<(), OrsError> {
+        if let Some(installation_id) = expected_installation_id {
+            crate::model::validate_text(installation_id, "ors_installation_identity")?;
+            if installation_id.len() > crate::MAX_BACKUP_ID_LEN
+                || installation_id.trim() != installation_id
+                || installation_id.chars().any(char::is_control)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "ors_installation_identity",
+                    reason: "installation identity must be exact, bounded text",
+                });
+            }
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        let schema_present = meta
+            .get(STORE_OBJECT_IDENTITY_SCHEMA_KEY)
+            .map_err(storage)?
+            .is_some();
+        let identity_present = meta
+            .get(STORE_OBJECT_IDENTITY_KEY)
+            .map_err(storage)?
+            .is_some();
+        let identity = match (schema_present, identity_present) {
+            (false, false) => None,
+            (true, true) => Some(read_store_object_identity(&meta)?),
+            _ => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "ors_store_object_identity",
+                    reason: "store-object identity row and schema marker disagree".to_owned(),
+                });
+            }
+        };
+        if let (Some(expected), Some(identity)) = (expected_installation_id, identity) {
+            if identity
+                .installation_id
+                .as_deref()
+                .is_some_and(|bound| bound != expected)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "ors_store_object_identity",
+                    reason: "ORS database is bound to a different installation identity"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_store_object_generation(
+        &self,
+        expected_installation_id: Option<&str>,
+    ) -> Result<StoreObjectIdentityRecord, OrsError> {
+        if let Some(installation_id) = expected_installation_id {
+            crate::model::validate_text(installation_id, "ors_installation_identity")?;
+            if installation_id.len() > crate::MAX_BACKUP_ID_LEN
+                || installation_id.trim() != installation_id
+                || installation_id.chars().any(char::is_control)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "ors_installation_identity",
+                    reason: "installation identity must be exact, bounded text",
+                });
+            }
+        }
+
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let schema = match meta
+            .get(STORE_OBJECT_IDENTITY_SCHEMA_KEY)
+            .map_err(storage)?
+        {
+            Some(value) if value.value().len() > MAX_STORE_OBJECT_IDENTITY_SCHEMA_BYTES => {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            Some(value) => Some(value.value().to_owned()),
+            None => None,
+        };
+        let raw_record = match meta.get(STORE_OBJECT_IDENTITY_KEY).map_err(storage)? {
+            Some(value) if value.value().len() > MAX_STORE_OBJECT_IDENTITY_BYTES => {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            Some(value) => Some(value.value().to_owned()),
+            None => None,
+        };
+        let mut record = match (schema.as_deref(), raw_record) {
+            (None, None) => StoreObjectIdentityRecord {
+                schema_version: STORE_OBJECT_IDENTITY_SCHEMA_VERSION,
+                installation_id: expected_installation_id.map(str::to_owned),
+                ors_generation: 1,
+            },
+            (Some(STORE_OBJECT_IDENTITY_SCHEMA_V1), Some(raw)) => {
+                let mut record: StoreObjectIdentityRecord = decode(&raw)?;
+                record.validate()?;
+                if encode(&record)? != raw {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "ors_store_object_identity",
+                        reason: "store-object identity row is not canonically encoded".to_owned(),
+                    });
+                }
+                record.ors_generation = record
+                    .ors_generation
+                    .checked_add(1)
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "ors_store_object_identity",
+                        reason: "store-object generation is exhausted".to_owned(),
+                    })?;
+                record
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "ors_store_object_identity",
+                    reason: "store-object identity row and schema marker disagree".to_owned(),
+                });
+            }
+            (Some(_), Some(_)) => {
+                return Err(OrsError::MigrationRequired {
+                    reason: "ORS store-object identity schema marker is unsupported".to_owned(),
+                });
+            }
+        };
+
+        if let Some(expected) = expected_installation_id {
+            match record.installation_id.as_deref() {
+                Some(bound) if bound != expected => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "ors_store_object_identity",
+                        reason: "ORS database is bound to a different installation identity"
+                            .to_owned(),
+                    });
+                }
+                Some(_) => {}
+                None => record.installation_id = Some(expected.to_owned()),
+            }
+        }
+        record.validate()?;
+        let encoded = encode(&record)?;
+        meta.insert(STORE_OBJECT_IDENTITY_KEY, encoded.as_str())
+            .map_err(storage)?;
+        meta.insert(
+            STORE_OBJECT_IDENTITY_SCHEMA_KEY,
+            STORE_OBJECT_IDENTITY_SCHEMA_V1,
+        )
+        .map_err(storage)?;
+        drop(meta);
+        write.commit().map_err(storage)?;
+
+        // Return a fresh read of the committed row, not the attempted write or
+        // a caller-provided generation.
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        let readback = read_store_object_identity(&meta)?;
+        if readback.ors_generation != record.ors_generation
+            || readback.installation_id != record.installation_id
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "store-object identity readback differs from the committed generation"
+                    .to_owned(),
+            });
+        }
+        Ok(readback)
     }
 
     /// Opens a Kernel-route test store with the structural Kernel-route evidence.
