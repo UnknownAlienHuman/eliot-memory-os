@@ -5655,7 +5655,7 @@ enum ImprovementIntakeFlight {
 /// branch of the improvement funnel, which is the one place a maintenance
 /// result is least likely to be interesting and most likely to be dropped.
 ///
-/// Three reads and one pure assembly, all under the lock:
+/// Two reads and one pure assembly, all under the lock:
 ///
 /// - the admitted Kernel fence for this pass, which is also the fence the
 ///   deduplication registry is read back at;
@@ -5663,16 +5663,20 @@ enum ImprovementIntakeFlight {
 ///   the live `GovernorOwners::maintenance` owner — this is where the
 ///   per-surface bound numbers and the owning authority come from
 ///   (`eliotd::improvement_intake_dispatch::maintenance_bound`), so the
-///   daemon spells none of them;
-/// - the Governor learning-closure image, read through
-///   `DaemonComposition::learning_closure().store()` so the brief's safe
-///   boundary is the newest boundary an owner actually closed
-///   (`SafeBoundary::from_observed_closure`). This is a read of already
-///   committed in-process state — the store's own mutex, no transport — and it
-///   is done HERE, inside the composition guard, because it must not race the
-///   guard release that precedes the authenticated dedup read below. An empty
-///   image is a typed refusal, so the pass commits nothing until a
-///   consequential closure has been observed.
+///   daemon spells none of them.
+///
+/// The brief's safe boundary and its recorded repeat used to be read HERE,
+/// through `DaemonComposition::learning_closure().store()`. That image is a
+/// `Mutex<LearningDeltaImage>` inside this process, so both were scoped to one
+/// process lifetime and every restart silently emptied them — a repeated
+/// verifier failure, which is rare and unrecoverable once lost, became
+/// invisible to every later pass. They are now read from `durable_delta_rows`,
+/// which the caller filled in its own UNGUARDED phase over the authenticated
+/// `GetLearningRecordRange` route
+/// (`eliotd::improvement_intake_dispatch::read_durable_learning_delta_scope`) at
+/// `delta_fence`, the same contour the deduplication read below uses. The fence
+/// that read ran at is re-checked here against the fence re-read under this
+/// guard, so a pass can never assemble over rows read at a superseded fence.
 ///
 /// The admission is deliberately NOT performed here. It needs the restored
 /// deduplication registry first, and that registry is read over the
@@ -5688,6 +5692,8 @@ enum ImprovementIntakeFlight {
 fn improvement_intake_artifact(
     composition: &DaemonComposition,
     decision: &eliot_maintenance::AutomationTriggerDecision,
+    durable_delta_rows: &[serde_json::Value],
+    delta_fence: &eliot_contracts::StateFence,
 ) -> Result<
     (
         eliotd::improvement_intake_dispatch::ImprovementArtifact,
@@ -5715,15 +5721,29 @@ fn improvement_intake_artifact(
             &eliotd::improvement_intake_dispatch::improvement_bound_idempotency_key(decision),
         )
         .map_err(|error| error.to_string())?;
-    // The brief's safe boundary is observed here, under the composition guard
-    // the caller already holds: `learning_closure()` is the daemon's single
-    // Governor-owned closure image, and `store()` hands back the canonical
-    // learning-delta store whose newest committed record IS an
-    // owner-observed consequential boundary.
+    // The rows the closure evidence is read from were fetched at `delta_fence`,
+    // which was read under a previous borrow and awaited with no mutex held. A
+    // moved fence means the evidence and the assembly could describe different
+    // authority epochs, so the pass refuses rather than assembling over a
+    // superseded read — the same re-check [`admit_over_restored_registry`]
+    // applies between the dedup read and the admission.
+    if fence != *delta_fence {
+        return Err(
+            "the admitted state fence moved between the durable learning-delta read and the \
+             artifact assembly"
+                .to_owned(),
+        );
+    }
+    // The brief's safe boundary and its recorded repeat are observed from the
+    // DURABLE learning-delta rows the caller read back over the authenticated
+    // Kernel named-read route. They are NOT read from the daemon's single
+    // in-process closure image: that image is emptied by a restart, which made
+    // both describe one process lifetime and dropped every repeated verifier
+    // failure recorded before it.
     let artifact = eliotd::improvement_intake_dispatch::assemble_improvement_artifact(
         decision,
         &fence,
-        composition.learning_closure().store(),
+        durable_delta_rows,
         &policy,
     )
     .map_err(|error| error.to_string())?;
@@ -5792,15 +5812,18 @@ fn admit_over_restored_registry(
 /// artifact through the Governor improvement pipeline.
 ///
 /// Six phases, and the lock is taken more than once because phase 1 is split
-/// around the publication:
+/// around the publication and around the durable closure read:
 ///
-/// 1. guarded, in two steps: evaluate the observation into the maintenance
+/// 1. guarded, in three steps: evaluate the observation into the maintenance
 ///    owner's own decision; then, UNGUARDED, publish that decision's source
-///    result through [`publish_maintenance_source_results`]; then guarded again
-///    to capture the admitted fence, assemble the artifact and read the `G-19`
-///    admission policy. The split exists because the decision is a maintenance
-///    source result in its own right and owes its observation whether or not
-///    the phases below it ever run;
+///    result through [`publish_maintenance_source_results`]; then, UNGUARDED,
+///    read the DURABLE learning-delta scope back at a fence captured under its
+///    own short borrow; then guarded again to re-check that fence, assemble the
+///    artifact and read the `G-19` admission policy. Both splits exist because
+///    the decision is a maintenance source result in its own right and owes its
+///    observation whether or not the phases below it ever run, and because the
+///    closure evidence it assembles over must survive a restart — the in-process
+///    closure image it replaced was emptied by every one of them;
 /// 2. UNGUARDED: read the whole candidate scope back through the existing
 ///    authenticated `GetLearningRecordRange` route at the fence captured in
 ///    phase 1. No mutex is held across this await, exactly as the Skill
@@ -5894,9 +5917,54 @@ async fn run_improvement_intake(
     // Phase 1b: publish that decision's source result, unguarded, before any
     // intake-specific phase can succeed or fail.
     publish_maintenance_source_results(composition, &decision, failure_guard).await;
+    // Phase 1c: the DURABLE learning-closure evidence, unguarded. The closure
+    // image it replaces was process-local, so a restart used to leave the brief
+    // with no observed boundary at all and any repeated verifier failure
+    // invisible; this reads the committed learning-delta rows back over the same
+    // authenticated `GetLearningRecordRange` route the deduplication read below
+    // uses, at a fence captured under a short borrow first. No mutex is held
+    // across the await.
+    //
+    // A refused or unexhausted read is this phase's own diagnostic, exactly as
+    // the phases below treat their refusals, and the pass STOPS. It is never
+    // treated as "no closure was ever recorded": that is precisely the state in
+    // which a committed repeat would be dropped.
+    let delta_fence = {
+        let guard = composition.lock().await;
+        match guard.notification_state_admission_fence() {
+            Ok(fence) => fence,
+            Err(error) => {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "improvement-intake",
+                    &error.to_string(),
+                )
+                .emit();
+                return retained.cloned();
+            }
+        }
+    };
+    let delta_rows =
+        match eliotd::improvement_intake_dispatch::read_durable_learning_delta_scope(
+            kernel,
+            &delta_fence,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "improvement-learning-delta-read",
+                    &error.to_string(),
+                )
+                .emit();
+                return retained.cloned();
+            }
+        };
     let prepared = {
         let guard = composition.lock().await;
-        improvement_intake_artifact(&guard, &decision)
+        improvement_intake_artifact(&guard, &decision, &delta_rows, &delta_fence)
     };
     let (artifact, policy, fence) = match prepared {
         Ok(prepared) => prepared,

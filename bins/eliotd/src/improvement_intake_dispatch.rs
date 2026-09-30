@@ -20,14 +20,24 @@
 //! references the trigger site passed in. Nothing here invents an observation:
 //! every ref below is derived from that decision's own fields.
 //!
-//! The second is the daemon's Governor-owned learning-closure image
-//! ([`eliot_governor::CanonicalLearningDeltaStore`], reached as
-//! `DaemonComposition::learning_closure().store()`), whose newest committed
+//! The second is the daemon's Governor-owned learning-closure record, read back
+//! from the DURABLE learning-delta scope the canonical owner holds
+//! ([`read_durable_learning_delta_scope`] →
+//! [`eliot_governor::observed_closure_from_durable_rows`]), whose committed
 //! record is a real campaign/attempt closure. It was already mandatory — the
 //! brief's safe boundary refuses the pass without it — but its own committed
 //! lineage reached only the brief's prose, so the candidate's evidence and
 //! deduplication lineage did not include it. It is now bound; see
 //! [`ObservedClosure::lineage_evidence_refs`].
+//!
+//! It was read from the in-process
+//! [`eliot_governor::CanonicalLearningDeltaStore`] image until this change, and
+//! that made every brief — and every repeated verifier failure marker on the same
+//! image — describe one process lifetime. The daemon publishes each committed
+//! closure through the existing canonical learning-record write
+//! ([`publish_learning_delta_record`], the same `RecordLearningRecord` mutation
+//! the candidate artifact commits through, at the closed `Delta` kind) and reads
+//! the rows back here, so a restart no longer empties the evidence A1 rests on.
 //!
 //! The evidence source is DERIVED from that decision's own closed fields by
 //! [`maintenance_evidence_source`], not asserted. It previously claimed
@@ -59,7 +69,7 @@
 //!   the outcome it produced; the residual [`EvidenceSource::Attempt`] arm.
 //! - **CampaignClosure** — the Governor's committed learning-closure record.
 //!   This is the one this change adds, and it was already a mandatory input of
-//!   this function ([`SafeBoundary::from_observed_closure`] refuses the whole
+//!   this function ([`SafeBoundary::from_observed_closure_record`] refuses the whole
 //!   pass without it) whose committed lineage reached only the brief's prose.
 //!   [`ObservedClosure::lineage_evidence_refs`] puts the record's own artifact
 //!   handle and canonical digest into the candidate's evidence lineage, on BOTH
@@ -524,11 +534,15 @@ use eliot_maintenance::{
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
-    LearningRecordKind, ScopeId, canonical_json_bytes, learning_record_commit_params,
-    learning_record_mutation_request,
+    EXPERIENCE_PAGE_NEXT_CURSOR, EXPERIENCE_PAGE_RECORDS, EXPERIENCE_PAGE_STATE_FENCE,
+    EXPERIENCE_PAGE_TRUNCATED, LEARNING_PARAM_CURSOR, LearningRecordKind,
+    MAX_LEARNING_PAGE_RECORDS, NamedReadOperation, ScopeId, canonical_json_bytes,
+    learning_record_commit_params, learning_record_mutation_request, learning_record_read_request,
 };
+use serde_json::Value;
 use thiserror::Error;
 
+use super::daemon_kernel_client::DaemonKernelClient;
 use super::{DaemonComposition, SERVICE_NAME};
 
 /// Closed improvement surface this daemon's own self-quality-debt observations
@@ -650,6 +664,19 @@ pub enum ImprovementDispatchError {
     /// The durable learning-record commit was refused.
     #[error("improvement learning-record commit: {0}")]
     Commit(String),
+    /// The durable learning-delta scope could not be read back as an EXHAUSTIVE
+    /// set at one fence, or a served row was not a record this build can prove.
+    ///
+    /// Every variant of this refusal means NO closure evidence was established.
+    /// None of them is "no closure exists", and a caller that treats one as an
+    /// absent repeat is exactly the failure this read exists to prevent.
+    #[error("improvement durable learning-delta read: {0}")]
+    ClosureRead(String),
+    /// The Governor could not re-prove the durable learning-delta rows into an
+    /// observed closure or a recorded repeated verifier failure. The typed
+    /// [`eliot_governor::LearningClosureError`] travels unchanged.
+    #[error("improvement durable learning-delta restore: {0}")]
+    ClosureRestore(#[from] eliot_governor::LearningClosureError),
     /// The store scope or record identity is not a valid contract value.
     #[error("improvement contract value: {0}")]
     Contract(String),
@@ -711,12 +738,16 @@ pub struct ImprovementArtifact {
 /// artifact, and the caller commits it through
 /// [`crate::DaemonComposition::commit_learning_record`].
 ///
-/// `observed_closures` is the single Governor-owned learning-closure image
-/// ([`eliot_governor::CanonicalLearningDeltaStore`]) this daemon already holds,
-/// reached as `DaemonComposition::learning_closure().store()`. It is read here,
-/// under whatever guard the caller holds, so the brief's safe boundary is an
-/// owner-observed consequential boundary rather than a formatted literal (see
-/// the `SafeBoundary::from_observed_closure` call below).
+/// `durable_delta_rows` is the EXHAUSTIVE set of committed learning-delta rows
+/// [`read_durable_learning_delta_scope`] read back from the canonical owner at
+/// the fence this pass admitted under, and re-proved row by row by
+/// [`eliot_governor::observed_closure_from_durable_rows`]. It is passed in rather
+/// than read from the in-process [`eliot_governor::CanonicalLearningDeltaStore`]
+/// image, because that image is process-local: a daemon restart empties it, and a
+/// brief gated on it — or a repeated verifier failure read from it — described
+/// only the current process lifetime. The rows arrive already read, so this
+/// function still performs no transport and is still callable under the
+/// composition guard.
 ///
 /// `policy` is the maintenance (`G-19`) owner's own admission policy record,
 /// read from the live owner in the same guarded phase. It is what the recorded
@@ -727,7 +758,7 @@ pub struct ImprovementArtifact {
 pub fn assemble_improvement_artifact(
     decision: &eliot_maintenance::AutomationTriggerDecision,
     state_fence: &StateFence,
-    observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
+    durable_delta_rows: &[Value],
     policy: &ImprovementAdmissionPolicy,
 ) -> Result<ImprovementArtifact, ImprovementDispatchError> {
     // The observed campaign-closure record is read FIRST, because the
@@ -736,11 +767,11 @@ pub fn assemble_improvement_artifact(
     // unnecessary"). It was already a mandatory input of this function — see
     // the boundary below — but its own committed lineage reached only the
     // brief's prose, so the deduplication comparison was made over strictly
-    // less evidence than the candidate actually rests on. Reading it here costs
-    // no extra exchange: it is the same mutex-guarded read of the same
-    // in-process image the boundary performs, under the composition guard the
-    // caller already holds, with no `await` between them.
-    let observed = newest_observed_closure(observed_closures)?;
+    // less evidence than the candidate actually rests on. It costs no exchange
+    // here: the rows were read by the caller's own unguarded phase and re-proved
+    // by the Governor, and both values this function takes come out of that one
+    // exhaustive read, with no `await` between them.
+    let observed = newest_observed_closure(durable_delta_rows)?;
     let decision_refs = maintenance_evidence_refs(decision);
     let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
     // `MaintenanceFamily` carries a `Display` impl (its canonical SCREAMING
@@ -754,13 +785,13 @@ pub fn assemble_improvement_artifact(
     let evidence_refs = closure_bound_evidence_refs(decision_refs, &observed);
     let admitted_scope = admitted_fence_ref(state_fence)?;
     // A repeated verifier failure committed by the TestD terminal-owner lane is
-    // read from the SAME mutex-guarded image as `observed` above, under the
-    // same composition guard and with no `await` between the two reads, so the
-    // candidate's evidence and the brief it is gated on describe one image. An
-    // unreadable image is the same typed `UnsafeBoundary` refusal the closure
-    // read above returns for the same condition, never a substituted "no repeat
-    // observed".
-    let repeated_failure = newest_repeated_verifier_failure(observed_closures)?;
+    // read from the SAME exhaustive durable read as `observed` above, so the
+    // candidate's evidence, the boundary it is gated on and the recorded repeat
+    // all describe one set of owner-committed records. A row this build cannot
+    // re-prove refuses the whole read rather than yielding a substituted "no
+    // repeat observed", which is what the process-local image used to do after
+    // every restart.
+    let repeated_failure = newest_repeated_verifier_failure(durable_delta_rows)?;
     let evidence = maintenance_sourced_evidence(
         decision,
         &observed,
@@ -811,22 +842,25 @@ pub fn assemble_improvement_artifact(
     // strings (a constant owner and a constant `boundary:{scope_ref}`), which
     // satisfied `SafeBoundary::validate` while observing nothing at all: the
     // check proved nothing about the operation it claims to gate.
-    // `SafeBoundary::from_observed_closure` takes both values from a record the
-    // Governor's learning-closure owner actually committed from owner-recorded
-    // lifecycle activities (`crates/governor/eliot-governor/src/
+    // `SafeBoundary::from_observed_closure_record` takes both values from a
+    // record the Governor's learning-closure owner actually committed from
+    // owner-recorded lifecycle activities (`crates/governor/eliot-governor/src/
     // learning_closure.rs:498`), and that boundary is derived by
     // `derive_boundaries`, which refuses an ordinary read and an empty activity
     // set before anything is committed, per I12.24:181.
     //
-    // STATED PLAINLY, because it changes what this pass does: `store` is read
-    // from already-committed in-process state and performs no exchange, but an
-    // EMPTY closure image is `ImprovementError::UnsafeBoundary`, so this pass
-    // now commits nothing until a consequential attempt has actually been
-    // closed in this process. That is the fail-closed direction I12.24:64
-    // requires — a brief must not reach an owner as though a boundary had been
-    // observed when none was — and the refusal is reported as a typed
-    // `ImprovementDispatchError::Improvement` by the caller, not swallowed.
-    let boundary = SafeBoundary::from_observed_closure(observed_closures)?;
+    // STATED PLAINLY, because it changes what this pass does: an EMPTY DURABLE
+    // scope is `ImprovementError::UnsafeBoundary`, so this pass now commits
+    // nothing until a consequential attempt has been closed AND published
+    // through the canonical learning-record write. That is the fail-closed
+    // direction I12.24:64 requires — a brief must not reach an owner as though a
+    // boundary had been observed when none was — and the refusal is reported as
+    // a typed `ImprovementDispatchError::Improvement` by the caller, not
+    // swallowed.
+    let boundary = SafeBoundary::from_observed_closure_record(
+        observed.actor_id.as_str(),
+        observed.boundary_ref.as_str(),
+    )?;
 
     // The brief's decision information is a PROJECTION OF THAT SAME OBSERVED
     // RECORD, not the raw maintenance trigger text. I12.24:74 requires the
@@ -836,26 +870,24 @@ pub fn assemble_improvement_artifact(
     // purpose, because it said nothing about what the closure actually
     // recorded.
     //
-    // `observed` was read at the TOP of this function, from the same
-    // mutex-guarded image, under the composition guard the caller already holds
-    // (`daemon_runtime::improvement_intake_artifact`), and this guarded phase
-    // commits nothing, so it is the record whose `actor_id` and
-    // `consequential_boundary` the boundary above names. It is read there and
-    // not here for two reasons that are now both load-bearing: the evidence
-    // lineage is bound to it (issue #1867 W2, see the top of this function), and
-    // the two-string `SafeBoundary` cannot carry the record itself —
-    // `eliot-improvement` has no `eliot-learning-delta` edge, so widening
-    // `SafeBoundary` to hold one would be a new dependency for a value the
-    // brief only needs to quote. The record TYPE is not named here either —
-    // `eliotd` has no `eliot-learning-delta` dependency — so it is read by
-    // inference and through the record's own accessors. An unreadable or empty
-    // image is the same typed `UnsafeBoundary` refusal the boundary constructor
-    // returns for the same condition, never a substituted value — and because
-    // the read was hoisted, it now surfaces EARLIER than it used to: before
-    // `admitted_fence_ref`'s refusal and before any candidate is assembled,
-    // where previously the fence refusal was reported first. Same typed error,
-    // same condition, different precedence; stated because the precedence is
-    // observable to the caller as which error string a pass reports.
+    // `observed` was read at the TOP of this function from the caller's one
+    // exhaustive DURABLE read, and this guarded phase commits nothing, so it is
+    // the record whose `actor_id` and `consequential_boundary` the boundary above
+    // names. It is read there and not here for two reasons that are now both
+    // load-bearing: the evidence lineage is bound to it (issue #1867 W2, see the
+    // top of this function), and the two-string `SafeBoundary` cannot carry the
+    // record itself — `eliot-improvement` has no `eliot-learning-delta` edge, so
+    // widening `SafeBoundary` to hold one would be a new dependency for a value
+    // the brief only needs to quote. The record TYPE is not named here either —
+    // `eliotd` has no `eliot-learning-delta` dependency — so it arrives as the
+    // Governor's own owned projection. An empty durable scope is the same typed
+    // `UnsafeBoundary` refusal the boundary constructor returns for the same
+    // condition, never a substituted value — and because the read was hoisted, it
+    // now surfaces EARLIER than it used to: before `admitted_fence_ref`'s
+    // refusal and before any candidate is assembled, where previously the fence
+    // refusal was reported first. Same typed error, same condition, different
+    // precedence; stated because the precedence is observable to the caller as
+    // which error string a pass reports.
     // The durable lineage handle and canonical digest the record itself
     // committed, so the owner can read exactly this closure without searching.
     let (observed_artifact, observed_digest) = (
@@ -871,6 +903,17 @@ pub fn assemble_improvement_artifact(
     let principal = boundary.observed_principal_ref();
     let boundary_ref = boundary.observed_boundary_ref();
     let unknowns = observed_unknowns(&observed, decision.family);
+    // The application class the brief states is DERIVED from the candidate's own
+    // recorded target surface through the crate's own classifier, not spelled.
+    // The previous wording asserted the word "advisory" as a literal while the
+    // only thing that makes it true is this derivation, so the brief now names
+    // what was derived. `enforce_improvement_class_gate` re-derives the same
+    // class at the admission seam, where the live registry is in hand; this copy
+    // is the value the brief quotes so the owner reads the class the gate will
+    // check rather than a constant.
+    let brief_class = classify(&ChangeDescriptor::from_recorded_surface(
+        candidate.target_surface,
+    ));
     // A recorded repeat is a fact the brief states in its own right, not a
     // clause the owner has to infer from the trigger text: it is the reason this
     // candidate exists on this pass, and I12.24:74 requires the evidence to be
@@ -901,19 +944,24 @@ pub fn assemble_improvement_artifact(
             observed.evidence_ref_count,
         ),
         &format!(
-            "the blocked family {} is evaluated on every cadence and cannot start, and the \
-             closure this brief is gated on {observed_effect}; giving that family a start route \
-             removes a blocked evaluation per cadence",
+            "OBSERVED: the maintenance owner recorded family {} blocked at this scope, and the \
+             closure this brief is gated on {observed_effect}. NOT MEASURED: this candidate has \
+             run no experiment and carries no baseline/after metric, so there is NO measured \
+             benefit figure for it; the expectation that giving that family a start route removes \
+             a blocked evaluation per cadence is an UNMEASURED PROJECTION put to the owner's \
+             judgement, not a result",
             decision.family
         ),
         &format!(
-            "advisory only; no authority, privacy, finish or durability effect is taken, and the \
-             observed boundary {boundary_ref} is not modified by it"
+            "OBSERVED: this pass executed nothing, so no authority, privacy, finish, durability \
+             or reserve effect was taken on any owner record, and the consequential boundary \
+             {boundary_ref} is unchanged. DERIVED, NOT ASSUMED: the candidate's own recorded \
+             target surface classifies as {brief_class:?}, which an advisory class makes a \
+             no-op until the owner acts (I12.24:82). NOT MEASURED: there is no risk metric, no \
+             counter-metric and no exposure window on this path, so no risk magnitude is claimed"
         ),
         principal,
-        "one owner triage pass over the stored brief; the observed closure record carries no \
-         cost, compute or Human-attention field, so the cost of the decision itself is the only \
-         cost this brief can state",
+        &observed_cost_account(&observed),
         &format!(
             "triage maintenance trigger {} against the observed boundary \
              {boundary_ref}{next_step_clause}",
@@ -1204,37 +1252,44 @@ fn closure_bound_evidence_refs(
 /// The newest committed closure record that records a REAL repeated verifier
 /// failure, when the canonical image holds one.
 ///
-/// # What this observes and why it is not the dead end the prior lane measured
+/// # Why this is read from the DURABLE scope and not the in-process image
 ///
-/// The second A1 disjunct was previously unreachable because it was looked for
-/// on the CAMPAIGN-CLOSURE ASSEMBLY path: `crates/meta/eliot-improvement/src/
-/// learning_closure.rs` returns a `ClosureAssembly::Disposition` for the
-/// repeated-failure-shaped cases and never a candidate, so no evidence could be
-/// raised there. That path is a pure function of a caller-supplied campaign
-/// episode and this daemon supplies no such episode, which is why it stayed
-/// dead.
+/// It was read from [`eliot_governor::CanonicalLearningDeltaStore`], which is a
+/// `Mutex<LearningDeltaImage>` inside this process. A daemon restart empties it,
+/// so a repeated failure — rare by construction, and therefore unrecoverable once
+/// lost — was visible to exactly one process lifetime and to no pass after it.
+/// `None` was indistinguishable from "this daemon has never seen a repeat", and
+/// for every process after the one that saw one it was silently that.
 ///
-/// The observation this reads instead is the durable ATTEMPT record the
-/// `TestD` terminal-owner lane already commits for every settled verifier attempt
-/// (`daemon_runtime::run_improvement_intake` reads that same image at
-/// `improvement_intake_artifact`). A repeated verifier failure is recorded there
-/// by the owner that can compare the two independent records it needs — the
-/// durable terminal job row's own attempt count and settled state, and the
-/// canonical verifier-execution fact's finished run, failed execution and
-/// `Fail` outcome — as
-/// [`eliot_learning_delta::REPEATED_VERIFIER_FAILURE_REF_PREFIX`] in that
-/// record's own `evidence_refs`.
+/// It is now read from the committed learning-delta rows the canonical owner
+/// holds ([`read_durable_learning_delta_scope`] →
+/// [`eliot_governor::repeated_verifier_failure_from_durable_rows`]), so the
+/// marker survives a restart and the whole A1 path keeps working across one.
+///
+/// # What the recorded repeat is, and what it is not
+///
+/// The record carries it as
+/// [`eliot_learning_delta::REPEATED_VERIFIER_FAILURE_REF_PREFIX`] in its own
+/// `evidence_refs`. That marker is minted by the Governor owner that can compare
+/// what one durable record recorded — the terminal job row's own attempt count,
+/// settled state and execution projection, against the canonical run derived from
+/// that same row's retained receipt bytes — and it is a CONSISTENCY CHECK ACROSS
+/// TWO PROJECTIONS OF ONE OWNER RECORD, not corroboration between two
+/// independent owners. The correctness of the underlying comparison, including
+/// the fact that the old "two independent owner records" claim was false and is
+/// withdrawn, is documented at
+/// [`eliot_governor::repeated_verifier_failure_from_durable_rows`] and on the
+/// marker itself.
 ///
 /// So `None` here is the ordinary answer and the pass is unchanged: a first
 /// failed attempt, a repeated PASS, an unsettled/blocked/cancelled run and a row
-/// whose execution disagrees with the run all record no marker. Nothing is
-/// inferred from a count, an ordinal or a status this module holds, and this
-/// reads the SAME mutex-guarded image under the SAME composition guard as
-/// [`newest_observed_closure`] with no `await` between them.
+/// whose execution disagrees with its run all record no marker. Nothing is
+/// inferred from a count, an ordinal or a status this module holds, and the read
+/// re-proves every served row rather than trusting the set it was handed.
 ///
 /// The record TYPE is not named — neither `eliotd` nor `eliot-improvement` has
-/// an `eliot-learning-delta` edge — and none is added: the record's accessors
-/// and fields are read through inference and the results carried by value.
+/// an `eliot-learning-delta` edge — and none is added: the record is re-proved
+/// and projected by the Governor owner, and the results are carried by value.
 #[derive(Clone, Debug)]
 struct RepeatedVerifierFailure {
     /// Verifier identity the marker retained, read whole so an identity
@@ -1292,30 +1347,20 @@ impl RepeatedVerifierFailure {
 
 /// Reads the newest committed repeated verifier failure, or `None`.
 fn newest_repeated_verifier_failure(
-    observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
-) -> Result<Option<RepeatedVerifierFailure>, ImprovementError> {
-    let (observed_records, _observed_version) = observed_closures
-        .load()
-        .map_err(|_| ImprovementError::UnsafeBoundary)?;
-    Ok(observed_records.iter().rev().find_map(|record| {
-        let verifier_ref = record.repeated_verifier_failure_verifier()?;
-        let (lineage_artifact, lineage_digest) = record.lineage_ref();
-        Some(RepeatedVerifierFailure {
-            verifier_ref: verifier_ref.to_owned(),
-            attempt_id: record.attempt_id.as_str().to_owned(),
-            campaign_id: record.campaign_id.as_str().to_owned(),
-            failure_refs: vec![
-                format!("learning-closure:{lineage_artifact}"),
-                format!("learning-closure-digest:{lineage_digest}"),
-            ],
-            lineage_artifact: lineage_artifact.to_string(),
-            lineage_digest: lineage_digest.to_owned(),
-            trace_refs: record
-                .evidence_refs
-                .iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
-        })
+    durable_delta_rows: &[Value],
+) -> Result<Option<RepeatedVerifierFailure>, ImprovementDispatchError> {
+    let restored = eliot_governor::repeated_verifier_failure_from_durable_rows(durable_delta_rows)?;
+    Ok(restored.map(|failure| RepeatedVerifierFailure {
+        verifier_ref: failure.verifier_ref,
+        attempt_id: failure.attempt_id,
+        campaign_id: failure.campaign_id,
+        failure_refs: vec![
+            format!("learning-closure:{}", failure.lineage_artifact),
+            format!("learning-closure-digest:{}", failure.lineage_digest),
+        ],
+        lineage_artifact: failure.lineage_artifact,
+        lineage_digest: failure.lineage_digest,
+        trace_refs: failure.trace_refs,
     }))
 }
 
@@ -1504,6 +1549,10 @@ pub struct ObservedClosure {
     pub lineage_artifact: String,
     /// Canonical digest of exactly the bytes that handle names.
     pub lineage_digest: String,
+    /// `actor_id` the record committed — the principal the safe boundary names.
+    pub actor_id: String,
+    /// `consequential_boundary` the record committed, in its own spelling.
+    pub boundary_ref: String,
     /// The closed attempt this observation belongs to.
     pub attempt_id: String,
     /// The campaign that attempt belonged to.
@@ -1518,34 +1567,38 @@ pub struct ObservedClosure {
     has_retry_lineage: bool,
 }
 
-/// Reads the newest committed closure record, refusing when there is none.
+/// Reads the observed closure the DURABLE learning-delta scope yields, refusing
+/// when there is none.
 ///
-/// The same mutex-guarded read [`SafeBoundary::from_observed_closure`] performs
-/// on the same image, under the composition guard the caller already holds, so
-/// both see the same newest record; this one runs FIRST, because the candidate's
-/// evidence lineage is bound to it (see
-/// [`ObservedClosure::lineage_evidence_refs`]). An unreadable or empty image is
-/// the same typed [`ImprovementError::UnsafeBoundary`] refusal, never a
-/// substituted value.
+/// The whole read is the Governor's: it re-proves every served row against its
+/// own bytes, the closed `Delta` kind, its own handle and the record's own
+/// `validate()`, and only then projects the values below. That is what makes
+/// this safe to call from an UNGUARDED phase after an exchange, and it is why an
+/// unreadable or empty durable scope is a typed refusal
+/// ([`eliot_governor::LearningClosureError`], carried unchanged as
+/// [`ImprovementDispatchError::ClosureRestore`]) rather than a substituted value.
+///
+/// The in-process [`eliot_governor::CanonicalLearningDeltaStore`] is deliberately
+/// NOT consulted: it is emptied by a restart, so gating a brief on it made the
+/// brief — and any repeated verifier failure on it — describe one process
+/// lifetime. Which record this selects, and why it is not claimed to be the most
+/// recent, is documented on
+/// [`eliot_governor::observed_closure_from_durable_rows`].
 fn newest_observed_closure(
-    observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
-) -> Result<ObservedClosure, ImprovementError> {
-    let (observed_records, _observed_version) = observed_closures
-        .load()
-        .map_err(|_| ImprovementError::UnsafeBoundary)?;
-    let observed = observed_records
-        .last()
-        .ok_or(ImprovementError::UnsafeBoundary)?;
-    let (lineage_artifact, lineage_digest) = observed.lineage_ref();
+    durable_delta_rows: &[Value],
+) -> Result<ObservedClosure, ImprovementDispatchError> {
+    let observed = eliot_governor::observed_closure_from_durable_rows(durable_delta_rows)?;
     Ok(ObservedClosure {
-        lineage_artifact: lineage_artifact.to_string(),
-        lineage_digest: lineage_digest.to_owned(),
-        attempt_id: observed.attempt_id.as_str().to_owned(),
-        campaign_id: observed.campaign_id.as_str().to_owned(),
-        route_id: observed.route_id.clone(),
-        evidence_ref_count: observed.evidence_refs.len(),
-        carries_behavioural_proposal: observed.carries_behavioural_proposal(),
-        has_retry_lineage: observed.lineage_for_retry().is_some(),
+        lineage_artifact: observed.lineage_artifact,
+        lineage_digest: observed.lineage_digest,
+        actor_id: observed.actor_id,
+        boundary_ref: observed.boundary_ref,
+        attempt_id: observed.attempt_id,
+        campaign_id: observed.campaign_id,
+        route_id: observed.route_id,
+        evidence_ref_count: observed.evidence_ref_count,
+        carries_behavioural_proposal: observed.carries_behavioural_proposal,
+        has_retry_lineage: observed.has_retry_lineage,
     })
 }
 
@@ -1565,7 +1618,7 @@ impl ObservedClosure {
     /// Why this is the honest binding and not a label. I12.24:60-61 puts a
     /// durable evidence set at the funnel's second step, and this record IS one:
     /// the Governor's learning-closure owner committed it from owner-recorded
-    /// lifecycle activities, and [`SafeBoundary::from_observed_closure`] already
+    /// lifecycle activities, and [`SafeBoundary::from_observed_closure_record`] already
     /// refuses the whole pass when it is absent. Before this, the candidate's
     /// deduplication lineage was built from the maintenance decision alone, so
     /// two observations of the same family at the same scope over DIFFERENT
@@ -1604,21 +1657,32 @@ fn observed_behaviour_effect(observed: &ObservedClosure) -> &'static str {
     }
 }
 
-/// The unknowns the observed closure could not resolve, plus the one it cannot
+/// The unknowns the observed closure could not resolve, plus the ones it cannot
 /// speak to at all.
 ///
 /// Unknowns are the states the record could NOT resolve. The maintenance
 /// start-route question is kept because it is real and no closure record answers
-/// it. `require_refs` in [`eliot_improvement::ImprovementBrief::validate`]
+/// it, and the cost measurement is kept because the record carries no field that
+/// answers it either — that one is the measured absence the brief's `cost` states
+/// rather than a number it never observed.
+/// `require_refs` in [`eliot_improvement::ImprovementBrief::validate`]
 /// still hard-requires a non-empty list.
 fn observed_unknowns(
     observed: &ObservedClosure,
     family: eliot_maintenance::MaintenanceFamily,
 ) -> Vec<String> {
-    let mut unknowns = vec![format!(
-        "unknown whether maintenance family {} has a start route",
-        family
-    )];
+    let mut unknowns = vec![
+        format!(
+            "unknown whether maintenance family {} has a start route",
+            family
+        ),
+        format!(
+            "unknown what the observed closure cost in compute, tool time or Human attention: the \
+             durable record {} carries no cost, elapsed-time or budget field, so no cost figure \
+             is measured anywhere on this path",
+            observed.lineage_artifact
+        ),
+    ];
     if !observed.has_retry_lineage {
         unknowns.push(format!(
             "the observed closure of campaign {} records no prior-attempt lineage, so it \
@@ -1627,6 +1691,54 @@ fn observed_unknowns(
         ));
     }
     unknowns
+}
+
+/// The brief's `cost` field, as an observed account plus a measured absence.
+///
+/// # Why this is not a sentence
+///
+/// The previous value was a literal string carrying no owner value at all, so
+/// the brief asserted a cost it never observed. I12.24:74 requires the brief to
+/// SHOW cost, and [`eliot_improvement::brief_at_safe_boundary`] refuses an empty
+/// one — so the field cannot simply be dropped. What it can be is the two things
+/// this path actually knows, kept visibly apart:
+///
+/// 1. the quantities the committed record DOES carry and this daemon can quote
+///    without inventing anything: its durable handle, the campaign and attempt it
+///    closed, how many evidence references it retained, whether it carries
+///    prior-attempt retry lineage, and whether it proposed a behaviour change;
+/// 2. a MEASURED ABSENCE, stated as such: [`eliot_learning_delta::StoredLearningDelta`]
+///    has no cost, compute, tool-time, elapsed-time or budget field, and this
+///    daemon runs no experiment and records no Human-attention measure, so no
+///    cost NUMBER exists to state. A sentence that reads like a cost while
+///    carrying none is worse than an owner who is told the measurement is
+///    missing, because the first hides the second.
+///
+/// The attempt identity is quoted WHOLE rather than split into an ordinal: the
+/// owner minted `{job_id}:attempt:{n}` and this daemon has no owner-side record
+/// of what `n` counts beyond the fact that it is physical attempts
+/// (`crates/instrument/eliot-testd-core/src/lib.rs:1430`), so splitting it would
+/// be a second reading of an identity the attempt owner issued.
+fn observed_cost_account(observed: &ObservedClosure) -> String {
+    format!(
+        "OBSERVED on the committed closure this brief is gated on: durable record {} retains {} \
+         evidence ref(s) for attempt {} of campaign {} on route {}, carries {} prior-attempt \
+         lineage, and {}. NOT MEASURED, AND STATED AS ABSENT: that record has no cost, compute, \
+         tool-time, elapsed-time or budget field, and this daemon ran no experiment and recorded \
+         no Human-attention measure, so NO cost figure exists for this candidate and none is \
+         asserted; what the owner is being asked to decide is whether to create one",
+        observed.lineage_artifact,
+        observed.evidence_ref_count,
+        observed.attempt_id,
+        observed.campaign_id,
+        observed.route_id,
+        if observed.has_retry_lineage {
+            "a"
+        } else {
+            "NO"
+        },
+        observed_behaviour_effect(observed),
+    )
 }
 
 /// Enforces the I12.24 application-class boundary over a real candidate
@@ -2909,6 +3021,235 @@ fn refuse_replay_only_promotion(
     }
     require_matched_budget_for_promotion(None)?;
     Ok(())
+}
+
+/// Publishes one committed learning-closure record through the existing
+/// Governor/Kernel `RecordLearningRecord` named mutation.
+///
+/// # Why this exists: the closure image was the only copy
+///
+/// [`eliot_governor::CanonicalLearningDeltaStore`] is a `Mutex` inside this
+/// process. Every closure it committed — including a
+/// `repeated-verifier-failure:` marker, which is rare and therefore lost
+/// permanently the moment the daemon restarts — existed nowhere else, so
+/// `newest_repeated_verifier_failure` answered `None` for the whole lifetime of
+/// every process after the one that saw the repeat. The heads this envelope binds
+/// are the ones the closure receipt itself computed from the store version the
+/// record was derived against
+/// (`eliot_governor::LearningClosureService::close_attempt`), so the durable
+/// commit is guarded by exactly the version the record was built on and a
+/// contended commit is refused rather than appended to a diverged image. The
+/// store's own compare-and-swap validation is untouched: this writes the record
+/// the closure already validated, and adds no second image.
+///
+/// # It is the SAME write, and it is candidate-only
+///
+/// [`DaemonComposition::commit_learning_record`] is the one Governor-owned
+/// caller of the closed `RecordLearningRecord` mutation, the same one the
+/// candidate artifact commits through, at the closed
+/// [`eliot_store_api::LearningRecordKind::Delta`] kind. No second store client
+/// and no second write path is opened. `permit`/`admitted`/
+/// `admission_receipt_present` are all false/absent because durability never
+/// implies effectiveness: a closure record is not an admitted local update, and
+/// `learning_effective_under_admission` says so rather than this function
+/// assuming it.
+///
+/// The scope is the same fixed `governor` scope the candidates land in and the
+/// same one `improvement_dedup_read` reads, so the delta row is visible to the
+/// durable read this module performs and to no second store client.
+pub async fn publish_learning_delta_record(
+    composition: &mut DaemonComposition,
+    receipt: &eliot_governor::LearningClosureReceipt,
+) -> Result<eliot_store_api::WriteReceipt, ImprovementDispatchError> {
+    let record_key = eliot_governor::learning_delta_record_key(&receipt.record);
+    // The commit identity MUST be derived at the fence the closure receipt's own
+    // head expectations were bound to: the envelope binds each head to the
+    // request fence, so reading the fence from the record is what keeps the
+    // durable commit admissible rather than a fence-mismatch refusal.
+    let state_fence = receipt.record.state_fence.clone();
+    let scope_digest = eliot_contracts::sha256_hex(IMPROVEMENT_SCOPE.as_bytes());
+    let fence_digest = eliot_contracts::sha256_hex(format!("{state_fence:?}").as_bytes());
+    let request = eliot_governor::learning_record_mutation_request_for_delta(
+        &receipt.record,
+        &scope_digest,
+        &fence_digest,
+        record_key.clone(),
+    )
+    .map_err(|error| ImprovementDispatchError::Commit(error.to_string()))?;
+    let identity = improvement_commit_identity(&record_key, &state_fence)?;
+    let scope = ScopeId::new(IMPROVEMENT_SCOPE)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let (write_receipt, _effective) = composition
+        .commit_learning_record(
+            &identity,
+            request,
+            scope,
+            // Proof refs are the record's OWN retained references, verbatim —
+            // the same discipline the candidate commit uses. Nothing is minted.
+            receipt
+                .record
+                .evidence_refs
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            None,
+            false,
+            false,
+            receipt.expected_revision_heads.clone(),
+            receipt.expected_ordering_heads.clone(),
+        )
+        .await
+        .map_err(|error| ImprovementDispatchError::Commit(error.to_string()))?;
+    Ok(write_receipt)
+}
+
+/// Reads the whole DURABLE learning-delta scope for this pass, at one fence.
+///
+/// # This is the read side of [`publish_learning_delta_record`]
+///
+/// It is the production `GetLearningRecordRange` route over
+/// [`DaemonKernelClient::store_named_async`] — the same authenticated Kernel
+/// named-read path `improvement_dedup_read::read_candidate_scope` uses — with
+/// the closed `Delta` kind instead of `Candidate`. No second store client, no
+/// second read operation and no new scope. The record TYPE is never named here:
+/// `eliotd` has no `eliot-learning-delta` edge, so the rows are handed on as
+/// projected values to
+/// [`eliot_governor::observed_closure_from_durable_rows`] /
+/// [`eliot_governor::repeated_verifier_failure_from_durable_rows`], which own the
+/// decode and the re-proof.
+///
+/// # The read is followed to EXHAUSTION, and a partial set is never "none"
+///
+/// `GetLearningRecordRange` declares no handle selector, so the store cannot be
+/// asked for `learning-delta:*` directly and a single page is NOT the whole
+/// scope. The store's own `next_cursor` is therefore followed until it reports
+/// `truncated == false`, which is the providers' authoritative
+/// end-of-enumeration signal, and the only way to stop without one — a
+/// non-advancing cursor — is a typed refusal. Every other refusal (transport,
+/// operation or fence mismatch, payload shape, missing continuation) propagates
+/// as [`ImprovementDispatchError::ClosureRead`] and the caller does NOT assemble
+/// a brief. It is never downgraded to "no closure was ever recorded", because
+/// that is precisely the state in which a committed repeat would be dropped.
+///
+/// Executed WITHOUT the composition lock, exactly like the candidate-scope read:
+/// the caller captures the fence under a short borrow, awaits this with no mutex
+/// held, and re-checks the fence under a fresh borrow before it assembles.
+pub async fn read_durable_learning_delta_scope(
+    kernel: &DaemonKernelClient,
+    admitted_fence: &StateFence,
+) -> Result<Vec<Value>, ImprovementDispatchError> {
+    let scope = ScopeId::new(IMPROVEMENT_SCOPE)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let mut rows: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut request = learning_record_read_request(
+            scope.clone(),
+            Some(LearningRecordKind::Delta),
+            MAX_LEARNING_PAGE_RECORDS,
+            admitted_fence.clone(),
+        );
+        if let Some(cursor) = cursor.as_deref() {
+            request.parameters.insert(
+                LEARNING_PARAM_CURSOR.to_owned(),
+                Value::String(cursor.to_owned()),
+            );
+        }
+        request.validate().map_err(|error| {
+            ImprovementDispatchError::ClosureRead(format!(
+                "the planned read is not a valid request: {error}"
+            ))
+        })?;
+        let response = kernel
+            .store_named_async(request.clone())
+            .await
+            .map_err(|error| {
+                ImprovementDispatchError::ClosureRead(format!("transport failed: {error}"))
+            })?;
+        // The response must answer EXACTLY the planned read, or it is not this
+        // read's evidence: operation identity, request fence, response shape and
+        // the payload's own fence echo are all re-proved before any row is read.
+        if response.operation != NamedReadOperation::GetLearningRecordRange
+            || response.operation != request.operation
+        {
+            return Err(ImprovementDispatchError::ClosureRead(
+                "the served page answers a different named read".to_owned(),
+            ));
+        }
+        if response.state_fence != request.state_fence {
+            return Err(ImprovementDispatchError::ClosureRead(
+                "the served page answers a different fence than the planned read".to_owned(),
+            ));
+        }
+        response.validate().map_err(|error| {
+            ImprovementDispatchError::ClosureRead(format!(
+                "the served page is not well formed: {error}"
+            ))
+        })?;
+        let payload_fence: StateFence =
+            serde_json::from_value(response.payload.get(EXPERIENCE_PAGE_STATE_FENCE).cloned().ok_or_else(
+                || {
+                    ImprovementDispatchError::ClosureRead(
+                        "the served page carries no state fence".to_owned(),
+                    )
+                },
+            )?)
+            .map_err(|_| {
+                ImprovementDispatchError::ClosureRead(
+                    "the served page fence does not decode".to_owned(),
+                )
+            })?;
+        if payload_fence != response.state_fence {
+            return Err(ImprovementDispatchError::ClosureRead(
+                "the served page fence contradicts the response fence".to_owned(),
+            ));
+        }
+        let truncated = response
+            .payload
+            .get(EXPERIENCE_PAGE_TRUNCATED)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                ImprovementDispatchError::ClosureRead(
+                    "the served page reports no truncation flag".to_owned(),
+                )
+            })?;
+        let page_rows = response
+            .payload
+            .get(EXPERIENCE_PAGE_RECORDS)
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ImprovementDispatchError::ClosureRead(
+                    "the served page carries no record set".to_owned(),
+                )
+            })?
+            .clone();
+        rows.extend(page_rows);
+        if !truncated {
+            return Ok(rows);
+        }
+        // A truncated page with no usable continuation cursor is an incomplete
+        // enumeration, not an end. Reading it as an end is how a partial page
+        // would look like an empty scope.
+        let next = response
+            .payload
+            .get(EXPERIENCE_PAGE_NEXT_CURSOR)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|cursor| !cursor.is_empty())
+            .ok_or_else(|| {
+                ImprovementDispatchError::ClosureRead(
+                    "the store reported a further learning-delta page and issued no continuation \
+                     cursor"
+                        .to_owned(),
+                )
+            })?;
+        if cursor.as_deref() == Some(next) {
+            return Err(ImprovementDispatchError::ClosureRead(format!(
+                "the store reissued continuation cursor {next} without advancing the enumeration"
+            )));
+        }
+        cursor = Some(next.to_owned());
+    }
 }
 
 pub async fn commit_improvement_artifact(

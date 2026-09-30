@@ -14,10 +14,10 @@
 //! [`SafeBoundary`] therefore has NO public fields and NO literal constructor:
 //! with public fields, any caller satisfied the gate by formatting two strings,
 //! which proves nothing about the operation it claims to gate. Its only
-//! constructor is [`SafeBoundary::from_observed_closure`], which reads the
-//! Governor's OWN committed learning-closure image
-//! ([`eliot_governor::CanonicalLearningDeltaStore`]) and takes both values from
-//! a record an owner actually closed:
+//! constructor is [`SafeBoundary::from_observed_closure_record`], which takes both
+//! values from a closure record an owner actually closed and that this crate
+//! cannot name — `eliot-improvement` has no `eliot-learning-delta` edge, and the
+//! record type is never spelled here:
 //!
 //! - `boundary_ref` is the `consequential_boundary` value
 //!   `eliot_learning_delta::derive_boundaries` DERIVED from the lifecycle
@@ -25,10 +25,9 @@
 //!   (`crates/governor/eliot-governor/src/learning_closure.rs:498`), which
 //!   refuses an ordinary read (`read_file`/`read`/`grep`) and an empty activity
 //!   set outright (`crates/smart/eliot-learning-delta/src/boundary.rs:214-228`)
-//!   before anything is committed. A record in that image IS therefore an
+//!   before anything is committed. A committed record therefore IS an
 //!   owner-observed consequential boundary, and I12.24:181 makes that derivation
-//!   the definition of one. The boundary type itself is never named here: the
-//!   reading of the record's own public field is the whole observation.
+//!   the definition of one.
 //! - `active_main_agent_or_human_ref` is the `actor_id` the closure owner
 //!   recorded for that attempt
 //!   (`crates/governor/eliot-governor/src/learning_closure.rs:940`) — the
@@ -39,13 +38,27 @@
 //!   constant instead would restate the literal this constructor exists to
 //!   remove.
 //!
-//! An empty image, an unreadable image, or a record naming no principal is
-//! [`ImprovementError::UnsafeBoundary`]. That is a deliberate behaviour change:
-//! before this, the daemon's improvement pass always succeeded because the gate
-//! read a literal; now it commits nothing until a consequential attempt has
-//! actually been closed. Failing closed is the direction I12.24:64 requires — a
-//! brief must not reach an owner as though a boundary had been observed when
-//! none was.
+//! # The caller is the DURABLE owner of that record, and this says so
+//!
+//! The values are read by the Governor, which owns the closure record and the
+//! `eliot-learning-delta` decode
+//! ([`eliot_governor::observed_closure_from_durable_rows`]), and handed here as
+//! two owned strings. That indirection is deliberate and it is the reason the
+//! provenance marker still means something: this crate cannot re-derive the
+//! record, and it does not pretend to. A caller that reads the record from
+//! anywhere but the durable owner can pass any two strings it likes — the
+//! guarantee this constructor offers is that the boundary VALUES are the ones the
+//! owner's committed record carries, and that guarantee is discharged by the
+//! caller, exactly as `A12.02:3` ("Identity is not a model's self-declared
+//! string") requires.
+//!
+//! An absent record, a record naming no principal, or a record naming no derived
+//! boundary is [`ImprovementError::UnsafeBoundary`]. That is a deliberate
+//! behaviour change: before this, the daemon's improvement pass always succeeded
+//! because the gate read a literal; now it commits nothing until a consequential
+//! attempt has actually been closed AND durably published. Failing closed is the
+//! direction I12.24:64 requires — a brief must not reach an owner as though a
+//! boundary had been observed when none was.
 //!
 //! # BYTES ARE NOT AN OBSERVATION
 //!
@@ -53,16 +66,15 @@
 //! not go through them, so a caller could write two arbitrary non-empty strings
 //! into any wire format and rebuild a `SafeBoundary` that
 //! [`brief_at_safe_boundary`] accepts — the same gate the public fields used to
-//! pass, reached by a different route, and reachable without the
-//! [`eliot_governor`] edge this constructor needs. `SafeBoundary` therefore
-//! carries a provenance marker that only [`SafeBoundary::from_observed_closure`]
-//! sets and `Deserialize` skips, so a boundary rebuilt from bytes cannot
-//! satisfy [`SafeBoundary::validate`]: I12.24:64 asks for a brief at a boundary
-//! an owner actually closed, and a re-serialized pair of strings is not one.
-//! `Serialize` is retained, so the two observed values still round-trip into the
-//! durable learning record next to the brief. What does not round-trip is the
-//! fact of the observation, which is a fact about this process rather than about
-//! bytes.
+//! pass, reached by a different route. `SafeBoundary` therefore
+//! carries a provenance marker that only
+//! [`SafeBoundary::from_observed_closure_record`] sets and `Deserialize` skips,
+//! so a boundary rebuilt from bytes cannot satisfy [`SafeBoundary::validate`]:
+//! I12.24:64 asks for a brief at a boundary an owner actually closed, and a
+//! re-serialized pair of strings is not one. `Serialize` is retained, so the two
+//! observed values still round-trip into the durable learning record next to the
+//! brief. What does not round-trip is the fact of the observation, which is a
+//! fact about this process rather than about bytes.
 //!
 //! # The brief's `proposed_owner` and its boundary are ONE principal
 //!
@@ -95,7 +107,6 @@
 //! constraining that caller. The relationship above is the contract, and the
 //! production caller is held to it.
 
-use eliot_governor::CanonicalLearningDeltaStore;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -171,8 +182,9 @@ impl OwnerDecision {
 ///
 /// Both fields were public `String`s checked only for non-emptiness, so
 /// `format!("owner:{OWNER}")` satisfied the gate on its own — a check reading a
-/// literal. They are private now and [`Self::from_observed_closure`] is the
-/// only constructor. Private alone still left a second route, because
+/// literal. They are private now and
+/// [`Self::from_observed_closure_record`] is the only constructor. Private alone
+/// still left a second route, because
 /// `Deserialize` is a public trait impl that ignores privacy: the provenance
 /// marker below closes it. `Serialize`/`Deserialize` are retained so the two
 /// observed values still round-trip into the durable learning record next to the
@@ -187,7 +199,7 @@ pub struct SafeBoundary {
     boundary_ref: String,
     /// Provenance of the observation itself, not a boundary attribute.
     ///
-    /// `true` only on a value [`Self::from_observed_closure`] read from a
+    /// `true` only on a value [`Self::from_observed_closure_record`] built from a
     /// committed closure record. `#[serde(skip)]` means the field is neither
     /// written nor read by `Serialize`/`Deserialize`, so a boundary rebuilt from
     /// bytes always arrives unmarked and is refused by [`Self::validate`] — the
@@ -198,47 +210,39 @@ pub struct SafeBoundary {
 }
 
 impl SafeBoundary {
-    /// Read the boundary from the owner-observed closure image.
+    /// Builds the boundary from one owner-observed closure record's own values.
     ///
-    /// `store` is the single Governor-owned
-    /// [`eliot_governor::CanonicalLearningDeltaStore`] this process already
-    /// holds (`DaemonComposition::learning_closure().store()`). This is a read
-    /// of already-committed in-process state: it opens no transport, no store
-    /// client and no new durability path. The store's own mutex is taken by
-    /// [`CanonicalLearningDeltaStore::load`], so the caller must invoke this
-    /// under whatever guard already serializes composition access.
+    /// `actor_id` and `consequential_boundary` are the two fields a committed
+    /// [`eliot_learning_delta::StoredLearningDelta`] carries; neither is
+    /// formatted, defaulted or synthesized here. The record TYPE is not named —
+    /// this crate has no `eliot-learning-delta` edge and does not take one for a
+    /// value it only quotes — and neither is the image it came from. The
+    /// production caller is the durable owner of the record: it reads the
+    /// committed rows and re-proves each one through
+    /// [`eliot_governor::observed_closure_from_durable_rows`], so the values
+    /// handed here are the ones an owner's committed record carries. This
+    /// constructor performs no read, opens no transport and takes no store
+    /// client, which is why it can be called from a phase that holds no
+    /// composition guard.
     ///
-    /// The MOST RECENT committed record is the observed boundary:
-    /// [`eliot_governor::LearningClosureService::close_attempt`] appends one
-    /// record per consequential closure
-    /// (`crates/governor/eliot-governor/src/learning_closure.rs:308-317`), so
-    /// the last element is the newest owner-observed consequential boundary
-    /// this process holds. Both boundary values on the result are that record's
-    /// own fields; neither is formatted, defaulted or synthesized here. The
-    /// provenance marker records that THIS constructor ran, not a third observed
-    /// value: it is the one thing about a boundary that cannot arrive from
-    /// outside this module, which is what makes [`Self::validate`] a gate rather
-    /// than a shape check.
+    /// The provenance marker records that THIS constructor ran, not a third
+    /// observed value: it is the one thing about a boundary that cannot arrive
+    /// from outside this module, which is what makes [`Self::validate`] a gate
+    /// rather than a shape check.
     ///
     /// # Errors
     ///
-    /// [`ImprovementError::UnsafeBoundary`] when the image cannot be read, when
-    /// it is empty (no consequential closure has been observed at all), or when
-    /// the newest record names no principal. An absent observation is a
-    /// refusal, never a substituted constant.
-    pub fn from_observed_closure(
-        store: &CanonicalLearningDeltaStore,
+    /// [`ImprovementError::UnsafeBoundary`] when a value is blank or
+    /// whitespace-only, i.e. when the record it came from names no principal or
+    /// no derived boundary. An absent observation is a refusal at the caller,
+    /// never a substituted constant.
+    pub fn from_observed_closure_record(
+        actor_id: &str,
+        consequential_boundary: &str,
     ) -> Result<Self, ImprovementError> {
-        let (records, _version) = store.load().map_err(|_| ImprovementError::UnsafeBoundary)?;
-        let record = records.last().ok_or(ImprovementError::UnsafeBoundary)?;
-        // `consequential_boundary` is not named as a type here: this crate has
-        // no `eliot-learning-delta` edge, and reading the record's own public
-        // field is the entire observation. `as_str` is the boundary's own
-        // canonical spelling, so the recorded name is the owner's closed
-        // vocabulary rather than a string spelled at this call site.
         let boundary = Self {
-            active_main_agent_or_human_ref: record.actor_id.clone(),
-            boundary_ref: record.consequential_boundary.as_str().to_owned(),
+            active_main_agent_or_human_ref: actor_id.to_owned(),
+            boundary_ref: consequential_boundary.to_owned(),
             observed: true,
         };
         boundary.validate()?;
@@ -247,11 +251,11 @@ impl SafeBoundary {
 
     /// The observed principal this boundary was read from.
     ///
-    /// Read-only: it hands back the `actor_id` [`Self::from_observed_closure`]
-    /// read from the committed record and cannot be used to change the
-    /// boundary. An owner-facing brief takes this value as its `proposed_owner`
-    /// so the name it proposes and the name its gate observed are one principal
-    /// (see the module documentation).
+    /// Read-only: it hands back the `actor_id`
+    /// [`Self::from_observed_closure_record`] was given from the committed record
+    /// and cannot be used to change the boundary. An owner-facing brief takes this
+    /// value as its `proposed_owner` so the name it proposes and the name its gate
+    /// observed are one principal (see the module documentation).
     pub fn observed_principal_ref(&self) -> &str {
         &self.active_main_agent_or_human_ref
     }

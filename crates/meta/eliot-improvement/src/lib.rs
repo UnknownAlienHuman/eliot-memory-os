@@ -70,7 +70,7 @@
 //! | `ImprovementCandidate::new` | `evidence_sources.rs:89` |
 //! | `ImprovementCandidate::transition_lifecycle` | `improvement_intake_dispatch.rs:736` |
 //! | `ImprovementCandidate::validate` | `improvement_dedup_read.rs:639` (and internally at `evidence_sources.rs:114`, `brief.rs:317`) |
-//! | `brief::SafeBoundary::from_observed_closure` | `improvement_intake_dispatch.rs:774` |
+//! | `brief::SafeBoundary::from_observed_closure_record` | `improvement_intake_dispatch.rs:829` |
 //! | `brief::brief_at_safe_boundary` | `improvement_intake_dispatch.rs:823` |
 //! | `brief::record_owner_decision` | `improvement_intake.rs:46` (from `improvement_intake_dispatch.rs:994`) |
 //! | `application_class::classify` | `improvement_intake_dispatch.rs:1488` |
@@ -285,11 +285,16 @@
 //!   learning loop are clock-free outright: `Select-String` for
 //!   `OffsetDateTime` over `learning_closure.rs` and `promotion_input.rs`
 //!   returns nothing, so neither module can read a clock even by accident.
-//! - **One owner-held read.** `brief::SafeBoundary::from_observed_closure`
-//!   calls `CanonicalLearningDeltaStore::load()` (`brief.rs:232`), a read of
-//!   already-committed IN-PROCESS state the caller passes in. It opens no
-//!   transport, no store client and no durability path; the caller's mutex
-//!   obligation is stated at `brief.rs:207-209`.
+//! - **No read at all in this crate.** `brief::SafeBoundary::
+//!   from_observed_closure_record` takes the two observed values as owned
+//!   strings and opens no transport, no store client and no durability path.
+//!   The read is the durable owner's:
+//!   `eliot_governor::observed_closure_from_durable_rows` re-proves every
+//!   committed learning-delta row against its own served bytes and the record's
+//!   own `validate()` before either value crosses into this crate. It is stated
+//!   rather than glossed that this leaves the guarantee resting on the caller:
+//!   this crate cannot re-derive the record and does not claim to, and
+//!   `A12.02:3` is discharged there.
 //!
 //! Per acceptance item A9 — "cannot edit source/config/policy, install
 //! artifacts, activate generations, issue authority, promote support/truth or
