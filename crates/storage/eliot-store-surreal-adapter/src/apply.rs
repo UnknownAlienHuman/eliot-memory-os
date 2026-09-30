@@ -1646,12 +1646,12 @@ async fn verify_durable_commit_bundle(
     let planned_outbox: Vec<String> = plan
         .outbox_records
         .iter()
-        .map(|record| record.outbox_id.to_string())
+        .map(|record| record.outbox_id.as_str().to_owned())
         .collect();
     let planned_events: Vec<String> = plan
         .event_ids
         .iter()
-        .map(|event_id| event_id.to_string())
+        .map(|event_id| event_id.as_str().to_owned())
         .collect();
     if !committed_effect_ids_match(&outbox_ids, &planned_outbox)
         || !committed_effect_ids_match(&event_ids, &planned_events)
