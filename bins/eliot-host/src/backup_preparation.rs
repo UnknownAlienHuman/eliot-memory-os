@@ -313,6 +313,56 @@
 //!   sweep reports through [`CleanupReport`] rather than through an error, so a
 //!   later stop can never discard the record of an effect that already occurred.
 //!
+//! # One record validator, and the reuse path is not the weaker one
+//!
+//! Every path that turns a stored frame back into a destination — the exact
+//! prepare replay inside [`prepare_isolated_destination`], and
+//! [`reconcile_preparation`] — goes through ONE helper,
+//! [`verified_recorded_destination`], and one lifecycle decision,
+//! [`recorded_result_lifecycle`]. They are deliberately the same code, because
+//! the two paths used to disagree and the disagreement was exploitable rather
+//! than cosmetic: replay decoded the frame structurally and then observed the
+//! root **by name**, so on the very same record the reuse path believed a stored
+//! operation identity it never compared, ignored the record version, and never
+//! joined the result back to the intent that admitted it. A repeated request
+//! therefore accepted a record that reconciliation would have refused.
+//!
+//! What the shared helper decides, in order, and against the **recorded intent**
+//! rather than a freshly observed registry revision:
+//!
+//! - the record version and the stored operation identity, so a frame written
+//!   for another operation is refused and never reattributed to the requested
+//!   one;
+//! - the lifecycle, structurally: a cleanup `transition` reports the owner's
+//!   reclamation disposition, a cancellation `status` marks an envelope whose
+//!   prior receipt is historical evidence, and an unknown version or state is
+//!   never defaulted to `Prepared`;
+//! - the result's own `admission_digest` and `config_projection_digest` against
+//!   the intent's, and its root, destination id and epoch against the intent's,
+//!   so a result cannot claim a configuration or a destination the admission
+//!   never carried;
+//! - the absence of a forensic audit note, by the same rule that refuses a
+//!   presented one;
+//! - and only then the owner proof itself, the same
+//!   [`reverify_recorded_destination`] containment check, reparse refusal and
+//!   retained-identity comparison reconciliation and reclamation use.
+//!
+//! The one input that differs is `require_live`, and it is a fact about the
+//! caller rather than about the record. A prepare replay passes `true`: it must
+//! return a live prepared destination or a conflict, and a cancelled or
+//! reclaimed record is terminal for preparation, so its prior receipt is
+//! evidence and never authority to hand back. Reconciliation passes `false`
+//! because the reclamation sweep legitimately still needs a cancelled record's
+//! root — that is exactly what `cancel_preparation` preserves it for — and
+//! because reporting it as `Current` is the disposal decision cleanup makes
+//! after its own custody, transition and emptiness proofs, not a claim this
+//! module makes. The root proof itself is identical in both cases.
+//!
+//! The retained lease is deliberately **not** handed back from this helper:
+//! deciding that a recorded root is still the owned object is not a reason to
+//! hold delete authority over it, and [`remove_reverified_destination`] takes
+//! its own proof immediately before its effect.
+//!
 //! # Target build and profile are owner-approved identities
 //!
 //! [`DelegatedPreparation::prepare`] refuses a presented
@@ -553,10 +603,11 @@ pub enum PreparationError {
 // and outer delegate records), `BackupCallerAuth::{check_shapes, authenticate}`
 // (the former surfaces through `authenticate_for_owner`; the latter is the
 // always-refuse stub with no production path),
-// `conflict_field`/`admission_digest`/`derive_*`/`hash_path`/`capture_identity`
+// `conflict_field`/`admission_digest`/`derive_*`/`hash_path`
 // /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
 // /`projection_to_preparation`/`intent_json`/`result_json`/`cleanup_transition_json`
-// /`destination_from_result`/`recorded_outcome`/`projected_disposition`
+// /`destination_from_result`/`recorded_result_lifecycle`
+// /`verified_recorded_destination`/`recorded_outcome`/`projected_disposition`
 // /`owner_identity_evidence`
 // /`reject_audit_note`
 // (private steps whose outcome surfaces with its exact category at the owning
@@ -1933,31 +1984,6 @@ fn reject_reparse(_path: &Path) -> Result<(), PreparationError> {
     Err(PreparationError::PlatformUnsupported)
 }
 
-/// Captures the OS identity of a root (volume + file index on Windows).
-///
-/// Identity observation belongs to the platform-windows owner: this calls
-/// [`eliot_platform_windows::directory_identity_for_path`], which opens the
-/// directory without following reparse points and reads the stable identity
-/// from the opened handle. Host only formats the observed identity into the
-/// preparation receipt and never touches a raw handle, so this module stays
-/// under the crate's `#![forbid(unsafe_code)]`.
-#[cfg(windows)]
-fn capture_identity(path: &Path) -> Result<RootIdentity, PreparationError> {
-    eliot_platform_windows::directory_identity_for_path(path)
-        .map(|identity| RootIdentity {
-            identity: file_identity_text(identity),
-        })
-        .map_err(|error| PreparationError::FilesystemEffect {
-            path: path.to_string_lossy().into_owned(),
-            reason: format!("root identity query failed: {error}"),
-        })
-}
-
-#[cfg(not(windows))]
-fn capture_identity(_path: &Path) -> Result<RootIdentity, PreparationError> {
-    Err(PreparationError::PlatformUnsupported)
-}
-
 /// Renders one observed [`FileIdentity`] as the receipt identity text.
 ///
 /// One canonical rendering is shared by creation-time capture and by every
@@ -2168,10 +2194,10 @@ fn admit_staging_parent(admission: &DestinationAdmission) -> Result<PathBuf, Pre
 /// into, and [`reverify_recorded_destination`] re-proves a destination some
 /// earlier call recorded. Neither covers the moment that matters most: between
 /// [`prepare_isolated_destination`]'s own `std::fs::create_dir` and its
-/// `record_result`. In that window the destination is named but not owned —
-/// [`capture_identity`] observes the object *currently* at that pathname, which
-/// is exactly the object a substitution would have put there — so the identity
-/// written into [`PreparedDestination::root_identity`] was a by-name
+/// `record_result`. In that window the destination is named but not owned — a
+/// by-name identity observation sees the object *currently* at that pathname,
+/// which is exactly the object a substitution would have put there — so the
+/// identity written into [`PreparedDestination::root_identity`] was a by-name
 /// observation rather than an owner-issued proof, and nothing had pinned the
 /// directory contour.
 ///
@@ -2188,13 +2214,12 @@ fn admit_staging_parent(admission: &DestinationAdmission) -> Result<PathBuf, Pre
 /// a false conflict through two formats.
 ///
 /// The recorded value is also unchanged for a destination prepared before this
-/// proof existed. Both routes read the same `GetFileInformationByHandle` pair
-/// off the same object — `ProtectedRootLease` pins it by retained handle,
-/// [`capture_identity`] opens it with `FILE_FLAG_OPEN_REPARSE_POINT` — so the
-/// `(volume_serial_number, file_index)` pair, and therefore the rendered
-/// receipt identity, is identical either way. A receipt already on disk keeps
-/// reconciling and keeps comparing equal; nothing here re-keys an existing
-/// result.
+/// proof existed. Creation and every later re-proof now read the same
+/// `GetFileInformationByHandle` pair off the same object through the same
+/// retained `ProtectedRootLease` handle, so the `(volume_serial_number,
+/// file_index)` pair, and therefore the rendered receipt identity, is identical
+/// either way. A receipt already on disk keeps reconciling and keeps comparing
+/// equal; nothing here re-keys an existing result.
 ///
 /// This is ownership of the root, not allocation of an installation. It proves
 /// *this operation's* object, and it deliberately proves nothing about what that
@@ -2488,6 +2513,60 @@ fn projected_disposition(intent: &serde_json::Value) -> Option<BackupPreparation
     }
 }
 
+/// Whether one recorded result frame is a **live prepared result** or a frame
+/// that only carries a receipt as history.
+///
+/// The single lifecycle decision every reader shares, and it is structural
+/// rather than defaulted because the frame carries a lifecycle, not just a set
+/// of destination fields:
+///
+/// * a frame whose `transition` block is a versioned cleanup transition of this
+///   module is a **reclamation** record ([`recorded_outcome`]). `CleanupPending`
+///   is an authorization whose effect nobody observed and `Reclaimed` a root
+///   that is gone, so neither names a live destination and neither may be
+///   re-prepared or re-reclaimed;
+/// * a frame carrying a cancellation `status` is a **cancelled** record. Its
+///   prior receipt is preserved deliberately, so the frame is still readable
+///   and the owned root is still reclaimable — but it is not a destination a
+///   caller may be *handed back* as if it were live preparation authority;
+/// * anything else is a live prepared result.
+///
+/// The distinction is returned rather than folded into a decode failure
+/// because the two consumers need opposite answers and neither may decide for
+/// the other: an exact prepare replay must refuse a non-live frame outright
+/// (a repeated request returns the same verified destination or a conflict,
+/// never a resurrected one), while the reclamation sweep legitimately still
+/// needs the cancelled record's root so an owner-authorized reclamation can
+/// reach it. Collapsing that into one answer would either resurrect a cancelled
+/// destination or strand its root with no path to reclamation.
+fn recorded_result_lifecycle(result: &serde_json::Value) -> Result<bool, PreparationError> {
+    match recorded_outcome(result)? {
+        BackupPreparationState::Prepared => {}
+        // A reclamation disposition is carried by the transition block and
+        // names no live destination.
+        BackupPreparationState::CleanupPending | BackupPreparationState::Reclaimed => {
+            return Ok(false);
+        }
+        // `recorded_outcome` only ever answers with a disposition this module
+        // writes, and a prepared result is the only one without a transition
+        // block. `Pending` is the pre-effect state and is never a result frame,
+        // so reaching it means the frame named a state this decision does not
+        // model; refusing beats reading it as prepared.
+        BackupPreparationState::Pending => {
+            return Err(PreparationError::InvalidRequest {
+                field: "transition",
+                reason: "recorded result names a pre-effect state; preserved for inspection"
+                    .to_owned(),
+            });
+        }
+    }
+    // A cancellation envelope is a superset of a prepared result: it keeps the
+    // whole receipt so no evidence is destroyed, and adds `status` plus
+    // `prior_receipt`. The record is preserved, but it is terminal for
+    // preparation: it is not live preparation authority to hand back.
+    Ok(result.get("status").is_none())
+}
+
 fn destination_from_result(
     operation_id: &str,
     result: &serde_json::Value,
@@ -2511,6 +2590,176 @@ fn destination_from_result(
         config_projection_digest: result.get("config_projection_digest")?.as_str()?.to_owned(),
         audit_fence_note,
     })
+}
+
+/// One shared record-validation helper, consumed by both the prepare replay and
+/// reconciliation, so neither can enforce a weaker root proof than the other.
+///
+/// Everything here is checked against the **recorded intent**, never against a
+/// freshly observed registry revision, because a record that cannot be joined
+/// back to the intent that admitted it is not this operation's outcome no
+/// matter what the filesystem currently shows:
+///
+/// * the stored record version and the stored operation identity against the
+///   lookup key, so a record written for another operation can never be
+///   reattributed to this one. A mismatching stored operation id is refused;
+///   it is never overwritten with the requested id;
+/// * the recorded admission digest and the result's own
+///   `admission_digest`/`config_projection_digest` against that intent, so a
+///   result cannot claim a configuration the admission never carried;
+/// * the recorded destination root, destination id and epoch, which
+///   [`HostStatePreparationJournal::record_result`] retains and which therefore
+///   are the record's own account of what it created rather than a name this
+///   module resolves again;
+/// * the permitted absence of a forensic audit note, which
+///   [`reject_audit_note`] already refuses on every path that owns a receipt.
+///
+/// `require_live` is the ONE thing the two callers answer differently, and it
+/// is a question about the caller, not about the record: `true` for a prepare
+/// replay, which must hand back a live prepared destination or refuse, and
+/// `false` for the reclamation sweep, which legitimately still needs a
+/// cancelled record's root so an owner-authorized reclamation can reach it.
+/// The root proof below is identical either way, so the weaker argument can
+/// never become the stronger one by omission.
+///
+/// Only after all of that is the root re-proved through the real protected-root
+/// owner by [`reverify_recorded_destination`], which containment-checks it,
+/// pins the contour by retained handle, re-proves the retained identity and
+/// compares the owner-observed identity against the recorded one. The retained
+/// lease is **not** returned here: this helper only decides whether a recorded
+/// destination is still an owned object, and a decision is not a reason to hold
+/// delete authority. The reclamation path takes its own proof immediately
+/// before its effect.
+fn verified_recorded_destination(
+    operation_id: &str,
+    intent: &serde_json::Value,
+    result: &serde_json::Value,
+    require_live: bool,
+) -> Result<PreparedDestination, PreparationError> {
+    let refused = |field: &'static str, reason: String| PreparationError::UnknownState {
+        operation: operation_id.to_owned(),
+        reason: format!("{field}: {reason}"),
+    };
+    // Version and operation identity come first: a frame this module did not
+    // write, or one written for another operation, is refused before any other
+    // field of it is believed. The stored operation id is compared against the
+    // lookup key and never overwritten with it.
+    for (frame, label) in [(intent, "intent"), (result, "result")] {
+        if frame.get("version").and_then(serde_json::Value::as_u64)
+            != Some(u64::from(PREPARATION_VERSION))
+        {
+            return Err(refused(
+                "version",
+                format!(
+                    "recorded {label} frame is missing or does not carry this preparation version"
+                ),
+            ));
+        }
+        match frame.get("operation_id").and_then(serde_json::Value::as_str) {
+            Some(stored) if stored == operation_id => {}
+            _ => {
+                return Err(refused(
+                    "operation_id",
+                    format!(
+                        "recorded {label} frame names a different or absent operation and is never \
+                         reattributed to the requested one"
+                    ),
+                ));
+            }
+        }
+    }
+    // Join the result back to the intent that admitted it. Both sinks retain
+    // these two digests on the intent, so a disagreement is a tampered or
+    // foreign frame rather than a projection that simply lacks the field.
+    let intent_digest = intent
+        .get("admission_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            refused(
+                "admission_digest",
+                "recorded intent carries no admission digest to answer".to_owned(),
+            )
+        })?;
+    let intent_projection = intent
+        .get("admission")
+        .and_then(|admission| admission.get("config_projection_digest"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            refused(
+                "config_projection_digest",
+                "recorded intent carries no configuration projection digest to answer".to_owned(),
+            )
+        })?;
+    if result.get("admission_digest").and_then(serde_json::Value::as_str) != Some(intent_digest) {
+        return Err(refused(
+            "admission_digest",
+            "recorded result does not answer the recorded intent".to_owned(),
+        ));
+    }
+    if result.get("config_projection_digest").and_then(serde_json::Value::as_str)
+        != Some(intent_projection)
+    {
+        return Err(refused(
+            "config_projection_digest",
+            "recorded result does not answer the recorded intent".to_owned(),
+        ));
+    }
+    // The lifecycle decision, before the destination is decoded. A
+    // prepare replay requires a live prepared result: a cancelled or reclaimed
+    // record is terminal for preparation and its prior receipt is historical
+    // evidence, never authority to hand back. The reclamation sweep does not
+    // require it, because it needs exactly that record's root to reclaim.
+    if require_live && !recorded_result_lifecycle(result)? {
+        return Err(refused(
+            "state",
+            "recorded outcome is not a live prepared destination; its prior receipt is preserved \
+             as evidence and is never republished as current preparation authority"
+                .to_owned(),
+        ));
+    }
+    let Some(destination) = destination_from_result(operation_id, result) else {
+        return Err(refused(
+            "result",
+            "recorded result is not a decodable prepared destination; preserved for inspection"
+                .to_owned(),
+        ));
+    };
+    // The record's own account of what it created, never a name resolved again
+    // or an identity re-derived from a newly observed registry revision.
+    if intent.get("root").and_then(serde_json::Value::as_str)
+        != Some(destination.root.to_string_lossy().into_owned().as_str())
+    {
+        return Err(refused(
+            "root",
+            "recorded result names a different root than the recorded intent admitted".to_owned(),
+        ));
+    }
+    if intent.get("destination_id").and_then(serde_json::Value::as_str)
+        != Some(destination.destination_id.as_str())
+    {
+        return Err(refused(
+            "destination_id",
+            "recorded result carries a different destination identity than the recorded intent"
+                .to_owned(),
+        ));
+    }
+    if intent.get("destination_epoch").and_then(serde_json::Value::as_u64)
+        != Some(destination.destination_epoch)
+    {
+        return Err(refused(
+            "destination_epoch",
+            "recorded result carries a different lineage marker than the recorded intent"
+                .to_owned(),
+        ));
+    }
+    // The forensic note is never carried in a receipt, so a record that has one
+    // is refused by the same rule that refuses a presented one.
+    reject_audit_note(destination.audit_fence_note.as_ref())?;
+    // Owner proof last: everything above is the record's own consistency, and
+    // only this establishes that the object at that name is still the owned
+    // protected object the record says it created.
+    reverify_recorded_destination(operation_id, &destination)?;
+    Ok(destination)
 }
 
 /// Prepares one isolated destination (issue #958, cases 958/5-7, 958/9, 958/12).
@@ -2553,47 +2802,32 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
             ));
         }
         if let Some(result) = result {
-            if let Some(destination) = destination_from_result(&admission.operation_id, &result) {
-                let live = capture_identity(&destination.root)
-                    .map_err(|_| PreparationError::UnknownState {
-                        operation: admission.operation_id.clone(),
-                        reason: "recorded root no longer observable; preserved".to_owned(),
-                    })
+            // The replay path runs the SAME record validation and the SAME
+            // protected-root re-proof reconciliation runs, through one shared
+            // helper. It used to decode the frame structurally and then observe
+            // the root by name (`capture_identity`), which made the reuse path
+            // strictly weaker than the verification path on the same record: it
+            // believed a stored operation identity it never compared, ignored
+            // the record version, never joined the result to its own intent, and
+            // could read a cancelled or reclaimed frame as a live destination.
+            // Every one of those is now refused before any destination is
+            // returned, and the owner proof is the same
+            // `reverify_recorded_destination` reconciliation uses.
+            let destination =
+                verified_recorded_destination(&admission.operation_id, &intent, &result, true)
                     .map_err(|error| {
                         note_prepare_error(OP_PREPARE, "replay_check", error, generation)
                     })?;
-                if live != destination.root_identity {
-                    return Err(note_prepare_error(
-                        OP_PREPARE,
-                        "replay_check",
-                        PreparationError::IdentityConflict {
-                            operation: admission.operation_id.clone(),
-                            recorded: destination.root_identity.identity.clone(),
-                            observed: live.identity.clone(),
-                        },
-                        generation,
-                    ));
-                }
-                // Observed replay, not a second effect: the recorded
-                // destination is re-verified and reused unchanged.
-                observe_prepare_progress(
-                    OP_PREPARE,
-                    "replay_check",
-                    "replay_observed",
-                    generation,
-                    destination.destination_epoch,
-                );
-                return Ok(destination);
-            }
-            return Err(note_prepare_error(
+            // Observed replay, not a second effect: the recorded destination is
+            // re-verified and reused unchanged.
+            observe_prepare_progress(
                 OP_PREPARE,
                 "replay_check",
-                PreparationError::UnknownState {
-                    operation: admission.operation_id.clone(),
-                    reason: "result record malformed; preserved for inspection".to_owned(),
-                },
+                "replay_observed",
                 generation,
-            ));
+                destination.destination_epoch,
+            );
+            return Ok(destination);
         }
         // Intent without result: a crash between intent and result recording.
         // The operation was already admitted under this id, and the digest
@@ -2791,18 +3025,21 @@ pub fn reconcile_preparation<J: PreparationJournal>(
                 .to_owned(),
         });
     };
-    let Some(destination) = destination_from_result(operation_id, &result) else {
-        observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
-        return Ok(ReconcileDisposition::Uncertain {
-            reason: "result record malformed; preserved for inspection".to_owned(),
-        });
-    };
-    match reverify_recorded_destination(operation_id, &destination) {
-        // The retained lease is dropped here on purpose: reconciliation only
-        // needs to decide whether the recorded root is still the owned object,
-        // and a decision is not a reason to hold delete authority over it. The
-        // reclamation path takes its own proof immediately before its effect.
-        Ok(_lease) => {
+    // The same shared validation the prepare replay path runs, so the two can
+    // never disagree about what a stored record proves. `require_live` is
+    // `false` here and that is deliberate: a cancelled or reclaimed record
+    // carries no live destination, but the reclamation sweep still needs its
+    // root, and `cancel_preparation` is documented as preserving the prior
+    // receipt precisely so an owner-authorized cleanup can reach it. What this
+    // must never do is report a frame it could not prove as `Current`, and that
+    // is decided by the shared root proof, identical to the prepare path's.
+    match verified_recorded_destination(operation_id, &intent, &result, false) {
+        // The retained proof is dropped by the shared helper on purpose:
+        // reconciliation only needs to decide whether the recorded root is still
+        // the owned object, and a decision is not a reason to hold delete
+        // authority over it. The reclamation path takes its own proof
+        // immediately before its effect.
+        Ok(destination) => {
             observe_prepare_progress(
                 OP_RECONCILE,
                 "outcome",
