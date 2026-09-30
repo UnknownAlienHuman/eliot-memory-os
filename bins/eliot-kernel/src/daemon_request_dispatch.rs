@@ -32,7 +32,7 @@ use eliot_kernel_service::{
     UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
     UserAutomationOperatorRuntime, UserAutomationOwnerLookup, UserAutomationRuntimeAdmission,
-    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationRuntimeError, UserAutomationWakeCancellation,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
     UserAutomationWakeHorizonPublication, UserAutomationWakeOccurrenceDisposition,
     UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
@@ -6885,13 +6885,62 @@ impl KernelComposition {
                 return Ok(Self::user_automation_runtime_error_response(error));
             }
         };
-        // The deterministic preflight is a decided answer about this occurrence
-        // before any owner effect, exactly like an admission and exactly like a
-        // Durable Job refusal, so it reaches the same owner-acknowledged
-        // disposition arm. A deferral is reported under its own owner reason and
-        // never re-labelled as a rejection; a blocked configuration is reported
-        // under its stable failure fingerprint and never as a success. Neither
-        // carries a Durable Job reference, because none was issued.
+        // The join's own answer is the last step this contour owns, and
+        // materialising it into this route's response is one step of its own:
+        // either the occurrence is reported under the closed disposition the
+        // owner decided before any effect, or the one execution reference the
+        // owner issued is validated against the occurrence the schedule owner
+        // resolved and the recurring horizon advances beside it.
+        Self::user_automation_due_wake_execution_response(
+            session,
+            &occurrence_id,
+            client,
+            &request,
+            &resolution,
+            &readback,
+            outcome,
+        )
+        .await
+    }
+
+    /// Materialises the execution join's own answer into this route's response
+    /// (issue #2806 items 5 and 6).
+    ///
+    /// The deterministic preflight is a decided answer about this occurrence
+    /// before any owner effect, exactly like an admission and exactly like a
+    /// Durable Job refusal, so it reaches the same owner-acknowledged
+    /// disposition arm. A deferral is reported under its own owner reason and
+    /// never re-labelled as a rejection; a blocked configuration is reported
+    /// under its stable failure fingerprint and never as a success. Neither
+    /// carries a Durable Job reference, because none was issued.
+    /// `BlockedConfig` is structurally unreachable on this route - the preflight
+    /// projection this leg assembles is refused by the Store owner rather than
+    /// returned blocked - and the arm is retained because the join's answer is a
+    /// closed vocabulary this contour maps completely, not because that member
+    /// can be observed here.
+    ///
+    /// The admitted arm validates the owner's own reference against the resolved
+    /// occurrence before it reports anything, and then advances the recurring
+    /// horizon through the same `user_automation_due_wake_admitted_value`
+    /// projection an admitted occurrence has always used.
+    ///
+    /// This step opens, closes and commits no store transaction of its own: the
+    /// revalidation that precedes it, the recurring-window derivation inside the
+    /// existing horizon slice request, and the durable append inside the two
+    /// existing response projections all stay with their existing owners, in that
+    /// order.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_execution_response(
+        session: &Session,
+        occurrence_id: &str,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        readback: &UserAutomationWakeReadback,
+        outcome: eliot_kernel_service::UserAutomationExecutionOutcome,
+    ) -> Result<serde_json::Value, TransportError> {
         let execution = match outcome {
             eliot_kernel_service::UserAutomationExecutionOutcome::Admitted {
                 execution, ..
@@ -6899,10 +6948,10 @@ impl KernelComposition {
             eliot_kernel_service::UserAutomationExecutionOutcome::Deferred { reason, .. } => {
                 return Self::user_automation_due_wake_decided_response(
                     session,
-                    &resolution,
-                    &occurrence_id,
-                    &request,
-                    &readback,
+                    resolution,
+                    occurrence_id,
+                    request,
+                    readback,
                     client,
                     "deferred",
                     format!(
@@ -6917,10 +6966,10 @@ impl KernelComposition {
             } => {
                 return Self::user_automation_due_wake_decided_response(
                     session,
-                    &resolution,
-                    &occurrence_id,
-                    &request,
-                    &readback,
+                    resolution,
+                    occurrence_id,
+                    request,
+                    readback,
                     client,
                     "blocked_config",
                     format!(
@@ -6944,10 +6993,10 @@ impl KernelComposition {
         }
         Ok(Self::user_automation_due_wake_admitted_value(
             session,
-            &resolution,
-            &occurrence_id,
-            &request,
-            &readback,
+            resolution,
+            occurrence_id,
+            request,
+            readback,
             client,
             execution,
         )
