@@ -108,12 +108,15 @@ public sealed class RuntimeDiscoveryService
 
     public static void ValidateEndpoint(OperatorEndpoint endpoint)
     {
-        // The role is exact and the capabilities are a non-empty subset of the
-        // closed two-capability vocabulary. A narrower owner grant (for
-        // example read-only) is accepted and rendered under: per-view and
-        // per-action gating reads the granted binding, so withheld
-        // capabilities withhold their views and mutations instead of failing
-        // endpoint validation. An empty, unknown or wider set is refused.
+        // The role is exact; the accepted capabilities are a non-empty list of
+        // distinct members of the closed two-capability vocabulary. An empty,
+        // duplicated, unknown or wider set is refused.
+        //
+        // This is a fail-early shape check, not the authority. The owner
+        // (eliot-user-broker-core OperatorEndpoint::validate and
+        // OperatorHandoffAuthority::issue) mints the full ordered capability
+        // set and re-checks it against the request and again on redemption;
+        // only that owner check is authoritative.
         if (string.IsNullOrWhiteSpace(endpoint.PipeName)
             || !endpoint.PipeName.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase)
             || endpoint.BrokerEpoch == 0
