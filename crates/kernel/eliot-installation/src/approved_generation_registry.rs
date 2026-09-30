@@ -26,7 +26,7 @@ use super::{
     PHASE_B_PENDING_SCM_DIGEST, PlatformAgentBridgeSecurityConvergenceReceipt,
     PlatformAgentBridgeStagePrepared, PlatformAgentBridgeStagingReceipt, PlatformHandle,
     ProvisionedSupervisionAuthority, ResourceGeneration, RuntimeLaunchDescriptor, StateFence,
-    canonical_json_bytes, handle, sha256_handle, sha256_hex, text,
+    SystemServiceHostRootReceipt, canonical_json_bytes, handle, sha256_handle, sha256_hex, text,
 };
 
 #[cfg(test)]
@@ -2628,6 +2628,11 @@ pub(crate) fn validate_approval_against_manifest(
 pub struct ApprovedGenerationRegistry {
     /// Mandatory durable wire discriminator.
     pub(crate) registry_wire_version: ContractVersion,
+    /// In-memory source-wire provenance for v17 current-user projection
+    /// identity checks. It is intentionally absent from the durable v18 wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) legacy_registry_identity_version: Option<(ContractVersion, u64)>,
     /// Monotonic CAS revision of this registry projection.
     pub(crate) revision: u64,
     /// Approved generations keyed by their exact generation identity.
@@ -2650,6 +2655,10 @@ pub struct ApprovedGenerationRegistry {
     /// pending activation.  A new stage supersedes this single terminal
     /// receipt.
     pub(crate) last_terminal_activation: Option<PendingActivationTerminal>,
+    /// Original SystemService Host-state root object identity for this
+    /// installation. It is shared by all generations and never reselected
+    /// from a path during registry reopen.
+    pub(crate) system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
     /// Operation-bound abort receipts retained across later staging. The
     /// one-slot terminal remains a fast idempotency view; this history is the
     /// crash-recovery owner for an earlier transaction.
@@ -2682,7 +2691,16 @@ impl Default for ApprovedGenerationRegistry {
 pub(crate) fn registry_projection_identity(
     registry: &ApprovedGenerationRegistry,
 ) -> Result<PlatformHandle, InstallationError> {
-    let bytes = serde_json::to_vec(registry).map_err(|error| InstallationError::InvalidField {
+    let bytes = if let Some((version, source_revision)) = registry
+        .legacy_registry_identity_version
+        .filter(|(_, source_revision)| *source_revision == registry.revision)
+        .filter(|_| registry.system_service_host_root_receipt.is_none())
+    {
+        serde_json::to_vec(&LegacyRegistryProjectionIdentityV17::new(registry, version))
+    } else {
+        serde_json::to_vec(registry)
+    }
+    .map_err(|error| InstallationError::InvalidField {
         field: "activation_projection.registry_identity".to_owned(),
         reason: error.to_string(),
     })?;
@@ -2690,6 +2708,66 @@ pub(crate) fn registry_projection_identity(
         field: "activation_projection.registry_identity".to_owned(),
         reason: error.to_string(),
     })
+}
+
+impl ApprovedGenerationRegistry {
+    pub(crate) fn matches_legacy_v17_identity_shape(
+        &self,
+        source: &serde_json::Value,
+    ) -> Result<bool, InstallationError> {
+        let Some((version, source_revision)) = self.legacy_registry_identity_version else {
+            return Ok(false);
+        };
+        if source_revision != self.revision || self.system_service_host_root_receipt.is_some() {
+            return Ok(false);
+        }
+        let projected = serde_json::to_value(LegacyRegistryProjectionIdentityV17::new(
+            self, version,
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "activation_projection.registry_identity".to_owned(),
+            reason: error.to_string(),
+        })?;
+        Ok(projected == *source)
+    }
+}
+
+/// The v17 serialization shape used only when activation identity is checked
+/// against an in-memory registry decoded from v17. Re-emitting the exact prior
+/// field order keeps a transaction that pinned that U/P snapshot replayable
+/// after decode has normalized the durable model to v18.
+#[derive(Serialize)]
+struct LegacyRegistryProjectionIdentityV17<'a> {
+    registry_wire_version: ContractVersion,
+    revision: u64,
+    generations: &'a [ApprovedGeneration],
+    service_registration_approvals: &'a [InstallerServiceRegistrationApproval],
+    active_generation: &'a Option<PlatformHandle>,
+    last_known_good_generation: &'a Option<PlatformHandle>,
+    pending_activation: &'a Option<PendingActivation>,
+    last_terminal_activation: &'a Option<PendingActivationTerminal>,
+    aborted_activation_receipts: &'a [PendingActivationAbortReceipt],
+    active_phase_b_rebind: &'a Option<ActivePhaseBRebind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    committed_cutover_activation: Option<&'a CommittedCutoverActivation>,
+}
+
+impl<'a> LegacyRegistryProjectionIdentityV17<'a> {
+    fn new(registry: &'a ApprovedGenerationRegistry, version: ContractVersion) -> Self {
+        Self {
+            registry_wire_version: version,
+            revision: registry.revision,
+            generations: &registry.generations,
+            service_registration_approvals: &registry.service_registration_approvals,
+            active_generation: &registry.active_generation,
+            last_known_good_generation: &registry.last_known_good_generation,
+            pending_activation: &registry.pending_activation,
+            last_terminal_activation: &registry.last_terminal_activation,
+            aborted_activation_receipts: &registry.aborted_activation_receipts,
+            active_phase_b_rebind: &registry.active_phase_b_rebind,
+            committed_cutover_activation: registry.committed_cutover_activation.as_ref(),
+        }
+    }
 }
 
 /// Operation-bound receipt for the cutover that performed the
@@ -2996,6 +3074,7 @@ impl ApprovedGenerationRegistry {
     pub const fn new() -> Self {
         Self {
             registry_wire_version: INSTALLATION_REGISTRY_WIRE_VERSION,
+            legacy_registry_identity_version: None,
             revision: 1,
             generations: Vec::new(),
             service_registration_approvals: Vec::new(),
@@ -3003,6 +3082,7 @@ impl ApprovedGenerationRegistry {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            system_service_host_root_receipt: None,
             aborted_activation_receipts: Vec::new(),
             active_phase_b_rebind: None,
             committed_cutover_activation: None,
@@ -3019,6 +3099,33 @@ impl ApprovedGenerationRegistry {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Returns the original SystemService Host-state root identity retained by
+    /// this registry, when one has been bound.
+    #[must_use]
+    pub const fn system_service_host_root_receipt(&self) -> Option<&SystemServiceHostRootReceipt> {
+        self.system_service_host_root_receipt.as_ref()
+    }
+
+    /// Returns whether this registry has only the exact empty first-install
+    /// projection. This is used to admit a crash replay before its first
+    /// pending activation is projected; every other state requires its
+    /// persisted SystemService Host-root receipt.
+    #[must_use]
+    pub fn is_uninitialized_for_system_service_bootstrap(&self) -> bool {
+        self.registry_wire_version == INSTALLATION_REGISTRY_WIRE_VERSION
+            && self.revision == 1
+            && self.generations.is_empty()
+            && self.service_registration_approvals.is_empty()
+            && self.active_generation.is_none()
+            && self.last_known_good_generation.is_none()
+            && self.pending_activation.is_none()
+            && self.last_terminal_activation.is_none()
+            && self.system_service_host_root_receipt.is_none()
+            && self.aborted_activation_receipts.is_empty()
+            && self.active_phase_b_rebind.is_none()
+            && self.committed_cutover_activation.is_none()
     }
 
     /// Returns the exact durable stage proof currently carried by Pending.
@@ -3287,6 +3394,28 @@ impl ApprovedGenerationRegistry {
                 Some(receipt)
             }
         };
+        let system_service_host_root_receipt = match transaction.profile {
+            InstallationProfile::SystemService => Some(
+                transaction
+                    .system_service_host_root_receipt()
+                    .cloned()
+                    .ok_or_else(|| InstallationError::MigrationRequired {
+                        reason: "SystemService transaction has no original Host-root receipt for registry staging"
+                            .to_owned(),
+                    })?,
+            ),
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => None,
+        };
+        if let Some(receipt) = system_service_host_root_receipt.as_ref() {
+            receipt.validate()?;
+            match self.system_service_host_root_receipt.as_ref() {
+                Some(existing) if existing != receipt => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Some(_) => {}
+                None => self.system_service_host_root_receipt = Some(receipt.clone()),
+            }
+        }
         if let Some(existing) = self.pending_activation.as_ref()
             && existing.transaction_id == transaction.transaction_id
             && existing.plan_digest == transaction.installer_plan_digest
@@ -3301,7 +3430,16 @@ impl ApprovedGenerationRegistry {
                     generation.manifest.generation == transaction.candidate_manifest.generation
                 })
                 .and_then(|generation| generation.profile_selection_receipt.as_ref());
-            if generation_receipt != profile_selection_receipt.as_ref() {
+            let system_service_receipt_matches = match transaction.profile {
+                InstallationProfile::SystemService => {
+                    self.system_service_host_root_receipt.as_ref()
+                        == system_service_host_root_receipt.as_ref()
+                }
+                InstallationProfile::UserMode | InstallationProfile::PortableDev => true,
+            };
+            if generation_receipt != profile_selection_receipt.as_ref()
+                || !system_service_receipt_matches
+            {
                 return Err(InstallationError::IdentityConflict);
             }
             for scm_approval in approvals {
@@ -4589,6 +4727,72 @@ impl ApprovedGenerationRegistry {
                 field: "registry.revision".to_owned(),
                 reason: "must be non-zero".to_owned(),
             });
+        }
+        let has_system_service_generation = self.generations.iter().any(|generation| {
+            generation.manifest.runtime_launch.profile == InstallationProfile::SystemService
+        });
+        let has_system_service_pending = self.pending_activation.as_ref().is_some_and(|pending| {
+            pending.manifest.runtime_launch.profile == InstallationProfile::SystemService
+        });
+        let has_system_service_abort_history =
+            self.aborted_activation_receipts.iter().any(|receipt| {
+                receipt.manifest.runtime_launch.profile == InstallationProfile::SystemService
+            });
+        let has_system_service_terminal_abort = self
+            .last_terminal_activation
+            .as_ref()
+            .and_then(|terminal| terminal.abort_receipt.as_ref())
+            .is_some_and(|receipt| {
+                receipt.manifest.runtime_launch.profile == InstallationProfile::SystemService
+            });
+        let has_system_service_projection = has_system_service_generation
+            || has_system_service_pending
+            || has_system_service_abort_history
+            || has_system_service_terminal_abort
+            || !self.service_registration_approvals.is_empty();
+        if has_system_service_projection && self.system_service_host_root_receipt.is_none() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "SystemService registry projection has no original Host-root object identity; explicit recovery is required"
+                    .to_owned(),
+            });
+        }
+        if let Some(receipt) = self.system_service_host_root_receipt.as_ref() {
+            receipt.validate()?;
+            let receipt_matches_manifest = |manifest: &CandidateManifest| {
+                manifest.runtime_launch.profile != InstallationProfile::SystemService
+                    || eliot_platform_windows::windows_paths_equal(
+                        std::path::Path::new(receipt.canonical_path()),
+                        std::path::Path::new(
+                            manifest
+                                .runtime_launch
+                                .runtime_state_roots
+                                .host_state_root
+                                .as_str(),
+                        ),
+                    )
+            };
+            for generation in &self.generations {
+                if !receipt_matches_manifest(&generation.manifest) {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            if let Some(pending) = self.pending_activation.as_ref()
+                && !receipt_matches_manifest(&pending.manifest)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if self
+                .aborted_activation_receipts
+                .iter()
+                .any(|abort| !receipt_matches_manifest(&abort.manifest))
+                || self
+                    .last_terminal_activation
+                    .as_ref()
+                    .and_then(|terminal| terminal.abort_receipt.as_ref())
+                    .is_some_and(|abort| !receipt_matches_manifest(&abort.manifest))
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
         }
         let mut identities = BTreeSet::new();
         let mut service_identities = BTreeSet::new();

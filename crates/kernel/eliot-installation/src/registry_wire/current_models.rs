@@ -25,6 +25,7 @@ use super::super::{
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallerServiceRegistrationApproval, PendingActivation, PendingActivationAbortReceipt,
     PendingActivationState, PlatformHandle, ResourceGeneration, StateFence,
+    SystemServiceHostRootReceipt,
 };
 
 use super::{PendingActivationTerminal, PendingActivationTerminalDisposition};
@@ -202,6 +203,7 @@ pub(super) struct RegistryWireV11 {
     last_known_good_generation: RequiredOption<PlatformHandle>,
     pending_activation: RequiredOption<PendingActivationWire>,
     last_terminal_activation: RequiredOption<PendingActivationTerminalWire>,
+    system_service_host_root_receipt: RequiredOption<SystemServiceHostRootReceipt>,
     #[serde(default)]
     aborted_activation_receipts: Vec<PendingActivationAbortReceipt>,
     active_phase_b_rebind: RequiredOption<ActivePhaseBRebindWireV11>,
@@ -235,6 +237,7 @@ impl RegistryWireV11 {
     pub(super) fn into_registry(self) -> ApprovedGenerationRegistry {
         ApprovedGenerationRegistry {
             registry_wire_version: self.registry_wire_version,
+            legacy_registry_identity_version: None,
             revision: self.revision,
             generations: self
                 .generations
@@ -252,6 +255,7 @@ impl RegistryWireV11 {
                 .last_terminal_activation
                 .0
                 .map(PendingActivationTerminalWire::into_terminal),
+            system_service_host_root_receipt: self.system_service_host_root_receipt.0,
             aborted_activation_receipts: self.aborted_activation_receipts,
             active_phase_b_rebind: self
                 .active_phase_b_rebind

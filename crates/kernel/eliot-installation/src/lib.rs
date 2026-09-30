@@ -298,14 +298,13 @@ use transaction::decode_installation_transaction_json;
 use transaction::decode_installation_transaction_json_from_store;
 pub use transaction::{
     CurrentUserTaskRunIntent, CurrentUserTaskUnknownKind, CurrentUserTaskUnknownProgress,
-    InstallationCreateDisposition,
-    InstallationEffectDisposition, InstallationEffectProgress, InstallationEffectProgressState,
-    InstallationOsObjectSnapshot, InstallationOwnershipSecret, InstallationRootAbsentSnapshot,
-    InstallationSecretCreationProof, InstallationSecretLifecycle,
+    InstallationCreateDisposition, InstallationEffectDisposition, InstallationEffectProgress,
+    InstallationEffectProgressState, InstallationOsObjectSnapshot, InstallationOwnershipSecret,
+    InstallationRootAbsentSnapshot, InstallationSecretCreationProof, InstallationSecretLifecycle,
     InstallationSecretProvisionDisposition, InstallationSecretReference, InstallationSecretScope,
-    InstallationStage, InstallationTransaction, RetainedProfileAnchor,
-    StoreFreeSpaceObservation,
-    parse_installation_transaction_id, validate_installation_transaction_json,
+    InstallationStage, InstallationTransaction, RetainedProfileAnchor, StoreFreeSpaceObservation,
+    SystemServiceHostRootReceipt, parse_installation_transaction_id,
+    validate_installation_transaction_json,
 };
 
 /// Stable wire name for the installation contract.
@@ -386,9 +385,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// selection receipt; v28 adds exact current-user Task registration intent,
 /// receipt and unresolved progress. Version 29 adds exact Task `RunEx` intent
 /// and receipt plus the source-publication profile-anchor object identity.
-/// Wires before v29 require explicit migration/recovery and are never
-/// synthesized from current paths or objects.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(29, 0, 0);
+/// Version 30 binds the original SystemService Host-state root object identity
+/// on the transaction wire. Legacy SystemService records require recovery;
+/// current-user records retain their prior decode path.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(30, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -396,10 +396,13 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 /// pending Phase-B receipts and committed/rebound live bindings. Version 15
 /// binds each Watchdog approval to the exact installer-read SCM control grant.
 /// Version 16 carries the complete OWNER|GROUP|DACL proof in every durable
-/// service-control grant receipt. Version 17 carries launch descriptors with
-/// their mandatory retained I3.1 profile-root binding.
-/// Older projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(17, 0, 0);
+/// service-control grant receipt. Version 17 carries User Broker installation
+/// pins and launch descriptors with their mandatory retained I3.1 profile-root
+/// binding. Version 18 persists one immutable SystemService Host-state root
+/// identity for the registry.
+/// Older SystemService projections require recovery; current-user projections
+/// retain their prior decode path.
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(18, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
