@@ -22,7 +22,8 @@ pub use initial_snapshot::{
     INITIAL_SNAPSHOT_SIGNATURE_ALGORITHM, INITIAL_SNAPSHOT_SIGNATURE_BYTES,
     INITIAL_SNAPSHOT_WIRE_VERSION, InitialConfigSnapshotTrustAnchor, InitialSnapshotError,
     InitialSnapshotIdentity, InitialSnapshotPayload, InitialSnapshotSigner,
-    InitialSnapshotVerificationContext, PRIVACY_MODE_KEY, PrivacyChoice,
+    InitialSnapshotVerificationContext, OBSERVATION_INGRESS_POLICY_KEY,
+    ObservationIngressPolicy, PRIVACY_MODE_KEY, PrivacyChoice,
     SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot, prepare_initial_snapshot_payload,
 };
 
