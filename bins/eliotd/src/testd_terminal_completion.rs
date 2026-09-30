@@ -381,8 +381,7 @@ impl DaemonComposition {
             return Err(no_task_material_denial("TestD terminal completion"));
         }
         let draft = finish_draft_from_testd_terminal_evidence(job, identity)?;
-        let operation_id = OperationId::new(format!("testd-owner-finish-{}", job.job_id))
-            .map_err(completion_error)?;
+        let operation_id = testd_terminal_finish_operation_id(&job.job_id)?;
         let verifier_fact = self
             .governor
             .prepare_testd_verifier_execution_fact_from_evidence(evidence)
@@ -505,11 +504,24 @@ pub async fn exchange_testd_owner_finish_leg(
     prepared.exchange(kernel).await.map_err(completion_error)
 }
 
-/// Commits the three Governor-owned canonical legs for one terminal evidence row
+/// Derives the one operation identity this terminal row's Governor-owned
+/// canonical legs commit under.
+///
+/// The current-plan leg and the finish-evidence/decision legs are distinct
+/// operations of the same row, so this is the single derivation both build on:
+/// the plan leg appends its own `/current-plan` suffix. Deriving it in one place
+/// keeps one row from carrying two unrelated operation identities for the same
+/// ceremony.
+fn testd_terminal_finish_operation_id(job_id: &str) -> Result<OperationId, DaemonError> {
+    OperationId::new(format!("testd-owner-finish-{job_id}")).map_err(completion_error)
+}
+
+/// Commits the Governor-owned canonical legs for one terminal evidence row
 /// as plan, exchange, apply.
 ///
 /// ```text
-/// publish the verifier-execution fact (rehydrate -> canonical write)
+/// admit the Task Controller's current plan (rehydrate task/Task-selection owners -> canonical write)
+/// -> publish the verifier-execution fact (rehydrate -> canonical write)
 /// -> publish the finish-evidence image (rehydrate task/plan/verifier fact -> canonical write)
 /// -> submit the finish candidate draft (rehydrate -> FinishService::evaluate -> persisted decision)
 /// ```
@@ -518,6 +530,11 @@ pub async fn exchange_testd_owner_finish_leg(
 /// across the phases that are pure reads of the retained owners:
 ///
 /// ```text
+/// (0) guard held  — deny a task-free row, then derive the Task Controller's
+///                   current plan for this task and the exchange it still owes;
+/// (0b) no guard    — publish that plan owner image over the Kernel port;
+/// (0c) guard held  — revalidate the plan leg and refresh, so the image the fact
+///                   leg reads is the one the plan leg committed;
 /// (1) guard held  — plan the fact leg: derive the immutable transition and
 ///                   the evidence-led candidate (no exchange);
 /// (2) no guard    — publish the verifier-execution fact over the Kernel port;
@@ -541,11 +558,12 @@ pub async fn exchange_testd_owner_finish_leg(
 /// not reentrant and blocks every other `run_loop` arm on the same lock, so one
 /// bounded drain step could stall the activation feed and the local-read poller
 /// for the whole duration of a Kernel exchange. The mutual exclusion the guard
-/// does provide is unchanged — each phase still runs alone, and phases (1)/(3)/
-/// (5)/(6) still observe exactly the state the preceding exchange published,
-/// because (3) refreshes the owner before the evidence leg is derived, (6)
-/// refreshes again before the decision is derived, and (3)/(5)/(8) re-check
-/// the pre-commit fence before the receipt is admitted.
+/// does provide is unchanged — each phase still runs alone, and phases (0c)/(1)/
+/// (3)/(5)/(6) still observe exactly the state the preceding exchange published,
+/// because (0c) refreshes the owner after the plan leg commits, (3) refreshes
+/// before the evidence leg is derived, (6) refreshes again before the decision is
+/// derived, and (0c)/(3)/(5)/(8) re-check the pre-commit fence before the
+/// receipt is admitted.
 ///
 /// The daemon never opens the `TestD` database: the row arrives through the
 /// Kernel owner poll. The candidate draft carries only the terminal job
@@ -558,6 +576,49 @@ pub async fn commit_testd_terminal_owner_fact(
     composition: &SharedTestdOwnerComposition,
     evidence: &TestdTerminalCompletionEvidence,
 ) -> Result<WriteReceipt, DaemonError> {
+    // (0) guard held, no exchange: deny a task-free row, then admit the Task
+    // Controller's current plan for this row's task and publish it.
+    //
+    // Issue #1741, I7.9: the current `TaskContract`'s plan revision is an owner
+    // fact, and the fact leg below reads it from the canonical owner image. That
+    // image carried no plan at all until the `eliot.finish` claim lane admitted
+    // one, so a row recovered after a restart — the whole point of this drain —
+    // refused at `read_current_plan` before the executed verifier run, exact
+    // artifacts or effect outcomes could be rehydrated. The plan is derived
+    // inside the Governor from the Task-selection and task-lifecycle owners; this
+    // lane supplies only the admitted identity, the row's operation identity and
+    // the task id, so it cannot hand the canonical owner a plan of its own.
+    //
+    // The task-binding denial stays ahead of every leg exactly as phase (1)
+    // places it: a missing admitted task denies the whole completion with the
+    // readiness gate's typed directive before anything launches.
+    let row_task_id = evidence
+        .request_identity
+        .request
+        .metadata
+        .task_id
+        .clone()
+        .ok_or_else(|| no_task_material_denial("TestD terminal completion"))?;
+    let plan_operation_id = OperationId::new(format!(
+        "{}/current-plan",
+        testd_terminal_finish_operation_id(&evidence.job.job_id)?.as_str()
+    ))
+    .map_err(completion_error)?;
+    let current_plan = {
+        let guard = composition.lock().await;
+        guard.prepare_current_plan_admission(
+            &evidence.request_identity,
+            &plan_operation_id,
+            &row_task_id,
+        )
+    }
+    .map_err(DaemonError::Finish)?;
+    if let Some(prepared) = current_plan.as_ref() {
+        let _receipt = exchange_testd_owner_finish_leg(kernel, prepared).await?;
+        let mut guard = composition.lock().await;
+        guard.accept_testd_terminal_owner_fact(prepared)?;
+        guard.refresh_testd_terminal_owner()?;
+    }
     // (1) guard held, no exchange.
     let plan = {
         let guard = composition.lock().await;

@@ -10,7 +10,7 @@
 //! strict draft decode and never reach the service.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_governor::{CompositionError, FinishAttemptError};
+use eliot_governor::{CompositionError, CompositionReadiness, FinishAttemptError};
 use eliot_protocol::{AgentResponseDisposition, FinishResultBody};
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
@@ -184,6 +184,37 @@ fn rejected_legacy_finish_proof(
     )
 }
 
+impl DaemonComposition {
+    /// Publishes the Task Controller's current plan into the owner image the
+    /// rest of this finish ceremony reads (issue #1741, I7.9).
+    ///
+    /// I7.9 requires the Finish service to rehydrate the current `TaskContract`
+    /// and the evidence joined to it. The canonical plan is a durable owner fact
+    /// and the finish owner reads it from its own retained owner image, but
+    /// `accept_prepared_finish_exchange` re-checks only the pre-commit fence, so
+    /// a committed plan leg does not publish itself: without this step the image
+    /// still carries the all-absent `current_plan` and the evidence leg refuses
+    /// at `read_current_plan` before it can rehydrate exact artifacts, executed
+    /// verifier runs or effect outcomes at all.
+    ///
+    /// This is the existing owner publication path, not a second one: it
+    /// re-reads every Governor owner from the Kernel over the same
+    /// authenticated recovery route the startup recovery uses, so the plan the
+    /// evidence leg is derived from is exactly the one the plan leg committed. A
+    /// partial or incoherent owner read fails closed and keeps the previous
+    /// projection — a refusal, never a locally invented plan. It transports
+    /// nothing, so the caller holds the composition guard for this call alone
+    /// and releases it before the next exchange.
+    pub fn publish_current_plan_owner(&mut self) -> Result<(), FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .refresh_from_kernel()
+            .map_err(FinishAttemptError::Composition)
+    }
+}
+
 /// Serves one exact Kernel-claimed `eliot.finish` candidate.
 ///
 /// The draft is decoded authoritatively here (`deny_unknown_fields`: the strict
@@ -298,6 +329,24 @@ pub async fn serve_finish_claim(
             guard.accept_prepared_finish_exchange(prepared)
         };
         if let Err(error) = accepted {
+            return rejected_finish_result(&claimed, &error);
+        }
+        // Issue #1741, I7.9: the committed plan has to reach the owner image
+        // before the evidence leg is derived. `accept_prepared_finish_exchange`
+        // re-checks only the pre-commit fence, so without this publication the
+        // image still carries the all-absent `current_plan` and
+        // `prepare_finish_evidence` refuses at `read_current_plan` — which would
+        // leave exact artifacts, executed verifier runs and effect outcomes
+        // unrehydrated on every live candidate. This is the same owner
+        // publication step the TestD terminal ceremony already performs between
+        // its fact leg and its evidence leg, driven by the same
+        // `refresh_from_kernel` recovery read, so no second scheme is added. A
+        // refusal here is a typed rejection body, never a locally derived plan.
+        let published = {
+            let mut guard = composition.lock().await;
+            guard.publish_current_plan_owner()
+        };
+        if let Err(error) = published {
             return rejected_finish_result(&claimed, &error);
         }
     }

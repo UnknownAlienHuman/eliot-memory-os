@@ -5846,6 +5846,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// not look like a new canonical fact. `Some` is returned only when the
     /// owner image would actually change.
     ///
+    /// # Publication
+    ///
+    /// Preparing does not publish. The derived image becomes the owner image only
+    /// through a later [`Self::refresh_from_kernel`], because
+    /// [`Self::accept_prepared_exchange`] re-checks the pre-commit fence and
+    /// nothing else. A caller that derives any later leg from
+    /// [`Self::read_current_plan`] — [`Self::prepare_finish_evidence`] is the
+    /// one that does — must therefore publish this leg first, or it reads the
+    /// pre-publish image and refuses on the all-absent `current_plan`. That is a
+    /// publication obligation on the caller, not a second plan authority here.
+    ///
     /// # Fail-closed
     ///
     /// Refuses, without mutating anything, when the composition is not ready;
