@@ -499,7 +499,8 @@ impl KernelComposition {
     /// The whole observation is bounded and performs no waiting beyond the two
     /// bounded Store round trips the readiness proof already performed, and it
     /// holds no lock across either of them: the gateway `Arc` is cloned out of
-    /// its owner and the owner guard is dropped before any Store IO. Control
+    /// its owner inside a block whose closing brace ends the guard's scope, so
+    /// the release is structural rather than a `drop()` call. Control
     /// and cancellation therefore stay responsive during an outage — nothing
     /// here waits on a reconnect, and no control-reserve slot is drawn.
     ///
@@ -522,50 +523,53 @@ impl KernelComposition {
         // could not be read is recorded unreadable rather than left defaulted
         // or inferred from its neighbour. Only then does the single fail-closed
         // predicate decide.
-        let Ok(retained) = self.canonical_store_gateway.lock() else {
-            // Inability to read the owner is not absence. The composition
-            // cannot prove a transport is missing, so connectivity is recorded
-            // unreadable and both downstream facts are recorded unreadable
-            // rather than being inferred from it.
-            observe_entrypoint_with_detail(
-                EntrypointStage::StoreBootstrap,
-                "kernel.store.availability:connectivity_owner_unreadable",
-            );
-            return Err(Self::refuse_on_connectivity(StoreConnectivity::Unreadable(
-                StoreOwnerUnreadable::GatewayOwnerPoisoned,
-            )));
-        };
-        // The owner guard is dropped HERE, before the first Store round trip.
-        // The cloned `Arc` is the only thing that leaves this block, so no lock
-        // is held across either bounded await below and control/cancellation
+        // The owner guard is held inside this block ONLY, and the only thing
+        // that leaves it is a cloned `Arc`. The guard's lifetime therefore
+        // ends at the closing brace the compiler can see, not at a `drop()`
+        // call it has to reason about: both bounded Store round trips below
+        // happen with the lock provably released, so control and cancellation
         // stay responsive during an outage.
-        let gateway = retained.clone();
-        drop(retained);
-        let Some(gateway) = gateway else {
-            // A clean absence: the owner answered and holds nothing. That is
-            // the only clean absence in this observation, and the downstream
-            // facts are recorded unreadable rather than absent, because
-            // nothing was asked of an owner that does not exist.
+        let gateway = {
+            let Ok(retained) = self.canonical_store_gateway.lock() else {
+                // Inability to read the owner is not absence. The composition
+                // cannot prove a transport is missing, so connectivity is
+                // recorded unreadable and both downstream facts are recorded
+                // unreadable rather than being inferred from it.
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.availability:connectivity_owner_unreadable",
+                );
+                return Err(Self::refuse_on_connectivity(StoreConnectivity::Unreadable(
+                    StoreOwnerUnreadable::GatewayOwnerPoisoned,
+                )));
+            };
+            let Some(gateway) = retained.clone() else {
+                // A clean absence: the owner answered and holds nothing. That
+                // is the only clean absence in this observation, and the
+                // downstream facts are recorded unreadable rather than absent,
+                // because nothing was asked of an owner that does not exist.
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.availability:connectivity_detached",
+                );
+                return Err(Self::refuse_on_connectivity(StoreConnectivity::Detached));
+            };
+            // A fenced gateway belongs to a superseded generation awaiting
+            // replacement. That is present-but-closed, a different fact from
+            // "no transport", and I14.11 item 7 forbids reading it as restored.
+            if gateway.is_fenced() {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.availability:connectivity_fenced",
+                );
+                return Err(Self::refuse_on_connectivity(StoreConnectivity::Fenced));
+            }
             observe_entrypoint_with_detail(
                 EntrypointStage::StoreBootstrap,
-                "kernel.store.availability:connectivity_detached",
+                "kernel.store.availability:connectivity_attached",
             );
-            return Err(Self::refuse_on_connectivity(StoreConnectivity::Detached));
+            gateway
         };
-        // A fenced gateway belongs to a superseded generation awaiting
-        // replacement. That is present-but-closed, a different fact from "no
-        // transport", and I14.11 item 7 forbids reading it as restored.
-        if gateway.is_fenced() {
-            observe_entrypoint_with_detail(
-                EntrypointStage::StoreBootstrap,
-                "kernel.store.availability:connectivity_fenced",
-            );
-            return Err(Self::refuse_on_connectivity(StoreConnectivity::Fenced));
-        }
-        observe_entrypoint_with_detail(
-            EntrypointStage::StoreBootstrap,
-            "kernel.store.availability:connectivity_attached",
-        );
         let (availability, evidence) =
             Self::observe_store_facts_through_transport(&gateway, request_fence).await?;
         availability.refuse_canonical_sensitive_authority()?;
@@ -587,8 +591,9 @@ impl KernelComposition {
     ///
     /// Both facts are the Store's own answers and the evidence is taken from
     /// those same two bounded round trips, so proving them costs no additional
-    /// Store IO. No lock is held here: the caller passed an `Arc` clone whose
-    /// owner guard it already dropped.
+    /// Store IO. No lock is held here and none can be: the caller passed a
+    /// gateway cloned out of an owner guard whose scope ended at a block brace
+    /// before this helper was entered.
     #[cfg(windows)]
     async fn observe_store_facts_through_transport(
         gateway: &KernelStoreGateway,
