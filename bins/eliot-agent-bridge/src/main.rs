@@ -7,9 +7,9 @@ use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
     ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue,
-    OwnerDryRunPreview, Profile, TransportAdmissionError, TransportProfile, UnderstandingBootstrap,
-    UseOutcome, kernel_ports_with_declaration, loopback_http_route, parse_args,
-    reactive_runtime_composition, validate_credential, validate_host, validate_origin,
+    OwnerDryRunPreview, Profile, ToolResultReceipt, TransportAdmissionError, TransportProfile,
+    UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration, loopback_http_route,
+    parse_args, reactive_runtime_composition, validate_credential, validate_host, validate_origin,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -368,6 +368,22 @@ enum Response {
         /// reader. Absent otherwise — never estimated, never invented.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<HotResourceView>,
+        /// Production tool-result receipt for this delivery (I7.24).
+        ///
+        /// Present only when the delivered result was projected into a
+        /// route-measured receipt: exact result digest, admissible source
+        /// handle, rendered bytes and tokens under the actual tokenizer,
+        /// plus FULL | PARTIAL | TRUNCATED | MISSING. Absent while no
+        /// route-owner token measurement exists on this path — the bridge
+        /// never estimates tokens, so an unmeasured delivery withholds the
+        /// receipt instead of inventing a count. A present receipt with a
+        /// non-FULL delivery never satisfies a complete-evidence or
+        /// verifier prerequisite (see
+        /// [`ToolResultReceipt::check_complete_evidence`]); the production
+        /// delivery recording below routes such a receipt through that
+        /// gate instead of emitting it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<ToolResultReceipt>,
     },
     Cancellation {
         result: HostCancellationResult,
@@ -1338,6 +1354,7 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
                 completion,
                 bootstrap: None,
                 evidence: None,
+                receipt: None,
                 reactive_receipts: Vec::new(),
             },
             Err(()) => invocation_projection_error(),
@@ -1399,14 +1416,35 @@ fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response
         *response = invocation_projection_error();
         return;
     };
-    if let Response::Invocation {
+    let gate_error = if let Response::Invocation {
         wire_result,
         evidence,
+        receipt,
         ..
     } = response
     {
         *wire_result = projected;
         *evidence = Some(view);
+        // I7.24 complete-evidence join: a projected receipt with a non-FULL
+        // delivery never satisfies a complete-evidence or verifier
+        // prerequisite, so it is consumed by the existing typed gate
+        // instead of being emitted. The slot stays absent while no
+        // route-owner token measurement exists on this path (the bridge
+        // never estimates tokens); only a measured receipt reaches the
+        // gate, and only a FULL one passes it.
+        receipt
+            .as_ref()
+            .and_then(|present| present.check_complete_evidence().err())
+    } else {
+        None
+    };
+    if let Some(gate) = gate_error {
+        *response = Response::Error {
+            code: "TOOL_RESULT_INCOMPLETE",
+            detail: format!(
+                "tool result delivery is incomplete and cannot satisfy a complete-evidence requirement; {gate}"
+            ),
+        };
     }
 }
 
