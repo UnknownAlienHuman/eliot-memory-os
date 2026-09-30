@@ -44,8 +44,8 @@ use crate::{
 use eliot_authority::{
     CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
     GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
-    IntroductionStatus, P07AuthorityPort, P07PortError, RootTransitionActivationReceipt,
-    RootTransitionActivationRequest,
+    IntroductionStatus, P07AuthorityPort, P07PortError, RevocationOperationIdentity,
+    RootTransitionActivationReceipt, RootTransitionActivationRequest,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
@@ -8537,12 +8537,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// an absent history, or a stale/invalid view refuses before any owner
     /// state is installed: unavailable history is never absence of
     /// revocation.
+    ///
+    /// `operation` is the admitted revocation operation identity this
+    /// restore runs under, supplied by the durable boundary that admitted
+    /// it and forwarded verbatim. It is required, never defaulted: the
+    /// snapshot is a grant/effect payload and the decoded history carries
+    /// only a fence, a durable source revision, and per-closure owner
+    /// namespace/digest/bounds records, so none of the identity's five
+    /// coordinates is derivable here. Restoring under a synthesized
+    /// identity would make the origin-bound recheck certify itself.
     pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
         reads: &R,
         snapshot: &AuthorityOwnerSnapshot,
         state_fence: &StateFence,
         origin_ref: &str,
         max_records: u32,
+        operation: &RevocationOperationIdentity,
     ) -> Result<AuthorityRestoreOutcome, CompositionError> {
         let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
         let response = reads
@@ -8554,6 +8564,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             snapshot,
             state_fence,
             Some(&evidence),
+            operation,
         )
     }
 
@@ -8567,6 +8578,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// on provider-revision advance and on recovery; a stale trigger
     /// refuses before any publish, and no owner state installs until
     /// the Kernel readback proves the exact published bytes.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed`] and is required, never defaulted.
     pub async fn synchronize_kernel_owner<
         R: CanonicalReadClient + ?Sized,
         K: OwnerPublishPort + ?Sized,
@@ -8577,6 +8592,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         origin_refs: &[String],
         max_records: u32,
         expected_revision: u64,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8588,6 +8604,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             origin_refs,
             max_records,
             expected_revision,
+            operation,
         )
         .await
     }
@@ -8596,6 +8613,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// read from the durable ORS boundary. The legacy method above remains the
     /// fail-closed empty-link entry point; a production caller that has read
     /// completed links must use this method.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed_with_canonical_receipts`] and is
+    /// required, never defaulted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, and the admitted operation identity explicit"
+    )]
     pub async fn synchronize_kernel_owner_with_canonical_receipts<
         R: CanonicalReadClient + ?Sized,
         K: OwnerPublishPort + ?Sized,
@@ -8607,6 +8633,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         max_records: u32,
         expected_revision: u64,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8619,6 +8646,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             max_records,
             expected_revision,
             canonical_receipts,
+            operation,
         )
         .await
     }
@@ -8627,9 +8655,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// plus owner quarantine evidence records read from the durable
     /// boundary. Absent evidence leaves the affected omissions explicitly
     /// unresolved; it is never reconstructed here.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed_with_quarantine_evidence`] and is
+    /// required, never defaulted.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, and quarantine evidence explicit"
+        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, quarantine evidence, and the admitted operation identity explicit"
     )]
     pub async fn synchronize_kernel_owner_with_quarantine_evidence<
         R: CanonicalReadClient + ?Sized,
@@ -8643,6 +8676,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         expected_revision: u64,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
         quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8656,6 +8690,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             expected_revision,
             canonical_receipts,
             quarantine_evidence,
+            operation,
         )
         .await
     }
