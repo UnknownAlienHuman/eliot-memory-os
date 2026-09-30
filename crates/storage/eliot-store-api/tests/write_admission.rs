@@ -217,6 +217,7 @@ fn valid_request() -> ReservedWriteRequest {
         admission,
         expected_revision_heads: revision_heads(),
         expected_ordering_heads: ordering_heads_for(&[("scope-admit-1".to_owned(), 6)]),
+        original_write_submission: None,
     }
 }
 
@@ -232,6 +233,7 @@ fn valid_request_two_scopes() -> ReservedWriteRequest {
             ("scope-admit-1".to_owned(), 6),
             ("scope-admit-2".to_owned(), 7),
         ]),
+        original_write_submission: None,
     }
 }
 
@@ -403,6 +405,7 @@ fn empty_duplicate_unsorted_or_incomplete_scope_sets_are_rejected() {
         admission: narrow,
         expected_revision_heads: revision_heads(),
         expected_ordering_heads: ordering_heads_for(&[("scope-admit-1".to_owned(), 6)]),
+        original_write_submission: None,
     };
     assert!(matches!(
         incomplete.validate(),
