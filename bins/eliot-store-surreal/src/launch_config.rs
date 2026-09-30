@@ -471,7 +471,7 @@ pub fn load_portable_dev_config(
 }
 
 /// Verifies that the retained repository root used to read the config is the
-/// same root admitted by the PortableDev runtime descriptor.
+/// same root admitted by the `PortableDev` runtime descriptor.
 fn validate_portable_dev_launch_root_binding(
     root: &UserOwnedRootLease,
     config: &StoreLaunchConfig,
