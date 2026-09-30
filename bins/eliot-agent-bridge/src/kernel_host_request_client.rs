@@ -3559,26 +3559,16 @@ fn invoke_request_frame(
         CanonicalDispatchEntry::InvokeRead => {
             host_request_invoke_read_frame(request, envelope, facts)?
         }
-        CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
-            AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-            envelope,
-            facts,
-        )?,
+        CanonicalDispatchEntry::SubmitAdmitOnly { .. } => {
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
+        }
         CanonicalDispatchEntry::SubmitActGated { .. } => {
             revalidate_act_dispatch(request, envelope, facts)?;
-            host_request_frame_for_envelope(
-                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                envelope,
-                facts,
-            )?
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
         }
         CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
             revalidate_coordinate_dispatch(request, envelope, facts)?;
-            host_request_frame_for_envelope(
-                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                envelope,
-                facts,
-            )?
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
         }
         CanonicalDispatchEntry::SubmitCarryingBytes => {
             host_request_user_automation_frame(request, envelope, facts)?
