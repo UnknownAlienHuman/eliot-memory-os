@@ -374,6 +374,9 @@ fn map_transport(error: KernelPortError, snapshot_id: &SnapshotId) -> P07PortErr
             P07PortError::Unavailable
         }
         KernelPortError::NotAdmitted(_) => P07PortError::NotAdmitted,
+        KernelPortError::TaskSelectionRequired | KernelPortError::TaskScopeIncompatible => {
+            P07PortError::InvalidBinding
+        }
         KernelPortError::Contract(_) => P07PortError::InvalidBinding,
         KernelPortError::Unknown(_) => P07PortError::UnknownOutcome {
             snapshot_id: snapshot_id.clone(),

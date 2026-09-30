@@ -2292,9 +2292,9 @@ impl DaemonComposition {
                 crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
                     "retained activation owner readback is invalid: {error}"
                 ))
-            })?;
+        })?;
         if readback.evidence != *owner_evidence
-            || readback.evidence.binding.as_ref() != binding
+            || readback.evidence.binding.as_ref() != binding.as_ref()
             || result.ticket_id != ticket.ticket_id
             || result.ticket_state_fence != readback.evidence.state_fence
         {
@@ -2369,7 +2369,7 @@ impl DaemonComposition {
             ))
         })?;
         let live_fence = self.governor.kernel_snapshot().state_fence();
-        if !eliot_contracts::fences_match_exact(&work_scope.state_fence, live_fence) {
+        if !eliot_contracts::fences_match_exact(&work_scope.state_fence, &live_fence) {
             return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
                 "current WorkScope snapshot fence is no longer live",
             ));
