@@ -166,6 +166,17 @@ impl CandidateSourceArtifactJoinV1 {
     pub fn artifact_id(&self) -> &ArtifactId {
         &self.owner.revalidated_snapshot.artifact_id
     }
+
+    /// Returns whether the analyzer workspace names this exact joined Git
+    /// worktree. The source artifact is meaningful only when the process
+    /// reads from the directory whose tree the source owner revalidated.
+    pub fn validates_workspace_root(&self, workspace_root: &Path) -> Result<bool, EngineError> {
+        let admitted_root = canonical_existing_path(
+            &self.owner.worktree_lease.record().receipt_body.worktree_path,
+        )?;
+        let requested_root = canonical_existing_path(workspace_root)?;
+        Ok(admitted_root == requested_root)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1164,7 +1175,25 @@ async fn write_worktree_payload(
         observation: input.observation,
         payload: input.payload,
     });
-    let receipt = writer.submit(admission.admit(&command)?).await?;
+    let (mut envelope, original_command) = admission.admit_with_original_preimage(&command)?;
+    let original_command = String::from_utf8(original_command)
+        .map_err(|error| rejected(format!("canonical command preimage is not UTF-8: {error}")))?;
+    let [observation] = envelope.tool_observations.as_mut_slice() else {
+        return Err(rejected("worktree canonical command has no unique observation"));
+    };
+    let Some(payload) = observation.payload.as_object_mut() else {
+        return Err(rejected("worktree canonical observation payload is not an object"));
+    };
+    if payload
+        .insert(
+            "canonical_input_preimage_json".to_owned(),
+            serde_json::Value::String(original_command),
+        )
+        .is_some()
+    {
+        return Err(rejected("worktree observation already contains a command preimage"));
+    }
+    let receipt = writer.submit(envelope).await?;
     Ok(write_receipt_ref(&receipt))
 }
 

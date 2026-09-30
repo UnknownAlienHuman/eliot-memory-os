@@ -28,46 +28,61 @@ pub struct WriteAdmissionService;
 
 impl WriteAdmissionService {
     pub fn admit(&self, command: &SemanticCommand) -> Result<MemoryWriteEnvelope, EngineError> {
+        self.admit_with_original_preimage(command)
+            .map(|(envelope, _)| envelope)
+    }
+
+    /// Admits a command and also returns the exact bytes used by the existing
+    /// `stable_input_hash` owner. Canonical source owners can retain these
+    /// bytes beside their projection so readback can validate the original
+    /// receipt hash instead of comparing two copies of that hash.
+    pub fn admit_with_original_preimage(
+        &self,
+        command: &SemanticCommand,
+    ) -> Result<(MemoryWriteEnvelope, Vec<u8>), EngineError> {
         let value = serde_json::to_value(command)?;
         let violations = eliot_types::ul::guard::inspect_text_encoding(&value);
         if !violations.is_empty() {
             return Err(EngineError::EncodingRejected { violations });
         }
         validate_command_shape(command)?;
-        let input_hash = stable_input_hash(command)?;
+        let (input_hash, input_preimage) = stable_input_hash_and_preimage(command)?;
         let context = command.context().clone();
         validate_context(&context.scope, &context.authority)?;
         let admitted = admit_command(command)?;
 
-        Ok(MemoryWriteEnvelope {
-            write_id: context.write_id,
-            operation_id: OperationId::new_v7(),
-            agent_id: context.agent_id,
-            session_id: context.session_id,
-            project_id: context.project_id,
-            task_id: context.task_id,
-            command_kind: command.kind(),
-            input_hash,
-            policy_snapshot_id: None,
-            project_sequence_hint: None,
-            created_at: OffsetDateTime::now_utc(),
-            scope: context.scope,
-            authority: context.authority,
-            task_contracts: admitted.task_contracts,
-            source_snapshots: admitted.source_snapshots,
-            evidence_atoms: admitted.evidence_atoms,
-            tool_observations: admitted.tool_observations,
-            failures: admitted.failures,
-            claims: admitted.claims,
-            verification_runs: admitted.verification_runs,
-            relations: admitted.relations,
-            lifecycle: LifecycleWriteOptions {
-                status: context.lifecycle_status,
-                visibility: context.visibility,
-                taint: context.taint,
+        Ok((
+            MemoryWriteEnvelope {
+                write_id: context.write_id,
+                operation_id: OperationId::new_v7(),
+                agent_id: context.agent_id,
+                session_id: context.session_id,
+                project_id: context.project_id,
+                task_id: context.task_id,
+                command_kind: command.kind(),
+                input_hash,
+                policy_snapshot_id: None,
+                project_sequence_hint: None,
+                created_at: OffsetDateTime::now_utc(),
+                scope: context.scope,
+                authority: context.authority,
+                task_contracts: admitted.task_contracts,
+                source_snapshots: admitted.source_snapshots,
+                evidence_atoms: admitted.evidence_atoms,
+                tool_observations: admitted.tool_observations,
+                failures: admitted.failures,
+                claims: admitted.claims,
+                verification_runs: admitted.verification_runs,
+                relations: admitted.relations,
+                lifecycle: LifecycleWriteOptions {
+                    status: context.lifecycle_status,
+                    visibility: context.visibility,
+                    taint: context.taint,
+                },
+                idempotency: IdempotencyOptions { allow_replay: true },
             },
-            idempotency: IdempotencyOptions { allow_replay: true },
-        })
+            input_preimage,
+        ))
     }
 }
 
@@ -642,8 +657,16 @@ fn stable_input_hash<T>(value: &T) -> Result<String, EngineError>
 where
     T: Serialize,
 {
+    stable_input_hash_and_preimage(value).map(|(hash, _)| hash)
+}
+
+fn stable_input_hash_and_preimage<T>(value: &T) -> Result<(String, Vec<u8>), EngineError>
+where
+    T: Serialize,
+{
     let bytes = serde_json::to_vec(value)?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    Ok((hash, bytes))
 }
 
 fn reject<T>(reason: &str) -> Result<T, EngineError> {

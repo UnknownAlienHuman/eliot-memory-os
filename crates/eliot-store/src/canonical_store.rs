@@ -3661,10 +3661,60 @@ impl CanonicalStore {
                         == Some(record.receipt_kind.as_str())
                     && observation.payload.get("receipt_body") == Some(&original_body)
             })
-            .count();
-        if matching_observations != 1 {
+            .collect::<Vec<_>>();
+        if matching_observations.len() != 1 {
             return Err(StoreError::Decode(
                 "canonical subject content does not match its original write observation"
+                    .to_owned(),
+            ));
+        }
+        let original_observation = matching_observations[0];
+        let Some(original_preimage) = original_observation
+            .payload
+            .get("canonical_input_preimage_json")
+            .and_then(Value::as_str)
+        else {
+            return Err(StoreError::Decode(
+                "canonical subject has no retained original command preimage".to_owned(),
+            ));
+        };
+        if blake3::hash(original_preimage.as_bytes())
+            .to_hex()
+            .as_str()
+            != receipt.input_hash
+        {
+            return Err(StoreError::Decode(
+                "canonical subject original command preimage does not match its receipt hash"
+                    .to_owned(),
+            ));
+        }
+        let original_command: eliot_types::SemanticCommand =
+            serde_json::from_str(original_preimage)
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+        let eliot_types::SemanticCommand::ToolObservationRecord(original_command) =
+            original_command
+        else {
+            return Err(StoreError::Decode(
+                "canonical subject original command is not a tool observation write".to_owned(),
+            ));
+        };
+        let mut observed_command_payload = original_observation.payload.clone();
+        let Some(observed_payload_object) = observed_command_payload.as_object_mut() else {
+            return Err(StoreError::Decode(
+                "canonical source-owner observation payload is not an object".to_owned(),
+            ));
+        };
+        observed_payload_object.remove("canonical_input_preimage_json");
+        let command_context = &original_command.context;
+        if command_context.write_id != receipt.write_id
+            || command_context.project_id != receipt.project_id
+            || command_context.task_id != receipt.task_id
+            || original_command.payload != observed_command_payload
+            || original_command.tool_name != original_observation.tool_name
+            || original_command.observation != original_observation.observation
+        {
+            return Err(StoreError::Decode(
+                "canonical subject original command does not match its committed observation"
                     .to_owned(),
             ));
         }

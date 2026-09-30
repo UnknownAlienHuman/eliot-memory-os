@@ -2219,6 +2219,15 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
                 "source owner join does not match the exact Instrument admission".to_owned(),
             ));
         }
+        if let Some(source_join) = source_artifact_join.as_ref()
+            && !source_join
+                .validates_workspace_root(Path::new(&source_candidate.workspace_root))
+                .map_err(|error| BridgeError::InconsistentBinding(error.to_string()))?
+        {
+            return Err(BridgeError::InconsistentBinding(
+                "analyzer workspace differs from the joined Git source worktree".to_owned(),
+            ));
+        }
         request.validate().map_err(BridgeError::ProcessEvidence)?;
         validate_instrument_process_request(&request, instrument_invocation)?;
         validate_candidate_identity(candidate_identity, build_fingerprint)?;
