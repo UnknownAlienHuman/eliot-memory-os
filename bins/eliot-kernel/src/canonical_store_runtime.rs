@@ -7,6 +7,15 @@
 //! Capability cells (§15 req.1): cell 8 canonical-store attachment runtime plus
 //! the pure cell 3/6 store-rebind predicates moved here from `lib` without
 //! touching the `rebind_store` transaction body, which stays whole in `lib`.
+//!
+//! Also owns the I14.11 canonical-Store availability observation (issue #1681):
+//! connectivity, process readiness and semantic freshness are three separately
+//! owned facts, each with its own state, and canonical-sensitive authority is
+//! refused unless all three hold. That is why the file grew the fact vocabulary
+//! beside the attachment runtime: the observation reads the attachment this
+//! module already owns and answers through the same bounded Store round trips
+//! `connect_canonical_store` uses. It is not a second attachment, reconnection
+//! ledger or process launcher.
 
 use super::HostStoreBootstrapRequirement;
 use super::KernelBuildError;
@@ -522,6 +531,9 @@ impl KernelComposition {
             }
         };
         let Some(gateway) = gateway else {
+            // A clean absence: the owner answered and holds nothing. The
+            // downstream facts are recorded unreadable rather than absent,
+            // because nothing was asked of an owner that does not exist.
             observe_entrypoint_with_detail(
                 EntrypointStage::StoreBootstrap,
                 "kernel.store.availability:connectivity_detached",
@@ -531,17 +543,17 @@ impl KernelComposition {
                 reason: StoreFactNotEstablished::NoRetainedTransport,
             });
         };
-        // The gateway is fenced when it is a superseded generation awaiting
-        // replacement. That is a distinct fact from "no transport": the
-        // transport exists and this one is closed to new work.
+        // A fenced gateway belongs to a superseded generation awaiting
+        // replacement. That is present-but-closed, a different fact from
+        // "no transport", and I14.11 item 7 forbids reading it as restored.
         if gateway.is_fenced() {
             observe_entrypoint_with_detail(
                 EntrypointStage::StoreBootstrap,
-                "kernel.store.availability:connectivity_detached",
+                "kernel.store.availability:connectivity_fenced",
             );
             return Err(StoreFactRefusal::NotEstablished {
                 owner: StoreFactOwner::Connectivity,
-                reason: StoreFactNotEstablished::NoRetainedTransport,
+                reason: StoreFactNotEstablished::SupersededGeneration,
             });
         }
         observe_entrypoint_with_detail(
@@ -600,10 +612,19 @@ impl KernelComposition {
                 reason: StoreOwnerUnreadable::StoreAnswerInvalid,
             });
         }
-        // Freshness is judged against the fence the caller presented *now*.
-        // A snapshot bound to any other fence is stale truth: refused, named
-        // as stale, and never reported as an outage.
-        let semantic_freshness = if &snapshot.state_fence == request_fence {
+        // Freshness is judged against the authority tuple and the resource
+        // generation of the fence the caller presented *now*, using the
+        // contract's own exact-tuple rule (`authorizes_canonical`) rather than
+        // a whole-struct comparison: the Store snapshot carries additional
+        // revision fields the caller's presented fence legitimately leaves
+        // unset, and comparing those would report a fresh Store as stale.
+        // A snapshot outside that tuple is stale truth: refused, named as
+        // stale, and never reported as an outage.
+        let semantic_freshness = if eliot_contracts::StateFence::authorizes_canonical(
+            &snapshot.state_fence.authority_epoch,
+            &request_fence.authority_epoch,
+        ) && snapshot.state_fence.resource_generation == request_fence.resource_generation
+        {
             observe_entrypoint_with_detail(
                 EntrypointStage::StoreBootstrap,
                 "kernel.store.availability:fresh",
@@ -967,6 +988,10 @@ pub enum StoreFactNotEstablished {
     /// the only fact in this module that is a clean absence, and it is clean
     /// only because the owner answered.
     NoRetainedTransport,
+    /// A transport is attached but belongs to a superseded generation. I14.11
+    /// item 7: a rebound socket must not reactivate a closed generation's
+    /// canonical work, so this is a refusal and not a partial success.
+    SupersededGeneration,
     /// The Store process answered a bounded round trip and reported itself
     /// not ready.
     ProcessNotReady,
@@ -983,6 +1008,7 @@ impl StoreFactNotEstablished {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoRetainedTransport => "no_retained_store_transport",
+            Self::SupersededGeneration => "store_generation_superseded",
             Self::ProcessNotReady => "store_process_not_ready",
             Self::SemanticTruthStale => "store_semantic_truth_stale",
         }
@@ -993,7 +1019,9 @@ impl StoreFactNotEstablished {
 ///
 /// `Attached` is the only state that carries no claim about the process or its
 /// semantic truth. `Detached` is a proven absence, and it is only ever
-/// reported by an owner that was actually read.
+/// reported by an owner that was actually read. `Fenced` is present-but-closed:
+/// the transport exists and belongs to a superseded generation, which I14.11
+/// item 7 forbids treating as restored.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreConnectivity {
@@ -1001,6 +1029,9 @@ pub enum StoreConnectivity {
     Attached,
     /// The retained-gateway owner was read and holds no transport.
     Detached,
+    /// The retained gateway belongs to a superseded generation and is fenced
+    /// against new canonical work.
+    Fenced,
     /// The owner could not be read. Never a clean absence, never readiness.
     Unreadable(StoreOwnerUnreadable),
 }
@@ -1069,7 +1100,7 @@ pub struct CanonicalStoreAvailability {
 /// evidence the refusal decision was taken against without paying for a second
 /// Store read.
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreTruthEvidence {
     /// The Store-reported operation-manifest digest from its health
     /// observation.
@@ -1184,6 +1215,12 @@ impl CanonicalStoreAvailability {
                 return Err(StoreFactRefusal::NotEstablished {
                     owner: StoreFactOwner::Connectivity,
                     reason: StoreFactNotEstablished::NoRetainedTransport,
+                });
+            }
+            StoreConnectivity::Fenced => {
+                return Err(StoreFactRefusal::NotEstablished {
+                    owner: StoreFactOwner::Connectivity,
+                    reason: StoreFactNotEstablished::SupersededGeneration,
                 });
             }
             StoreConnectivity::Attached => {}

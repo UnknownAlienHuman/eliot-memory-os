@@ -663,6 +663,26 @@ impl KernelComposition {
                 if lineage_zeros > 1 {
                     return Err(KernelServiceError::ReadinessNotProven);
                 }
+                // #1681 / I14.21 / I14.11 item 7: an unresolved rebind effect
+                // blocks capability restoration. A `Pending` ORS replay record
+                // for this exact generation and authority epoch is a possible
+                // Store effect whose outcome is still unknown, and readiness
+                // and attachment alone cannot clear it. The effect stays
+                // unknown here: it is not retried, is not given a fresh
+                // identity to repeat, and is not resolved by assuming it did
+                // not happen.
+                let unresolved_same_lineage = ors_records.iter().any(|r| {
+                    r.state == eliot_ors::StoreRebindReplayState::Pending
+                        && r.generation == receipt.generation.value()
+                        && r.authority_epoch == receipt.authority_epoch.sequence.get()
+                });
+                if unresolved_same_lineage {
+                    observe_live_receipt(
+                        "kernel.live_receipt.store_availability_refused",
+                        "store_rebind_effect_unresolved",
+                    );
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
                 let latest = committed.into_iter().max_by_key(|r| {
                     (
                         r.commit_order,
@@ -720,7 +740,12 @@ impl KernelComposition {
         // rather than a healthy Store.
         let availability_fence =
             StateFence::new(candidate.kernel_epoch.clone(), request.generation);
-        let (availability, evidence) = self
+        // `observe_canonical_store_availability` fails closed: it returns the
+        // full three-fact record only when all three hold, and otherwise
+        // returns the refusal naming the owner that is missing. The caller
+        // therefore cannot reach the evidence below on stale truth, an
+        // unattached transport, or an owner it could not read.
+        let (_availability, evidence) = self
             .observe_canonical_store_availability(&availability_fence)
             .await
             .map_err(|refusal| {
@@ -730,12 +755,6 @@ impl KernelComposition {
                 );
                 refusal.kernel_service_error()
             })?;
-        // The availability is admitted by construction here, but the decision
-        // is still taken through the one fail-closed predicate rather than by
-        // assuming it succeeded.
-        availability
-            .refuse_canonical_sensitive_authority()
-            .map_err(|refusal| refusal.kernel_service_error())?;
         // The facts are proven. The two owner-issued values the receipt cites
         // come from the SAME bounded round trips the observation just made, so
         // proving the three facts costs no additional Store IO.
