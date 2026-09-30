@@ -5,13 +5,13 @@
 //! validated by `KernelStoreGateway`, and exposes it only while the matching
 //! local ORS transaction runs. No readback or receipt survives that call.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use eliot_contracts::StateFence;
 use eliot_ors::{
     CanonicalEvidenceProvider, CanonicalReconciliation, OrsError, RecoveryInboxItem,
-    ScopeReservationRequest, WriterReservationToken,
+    ReservationRequest, ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
 };
 use eliot_receipts::ReceiptEnvelope;
 use eliot_store_api::{OrderingHeadReadback, WriteReceipt};
@@ -128,6 +128,12 @@ impl CanonicalStoreEvidence {
         envelope
             .validate()
             .map_err(|error| OrsError::CanonicalEvidence(error.to_string()))?;
+        let write_binding = token.write_binding.as_ref().ok_or_else(|| {
+            OrsError::CanonicalEvidence(
+                "Store receipt cannot reconcile a reservation without its original write binding"
+                    .to_owned(),
+            )
+        })?;
         if reconciliation.receipt != envelope
             || reconciliation.operation_id != token.operation_id
             || reconciliation.reservation_id != token.reservation_id
@@ -135,6 +141,13 @@ impl CanonicalStoreEvidence {
             || reconciliation.state_fence != token.state_fence
             || reconciliation.recovery_owner != token.recovery_owner
             || store_receipt.operation_id.as_str() != token.operation_id.as_str()
+            || write_binding.operation_id != token.operation_id
+            || write_binding.prepared_transition_sha256 != token.prepared_transition_sha256
+            || write_binding.idempotency_key.as_str() != store_receipt.idempotency_key.as_str()
+            || write_binding.canonical_request_sha256 != store_receipt.canonical_request_hash
+            || write_binding.operation_manifest_digest.as_str()
+                != store_receipt.operation_manifest_digest.as_str()
+            || write_binding.state_fence != token.state_fence
             || store_receipt.ordering_sequences.len() != token.scopes.len()
             || reconciliation.scopes.len() != token.scopes.len()
         {
@@ -236,6 +249,34 @@ impl Default for CanonicalStoreEvidence {
 }
 
 impl CanonicalEvidenceProvider for CanonicalStoreEvidence {
+    fn verify_reservation(&self, request: &ReservationRequest) -> Result<(), OrsError> {
+        let ScopedCanonicalEvidence::Ordering {
+            operation_id,
+            transition_sha256,
+            state_fence,
+            readbacks,
+        } = self.active()?
+        else {
+            return Err(OrsError::CanonicalEvidence(
+                "reservation verification requires a live Store readback".to_owned(),
+            ));
+        };
+        let expected_fence = StateFenceSnapshot::capture(
+            &state_fence,
+            request.envelope.state_fence.observed_authority_epoch,
+        )?;
+        if request.envelope.operation_or_checkpoint_id.as_str() != operation_id
+            || request.prepared_transition_sha256 != transition_sha256
+            || request.envelope.state_fence != expected_fence
+        {
+            return Err(OrsError::CanonicalEvidence(
+                "reservation operation, transition digest, or full fence differs from the live Store observation"
+                    .to_owned(),
+            ));
+        }
+        verify_store_ordering_heads(&state_fence, &readbacks, &request.scopes)
+    }
+
     fn verify_ordering_heads(
         &self,
         scopes: &[ScopeReservationRequest],
@@ -251,29 +292,9 @@ impl CanonicalEvidenceProvider for CanonicalStoreEvidence {
                 "ordering head verification requires a live Store readback".to_owned(),
             ));
         };
-        if operation_id.trim().is_empty()
-            || validate_digest(&transition_sha256).is_err()
-            || scopes.len() != readbacks.len()
-        {
-            return Err(OrsError::CanonicalEvidence(
-                "ORS scope set differs from the Store readback set".to_owned(),
-            ));
-        }
-        for scope in scopes {
-            let observed = readbacks
-                .get(scope.scope.as_str())
-                .ok_or_else(|| OrsError::CanonicalEvidence("Store readback scope missing".to_owned()))?;
-            if observed.head.state_fence != state_fence
-                || observed.head.sequence != scope.expected_head.sequence
-                || observed.canonical_sha256 != scope.expected_head.head_sha256
-                || scope.expected_head.revision_head.is_some()
-            {
-                return Err(OrsError::CanonicalEvidence(
-                    "ORS expected head does not match the Store owner readback".to_owned(),
-                ));
-            }
-        }
-        Ok(())
+        validate_nonblank(&operation_id, "operation_id")?;
+        validate_digest(&transition_sha256)?;
+        verify_store_ordering_heads(&state_fence, &readbacks, scopes)
     }
 
     fn verify_reconciliation(
@@ -318,6 +339,43 @@ impl CanonicalEvidenceProvider for CanonicalStoreEvidence {
             "recovery inbox signer proof source is not installed".to_owned(),
         ))
     }
+}
+
+fn verify_store_ordering_heads(
+    state_fence: &StateFence,
+    readbacks: &BTreeMap<String, OrderingHeadReadback>,
+    scopes: &[ScopeReservationRequest],
+) -> Result<(), OrsError> {
+    if scopes.is_empty() || scopes.len() != readbacks.len() {
+        return Err(OrsError::CanonicalEvidence(
+            "ORS scope set differs from the Store readback set".to_owned(),
+        ));
+    }
+    let requested_scopes = scopes
+        .iter()
+        .map(|scope| scope.scope.as_str())
+        .collect::<BTreeSet<_>>();
+    let observed_scopes = readbacks.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if requested_scopes.len() != scopes.len() || requested_scopes != observed_scopes {
+        return Err(OrsError::CanonicalEvidence(
+            "ORS reservation scope set is not the exact Store readback scope set".to_owned(),
+        ));
+    }
+    for scope in scopes {
+        let observed = readbacks
+            .get(scope.scope.as_str())
+            .ok_or_else(|| OrsError::CanonicalEvidence("Store readback scope missing".to_owned()))?;
+        if observed.head.state_fence != *state_fence
+            || observed.head.sequence != scope.expected_head.sequence
+            || observed.canonical_sha256 != scope.expected_head.head_sha256
+            || scope.expected_head.revision_head.is_some()
+        {
+            return Err(OrsError::CanonicalEvidence(
+                "ORS expected head does not match the Store owner readback".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct ActiveEvidenceReset<'a> {
