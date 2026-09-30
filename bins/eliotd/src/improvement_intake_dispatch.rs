@@ -613,12 +613,6 @@ pub fn assemble_improvement_artifact(
     // in-process image the boundary performs, under the composition guard the
     // caller already holds, with no `await` between them.
     let observed = newest_observed_closure(observed_closures)?;
-    // Evidence lineage: the decision's own stable identity, never a fresh
-    // per-observation value, so a repeat deduplicates — plus the observed
-    // closure's own durable lineage, so two observations of the same family at
-    // the same scope over DIFFERENT committed closures are distinguishable
-    // evidence rather than one indistinguishable observation. See
-    // `ObservedClosure::lineage_evidence_refs`.
     let decision_refs = maintenance_evidence_refs(decision);
     let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
     // `MaintenanceFamily` carries a `Display` impl (its canonical SCREAMING
@@ -626,49 +620,19 @@ pub fn assemble_improvement_artifact(
     // closed owner enums and gain no `Display` here, so they are named by
     // their derived variant spelling instead.
     let trigger = maintenance_trigger_text(decision);
-    // The replay plan is diagnostic-only (I12.24:76-77): the fixed replay,
-    // holdout and transfer legs are the decision's own canonical refs, and the
-    // counter metrics name what must not regress. Promotion is separately
-    // refused by the intake's budget gate, which this advisory path does not
-    // attempt to satisfy.
-    //
-    // It is built over the DECISION's refs alone, not the combined lineage:
-    // `ReplayPlan::fixed_replay_refs` is the set the replay re-runs, and the
-    // closure lineage names the record that was observed rather than work to
-    // re-run. Widening it here would change what the replay claims to fix.
+    // The replay plan is built over the DECISION's refs alone, not the combined
+    // lineage; the reason is recorded on `maintenance_replay_plan`.
     let replay_plan = maintenance_replay_plan(decision, &decision_refs);
-    let mut evidence_refs = decision_refs;
-    evidence_refs.extend(observed.lineage_evidence_refs());
+    let evidence_refs = closure_bound_evidence_refs(decision_refs, &observed);
     let admitted_scope = admitted_fence_ref(state_fence)?;
-    // The evidence bundle is selected by the DERIVED source, not asserted
-    // (issue #1867 W2). Every source but one is the maintenance occurrence
-    // itself, and is assembled by the funnel's own validated constructor. The
-    // conformance-audit source is different in kind: I12.24:50 names the
-    // trigger "Architecture/Implementation/runtime conformance gap", so that
-    // evidence enters the funnel through the Self-Quality conformance
-    // diagnosis contract, which owns the finding's inert owner handoff
-    // (`eliot_self_quality::conformance_evidence`), rather than being labelled
-    // as a maintenance occurrence and losing the conformance owner, the
-    // priority axis and the invalidation set the finding recorded. Both arms
-    // terminate in the same `eliot_improvement::sourced_evidence` validation,
-    // so neither can bypass it.
-    let evidence = match maintenance_evidence_source(decision) {
-        EvidenceSource::ConformanceDiagnosis => {
-            conformance_diagnosis_evidence(decision, &trigger, &admitted_scope, &observed)?
-        }
-        source => sourced_evidence(
-            source,
-            &evidence_refs,
-            &trace_refs,
-            &trigger,
-            &[format!(
-                "unproven-blocked-automation:{}",
-                decision.trigger_id
-            )],
-            &admitted_scope,
-            IMPROVEMENT_OWNER,
-        )?,
-    };
+    let evidence = maintenance_sourced_evidence(
+        decision,
+        &observed,
+        &evidence_refs,
+        &trace_refs,
+        &trigger,
+        &admitted_scope,
+    )?;
 
     let mut candidate = candidate_from_evidence(
         SERVICE_NAME,
@@ -913,12 +877,89 @@ fn maintenance_trigger_text(decision: &eliot_maintenance::AutomationTriggerDecis
     )
 }
 
+/// The candidate's canonical evidence lineage: the decision's own refs, bound to
+/// the observed campaign closure's committed lineage (issue #1867 W2).
+///
+/// The decision's own refs are its stable identity, never a fresh
+/// per-observation value, so a repeat of the same decision deduplicates. What
+/// this adds is the observed closure: the two references come from the
+/// Governor-owned learning-closure record's own committed identity
+/// ([`ObservedClosure::lineage_evidence_refs`]), so two evaluations of the same
+/// family at the same scope over DIFFERENT committed closures are
+/// distinguishable evidence rather than one indistinguishable observation.
+///
+/// `decision_refs` is taken by value because it is consumed here and must NOT
+/// be reused afterwards: the replay plan is built over it before this call, and
+/// widening THAT set with the closure lineage would change what the replay
+/// claims to re-run.
+fn closure_bound_evidence_refs(
+    decision_refs: Vec<String>,
+    observed: &ObservedClosure,
+) -> Vec<String> {
+    let mut evidence_refs = decision_refs;
+    evidence_refs.extend(observed.lineage_evidence_refs());
+    evidence_refs
+}
+
+/// The validated evidence bundle for this observation, over both bound sources.
+///
+/// The bundle is selected by the DERIVED source, not asserted (issue #1867 W2).
+/// Every source but one is the maintenance occurrence itself, and is assembled
+/// by the funnel's own validated constructor. The conformance-audit source is
+/// different in kind: I12.24:50 names the trigger "Architecture/Implementation/
+/// runtime conformance gap", so that evidence enters the funnel through the
+/// Self-Quality conformance diagnosis contract, which owns the finding's inert
+/// owner handoff (`eliot_self_quality::conformance_evidence`), rather than
+/// being labelled as a maintenance occurrence and losing the conformance owner,
+/// the priority axis and the invalidation set the finding recorded. Both arms
+/// terminate in the same `eliot_improvement::sourced_evidence` validation, so
+/// neither can bypass it.
+///
+/// `evidence_refs` is already closure-bound by
+/// [`closure_bound_evidence_refs`]; the conformance arm re-derives its own set
+/// from `observed` rather than reading this argument, because the #971 handoff
+/// contract requires its own refs to be sorted and unique within the finding
+/// and must not inherit a set assembled for a different constructor.
+fn maintenance_sourced_evidence(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    observed: &ObservedClosure,
+    evidence_refs: &[String],
+    trace_refs: &[String],
+    trigger: &str,
+    validity_scope: &str,
+) -> Result<SourcedEvidence, ImprovementDispatchError> {
+    match maintenance_evidence_source(decision) {
+        EvidenceSource::ConformanceDiagnosis => {
+            conformance_diagnosis_evidence(decision, trigger, validity_scope, observed)
+        }
+        source => sourced_evidence(
+            source,
+            evidence_refs,
+            trace_refs,
+            trigger,
+            &[format!(
+                "unproven-blocked-automation:{}",
+                decision.trigger_id
+            )],
+            validity_scope,
+            IMPROVEMENT_OWNER,
+        )
+        .map_err(ImprovementDispatchError::from),
+    }
+}
+
 /// The diagnostic-only replay plan for this observation (I12.24:76-77).
 ///
 /// The fixed replay, holdout and transfer legs are the decision's own canonical
 /// refs, and the counter metric names what must not regress. Promotion is
 /// separately refused by the budget gate, which this advisory path does not
 /// attempt to satisfy.
+///
+/// The caller passes the DECISION's refs alone, never the combined
+/// closure-bound lineage of [`closure_bound_evidence_refs`]:
+/// `ReplayPlan::fixed_replay_refs` is the set the replay re-runs, and the
+/// closure lineage names the record that was observed rather than work to
+/// re-run, so widening it here would change what the replay claims to fix.
 fn maintenance_replay_plan(
     decision: &eliot_maintenance::AutomationTriggerDecision,
     evidence_refs: &[String],
