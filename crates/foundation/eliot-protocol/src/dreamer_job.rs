@@ -1570,6 +1570,15 @@ pub struct DurableJobResponse {
     pub attempt_id: ArtifactId,
     /// Scope/epoch/generation/fence projection for the bound job.
     pub scope: WorkScopeBinding,
+    /// Original semantic input reference retained by the durable job owner.
+    ///
+    /// Older owner records and fixtures may not carry this projection. Such
+    /// absence remains explicit (`None`) and is never treated as a ready
+    /// semantic input. New Submit replies must echo the exact reference from
+    /// `JobSubmission`; subsequent owner replies project it from the retained
+    /// `DurableJobRecord`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_input: Option<OpaqueContentRef>,
     /// Exact record revision observed for this response.
     pub revision: u64,
     /// Semantic lifecycle state, separate from the mutation disposition.
@@ -1622,6 +1631,9 @@ impl DurableJobResponse {
     /// Validates response shape without binding it to a request.
     pub fn validate(&self) -> Result<(), DurableJobError> {
         self.request_identity.validate()?;
+        if let Some(semantic_input) = &self.semantic_input {
+            semantic_input.validate("semantic_input.sha256")?;
+        }
         if self.revision == 0 {
             return Err(DurableJobError::InvalidField {
                 field: "revision",
@@ -1775,6 +1787,13 @@ impl DurableJobResponse {
                 }
                 if self.scope != submission.work_scope {
                     return Err(DurableJobError::FenceMismatch);
+                }
+                let semantic_input = self
+                    .semantic_input
+                    .as_ref()
+                    .ok_or(DurableJobError::SemanticInputUnavailable)?;
+                if semantic_input != &submission.semantic_input {
+                    return Err(DurableJobError::SemanticInputMismatch);
                 }
                 // Any positive revision is admitted: an idempotent resubmit
                 // may return the already-advanced record.
@@ -1934,6 +1953,10 @@ pub enum DurableJobError {
     FenceMismatch,
     #[error("operation identity does not match its typed operation")]
     OperationMismatch,
+    #[error("original semantic input reference is unavailable")]
+    SemanticInputUnavailable,
+    #[error("response semantic input reference differs from the submitted owner record")]
+    SemanticInputMismatch,
     #[error("role does not have the requested capability")]
     CapabilityDenied,
     #[error("invalid or expired active lease")]

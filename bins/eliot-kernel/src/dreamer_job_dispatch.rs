@@ -1018,6 +1018,7 @@ mod dreamer_job_dispatch_tests {
         job: serde_json::Value,
         attempt: serde_json::Value,
         scope: serde_json::Value,
+        semantic_input: serde_json::Value,
         revision: u64,
     }
 
@@ -1077,12 +1078,15 @@ mod dreamer_job_dispatch_tests {
                         serde_json::to_value(&submission.attempt_id).expect("attempt json");
                     let scope_value =
                         serde_json::to_value(&submission.work_scope).expect("scope json");
+                    let semantic_input_value = serde_json::to_value(&submission.semantic_input)
+                        .expect("semantic input json");
                     let response: DurableJobResponse = serde_json::from_value(serde_json::json!({
                         "request_identity": serde_json::to_value(&request.request_identity)
                             .expect("identity json"),
                         "job_id": job_value.clone(),
                         "attempt_id": attempt_value.clone(),
                         "scope": scope_value.clone(),
+                        "semantic_input": semantic_input_value.clone(),
                         "revision": 1,
                         "state": "QUEUED",
                         "disposition": "COMMITTED",
@@ -1107,6 +1111,7 @@ mod dreamer_job_dispatch_tests {
                             job: job_value,
                             attempt: attempt_value,
                             scope: scope_value,
+                            semantic_input: semantic_input_value,
                             revision: 1,
                         },
                     );
@@ -1137,6 +1142,7 @@ mod dreamer_job_dispatch_tests {
                         "job_id": stored.job.clone(),
                         "attempt_id": stored.attempt.clone(),
                         "scope": stored.scope.clone(),
+                        "semantic_input": stored.semantic_input.clone(),
                         "revision": stored.revision,
                         "state": "QUEUED",
                         "disposition": null,
@@ -1186,6 +1192,7 @@ mod dreamer_job_dispatch_tests {
                             "job_id": stored.job.clone(),
                             "attempt_id": stored.attempt.clone(),
                             "scope": stored.scope.clone(),
+                            "semantic_input": stored.semantic_input.clone(),
                             "revision": stored.revision,
                             "state": "LEASED",
                             "disposition": "COMMITTED",
