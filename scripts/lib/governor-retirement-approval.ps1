@@ -336,13 +336,39 @@ function Get-GovernorRetirementCandidateTree([string]$Repo, [string]$SourceCommi
     return $tree
 }
 
-function Get-GovernorRetirementNormativePairRevision([string]$Repo) {
-    $path = Join-Path $Repo 'docs/normative-pair.toml'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw 'tracked normative pair receipt is missing: docs/normative-pair.toml'
+function Get-GovernorRetirementNormativePairRevision([string]$Repo, [string]$SourceCommit) {
+    $relativePath = 'docs/normative-pair.toml'
+    $blob = Get-GovernorRetirementTrackedPathDigest $Repo $SourceCommit $relativePath
+    if (-not $blob) {
+        throw "tracked normative pair receipt is missing at $SourceCommit`: $relativePath"
     }
-    $bytes = [System.IO.File]::ReadAllBytes($path)
-    $text = [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'git'
+    $psi.Arguments = "-C `"$Repo`" cat-file blob $blob"
+    $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $memory = [System.IO.MemoryStream]::new()
+    try {
+        $process.StandardOutput.BaseStream.CopyTo($memory)
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "failed to read the pinned normative pair blob $blob at $SourceCommit"
+        }
+        $bytes = $memory.ToArray()
+    }
+    finally {
+        $process.StandardOutput.Close()
+        $memory.Dispose()
+        $process.Dispose()
+    }
+    try {
+        $text = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes).TrimStart([char]0xFEFF)
+    }
+    catch {
+        throw "pinned normative pair receipt at $SourceCommit is not valid UTF-8: $([string]$_.Exception.Message)"
+    }
     $revision = $null
     $pairKey = $null
     foreach ($line in ($text -split "`r?`n")) {
@@ -395,7 +421,7 @@ function Get-GovernorRetirementTrackedBlobMap([string]$Repo, [string]$SourceComm
         $path = ([string]$row).Substring($tab + 1)
         if (-not $wanted.Contains($path)) { continue }
         $fields = @($meta -split ' ')
-        if ($fields.Count -lt 3) { continue }
+        if ($fields.Count -lt 3 -or $fields[1] -cne 'blob') { continue }
         $map[$path] = [string]$fields[2]
     }
     $missingPaths = @($wanted | Where-Object { -not $map.ContainsKey([string]$_) })
@@ -416,7 +442,8 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
     if ($blobs.Count -eq 0) {
         return $result
     }
-    $input = ((@($blobs.GetEnumerator() | ForEach-Object { $_.Value }) -join "`n") + "`n")
+    $requestedOids = @($blobs.Values | Sort-Object -Unique)
+    $input = (($requestedOids -join "`n") + "`n")
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = 'git'
     $psi.Arguments = "-C `"$Repo`" cat-file --batch"
@@ -446,9 +473,19 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
         $stage = 'header'
         $currentOid = $null
         $remaining = 0
-        $completed = 0
+        $responses = 0
+        $readFailures = [System.Collections.Generic.List[string]]::new()
+        $seenOids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $inputClosed = $false
         while ($true) {
-            $read = $standardOutput.Read($buffer, 0, $buffer.Length)
+            $readTask = $standardOutput.ReadAsync($buffer, 0, $buffer.Length)
+            $null = [System.Threading.Tasks.Task]::WhenAny($writer, $readTask).GetAwaiter().GetResult()
+            if ($writer.IsCompleted -and -not $inputClosed) {
+                [void]$writer.GetAwaiter().GetResult()
+                $process.StandardInput.Close()
+                $inputClosed = $true
+            }
+            $read = $readTask.GetAwaiter().GetResult()
             if ($read -le 0) { break }
             $offset = 0
             while ($offset -lt $read) {
@@ -460,14 +497,35 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                             $line = $header.ToString()
                             [void]$header.Clear()
                             $fields = @($line -split ' ')
-                            if ($fields.Count -ge 3 -and $fields[1] -ceq 'blob') {
+                            if ($fields.Count -eq 2 -and $fields[1] -ceq 'missing') {
+                                $responses++
+                                [void]$readFailures.Add("tracked object is missing: $([string]$fields[0])")
+                                $stage = 'header'
+                            }
+                            elseif ($fields.Count -ge 3 -and $fields[2] -match '^\d+$') {
                                 $currentOid = [string]$fields[0]
-                                $remaining = [int]$fields[2]
-                                $pending.Clear()
-                                $stage = 'content'
+                                $remaining = [int64]$fields[2]
+                                $responses++
+                                if ($fields[1] -cne 'blob') {
+                                    [void]$readFailures.Add("tracked object is not a blob: $currentOid ($([string]$fields[1]))")
+                                    $stage = if ($remaining -eq 0) { 'trailing' } else { 'skipcontent' }
+                                }
+                                elseif (-not $byOid.ContainsKey($currentOid)) {
+                                    [void]$readFailures.Add("cat-file returned an unrequested object: $currentOid")
+                                    $stage = if ($remaining -eq 0) { 'trailing' } else { 'skipcontent' }
+                                }
+                                elseif (-not $seenOids.Add($currentOid)) {
+                                    [void]$readFailures.Add("cat-file returned a duplicate object: $currentOid")
+                                    $stage = if ($remaining -eq 0) { 'trailing' } else { 'skipcontent' }
+                                }
+                                else {
+                                    $pending.Clear()
+                                    $stage = if ($remaining -eq 0) { 'content' } else { 'content' }
+                                }
                             }
                             else {
-                                # "<oid> missing" or a non-blob object: skip it.
+                                $responses++
+                                [void]$readFailures.Add("cat-file returned a malformed response header: $line")
                                 $stage = 'skipheader'
                             }
                             break
@@ -476,7 +534,7 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                     }
                 }
                 elseif ($stage -eq 'content') {
-                    $take = [Math]::Min($remaining, $read - $offset)
+                    $take = [int][Math]::Min($remaining, [int64]($read - $offset))
                     for ($i = 0; $i -lt $take; $i++) { $pending.Add($buffer[$offset + $i]) }
                     $offset += $take
                     $remaining -= $take
@@ -489,12 +547,17 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                                     text = [System.Text.Encoding]::UTF8.GetString($bytes)
                                 }
                             }
-                            $completed++
                         }
                         $pending.Clear()
                         $currentOid = $null
                         $stage = 'trailing'
                     }
+                }
+                elseif ($stage -eq 'skipcontent') {
+                    $take = [int][Math]::Min($remaining, [int64]($read - $offset))
+                    $offset += $take
+                    $remaining -= $take
+                    if ($remaining -eq 0) { $stage = 'trailing' }
                 }
                 elseif ($stage -eq 'trailing') {
                     # exactly one LF after the object content
@@ -502,19 +565,23 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                         $byte = $buffer[$offset]
                         $offset++
                         if ($byte -eq 0x0A) { $stage = 'header'; break }
+                        [void]$readFailures.Add('cat-file object response is missing its trailing LF')
                     }
                 }
                 else {
                     $offset = $read
                 }
             }
-            if ($completed -ge $blobs.Count) { break }
         }
-        [void]$writer.GetAwaiter().GetResult()
-        $process.StandardInput.Close()
+        if (-not $inputClosed) {
+            [void]$writer.GetAwaiter().GetResult()
+            $process.StandardInput.Close()
+            $inputClosed = $true
+        }
         $process.WaitForExit()
-        if ($process.ExitCode -ne 0 -or $result.Count -ne $blobs.Count) {
-            throw "tracked retirement blob read was incomplete (exit=$($process.ExitCode) expected=$($blobs.Count) read=$($result.Count))"
+        if ($process.ExitCode -ne 0 -or $responses -ne $requestedOids.Count -or $result.Count -ne $blobs.Count -or $readFailures.Count -gt 0) {
+            $failureDetails = [string]::Join('; ', @($readFailures | Select-Object -First 8))
+            throw "tracked retirement blob read was incomplete (exit=$($process.ExitCode) expected=$($requestedOids.Count) responses=$responses read=$($result.Count) paths=$($blobs.Count) failures=$failureDetails)"
         }
     }
     finally {
@@ -1036,6 +1103,11 @@ function Test-GovernorRetirementApprovalShape(
         }
         if ($normativeDigest -cnotmatch '^[0-9a-f]{64}$') {
             return (& $rejected "APPROVAL_NORMATIVE_PAIR_DIGEST_MALFORMED (value=$normativeDigest)")
+        }
+        $sourceNormativePair = Get-GovernorRetirementNormativePairRevision $Repo $SourceCommit
+        if ($normativeRevision -cne [string]$sourceNormativePair.revision -or
+            $normativeDigest -cne [string]$sourceNormativePair.sha256) {
+            return (& $rejected "APPROVAL_NORMATIVE_PAIR_MISMATCH (approved=$normativeRevision/$normativeDigest source=$([string]$sourceNormativePair.revision)/$([string]$sourceNormativePair.sha256))")
         }
         $configPolicy = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'config_policy_revision')
         if ([string]::IsNullOrWhiteSpace($configPolicy)) {
@@ -1725,7 +1797,7 @@ function New-GovernorRetirementApproval(
         throw "retirement approval issuance refuses an incomplete independent closure: $([string]::Join(', ', $blocking))"
     }
     $candidateTree = Get-GovernorRetirementCandidateTree $Repo $SourceCommit
-    $normativePair = Get-GovernorRetirementNormativePairRevision $Repo
+    $normativePair = Get-GovernorRetirementNormativePairRevision $Repo $SourceCommit
     $declarationBlob = Get-GovernorRetirementTrackedPathDigest $Repo $SourceCommit $script:GovernorRetirementDispositionInventoryPath
     if (-not $declarationBlob) {
         throw "the closure declaration inventory is not tracked at candidate ${SourceCommit}: $($script:GovernorRetirementDispositionInventoryPath)"
@@ -1935,7 +2007,7 @@ function Resolve-GovernorRetirementApprovalBinding(
     # trust-policy pair that independently binds D under the same rule. No
     # field in R(C) is rewritten or re-digested to make it name D.
     $candidateTree = Get-GovernorRetirementCandidateTree $Repo $SourceCommit
-    $normativePair = Get-GovernorRetirementNormativePairRevision $Repo
+    $normativePair = Get-GovernorRetirementNormativePairRevision $Repo $SourceCommit
     $candidateIdentity = Get-GovernorRetirementPinnedLegacyIdentity $Repo $SourceCommit
     $approvedClosureRuleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'closure_rule_set')
     $selectedClosureRuleSet = if ($script:GovernorRetirementClosureRuleSets -ccontains $approvedClosureRuleSet) {
