@@ -1382,17 +1382,16 @@ pub struct PacketAdmissionBundle {
     pub measurements: Vec<AdmissionMeasurement>,
 }
 
-/// Owner-minted admission pieces closed into one bundle.
+/// The owner-minted admission pieces that cannot exist before the candidate set.
 ///
-/// The future suppliers (Decision Safety Floor owner, candidate-policy
-/// owner, quality scorecard owner, route capacity/measurement owner) hand
-/// these pieces to [`PacketAdmissionBundle::build`], which validates each
-/// through its owner's own `validate` and proves closure over one
-/// compilation. Grouped so the builder takes an owner-pieces value instead
-/// of a long argument list.
+/// The protected floor is deliberately absent: it is the one admission-closure
+/// identity the Context owner publishes from the recipe body alone, so it is
+/// resolved before the candidate stage and is a separate input to
+/// [`KernelContextReadClient::compile_context_packet`]. Everything below is
+/// keyed by candidate atom identity, so it is supplied by
+/// [`PacketAdmissionParts`]'s owner at the point the candidate stage has
+/// produced the exact atom set these records must cover — not before it.
 pub struct PacketAdmissionParts {
-    /// Owner-minted protected floor identity.
-    pub floor: SafetyFloorIdentity,
     /// Owner-minted priority policy identity.
     pub priority: PriorityPolicyIdentity,
     /// Owner-minted admission rule identity.
@@ -1422,23 +1421,44 @@ impl PacketAdmissionBundle {
     /// as policy, or a foreign measurement fails here as a typed composition
     /// error, never as an admitted bundle.
     ///
-    /// STITCH-2564-PACKET-SUPPLY: no production owner mints these pieces yet
-    /// (measured on `origin/main`: `SafetyFloorIdentity`,
-    /// `PriorityPolicyIdentity`, `AdmissionRuleIdentity` and
-    /// `MeasurementCompositionProfile` are constructed only in `tests/`
-    /// fixtures). The future suppliers — Decision Safety Floor owner,
-    /// candidate-policy owner, quality scorecard owner, route
-    /// capacity/measurement owner — call this builder and feed the resulting
-    /// bundle to [`KernelContextReadClient::compile_context_packet`]; until
-    /// they do, the campaign packet reports the unbound-closure gap instead
-    /// of compiling.
+    /// #1862 ordering fix: the candidate set is an explicit argument because
+    /// two of these pieces are keyed by candidate atom identity and cannot
+    /// exist before it. `AdmissionInput::validate` forces
+    /// `priority.priorities` and `measurements` to equal the candidate atom
+    /// set exactly, so a builder that ran before `construct_context_candidates`
+    /// was handed a denominator that did not yet exist. The composition now
+    /// constructs the candidate set first and calls this builder with it, and
+    /// this builder proves the two keyed pieces against that exact set here,
+    /// so a priority or measurement record naming an atom the candidate stage
+    /// did not produce is refused at the closure rather than later by a
+    /// validation the composition could not have satisfied in the first place.
+    /// The floor stays a separate argument because the Context owner publishes
+    /// it from the recipe body alone, before any candidate exists.
+    ///
+    /// STITCH-2564-PACKET-SUPPLY, re-measured for #1862: one of the four
+    /// identities has a real owner source. `SafetyFloorIdentity` is resolved
+    /// on the live campaign packet route by the Context owner's own
+    /// publication, `eliot_context::campaign_publication::context_safety_floor_identity`,
+    /// which reads the floor out of the authenticated recipe body's
+    /// `GoverningContextRequirements::floor` and the resolved revision's own
+    /// `RecipeAdmissionPolicy::safety_floor` reference. `PriorityPolicyIdentity`,
+    /// `AdmissionRuleIdentity` and `MeasurementCompositionProfile` still have
+    /// no production construction site; the per-identity account of what each
+    /// one lacks is recorded on
+    /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+    /// The remaining suppliers — priority-policy owner, admission-rule record
+    /// owner, route capacity/measurement owner — call this builder with the
+    /// candidate set this compilation produced and feed the resulting bundle to
+    /// [`KernelContextReadClient::compile_context_packet`]; until they do, the
+    /// campaign packet reports the unbound-closure gap instead of compiling.
     pub fn build(
         parts: PacketAdmissionParts,
+        floor: SafetyFloorIdentity,
+        candidates: &ContextCandidateSetResult,
         recipe: &ContextRecipe,
         binding: &ContextBinding,
     ) -> Result<Self, PacketCompositionError> {
         let PacketAdmissionParts {
-            floor,
             priority,
             rule,
             measurement_profile,
@@ -1462,7 +1482,7 @@ impl PacketAdmissionBundle {
         {
             return Err(PacketCompositionError::BindingMismatch);
         }
-        if recipe.binding != *binding {
+        if recipe.binding != *binding || candidates.set.binding != *binding {
             return Err(PacketCompositionError::BindingMismatch);
         }
         let floor_roles: BTreeSet<_> = floor.floor.mandatory_roles.iter().collect();
@@ -1490,6 +1510,34 @@ impl PacketAdmissionBundle {
             if measurement.binding.context != *binding {
                 return Err(PacketCompositionError::BindingMismatch);
             }
+        }
+        // The two atom-keyed pieces must cover exactly the candidate atom set
+        // this compilation produced. This is the same relation
+        // `AdmissionInput::validate` enforces, proved here at the point the
+        // bundle is closed rather than only after it is assembled: a priority
+        // or measurement record for an atom the candidate stage did not emit,
+        // or a candidate atom neither piece names, is refused as a closure
+        // mismatch instead of passing this builder and failing later.
+        let candidate_ids: BTreeSet<&ArtifactId> = candidates
+            .set
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.atom_id)
+            .collect();
+        let priority_ids: BTreeSet<&ArtifactId> = priority
+            .priorities
+            .iter()
+            .map(|declared| &declared.atom_id)
+            .collect();
+        let measured_ids: BTreeSet<&ArtifactId> = measurements
+            .iter()
+            .map(|measurement| &measurement.atom_id)
+            .collect();
+        if priority_ids != candidate_ids
+            || measured_ids != candidate_ids
+            || measurements.len() != candidates.set.candidates.len()
+        {
+            return Err(PacketCompositionError::BindingMismatch);
         }
         Ok(Self {
             floor,
@@ -1532,11 +1580,14 @@ impl KernelContextReadClient {
     ///   owner: generic authority rows are not automatically admitted
     ///   Cue/negative-memory/capability inputs.
     ///
-    /// The admission closure pieces (`floor`, `priority`, `rule`,
-    /// `measurement_profile`, omissions, measurements), the `quality`
-    /// scorecard, the assembly `policy`, and the `measure` callback all arrive
-    /// from their owners: a protected floor, reservations, and scorecard
-    /// evidence are never assembled here merely to satisfy the renderer. The
+    /// The admission closure pieces, the `quality` scorecard, the assembly
+    /// `policy`, and the `measure` callback all arrive from their owners: a
+    /// protected floor, reservations, and scorecard evidence are never
+    /// assembled here merely to satisfy the renderer. `floor` is a value because
+    /// the Context owner publishes it from the recipe body alone, before any
+    /// candidate exists. The remaining pieces are supplier callbacks invoked at
+    /// the point their material exists: `admission_parts` after
+    /// `construct_context_candidates`, `quality` after the admitted set. The
     /// pieces are closed into the one admission bundle by
     /// [`PacketAdmissionBundle::build`], so an unvalidated or foreign piece
     /// fails before any candidate is admitted. An explicit admission gap fails as
@@ -1546,14 +1597,22 @@ impl KernelContextReadClient {
     /// cannot pass `policy.max_serialized_bytes`, and genuinely deferred
     /// compilation uses a durable job, never an unconsumed handle.
     ///
-    /// STITCH-2564-PACKET-SUPPLY: the production invoker is the campaign
-    /// packet composition
+    /// STITCH-2564-PACKET-SUPPLY, re-measured for #1862: this edge is now
+    /// callable in principle rather than uncallable by construction. The two
+    /// ordering reasons that made the previous parameter set unsatisfiable are
+    /// gone: the admission closure is closed AFTER the candidate atom set it must
+    /// cover exists, and the scorecard is requested AFTER the admitted set it
+    /// grades exists. The production invoker is the campaign packet composition
     /// (`bins/eliotd/src/campaign_packet.rs::resolve_compile_and_bind_result`),
-    /// which holds the admitted binding and the owner recipe today and still
-    /// lacks the remaining owner suppliers (seven-role converters, candidate
-    /// policy, admission identities, quality card, assembly policy,
-    /// measurement). Until those suppliers call this edge with owner-minted
-    /// pieces, the packet keeps its unbound-closure gap.
+    /// which now holds the admitted binding, the owner recipe, and the
+    /// owner-issued `SafetyFloorIdentity` — the floor is resolved there through
+    /// `eliot_context::campaign_publication::context_safety_floor_identity` and
+    /// checked by this edge's own admission join. The remaining suppliers
+    /// (seven-role acquisitions, candidate policy, priority policy, admission
+    /// rule record, measurement profile, per-atom measurements, quality card,
+    /// assembly policy, measurement callback) are still absent, so the packet
+    /// keeps its unbound-closure gap; the per-identity account is recorded on
+    /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
     ///
     /// #1862: `campaign_view` is the validated immutable
     /// `CampaignLearningStateView` this compilation is bound to, and
@@ -1570,16 +1629,25 @@ impl KernelContextReadClient {
     ///
     /// Admission compares the immutable view against the very binding its own
     /// decision is made under, and never trusts the candidate cell's verdict. The
-    /// refusal keeps the owner's typed `ContextError` rather than being flattened.
+    /// floor it admits against is the owner-minted one this composition was
+    /// handed, and the recipe is the exact recipe instance this decision is made
+    /// under, so the protected floor's binding, decision identity and coverage
+    /// of the recipe's mandatory roles are the admission cell's own checks rather
+    /// than an assumption made for it. The refusal keeps the owner's typed
+    /// `ContextError` rather than being flattened.
     fn require_campaign_view_for_admission(
         request: &CandidateRequest,
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
+        floor: &SafetyFloorIdentity,
+        recipe: &ContextRecipe,
     ) -> Result<(), PacketCompositionError> {
         check_campaign_view_for_admission(
             &request.binding,
             campaign_view,
             context_recipe_body_digest,
+            floor,
+            recipe,
         )
         .map_err(|error| PacketCompositionError::CampaignView(Box::new(error)))
     }
@@ -1607,6 +1675,20 @@ impl KernelContextReadClient {
     /// reordered source member, a foreign source revision or a lost unit fails
     /// closed before the packet leaves this composition rather than after it has
     /// been consumed.
+    /// #1862 ordering: the two atom-keyed admission pieces and the quality
+    /// scorecard are supplier callbacks, not values, because neither exists
+    /// before the stage that produces what they are keyed by.
+    /// `admission_parts` is invoked with the candidate set this compilation
+    /// actually produced, so `PriorityPolicyIdentity::priorities` and the
+    /// per-atom `AdmissionMeasurement` records are minted against a real
+    /// denominator; `quality` is invoked with the `AdmittedContextSet` this
+    /// compilation actually admitted, so the card can name the admitted payload
+    /// digest and the ordered rendered payload digest of the packet it grades.
+    /// Both suppliers are still owner-minted and neither is defaulted here: a
+    /// supplier that returns an error stops the compilation, and the assembly
+    /// owner independently re-derives and content-compares every digest the
+    /// card names, so a card that does not describe this packet is refused
+    /// rather than trusted.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
@@ -1615,13 +1697,12 @@ impl KernelContextReadClient {
         policy: &CandidatePolicy,
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
-        floor: SafetyFloorIdentity,
-        priority: PriorityPolicyIdentity,
-        rule: AdmissionRuleIdentity,
-        measurement_profile: MeasurementCompositionProfile,
-        supplied_omissions: Vec<SuppliedOmissionBinding>,
-        measurements: Vec<AdmissionMeasurement>,
-        quality: QualityScorecard,
+        floor: &SafetyFloorIdentity,
+        admission_parts: impl FnOnce(
+            &ContextCandidateSetResult,
+        )
+        -> Result<PacketAdmissionParts, PacketCompositionError>,
+        quality: impl FnOnce(&AdmittedContextSet) -> Result<QualityScorecard, PacketCompositionError>,
         assembly: &AssemblyPolicy,
         measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
     ) -> Result<(ActiveUnderstandingViewResult, MaterialRankTraceDelivery), PacketCompositionError>
@@ -1640,22 +1721,15 @@ impl KernelContextReadClient {
         policy
             .validate()
             .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        floor
+            .validate()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         Self::require_campaign_view_for_admission(
             request,
             campaign_view,
             context_recipe_body_digest,
-        )?;
-        let admission = PacketAdmissionBundle::build(
-            PacketAdmissionParts {
-                floor,
-                priority,
-                rule,
-                measurement_profile,
-                supplied_omissions,
-                measurements,
-            },
+            floor,
             recipe,
-            &request.binding,
         )?;
         let scope_revision = observed_scope_revision(seven)?;
         let task_frame = required_projection(
@@ -1703,6 +1777,17 @@ impl KernelContextReadClient {
             policy,
         )
         .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        // The candidate set now exists, so the owner-minted admission-closure
+        // pieces keyed by candidate atom identity can be closed over it. This
+        // is the point the old parameter shape could not reach: it demanded the
+        // same two records before the denominator they must equal was produced.
+        let admission = PacketAdmissionBundle::build(
+            admission_parts(&candidates)?,
+            floor.clone(),
+            &candidates,
+            recipe,
+            &request.binding,
+        )?;
         let input = packet_admission_input(request, recipe, &candidates, &admission);
         input
             .validate()
@@ -1713,6 +1798,9 @@ impl KernelContextReadClient {
             campaign_view,
             context_recipe_body_digest,
         )?;
+        // The admitted set now exists, so the scorecard owner is asked for the
+        // card that grades exactly this admitted set and its rendered output.
+        let quality = quality(&admitted)?;
         let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
             .map_err(|error| composition_failure(error, recipe, &request.binding))?;
         check_delivered_traces(&delivery, &assembled)
