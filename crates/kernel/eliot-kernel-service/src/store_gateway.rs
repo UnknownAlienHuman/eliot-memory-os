@@ -6007,8 +6007,18 @@ impl KernelStoreGateway {
     /// unadmitted beside its named reason, except for a blocked decision the
     /// notification owner cannot be reached for, which stays unknown under its
     /// failure fingerprint instead of collapsing into an unattributed error.
-    /// Any other join failure is an unknown disposition: an owner may already
-    /// have effected it.
+    ///
+    /// Every answer the Durable Job owner could give about an effect it may
+    /// already have issued is the occurrence's `UnknownOutcome` disposition, not
+    /// a route error and never an admission. This leg's wake phase is always
+    /// `Published` at this point, so the occurrence exists, its Durable Job
+    /// identity is the occurrence identity, and the disposition names exactly
+    /// that occurrence: the caller is told what must be reconciled instead of
+    /// being handed a route error that discards the committed configuration and
+    /// every phase beside it. A refusal the owner answered before any effect,
+    /// and every precondition this leg could not establish locally, stay route
+    /// errors: those provably admitted nothing, and no phase member may claim
+    /// otherwise.
     fn project_run_now_execution_outcome(
         wake: UserAutomationWakePhase,
         outcome: Result<UserAutomationExecutionOutcome, UserAutomationExecutionError>,
@@ -6047,6 +6057,35 @@ impl KernelStoreGateway {
                 }
                 Ok((wake, UserAutomationExecutionPhase::Unavailable { reason }))
             }
+            // The join crossed the Durable Job admission boundary and the owner
+            // did not establish what it did there: the answer was lost, it was
+            // settled without a readable ledger result, it was bound to another
+            // identity, or it returned a reference that does not bind to this
+            // occurrence. The occurrence is therefore unadmitted exactly as far
+            // as this caller can prove, and the only honest member of the
+            // canonical disposition vocabulary is `UnknownOutcome`. It is never
+            // reported as `Admitted`, and it is not discarded into a route error
+            // that would hide the committed Store receipt and the occurrence the
+            // caller must reconcile.
+            Err(
+                error @ UserAutomationExecutionError::Runtime(
+                    UserAutomationRuntimeError::UnknownOutcome(_)
+                    | UserAutomationRuntimeError::IdentityConflict
+                    | UserAutomationRuntimeError::OutcomeSettled(_),
+                )
+                | error @ UserAutomationExecutionError::RuntimeResponseMismatch(_),
+            ) => Ok((
+                wake,
+                UserAutomationExecutionPhase::UnknownOutcome {
+                    reason: unestablished_run_now_execution_reason(occurrence_id, &error),
+                },
+            )),
+            // A refusal the Durable Job owner answered before any owner effect,
+            // and a precondition this leg could not prove locally, provably
+            // admitted nothing. They are not an unknown outcome, and the closed
+            // execution vocabulary has no member for a decided refusal that is
+            // not an owner policy deferral, so the operation is refused instead
+            // of being dressed up as one.
             Err(error) => Err(error.to_string()),
         }
     }
@@ -8121,6 +8160,28 @@ fn unproven_run_now_wake_reason(occurrence_id: &str) -> String {
     format!(
         "the wake handoff of committed occurrence {occurrence_id} did not prove a pending wake, \
          so no occurrence joins the Durable Job owner and the occurrence stays unadmitted"
+    )
+}
+
+/// Execution phase reason for a `RunNow` join whose owner answer does not
+/// establish whether the occurrence was admitted.
+///
+/// The Durable Job owner's answer for this exact occurrence was lost, bound to
+/// another identity, settled without a readable ledger result, or returned a
+/// reference that does not bind to this occurrence. The wake handoff is proven,
+/// so the occurrence exists, and its Durable Job identity is the occurrence
+/// identity: naming it is what lets a later attempt reconcile that same
+/// occurrence under its original job identity instead of submitting a second
+/// job. An unknown external effect is reported as unresolved and is never
+/// turned into a fabricated admission (I5.19).
+fn unestablished_run_now_execution_reason(
+    occurrence_id: &str,
+    detail: impl std::fmt::Display,
+) -> String {
+    format!(
+        "the Durable Job owner did not establish an admission for committed occurrence \
+         {occurrence_id}, so the occurrence stays unadmitted until that same occurrence is \
+         reconciled: {detail}"
     )
 }
 
