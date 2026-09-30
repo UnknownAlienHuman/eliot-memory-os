@@ -198,7 +198,7 @@ pub fn is_controlboard_read_tool(tool: &serde_json::Value) -> bool {
 ///   material.
 ///
 /// The attempt's session must be present and match the session the envelope
-/// admitted; a missing HostPeer session or mismatch is refused as an exact
+/// admitted; a missing `HostPeer` session or mismatch is refused as an exact
 /// typed board error, never resolved toward either side. Nothing is pinned to
 /// an expected revision or fence: the caller declared no view, so the read
 /// serves the one snapshot taken here.
