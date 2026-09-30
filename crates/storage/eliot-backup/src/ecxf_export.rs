@@ -14,9 +14,12 @@
 //! source vocabulary it projects.
 //!
 //! The fence is not asserted by the caller. Every fence field is read from the
-//! source view the port returns: state fence, revision heads, ordering heads,
-//! event range, scope, schema/store generation and the store-declared
-//! residency-key reachability set. Coherence is then *proved* before a byte is
+//! source view the port returns — state fence, revision heads, ordering heads,
+//! event range, scope and schema/store generation — with one exception carried
+//! deliberately apart: the blob-reachability set comes from its own store call,
+//! [`EcxfSourceStore::reachable_residency_keys`], because the view that carries
+//! the blobs is the export's own output and cannot also be the evidence about
+//! it. Coherence is then *proved* before a byte is
 //! written, and the proof fails closed (I05-10 "consistent export boundary";
 //! I5.13: an incoherent boundary fails that class rather than producing a
 //! partial successful backup):
@@ -47,6 +50,12 @@
 //!   retained checksum does not describe its payload is refused instead of
 //!   being re-digested into an internally consistent package that no longer
 //!   preserves the source's integrity claim;
+//! * the fence's blob-reachability set is read through its own store call
+//!   ([`EcxfSourceStore::reachable_residency_keys`]), not taken from the view
+//!   that also carries the blobs — so when `eliot-ecxf` compares it against the
+//!   residency keys of the delivered blobs, the two sides are "what the Store
+//!   says is reachable" and "what this package carries", and neither is derived
+//!   from the other (issue #1871, A2);
 //! * `eliot-ecxf` then re-proves that every revision and ordering head carries
 //!   that same `state_fence`, that every purge-ledger entry does too, that the
 //!   fence reachability set equals the residency keys of the exported blobs,
@@ -196,11 +205,6 @@ pub struct CoherentSourceExport {
     pub ordering_heads: Vec<OrderingHead>,
     /// Canonical event interval covered by this view.
     pub event_range: EventRange,
-    /// Opaque residency-key digests the source declares reachable from this
-    /// export. They are compared against the residency keys of the delivered
-    /// blobs, so a source that under- or over-declares reachability fails
-    /// instead of shipping an archive whose fence does not describe it.
-    pub reachable_blob_residency_keys: Vec<String>,
     /// Canonical events of the view.
     pub events: Vec<CanonicalRecord>,
     /// Projection records of the view.
@@ -234,6 +238,33 @@ pub trait EcxfSourceStore: Send + Sync {
         &self,
         request: &EcxfExportRequest,
     ) -> Result<CoherentSourceExport, BackupError>;
+
+    /// Reads which opaque residency-key digests the source Store itself
+    /// declares reachable from this export's scope.
+    ///
+    /// This is deliberately a **second, independent store read** rather than a
+    /// field of [`CoherentSourceExport`]. Issue #1871 item A2 requires the
+    /// fence's blob-reachability value to be checkable against the source
+    /// Store, and the delivered blobs are one value this crate itself
+    /// assembles. If the reachability set travelled in the same struct as
+    /// [`CoherentSourceExport::blobs`], the only available comparison would be
+    /// the declared set against the export's own blob list — the export
+    /// vouching for itself, which proves nothing about the source (the same
+    /// defect class as the repaired event-range shadow).
+    ///
+    /// Reading it here makes the two sides genuinely different: this method
+    /// answers "which residency keys does the Store say are reachable", while
+    /// the delivered blobs answer "which residency keys does this package
+    /// carry". A source that under-declares, over-declares, or cannot answer
+    /// fails instead of shipping a fence that describes only itself.
+    ///
+    /// An owner that cannot answer refuses with its own typed failure rather
+    /// than returning an empty set: no reachable blob and no way to know that
+    /// are different facts, and only the owner can tell them apart.
+    async fn reachable_residency_keys(
+        &self,
+        request: &EcxfExportRequest,
+    ) -> Result<Vec<String>, BackupError>;
 }
 
 /// Exports one coherent `ECXF/1` package from a source store and publishes it.
@@ -268,6 +299,12 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
     let export_id = request.identity.operation_id.to_string();
     let snapshot = source.coherent_export(request).await?;
     prove_coherent_boundary(&snapshot, request)?;
+    // Issue #1871, A2: the fence's blob reachability is read from the source
+    // Store through its own call, not taken from the view that also carries the
+    // blobs this crate is about to assemble. The comparison performed below is
+    // therefore between what the Store says is reachable and what this package
+    // actually carries, and neither side is derived from the other.
+    let reachable_residency_keys = source.reachable_residency_keys(request).await?;
     let (revision_start, revision_end) = revision_range(&snapshot.revision_heads);
     let fence = eliot_ecxf::ExportFence {
         export_id: export_id.clone(),
@@ -278,7 +315,7 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
         revision_heads: snapshot.revision_heads.clone(),
         ordering_heads: snapshot.ordering_heads.clone(),
         event_range: snapshot.event_range.clone(),
-        blob_reachability_manifest: snapshot.reachable_blob_residency_keys.clone(),
+        blob_reachability_manifest: reachable_residency_keys.clone(),
         consistent: snapshot.completeness.is_complete(),
     };
     let manifest = eliot_ecxf::EcxfManifest {
