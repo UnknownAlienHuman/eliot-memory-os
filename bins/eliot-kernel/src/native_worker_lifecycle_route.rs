@@ -59,7 +59,13 @@ use eliot_kernel_service::{
     NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
     NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
 };
-use eliot_ors::{NativeWorkerClaimRecord, NativeWorkerClaimState, OperationIdentity, OrsError};
+use eliot_ors::{
+    AdmissionReservationClaimRef, AdmissionReservationClaims,
+    AdmissionReservationIdentityInput, AdmissionReservationStageRequest, NativeWorkerClaimRecord,
+    NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OrsError, StateFenceSnapshot,
+    admission_reservation_identity, epoch_lineage_for, stage_admission_reservation_inactive,
+    stage_operation_identity,
+};
 use eliot_process::OperationId;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde::Serialize;
@@ -2086,6 +2092,215 @@ impl KernelComposition {
         Ok(())
     }
 
+    /// Stages the exact `STAGED_INACTIVE` admission reservation for one claim
+    /// BEFORE the service owner is asked to admit it (#1678 REQ3, W2, A1).
+    ///
+    /// This is the stage half of the normative admission reservation saga and
+    /// the only production caller of
+    /// [`eliot_ors::stage_admission_reservation_inactive`]. It runs after the
+    /// claim/registration shape, epoch/fence, deadline and executable-join
+    /// checks above have all passed, and before `admit_native_worker_claim`
+    /// below, so the durable reservation exists before any semantic admission
+    /// write.
+    ///
+    /// What it creates: one `StagedInactive` ORS row carrying the complete
+    /// immutable claim set. What it does NOT create: no process, no provider
+    /// initialization, no environment allocation, no external effect. A staged
+    /// reservation is inert (I14.20: "`STAGED_INACTIVE` may reserve bounded
+    /// internal capacity but cannot provision or launch"), and nothing in this
+    /// function or its callees can launch.
+    ///
+    /// The reservation identity is DERIVED from the immutable claim binding
+    /// (see [`eliot_ors::admission_reservation_identity`]), not minted, so a
+    /// crash between stage and canonical admission re-derives the identical
+    /// `reservation_id` on restart and reloads the same row (#1678 A2) rather
+    /// than creating a second reservation. An exact replay returns the stored
+    /// row and charges nothing twice; the same identity under different content
+    /// is refused by the typed ORS owner as `DuplicateConflict` and never
+    /// overwrites.
+    fn stage_claim_admission_reservation(
+        &self,
+        request: &NativeWorkerClaimRequest,
+        claim: &serde_json::Value,
+        registration: &serde_json::Value,
+        now_unix_ms: i64,
+    ) -> Result<OperationIdentity, NativeWorkerRouteError> {
+        let claims = Self::admission_reservation_claims(request, claim, registration)?;
+        let authority_epoch = epoch_lineage_for(&request.authority_epoch, None)
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "authority_epoch",
+            })?;
+        // The fence is captured from the EXACT fence the claim was admitted
+        // under and validated against the canonical EpochId with the existing
+        // validator. The digest is checked against the ORIGINAL recorded fence
+        // by that validator; it is never recomputed here in order to trust it.
+        let state_fence = StateFenceSnapshot::capture(
+            &request.state_fence,
+            request.authority_epoch.sequence.get(),
+        )
+        .and_then(|snapshot| {
+            snapshot
+                .validate_against_epoch(&request.authority_epoch)
+                .map(|()| snapshot)
+        })
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "state_fence",
+        })?;
+        let identity_input = AdmissionReservationIdentityInput {
+            work_item_id: OperationIdentity::new(&request.claim_id).map_err(|_| {
+                NativeWorkerRouteError::Shape {
+                    field: "claim_id",
+                }
+            })?,
+            proposed_attempt_id: OperationIdentity::new(&request.attempt_id).map_err(|_| {
+                NativeWorkerRouteError::Shape {
+                    field: "attempt_id",
+                }
+            })?,
+            semantic_admission_revision: request.request_digest.clone(),
+            claims: claims.clone(),
+            state_fence: state_fence.clone(),
+            authority_epoch: authority_epoch.clone(),
+        };
+        let reservation_id = admission_reservation_identity(&identity_input).map_err(|_| {
+            NativeWorkerRouteError::Fence {
+                field: "admission_reservation.identity",
+            }
+        })?;
+        let operation_id = stage_operation_identity(&reservation_id).map_err(|_| {
+            NativeWorkerRouteError::Fence {
+                field: "admission_reservation.stage_operation",
+            }
+        })?;
+        // The expiry boundary is the claim's own deadline, already validated
+        // as strictly in the future by `require_claim_deadline` above. The
+        // `expires_at_ms` is therefore the deadline, never a fresh clock read.
+        let expires_at_ms = i64::try_from(request.deadline_unix_ms).map_err(|_| {
+            NativeWorkerRouteError::Fence {
+                field: "deadline_unix_ms",
+            }
+        })?;
+        stage_admission_reservation_inactive(
+            self.generation_gateway.ors.as_ref(),
+            &AdmissionReservationStageRequest {
+                reservation_id: reservation_id.clone(),
+                work_item_id: identity_input.work_item_id.clone(),
+                proposed_attempt_id: identity_input.proposed_attempt_id.clone(),
+                operation_id,
+                claims,
+                authority_epoch,
+                state_fence,
+                expires_at_ms,
+                now_unix_ms,
+            },
+        )
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "admission_reservation.stage",
+        })?;
+        Ok(reservation_id)
+    }
+
+    /// Projects the complete W2 claim set for one claim from the existing
+    /// owner fields (resource, lane, environment, effect, quota).
+    ///
+    /// Every reference and digest comes from a field the claim owner already
+    /// produced and the service owner already validated; nothing is invented
+    /// here. Each claim reference is the owner identity of that role and each
+    /// digest is the owner-produced digest of the exact content behind it, so
+    /// `AdmissionReservationClaims::validate` checks real values.
+    fn admission_reservation_claims(
+        request: &NativeWorkerClaimRequest,
+        claim: &serde_json::Value,
+        registration: &serde_json::Value,
+    ) -> Result<AdmissionReservationClaims, NativeWorkerRouteError> {
+        // Digest helper: every claim digest is the SHA-256 over the exact
+        // owner-produced content tuple behind that role. A digest is never
+        // recomputed in order to be trusted later; `AdmissionReservationClaimRef
+        // ::validate` only checks its shape, and the typed ORS owner re-reads
+        // and re-validates the recorded value on every readback.
+        fn digest<T: Serialize>(
+            value: &T,
+        ) -> Result<String, NativeWorkerRouteError> {
+            sha256_json(value).map_err(|_| NativeWorkerRouteError::Shape {
+                field: "admission_reservation.claim_digest",
+            })
+        }
+        // Resource claim: the installed worker artifact + configuration content
+        // the presenting registration already bound.
+        let resources = AdmissionReservationClaimRef {
+            reference: OpaqueLabel::new(require_claim_text(
+                registration,
+                "installation_id",
+            )?)
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "installation_id",
+            })?,
+            sha256: digest(&(
+                &request.installation_id,
+                &request.worker_artifact_digest,
+                &request.worker_config_digest,
+            ))?,
+        };
+        // Lane claim: the admitted scheduler lane / route class this unit
+        // executes on.
+        let lane = AdmissionReservationClaimRef {
+            reference: OpaqueLabel::new(&request.route_class).map_err(|_| {
+                NativeWorkerRouteError::Fence {
+                    field: "route_class",
+                }
+            })?,
+            sha256: digest(&(&request.route_class, &request.execution_unit_schema_version))?,
+        };
+        // Environment claim: the exact task WorkScope and governed decision
+        // environment the unit is admitted into.
+        let environment = AdmissionReservationClaimRef {
+            reference: OpaqueLabel::new(require_claim_text(claim, "work_scope_id")?)
+                .map_err(|_| NativeWorkerRouteError::Fence {
+                    field: "work_scope_id",
+                })?,
+            sha256: digest(&(
+                &request.work_scope_id,
+                &request.task_id,
+                &request.decision_id,
+            ))?,
+        };
+        // Effect claim: the exact external-effect operation this attempt is
+        // admitted to perform under its cancellation and result contract.
+        let effects = AdmissionReservationClaimRef {
+            reference: OpaqueLabel::new(&request.operation_id).map_err(|_| {
+                NativeWorkerRouteError::Fence {
+                    field: "operation_id",
+                }
+            })?,
+            sha256: digest(&(
+                &request.operation_id,
+                &request.cancellation_policy_id,
+                &request.expected_result_schema,
+                &request.expected_result_schema_version,
+            ))?,
+        };
+        // Quota view claim: the exact pessimistic cost, context and delegation
+        // ceiling the unit was admitted against, keyed by the execution unit
+        // schema revision that bounds it.
+        let quota_view = AdmissionReservationClaimRef {
+            reference: OpaqueLabel::new(format!(
+                "quota-view:{}",
+                request.execution_unit_schema_version
+            ))
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "quota_view",
+            })?,
+            sha256: digest(&request.budget)?,
+        };
+        Ok(AdmissionReservationClaims {
+            resources,
+            lane,
+            environment,
+            effects,
+            quota_view,
+        })
+    }
+
     /// Admits one claim: validate, deadline, typed service admission, receipt.
     ///
     /// Persistence happens inside the service owner's
@@ -2159,6 +2374,21 @@ impl KernelComposition {
                 field: "capability_cell_registry_digest",
             });
         }
+        // #1678 REQ3: stage the exact STAGED_INACTIVE reservation BEFORE any
+        // semantic admission effect. This creates only the durable reservation
+        // row; it launches nothing, provisions nothing and allocates no
+        // environment. The derived reservation identity is stable across a
+        // crash, so a restart re-derives and reloads this same reservation
+        // (#1678 A2) instead of minting a second one.
+        let stage_now_ms = i64::try_from(now).map_err(|_| NativeWorkerRouteError::Fence {
+            field: "now",
+        })?;
+        let reservation_id = self.stage_claim_admission_reservation(
+            &request,
+            claim,
+            registration,
+            stage_now_ms,
+        )?;
         let service = self.service_guard()?;
         let live_epoch = service.authority_epoch();
         let decision = service
@@ -2188,10 +2418,15 @@ impl KernelComposition {
             .executable_binding
             .as_ref()
             .map(|join| join.executable_binding_digest.clone());
-        let extra_echo: Vec<(&str, &str)> = match executable_echo.as_deref() {
-            Some(digest) => vec![("executable_binding_digest", digest)],
-            None => Vec::new(),
-        };
+        let mut extra_echo: Vec<(&str, &str)> = Vec::new();
+        if let Some(digest) = executable_echo.as_deref() {
+            extra_echo.push(("executable_binding_digest", digest));
+        }
+        // #1678 W1: the staged reservation identity rides the sealed receipt, so
+        // a later recovery or launch consumer re-derives and reloads this exact
+        // reservation instead of minting a new one. It is an identity echo only:
+        // a staged reservation carries no launch authority (I14.20).
+        extra_echo.push(("admission_reservation_id", reservation_id.as_str()));
         Self::seal_decision(
             "native_worker_claim",
             &claim_id,
