@@ -126,6 +126,7 @@ mod credential_provision;
 mod guard_containment;
 mod installation_registry;
 mod integration_discovery;
+mod isolated_destination;
 mod managed_change_plan;
 mod package;
 mod package_planner;
@@ -139,20 +140,19 @@ mod registry_wire;
 mod runtime_root_contract;
 mod scm_approval;
 mod setup_binding;
-mod isolated_destination;
 mod signed_activation;
 mod survey;
 mod transaction;
 mod user_broker_profile;
 
 pub use guard_containment::RetainedGuardRevert;
-pub use installation_registry::{
-    InstallationHostRootClass, RedbInstallationRegistry, classify_installation_host_root,
-};
 #[cfg(test)]
 use installation_registry::classify_registry_table;
 #[cfg(test)]
 use installation_registry::validate_installation_host_root;
+pub use installation_registry::{
+    InstallationHostRootClass, RedbInstallationRegistry, classify_installation_host_root,
+};
 use installation_registry::{
     LEGACY_REGISTRY_TABLE, REGISTRY_RELATIVE_PATH, REGISTRY_TABLE, installation_registry_path,
 };
@@ -179,12 +179,6 @@ use approved_generation_registry::{
 };
 
 pub(crate) use integration_discovery::WindowsPathIdentity;
-pub use isolated_destination::{
-    IsolatedDestinationAdmissionInput, IsolatedDestinationAllocation, IsolatedDestinationError,
-    IsolatedDestinationRefusal, IsolationEvidence, PREPARED_DESTINATION_ADMISSION_WIRE,
-    PreparedDestinationAdmission, PreparedDestinationFacts, ProposedRestorationRequirements,
-    admit_prepared_isolated_destination,
-};
 pub use integration_discovery::{
     AcceptedCatalogueContext, AcceptedInstallationSurvey, AcceptedIntegrationCatalogue,
     BoundedProbeInvocation, BoundedSafeProbe, CatalogueAdmissionError, DISCOVERY_CATALOGUE_SCHEMA,
@@ -193,6 +187,12 @@ pub use integration_discovery::{
     ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
     admit_installation_survey_and_compile_change, integration_seed_family_ids,
     load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
+};
+pub use isolated_destination::{
+    IsolatedDestinationAdmissionInput, IsolatedDestinationAllocation, IsolatedDestinationError,
+    IsolatedDestinationRefusal, IsolationEvidence, PREPARED_DESTINATION_ADMISSION_WIRE,
+    PreparedDestinationAdmission, PreparedDestinationFacts, ProposedRestorationRequirements,
+    admit_prepared_isolated_destination,
 };
 
 pub use managed_change_plan::{

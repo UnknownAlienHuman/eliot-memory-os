@@ -6805,9 +6805,9 @@ impl HostComposition {
             .owner_purge_ledger_revision()
             .map_err(|_| "no current owner-issued purge-ledger revision is available".to_owned())?;
         let roots = evidence.runtime_roots();
-        let area = roots
-            .isolated_restore_root()
-            .map_err(|_| "this installation profile declares no isolated restore area".to_owned())?;
+        let area = roots.isolated_restore_root().map_err(|_| {
+            "this installation profile declares no isolated restore area".to_owned()
+        })?;
         let area_lease = ProtectedRootLease::open_existing(std::path::Path::new(area.as_str()))
             .map_err(|_| {
                 "the owner-declared isolated restore area could not be proved through its \
@@ -6864,9 +6864,7 @@ impl HostComposition {
     /// error body never reaches a dispatch answer and a new refusal class is a
     /// compile error rather than a silently merged message.
     #[cfg(windows)]
-    fn isolated_destination_reason(
-        error: eliot_installation::IsolatedDestinationError,
-    ) -> String {
+    fn isolated_destination_reason(error: eliot_installation::IsolatedDestinationError) -> String {
         use eliot_installation::{IsolatedDestinationError, IsolatedDestinationRefusal};
         match error {
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ArbitraryDestination) => {
@@ -6879,10 +6877,10 @@ impl HostComposition {
             ) => "the admitted destination is the source installation and is never a restore \
                     destination"
                 .to_owned(),
-            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::DestinationOverlapsSource) => {
-                "the admitted destination root is not isolated from the source installation root"
-                    .to_owned()
-            }
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::DestinationOverlapsSource,
+            ) => "the admitted destination root is not isolated from the source installation root"
+                .to_owned(),
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ExistingInstallation) => {
                 "the admitted destination is an installation this authority already holds, so it \
                  is not a new distinct isolated installation"
@@ -6897,9 +6895,9 @@ impl HostComposition {
                  isolated restore destination"
                     .to_owned()
             }
-            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::BoundRecordConflict {
-                field,
-            }) => format!(
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::BoundRecordConflict { field },
+            ) => format!(
                 "an owner-issued bound record ({field}) does not match the destination under \
                  admission"
             ),

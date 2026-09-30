@@ -146,7 +146,9 @@ pub enum IsolatedDestinationRefusal {
 
     /// The owner-declared isolated restore area could not be resolved through
     /// the retained protected-root lease.
-    #[error("the owner-declared isolated restore area is not resolvable through its protected-root lease")]
+    #[error(
+        "the owner-declared isolated restore area is not resolvable through its protected-root lease"
+    )]
     IsolatedAreaUnproved,
 
     /// The destination leaf already existed at admission time, so the
@@ -272,26 +274,25 @@ impl ProposedRestorationRequirements {
         max_restore_bytes: u64,
     ) -> Result<Self, IsolatedDestinationError> {
         facts.validate()?;
-        let wire = PlatformHandle::new(Self::WIRE)
-            .map_err(|error| InstallationError::InvalidField {
+        let wire =
+            PlatformHandle::new(Self::WIRE).map_err(|error| InstallationError::InvalidField {
                 field: "prepared_destination.requirements.wire".to_owned(),
                 reason: error.to_string(),
             })?;
-        let target_schema_digest =
-            PlatformHandle::new(facts.target_schema_digest.as_str()).map_err(|error| {
-                InstallationError::InvalidField {
-                    field: "prepared_destination.requirements.target_schema_digest".to_owned(),
-                    reason: error.to_string(),
-                }
+        let target_schema_digest = PlatformHandle::new(facts.target_schema_digest.as_str())
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination.requirements.target_schema_digest".to_owned(),
+                reason: error.to_string(),
             })?;
-        let requires_source_key_material = matches!(facts.archive_class, BackupClassWire::FullRecovery);
+        let requires_source_key_material =
+            matches!(facts.archive_class, BackupClassWire::FullRecovery);
         let mut requirements = Self {
             wire,
             admitted_classes: vec![facts.archive_class],
             max_restore_bytes,
             target_schema_digest,
             requires_source_key_material,
-            requirements_digest: target_schema_digest.clone(),
+            requirements_digest: target_schema_digest,
         };
         requirements.requirements_digest = requirements.computed_digest()?;
         requirements.validate()?;
@@ -351,7 +352,15 @@ impl ProposedRestorationRequirements {
         }
         let mut seen = BTreeSet::new();
         for class in &self.admitted_classes {
-            if !seen.insert(*class) {
+            // `BackupClassWire` is a closed vocabulary that derives `Eq`/`Hash`
+            // but deliberately not `Ord`, so identity is taken from its own wire
+            // spelling rather than from an invented ordering of the enum.
+            if !seen.insert(serde_json::to_string(class).map_err(|error| {
+                IsolatedDestinationError::Installation(InstallationError::InvalidField {
+                    field: "prepared_destination.requirements.admitted_class".to_owned(),
+                    reason: error.to_string(),
+                })
+            })?) {
                 return Err(IsolatedDestinationError::Installation(
                     InstallationError::Duplicate {
                         kind: "prepared-destination restoration class".to_owned(),
@@ -444,7 +453,10 @@ impl IsolationEvidence {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "the digest covers exactly these ten fields")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the digest covers exactly these ten fields"
+    )]
     fn digest_over_fields(
         wire: &PlatformHandle,
         isolated_area_root: &str,
@@ -499,8 +511,11 @@ impl IsolationEvidence {
                 },
             ));
         }
-        text(&self.isolated_area_root, "prepared_destination.isolation.isolated_area_root")
-            .map_err(IsolatedDestinationError::Installation)?;
+        text(
+            &self.isolated_area_root,
+            "prepared_destination.isolation.isolated_area_root",
+        )
+        .map_err(IsolatedDestinationError::Installation)?;
         text(
             &self.destination_installation_root,
             "prepared_destination.isolation.destination_installation_root",
@@ -511,8 +526,11 @@ impl IsolationEvidence {
             "prepared_destination.isolation.source_installation_root",
         )
         .map_err(IsolatedDestinationError::Installation)?;
-        text(&self.source_host_root, "prepared_destination.isolation.source_host_root")
-            .map_err(IsolatedDestinationError::Installation)?;
+        text(
+            &self.source_host_root,
+            "prepared_destination.isolation.source_host_root",
+        )
+        .map_err(IsolatedDestinationError::Installation)?;
         handle(
             &self.destination_installation_key,
             "prepared_destination.isolation.destination_installation_key",
@@ -630,7 +648,10 @@ impl PreparedDestinationAdmission {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "the digest covers exactly these fields")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the digest covers exactly these fields"
+    )]
     fn digest_over_fields(
         wire: &PlatformHandle,
         operation_id: &PlatformHandle,
@@ -695,8 +716,14 @@ impl PreparedDestinationAdmission {
                 "prepared_destination.destination_installation",
             ),
             (&self.archive_id, "prepared_destination.archive_id"),
-            (&self.target_schema_digest, "prepared_destination.target_schema_digest"),
-            (&self.approved_target_build, "prepared_destination.approved_target_build"),
+            (
+                &self.target_schema_digest,
+                "prepared_destination.target_schema_digest",
+            ),
+            (
+                &self.approved_target_build,
+                "prepared_destination.approved_target_build",
+            ),
             (
                 &self.approved_target_profile,
                 "prepared_destination.approved_target_profile",
@@ -706,8 +733,11 @@ impl PreparedDestinationAdmission {
         }
         sha256_handle(&self.archive_digest, "prepared_destination.archive_digest")
             .map_err(IsolatedDestinationError::Installation)?;
-        sha256_handle(&self.admission_digest, "prepared_destination.admission_digest")
-            .map_err(IsolatedDestinationError::Installation)?;
+        sha256_handle(
+            &self.admission_digest,
+            "prepared_destination.admission_digest",
+        )
+        .map_err(IsolatedDestinationError::Installation)?;
         if self.current_purge_ledger_revision == 0 {
             return Err(IsolatedDestinationError::Installation(
                 InstallationError::IncompleteObservation(
@@ -828,18 +858,17 @@ impl PreparedDestinationFacts {
     ) -> Result<Self, IsolatedDestinationError> {
         identity.validate()?;
         let facts = Self {
-            wire: PlatformHandle::new(Self::WIRE)
-                .map_err(|error| InstallationError::InvalidField {
+            wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
+                InstallationError::InvalidField {
                     field: "prepared_destination.facts.wire".to_owned(),
                     reason: error.to_string(),
-                })?,
-            operation_id: PlatformHandle::new(
-                identity.mutation.canonical_request_hash.as_str(),
-            )
-            .map_err(|error| InstallationError::InvalidField {
-                field: "prepared_destination.facts.operation_id".to_owned(),
-                reason: error.to_string(),
+                }
             })?,
+            operation_id: PlatformHandle::new(identity.mutation.canonical_request_hash.as_str())
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "prepared_destination.facts.operation_id".to_owned(),
+                    reason: error.to_string(),
+                })?,
             source_installation: PlatformHandle::new(identity.source_installation.as_str())
                 .map_err(|error| InstallationError::InvalidField {
                     field: "prepared_destination.facts.source_installation".to_owned(),
@@ -866,11 +895,12 @@ impl PreparedDestinationFacts {
                     reason: error.to_string(),
                 },
             )?,
-            facts_digest: PlatformHandle::new(identity.schema_digest.as_str())
-                .map_err(|error| InstallationError::InvalidField {
+            facts_digest: PlatformHandle::new(identity.schema_digest.as_str()).map_err(
+                |error| InstallationError::InvalidField {
                     field: "prepared_destination.facts.facts_digest".to_owned(),
                     reason: error.to_string(),
-                })?,
+                },
+            )?,
         };
         if !valid_installation_key(facts.destination_installation.as_str()) {
             return Err(IsolatedDestinationRefusal::ArbitraryDestination.into());
@@ -924,7 +954,10 @@ impl PreparedDestinationFacts {
             ));
         }
         for (value, field) in [
-            (&self.operation_id, "prepared_destination.facts.operation_id"),
+            (
+                &self.operation_id,
+                "prepared_destination.facts.operation_id",
+            ),
             (
                 &self.source_installation,
                 "prepared_destination.facts.source_installation",
@@ -941,12 +974,21 @@ impl PreparedDestinationFacts {
         ] {
             handle(value, field).map_err(IsolatedDestinationError::Installation)?;
         }
-        sha256_handle(&self.archive_digest, "prepared_destination.facts.archive_digest")
-            .map_err(IsolatedDestinationError::Installation)?;
-        sha256_handle(&self.target_schema_digest, "prepared_destination.facts.target_schema_digest")
-            .map_err(IsolatedDestinationError::Installation)?;
-        sha256_handle(&self.facts_digest, "prepared_destination.facts.facts_digest")
-            .map_err(IsolatedDestinationError::Installation)?;
+        sha256_handle(
+            &self.archive_digest,
+            "prepared_destination.facts.archive_digest",
+        )
+        .map_err(IsolatedDestinationError::Installation)?;
+        sha256_handle(
+            &self.target_schema_digest,
+            "prepared_destination.facts.target_schema_digest",
+        )
+        .map_err(IsolatedDestinationError::Installation)?;
+        sha256_handle(
+            &self.facts_digest,
+            "prepared_destination.facts.facts_digest",
+        )
+        .map_err(IsolatedDestinationError::Installation)?;
         if matches!(self.archive_class, BackupClassWire::ScopeExport) {
             return Err(IsolatedDestinationRefusal::ClassNotRestorable.into());
         }
@@ -1178,15 +1220,13 @@ pub fn admit_prepared_isolated_destination(
     // The destination must be STRICTLY inside the area (the area itself is not a
     // destination) and must neither contain, be contained by, nor equal the
     // source installation root: I5.13's isolated root, A13.7's isolated area.
-    let strictly_inside_area = !same_windows_root_text(
-        &destination_installation_root,
-        &resolved_area_text,
-    ) && path_is_within(&destination_installation_root, &resolved_area_text);
-    let disjoint_from_source = !same_windows_root_text(
-        &destination_installation_root,
-        &source_installation_root,
-    ) && !path_is_within(&destination_installation_root, &source_installation_root)
-        && !path_is_within(&source_installation_root, &destination_installation_root);
+    let strictly_inside_area =
+        !same_windows_root_text(&destination_installation_root, &resolved_area_text)
+            && path_is_within(&destination_installation_root, &resolved_area_text);
+    let disjoint_from_source =
+        !same_windows_root_text(&destination_installation_root, &source_installation_root)
+            && !path_is_within(&destination_installation_root, &source_installation_root)
+            && !path_is_within(&source_installation_root, &destination_installation_root);
     if !(strictly_inside_area && disjoint_from_source) {
         return Err(IsolatedDestinationRefusal::DestinationOverlapsSource.into());
     }
@@ -1230,8 +1270,7 @@ pub fn admit_prepared_isolated_destination(
     if input.current_purge_ledger_revision == 0 {
         return Err(IsolatedDestinationError::Installation(
             InstallationError::IncompleteObservation(
-                "the owner issued no current purge-ledger revision for this destination"
-                    .to_owned(),
+                "the owner issued no current purge-ledger revision for this destination".to_owned(),
             ),
         ));
     }
@@ -1241,12 +1280,11 @@ pub fn admit_prepared_isolated_destination(
         super::InstallationProfile::UserMode => "user_mode",
         super::InstallationProfile::PortableDev => "portable_dev",
     };
-    let approved_target_profile = PlatformHandle::new(profile_token).map_err(|error| {
-        InstallationError::InvalidField {
+    let approved_target_profile =
+        PlatformHandle::new(profile_token).map_err(|error| InstallationError::InvalidField {
             field: "prepared_destination.approved_target_profile".to_owned(),
             reason: error.to_string(),
-        }
-    })?;
+        })?;
 
     let isolation_wire = PlatformHandle::new(IsolationEvidence::WIRE).map_err(|error| {
         InstallationError::InvalidField {
