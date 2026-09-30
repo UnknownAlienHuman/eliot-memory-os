@@ -83,18 +83,6 @@ impl OwnerRoute {
     }
 }
 
-/// What kind of obligation an owner loss leaves outstanding.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ObligationKind {
-    /// An eligible successor lease was authenticated in the same call, so the
-    /// record is owned again under a new ownership epoch.
-    ReassignOwner,
-    /// No eligible successor exists, so the record stays unassigned and
-    /// escalates through the admitted Human/critical-attention route.
-    Escalate,
-}
-
 /// Why an ownership lease stopped being current.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -422,18 +410,6 @@ impl Ownership {
     #[must_use]
     pub const fn is_assigned(&self) -> bool {
         matches!(self, Self::Assigned(_))
-    }
-
-    /// The principal that is fenced from further updates, if any.
-    ///
-    /// A reassignment to the same principal under a new lease is still a
-    /// reassignment: the *old lease* stays fenced even though the name returns.
-    #[must_use]
-    pub fn fenced_holder(&self) -> Option<&OwnerRef> {
-        match self {
-            Self::Assigned(_) => None,
-            Self::Unassigned(unassigned) => Some(&unassigned.last_holder),
-        }
     }
 }
 

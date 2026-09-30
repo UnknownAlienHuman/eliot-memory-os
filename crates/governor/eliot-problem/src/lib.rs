@@ -19,8 +19,8 @@ mod ownership;
 
 pub use ownership::{
     AssignedOwnership, AuthenticatedOwnerLease, AuthorizedWaiver, ClosureEvidence, LeaseIdentity,
-    ObligationKind, OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseLoss, OwnerLossReason,
-    OwnerRoute, Ownership, OwnershipObligation, UnassignedOwnership, WaiverRecord, obligation_id,
+    OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseLoss, OwnerLossReason, OwnerRoute, Ownership,
+    OwnershipObligation, UnassignedOwnership, WaiverRecord, obligation_id,
 };
 
 /// Stable package identity.
@@ -727,6 +727,66 @@ impl ReopenRecord {
 }
 
 impl Problem {
+    /// Opens a Problem at revision 1 with a lease-backed owner.
+    ///
+    /// The owner is an [`AuthenticatedOwnerLease`], so opening a Problem under a
+    /// principal the caller merely named is not expressible: the lease owner
+    /// named the holder and this crate re-derived the commitment. `severity` and
+    /// `observed_evidence` are checked against the admitting `Signal`, so the
+    /// record cannot restate a severity or an observation the Signal never
+    /// carried, and `expected_resolution` is fixed here — before anyone can
+    /// close it — which is what makes later resolution evidence-backed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        problem_id: ProblemId,
+        source: &Signal,
+        class: ProblemClass,
+        title: String,
+        symptom: String,
+        scope_id: String,
+        affected_dependencies: Vec<String>,
+        hypotheses: Vec<ProblemHypothesis>,
+        ownership: &AuthenticatedOwnerLease,
+        containment: Vec<ArtifactId>,
+        next_probe: String,
+        resolution_condition: String,
+        expected_resolution: Vec<ArtifactId>,
+        state_fence: StateFence,
+    ) -> Result<Self, ProblemError> {
+        source.validate()?;
+        let value = Self {
+            problem_id,
+            signal_refs: vec![source.signal_id.clone()],
+            class,
+            severity: source.severity,
+            title,
+            symptom,
+            scope_id,
+            affected_dependencies,
+            observed_evidence: source.evidence_handles.clone(),
+            hypotheses,
+            ownership: Ownership::Assigned(AssignedOwnership {
+                holder: ownership.holder().clone(),
+                lease: ownership.identity().clone(),
+                ownership_epoch: ownership.ownership_epoch(),
+            }),
+            containment,
+            repair_history: Vec::new(),
+            next_probe,
+            state: ProblemState::Open,
+            resolution_condition,
+            expected_resolution,
+            reopen_history: Vec::new(),
+            obligation: None,
+            acknowledged_by: None,
+            state_fence,
+            revision: 1,
+            reopen_count: 0,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     /// Validates problem invariants, lease-bound ownership and evidence identity.
     pub fn validate(&self) -> Result<(), ProblemError> {
         text(&self.title, "title")?;
@@ -981,17 +1041,22 @@ impl Problem {
     ///
     /// `lease` must be an [`AuthenticatedOwnerLease`], so the successor is
     /// named by the lease owner rather than by the caller: a caller that only
-    /// has a principal string cannot reach this entry at all. The grant's
-    /// ownership epoch must be greater than the epoch currently held, so I13.8's
+    /// has a principal string cannot reach this entry at all. The lease must
+    /// still be inside its own validity window at `now_ms`, the grant's
+    /// ownership epoch must be greater than the epoch currently held so I13.8's
     /// "new Authority Epoch" cannot be a reuse, and the grant must be bound to
     /// the record's live fence.
     pub fn assign_owner(
         &mut self,
         expected_fence: &StateFence,
         lease: &AuthenticatedOwnerLease,
+        now_ms: u64,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         let grant = lease.grant();
+        if !lease.is_current_at(now_ms) {
+            return Err(ProblemError::OwnerLeaseNotCurrent);
+        }
         if !lease.is_bound_to(&self.state_fence) {
             return Err(ProblemError::FenceMismatch);
         }
@@ -1659,15 +1724,20 @@ impl Incident {
     /// Assigns an eligible successor under a newly issued ownership lease.
     ///
     /// Same lease-epoch rule as the Problem and attention records: the successor
-    /// is named by the lease owner, and the grant's ownership epoch must exceed
-    /// the epoch currently held, so a renewal is a new epoch rather than a reuse.
+    /// is named by the lease owner, the lease must be current at `now_ms`, and
+    /// the grant's ownership epoch must exceed the epoch currently held, so a
+    /// renewal is a new epoch rather than a reuse.
     pub fn assign_owner(
         &mut self,
         expected_fence: &StateFence,
         lease: &AuthenticatedOwnerLease,
+        now_ms: u64,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         let grant = lease.grant();
+        if !lease.is_current_at(now_ms) {
+            return Err(ProblemError::OwnerLeaseNotCurrent);
+        }
         if !lease.is_bound_to(&self.state_fence) {
             return Err(ProblemError::FenceMismatch);
         }
@@ -2523,20 +2593,25 @@ impl CriticalAttention {
     /// Assigns an eligible successor under a newly issued ownership lease.
     ///
     /// The successor is named by the lease owner, not by the caller: a caller
-    /// holding only a principal string cannot reach this entry. The grant's
-    /// ownership epoch must exceed the epoch currently held, and the grant must
-    /// be bound to the record's live fence, so a renewal is a new epoch rather
-    /// than a reuse. The blocking action set is retained in full.
+    /// holding only a principal string cannot reach this entry. The lease must
+    /// still be current at `now_ms`, the grant's ownership epoch must exceed the
+    /// epoch currently held, and the grant must be bound to the record's live
+    /// fence, so a renewal is a new epoch rather than a reuse. The blocking
+    /// action set is retained in full.
     pub fn assign_owner(
         &mut self,
         expected_fence: &StateFence,
         lease: &AuthenticatedOwnerLease,
+        now_ms: u64,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         if self.state.is_terminal() {
             return Err(ProblemError::ImmutableState);
         }
         let grant = lease.grant();
+        if !lease.is_current_at(now_ms) {
+            return Err(ProblemError::OwnerLeaseNotCurrent);
+        }
         if !lease.is_bound_to(&self.state_fence) {
             return Err(ProblemError::FenceMismatch);
         }
@@ -2629,8 +2704,9 @@ impl CriticalAttention {
         &mut self,
         expected_fence: &StateFence,
         lease: &AuthenticatedOwnerLease,
+        now_ms: u64,
     ) -> Result<(), ProblemError> {
-        self.assign_owner(expected_fence, lease)?;
+        self.assign_owner(expected_fence, lease, now_ms)?;
         if self.state != AttentionState::Escalated {
             let revision = next_revision(self.revision)?;
             let mut candidate = self.clone();
@@ -2961,11 +3037,28 @@ pub fn contract_identity() -> Result<eliot_contracts::ContractIdentity, ProblemE
         &serde_json::json!({
             "signal": schemars::schema_for!(Signal),
             "problem": schemars::schema_for!(Problem),
+            "problem_class": schemars::schema_for!(ProblemClass),
+            "problem_hypothesis": schemars::schema_for!(ProblemHypothesis),
+            "repair_record": schemars::schema_for!(RepairRecord),
+            "reopen_record": schemars::schema_for!(ReopenRecord),
+            "ownership": schemars::schema_for!(Ownership),
+            "assigned_ownership": schemars::schema_for!(AssignedOwnership),
+            "unassigned_ownership": schemars::schema_for!(UnassignedOwnership),
+            "owner_lease_grant": schemars::schema_for!(OwnerLeaseGrant),
+            "lease_identity": schemars::schema_for!(LeaseIdentity),
+            "owner_lease_loss": schemars::schema_for!(OwnerLeaseLoss),
+            "owner_loss_reason": schemars::schema_for!(OwnerLossReason),
+            "owner_route": schemars::schema_for!(OwnerRoute),
+            "ownership_obligation": schemars::schema_for!(OwnershipObligation),
+            "closure_evidence": schemars::schema_for!(ClosureEvidence),
+            "authorized_waiver": schemars::schema_for!(AuthorizedWaiver),
+            "waiver_record": schemars::schema_for!(WaiverRecord),
             "incident": schemars::schema_for!(Incident),
             "incident_reason": schemars::schema_for!(IncidentReason),
             "incident_promotion": schemars::schema_for!(IncidentPromotion),
             "incident_promotion_authority": schemars::schema_for!(PromotionAuthority),
             "incident_review_request": schemars::schema_for!(IncidentReviewRequest),
+            "attention_influence": schemars::schema_for!(AttentionInfluence),
             "conflict": schemars::schema_for!(Conflict),
             "concilium": schemars::schema_for!(ConciliumRun),
             "attention": schemars::schema_for!(CriticalAttention),
@@ -3014,28 +3107,99 @@ mod tests {
         })
     }
 
-    fn problem() -> Result<Problem, ProblemError> {
-        Ok(Problem {
-            problem_id: ProblemId::new("problem-1")?,
-            signal_refs: vec![SignalId::new("signal-1")?],
-            title: "repeated failure".to_owned(),
+    /// The lease owner's own commitment store, standing in for the real issuer.
+    struct TestIssuer {
+        grants: Vec<OwnerLeaseGrant>,
+    }
+
+    impl OwnerLeaseIssuer for TestIssuer {
+        fn commitment_for(&self, grant: &OwnerLeaseGrant) -> Option<String> {
+            if self.grants.contains(grant) {
+                grant.expected_commitment().ok()
+            } else {
+                None
+            }
+        }
+    }
+
+    fn lease_for(principal: &str, fence: &StateFence, epoch: u64) -> Result<AuthenticatedOwnerLease, ProblemError> {
+        let grant = OwnerLeaseGrant {
+            lease_id: format!("lease-{principal}-{epoch}"),
+            holder: OwnerRef {
+                principal: principal.to_owned(),
+                generation: format!("generation-{epoch}"),
+            },
+            authority_epoch: fence.authority_epoch.clone(),
+            state_fence: fence.clone(),
+            ownership_epoch: epoch,
+            issued_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        };
+        let issuer = TestIssuer {
+            grants: vec![grant.clone()],
+        };
+        AuthenticatedOwnerLease::authenticate(&grant, &issuer)
+    }
+
+    fn signal() -> Result<Signal, ProblemError> {
+        Ok(Signal {
+            signal_id: SignalId::new("signal-1")?,
+            rule_id: "rule-1".to_owned(),
+            severity: SignalSeverity::Blocking,
+            subject: "subject-1".to_owned(),
             scope_id: "scope-1".to_owned(),
-            owner: owner(),
-            state: ProblemState::Open,
-            evidence_refs: vec![artifact("evidence-1")?],
-            resolution_condition: "verifier evidence".to_owned(),
-            acknowledged_by: None,
+            observed_at: ClockReading::default(),
+            evidence_handles: vec![artifact("evidence-1")?],
+            observation: None,
+            attribution: SignalAttribution::Known,
+            processing_state: SignalProcessingState::Observed,
+            delivery_state: DeliveryState::Pending,
+            disposition: SignalDisposition::ProblemCandidate,
+            dedup_key: "dedup-1".to_owned(),
+            reopen_condition: "recurrence".to_owned(),
             state_fence: state_fence(),
-            revision: 1,
-            reopen_count: 0,
         })
+    }
+
+    fn problem() -> Result<Problem, ProblemError> {
+        let fence = state_fence();
+        let lease = lease_for("owner-1", &fence, 1)?;
+        Problem::new(
+            ProblemId::new("problem-1")?,
+            &signal()?,
+            ProblemClass::Operational,
+            "repeated failure".to_owned(),
+            "the route fails repeatedly".to_owned(),
+            "scope-1".to_owned(),
+            vec!["dependency-1".to_owned()],
+            Vec::new(),
+            &lease,
+            Vec::new(),
+            "next probe".to_owned(),
+            "verifier evidence".to_owned(),
+            vec![artifact("evidence-2")?],
+            fence,
+        )
+    }
+
+    fn closure(fence: &StateFence, verifier: &str, refs: Vec<ArtifactId>) -> ClosureEvidence {
+        ClosureEvidence {
+            verifier: OwnerRef {
+                principal: verifier.to_owned(),
+                generation: "verifier-generation".to_owned(),
+            },
+            verifier_fence: fence.clone(),
+            verified_subject: "subject-1".to_owned(),
+            verified_observables: refs,
+        }
     }
 
     #[test]
     fn acknowledgement_is_not_resolution() -> Result<(), ProblemError> {
         let fence = state_fence();
+        let lease = lease_for("owner-1", &fence, 1)?;
         let mut value = problem()?;
-        value.acknowledge(&fence, "owner-1")?;
+        value.acknowledge(&fence, &lease)?;
         assert_eq!(value.acknowledged_by.as_deref(), Some("owner-1"));
         assert_eq!(value.state, ProblemState::Open);
         assert!(!value.is_resolved());
@@ -3049,14 +3213,15 @@ mod tests {
         value.transition(&fence, ProblemState::Triaged)?;
         value.transition(&fence, ProblemState::Diagnosing)?;
         value.transition(&fence, ProblemState::Verifying)?;
-        value.transition(&fence, ProblemState::Resolved)?;
+        value.resolve(&fence, &closure(&fence, "verifier-1", vec![artifact("evidence-2")?]))?;
         assert!(matches!(
             value.reopen(&fence, Vec::new()),
             Err(ProblemError::ReopenRequiresEvidence)
         ));
-        value.reopen(&fence, vec![artifact("evidence-2")?])?;
+        value.reopen(&fence, vec![artifact("evidence-3")?])?;
         assert_eq!(value.state, ProblemState::Open);
         assert_eq!(value.reopen_count, 1);
+        assert_eq!(value.reopen_history.len(), 1);
         assert_eq!(value.acknowledged_by, None);
         Ok(())
     }
@@ -3066,13 +3231,15 @@ mod tests {
         let old_fence = state_fence();
         let new_fence =
             StateFence::new(test_epoch(TEST_LINEAGE_A, 2), ResourceGeneration::genesis());
+        let old_lease = lease_for("owner-1", &old_fence, 1)?;
+        let new_lease = lease_for("owner-2", &new_fence, 2)?;
         let mut value = problem()?;
-        value.reassign_owner(&old_fence, owner(), new_fence.clone())?;
+        value.assign_owner(&old_fence, &new_lease, 1_500)?;
         assert!(matches!(
-            value.acknowledge(&old_fence, "owner-1"),
+            value.acknowledge(&old_fence, &old_lease),
             Err(ProblemError::FenceMismatch)
         ));
-        value.acknowledge(&new_fence, "owner-1")?;
+        value.acknowledge(&new_fence, &new_lease)?;
         Ok(())
     }
 
