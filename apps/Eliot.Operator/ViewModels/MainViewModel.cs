@@ -1405,11 +1405,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
             && (string.Equals(outcome, StaleFenceReasonCode, StringComparison.Ordinal)
                 || string.Equals(outcome, StaleFenceReasonCode.ToLowerInvariant(), StringComparison.Ordinal));
 
+        // The receipt's `revision` is the produced post-transition task revision,
+        // not the revision that was expected at submission: a committed mutation
+        // advances the revision, so a successful receipt legitimately returns a
+        // higher value. What this must prove is therefore monotonic — the receipt
+        // is bound to a revision at least as new as the one this operation was
+        // submitted against, so it cannot predate the submission. A lower
+        // revision is an unbound receipt from before this command.
         if (!staleFence
             && (!receipt.TryGetProperty("revision", out var revision)
                 || revision.ValueKind != JsonValueKind.Number
                 || !revision.TryGetUInt64(out var receiptRevision)
-                || receiptRevision != expectedOperationRevision))
+                || receiptRevision < expectedOperationRevision))
         {
             throw new InvalidOperationException("operator command receipt has an unbound task revision");
         }
