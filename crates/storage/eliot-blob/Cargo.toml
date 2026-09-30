@@ -25,7 +25,7 @@ blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-zstd = { version = "=0.13.3", default-features = false, features = ["std"] }
+zstd = "=0.13.3"
 
 [lints]
 workspace = true
