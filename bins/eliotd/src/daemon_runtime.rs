@@ -52,7 +52,9 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
 
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
@@ -6852,13 +6854,7 @@ fn transient_not_before(result: &AgentActivationResolutionResult) -> Option<u64>
 }
 
 pub(crate) fn unix_ms(now: SystemTime) -> Result<u64, String> {
-    let elapsed = now
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("daemon activation clock precedes Unix epoch: {error}"))?;
-    elapsed
-        .as_millis()
-        .try_into()
-        .map_err(|_| "daemon activation clock exceeds u64 milliseconds".to_owned())
+    eliotd::try_unix_ms(now)
 }
 
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {

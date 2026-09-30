@@ -56,42 +56,42 @@ pub(crate) struct CapturedLspReadContext {
 /// ownership is allocated before the sealed process admission is built; the
 /// bridge checks that the admitted command names that exact owned path.
 #[cfg(windows)]
-pub(crate) struct LiveLspCaptureInvocation<'a, G, C> {
-    pub(crate) identity: &'a RequestIdentity,
-    pub(crate) source_artifact_admission: &'a eliot_governor::SourceArtifactAdmission,
+pub struct LiveLspCaptureInvocation<'a, G, C> {
+    pub identity: &'a RequestIdentity,
+    pub source_artifact_admission: &'a eliot_governor::SourceArtifactAdmission,
     /// Owner-formed canonical Store transition shell for this original
     /// request. The W1 wrapper replaces only its CaptureObservation payload
     /// pointer with the receipt returned by the live Blob publication.
-    pub(crate) capture_envelope: eliot_governor::CanonicalWriteEnvelope,
+    pub capture_envelope: eliot_governor::CanonicalWriteEnvelope,
     /// Exact source closure already observed for the admitted WorkScope.
-    pub(crate) governing_sources: &'a eliot_governor::GoverningSourceSet,
-    pub(crate) privacy_profile: &'a eliot_governor::PrivacyProfile,
-    pub(crate) git_owner: Arc<G>,
-    pub(crate) command: &'a eliot_lsp_bridge::LspCommand,
-    pub(crate) process_admission: eliot_kernel_service::ProcessExecutionAdmissionRequest,
-    pub(crate) instrument_invocation: &'a eliot_instrument_api::InstrumentInvocation,
-    pub(crate) source_candidate: &'a eliot_lsp_bridge::SourceCandidate,
-    pub(crate) source_root: &'a eliot_lsp_bridge::RepoRoot,
-    pub(crate) source_scope: Option<&'a eliot_lsp_bridge::GovernedGitScope>,
-    pub(crate) candidate_identity: Option<&'a eliot_lsp_bridge::CandidateIdentity>,
-    pub(crate) build_fingerprint: Option<&'a eliot_lsp_bridge::BuildFingerprint>,
-    pub(crate) config: &'a eliot_lsp_bridge::AnalyzerConfig,
-    pub(crate) operation: &'a eliot_lsp_bridge::SemanticOperation,
-    pub(crate) resolved_executable: &'a eliot_lsp_bridge::ResolvedExecutableIdentity,
-    pub(crate) registry_entry: &'a eliot_instrument_runner::RegistryEntry,
-    pub(crate) instrument_spec: &'a eliot_instrument_runner::InstrumentSpec,
-    pub(crate) source_artifact_proof: eliot_lsp_bridge::LspSourceArtifactProof,
-    pub(crate) scip_output_owner: Option<eliot_platform_windows::OwnedDirectoryPublication>,
-    pub(crate) source_scope_after_run: Option<&'a eliot_lsp_bridge::GovernedGitScope>,
-    pub(crate) candidate_identity_after_run: Option<&'a eliot_lsp_bridge::CandidateIdentity>,
-    pub(crate) build_fingerprint_after_run: Option<&'a eliot_lsp_bridge::BuildFingerprint>,
-    pub(crate) after_run_source_proof: Option<eliot_lsp_bridge::LspSourceArtifactProof>,
-    pub(crate) invoked_at_unix_ms: u64,
+    pub governing_sources: &'a eliot_governor::GoverningSourceSet,
+    pub privacy_profile: &'a eliot_governor::PrivacyProfile,
+    pub git_owner: Arc<G>,
+    pub command: &'a eliot_lsp_bridge::LspCommand,
+    pub process_admission: eliot_kernel_service::ProcessExecutionAdmissionRequest,
+    pub instrument_invocation: &'a eliot_instrument_api::InstrumentInvocation,
+    pub source_candidate: &'a eliot_lsp_bridge::SourceCandidate,
+    pub source_root: &'a eliot_lsp_bridge::RepoRoot,
+    pub source_scope: Option<&'a eliot_lsp_bridge::GovernedGitScope>,
+    pub candidate_identity: Option<&'a eliot_lsp_bridge::CandidateIdentity>,
+    pub build_fingerprint: Option<&'a eliot_lsp_bridge::BuildFingerprint>,
+    pub config: &'a eliot_lsp_bridge::AnalyzerConfig,
+    pub operation: &'a eliot_lsp_bridge::SemanticOperation,
+    pub resolved_executable: &'a eliot_lsp_bridge::ResolvedExecutableIdentity,
+    pub registry_entry: &'a eliot_lsp_bridge::RegistryEntry,
+    pub instrument_spec: &'a eliot_lsp_bridge::InstrumentSpec,
+    pub source_artifact_proof: eliot_lsp_bridge::LspSourceArtifactProof,
+    pub scip_output_owner: Option<eliot_platform_windows::OwnedDirectoryPublication>,
+    pub source_scope_after_run: Option<&'a eliot_lsp_bridge::GovernedGitScope>,
+    pub candidate_identity_after_run: Option<&'a eliot_lsp_bridge::CandidateIdentity>,
+    pub build_fingerprint_after_run: Option<&'a eliot_lsp_bridge::BuildFingerprint>,
+    pub after_run_source_proof: Option<eliot_lsp_bridge::LspSourceArtifactProof>,
+    pub invoked_at_unix_ms: u64,
     /// Owner completion wait. The daemon passes the exact operation ID after
     /// it has been accepted by the original process owner. Its evidence is
     /// only a scheduling barrier: the bridge performs a fresh original-owner
     /// reconciliation before minting the non-Serde live projection.
-    pub(crate) await_terminal: C,
+    pub await_terminal: C,
 }
 
 /// Typed failures from the live captured-LSP source read and semantic adoption.
@@ -121,7 +121,11 @@ pub enum CapturedLspAdoptionError {
     TaskBinding(#[from] crate::task_binding_admission::TaskBindingError),
     /// The capture shell could not be prepared as one canonical Store write.
     #[error("canonical CaptureObservation preparation failed: {0}")]
-    Canonical(String),
+    CanonicalEnvelope(String),
+    /// Canonical owner rejected the exact transition envelope, preserving its
+    /// structured error rather than reducing it to diagnostic text.
+    #[error("canonical CaptureObservation preparation failed: {0}")]
+    Canonical(#[from] eliot_canonical::CanonicalError),
     /// The authenticated Kernel transition route refused the canonical write.
     #[error("canonical CaptureObservation Kernel transition failed: {0}")]
     KernelTransition(#[from] eliot_governor::KernelPortError),
@@ -167,11 +171,12 @@ pub enum CapturedLspAdoptionError {
 /// can succeed even when the separate task-bound canonical write prerequisite
 /// is unavailable; the pointer remains available for the canonical STITCH.
 #[cfg(windows)]
-pub(crate) struct CapturedLspW1Outcome {
-    pub(crate) record: eliot_lsp_bridge::RetainedLspObservationV1,
-    pub(crate) projection: eliot_lsp_bridge::LspAdoptionProjection,
-    pub(crate) payload_ref: eliot_store_api::CapturedBlobPayloadRefV1,
-    pub(crate) canonical_write:
+#[derive(Debug)]
+pub struct CapturedLspW1Outcome {
+    pub record: eliot_lsp_bridge::RetainedLspObservationV1,
+    pub projection: eliot_lsp_bridge::LspAdoptionProjection,
+    pub payload_ref: eliot_store_api::CapturedBlobPayloadRefV1,
+    pub canonical_write:
         Result<eliot_store_api::CausalWriteReceipt, CapturedLspCanonicalWriteError>,
 }
 
@@ -180,9 +185,16 @@ pub(crate) struct CapturedLspW1Outcome {
 /// the authenticated Kernel transition, the original operation may have been
 /// applied and must be reconciled under its unchanged identity.
 #[cfg(windows)]
-pub(crate) enum CapturedLspCanonicalWriteError {
-    RefusedBeforeHandoff(CapturedLspAdoptionError),
-    OutcomeUncertain(CapturedLspAdoptionError),
+#[derive(Debug, Error)]
+pub enum CapturedLspCanonicalWriteError {
+    /// A selection, canonical, or owner gate refused before the transition was
+    /// handed to the authenticated Kernel route.
+    #[error("canonical capture refused before Kernel handoff: {0}")]
+    RefusedBeforeHandoff(#[source] CapturedLspAdoptionError),
+    /// The authenticated Kernel transition was invoked but returned no
+    /// validated receipt; reconcile the same immutable operation identity.
+    #[error("canonical capture outcome is uncertain and must be reconciled: {0}")]
+    OutcomeUncertain(#[source] CapturedLspAdoptionError),
 }
 
 /// Adapter from the proof-bound LSP bridge to the daemon's authenticated
@@ -229,9 +241,8 @@ impl eliot_lsp_bridge::LspProcessOwnerPort for DaemonCurrentSourceLspProcessOwne
                     self.task_id.clone(),
                 )
                 .await
-                .map_err(|error| eliot_lsp_bridge::LspProcessOwnerError::Rejected {
-                    code: "CURRENT_SOURCE_PROCESS_TRANSPORT_FAILED".to_owned(),
-                    detail: error.to_string(),
+                .map_err(|error| {
+                    eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error))
                 })?;
             match response {
                 eliot_kernel_service::ProcessExecutionResponse::Started(receipt) => Ok(receipt),
@@ -253,9 +264,8 @@ impl eliot_lsp_bridge::LspProcessOwnerPort for DaemonCurrentSourceLspProcessOwne
                     self.task_id.clone(),
                 )
                 .await
-                .map_err(|error| eliot_lsp_bridge::LspProcessOwnerError::Rejected {
-                    code: "CURRENT_SOURCE_PROCESS_TRANSPORT_FAILED".to_owned(),
-                    detail: error.to_string(),
+                .map_err(|error| {
+                    eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error))
                 })?;
             match response {
                 eliot_kernel_service::ProcessExecutionResponse::Reconciled(evidence) => {
@@ -761,6 +771,18 @@ pub enum RevisionFenceMismatch {
         /// Fence observed on the live snapshot.
         observed: Box<StateFence>,
     },
+}
+
+/// Converts an explicit daemon runtime clock reading to Unix milliseconds
+/// without a fallback timestamp. Used by owner APIs that require freshness.
+pub fn try_unix_ms(now: SystemTime) -> Result<u64, String> {
+    let elapsed = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("daemon runtime clock precedes Unix epoch: {error}"))?;
+    elapsed
+        .as_millis()
+        .try_into()
+        .map_err(|_| "daemon runtime clock exceeds u64 milliseconds".to_owned())
 }
 
 fn unix_ms() -> u64 {
@@ -2159,7 +2181,8 @@ impl DaemonComposition {
     /// current-source process owner, then publishes the bridge-minted live
     /// observation into the original source Blob owner. It attempts to commit
     /// the exact returned pointer in a task-bound canonical CaptureObservation;
-    /// a withheld canonical effect is returned alongside the published pointer.
+    /// its result distinguishes pre-handoff refusal from an outcome requiring
+    /// reconciliation, alongside the published pointer.
     /// This is a composition seam for an admitted W1 caller; it adds no external
     /// tool or read-trigger surface.
     #[cfg(windows)]
@@ -2167,13 +2190,13 @@ impl DaemonComposition {
         clippy::too_many_lines,
         reason = "the W1 seam keeps one original admitted request on-stack across launch, live capture, publication, and canonical commit"
     )]
-    pub(crate) async fn invoke_lsp_capture_w1<G, C, F>(
+    pub async fn invoke_lsp_capture_w1<G, C, F>(
         &self,
         kernel: &DaemonKernelClient,
         invocation: LiveLspCaptureInvocation<'_, G, C>,
     ) -> Result<CapturedLspW1Outcome, CapturedLspAdoptionError>
     where
-        G: eliot_git_bridge::AsyncProcessRunner + 'static,
+        G: eliot_lsp_bridge::GitProcessRunner + 'static,
         C: FnOnce(eliot_process::OperationId) -> F,
         F: Future<Output = Result<eliot_process::ProcessEvidence, String>>,
     {
@@ -2228,7 +2251,7 @@ impl DaemonComposition {
             .governor
             .task_selection_evidence_for_request(
                 || {
-                    crate::daemon_runtime::unix_ms(SystemTime::now())
+                    crate::try_unix_ms(SystemTime::now())
                         .map_err(CompositionError::Clock)
                 },
                 request_principal,
@@ -2318,7 +2341,7 @@ impl DaemonComposition {
                         || capture_envelope.task_id.as_deref() != Some(task_id.as_str())
                         || capture_envelope.request.state_fence != *request_fence
                     {
-                        return Err(CapturedLspAdoptionError::Canonical(
+                        return Err(CapturedLspAdoptionError::CanonicalEnvelope(
                             "capture envelope changed the original admitted request, task, fence, or idempotency binding".to_owned(),
                         ));
                     }
@@ -2326,7 +2349,7 @@ impl DaemonComposition {
                         || capture_envelope.semantic_commands[0].operation
                             != eliot_store_api::NamedMutationOperation::CaptureObservation
                     {
-                        return Err(CapturedLspAdoptionError::Canonical(
+                        return Err(CapturedLspAdoptionError::CanonicalEnvelope(
                             "capture envelope must contain exactly one CaptureObservation command".to_owned(),
                         ));
                     }
@@ -2351,10 +2374,7 @@ impl DaemonComposition {
                         .governor
                         .owners()
                         .canonical
-                        .prepare(&capture_envelope)
-                        .map_err(|error| {
-                            CapturedLspAdoptionError::Canonical(error.to_string())
-                        })?;
+                        .prepare(&capture_envelope)?;
                     let dispatched = crate::task_binding_admission::admit_lsp_capture_from_owner(
                         identity,
                         source_artifact_admission,
@@ -2379,7 +2399,7 @@ impl DaemonComposition {
                         .governor
                         .task_selection_evidence_for_request(
                             || {
-                                crate::daemon_runtime::unix_ms(SystemTime::now())
+                                crate::try_unix_ms(SystemTime::now())
                                     .map_err(CompositionError::Clock)
                             },
                             request_principal,
