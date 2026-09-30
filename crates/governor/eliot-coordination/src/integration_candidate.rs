@@ -421,9 +421,7 @@ impl CoordinationOwner {
                 .iter()
                 .any(|entry| entry.revision == requested)
         }) {
-            gaps.push(
-                "requested revision is not retained for this artifact identity".to_owned(),
-            );
+            gaps.push("requested revision is not retained for this artifact identity".to_owned());
         }
         if reviews.is_empty() {
             gaps.push("no retained reviews for this artifact identity".to_owned());
