@@ -114,8 +114,9 @@ impl KernelAuthorityPort {
             BrokerOperation::Register => guard.issue_register(payload, now),
             BrokerOperation::HeartbeatRenewal => guard.issue_heartbeat(payload, now),
             BrokerOperation::FenceLogoff => guard.issue_fence(payload, now),
-            BrokerOperation::ValidateNativeResourceSelectionCurrent => guard
-                .issue_native_resource_selection_currentness(payload, now),
+            BrokerOperation::ValidateNativeResourceSelectionCurrent => {
+                guard.issue_native_resource_selection_currentness(payload, now)
+            }
             BrokerOperation::AuthorizeLaunch => {
                 return Err(PortError::Invalid(
                     "authorize-launch requires its caller launch binding".to_owned(),
