@@ -2282,8 +2282,9 @@ pub fn reassign_coordinator(
 /// coherence is NOT checked here: a draining old wave may legitimately rest
 /// under a superseded admission, so rest-state structural integrity and
 /// live current-authority coherence are separate decisions. Live paths use
-/// [`check_owner_join`]; restart recovery uses this function and rehydrates
-/// current authority independently afterwards.
+/// [`check_owner_join`]. Restart recovery uses this function; it verifies the
+/// STORED links only and does not rehydrate current authority, so a caller
+/// that needs live authority must resolve it from its own owner.
 pub fn check_stored_links(
     definition: &SwarmPlanDefinition,
     admission: &SwarmPlanAdmission,
