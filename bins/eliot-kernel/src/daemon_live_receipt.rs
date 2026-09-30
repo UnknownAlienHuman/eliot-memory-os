@@ -40,8 +40,8 @@ fn observe_live_receipt(event: &'static str, outcome: &'static str, context: &tr
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
-        parent: context,
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "daemon live receipt observation"

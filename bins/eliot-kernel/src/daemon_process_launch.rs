@@ -57,8 +57,8 @@ fn observe_daemon_launch(event: &'static str, outcome: &'static str, context: &t
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
-        parent: context,
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "daemon launch observation"
@@ -235,7 +235,7 @@ impl KernelComposition {
             "operation",
             admission.intent().operation_id().as_str(),
         );
-        let generation_text = admission.intent().generation().value().to_string();
+        let generation_text = admission.intent().generation().get().to_string();
         record_launch_context_field(context, "generation", &generation_text);
         if let Some(epoch_digest) = admission.state_fence().canonical_epoch_digest() {
             record_launch_context_field(context, "state_fence", &epoch_digest);
