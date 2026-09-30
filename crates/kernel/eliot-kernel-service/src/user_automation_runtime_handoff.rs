@@ -24,7 +24,7 @@ use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_kernel_core::user_automation::{
     AutomationExecutionReference, AutomationOccurrenceIdentity, DstFoldPolicy, DstGapPolicy,
     ScheduleKind, UserAutomationConfigurationState, UserAutomationDeferReason,
-    UserAutomationTrigger,
+    UserAutomationRevision, UserAutomationTrigger,
 };
 use eliot_runtime_contracts::WakeIntentState;
 use eliot_store_api::{OperationIdentity, WriteReceipt, WriteReceiptStatus};
@@ -1225,12 +1225,13 @@ impl UserAutomationOperatorTransition {
             }
         }
         if let Some(horizon) = &self.horizon {
-            validate_horizon_phase(horizon)?;
+            validate_horizon_phase(horizon, committed_revision(&self.configuration))?;
             if horizon.published() {
                 // A published horizon is an owner-acknowledged wake set, never a
                 // configuration fact: the transition may only report one beside
                 // a committed revision of the same immutable identity.
-                if committed_revision_id(&self.configuration).as_deref()
+                if committed_revision(&self.configuration)
+                    .map(|revision| revision.revision.as_str())
                     != Some(horizon.automation_revision.as_str())
                 {
                     return Err(
@@ -1575,11 +1576,19 @@ impl UserAutomationOperatorTransition {
     }
 }
 
-/// Returns the exact revision identity a committed or replayed configuration
-/// mutation produced, if this phase is one.
-fn committed_revision_id(phase: &UserAutomationConfigurationPhase) -> Option<String> {
+/// Returns the exact revision a committed or replayed configuration mutation
+/// produced, if this phase is one.
+///
+/// It returns the committed document rather than just its identity because the
+/// callers here bind a runtime projection to that revision's own content — its
+/// normalized occurrence denominator — and not only to its name. A read-only
+/// answer and a `RunNow` answer own no revision, and both answer `None` rather
+/// than naming one that does not exist.
+fn committed_revision(
+    phase: &UserAutomationConfigurationPhase,
+) -> Option<&UserAutomationRevision> {
     match phase.mutation_result()? {
-        UserAutomationMutationResult::Revision { revision, .. } => Some(revision.revision.clone()),
+        UserAutomationMutationResult::Revision { revision, .. } => Some(revision),
         UserAutomationMutationResult::RunNow { .. } => None,
     }
 }
@@ -1636,8 +1645,22 @@ fn recovery_phase_for_obligation(
 /// A published horizon must have acknowledged a non-empty requested set and no
 /// remainder; an unresolved horizon must name its reason, carry a non-empty
 /// requested set, retain a non-empty exact remainder, and carry a replay handle.
-/// Every occurrence identity on both sides must be unique text.
-fn validate_horizon_phase(horizon: &UserAutomationHorizonPhase) -> Result<(), String> {
+/// Each of the two occurrence lists must be duplicate-free on its own; they are
+/// NOT required to be disjoint, because the remainder legitimately overlaps the
+/// requested set and may equal it.
+///
+/// `revision` is the exact committed document this transition carries, when it
+/// carries one. When it is the revision the horizon names, the phase's occurrence
+/// sets are additionally bound to that revision's OWN normalized occurrence
+/// denominator, which is the set both this phase's producers compile them from.
+/// Membership and run-order are what that adds: a phase that named foreign or
+/// reordered occurrences would otherwise have the right shape and the wrong
+/// members, and nothing downstream could tell, because the remainder a schedule
+/// owner never acknowledged is deliberately allowed to overlap the requested set.
+fn validate_horizon_phase(
+    horizon: &UserAutomationHorizonPhase,
+    revision: Option<&UserAutomationRevision>,
+) -> Result<(), String> {
     for (value, field) in [
         (&horizon.automation_id, "horizon.automation_id"),
         (&horizon.automation_revision, "horizon.automation_revision"),
@@ -1655,16 +1678,20 @@ fn validate_horizon_phase(horizon: &UserAutomationHorizonPhase) -> Result<(), St
     {
         return Err("horizon phase needs a lowercase revision digest".to_owned());
     }
-    let mut unique = BTreeSet::new();
-    for occurrence_id in horizon
-        .requested_occurrence_ids
-        .iter()
-        .chain(horizon.remaining_occurrence_ids.iter())
-    {
-        if occurrence_id.trim().is_empty() || !unique.insert(occurrence_id.as_str()) {
-            return Err("horizon occurrence identities must be unique text".to_owned());
-        }
-    }
+    // Uniqueness is a rule about ONE list at a time, and these two lists are
+    // deliberately not disjoint: `remaining` is the occurrences of this flight
+    // the owner did not acknowledge PLUS the denominator tail past the bounded
+    // flight, so a requested-but-unacknowledged occurrence appears in both, and
+    // an owner that acknowledged nothing makes the two lists equal. Folding both
+    // into one set therefore refused every `Partial`, `Unavailable` and
+    // `UnknownOutcome` horizon — including the phase this very module builds
+    // when no owner was reached — and turned the failure cut issue #2806
+    // requires into a hard error on the whole committed operator transition. Each
+    // list is checked on its own instead, which is exactly what forbids a
+    // double-counted occurrence, and the retained-remaining rule below still
+    // refuses to let a failure answer report an empty remainder.
+    validate_distinct_occurrence_list(&horizon.requested_occurrence_ids)?;
+    validate_distinct_occurrence_list(&horizon.remaining_occurrence_ids)?;
     if horizon.requested_occurrence_ids.is_empty() {
         return Err("a horizon phase must name the occurrences it requested".to_owned());
     }
@@ -1689,6 +1716,87 @@ fn validate_horizon_phase(horizon: &UserAutomationHorizonPhase) -> Result<(), St
                         .to_owned(),
                 );
             }
+        }
+    }
+    let committed = revision.filter(|held| held.revision == horizon.automation_revision);
+    if let Some(revision) = committed {
+        validate_horizon_denominator_membership(horizon, revision)?;
+    }
+    Ok(())
+}
+
+/// Binds one horizon phase's occurrence sets to the committed revision's own
+/// normalized occurrence denominator.
+///
+/// The requested set must be a contiguous run of that denominator in the
+/// revision's own order, and the retained remainder must be made only of its
+/// members. A remainder member outside the requested run is exactly what the
+/// single-flight bound produces, so the two rules are deliberately different: the
+/// requested set may not skip or reorder, while the remainder may legitimately
+/// reach past the run. Neither rule can invent a future instant — every member is
+/// an occurrence this immutable revision already compiled.
+fn validate_horizon_denominator_membership(
+    horizon: &UserAutomationHorizonPhase,
+    revision: &UserAutomationRevision,
+) -> Result<(), String> {
+    let identities = revision.compile_occurrence_identities().map_err(|error| {
+        format!(
+            "the committed revision of horizon {} does not compile its own normalized \
+             occurrence denominator: {error}",
+            horizon.automation_revision
+        )
+    })?;
+    let denominator = identities
+        .iter()
+        .map(|identity| identity.occurrence_id.as_str())
+        .collect::<Vec<_>>();
+    let mut run = Vec::with_capacity(horizon.requested_occurrence_ids.len());
+    for occurrence_id in &horizon.requested_occurrence_ids {
+        let member = occurrence_id.as_str();
+        let Some(position) = denominator.iter().position(|candidate| *candidate == member) else {
+            return Err(format!(
+                "horizon requested occurrence {occurrence_id} is not a member of the committed \
+                 revision's normalized denominator"
+            ));
+        };
+        run.push(position);
+    }
+    if run.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+        return Err(
+            "horizon requested occurrences are not a contiguous run of the committed revision's \
+             normalized denominator in its own order"
+                .to_owned(),
+        );
+    }
+    for occurrence_id in &horizon.remaining_occurrence_ids {
+        if !denominator.contains(&occurrence_id.as_str()) {
+            return Err(format!(
+                "horizon remaining occurrence {occurrence_id} is not a member of the committed \
+                 revision's normalized denominator"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects one horizon occurrence list that is blank text or counts an identity
+/// twice.
+///
+/// This is the same rule the horizon request and the owner's acknowledgement
+/// enforce on their own lists (`validate_unique_horizon_list` in
+/// `user_automation_execution`), restated for the phase projection because the
+/// phase is a separate wire value with its own two lists. It is deliberately a
+/// PER-LIST rule and not a rule over the concatenation: see
+/// [`validate_horizon_phase`] for why the requested set and the remainder are
+/// expected to overlap.
+fn validate_distinct_occurrence_list(occurrence_ids: &[String]) -> Result<(), String> {
+    let mut unique = BTreeSet::new();
+    for occurrence_id in occurrence_ids {
+        if occurrence_id.trim().is_empty() || occurrence_id.chars().any(char::is_control) {
+            return Err("horizon occurrence identities must be non-blank text".to_owned());
+        }
+        if !unique.insert(occurrence_id.as_str()) {
+            return Err("horizon occurrence identities must be unique text".to_owned());
         }
     }
     Ok(())
