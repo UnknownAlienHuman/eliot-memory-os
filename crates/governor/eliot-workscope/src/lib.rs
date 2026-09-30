@@ -1298,35 +1298,18 @@ impl OnboardingReadinessReceipt {
             .validate()
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
         self.validate_task_binding()?;
-        if let Some(evidence) = &self.task_selection_evidence {
-            evidence
-                .validate()
-                .map_err(|_| WorkScopeError::InvalidTaskSelectionEvidence)?;
-            let TaskBindingState::CurrentTaskContract {
-                task_ref,
-                task_revision,
-                acceptance_digest,
-                selection_source_ref,
-                evidence_ref,
-            } = &self.task_binding
-            else {
-                return Err(WorkScopeError::BindingReceiptMismatch);
-            };
-            if evidence.task_ref != *task_ref
-                || evidence.task_revision != *task_revision
-                || evidence.acceptance_digest != *acceptance_digest
-                || evidence.selection_source_ref != *selection_source_ref
-                || evidence.evidence_ref != *evidence_ref
-                || evidence.work_scope_ref != self.scope.scope_ref
-                || self
-                    .state_fence
-                    .task_revision
-                    .map(|revision| revision.value())
-                    != Some(evidence.task_revision)
-            {
-                return Err(WorkScopeError::BindingReceiptMismatch);
-            }
-        }
+        self.validate_task_selection_evidence()?;
+        self.validate_readiness_inputs()?;
+        Self::check_refs(&self.discovered_source_refs, "discovered_source_refs", 32)?;
+        Self::check_refs(&self.admitted_source_refs, "admitted_source_refs", 32)?;
+        Self::check_refs(&self.conflicting_source_refs, "conflicting_source_refs", 32)?;
+        Self::check_refs(&self.unavailable_source_refs, "unavailable_source_refs", 32)?;
+        Self::check_store_seed_maintenance(self)?;
+        counter(self.expiry_tick, "expiry_tick")?;
+        Ok(())
+    }
+
+    fn validate_readiness_inputs(&self) -> Result<(), WorkScopeError> {
         if self.limiting_integration_evidence.is_empty()
             || self.limiting_integration_evidence.len() > 8
         {
@@ -1345,12 +1328,50 @@ impl OnboardingReadinessReceipt {
         for missing in &self.missing_inputs {
             text(missing, "missing_inputs")?;
         }
-        Self::check_refs(&self.discovered_source_refs, "discovered_source_refs", 32)?;
-        Self::check_refs(&self.admitted_source_refs, "admitted_source_refs", 32)?;
-        Self::check_refs(&self.conflicting_source_refs, "conflicting_source_refs", 32)?;
-        Self::check_refs(&self.unavailable_source_refs, "unavailable_source_refs", 32)?;
-        Self::check_store_seed_maintenance(self)?;
-        counter(self.expiry_tick, "expiry_tick")?;
+        Ok(())
+    }
+
+    fn validate_task_selection_evidence(&self) -> Result<(), WorkScopeError> {
+        let Some(evidence) = &self.task_selection_evidence else {
+            return Ok(());
+        };
+        Self::validate_selected_evidence(evidence)?;
+        let TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+            selection_source_ref,
+            evidence_ref,
+        } = &self.task_binding
+        else {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        };
+        if evidence.task_ref != *task_ref
+            || evidence.task_revision != *task_revision
+            || evidence.acceptance_digest != *acceptance_digest
+            || evidence.selection_source_ref != *selection_source_ref
+            || evidence.evidence_ref != *evidence_ref
+            || evidence.work_scope_ref != self.scope.scope_ref
+            || self
+                .state_fence
+                .task_revision
+                .map(eliot_contracts::TaskRevision::value)
+                != Some(evidence.task_revision)
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_selected_evidence(
+        evidence: &TaskSelectionEvidence,
+    ) -> Result<(), WorkScopeError> {
+        evidence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidTaskSelectionEvidence)?;
+        if evidence.is_contaminated() {
+            return Err(WorkScopeError::InvalidTaskSelectionEvidence);
+        }
         Ok(())
     }
 
@@ -1807,6 +1828,26 @@ impl ColdStartController {
         {
             return Err(WorkScopeError::InvalidCounter { field: "lease" });
         }
+        let task = match (&task, &previous.task_selection_evidence) {
+            (
+                TaskBindingInput::Current {
+                    task_ref,
+                    task_revision,
+                    acceptance_digest,
+                    selection_source_ref,
+                    evidence_ref,
+                },
+                Some(evidence),
+            ) if task_ref == &evidence.task_ref
+                && task_revision == &evidence.task_revision
+                && acceptance_digest == &evidence.acceptance_digest
+                && selection_source_ref == &evidence.selection_source_ref
+                && evidence_ref == &evidence.evidence_ref =>
+            {
+                TaskBindingInput::Selected(evidence.clone())
+            }
+            _ => task,
+        };
         let mut receipt = self.compile(
             receipt_ref,
             lease,
@@ -2070,9 +2111,7 @@ impl ColdStartController {
                 evidence_ref,
             ),
             TaskBindingInput::Selected(evidence) => {
-                evidence
-                    .validate()
-                    .map_err(|_| WorkScopeError::InvalidTaskSelectionEvidence)?;
+                Self::validate_selected_evidence(&evidence)?;
                 Self::check_current_task_ref(
                     evidence.task_ref,
                     evidence.task_revision,
