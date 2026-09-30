@@ -225,8 +225,10 @@ pub(crate) fn observe_authorized_admission(
 /// the token observation stays
 /// [`TokenCountUnavailableReason::MeasurementUnavailable`] rather than a
 /// zero that would read as measured. A token-truncated delivery has no owner
-/// signal here and is never inferred; only the future tokenizer owner can
-/// drive [`ToolExposureReceiptV2::record_truncated_delivery`].
+/// signal here and is never inferred. Withheld-behind-handle byte truncation
+/// is separately owner-signalled by the bridge result/delivery path, which
+/// drives [`ToolExposureReceiptV2::record_truncated_delivery`] from its
+/// retained-handle measurement; token measurement still has no owner here.
 ///
 /// # Errors
 ///

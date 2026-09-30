@@ -61,6 +61,13 @@ use eliot_protocol::{
     RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
+use eliot_receipts::{
+    ToolExposureError, ToolExposureReceiptV2,
+    tool_exposure::{
+        DeliveredToolRepresentation, ProducedToolResultIdentity, TokenCountObservation,
+        TokenCountUnavailableReason,
+    },
+};
 use eliot_runtime::{Runtime, RuntimeConfig};
 
 mod bridge_contract;
@@ -5725,6 +5732,74 @@ impl BridgeRunner {
         } else {
             DeliveryStatus::Full
         }
+    }
+    /// Records the owner-measured retained-handle truncation onto an evaluated receipt (I7.24).
+    ///
+    /// The admission skeleton arrives from its owner
+    /// (`ToolExposureReceiptV2::admission_observed`) and is never minted
+    /// here: tool definition, route fingerprint, and receipt identity stay
+    /// admission-derived. What this seam measures itself is the delivery
+    /// evidence: the produced digest is recomputed over the exact full result
+    /// bytes and must bind the retained handle's digest, and the delivered
+    /// representation is the exact inline preview with its own digest and byte
+    /// count. A view whose preview withholds nothing is refused typed — a
+    /// non-truncated delivery is never recorded as `TRUNCATED` — as is a byte
+    /// body the retained handle does not bind. Token measurement has no owner
+    /// on the hot-view path, so the observation stays explicitly unavailable
+    /// rather than a zero; a route-owner token attestation still projects only
+    /// via [`Self::project_tool_result_receipt`].
+    ///
+    /// The recorded receipt keeps `transport_completed` as `Some(true)` with
+    /// `result_delivery` as `TRUNCATED`, so it never satisfies
+    /// complete-evidence or verifier requirements. The admission-owner
+    /// per-evaluation join that supplies the skeleton is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolExposureError`] when the view is not truncated, the
+    /// presented bytes do not bind the retained handle, a byte count exceeds
+    /// its bound, or the resulting receipt is inconsistent.
+    pub fn record_truncated_tool_delivery(
+        receipt: ToolExposureReceiptV2,
+        view: &HotResourceView,
+        full_result_bytes: &[u8],
+    ) -> Result<ToolExposureReceiptV2, ToolExposureError> {
+        if !view.is_truncated() {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.result_delivery",
+                reason: "a non-truncated hot view is never recorded as a truncated delivery",
+            });
+        }
+        let produced_digest = sha256_hex(full_result_bytes);
+        if produced_digest != view.handle().digest() {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.produced_result.result_digest",
+                reason: "retained handle does not bind the presented result bytes",
+            });
+        }
+        let preview = view.preview();
+        let byte_count =
+            u64::try_from(preview.len()).map_err(|_| ToolExposureError::InvalidField {
+                field: "receipt.delivered_representation.byte_count",
+                reason: "delivered byte count exceeds the addressable bound",
+            })?;
+        let handle_uri = view.handle().uri().as_str().to_owned();
+        receipt.record_truncated_delivery(
+            ProducedToolResultIdentity {
+                result_digest: produced_digest,
+                artifact_ref: None,
+                source_handle: Some(handle_uri.clone()),
+            },
+            DeliveredToolRepresentation {
+                representation_digest: sha256_hex(preview),
+                source_handle: handle_uri,
+                byte_count,
+                token_observation: TokenCountObservation::Unavailable {
+                    reason: TokenCountUnavailableReason::MeasurementUnavailable,
+                },
+                prior_delivery_receipt_id: None,
+            },
+        )
     }
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. Zero while detached; cleared by the core on every attach.
