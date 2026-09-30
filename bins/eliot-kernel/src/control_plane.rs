@@ -171,6 +171,26 @@ impl KernelComposition {
         self.apply_control_with_terminal(command, true)
     }
 
+    /// Closes new normal admission at the bridge transition boundary before
+    /// moving the service to `Draining`.
+    ///
+    /// Bridge requests hold the transition read guard through their durable
+    /// ORS stage and index publication. Taking its write side here lets every
+    /// already admitted request finish publishing before Drain closes the
+    /// service gate, and later requests observe the closed state.
+    pub(crate) fn apply_drain_with_terminal(
+        &self,
+        emit_terminal: bool,
+    ) -> Result<KernelServiceState, KernelServiceError> {
+        #[cfg(windows)]
+        let _admission_transition = self
+            .agent_bridge_transition_write()
+            .map_err(|_| {
+                KernelServiceError::Platform("admission transition lock unavailable".to_owned())
+            })?;
+        self.apply_control_with_terminal(KernelControlCommand::Drain, emit_terminal)
+    }
+
     fn apply_control_with_terminal(
         &self,
         command: KernelControlCommand,
@@ -899,6 +919,10 @@ impl KernelComposition {
                 KernelControlCommand::RevokeRuntimeLease(query) => {
                     self.revoke_runtime_lease(&query.state_fence, &query.lease_id)?;
                 }
+                KernelControlCommand::Drain => {
+                    self.apply_drain_with_terminal(false)
+                        .map_err(ControlRequestFailure::Transition)?;
+                }
                 command => {
                     self.apply_control_with_terminal(command.clone(), false)
                         .map_err(ControlRequestFailure::Transition)?;
@@ -917,10 +941,15 @@ impl KernelComposition {
         // this arm, which is exactly the bare-census shape the response
         // validator and the Host retirement barrier require.
         let runtime_lease_census = match &request.command {
-            KernelControlCommand::ReadRuntimeLeaseCensus(query) => Some(
-                self.read_runtime_lease_census(&query.state_fence, &query.supervision_lease_id)
-                    .map_err(|_| TransportError::SessionFenced)?,
-            ),
+            KernelControlCommand::ReadRuntimeLeaseCensus(query) => {
+                let admission_revision = self
+                    .store_stop_admission_revision(&query.state_fence, true)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Some(
+                    self.read_runtime_lease_census(query, &admission_revision)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                )
+            }
             _ => None,
         };
         let state = self

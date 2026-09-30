@@ -1317,6 +1317,18 @@ impl KernelService {
         })
     }
 
+    /// Returns the number of held normal-work admission permits.
+    ///
+    /// Shutdown samples this owner count after closing new admission so a
+    /// caller that acquired a permit just before `Drain` cannot be omitted
+    /// while its Store effect is still in flight.
+    #[must_use]
+    pub fn normal_admissions_in_flight(&self) -> usize {
+        self.front_door
+            .normal_capacity()
+            .saturating_sub(self.front_door.available_normal())
+    }
+
     /// Acquires one held protected-control lease for a protected operation.
     ///
     /// Only the closed protected family may hold this lease: cancellation,

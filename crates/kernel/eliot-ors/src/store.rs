@@ -8,6 +8,7 @@ use eliot_contracts::{
     AuthorityEpoch, BRIDGE_RECOVERY_SELECTOR_VERSION, BridgeRecoveryPageCommitment,
     BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition,
     EpochId, EpochRelation, EpochTransition, HostCorrelationProjection, HostJsonRpcCorrelationId,
+    ResourceGeneration, StateFence,
     HostRequestLogicalKind, canonical_json_bytes, host_request_legacy_presence_key,
     host_request_logical_key,
 };
@@ -18,13 +19,15 @@ use eliot_receipts::{
     ReceiptDispositionKind, ReceiptEnvelope, ReceiptIdentity,
 };
 use eliot_runtime_contracts::{
-    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
+    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState, LeaseState,
     RuntimeLease, SignedSupervisionLease, VerifiedSupervisionLease,
     VerifiedSupervisionLeaseTerminalTransition,
 };
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
 };
+use schemars::JsonSchema;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -75,7 +78,8 @@ use crate::{
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, LegacyFenceBoundBackupVerificationClass,
+    KernelAuthoritySnapshot, KernelReconciliationItem, KernelReconciliationKind,
+    LegacyFenceBoundBackupVerificationClass,
     LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass,
     NativeWorkerClaimAdmission, NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome,
     NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OperationalCurrentRecoveryCursor,
@@ -4588,6 +4592,328 @@ pub struct RuntimeLeaseCensusRows {
     pub supervision: SupervisionLeaseSnapshot,
     /// Exact-fence `RuntimeLease` rows ordered by lease id.
     pub runtime_leases: Vec<RuntimeLease>,
+}
+
+/// Complete owner-issued count of Store-stop obligations in the canonical ORS.
+///
+/// Counts are derived in one redb read transaction across every required
+/// source family. A missing family, corrupt row, incomplete read or binding
+/// mismatch produces `Unavailable`; it is never converted to zero.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreStopCensusCounts {
+    /// Nonterminal RuntimeLease rows, regardless of their recorded expiry.
+    pub runtime_leases: u64,
+    /// Nonterminal canonical data reservations.
+    pub data_reservations: u64,
+    /// Imported inbox items, active process-stream recovery, and unresolved
+    /// durable recovery problems.
+    pub maintenance_reservations: u64,
+    /// Nonterminal admission reservations, host requests, activation tickets,
+    /// native-worker claims, Doctor attempts, process starts, authority
+    /// handoffs, and supervision-ticket stages.
+    pub inflight_admissions: u64,
+    /// Nonterminal effect, campaign-source CAS, Doctor effect, prepared scan
+    /// disclosure, operational operation/retry, Store rebind, or commit
+    /// reconciliation obligations.
+    pub unresolved_store_effects: u64,
+}
+
+impl StoreStopCensusCounts {
+    /// Returns the exact number of typed source obligations, failing on overflow.
+    pub fn total(&self) -> Option<u64> {
+        self.runtime_leases
+            .checked_add(self.data_reservations)?
+            .checked_add(self.maintenance_reservations)?
+            .checked_add(self.inflight_admissions)?
+            .checked_add(self.unresolved_store_effects)
+    }
+
+    /// Whether every completely observed owner family contains no obligation.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.runtime_leases == 0
+            && self.data_reservations == 0
+            && self.maintenance_reservations == 0
+            && self.inflight_admissions == 0
+            && self.unresolved_store_effects == 0
+    }
+}
+
+/// Request binding for one complete owner-issued Store-stop census.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreStopCensusRequest {
+    /// Exact `StateFence` selected by the caller.
+    pub state_fence: StateFence,
+    /// Optional exact supervision head selected by Host or the admitted Kernel contour.
+    /// When omitted, the owner requires one unique head for the fence.
+    pub supervision_lease_id: Option<String>,
+    /// Optional Host-journal installation expected from the ORS owner.
+    pub expected_installation_id: Option<String>,
+    /// Optional Host-journal activation expected from the ORS owner.
+    pub expected_activation_id: Option<String>,
+    /// Optional Host-journal activation generation expected from the ORS owner.
+    pub expected_activation_generation: Option<ResourceGeneration>,
+    /// Kernel-issued revision for the closed admission frontier.
+    pub admission_revision: String,
+}
+
+impl StoreStopCensusRequest {
+    /// Validates the binding and revision shape without reading the owner.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        self.state_fence.validate().map_err(|_| OrsError::FenceMismatch)?;
+        crate::model::validate_digest(&self.admission_revision, "store_stop_admission_revision")?;
+        if let Some(lease_id) = &self.supervision_lease_id {
+            crate::model::validate_text(lease_id, "store_stop_supervision_lease_id")?;
+        }
+        if let Some(installation_id) = &self.expected_installation_id {
+            crate::model::validate_text(installation_id, "store_stop_installation_id")?;
+        }
+        if let Some(activation_id) = &self.expected_activation_id {
+            crate::model::validate_text(activation_id, "store_stop_activation_id")?;
+        }
+        if self.expected_activation_id.is_some() != self.expected_activation_generation.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "store_stop_activation_binding",
+                reason: "activation identity and generation must be supplied together",
+            });
+        }
+        if self
+            .expected_activation_generation
+            .is_some_and(|generation| generation != self.state_fence.resource_generation)
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Why the complete Store-stop census could not be established.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreStopCensusUnavailableReason {
+    /// The request did not carry a valid exact binding.
+    InvalidRequest,
+    /// A required table, row, or owner revision was missing, corrupt, or unreadable.
+    OwnerSnapshotUnavailable,
+    /// Durable Store, activation, supervision, or StateFence binding differed.
+    OwnerBindingMismatch,
+}
+
+impl StoreStopCensusUnavailableReason {
+    /// Bounded diagnostic code suitable for status and lifecycle projections.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid-request",
+            Self::OwnerSnapshotUnavailable => "owner-snapshot-unavailable",
+            Self::OwnerBindingMismatch => "owner-binding-mismatch",
+        }
+    }
+}
+
+/// Complete ORS-owned proof for one Store-stop owner observation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreStopCensusProof {
+    /// Exact Host installation identity read from the current ORS object.
+    pub installation_id: String,
+    /// Durable ORS Store-object generation read from the same snapshot.
+    pub ors_generation: u64,
+    /// Activation identity taken from the exact current supervision head.
+    pub activation_id: String,
+    /// Activation generation taken from the exact current supervision head.
+    pub activation_generation: ResourceGeneration,
+    /// Complete StateFence bound by the supervision head and runtime rows.
+    pub state_fence: StateFence,
+    /// Current supervision row identity closing the snapshot.
+    pub supervision_lease_id: String,
+    /// All exact-fence RuntimeLease rows, ordered by lease id.
+    pub runtime_leases: Vec<RuntimeLease>,
+    /// Current supervision row bound to the same fence and activation.
+    pub supervision_lease: SupervisionLeaseSnapshot,
+    /// Kernel-issued revision for the closed admission frontier.
+    pub admission_revision: String,
+    /// ORS-issued digest over the Store identity and all source rows.
+    pub owner_observation_revision: String,
+    /// Complete denominator for every required persisted source family.
+    pub counts: StoreStopCensusCounts,
+}
+
+impl StoreStopCensusProof {
+    /// Validates source closure and every exact installation/activation/fence binding.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        crate::model::validate_text(&self.installation_id, "store_stop_installation_id")?;
+        crate::model::validate_text(&self.activation_id, "store_stop_activation_id")?;
+        crate::model::validate_text(&self.supervision_lease_id, "store_stop_supervision_lease_id")?;
+        crate::model::validate_digest(&self.admission_revision, "store_stop_admission_revision")?;
+        crate::model::validate_digest(
+            &self.owner_observation_revision,
+            "store_stop_owner_observation_revision",
+        )?;
+        if self.ors_generation == 0 || self.counts.total().is_none() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "store_stop_census",
+                reason: "Store generation or denominator is invalid".to_owned(),
+            });
+        }
+        self.state_fence.validate().map_err(|_| OrsError::FenceMismatch)?;
+        self.supervision_lease.validate()?;
+        let binding = &self.supervision_lease.record.binding;
+        if self.supervision_lease.record.lease_id.as_str() != self.supervision_lease_id
+            || binding.state_fence != self.state_fence
+            || binding.activation_id.as_str() != self.activation_id
+            || binding.activation_generation != self.activation_generation
+            || binding.activation_generation != self.state_fence.resource_generation
+            || binding.kernel_epoch != self.state_fence.authority_epoch
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        let mut previous: Option<&str> = None;
+        let mut exact_nonterminal = 0_u64;
+        for lease in &self.runtime_leases {
+            lease
+                .validate()
+                .map_err(|error| OrsError::Contract(error.to_string()))?;
+            if lease.state_fence != self.state_fence
+                || previous.is_some_and(|prior| prior >= lease.lease_id.as_str())
+            {
+                return Err(OrsError::FenceMismatch);
+            }
+            previous = Some(&lease.lease_id);
+            if !store_stop_runtime_lease_terminal(lease.state) {
+                exact_nonterminal = exact_nonterminal.checked_add(1).ok_or(
+                    OrsError::ProjectionLimitExceeded,
+                )?;
+            }
+        }
+        if self.counts.runtime_leases < exact_nonterminal {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "store_stop_census",
+                reason: "runtime denominator omits exact-fence rows".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One complete Store-stop result: a proven zero, known outstanding work, or unavailable.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoreStopCensusResult {
+    /// Every required source was scanned and its obligation count is zero.
+    KnownZero(StoreStopCensusProof),
+    /// Every required source was scanned and one or more obligations remain.
+    KnownOutstanding(StoreStopCensusProof),
+    /// The owner could not establish a complete, correctly bound snapshot.
+    Unavailable {
+        /// Original request context; it is not represented as an owner proof.
+        request: StoreStopCensusRequest,
+        /// Bounded failure class with no owner detail or identity leak.
+        reason: StoreStopCensusUnavailableReason,
+    },
+}
+
+impl StoreStopCensusResult {
+    /// Validates the typed result and rejects outcome/count contradictions.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        match self {
+            Self::KnownZero(proof) => {
+                proof.validate()?;
+                if !proof.counts.is_zero() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_stop_census",
+                        reason: "KnownZero carries outstanding obligations".to_owned(),
+                    });
+                }
+            }
+            Self::KnownOutstanding(proof) => {
+                proof.validate()?;
+                if proof.counts.is_zero() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_stop_census",
+                        reason: "KnownOutstanding carries a zero denominator".to_owned(),
+                    });
+                }
+            }
+            Self::Unavailable { request, .. } => request.validate()?,
+        }
+        Ok(())
+    }
+
+    /// Returns the complete proof only for a successfully read owner snapshot.
+    #[must_use]
+    pub const fn proof(&self) -> Option<&StoreStopCensusProof> {
+        match self {
+            Self::KnownZero(proof) | Self::KnownOutstanding(proof) => Some(proof),
+            Self::Unavailable { .. } => None,
+        }
+    }
+
+    /// Returns true only for a validated all-zero Store-stop denominator.
+    #[must_use]
+    pub fn is_known_zero(&self) -> bool {
+        matches!(self, Self::KnownZero(proof) if proof.validate().is_ok())
+    }
+
+    /// Returns true only when all Store obligations and supervision are terminal.
+    #[must_use]
+    pub fn is_fully_retired(&self) -> bool {
+        let Some(proof) = self.proof() else {
+            return false;
+        };
+        self.is_known_zero()
+            && proof
+                .runtime_leases
+                .iter()
+                .all(|lease| store_stop_runtime_lease_terminal(lease.state))
+            && store_stop_runtime_lease_terminal(proof.supervision_lease.record.state)
+            && proof.supervision_lease.record.projection == SupervisionLeaseProjection::Terminal
+    }
+
+    /// Bounded status vocabulary; identities, revisions and owner prose stay private.
+    #[must_use]
+    pub const fn observation_code(&self) -> &'static str {
+        match self {
+            Self::KnownZero(_) => "known-zero",
+            Self::KnownOutstanding(_) => "known-outstanding",
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+}
+
+fn store_stop_runtime_lease_terminal(state: LeaseState) -> bool {
+    matches!(
+        state,
+        LeaseState::Released
+            | LeaseState::Expired
+            | LeaseState::Revoked
+            | LeaseState::Superseded
+            | LeaseState::Closed
+    )
+}
+
+fn store_stop_hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn store_stop_revision_hex(hasher: Sha256) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn increment_store_stop_count(value: &mut u64) -> Result<(), OrsError> {
+    *value = value
+        .checked_add(1)
+        .ok_or(OrsError::ProjectionLimitExceeded)?;
+    Ok(())
 }
 
 impl RedbRecoveryStore {
@@ -24952,6 +25278,605 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Reads the complete Store-stop obligation denominator from one ORS-owned
+    /// redb snapshot. Every source table is required and scanned in full. A
+    /// missing table, malformed row, overflow, stale installation/activation,
+    /// or unreadable supervision binding produces `Unavailable`, never zero.
+    pub fn load_store_stop_census(
+        &self,
+        request: &StoreStopCensusRequest,
+    ) -> StoreStopCensusResult {
+        if request.validate().is_err() {
+            return StoreStopCensusResult::Unavailable {
+                request: request.clone(),
+                reason: StoreStopCensusUnavailableReason::InvalidRequest,
+            };
+        }
+        match self.read_store_stop_census(request) {
+            Ok(proof) if proof.counts.is_zero() => StoreStopCensusResult::KnownZero(proof),
+            Ok(proof) => StoreStopCensusResult::KnownOutstanding(proof),
+            Err(reason) => StoreStopCensusResult::Unavailable {
+                request: request.clone(),
+                reason,
+            },
+        }
+    }
+
+    /// Re-reads every owner source under the exact bindings of a prior proof.
+    /// The returned revision must match before shutdown may consume Stop.
+    pub fn revalidate_store_stop_census(&self, proof: &StoreStopCensusProof) -> bool {
+        let request = StoreStopCensusRequest {
+            state_fence: proof.state_fence.clone(),
+            supervision_lease_id: Some(proof.supervision_lease_id.clone()),
+            expected_installation_id: Some(proof.installation_id.clone()),
+            expected_activation_id: Some(proof.activation_id.clone()),
+            expected_activation_generation: Some(proof.activation_generation),
+            admission_revision: proof.admission_revision.clone(),
+        };
+        self.load_store_stop_census(&request).proof() == Some(proof)
+    }
+
+    fn read_store_stop_census(
+        &self,
+        request: &StoreStopCensusRequest,
+    ) -> Result<StoreStopCensusProof, StoreStopCensusUnavailableReason> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+        let meta = read
+            .open_table(META)
+            .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+        let identity_record = read_store_object_identity(&meta)
+            .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+        let identity = identity_record
+            .installed_identity()
+            .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+        if request
+            .expected_installation_id
+            .as_deref()
+            .is_some_and(|expected| expected != identity.installation_id())
+        {
+            return Err(StoreStopCensusUnavailableReason::OwnerBindingMismatch);
+        }
+
+        let mut hasher = Sha256::new();
+        store_stop_hash_field(&mut hasher, b"eliot.ors.store-stop-census.v1");
+        store_stop_hash_field(&mut hasher, identity.installation_id().as_bytes());
+        store_stop_hash_field(&mut hasher, &identity.ors_generation().to_le_bytes());
+        store_stop_hash_field(&mut hasher, request.admission_revision.as_bytes());
+        let fence_json = serde_json::to_vec(&request.state_fence)
+            .map_err(|_| StoreStopCensusUnavailableReason::InvalidRequest)?;
+        store_stop_hash_field(&mut hasher, &fence_json);
+
+        // Initialize counters only after the required owner tables are openable;
+        // an empty count is authoritative only after each complete scan below.
+        let mut counts = StoreStopCensusCounts {
+            runtime_leases: 0,
+            data_reservations: 0,
+            maintenance_reservations: 0,
+            inflight_admissions: 0,
+            unresolved_store_effects: 0,
+        };
+        let mut runtime_leases = Vec::new();
+        let mut selected_supervision: Option<SupervisionLeaseSnapshot> = None;
+        let mut matching_supervision_rows = 0_u64;
+
+        macro_rules! scan_census_table {
+            ($table:expr, $family:literal, $key:ident, $value:ident, $body:block) => {{
+                store_stop_hash_field(&mut hasher, $family.as_bytes());
+                let table = read
+                    .open_table($table)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+                for entry in table
+                    .iter()
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?
+                {
+                    let (key_entry, value_entry) = entry
+                        .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+                    let $key = key_entry.value();
+                    let $value = value_entry.value();
+                    store_stop_hash_field(&mut hasher, $key.as_bytes());
+                    store_stop_hash_field(&mut hasher, $value.as_bytes());
+                    $body
+                }
+            }};
+        }
+
+        scan_census_table!(SUPERVISION_LEASE_CURRENT, "supervision", key, value, {
+            let snapshot: SupervisionLeaseSnapshot = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            snapshot
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != snapshot.record.lease_id.as_str() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            let selected_by_id = request
+                .supervision_lease_id
+                .as_deref()
+                .is_none_or(|lease_id| lease_id == snapshot.record.lease_id.as_str());
+            if selected_by_id && snapshot.record.binding.state_fence == request.state_fence {
+                matching_supervision_rows = matching_supervision_rows
+                    .checked_add(1)
+                    .ok_or(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+                selected_supervision = Some(snapshot);
+            }
+        });
+
+        scan_census_table!(RUNTIME_LEASE_CURRENT, "runtime_leases", key, value, {
+            let lease: RuntimeLease = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            lease
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != lease.lease_id {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if lease.state_fence == request.state_fence {
+                runtime_leases.push(lease.clone());
+            }
+            if !store_stop_runtime_lease_terminal(lease.state) {
+                increment_store_stop_count(&mut counts.runtime_leases)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(RESERVATIONS, "data_reservations", key, value, {
+            let record: ReservationRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.token.reservation_id.as_str() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if !record.state.is_terminal() {
+                increment_store_stop_count(&mut counts.data_reservations)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(RECOVERY_INBOX, "maintenance_reservations", key, value, {
+            let record: DurableInboxRecord = decode_named(value, "recovery_inbox")
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .item
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.item.item_id.as_str()
+                || record.operation_order == 0
+                || record.terminal_receipt_id.is_some()
+                    != record.terminal_receipt_sha256.is_some()
+                || (record.disposition == RecoveryInboxDisposition::Imported
+                    && record.terminal_receipt_id.is_some())
+                || (record.disposition != RecoveryInboxDisposition::Imported
+                    && record.terminal_receipt_id.is_none())
+            {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if let Some(receipt_id) = &record.terminal_receipt_id {
+                crate::model::validate_text(
+                    receipt_id.as_str(),
+                    "recovery_inbox_terminal_receipt_id",
+                )
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+            if let Some(receipt_digest) = &record.terminal_receipt_sha256 {
+                crate::model::validate_digest(
+                    receipt_digest,
+                    "recovery_inbox_terminal_receipt_digest",
+                )
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+            if record.disposition == RecoveryInboxDisposition::Imported {
+                increment_store_stop_count(&mut counts.maintenance_reservations)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(RECOVERY_PROBLEMS, "recovery_problems", key, value, {
+            let problem: RecoveryProblem = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            problem
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != problem.operation_or_checkpoint_id.as_str() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if !problem.is_resolved() {
+                increment_store_stop_count(&mut counts.maintenance_reservations)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(PROCESS_STREAM_RECOVERY, "process_stream_recovery", key, value, {
+            let projection: ProcessStreamRecoveryProjection = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            projection
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key
+                != projection
+                    .record_key()
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?
+            {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if projection.activation == crate::StreamRecoveryActivation::Active {
+                increment_store_stop_count(&mut counts.maintenance_reservations)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(CAMPAIGN_SOURCE_PENDING, "campaign_source_pending", key, value, {
+            let reservation: CampaignSourceReservation = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            crate::model::validate_text(
+                &reservation.operation_id,
+                "campaign_source_pending_operation_id",
+            )
+            .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            crate::model::validate_digest(
+                &reservation.request_digest,
+                "campaign_source_pending_request_digest",
+            )
+            .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            reservation
+                .publication
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if !matches!(
+                &reservation.publication.state,
+                eliot_store_api::CampaignSourcePublicationState::NewRevision { .. }
+            ) || key
+                != campaign_source_key(&reservation.publication.record)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?
+            {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            increment_store_stop_count(&mut counts.unresolved_store_effects)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+        });
+
+        scan_census_table!(SUPERVISION_LEASE_STAGED, "supervision_lease_staged", key, value, {
+            let stage: SupervisionLeaseStageReceipt = decode_named(value, "supervision_lease_staged")
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            stage
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != stage.ticket.lease_id.as_str() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            increment_store_stop_count(&mut counts.inflight_admissions)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+        });
+
+        scan_census_table!(PROCESS_START_REPLAY, "process_start_replay", key, value, {
+            let record: ProcessStartReplayRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.operation_id.as_str() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if matches!(
+                record.state,
+                ProcessStartReplayState::Reserved | ProcessStartReplayState::Unknown
+            ) {
+                increment_store_stop_count(&mut counts.inflight_admissions)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(AUTHORITY_HANDOFFS, "authority_handoffs", key, value, {
+            let record: AuthorityHandoffRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.handoff_id.as_str() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if matches!(
+                record.state,
+                AuthorityHandoffState::Reserved | AuthorityHandoffState::Unknown
+            ) {
+                increment_store_stop_count(&mut counts.inflight_admissions)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(SCAN_DISCLOSURE_RECORDS, "scan_disclosures", key, value, {
+            let record: crate::ScanDisclosureOrsRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.operation_key {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if record.state == crate::ScanDisclosureRecordState::Prepared {
+                increment_store_stop_count(&mut counts.unresolved_store_effects)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(OPERATIONAL_CURRENT, "operational_current", key, value, {
+            let record: DurableOperationalRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .input
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if record.operation_order == 0 {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if record.kind == OperationalKind::AdmissionReservation
+                || record.admission_reservation.is_some()
+            {
+                let snapshot = Self::admission_reservation_snapshot(&record)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+                let admission = snapshot.record();
+                let expected_key = Self::operational_key(
+                    OperationalKind::AdmissionReservation,
+                    &admission.reservation_id,
+                );
+                if key != expected_key {
+                    return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+                }
+                if !matches!(
+                    admission.state,
+                    AdmissionReservationState::Released | AdmissionReservationState::Expired
+                ) {
+                    increment_store_stop_count(&mut counts.inflight_admissions)
+                        .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+                }
+            } else {
+                let expected_key = Self::operational_key(record.kind, &record.input.subject_id);
+                if key != expected_key {
+                    return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+                }
+                if matches!(
+                    record.kind,
+                    OperationalKind::Operation | OperationalKind::Retry
+                )
+                    && !matches!(
+                        record.phase,
+                        OperationalPhase::Terminal | OperationalPhase::Released
+                    )
+                {
+                    increment_store_stop_count(&mut counts.unresolved_store_effects)
+                        .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+                }
+            }
+        });
+
+        scan_census_table!(HOST_REQUESTS, "host_requests", key, value, {
+            let record: HostRequestRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.record_key() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if !record.state.is_terminal() {
+                increment_store_stop_count(&mut counts.inflight_admissions)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(ACTIVATION_LIFECYCLES, "activation_lifecycles", key, value, {
+            let record: ActivationLifecycleRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.record_key() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            // DeferredNotReady carries a recorded result and a future
+            // successor schedule; like a wake intent, it is retained future
+            // work rather than an admission currently using this Store.
+            if matches!(
+                record.state,
+                ActivationLifecycleState::Pending
+                    | ActivationLifecycleState::Claimed
+                    | ActivationLifecycleState::Reconciling
+            ) {
+                increment_store_stop_count(&mut counts.inflight_admissions)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(NATIVE_WORKER_CLAIMS, "native_worker_claims", key, value, {
+            let record: NativeWorkerClaimRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.record_key() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if !record.state.is_terminal() {
+                increment_store_stop_count(&mut counts.inflight_admissions)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(DOCTOR_ATTEMPTS, "doctor_attempts", key, value, {
+            let record: crate::DoctorAttemptRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.record_key() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if !record.state.is_terminal() {
+                increment_store_stop_count(&mut counts.inflight_admissions)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(DOCTOR_EFFECTS, "doctor_effects", key, value, {
+            let record: crate::DoctorEffectRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.record_key() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if !record.state.is_terminal() {
+                increment_store_stop_count(&mut counts.unresolved_store_effects)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(STORE_REBIND_REPLAY, "store_rebinds", key, value, {
+            let record: crate::StoreRebindReplayRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            let expected_key = format!("{}::{}", record.operation_id.as_str(), record.request_digest);
+            if key != expected_key {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if record.state == crate::StoreRebindReplayState::Pending {
+                increment_store_stop_count(&mut counts.unresolved_store_effects)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(UNKNOWN_COMMIT_RECOVERY, "unknown_commits", key, value, {
+            let record: UnknownCommitRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.record_key() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if record.is_open() {
+                increment_store_stop_count(&mut counts.unresolved_store_effects)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(STORE_FAILURE_RETENTION, "store_failure_retention", key, value, {
+            let record: crate::StoreFailureRetentionRecord = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            record
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != record.record_key() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if record.failure.disposition == eliot_store_api::StoreFailureDisposition::UnknownOutcome
+                && record.reconciled_receipt.is_none()
+            {
+                increment_store_stop_count(&mut counts.unresolved_store_effects)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(EFFECT_OPERATION_LEASES, "effect_leases", key, value, {
+            let lease: crate::EffectOperationLease = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            lease
+                .validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            if key != lease.lease_id.as_str() {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if !matches!(
+                lease.state,
+                LeaseState::Released
+                    | LeaseState::Expired
+                    | LeaseState::Revoked
+                    | LeaseState::Superseded
+                    | LeaseState::Closed
+            ) {
+                increment_store_stop_count(&mut counts.unresolved_store_effects)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        scan_census_table!(EFFECT_REPLAY_RECONCILIATIONS, "effect_reconciliations", key, value, {
+            let item: KernelReconciliationItem = decode(value)
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            item.validate()
+                .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            let Some(operation_id) = item.operation_id.as_ref() else {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            };
+            let expected_key = format!(
+                "{}::{:020}::{}",
+                Self::encode_key_component(item.module_id.as_str()),
+                item.generation.value(),
+                Self::encode_key_component(operation_id.as_str())
+            );
+            if key != expected_key {
+                return Err(StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable);
+            }
+            if matches!(
+                item.kind,
+                KernelReconciliationKind::ManifestRevocationUnacknowledged
+                    | KernelReconciliationKind::ManifestDeliveryGapOpen
+                    | KernelReconciliationKind::EffectLeaseRevocationUnacknowledged
+                    | KernelReconciliationKind::EffectDeliveryGapOpen
+            ) {
+                increment_store_stop_count(&mut counts.unresolved_store_effects)
+                    .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+            }
+        });
+
+        if matching_supervision_rows != 1 {
+            return Err(StoreStopCensusUnavailableReason::OwnerBindingMismatch);
+        }
+        let supervision = selected_supervision
+            .ok_or(StoreStopCensusUnavailableReason::OwnerBindingMismatch)?;
+        let activation_id = supervision.record.binding.activation_id.as_str().to_owned();
+        let activation_generation = supervision.record.binding.activation_generation;
+        if request
+            .expected_activation_id
+            .as_deref()
+            .is_some_and(|expected| expected != activation_id)
+            || request
+                .expected_activation_generation
+                .is_some_and(|expected| expected != activation_generation)
+        {
+            return Err(StoreStopCensusUnavailableReason::OwnerBindingMismatch);
+        }
+        runtime_leases.sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
+
+        store_stop_hash_field(&mut hasher, activation_id.as_bytes());
+        store_stop_hash_field(&mut hasher, &activation_generation.value().to_le_bytes());
+        store_stop_hash_field(&mut hasher, supervision.record.lease_id.as_str().as_bytes());
+        let owner_observation_revision = store_stop_revision_hex(hasher);
+        let proof = StoreStopCensusProof {
+            installation_id: identity.installation_id().to_owned(),
+            ors_generation: identity.ors_generation(),
+            activation_id,
+            activation_generation,
+            state_fence: request.state_fence.clone(),
+            supervision_lease_id: supervision.record.lease_id.as_str().to_owned(),
+            runtime_leases,
+            supervision_lease: supervision,
+            admission_revision: request.admission_revision.clone(),
+            owner_observation_revision,
+            counts,
+        };
+        proof
+            .validate()
+            .map_err(|_| StoreStopCensusUnavailableReason::OwnerSnapshotUnavailable)?;
+        Ok(proof)
+    }
+
     /// Exact-fence retirement census rows for the #1918 ACT-1/A4 drain gate
     /// (I1.5, I18.53 ACT-1/ACT-4).
     ///
@@ -24959,15 +25884,13 @@ impl RedbRecoveryStore {
     /// exact-fence `RuntimeLease` current set from the canonical ORS tables.
     /// The supervision row must be bound to the presented fence; a row bound
     /// to another fence cannot close this fence's proof (`FenceMismatch`).
-    /// An absent supervision head fails closed: it is the exact-mismatch the
+    /// An absent supervision head fails closed: it is the exact mismatch the
     /// Kernel census treats as unprovable, never as an expired lease.
     /// `RuntimeLease` rows are re-validated on readback, key-checked against
     /// their own lease identity, selected by exact fence equality, and
     /// returned ordered by lease id, so the caller never re-sorts or
-    /// re-filters. A store that never recorded a runtime-lease table has no
-    /// durable rows to return; that observed absence is reported as the empty
-    /// set, exactly like the supervision-status `has_table` precedent, and
-    /// never as a caller-supplied default.
+    /// re-filters. This legacy projection remains separate from the complete
+    /// Store-stop denominator served by [`Self::load_store_stop_census`].
     pub fn load_runtime_lease_census_by_state_fence(
         &self,
         fence: &eliot_contracts::StateFence,
@@ -25970,6 +26893,12 @@ impl RedbRecoveryStore {
                 .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
                 .map_err(storage)?,
         );
+        // Store-stop census source families are materialized by the same
+        // owner initialization transaction; physical absence is never read as
+        // a caller-provided zero denominator.
+        drop(write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?);
+        drop(write.open_table(STORE_FAILURE_RETENTION).map_err(storage)?);
+        drop(write.open_table(HOST_REQUESTS).map_err(storage)?);
         drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
         drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
         // #2802: part of the base family, materialized empty on every open like

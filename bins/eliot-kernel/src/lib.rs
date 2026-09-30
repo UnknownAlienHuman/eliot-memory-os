@@ -4574,7 +4574,8 @@ impl KernelComposition {
 
         // AdmissionsClosed: the service gate closes normal admission; the
         // frame-dispatch Ready gate denies new work from `Draining` on.
-        match self.apply_control(KernelControlCommand::Drain) {
+        let drain_result = self.apply_drain_with_terminal(true);
+        match drain_result {
             Ok(state) => record(
                 ShutdownPhase::AdmissionsClosed,
                 format!("service-drain-admitted:{state}"),
@@ -4731,6 +4732,53 @@ impl KernelComposition {
                 vec![census.observation_code().to_owned()],
             ));
         }
+        #[cfg(windows)]
+        let store_census_proof = match census.store_stop_result() {
+            Some(eliot_ors::StoreStopCensusResult::KnownZero(proof))
+                if proof.admission_revision == admission.admission_revision
+                    && proof.installation_id == admission.installation_id
+                    && proof.activation_id == admission.activation_id
+                    && format!(
+                        "{}:{}@{}",
+                        proof.state_fence.authority_epoch.lineage_id,
+                        proof.state_fence.authority_epoch.sequence,
+                        proof.state_fence.resource_generation.value()
+                    ) == admission.state_fence =>
+            {
+                proof.clone()
+            }
+            _ => {
+                return Err(DrainHalt::with_pending(
+                    "store-stop-census-binding-mismatch",
+                    vec![census.observation_code().to_owned()],
+                ));
+            }
+        };
+        // Re-read the full ORS owner revision and front-door frontier before
+        // asking the Store gateway to fence. The owner proof binds installation,
+        // activation, ORS generation, exact StateFence and admission revision.
+        #[cfg(windows)]
+        {
+            if !self
+                .generation_gateway
+                .ors
+                .revalidate_store_stop_census(&store_census_proof)
+            {
+                return Err(DrainHalt::with_pending(
+                    "store-stop-owner-revision-changed",
+                    vec![census.observation_code().to_owned()],
+                ));
+            }
+            let before_store_stop = self
+                .drain_admission_coherence(coordinator)
+                .map_err(DrainHalt::new)?;
+            if before_store_stop != admission {
+                return Err(DrainHalt::with_pending(
+                    "drain-admission-raced-final-census",
+                    vec![census.observation_code().to_owned()],
+                ));
+            }
+        }
         // The store stop is the store owner's, not the coordinator's. The
         // lease census above admits the drain only with no outstanding
         // canonical-data or maintenance obligation, so the stop is requested
@@ -4788,6 +4836,17 @@ impl KernelComposition {
         if revalidated != admission {
             return Err(DrainHalt::with_pending(
                 "drain-admission-raced-final-census",
+                vec![census.observation_code().to_owned()],
+            ));
+        }
+        #[cfg(windows)]
+        if !self
+            .generation_gateway
+            .ors
+            .revalidate_store_stop_census(&store_census_proof)
+        {
+            return Err(DrainHalt::with_pending(
+                "store-stop-owner-revision-changed",
                 vec![census.observation_code().to_owned()],
             ));
         }
@@ -4861,15 +4920,99 @@ impl KernelComposition {
         Ok(decision)
     }
 
-    /// Samples the exact drain/admission frontier the final lease census is
-    /// taken under and revalidated against.
+    /// Computes the Kernel-issued revision of the current admission frontier.
+    ///
+    /// The revision binds the exact StateFence, admitted activation contour,
+    /// lifecycle admission state, held normal-work permits, and front-door
+    /// in-flight indexes. Shutdown also compares the full sampled fields
+    /// before consuming Store stop.
+    pub(crate) fn store_stop_admission_revision(
+        &self,
+        expected_state_fence: &StateFence,
+        require_closed: bool,
+    ) -> Result<String, &'static str> {
+        expected_state_fence
+            .validate()
+            .map_err(|_| "authority-fence-unavailable")?;
+        let current_fence = match self.front_door_policy.lock() {
+            Ok(policy) => policy.module_generation.state_fence.clone(),
+            Err(_) => return Err("authority-fence-unavailable"),
+        };
+        if current_fence != *expected_state_fence {
+            return Err("authority-fence-changed-during-census");
+        }
+        let (
+            installation_id,
+            activation_id,
+            activation_generation,
+            service_state,
+            normal_admissions,
+        ) = match self.service.lock() {
+            Ok(service) => {
+                let candidate = service
+                    .candidate_binding()
+                    .ok_or("activation-contour-unavailable")?;
+                (
+                    candidate.installation_id.as_str().to_owned(),
+                    candidate.activation_id.as_str().to_owned(),
+                    candidate
+                        .supervision_incarnation
+                        .activation_generation
+                        .clone(),
+                    service.state(),
+                    service.normal_admissions_in_flight(),
+                )
+            }
+            Err(_) => return Err("activation-contour-unavailable"),
+        };
+        if normal_admissions != 0 {
+            return Err("normal-admission-in-flight");
+        }
+        if require_closed && service_state != KernelServiceState::Draining {
+            return Err("normal-admission-not-closed");
+        }
+        #[cfg(windows)]
+        let (bridge_sessions, host_request_operations) = {
+            let bridge_sessions = match self.agent_bridge_connections.lock() {
+                Ok(connections) => connections.len(),
+                Err(_) => return Err("bridge-session-index-unreadable"),
+            };
+            let host_request_operations = match self.host_request_connection_index.lock() {
+                Ok(index) => index.values().map(Vec::len).sum::<usize>(),
+                Err(_) => return Err("host-request-index-unreadable"),
+            };
+            (bridge_sessions, host_request_operations)
+        };
+        #[cfg(not(windows))]
+        let (bridge_sessions, host_request_operations) = (0usize, 0usize);
+        let fence = format!(
+            "{}:{}@{}",
+            current_fence.authority_epoch.lineage_id,
+            current_fence.authority_epoch.sequence,
+            current_fence.resource_generation.value()
+        );
+        store_stop_admission_revision(
+            &fence,
+            &installation_id,
+            &activation_id,
+            &activation_generation,
+            service_state,
+            normal_admissions,
+            bridge_sessions,
+            host_request_operations,
+        )
+    }
+
+    /// Samples the exact drain/admission frontier the final Store-stop census
+    /// is taken under and revalidated against.
     ///
     /// The census reads several independent owners, so each zero it observes
     /// is only a statement about the instant that owner was sampled. This
     /// sample is the cross-owner coherence check: the drain authorization is
-    /// consumed only when the drain generation, the front-door State Fence,
-    /// the service admission state, and both front-door indexes are identical
-    /// before and after the census.
+    /// consumed only when the drain generation, installation/activation
+    /// contour, front-door State Fence, service admission state, held normal
+    /// work permits, and both front-door indexes are identical before and
+    /// after the census.
     ///
     /// Every owner is read under its own guard, and each guard is released
     /// before the next owner is touched: no global mutex is held across an
@@ -4900,21 +5043,36 @@ impl KernelComposition {
         // has admitted no activation yet has no such contour, which is the
         // genesis case the I1.5 pairing leaves unfenced rather than a second
         // opinion about the live one.
-        let activation_generation = match self.service.lock() {
+        let (
+            installation_id,
+            activation_id,
+            activation_generation,
+            service_state,
+            normal_admissions,
+        ) = match self.service.lock() {
             Ok(service) => {
                 let candidate = service
                     .candidate_binding()
                     .ok_or("activation-contour-unavailable")?;
-                candidate
-                    .supervision_incarnation
-                    .activation_generation
-                    .clone()
+                (
+                    candidate.installation_id.as_str().to_owned(),
+                    candidate.activation_id.as_str().to_owned(),
+                    candidate
+                        .supervision_incarnation
+                        .activation_generation
+                        .clone(),
+                    service.state(),
+                    service.normal_admissions_in_flight(),
+                )
             }
             Err(_) => return Err("activation-contour-unavailable"),
         };
-        let service_state = self
-            .service_state()
-            .map_err(|_| "service-state-unavailable")?;
+        if normal_admissions != 0 {
+            return Err("normal-admission-in-flight");
+        }
+        if service_state != KernelServiceState::Draining {
+            return Err("normal-admission-not-closed");
+        }
         #[cfg(windows)]
         let (bridge_sessions, host_request_operations) = {
             let bridge_sessions = match self.agent_bridge_connections.lock() {
@@ -4932,13 +5090,27 @@ impl KernelComposition {
         // race it.
         #[cfg(not(windows))]
         let (bridge_sessions, host_request_operations) = (0usize, 0usize);
+        let admission_revision = store_stop_admission_revision(
+            &state_fence,
+            &installation_id,
+            &activation_id,
+            &activation_generation,
+            service_state,
+            normal_admissions,
+            bridge_sessions,
+            host_request_operations,
+        )?;
         Ok(DrainAdmissionCoherence {
             drain_generation,
             state_fence,
+            installation_id,
+            activation_id,
             activation_generation,
             service_state,
+            normal_admissions,
             bridge_sessions,
             host_request_operations,
+            admission_revision,
         })
     }
 
@@ -5023,16 +5195,49 @@ struct DrainAdmissionCoherence {
     drain_generation: String,
     /// The front-door `StateFence` binding (`lineage:sequence@resource`).
     state_fence: String,
+    /// Host installation identity of the admitted candidate contour this sample
+    /// observed.
+    installation_id: String,
+    /// The activation identity of the admitted candidate contour this sample
+    /// observed.
+    activation_id: String,
     /// The activation generation of the admitted candidate contour this sample
     /// observed, in the same `SupervisionJournalEpoch` domain a waking
     /// activation presents.
     activation_generation: SupervisionJournalEpoch,
     /// The service admission state the census was taken under.
     service_state: KernelServiceState,
+    /// Held normal-work permits whose operations have not completed.
+    normal_admissions: usize,
     /// Admitted front-door bridge Session count.
     bridge_sessions: usize,
     /// Admitted front-door host-request operation count.
     host_request_operations: usize,
+    /// Revision used by the owner-issued Store-stop census.
+    admission_revision: String,
+}
+
+fn store_stop_admission_revision(
+    state_fence: &str,
+    installation_id: &str,
+    activation_id: &str,
+    activation_generation: &SupervisionJournalEpoch,
+    service_state: KernelServiceState,
+    normal_admissions: usize,
+    bridge_sessions: usize,
+    host_request_operations: usize,
+) -> Result<String, &'static str> {
+    crate::sha256_json(&(
+        state_fence,
+        installation_id,
+        activation_id,
+        activation_generation,
+        service_state,
+        normal_admissions,
+        bridge_sessions,
+        host_request_operations,
+    ))
+    .map_err(|_| "admission-revision-unavailable")
 }
 
 fn status_frame(

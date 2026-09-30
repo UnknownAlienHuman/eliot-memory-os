@@ -77,7 +77,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 6;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 7;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -1355,6 +1355,15 @@ impl KernelControlRequest {
         }
         if let KernelControlCommand::ReadRuntimeLeaseCensus(query) = &self.command {
             query.validate()?;
+            if query.installation_id != self.candidate.installation_id.as_str()
+                || query.activation_id != self.candidate.activation_id.as_str()
+                || query.state_fence.authority_epoch != self.candidate.kernel_epoch
+                || query.state_fence.resource_generation != self.generation
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "runtime_lease_census.candidate_binding",
+                });
+            }
         }
         if let KernelControlCommand::RevokeRuntimeLease(query) = &self.command {
             query.validate()?;
@@ -3304,23 +3313,26 @@ impl IntroductionReadbackQuery {
     }
 }
 
-/// Authenticated read-only query for one complete `StateFence`. The lease id
-/// identifies the current ORS supervision row whose readback closes the
-/// generation-retirement proof; it is not a caller-authored lease claim.
-///
-/// Ported from #1751 donor 552ee79a (M2 integration copy; no authorship
-/// change, no duplicate owner).
+/// Authenticated read-only query for one complete Store-stop owner census.
+/// The installation, activation and fence are selected from Host's durable
+/// activation journal and must be re-read from the ORS owner exactly.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeLeaseCensusQuery {
-    /// Complete fence selecting the census rows.
+    /// Complete fence selecting the Store-stop owner census.
     pub state_fence: StateFence,
     /// Current ORS supervision row closing the proof.
     pub supervision_lease_id: String,
+    /// Host-journal installation the ORS owner must read back exactly.
+    pub installation_id: String,
+    /// Host-journal activation the ORS supervision head must bind exactly.
+    pub activation_id: String,
+    /// Host-journal activation generation for the exact fence.
+    pub activation_generation: ResourceGeneration,
 }
 
 impl RuntimeLeaseCensusQuery {
-    /// Validates the query shape without performing any read.
+    /// Validates the query shape without performing any owner read.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
         self.state_fence
             .validate()
@@ -3331,7 +3343,15 @@ impl RuntimeLeaseCensusQuery {
         validate_text(
             &self.supervision_lease_id,
             "runtime_lease_census.supervision_lease_id",
-        )
+        )?;
+        validate_text(&self.installation_id, "runtime_lease_census.installation_id")?;
+        validate_text(&self.activation_id, "runtime_lease_census.activation_id")?;
+        if self.activation_generation != self.state_fence.resource_generation {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "runtime_lease_census.activation_generation",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -3365,89 +3385,8 @@ impl RuntimeLeaseRevokeQuery {
     }
 }
 
-/// One Kernel-authored census read from the canonical ORS current tables.
-///
-/// Ported from #1751 donor 552ee79a (M2 integration copy; no authorship
-/// change, no duplicate owner).
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeLeaseCensus {
-    /// Complete fence every returned row was selected by.
-    pub state_fence: StateFence,
-    /// Supervision row identity closing the proof.
-    pub supervision_lease_id: String,
-    /// Exact-fence `RuntimeLease` rows ordered by lease id.
-    pub runtime_leases: Vec<RuntimeLease>,
-    /// Current supervision row bound to the same fence.
-    pub supervision_lease: SupervisionLeaseSnapshot,
-}
-
-impl RuntimeLeaseCensus {
-    /// Validates fence agreement, lease ordering, and supervision binding.
-    pub fn validate(&self) -> Result<(), KernelServiceError> {
-        let query = RuntimeLeaseCensusQuery {
-            state_fence: self.state_fence.clone(),
-            supervision_lease_id: self.supervision_lease_id.clone(),
-        };
-        query.validate()?;
-        for (index, lease) in self.runtime_leases.iter().enumerate() {
-            lease
-                .validate()
-                .map_err(|_| KernelServiceError::InvalidField {
-                    field: "runtime_lease_census.runtime_leases",
-                    reason: "contains an invalid RuntimeLease",
-                })?;
-            if lease.state_fence != self.state_fence
-                || (index > 0 && self.runtime_leases[index - 1].lease_id >= lease.lease_id)
-            {
-                return Err(KernelServiceError::HandshakeMismatch {
-                    field: "runtime_lease_census.runtime_lease_fence_or_order",
-                });
-            }
-        }
-        self.supervision_lease
-            .validate()
-            .map_err(|_| KernelServiceError::InvalidField {
-                field: "runtime_lease_census.supervision_lease",
-                reason: "must be a validated current ORS row",
-            })?;
-        if self.supervision_lease.record.lease_id.as_str() != self.supervision_lease_id
-            || self.supervision_lease.record.binding.state_fence != self.state_fence
-        {
-            return Err(KernelServiceError::HandshakeMismatch {
-                field: "runtime_lease_census.supervision_lease_binding",
-            });
-        }
-        Ok(())
-    }
-
-    /// Returns whether every `RuntimeLease` and the current
-    /// `SupervisionLease` are terminal in this exact-fence ORS snapshot.
-    ///
-    /// Ported from #1751 donor b2566e47 (M2 integration copy; the barrier
-    /// retirement gate consumes it; no authorship change).
-    #[must_use]
-    pub fn is_fully_retired(&self) -> bool {
-        fn terminal(state: eliot_runtime_contracts::LeaseState) -> bool {
-            matches!(
-                state,
-                eliot_runtime_contracts::LeaseState::Released
-                    | eliot_runtime_contracts::LeaseState::Expired
-                    | eliot_runtime_contracts::LeaseState::Revoked
-                    | eliot_runtime_contracts::LeaseState::Superseded
-                    | eliot_runtime_contracts::LeaseState::Closed
-            )
-        }
-
-        self.validate().is_ok()
-            && self
-                .runtime_leases
-                .iter()
-                .all(|lease| terminal(lease.state))
-            && terminal(self.supervision_lease.record.state)
-            && self.supervision_lease.record.projection == SupervisionLeaseProjection::Terminal
-    }
-}
+/// Shared ORS-issued Store-stop result carried over the Kernel service wire.
+pub type RuntimeLeaseCensus = eliot_ors::StoreStopCensusResult;
 
 /// Control messages accepted by the Kernel service boundary.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

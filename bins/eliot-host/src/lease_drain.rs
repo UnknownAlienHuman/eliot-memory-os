@@ -26,7 +26,7 @@ pub struct GenerationRetirementFence {
 }
 
 /// Opaque owner-produced proof that the exact committed Host drain has no
-/// active `RuntimeLease` or `SupervisionLease` in canonical ORS.
+/// Store-stop obligation in canonical ORS.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationRetirementBarrier {
     fence: GenerationRetirementFence,
@@ -266,6 +266,9 @@ impl HostComposition {
         let query = eliot_kernel_service::RuntimeLeaseCensusQuery {
             state_fence: expected.state_fence.clone(),
             supervision_lease_id: supervision_lease_ref.as_str().to_owned(),
+            installation_id: state.host.installation.as_str().to_owned(),
+            activation_id: expected.activation_id.as_str().to_owned(),
+            activation_generation: expected.state_fence.resource_generation,
         };
         query
             .validate()
@@ -396,9 +399,27 @@ impl HostComposition {
         census
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let supervision = &census.supervision_lease;
-        if census.state_fence != expected.state_fence
-            || census.supervision_lease_id != supervision_lease_ref.as_str()
+        let Some(proof) = census.proof() else {
+            let census_digest = sha256_json(&census)?;
+            let evidence = PlatformHandle::new(format!("store-stop-census-sha256:{census_digest}"))
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+            self.record_drain_recovery_gap(
+                "kernel-store-stop-census-unavailable",
+                GapDisposition::BlockDependentTransition,
+                &[evidence],
+            )?;
+            return Err(HostError::RecoveryRequired(
+                "Kernel Store-stop census is unavailable; generation retirement remains blocked"
+                    .to_owned(),
+            ));
+        };
+        let supervision = &proof.supervision_lease;
+        if proof.installation_id != state.host.installation.as_str()
+            || proof.activation_id != expected.activation_id.as_str()
+            || proof.activation_generation != expected.state_fence.resource_generation
+            || proof.ors_generation == 0
+            || proof.state_fence != expected.state_fence
+            || proof.supervision_lease_id != supervision_lease_ref.as_str()
             || supervision.record.binding.activation_id.as_str() != expected.activation_id.as_str()
             || supervision.record.binding.activation_generation
                 != expected.state_fence.resource_generation
@@ -406,12 +427,13 @@ impl HostComposition {
             || supervision.record.binding.state_fence != expected.state_fence
         {
             return Err(HostError::RecoveryRequired(
-                "canonical ORS census is not bound to the committed generation".to_owned(),
+                "canonical ORS census is not bound to the committed installation and generation"
+                    .to_owned(),
             ));
         }
         if !census.is_fully_retired() {
             let census_digest = sha256_json(&census)?;
-            let evidence = PlatformHandle::new(format!("runtime-census-sha256:{census_digest}"))
+            let evidence = PlatformHandle::new(format!("store-stop-census-sha256:{census_digest}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?;
             self.record_drain_recovery_gap(
                 if drain_refused {
@@ -423,7 +445,7 @@ impl HostComposition {
                 &[evidence],
             )?;
             return Err(HostError::RecoveryRequired(
-                "committed drain retained: exact-fence ORS still has a live owner obligation; Kernel and Store remain running"
+                "committed drain retained: exact ORS Store-stop census has outstanding obligations; Kernel and Store remain running"
                     .to_owned(),
             ));
         }

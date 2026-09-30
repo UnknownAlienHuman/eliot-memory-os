@@ -1111,16 +1111,6 @@ impl ShutdownDrainCoordinator {
         self.lock().committed.clone()
     }
 
-    /// Requires the canonical-data lease-zero precondition before any
-    /// store-stop request.
-    pub(crate) const fn check_lease_zero(has_outstanding_lease: bool) -> Result<(), &'static str> {
-        if has_outstanding_lease {
-            Err("canonical-data lease outstanding")
-        } else {
-            Ok(())
-        }
-    }
-
     /// Bounded wait for pending receipts to resolve, driven by one typed
     /// owner observation per tick.
     ///
@@ -1853,10 +1843,6 @@ mod shutdown_drain_tests {
         // A branch no declared edge names is refused rather than ordered by
         // assumption.
         assert!(reverse_quiescence_order(&["unrelated-module".to_owned()]).is_err());
-
-        // Canonical-data lease-zero precondition used by the composition root.
-        assert!(ShutdownDrainCoordinator::check_lease_zero(false).is_ok());
-        assert!(ShutdownDrainCoordinator::check_lease_zero(true).is_err());
 
         coordinator
             .complete_terminal(ShutdownTerminal::Intentional)

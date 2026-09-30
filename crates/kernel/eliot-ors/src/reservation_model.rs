@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::validate_digest;
+use crate::model::{validate_digest, validate_text};
 use crate::{
     EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity, OrderingScope, OrsError,
     RecoveryOwner, RecoveryPayload, RecoveryPayloadEnvelope, RecoveryWriteBinding,
@@ -182,6 +182,79 @@ pub struct ReservationRecord {
     pub state: ReservationState,
     pub unknown_reason: Option<OpaqueLabel>,
     pub terminal_receipt_id: Option<OpaqueLabel>,
+}
+
+impl ReservationRecord {
+    /// Revalidates one persisted reservation before a complete Store-stop
+    /// census treats its lifecycle state as authoritative.
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        let token = &self.token;
+        validate_text(token.reservation_id.as_str(), "reservation_id")?;
+        validate_text(token.operation_id.as_str(), "reservation_operation_id")?;
+        validate_text(token.recovery_owner.as_str(), "reservation_recovery_owner")?;
+        validate_digest(
+            &token.prepared_transition_sha256,
+            "prepared_transition_sha256",
+        )?;
+        token.writer_epoch.validate()?;
+        token
+            .state_fence
+            .validate_against_lineage(&token.writer_epoch)?;
+        if token.reservation_order == 0 || token.scopes.is_empty() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "reservation",
+                reason: "reservation order or scope set is incomplete".to_owned(),
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for scope in &token.scopes {
+            scope.expected_head.validate()?;
+            if scope.reserved_sequence == 0 || !seen.insert(scope.scope.clone()) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "reservation",
+                    reason: "reservation scope sequence or identity is invalid".to_owned(),
+                });
+            }
+        }
+        if let Some(binding) = &token.write_binding {
+            binding.validate()?;
+            let bound_scopes = binding
+                .ordering_scopes
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if binding.operation_id != token.operation_id
+                || binding.authority_epoch != token.writer_epoch
+                || binding.state_fence != token.state_fence
+                || binding.prepared_transition_sha256 != token.prepared_transition_sha256
+                || bound_scopes != seen
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "reservation",
+                    reason: "write binding does not match its reservation token".to_owned(),
+                });
+            }
+        }
+        if let Some(reason) = &self.unknown_reason {
+            validate_text(reason.as_str(), "reservation_unknown_reason")?;
+        }
+        if let Some(receipt_id) = &self.terminal_receipt_id {
+            validate_text(receipt_id.as_str(), "reservation_terminal_receipt_id")?;
+        }
+        let reconciling = self.state == ReservationState::Reconciling;
+        let finalized = self.state == ReservationState::Finalized;
+        if self.unknown_reason.is_some() != reconciling
+            || (finalized && self.terminal_receipt_id.is_none())
+            || (!matches!(self.state, ReservationState::Finalized | ReservationState::Released)
+                && self.terminal_receipt_id.is_some())
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "reservation",
+                reason: "reservation lifecycle and terminal evidence disagree".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
