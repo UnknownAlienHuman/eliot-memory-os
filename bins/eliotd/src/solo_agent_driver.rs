@@ -944,10 +944,7 @@ fn read_verified_projection_bytes(
 
 /// Validates one persisted solo projection envelope: wire version, the recorded
 /// digest against the payload, and the exact operation identity it addresses.
-fn verify_projection(
-    bytes: &[u8],
-    operation_id: &str,
-) -> Result<SoloProjectionFile, DaemonError> {
+fn verify_projection(bytes: &[u8], operation_id: &str) -> Result<SoloProjectionFile, DaemonError> {
     let file: SoloProjectionFile = serde_json::from_slice(bytes).map_err(|error| {
         DaemonError::Composition(CompositionError::Recovery(format!(
             "solo projection decode: {error}"
@@ -969,9 +966,11 @@ fn verify_projection(
         )));
     }
     if file.payload.operation_id != operation_id {
-        return Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(
-            "solo projection addresses a foreign operation".to_owned(),
-        )));
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo projection addresses a foreign operation".to_owned(),
+            ),
+        ));
     }
     Ok(file)
 }
@@ -1420,8 +1419,8 @@ fn restore_solo_fabric(
 /// takes, and this is where the residual is stated, not a place where it is
 /// manufactured.
 #[cfg(not(test))]
-fn admitted_solo_restore_capability(
-) -> Result<eliot_agent_coordinator::AdmittedProviderCapability, DaemonError> {
+fn admitted_solo_restore_capability()
+-> Result<eliot_agent_coordinator::AdmittedProviderCapability, DaemonError> {
     Err(DaemonError::Kernel(
         "solo restore is blocked until Kernel retains an independently owner-verified executable-binding digest"
             .to_owned(),
