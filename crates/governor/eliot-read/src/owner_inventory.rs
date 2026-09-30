@@ -54,9 +54,9 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::ContractVersion;
 use eliot_store_api::{
-    NamedOperationManifest, NamedReadOperation, ReadConsistency, activated_read_operations,
-    declared_read_parameters, named_read_operation_name, parameter_schema_digest,
-    project_parameter_schema,
+    EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME, NamedOperationManifest,
+    NamedReadOperation, ReadConsistency, activated_read_operations, declared_read_parameters,
+    named_read_operation_name, parameter_schema_digest, project_parameter_schema,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -900,6 +900,21 @@ const PUBLIC_ITEM_DECLARATIONS: &[PublicTypeDeclaration] = &[
         witness: None,
     },
     PublicTypeDeclaration {
+        name: "READ_CELL_ID",
+        kind: PublicApiKind::ContractConstant,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "READ_CELL_OWNER",
+        kind: PublicApiKind::ContractConstant,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "READ_CELL_PROOF_ENTRYPOINT",
+        kind: PublicApiKind::ContractConstant,
+        witness: None,
+    },
+    PublicTypeDeclaration {
         name: "contract_identity",
         kind: PublicApiKind::ContractFunction,
         witness: None,
@@ -1085,7 +1100,7 @@ struct StoreDependency {
 }
 
 /// Store items the read path depends on, each with a real call as its witness.
-const STORE_DEPENDENCIES: [StoreDependency; 7] = [
+const STORE_DEPENDENCIES: [StoreDependency; 8] = [
     StoreDependency {
         symbol: "activated_read_operations",
         witness: activated_read_operation_count,
@@ -1113,6 +1128,10 @@ const STORE_DEPENDENCIES: [StoreDependency; 7] = [
     StoreDependency {
         symbol: "ExperienceRangePage",
         witness: typed_coverage_statement_operation_count,
+    },
+    StoreDependency {
+        symbol: "EXPERIENCE_BANK_READ_NAME + EXPERIENCE_FEEDBACK_READ_NAME",
+        witness: resolved_experience_read_name_count,
     },
 ];
 
@@ -1445,8 +1464,14 @@ fn compare_activated_read_model() -> Result<Vec<OperationReadModelComparison>, R
         .collect()
 }
 
-/// Refuses a reconstruction table that no longer matches the intent gate it
-/// claims to enumerate.
+/// Refuses a reconstruction table that names an operation the Store has not
+/// activated.
+///
+/// The table is the single statement of the reconstruction set: the owner's own
+/// intent gate reads it through `operation_matches_intent`, so there is no second
+/// copy to compare against. What remains to check is the one thing this crate
+/// does not own — whether the Store has actually activated every operation the
+/// table claims — which is what the comparison rows answer.
 fn verify_context_reconstruction_table(
     comparisons: &[OperationReadModelComparison],
 ) -> Result<(), ReadError> {
@@ -1468,7 +1493,7 @@ fn verify_context_reconstruction_table(
     if declared != admitted {
         return Err(ReadError::InvalidField {
             field: "context_reconstruction_operations".to_owned(),
-            reason: "the declared table does not match the activated operations the reconstruction intent gate admits"
+            reason: "the declared table names an operation the store has not activated"
                 .to_owned(),
         });
     }
@@ -1799,5 +1824,24 @@ fn typed_coverage_statement_operation_count() -> usize {
     activated_read_operations()
         .into_iter()
         .filter(|operation| declares_store_coverage_statement(*operation))
+        .count()
+}
+
+/// Observes how many of the Store's own experience read names the coverage gate
+/// actually resolves to an activated operation.
+///
+/// The coverage gate names the two experience range reads by the Store's exported
+/// constants rather than by `NamedReadOperation` variants, so this is the real
+/// call that proves those two names still denote activated reads: if the Store
+/// renamed or repointed either read, the gate would silently stop matching it and
+/// this count would fall below the two names the gate declares.
+fn resolved_experience_read_name_count() -> usize {
+    [EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME]
+        .into_iter()
+        .filter(|name| {
+            activated_read_operations()
+                .into_iter()
+                .any(|operation| named_read_operation_name(operation) == *name)
+        })
         .count()
 }

@@ -1,14 +1,18 @@
 //! G-06 Governor read/query contracts and named-read facade.
 //!
-//! DISPOSITION (#1144, WIRE): this crate is the declared Governor read owner.
+//! DISPOSITION (#1144, RETAINED AS THE DECLARED GOVERNOR READ OWNER): this
+//! crate is the declared Governor read owner, with one live production consumer.
 //! It is a stateless projection over the store-neutral named read port
 //! ([`CanonicalReadClient`]): it owns no cache, no freshness state, and no
 //! second consistency algorithm. Every read binds the caller request identity,
 //! scope, consistency, dependency revisions, current [`StateFence`], and exact
 //! source/evidence handles, and returns revision heads with provenance
-//! disposition so callers can revalidate. Real consumers: `eliot-governor`
-//! (`ReadApi` for context/input reconstruction) and `eliotd` (`LocalReadPort`
-//! for `eliot.query` / `eliot.packet` answers).
+//! disposition so callers can revalidate. The live consumer is the `eliotd`
+//! daemon's `eliot.query` `context_reconstruction` route
+//! (`bins/eliotd/src/context_reconstruction_route.rs::serve_context_reconstruction`),
+//! which the run loop invokes and which this owner serves through
+//! `eliot_governor`'s `GovernorContextInputs::reconstruct`; see "Disposition"
+//! below for the full consumer table.
 //!
 //! Requests carry explicit intent, scope, consistency and fence
 //! dependencies. The facade never accepts raw database query text, writes
@@ -32,7 +36,7 @@
 //! It is the machine-checkable copy; the list here is its human-readable summary.
 //!
 //! Two statements in that list are bounded on purpose. `ReadApi`, `LocalReadPort`
-//! and `ReadService` are the only real construction and call sites of this
+//! and `ReadService` are the only construction and dispatch points of this
 //! package's read semantics: the two traits have exactly one blanket
 //! implementation, in [`ReadService`], and the three families
 //! (`state`/`query`/`resource` and their `bound_*` forms) are the only entry
@@ -52,6 +56,8 @@
 //! ```text
 //! public API:        ReadApi, LocalReadPort, ReadService,
 //!                    contract_identity, CONTRACT_NAME, CONTRACT_VERSION,
+//!                    READ_CELL_ID, READ_CELL_OWNER,
+//!                    READ_CELL_PROOF_ENTRYPOINT,
 //!                    context_reconstruction_operations,
 //!                    ReadOutcome, ReadPrincipal, ReadSchemaIdentity,
 //!                    ReadSourceIdentity, ReadCoverage, ReadOrderingBinding,
@@ -70,8 +76,10 @@
 //!                    `owner_inventory::compare_operation_with_store_read_model`
 //!                    (generated_operation_manifests, activated_read_operations,
 //!                    declared_read_parameters, project_parameter_schema,
-//!                    parameter_schema_digest) and the Store-owned experience
-//!                    page coverage statement (ExperienceRangePage). No SurrealDB
+//!                    parameter_schema_digest, named_read_operation_name,
+//!                    EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME)
+//!                    and the Store-owned experience page coverage statement
+//!                    (ExperienceRangePage). No SurrealDB
 //!                    SDK, no credentials, no write capability, no raw query
 //!                    text;
 //! serialization:      every public type is `deny_unknown_fields` JSON with
@@ -110,6 +118,24 @@
 //! Store declaration table resolves, so a port can no longer send a selector the
 //! Store does not declare.
 //!
+//! Two more restatements of a Store-owned answer were live and are now removed:
+//!
+//! * the intent gate restated the reconstruction operation set as a literal
+//!   [`NamedReadOperation`] match beside
+//!   [`context_reconstruction_operations`], and
+//!   [`owner_inventory::read_owner_inventory`] carried a comparison function
+//!   whose only job was to notice the two copies disagreeing. The gate now reads
+//!   the table, so the set is stated once and cannot drift; the remaining check
+//!   is the one this crate does not own, whether the Store activated every
+//!   operation the table names.
+//! * the page-coverage gate restated the two experience range reads as
+//!   `NamedReadOperation` variants. The Store already names them
+//!   (`EXPERIENCE_BANK_READ_NAME` / `EXPERIENCE_FEEDBACK_READ_NAME`) and owns
+//!   the one spelling of each through `named_read_operation_name`, so the gate
+//!   resolves the canonical name and matches the Store's own constants. A
+//!   renamed or repointed read can no longer leave this owner gating a set the
+//!   Store no longer declares.
+//!
 //! The other three semantics were measured and each already had exactly one
 //! owner, so nothing was moved:
 //!
@@ -120,7 +146,9 @@
 //! * freshness: [`FreshnessPolicy`] is declared once and carried as a
 //!   [`QueryIntent`] field. Before this change the two port methods each wrote
 //!   their own `QueryIntent` literal, which was a second statement of the same
-//!   freshness choice; they now take it from the declared row.
+//!   freshness choice; they now take it from the declared row. Freshness is
+//!   enforced by the consistency mode, the declared dependency revisions and the
+//!   fence, all resolved in [`ReadService::execute`] — never by a second rule.
 //! * revision/order heads: [`ReadOrderingBinding`] is the only order-head
 //!   vocabulary and [`ReadService::execute`] is the only place that reads
 //!   `RevisionHead` sets (before, and again after, the named read). The
@@ -145,41 +173,55 @@
 //!                            `ScopeRevisionView` and the generated operation
 //!                            catalogue. This crate consumes those identities
 //!                            read-only and never re-declares them.
-//! runtime-status consumers:  `crates/governor/eliot-governor/src/
-//!                            context_inputs.rs` retains seven role reads with
-//!                            `ProjectionState` dispositions; `bins/eliotd`
-//!                            retains one bounded evidence read per admitted
-//!                            `eliot.query` pair and routes its
+//! reconstruction consumers:  `crates/governor/eliot-governor/src/
+//!                            context_inputs.rs` retains the seven role reads
+//!                            with `ProjectionState` dispositions, served by the
+//!                            `eliotd` `context_reconstruction` route on the run
+//!                            loop; `bins/eliotd/src/experience_runtime.rs:
+//!                            read_current_position` issues its
 //!                            `GetCurrentEpistemicPosition` edge read through
-//!                            this owner (`experience_runtime.rs:read_current_position`).
-//!                            All of them consume the resolved [`ReadIdentity`]
-//!                            instead of re-deriving freshness: a direct
+//!                            this owner as a `ReadApi::bound_state` read rather
+//!                            than a raw `execute_named` call, so it consumes the
+//!                            resolved [`ReadIdentity`] instead of re-deriving
+//!                            source, fence and coverage. A direct
 //!                            `CanonicalReadClient::execute_named` call is no
-//!                            longer a second answer to source/fence/coverage.
+//!                            longer a second answer to those questions.
 //! ```
 //!
-//! # Declared edges versus a live read (A1)
+//! # Disposition: one declared read owner with one live production consumer (A1)
 //!
-//! The inventory above is a *declared-edge* statement, and the difference is
-//! load-bearing for any deletion decision. `cargo metadata` reports three
-//! workspace members with an edge onto this package; searching the current
-//! source for a non-test call site gives:
+//! Disposition (a): this package is the declared Governor read owner and is
+//! retained. `cargo metadata` reports three workspace members with an edge onto
+//! it; searching the current source for a non-test call site gives:
 //!
 //! | member | declared edge | what that member does with it |
 //! |---|---|---|
-//! | `eliot-governor` | normal | production `ReadApi` implementor: `GovernorContextInputs<'_, R: ReadApi + ?Sized>` (`context_inputs.rs:391`) issues the seven role reads and classifies each `ReadOutcome`; its only call site is `KernelContextReadClient::reconstruct_context_inputs` (`bins/eliotd/src/kernel_context_read_client.rs:702`), itself reached only through `DaemonComposition::reconstruction_composition` (`bins/eliotd/src/lib.rs:3296`), which **no caller in this repository invokes**; |
-//! | `eliotd` | normal | production entry points `answer_evidence_query` / `answer_projection_inputs` construct a `ReadService` and are re-exported from the library (`bins/eliotd/src/lib.rs:227`), but the `eliotd` **binary** composes none of them: `main.rs` reaches only `daemon_runtime::run`, and the run loop's local-read leg calls `forward_admitted_local_read` -> `DaemonKernelClient::local_read_async`, which asks the **Kernel** to serve the read and returns the persisted result body. The only caller of the Governor-serving path `serve_admitted_local_read` -> `KernelContextReadClient::execute_local_read` is `bins/eliotd/tests/local_read_e2e.rs`; |
+//! | `eliot-governor` | normal | production `ReadApi` implementor: `GovernorContextInputs<'_, R: ReadApi + ?Sized>` (`context_inputs.rs:391`) issues the seven role reads through `ReadApi::bound_state` / `bound_query` and classifies each [`ReadOutcome`]; its call site is `KernelContextReadClient::reconstruct_context_inputs` (`bins/eliotd/src/kernel_context_read_client.rs:737`), which composes the one `ReadService` over the retained authenticated Kernel handle; |
+//! | `eliotd` | normal | the live production edge: `context_reconstruction_route::serve_context_reconstruction` (`bins/eliotd/src/context_reconstruction_route.rs:203`) is invoked by `daemon_runtime::run_local_read_poll` (`bins/eliotd/src/daemon_runtime.rs:4443`) for an admitted `eliot.query` pair whose explicit intent mode is `context_reconstruction`, and that leg is on the run loop — `main.rs` -> `daemon_runtime::run` -> `run_loop` -> `start_tick_work` -> `maybe_start_local_read_poll` -> `start_local_read_poll` -> `run_local_read_poll`. This crate's [`ReadService`] is what serves it; |
 //! | `eliot-kernel-service` | **dev-dependency only** | uses `ReadService` inside `mod live_surreal_evidence_pack_e2e` in `store_gateway.rs`. Not in the production graph. |
 //!
-//! So on the exact source searched, `eliot-read` has **no read that a process
-//! entry point can reach**: every production call site is either reached only by
-//! a test or by an accessor nothing calls. `provider_memory_feed` has no
-//! importer at all. No caller was invented, no `#[allow(dead_code)]` was added,
-//! and no value is constructed and dropped to make the set look populated; the
-//! crate's proof ceiling is therefore
-//! `CURRENT_UNVERIFIED` at best, never `CURRENT_VERIFIED` (I0.5). This is
-//! stated here rather than hidden because a deletion decision and a liveness
-//! claim are different decisions, and only the first is a source fact.
+//! So the reconstruction route is a real, process-reachable read: an `eliot.query`
+//! carrying `intent.mode = context_reconstruction` is claimed by the daemon's
+//! local-read poller and answered by this owner over the six closed named reads
+//! of [`context_reconstruction_operations`]. Two further `eliotd` surfaces are
+//! declared but not composed by the binary: `answer_evidence_query` /
+//! `answer_projection_inputs` (`governor_local_read.rs`) and
+//! `serve_admitted_local_read`, whose only caller is
+//! `bins/eliotd/tests/local_read_e2e.rs`. Those are library entry points, not
+//! liveness claims, and they are stated as such.
+//!
+//! `provider_memory_feed` has no importer in this repository. It declares no read
+//! wire shape and grants no promotion authority, so it is inventoried as
+//! [`owner_inventory::PublicApiKind::OffWire`] candidate surface (I10.19) rather
+//! than as part of the read contract, and it is not what makes this package
+//! live.
+//!
+//! No caller was invented, no `#[allow(dead_code)]` was added, and no value is
+//! constructed and dropped to make the set look populated. A source-reachable
+//! read is not executed evidence: the crate's proof ceiling stays
+//! `CURRENT_UNVERIFIED`, never `CURRENT_VERIFIED` (I0.5), because "the run loop
+//! calls this" is a source fact and "a read executed and degraded correctly" is
+//! the #11 Product Pulse, which this package cannot assert about itself.
 //!
 //! # Retained-read binding (W5, A3)
 //!
@@ -214,6 +256,29 @@
 //! survives; the four owner-level states travel as
 //! [`ReadError::Outcome`]. No failure collapses into a string, a generic code,
 //! or another state.
+//!
+//! # Read cell, owner and proof surface (A10)
+//!
+//! The read cell is resolved by #13, and the part of that this package owns is
+//! declared as three typed values rather than left to prose:
+//! [`READ_CELL_ID`], [`READ_CELL_OWNER`] and [`READ_CELL_PROOF_ENTRYPOINT`].
+//! [`contract_identity`] binds all three into this contract's identity shape
+//! through #13's own owner references (`CapabilityCellId`, `CellOwnerRef`,
+//! `ProofEntrypointRef`), so the registry can match this contract to the cell
+//! this package declares in `Cargo.toml::package.metadata.eliot` without a second
+//! hand-typed spelling here. The three constants state what this package already
+//! declared; they grant no authority, and they deliberately do NOT invent the
+//! rest of a `CapabilityCellRecord` — an execution contour, a proof ceiling, a
+//! Product Pulse reference and a contract digest belong to #13's generated
+//! registry and to #11's executed evidence, not to the read owner.
+//!
+//! What is deliberately absent is the executed half of A10. One live read, a
+//! cache rebuild and a stale/conflict degradation path are runtime facts, and a
+//! source fact about which function the run loop calls is not one of them. This
+//! package states the proof *entrypoint* it declares; whether that command ran,
+//! and whether a read degraded correctly, is the #11 Product Pulse and cannot be
+//! claimed from here. Until it runs, the ceiling stays `CURRENT_UNVERIFIED`
+//! (I0.5), and production activation of this owner remains #11's to grant.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -230,9 +295,10 @@ use eliot_contracts::{
     SessionId, SourceId, StateFence, TaskId, contract_identity as make_contract_identity,
 };
 use eliot_store_api::{
-    AutomationContinuationFailure, CanonicalReadClient, ExperienceRangePage, NamedReadOperation,
-    NamedReadRequest, NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey,
-    ScopeId, StoreError,
+    AutomationContinuationFailure, CanonicalReadClient, EXPERIENCE_BANK_READ_NAME,
+    EXPERIENCE_FEEDBACK_READ_NAME, ExperienceRangePage, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
+    StoreError, named_read_operation_name,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -245,15 +311,37 @@ use crate::owner_inventory::LocalReadPortMethod;
 pub const CONTRACT_NAME: &str = "eliot.governor.read";
 /// Current wire revision for the Governor read contract.
 ///
-/// `3.1.0` adds [`ReadOutcome::Missing`], the authoritative statement that a
-/// looked-for subject is absent, to the closed read outcome vocabulary. It is
-/// a minor revision because it adds a non-current state to an existing closed
-/// enum: no successful result changes meaning and no prior value is renumbered.
+/// `3.2.0` binds the read cell, its owner and its proof entrypoint
+/// ([`READ_CELL_ID`], [`READ_CELL_OWNER`], [`READ_CELL_PROOF_ENTRYPOINT`]) into
+/// this contract's identity shape, so the #13 registry can bind the contract to
+/// the cell this package declares through #13's own typed owner references. It is
+/// a minor revision because it adds identity fields to the handshake shape: no
+/// read result changes meaning, no prior value is renumbered, and no read decision
+/// changes. `3.1.0` adds [`ReadOutcome::Missing`], the authoritative statement
+/// that a looked-for subject is absent, to the closed read outcome vocabulary.
 /// `3.0.0` added the retained-read identity closure ([`ReadIdentity`]), the
 /// caller-declared order-head dependency ([`ReadOrderingBinding`]), the
 /// owner-resolved coverage identity ([`ReadCoverage`]) and the closed read
 /// outcome vocabulary ([`ReadOutcome`]).
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 1, 0);
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 2, 0);
+
+/// Functional capability cell this read owner is declared as (#13).
+///
+/// The same value this package declares in
+/// `Cargo.toml::package.metadata.eliot.functional_cell`.
+pub const READ_CELL_ID: &str = "governor_read";
+/// Lifecycle owner accountable for the read cell (#13).
+///
+/// The same value this package declares in
+/// `Cargo.toml::package.metadata.eliot.lifecycle_owner`.
+pub const READ_CELL_OWNER: &str = "G-06";
+/// Independently invokable proof entrypoint for the read cell (#13).
+///
+/// The same value this package declares in
+/// `Cargo.toml::package.metadata.eliot.proof_entrypoint`. Naming the command
+/// claims nothing about it having been executed: the crate's proof ceiling stays
+/// `CURRENT_UNVERIFIED` until #11 runs it.
+pub const READ_CELL_PROOF_ENTRYPOINT: &str = "cargo test -p eliot-read";
 
 /// Closed semantic query modes from the public ELIOT query surface.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -2049,15 +2137,24 @@ fn classify_payload_coverage(
 /// Returns whether the Store contract types a page coverage statement for this
 /// operation.
 ///
-/// The answer is read from the Store's own exported contract: only the two
-/// experience range reads publish a typed [`ExperienceRangePage`] statement, so
-/// only they are gated on it. Any operation that starts publishing such a
-/// statement gains the gate through its Store contract, not through a decision
-/// made here.
+/// The answer is read from the Store's own exported contract: the two
+/// experience range reads are named by the Store as
+/// [`EXPERIENCE_BANK_READ_NAME`] and [`EXPERIENCE_FEEDBACK_READ_NAME`], and this
+/// gate resolves the operation's canonical name through
+/// [`named_read_operation_name`], the single owner of that spelling. Those two
+/// operations are the only ones whose Store contract types a page coverage
+/// statement ([`ExperienceRangePage`]), so only they are gated on it.
+///
+/// This predicate used to name the same two operations again as
+/// `NamedReadOperation` variants, which was a second answer to a question the
+/// Store already answers by name: a renamed or repointed read would have left
+/// the owner gating a set the Store no longer declares. The set is still exactly
+/// these two reads — that is a fact about the Store's page contract, not a
+/// choice made here — but it is now written once, in the Store's own spelling.
 const fn declares_store_coverage_statement(operation: NamedReadOperation) -> bool {
     matches!(
-        operation,
-        NamedReadOperation::GetExperienceBankRange | NamedReadOperation::GetAgentFeedbackRange
+        named_read_operation_name(operation),
+        EXPERIENCE_BANK_READ_NAME | EXPERIENCE_FEEDBACK_READ_NAME
     )
 }
 
@@ -2073,6 +2170,9 @@ pub fn contract_identity() -> Result<ContractIdentity, eliot_contracts::Contract
         identity_rule: &'static str,
         ordering_rule: &'static str,
         outcome_rule: &'static str,
+        read_cell: eliot_contracts::CapabilityCellId,
+        read_cell_owner: eliot_contracts::CellOwnerRef,
+        read_cell_proof_entrypoint: eliot_contracts::ProofEntrypointRef,
     }
 
     make_contract_identity(
@@ -2087,6 +2187,21 @@ pub fn contract_identity() -> Result<ContractIdentity, eliot_contracts::Contract
             identity_rule: "principal_scope_fence_heads_consistency_source_schema_coverage_and_invalidation",
             ordering_rule: "declared_order_heads_must_carry_the_exact_read_fence",
             outcome_rule: "only_current_is_successful_not_running_missing_unknown_partial_stay_distinct",
+            // The read cell, its owner and its proof entrypoint are bound here
+            // through #13's own typed owner references
+            // (`CapabilityCellId` / `CellOwnerRef` / `ProofEntrypointRef`) so the
+            // #13 registry can bind this contract to the cell it declares
+            // without a second hand-typed spelling here, and without this crate
+            // inventing a registry record, an execution contour, a proof ceiling
+            // or a Product Pulse it does not own. The three values are the same
+            // ones `Cargo.toml::package.metadata.eliot` declares for this
+            // package, so a package that changed them without changing the
+            // source changes the identity digest instead of staying silent.
+            read_cell: eliot_contracts::CapabilityCellId::new(READ_CELL_ID)?,
+            read_cell_owner: eliot_contracts::CellOwnerRef::new(READ_CELL_OWNER)?,
+            read_cell_proof_entrypoint: eliot_contracts::ProofEntrypointRef::new(
+                READ_CELL_PROOF_ENTRYPOINT,
+            )?,
         },
     )
 }
@@ -2165,15 +2280,15 @@ fn operation_matches_intent(operation: NamedReadOperation, mode: QueryMode) -> b
             NamedReadOperation::GetEvidencePack
                 | NamedReadOperation::GetUnderstandingProjectionInputs
         ),
-        QueryMode::ContextReconstruction => matches!(
-            operation,
-            NamedReadOperation::GetEvidencePack
-                | NamedReadOperation::GetUnderstandingProjectionInputs
-                | NamedReadOperation::GetCurrentEpistemicPosition
-                | NamedReadOperation::GetTaskState
-                | NamedReadOperation::GetAttentionAndProblems
-                | NamedReadOperation::GetCapabilityEvidenceState
-        ),
+        // The reconstruction set is stated once, by
+        // `context_reconstruction_operations`. This arm used to restate the same
+        // six operations as a literal, and the owner inventory carried a
+        // comparison whose only job was to notice the two copies disagreeing;
+        // the gate now reads the one table, so a set that drifts from the table
+        // is impossible rather than merely detected.
+        QueryMode::ContextReconstruction => {
+            context_reconstruction_operations().contains(&operation)
+        }
     }
 }
 
