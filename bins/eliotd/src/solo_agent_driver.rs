@@ -85,22 +85,22 @@ use std::sync::Mutex;
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_bridge_core::ToolResultReceipt;
-use eliot_agent_coordinator::{
-    CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
-    load_runtime_scheduling_profile,
-};
 #[cfg(not(test))]
 use eliot_agent_coordinator::{
     AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial,
+};
+use eliot_agent_coordinator::{
+    CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
+    load_runtime_scheduling_profile,
 };
 use eliot_contracts::{fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric, DispatchAck,
-    DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricOperation, FabricPortId,
-    FabricSnapshot, PortBindingState, Reservation, RouteRequirements, SwarmDefinition,
-    VerifiedProviderMaterial, daemon_coordinator_config,
+    DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricOperation,
+    FabricPortId, FabricSnapshot, PortBindingState, Reservation, RouteRequirements,
+    SwarmDefinition, VerifiedProviderMaterial, daemon_coordinator_config,
 };
 #[cfg(test)]
 use crate::agent_fabric::{FabricPorts, ModelRegistryPort};
