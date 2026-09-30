@@ -52,6 +52,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use eliot_agent_contracts::{PublicReference, RetainedHandoffCheckpoint};
 use eliot_authority::ImpactClass;
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmittedContextSet, AtomAvailability, ContextCandidate,
@@ -60,12 +61,11 @@ use eliot_context_contracts::{
     DecisionLineageSupersession, LossPolicy, OmissionRecord, RepresentationKind, RoleLossRule,
     SemanticRole, canonical_digest,
 };
-use eliot_agent_contracts::{PublicReference, RetainedHandoffCheckpoint};
 use eliot_contracts::{
     ArtifactId, DecisionId, StateFence, TaskId, TaskRevision, fences_match_exact,
 };
-use eliot_security_contracts::EffectCeiling;
 use eliot_receipts::ProofCeiling;
+use eliot_security_contracts::EffectCeiling;
 use serde::{Deserialize, Serialize};
 
 use crate::MaterialRankTrace;
@@ -1442,9 +1442,9 @@ pub fn bind_material_dispatch(
     let is_resume = owners.phase == DecisionLineagePhase::Resume;
     let wants_resume = matches!(entrypoint, MaterialEntrypointKind::ResumeDispatch);
     if is_resume != wants_resume {
-        return Err(MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
-            "dispatch.entrypoint",
-        )));
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::InvalidField("dispatch.entrypoint"),
+        ));
     }
     if !fences_match_exact(&packet.binding.state_fence, owners.state_fence) {
         return Err(MaterialDecisionRefusal::Boundary(
@@ -1470,9 +1470,9 @@ pub fn bind_material_dispatch(
         .validate()
         .map_err(MaterialDecisionRefusal::Boundary)?;
     if !owner_text(&closure.recipe.recipe_sha256) {
-        return Err(MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
-            "dispatch.recipe",
-        )));
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::InvalidField("dispatch.recipe"),
+        ));
     }
     let completeness = lineage
         .validate_for_phase(owners.phase)
@@ -1639,9 +1639,10 @@ fn dispatch_refusal(
     allowed_action: AllowedFloorAction,
     reason: &str,
 ) -> MaterialDecisionRefusal {
-    let mut incomplete =
-        DecisionContextIncomplete::new(binding.floor.floor.rule_evidence.clone());
-    incomplete.missing.push(binding.floor.floor.rule_evidence.clone());
+    let mut incomplete = DecisionContextIncomplete::new(binding.floor.floor.rule_evidence.clone());
+    incomplete
+        .missing
+        .push(binding.floor.floor.rule_evidence.clone());
     incomplete
         .reopening_requirements
         .push(action_text(allowed_action));
@@ -1665,16 +1666,17 @@ fn dispatch_lineage_refusal(
     completeness: DecisionLineageCompleteness,
     references: Vec<AffectedLineageReference>,
 ) -> MaterialDecisionRefusal {
-    let mut incomplete =
-        DecisionContextIncomplete::new(binding.floor.floor.rule_evidence.clone());
-    incomplete.missing.push(binding.floor.floor.rule_evidence.clone());
+    let mut incomplete = DecisionContextIncomplete::new(binding.floor.floor.rule_evidence.clone());
+    incomplete
+        .missing
+        .push(binding.floor.floor.rule_evidence.clone());
     let allowed_action = allowed_lineage_action(completeness);
     incomplete
         .reopening_requirements
         .push(action_text(allowed_action));
-    incomplete.reopening_requirements.push(
-        "the decision lineage is no longer complete for the bound decision phase".to_owned(),
-    );
+    incomplete
+        .reopening_requirements
+        .push("the decision lineage is no longer complete for the bound decision phase".to_owned());
     DecisionFloorRefusal {
         incomplete,
         phase: binding.phase,
@@ -1762,26 +1764,20 @@ pub fn admit_material_resume(
     history: &ResumeHistoryInputs<'_>,
 ) -> Result<AdmittedDecisionFloor, MaterialDecisionRefusal> {
     if owners.phase != DecisionLineagePhase::Resume {
-        return Err(MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
-            "resume.phase",
-        )));
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::InvalidField("resume.phase"),
+        ));
     }
-    history
-        .retained
-        .validate()
-        .map_err(|_| MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
-            "resume.retained_checkpoint",
-        )))?;
-    history
-        .current_delta_view
-        .validate()
-        .map_err(|_| MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
-            "resume.current_delta_view",
-        )))?;
+    history.retained.validate().map_err(|_| {
+        MaterialDecisionRefusal::Boundary(ContextError::InvalidField("resume.retained_checkpoint"))
+    })?;
+    history.current_delta_view.validate().map_err(|_| {
+        MaterialDecisionRefusal::Boundary(ContextError::InvalidField("resume.current_delta_view"))
+    })?;
     if history.current_delta_view.digest.is_none() {
-        return Err(MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
-            "resume.current_delta_view.digest",
-        )));
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::InvalidField("resume.current_delta_view.digest"),
+        ));
     }
     let checkpoint = &history.retained.checkpoint;
     let revalidation = &history.retained.revalidation;
@@ -1824,12 +1820,9 @@ pub fn admit_material_resume(
             Vec::new(),
         ));
     }
-    let checkpoint_ref = history
-        .retained
-        .checkpoint_ref()
-        .map_err(|_| MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
-            "resume.checkpoint_ref",
-        )))?;
+    let checkpoint_ref = history.retained.checkpoint_ref().map_err(|_| {
+        MaterialDecisionRefusal::Boundary(ContextError::InvalidField("resume.checkpoint_ref"))
+    })?;
     let cites_checkpoint = matches!(
         &lineage.handoff,
         DecisionLineageSlot::Present { value } if value.reference == checkpoint_ref
@@ -1850,7 +1843,7 @@ pub fn admit_material_resume(
         let unnamed = checkpoint
             .known_losses
             .iter()
-            .any(|loss| !named.iter().any(|candidate| *candidate == &loss.subject_ref));
+            .any(|loss| !named.contains(&&loss.subject_ref));
         let explicit = matches!(
             &lineage.omissions,
             DecisionLineageSlot::Present { .. } | DecisionLineageSlot::Unknown { .. }
