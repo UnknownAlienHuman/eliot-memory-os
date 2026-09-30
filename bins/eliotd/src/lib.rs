@@ -2090,13 +2090,18 @@ impl DaemonComposition {
             snapshot.state_fence.clone(),
         )
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        let observation = self
-            .governor
-            .observation_capture_owner_binding_for_activation(&snapshot)
+        let readback = AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let Some(observation) = self
+            .governor
+            .try_observation_capture_owner_binding_for_activation(&snapshot)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?
+        else {
+            return Ok(readback);
+        };
         let observation = Self::activation_observation_policy_readback(&observation)?;
-        AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
-            .and_then(|readback| readback.with_observation_policy_readback(observation))
+        readback
+            .with_observation_policy_readback(observation)
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
@@ -2125,6 +2130,20 @@ impl DaemonComposition {
     ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, DaemonError> {
         self.governor
             .observation_capture_owner_binding_for_host_origin(receipt)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Attempts the supplemental Host-origin observation-policy projection.
+    /// Missing explicit capture policy is ordinary activation state and does
+    /// not suppress the independent negative activation owner result; other
+    /// owner errors remain errors. Capture preparation continues to use the
+    /// strict projection method above.
+    pub fn try_host_origin_observation_owner_binding(
+        &self,
+        receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    ) -> Result<Option<eliot_governor::ObservationCaptureOwnerBinding>, DaemonError> {
+        self.governor
+            .try_observation_capture_owner_binding_for_host_origin(receipt)
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
