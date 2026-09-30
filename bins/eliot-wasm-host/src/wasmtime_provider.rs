@@ -402,6 +402,28 @@ impl WasmtimeComponentEngine {
         }
     }
 
+    /// Lends the provider-built dispatch leg for the admitted cancellation
+    /// policy (issue #758, W1): the `(&Engine, &Component)` pair the
+    /// provider itself invokes under (`invoke_component_with_epoch_driver`
+    /// selects the same leg), so typed dispatch can instantiate from
+    /// provider-built engine legs instead of a locally-configured engine.
+    ///
+    /// Borrow-only: no new engine or linker owner, no compilation, no
+    /// configuration, and no behavior change to the legacy `run` path. Both
+    /// legs compile the same digest-bound artifact bytes under the same
+    /// provider settings; the admitted policy selects which leg runs.
+    #[must_use]
+    pub fn dispatch_leg(&self, limits: &InvocationLimits) -> (&Engine, &Component) {
+        match limits.epoch.cancellation {
+            eliot_wasm_runtime::CancellationPolicy::EpochInterruption => {
+                (&self.epoch_engine, &self.epoch_component)
+            }
+            eliot_wasm_runtime::CancellationPolicy::EpochAndFuel => {
+                (&self.fuel_engine, &self.fuel_component)
+            }
+        }
+    }
+
     /// Executes raw input through the admitted component without the port
     /// manifest gate. The only caller is the P03-admitted guest-runner
     /// child: the artifact was digest-bound at build, the limits arrive via
