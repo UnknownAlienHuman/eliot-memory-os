@@ -10,7 +10,7 @@
 //! - **I1.11 Startup algorithm** — resolution is available only after Governor/Kernel admission; no startup authority issuance here.
 //! - **I2.2 When a capability becomes a separate crate** — pure contract/test seam justifies isolated module; no placeholder proliferation.
 //! - **I2.23 Capability-family topology and crate extraction decisions** — Governor task/authority/canonical-transition family; validated via `CrateExtractionDecision`.
-//! - **Semantic-grant handle: `eliot_governor::GovernorActivationOutcome` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionResult` via `GovernorComposition::resolve_activation_outcome_v2`** — Kernel-issued ticket resolved against the current Governor owner set.
+//! - **Semantic-grant handle: `eliot_governor::GovernorActivationOutcome` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionResult` via `GovernorComposition::resolve_activation_outcome`** — Kernel-issued ticket resolved against the current Governor owner set.
 //! - **Wave 2 Governor-internal outcome -> protocol v2**: `eliot_governor::GovernorActivationOutcome` -> `eliot_protocol::AgentActivationResolutionResult` is a lossless, exhaustive mapping; no resolver error is coerced to success or dropped.
 //!
 //! This is a read-only activation resolution projection and owns no authority issuance, write/effect, fence, default, retry, Kernel, Store, or lifecycle semantics.
@@ -272,7 +272,10 @@ fn build_protocol_result(
 
 /// Lossless mapping from the Governor-internal typed outcome to the wire v2
 /// protocol result. Every variant is preserved 1:1; no error is coerced to
-/// `Resolved` and no error is dropped.
+/// `Resolved` and no error is dropped. A `Resolved` snapshot whose fence is
+/// not the exact ticket fence is not mappable: it fails closed as a mapping
+/// error, never as a binding, so stale selection cannot receive authority
+/// (issue #1746, W2/A2).
 pub fn map_governor_outcome_to_protocol(
     ticket: &AgentActivationResolutionTicket,
     outcome: GovernorActivationOutcome,
@@ -312,6 +315,20 @@ fn map_governor_outcome_to_protocol_inner(
         ticket = %crate::diagnostics::sanitize_identity(&ticket.ticket_id)
     )
     .entered();
+    // Issue #1746 (W2/A2): a Governor snapshot resolved under another fence is
+    // stale selection for this exact ticket. Projecting it as `Resolved`
+    // would mint application identity (principal/session/task) under the wrong
+    // epoch/generation, so the mapping fails closed here — before any binding
+    // is built — and the caller answers through the typed mapping-failure
+    // terminal instead. The live resolver pre-checks this same equality, so
+    // this arm only fires for out-of-band callers; it changes no live path.
+    if let GovernorActivationOutcome::Resolved(snapshot) = &outcome
+        && snapshot.state_fence != ticket.state_fence
+    {
+        return Err(DaemonError::Lifecycle(
+            "resolved activation snapshot fence differs from the exact ticket fence".to_owned(),
+        ));
+    }
     let owner_revision = match &outcome {
         GovernorActivationOutcome::Resolved(snapshot) => snapshot.owner_revision,
         _ => successor_observation
@@ -568,6 +585,7 @@ mod projection_tests {
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-1".to_owned(),
+            workspace_selector: None,
             cancellation_id: "cancellation-1".to_owned(),
             state_fence: StateFence::new(test_epoch(1), ResourceGeneration::new(1).expect("gen")),
             kernel_deadline_unix_ms: deadline,

@@ -224,7 +224,7 @@ pub use platform_security::{
     WindowsStoreCredentialTargetGenerator, converge_agent_bridge_security,
     open_agent_bridge_declaration_read_lease, open_agent_bridge_final_read_lease,
     register_interactive_watchdog_task, run_registered_watchdog_task, validate_pinned_artifact,
-    verify_agent_bridge_security,
+    validate_pinned_artifact_with_identity, verify_agent_bridge_security,
 };
 #[cfg(test)]
 use platform_security::{watchdog_task_readback_matches, watchdog_task_xml};
@@ -254,9 +254,9 @@ pub use process_job::{
 pub use process_path_lease::RetainedProcessPathLease;
 pub use protected_path::{
     ProtectedPathError, ProtectedPathLease, ProtectedPathStage, ProtectedRootLease,
-    canonical_windows_path, prepare_protected_directory, protected_program_data_path,
-    protected_program_data_root, read_protected_file, require_protected_program_data_path,
-    validate_protected_file,
+    ProtectedRootRemovalOutcome, ProtectedRootRemovalProof, canonical_windows_path,
+    prepare_protected_directory, protected_program_data_path, protected_program_data_root,
+    read_protected_file, require_protected_program_data_path, validate_protected_file,
 };
 pub use runtime_receipt_publication::{
     PublicationOutcome, PublicationPrecondition, PublicationReceipt, PublicationUnknown,
@@ -306,7 +306,11 @@ pub use terminal_containment::{
 pub(crate) use user_owned_leases::current_process_sid;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use user_owned_leases::protect_user_owned_opened_handle;
-pub use user_owned_leases::{UserOwnedPathLease, UserOwnedRootLease, UserOwnedRootReadLease};
+pub use user_owned_leases::{
+    UserOwnedPathLease, UserOwnedRootLease, UserOwnedRootReadLease, UserSelectedResourceError,
+    UserSelectedResourceKind, UserSelectedResourceLease, UserSelectedResourceMeasurement,
+    UserSelectedResourceNodeMeasurement,
+};
 
 /// Failure returned by a Windows-only primitive before it can be projected
 /// into a provider-neutral P-01 outcome.

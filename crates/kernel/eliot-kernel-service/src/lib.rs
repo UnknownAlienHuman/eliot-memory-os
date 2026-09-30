@@ -35,6 +35,7 @@ mod lifecycle_admission;
 mod lifecycle_persist;
 #[cfg(test)]
 mod lifecycle_persist_tests;
+mod maintenance_trigger_claim;
 mod maintenance_trigger_delivery;
 mod notification_state;
 #[cfg(test)]
@@ -76,7 +77,8 @@ pub use capacity_evidence::{
 };
 pub use contract_rejection_gate::{
     PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageIdentitySnapshot,
-    PreStageRejection, PreStageState, VerifiedCorrectionLink, derive_rejection_id, pre_stage_check,
+    PreStageJournalReadiness, PreStageRejection, PreStageState, VerifiedCorrectionLink,
+    derive_rejection_id, pre_stage_check,
 };
 pub use doctor::{
     ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,
@@ -112,6 +114,11 @@ pub use lifecycle_persist::{
     LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
     LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
     build_persist_transitions, handle_lifecycle_persist_request,
+};
+pub use maintenance_trigger_claim::{
+    MaintenanceTriggerRecoveryRoute, MaintenanceTriggerRedeliveryOutcome, claim_trigger_for_daemon,
+    enumerate_pending_for_reconnect, recover_trigger_for_replacement, redeliver_after_timeout,
+    revoke_consumer_and_surface_pending,
 };
 pub use maintenance_trigger_delivery::{
     AuthenticatedMaintenanceTriggerSession, MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS,
@@ -217,6 +224,13 @@ pub use store_gateway::KernelStoreGateway;
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
+// Issue #1681 W3: the named-read refusal leaves the Kernel with a typed
+// `StoreError` and nothing else. These two are the missing half the transport
+// edge needs to turn that cause into the complete versioned #1679 directive
+// instead of a bare reason string, and they live beside the gateway error they
+// interpret so the cause is never re-derived from rendered text.
+#[cfg(windows)]
+pub use store_gateway::{store_read_profile_revision, store_read_unavailable_response};
 // Issue #2764 item 6: the Dreamer route's real caller must be able to
 // distinguish a proven mutation disposition from a still-open Problem State
 // and from a bare gateway refusal, so both the carrier and the recovered

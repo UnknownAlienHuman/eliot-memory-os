@@ -1239,6 +1239,7 @@ mod tests {
         };
         let operation = "op-envelope";
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new(operation).map_err(StoreError::Foundation)?,
                 idempotency_key: format!("idem-{operation}"),

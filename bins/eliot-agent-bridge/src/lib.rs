@@ -50,8 +50,8 @@ use eliot_contracts::{
     RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_governor::{
-    CapabilityRouteRegistry, ExecutionIdentity, RouteBehaviorFingerprint,
-    RouteInstallationIdentity, RuntimeRoute,
+    ActualRouteReceipt, CapabilityRouteRegistry, ExecutionIdentity, ObservedRoute,
+    RouteBehaviorFingerprint, RouteInstallationIdentity, RuntimeRoute,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -76,6 +76,7 @@ pub mod opencode_host_events;
 pub mod reactive_injection_receipts;
 pub mod reactive_runtime_composition;
 pub mod route_identity_gate;
+mod route_registry;
 pub mod settled_plan_transport;
 mod transport_profile;
 mod understanding_bootstrap;
@@ -89,15 +90,16 @@ use kernel_activation_client::KernelHostActivationPort;
 use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
 };
-pub use kernel_host_request_client::KernelHostRequestClient;
 use kernel_host_request_client::ReplayCacheEntry;
+pub use kernel_host_request_client::{KernelHostRequestClient, OwnerDryRunPreview};
 pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{
     AdmissionBasis, AttentionItem, CueOrigin, DeliveryPoint, FiringEvidence, InjectionReceipt,
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
-use route_identity_gate::{admit_bridge_route_launch, classify_bridge_route_resume};
+use route_identity_gate::{admit_bridge_route_launch, classify_bridge_route_reconnect};
+use route_registry::RetainedRouteLaunch;
 pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
@@ -115,9 +117,10 @@ pub use transport_profile::{
 use understanding_bootstrap::validate_task_inputs_match_surface;
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootDelta, BootstrapContext, BootstrapError, BootstrapSession,
-    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition,
-    RoutePayloadMeasurement, ScopeLevel, SelectedTask, TaskCandidate, TaskSelectionDisposition,
-    TaskSelectionView, UnderstandingBootstrap, get_understanding_bootstrap, measure_route_payload,
+    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ProjectionFreshness,
+    ProjectionProvenance, ReadinessDisposition, RoutePayloadMeasurement, ScopeLevel, SelectedTask,
+    TaskCandidate, TaskSelectionDisposition, TaskSelectionView, UnderstandingBootstrap,
+    get_understanding_bootstrap, measure_route_payload,
 };
 
 fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
@@ -4745,11 +4748,23 @@ pub struct BridgeRunner {
     /// Fingerprint persisted for the last admitted launch (issue #1816, W3).
     ///
     /// The complete W3 material returned by [`admit_bridge_route_launch`].
-    /// [`BridgeRunner::reconnect`] classifies resume against it through
-    /// [`classify_bridge_route_resume`], so a fingerprint move can never
+    /// [`BridgeRunner::reconnect`] cross-checks this launch value against the
+    /// sealed launch and the live presentation through
+    /// [`classify_bridge_route_reconnect`], so a fingerprint move can never
     /// silently continue. Process memory only, like the rest of the attach
     /// state: a new process admits a new launch.
     active_route_fingerprint: Option<RouteBehaviorFingerprint>,
+    /// Sealed route launch retained for resume classification (issue #1816, W4).
+    ///
+    /// Sealed by [`BridgeRunner::attach`] from the genuine post-attach facts
+    /// — the admitted route and installation plus the owner-issued attach
+    /// binding — and read by [`BridgeRunner::reconnect`] through
+    /// [`classify_bridge_route_reconnect`]. This is the independent retained
+    /// side of the resume comparison: a different production step seals it
+    /// than the one that presents the live declaration and binding, so the
+    /// guard never compares a fingerprint with itself. Process memory only,
+    /// like the rest of the attach state: a new process admits a new launch.
+    retained_route_launch: Option<RetainedRouteLaunch>,
 }
 
 /// Owner-supplied bootstrap inputs sealed to the live attach binding.
@@ -4762,11 +4777,29 @@ pub struct BridgeRunner {
 /// Fence, or another scope/task binding refuses instead of projecting
 /// stale authority as current. Noting again under the current attach
 /// reseals the snapshot.
+///
+/// The snapshot freezes every carried identity class at note time (issue #8
+/// W1): principal and Session through the seal itself, `WorkScope` through
+/// the seal plus the note-time content check, the task set through the
+/// note-time selection-vs-seal binding plus
+/// [`BootstrapSnapshot::delivery_tasks_match`], and source, route,
+/// workspace-instance, projection-source/generation, and receipt references
+/// by retaining the exact noted context — sealed delivery composes only
+/// from these frozen values and refuses any caller task set that differs.
+/// Frozen serializer/tokenizer identities arrive only through the
+/// Governor-compiled surface intake; the host-snapshot intake refuses them
+/// outright instead of clearing them, so a client-named rendering identity
+/// fails closed with `BOOTSTRAP_RENDERING_UNBOUND` rather than projecting
+/// an unidentified rendering. `owner_compiled` records which intake noted
+/// the snapshot so sealed delivery stamps the honest
+/// [`ProjectionProvenance`]/[`ProjectionFreshness`] instead of letting a
+/// host-carried bootstrap present itself as owner-issued (issue #8 P1/A2).
 #[derive(Clone, Debug)]
 struct BootstrapSnapshot {
     context: BootstrapContext,
     tasks: BootstrapTaskInputs,
     binding: Option<AttachBinding>,
+    owner_compiled: bool,
 }
 
 impl BootstrapSnapshot {
@@ -4911,6 +4944,59 @@ impl BootstrapSnapshot {
             });
         }
         Ok(())
+    }
+
+    /// Requires the caller task set to equal the sealed snapshot task set.
+    ///
+    /// The snapshot task set is the exact owner-supplied set noted under the
+    /// live attach seal (handles, revisions, acceptance digests,
+    /// history/crossover flags, scope level, authoritative selection). Every
+    /// sealed delivery composes from that frozen set, so one seal yields one
+    /// task-bound bootstrap: a caller set naming any other task, revision,
+    /// digest, or selection is a changed task set, not a delivery input.
+    /// Change it by re-noting under the live attach; delivery refuses with
+    /// `BOOTSTRAP_TASK_SET_MISMATCH` instead of composing mixed-source
+    /// authority.
+    fn delivery_tasks_match(&self, tasks: &BootstrapTaskInputs) -> Result<(), BootstrapError> {
+        if self.tasks == *tasks {
+            Ok(())
+        } else {
+            Err(BootstrapError {
+                code: "BOOTSTRAP_TASK_SET_MISMATCH",
+                detail:
+                    "caller task set disagrees with the task set sealed in the noted bootstrap snapshot; re-note under the live attach to change it"
+                        .to_owned(),
+            })
+        }
+    }
+}
+
+/// Stamps the sealed-delivery provenance and freshness on one composed bootstrap.
+///
+/// The composition itself always reports host-carried provenance with a
+/// partial (or unavailable, when no projection source was stated) freshness,
+/// because its inputs are caller-supplied. Sealed delivery upgrades both
+/// stamps exactly when the snapshot arrived through the Governor-compiled
+/// surface intake (`owner_compiled`) and the live attach still equals the
+/// noted seal — the caller of this helper has already established both, so
+/// the stamp records this operation's evidence instead of re-deriving it.
+/// A stated source on an owner-compiled snapshot delivers as
+/// [`ProjectionFreshness::Current`]; a stated source on a host-carried
+/// snapshot stays [`ProjectionFreshness::Partial`] (frozen under the seal,
+/// owner currency not independently established, refresh through the carried
+/// `next_safe_expansion`); an unstated source delivers as
+/// [`ProjectionFreshness::Unavailable`] on either intake.
+fn stamp_sealed_provenance(bootstrap: &mut UnderstandingBootstrap, owner_compiled: bool) {
+    if bootstrap.projection_source_ref.is_empty() {
+        bootstrap.projection_provenance = if owner_compiled {
+            ProjectionProvenance::OwnerCompiled
+        } else {
+            ProjectionProvenance::HostCarried
+        };
+        bootstrap.projection_freshness = ProjectionFreshness::Unavailable;
+    } else if owner_compiled {
+        bootstrap.projection_provenance = ProjectionProvenance::OwnerCompiled;
+        bootstrap.projection_freshness = ProjectionFreshness::Current;
     }
 }
 
@@ -5106,6 +5192,7 @@ impl BridgeRunner {
             route_installation,
             delegated_user_broker_class,
             active_route_fingerprint: None,
+            retained_route_launch: None,
         })
     }
     #[must_use]
@@ -5132,8 +5219,10 @@ impl BridgeRunner {
     ///
     /// The contour route is admitted through [`admit_bridge_route_launch`]
     /// against the retained registry BEFORE the core attaches, so a refused
-    /// route never launches. The persisted fingerprint is retained for
-    /// [`BridgeRunner::reconnect`].
+    /// route never launches. The launch observation is then recorded as a
+    /// Governor receipt from the genuine attach evidence, and the launch is
+    /// sealed for [`BridgeRunner::reconnect`]: a launch that cannot be
+    /// receipted never becomes a continuity bound.
     #[allow(clippy::result_large_err)]
     pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
         let fingerprint = admit_bridge_route_launch(
@@ -5144,6 +5233,53 @@ impl BridgeRunner {
         )
         .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         let view = self.core.attach(request)?;
+        // The launch receipt is recorded before the launch is sealed. The
+        // receipt carries the genuine attach observation: the owner-issued
+        // binding as transport-metadata evidence, and no observed route
+        // facts, because the activation handshake exposes none and I3.4
+        // forbids reconstructing them from the request. Every component is
+        // validated identity text (admitted route/installation plus the
+        // owner's validated binding identities), so the owner's whole-receipt
+        // validation holds on this path and its typed refusal propagates.
+        let observed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .map_err(|_| {
+                BridgeError::ProviderContract(
+                    "bridge route launch receipt clock precedes the Unix epoch".to_owned(),
+                )
+            })?;
+        let binding = view.binding();
+        let launch_receipt = ActualRouteReceipt::new(
+            self.bridge_route.clone(),
+            self.route_installation.clone(),
+            ObservedRoute {
+                provider_and_model: None,
+                auth_profile_class: None,
+                billing_mode: None,
+                serializer_fingerprint: None,
+            },
+            observed_at,
+            vec![
+                format!("bridge-contour-attach:{}", self.bridge_route.route_id),
+                format!(
+                    "kernel-activation-session:{}",
+                    binding.session_id().as_str()
+                ),
+                format!(
+                    "kernel-activation-connection:{}",
+                    binding.connection_id().as_str()
+                ),
+            ],
+        );
+        self.route_registry
+            .record_receipt(launch_receipt)
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.retained_route_launch = Some(RetainedRouteLaunch::seal(
+            &self.bridge_route,
+            &self.route_installation,
+            &view,
+        ));
         self.active_route_fingerprint = Some(fingerprint);
         self.reset_bootstrap_gate_on_session_change();
         Ok(view)
@@ -5151,24 +5287,46 @@ impl BridgeRunner {
     /// Reconnects under a replacement connection: the real bridge resume path
     /// (issue #1816, W4).
     ///
-    /// The live route is classified against the launch fingerprint through
-    /// [`classify_bridge_route_resume`]. An unchanged fingerprint keeps
-    /// native resume; any divergence refuses with an explicit
+    /// The live contour declaration is re-derived from the live profile and
+    /// fingerprinted, and the live attach binding is read fresh; both are
+    /// classified against the sealed launch and the Governor-retained receipt
+    /// through [`classify_bridge_route_reconnect`]. An unchanged launch keeps
+    /// native resume; any route-material, launch-authority, bound-integrity,
+    /// or retained-receipt divergence refuses with an explicit
     /// rehydrated/new-attempt state instead of silently continuing under the
-    /// previous session identity.
+    /// previous launch. A resume with no sealed launch while the core holds a
+    /// live attach is refused for the same reason: that is continuity without
+    /// admission.
     #[allow(clippy::result_large_err)]
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
-        let route_moved = match &self.active_route_fingerprint {
-            Some(prior) => {
-                let next =
-                    RouteBehaviorFingerprint::of(&self.bridge_route, &self.route_installation);
-                classify_bridge_route_resume(prior, &next) == ContinuityKind::Rehydrated
+        let route_moved = match (&self.retained_route_launch, &self.active_route_fingerprint) {
+            (Some(sealed), Some(prior)) => {
+                let profile = self.profile;
+                let (live_route, live_installation, _) = bridge_contour_declaration(profile);
+                match self.attach_view() {
+                    Some(live) => {
+                        classify_bridge_route_reconnect(
+                            sealed,
+                            prior,
+                            &self.route_registry,
+                            &live_route,
+                            &live_installation,
+                            &live,
+                        ) == ContinuityKind::Rehydrated
+                    }
+                    // The core holds no live attach: it reports the
+                    // attachment state itself; the route gate invents nothing.
+                    None => false,
+                }
             }
-            None => false,
+            // Sealed without a bound, or a live attach with no sealed launch:
+            // continuity without admission never continues silently.
+            (Some(_), None) => true,
+            (None, _) => self.attach_view().is_some(),
         };
         if route_moved {
             return Err(BridgeError::ProviderContract(
-                "bridge route fingerprint moved since launch: resume refuses silent \
+                "bridge route launch admission does not cover this resume: refusing silent \
                  continuity; re-attach for an explicit rehydrated new attempt"
                     .to_owned(),
             ));
@@ -5589,6 +5747,7 @@ impl BridgeRunner {
             context,
             tasks: empty_tasks,
             binding,
+            owner_compiled: false,
         });
         Ok(())
     }
@@ -5603,10 +5762,14 @@ impl BridgeRunner {
     /// later session, fence, or scope/task move refuses at compose time.
     /// Material readiness is refused on this generic context path because
     /// its fence is only an opaque reference, not a typed value comparable to
-    /// the live attach fence.
+    /// the live attach fence. Frozen serializer/tokenizer identities are
+    /// refused on this host path for the same reason: they arrive only
+    /// through the Governor-compiled surface intake, so a client-named
+    /// rendering identity fails closed with `BOOTSTRAP_RENDERING_UNBOUND`
+    /// instead of being silently cleared or projected.
     pub fn note_owner_snapshot(
         &mut self,
-        mut context: BootstrapContext,
+        context: BootstrapContext,
         tasks: BootstrapTaskInputs,
     ) -> Result<(), BootstrapError> {
         if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
@@ -5615,25 +5778,54 @@ impl BridgeRunner {
                 detail: "material readiness cannot be projected while the retained context carries only an opaque fence reference".to_owned(),
             });
         }
-        // The host-supplied path never carries frozen rendering identities:
-        // a client can name them in request JSON (bypassing the constructor),
-        // so they are cleared here before validation and retention. Only the
-        // compiled-surface intake re-applies the exact owner values below.
-        context.serializer_id.clear();
-        context.serializer_version.clear();
-        context.serializer_options_digest.clear();
-        context.tokenizer_id.clear();
-        context.tokenizer_version.clear();
-        context.tokenizer_hash.clear();
-        get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
+        if !context.serializer_id.is_empty()
+            || !context.serializer_version.is_empty()
+            || !context.serializer_options_digest.is_empty()
+            || !context.tokenizer_id.is_empty()
+            || !context.tokenizer_version.is_empty()
+            || !context.tokenizer_hash.is_empty()
+        {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_RENDERING_UNBOUND",
+                detail: "host-supplied snapshot names frozen serializer/tokenizer identities that only the Governor-compiled surface intake may carry".to_owned(),
+            });
+        }
+        self.retain_sealed_snapshot(context, tasks, false)
+    }
+
+    /// Validates one noted snapshot and seals it to the live attach binding.
+    ///
+    /// Shared retention core behind the host-snapshot and compiled-surface
+    /// intakes: fail-closed composition validation first (nothing invalid is
+    /// ever stored), then the principal/`WorkScope` content check against the
+    /// live seal, then the composed task-selection check against the sealed
+    /// activation task (issue #8 W1/P1: a `Bound`/`Unique` selection must name
+    /// the sealed task and revision before retention, so later
+    /// `delivery_tasks_match` equality preserves a seal-checked set instead
+    /// of two unbound host values; `Ambiguous`/`None` claims no task and
+    /// needs no agreement, exactly as at delivery), then retention of the
+    /// exact noted context, task set, seal, and intake provenance.
+    /// `owner_compiled` is true only for snapshots
+    /// whose context arrived through [`BootstrapContext::from_compiled_surface`]
+    /// with its owner-frozen rendering identities already validated there.
+    fn retain_sealed_snapshot(
+        &mut self,
+        context: BootstrapContext,
+        tasks: BootstrapTaskInputs,
+        owner_compiled: bool,
+    ) -> Result<(), BootstrapError> {
+        let composed =
+            get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
         let binding = self.attach_view().map(|view| view.binding().clone());
         if let Some(seal) = &binding {
             BootstrapSnapshot::content_matches_binding(&context, seal)?;
+            BootstrapSnapshot::selection_matches_sealed_task(&composed, seal)?;
         }
         self.bootstrap_snapshot = Some(BootstrapSnapshot {
             context,
             tasks,
             binding,
+            owner_compiled,
         });
         Ok(())
     }
@@ -5673,7 +5865,10 @@ impl BridgeRunner {
     /// those facts remain dependent on the live authenticated #8 producer.
     /// A no-task or ambiguous surface cannot be delivered through this
     /// attach-bound route: it needs an authenticated preselection transport
-    /// before a snapshot can be retained or served.
+    /// before a snapshot can be retained or served. Retention goes through
+    /// the shared sealed-snapshot core with `owner_compiled` set, so sealed
+    /// delivery stamps the owner-compiled provenance and current freshness
+    /// instead of the host-carried defaults.
     ///
     /// # Live status
     ///
@@ -5738,38 +5933,12 @@ impl BridgeRunner {
             next_safe_expansion,
             boot_delta,
         )?;
-        self.note_owner_snapshot(context, tasks)?;
-        // The generic note path clears frozen rendering identities (host
-        // clients can name them in request JSON); re-apply the exact values
-        // the compiled owner surface carried, already validated by
-        // `from_compiled_surface` above.
-        if let Some(snapshot) = self.bootstrap_snapshot.as_mut() {
-            snapshot
-                .context
-                .serializer_id
-                .clone_from(&surface.serializer_id);
-            snapshot
-                .context
-                .serializer_version
-                .clone_from(&surface.serializer_version);
-            snapshot
-                .context
-                .serializer_options_digest
-                .clone_from(&surface.serializer_options_digest);
-            snapshot
-                .context
-                .tokenizer_id
-                .clone_from(&surface.tokenizer_id);
-            snapshot
-                .context
-                .tokenizer_version
-                .clone_from(&surface.tokenizer_version);
-            snapshot
-                .context
-                .tokenizer_hash
-                .clone_from(&surface.tokenizer_hash);
-        }
-        Ok(())
+        // The context already carries the exact owner-frozen
+        // serializer/tokenizer identities validated by
+        // `from_compiled_surface` above, so retention keeps them verbatim:
+        // the host-snapshot intake (which refuses client-named rendering
+        // identities) is bypassed, not reused, here.
+        self.retain_sealed_snapshot(context, tasks, true)
     }
     /// Task inputs retained by the noted owner snapshot for auto-boot.
     ///
@@ -5793,10 +5962,16 @@ impl BridgeRunner {
     /// Always available, including after the once-per-session auto-boot was
     /// delivered. Requires a noted snapshot and a live attach still equal
     /// to the noted seal; a wrong session, stale fence, or changed
-    /// scope/task binding fails closed instead of projecting `READY`. A
+    /// scope/task binding fails closed instead of projecting `READY`. The
+    /// caller task set must equal the sealed snapshot task set
+    /// (`BOOTSTRAP_TASK_SET_MISMATCH`); the frozen set changes only by
+    /// re-noting under the live attach. A
     /// composed selection that names any task other than the sealed
     /// activation task is refused the same way, so a forged or stale packet
-    /// can never retrieve `READY` through this path either.
+    /// can never retrieve `READY` through this path either. Delivery stamps
+    /// the snapshot intake's [`ProjectionProvenance`] and the projection's
+    /// [`ProjectionFreshness`] before measuring, so the returned bootstrap
+    /// never presents host-carried values as owner-issued (issue #8 P1/A2).
     pub fn get_understanding_bootstrap(
         &self,
         tasks: &BootstrapTaskInputs,
@@ -5814,14 +5989,18 @@ impl BridgeRunner {
                 detail: "noted bootstrap seal disagrees with the live attach binding".to_owned(),
             });
         };
+        snapshot.delivery_tasks_match(tasks)?;
         let mut bootstrap =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
         BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
+        stamp_sealed_provenance(&mut bootstrap, snapshot.owner_compiled);
         attach_route_payload_measurement(&mut bootstrap);
         Ok(bootstrap)
     }
     /// Previews the one-time bootstrap without marking it delivered. A
     /// response can check its complete frame before consuming the delivery.
+    /// Composes only the sealed snapshot task set; a changed caller set
+    /// yields `None` without consuming the slot.
     pub fn preview_first_response_bootstrap(
         &self,
         tasks: &BootstrapTaskInputs,
@@ -5829,6 +6008,7 @@ impl BridgeRunner {
     ) -> Option<UnderstandingBootstrap> {
         let snapshot = self.bootstrap_snapshot.clone()?;
         let sealed = snapshot.sealed_live_binding(self.attach_view())?;
+        snapshot.delivery_tasks_match(tasks).ok()?;
         let preview =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
         BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
@@ -5836,6 +6016,7 @@ impl BridgeRunner {
         session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
             .map(|mut bootstrap| {
+                stamp_sealed_provenance(&mut bootstrap, snapshot.owner_compiled);
                 attach_route_payload_measurement(&mut bootstrap);
                 bootstrap
             })
@@ -5846,10 +6027,14 @@ impl BridgeRunner {
     /// noted, or when the live attach moved away from the noted seal;
     /// composition failures also yield `None` without marking delivery
     /// so a later response with complete inputs can still carry the bootstrap.
-    /// A composed selection that names any task other than the sealed
+    /// A caller task set that differs from the sealed snapshot set yields
+    /// `None` the same way, without consuming the once-per-session slot. A
+    /// composed selection that names any task other than the sealed
     /// activation task yields `None` the same way, without consuming the
     /// once-per-session slot, so a forged or stale packet can never
     /// auto-boot `READY` and a later coherent response can still deliver.
+    /// Delivery stamps the snapshot intake's [`ProjectionProvenance`] and
+    /// the projection's [`ProjectionFreshness`] before measuring.
     pub fn take_first_response_bootstrap(
         &mut self,
         tasks: &BootstrapTaskInputs,
@@ -5857,12 +6042,14 @@ impl BridgeRunner {
     ) -> Option<UnderstandingBootstrap> {
         let snapshot = self.bootstrap_snapshot.clone()?;
         let sealed = snapshot.sealed_live_binding(self.attach_view())?;
+        snapshot.delivery_tasks_match(tasks).ok()?;
         let preview =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
         BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
         self.bootstrap_session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
             .map(|mut bootstrap| {
+                stamp_sealed_provenance(&mut bootstrap, snapshot.owner_compiled);
                 attach_route_payload_measurement(&mut bootstrap);
                 bootstrap
             })

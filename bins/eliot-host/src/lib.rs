@@ -1122,6 +1122,14 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         test: "891/case-13",
     },
     HostLifecycleBoundary {
+        name: "backup-dispatch.terminal",
+        source_item: "HostComposition::dispatch_backup_owner_operation",
+        owner_state: "admitted backup operation/closed dispatch target/retained preparation",
+        event: "host-backup-dispatch-failed",
+        caller: "HostComposition::process_backup_dispatch_requests",
+        test: "983/case-9",
+    },
+    HostLifecycleBoundary {
         name: "backup-cutover.terminal",
         source_item: "HostComposition::backup_dispatch_cutover",
         owner_state: "admitted cutover body/evidence/retirement fence",
@@ -1450,13 +1458,27 @@ const BOUNDARY_WAKE_SATISFY_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-wake-satisfy-failed");
 const BOUNDARY_WAKE_SATISFIED_OBSERVED: &HostLifecycleBoundary =
     boundary_by_event("host.wake-satisfied observed");
-// F-LOG-HOST-8 (#983 W4): the three admitted cutover dispatch arms are the
-// outer caller boundaries for one failed cutover operation, so each arms the
-// crate's own `HostTerminalGuard` and owns exactly one terminal record. The
-// leaf `backup_cutover` phase/refusal records stay nonterminal and correlate
-// beneath the armed guard by emission order; there is no dedup cache, and each
-// code keeps its own operation distinct from its siblings and from any process
-// shutdown failure (`host-stop-failed`, `host-open-failed`).
+// F-LOG-HOST-8 (#983 W4): every admitted backup operation has exactly ONE
+// terminal emitter, and the owner is named per operation rather than per layer.
+//
+// `HostComposition::dispatch_backup_owner_operation` owns the live
+// registered-owner operation: it is the outermost boundary the production
+// contour actually reaches, because
+// `HostComposition::process_backup_dispatch_requests` runs it for every request
+// the closed prepare/cutover dispatch table admitted, and it is the only frame
+// that decides the success or typed refusal of that operation. It calls only
+// `HostComposition::backup_dispatch_reconcile`, which arms no guard, so no two
+// guards are ever armed for one operation and no dedup cache is needed to keep
+// the second one quiet.
+//
+// The four admitted ports below own the single operation each of them runs, and
+// none of them is reachable from the dispatch-owner boundary, so their guards
+// never nest inside it. The leaf `backup_cutover` / `backup_preparation` phase
+// and refusal records stay nonterminal and correlate beneath the armed guard by
+// emission order. Every code here is distinct from its siblings and from a
+// separate process shutdown failure (`host-stop-failed`, `host-open-failed`).
+const BOUNDARY_BACKUP_DISPATCH_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-dispatch-failed");
 const BOUNDARY_BACKUP_CUTOVER_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-backup-cutover-failed");
 const BOUNDARY_BACKUP_PREPARE_TERMINAL: &HostLifecycleBoundary =
@@ -1727,6 +1749,33 @@ pub enum HostError {
     StoreNotLive { evidence: StoreLivenessEvidence },
     #[error("Host child cleanup requires recovery: {0}")]
     RecoveryRequired(String),
+    /// A planned Store endpoint is occupied by a listener whose exact
+    /// installation ownership is unproven.
+    ///
+    /// Issue #1775. The typed directive is the recovery instruction: it names
+    /// the classified origin, the read-only operations still permitted, the
+    /// blocked control operations, the exact missing ownership evidence and one
+    /// safe next action. It authorizes nothing — the occupant is left running,
+    /// and no stop, kill, credential attachment, login, adoption, reuse or data
+    /// migration is performed. Its `Display` is the bounded, non-sensitive
+    /// summary, so endpoints and process identities stay in typed fields.
+    ///
+    /// The directive is boxed so the `Err` path of every function returning
+    /// `Result<_, HostError>` stays pointer-sized. Boxing relocates the same
+    /// typed value; it changes where the bytes live, never which variant of the
+    /// directive is produced, and `Display` still renders the bounded summary
+    /// through the box.
+    #[cfg(windows)]
+    #[error("planned Store endpoint is occupied and exact installation ownership is unproven: {0}")]
+    OriginCollisionUnproven(Box<eliot_host_service::ForeignOccupantRecoveryDirective>),
+    /// The planned Store endpoint's owner could not be read.
+    ///
+    /// Issue #1775. A read that failed is not a read that succeeded with an
+    /// empty answer, so this is never reported as clean absence: the
+    /// start/reconnect defers until exact ownership is observable.
+    #[cfg(windows)]
+    #[error("planned Store endpoint owner is unreadable, so ownership is unproven: {0}")]
+    StoreEndpointOwnerUnreadable(String),
     #[cfg(windows)]
     #[error("Watchdog coverage is unavailable: {0}")]
     WatchdogCoverageUnavailable(String),
@@ -4483,7 +4532,17 @@ impl HostJobBranches {
         )?;
         let (_, store_working_directory) =
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
-        host_job_launch::ensure_store_endpoint_available(&launch.canonical_store_arguments)?;
+        // Issue #1775: an owned reconnect resolves the collision against the
+        // same approved identity as the fresh launch, so a foreign occupant
+        // produces the typed directive and an unreadable owner defers.
+        host_job_launch::ensure_store_endpoint_available(
+            &launch.canonical_store_arguments,
+            &host_job_launch::StoreEndpointOwnershipBinding {
+                installation: &host.installation,
+                generation,
+                state_fence: &launch.authority_state_fence,
+            },
+        )?;
         let child = Self::launch(
             &executable,
             executable_lease,
@@ -5191,7 +5250,7 @@ use journal_append::{
 // `ActivationTriggerClass` vocabulary, never from literals at the call site.
 use activation_lifecycle::{
     CAPABILITY_CANONICAL_STORE, CAPABILITY_INDEPENDENT_SUPERVISION, CAPABILITY_RUNTIME_SUPERVISION,
-    requires_capability,
+    is_fresh_admitting_observation, prove_terminal_runtime_release, requires_capability,
 };
 
 mod store_recovery_fence;
@@ -5317,6 +5376,10 @@ pub struct HostComposition {
     runtime_control_queue: HostRuntimeControlQueue,
     #[cfg(windows)]
     user_automation_execution_queue: HostUserAutomationExecutionQueue,
+    /// Bounded handoff the registered backup owner submits admitted operations
+    /// through, drained by this composition's own serialized owner loop.
+    #[cfg(windows)]
+    backup_dispatch_queue: HostBackupDispatchQueue,
     #[cfg(windows)]
     store_recovery_startup_fence: StoreRecoveryStartupFence,
     active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind,
@@ -5572,11 +5635,16 @@ pub(crate) fn open_registry_store_at(
 ///   [`crate::backup_preparation::DelegatedPreparation::prepare`];
 /// - `Cutover` — [`HostComposition::backup_dispatch_cutover`], delegating to
 ///   [`crate::backup_cutover::execute_cutover`] under a separate cutover
-///   admission.
+///   admission;
+/// - `Reconcile` — [`HostComposition::backup_dispatch_reconcile`], delegating
+///   to [`crate::backup_preparation::DelegatedPreparation::reconcile`] over the
+///   preparation this Host already retained. It is a read of the owner's own
+///   durable record and can never select the prepare or cutover arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackupDispatchTarget {
     Prepare,
     Cutover,
+    Reconcile,
 }
 
 /// The exact closed prepare/cutover dispatch table this Host composition
@@ -5587,8 +5655,11 @@ pub enum BackupDispatchTarget {
 /// the endpoint admits against one row shape and the routing below stays
 /// load-bearing. `PREPARE_ISOLATED_RESTORE` is the preparation owner
 /// operation and carries no cutover admission; `ADMIT_CUTOVER` is the
-/// separately admitted cutover owner operation. Every other method the
-/// endpoint accepts has no row here and therefore no owner operation.
+/// separately admitted cutover owner operation; `RESTORE_STATUS` and
+/// `RECONCILE_RESTORE` are the two accepted status/reconciliation reads and
+/// resolve to the one owner operation that re-reads the preparation this Host
+/// retained. Every other method the endpoint accepts has no row here and
+/// therefore no owner operation.
 #[cfg(windows)]
 const HOST_BACKUP_DISPATCH_REGISTRATION: &[eliot_host_control_endpoint::AcceptedOwnerMethod] = &[
     eliot_host_control_endpoint::AcceptedOwnerMethod::new(
@@ -5599,39 +5670,186 @@ const HOST_BACKUP_DISPATCH_REGISTRATION: &[eliot_host_control_endpoint::Accepted
         eliot_protocol::backup::BackupOperationKind::AdmitCutover,
         true,
     ),
+    eliot_host_control_endpoint::AcceptedOwnerMethod::new(
+        eliot_protocol::backup::BackupOperationKind::RestoreStatus,
+        false,
+    ),
+    eliot_host_control_endpoint::AcceptedOwnerMethod::new(
+        eliot_protocol::backup::BackupOperationKind::ReconcileRestore,
+        false,
+    ),
 ];
+
+/// Upper bound on backup operations the registered owner may hand to the live
+/// Host composition before the handoff refuses instead of growing.
+///
+/// The handoff has the same bounded request/answer shape as the endpoint's
+/// other owner queue, not a buffer: past this depth the owner refuses the
+/// request before the composition is entered, so a burst can never become an
+/// unbounded backlog of admitted operations nothing is draining.
+pub const MAX_PENDING_BACKUP_DISPATCH_OPERATIONS: usize = 8;
+
+/// Bounded deadline one admitted backup operation may spend waiting for the
+/// live Host composition's serialized owner loop to answer it.
+///
+/// Bounded because the pipe server thread blocks on this answer: an unanswered
+/// operation has to become a typed refusal rather than hold a Host control
+/// connection open indefinitely. It never becomes a success and never becomes
+/// an absence — the operation stays admitted at the owner, which is exactly
+/// what a later reconciliation reads.
+#[cfg(windows)]
+const BACKUP_DISPATCH_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One admitted backup operation handed from the registered owner to the live
+/// Host composition, with the single-slot answer channel the pipe server thread
+/// is blocked on.
+#[cfg(windows)]
+struct BackupDispatchWork {
+    /// The exact admitted request the endpoint already gated and validated.
+    request: eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    /// Answers this one operation back to the blocked owner call.
+    answer: std::sync::mpsc::SyncSender<Result<(), BackupDispatchRefusal>>,
+}
+
+/// The bounded handoff state shared by the registered owner and the composition.
+#[cfg(windows)]
+struct BackupDispatchHandoff {
+    /// Operations the owner has handed over and the composition has not taken.
+    pending: std::sync::mpsc::SyncSender<BackupDispatchWork>,
+    /// The composition's own end. It is taken on, never cloned, so exactly one
+    /// serialized owner loop drains the handoff.
+    received: std::sync::Mutex<std::sync::mpsc::Receiver<BackupDispatchWork>>,
+}
+
+/// The bounded handoff between the registered Host backup owner and the live
+/// Host composition (#962).
+///
+/// This is the missing half of the registration. The owner registered on the
+/// canonical runtime-control pipe is the only component that ever sees an
+/// admitted backup request, and it is not the component that holds the durable
+/// Host journal, the owner lease, or the installation registry. This value is
+/// the one seam between them: the owner submits an admitted request here and
+/// blocks for the answer, and
+/// [`HostComposition::process_backup_dispatch_requests`] — reached from the
+/// service loop, the same place the `UserAutomation` owner queue is drained - runs
+/// the owner operation against this composition's real retained state.
+///
+/// It is a channel, not a second `HostComposition`, not a global mutex and not a
+/// detached task: it carries one admitted request and one answer, it is bounded
+/// in depth and in time, and every operation it carries is answered by the
+/// owner's own code path.
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct HostBackupDispatchQueue {
+    /// Shared handoff state. Cloning a handle does not clone the queue, so no
+    /// second receiver can exist.
+    handoff: std::sync::Arc<BackupDispatchHandoff>,
+}
+
+#[cfg(windows)]
+impl HostBackupDispatchQueue {
+    /// Opens the empty handoff for exactly one Host composition lifecycle.
+    #[must_use]
+    pub fn bounded() -> Self {
+        let (pending, received) =
+            std::sync::mpsc::sync_channel(MAX_PENDING_BACKUP_DISPATCH_OPERATIONS);
+        Self {
+            handoff: std::sync::Arc::new(BackupDispatchHandoff {
+                pending,
+                received: std::sync::Mutex::new(received),
+            }),
+        }
+    }
+
+    /// Hands one admitted request to the live composition and blocks for the
+    /// owner's answer within the bounded deadline.
+    ///
+    /// `Ok(())` is returned only after the composition ran the exact owner
+    /// operation that request resolved to, so a transport acknowledgement is
+    /// never reported as backup semantic success. A full handoff, a closed
+    /// handoff, and an unanswered operation are three distinct typed refusals,
+    /// the first two produced before the composition is entered at all.
+    fn submit(
+        &self,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    ) -> Result<(), BackupDispatchRefusal> {
+        let operation = request.operation;
+        let (answer, answered) = std::sync::mpsc::sync_channel(1);
+        self.handoff
+            .pending
+            .try_send(BackupDispatchWork {
+                request: request.clone(),
+                answer,
+            })
+            .map_err(|_| {
+                BackupDispatchRefusal::new(
+                    operation,
+                    "the live Host composition is not draining the backup dispatch handoff",
+                )
+            })?;
+        match answered.recv_timeout(BACKUP_DISPATCH_ANSWER_DEADLINE) {
+            Ok(outcome) => outcome,
+            // A disconnected requester and an unanswered operation are the
+            // same honest answer here: the operation stays admitted at the
+            // owner, and this refusal is not a claim that no effect exists.
+            Err(_) => Err(BackupDispatchRefusal::new(
+                operation,
+                "the live Host composition did not answer this admitted backup operation within its bounded deadline",
+            )),
+        }
+    }
+
+    /// Takes the next handed-over operation, or `None` when the handoff is empty
+    /// or its receiver lock is poisoned.
+    ///
+    /// Non-blocking by contract: the service loop sweeps this once per tick and
+    /// must never wait on it, so a requester that disconnected mid-flight cannot
+    /// stall supervision.
+    fn take_pending(&self) -> Option<BackupDispatchWork> {
+        let received = self.handoff.received.lock().ok()?;
+        received.try_recv().ok()
+    }
+}
 
 /// The registered Host backup owner for the canonical Host runtime-control
 /// pipe (#962).
 ///
-/// It owns only the typed dispatch decision: it resolves the admitted
-/// operation through the composition's own
+/// It owns the typed dispatch decision and the handoff, not the effect: it
+/// resolves the admitted operation through the composition's own
 /// [`HostComposition::backup_dispatch_target`] and
-/// [`HostComposition::backup_dispatch_needs_cutover_admission`] routing and
-/// refuses every operation that has no registered owner row — a rehearsal
-/// completion, a capture or page read, an archive verification, a restore
-/// step, and every accepted method the composition did not register — before
-/// any effect. It opens no pipe, decodes no frame, authenticates no peer,
-/// admits no capability, and computes no digest.
+/// [`HostComposition::backup_dispatch_needs_cutover_admission`] routing, refuses
+/// every operation that has no registered owner row — a rehearsal completion, a
+/// capture or page read, an archive verification, a restore step, and every
+/// accepted method the composition did not register — before any effect, and
+/// then hands the admitted request to the live composition through
+/// [`HostBackupDispatchQueue`] and blocks for the answer the owner's own code
+/// produced. It opens no pipe, decodes no frame, authenticates no peer, admits
+/// no capability, and computes no digest.
 ///
-/// The owner effect for the resolved target is
+/// The owner operation that answers is
+/// [`HostComposition::backup_dispatch_reconcile`] for `RESTORE_STATUS` and
+/// `RECONCILE_RESTORE`: a real read of the preparation this Host retained,
+/// through the same durable sink a prepare writes. The two effect arms,
 /// [`HostComposition::backup_dispatch_prepare`] and
-/// [`HostComposition::backup_dispatch_cutover`]. Both need an owner-issued
-/// admitted body that the closed `#954`
-/// [`BackupRuntimeControlRequest`] envelope does not carry and that this
-/// composition does not retain, so this owner refuses them with a bounded
-/// typed refusal instead of fabricating an owner-issued body from a payload
-/// claim. That refusal is the honest pre-effect answer; the admitted bodies
-/// are the stitching phase's input.
+/// [`HostComposition::backup_dispatch_cutover`], still refuse — and each names
+/// the exact owner obligation that is absent rather than being a blanket
+/// error: the closed `#954` [`BackupRuntimeControlRequest`] envelope carries no
+/// admitted preparation body, and retained Host state carries no owner-issued
+/// isolated-restore staging parent for a prepare to write into.
 #[cfg(windows)]
-pub struct HostBackupDispatchOwner;
+pub struct HostBackupDispatchOwner {
+    /// The live composition's bounded handoff. This is the owner's real state,
+    /// and it is what turns a registration into an executed owner operation.
+    handoff: HostBackupDispatchQueue,
+}
 
 #[cfg(windows)]
 impl HostBackupDispatchOwner {
-    /// Binds the owner to the exact closed prepare/cutover dispatch table.
+    /// Binds the owner to the live Host composition's bounded dispatch handoff
+    /// and to the exact closed dispatch table this composition registered.
     #[must_use]
-    pub fn accepted() -> Self {
-        Self
+    pub fn accepted(handoff: HostBackupDispatchQueue) -> Self {
+        Self { handoff }
     }
 }
 
@@ -5686,24 +5904,22 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
         // routing and cutover-admission decision for this operation - a routed
         // cutover proves only that it selected the cutover target, never that it
         // activated anything, so the observed disposition stays "none" and
-        // rehearsal can never reach a cutover word from here. The typed refusal
-        // below (no separately admitted cutover body is retained) is returned
-        // unchanged: this is the leaf's nonterminal evidence, and the outer
-        // dispatch boundary owns the single terminal record per failed
-        // operation.
+        // rehearsal can never reach a cutover word from here. Whatever the
+        // handoff below answers, this stays the leaf's nonterminal evidence,
+        // and the outer dispatch boundary owns the single terminal record per
+        // failed operation.
         crate::backup_cutover::observe_live_cutover_dispatch(
             operation,
             Some(target),
             HostComposition::backup_dispatch_needs_cutover_admission(operation).unwrap_or_default(),
         );
-        Err(refusal(match target {
-            BackupDispatchTarget::Prepare => {
-                "no owner-issued admitted isolated-restore preparation is retained by this Host"
-            }
-            BackupDispatchTarget::Cutover => {
-                "no separately admitted cutover body is retained by this Host"
-            }
-        }))
+        // The routing decision is complete and the operation is registered, so
+        // the request is handed to the live composition that owns the durable
+        // Host journal, the owner lease and the installation registry, and this
+        // call blocks for the answer that owner's own code produced. This is the
+        // missing execution: the registered owner is no longer a zero-field
+        // adapter that refuses everything it routes to.
+        self.handoff.submit(request)
     }
 }
 
@@ -5792,14 +6008,19 @@ impl HostComposition {
     /// [`DelegatedPreparation::prepare`](crate::backup_preparation::DelegatedPreparation::prepare));
     /// `ADMIT_CUTOVER` resolves through the #961 owner cutover chain
     /// (`crate::backup_cutover::execute_cutover`) exclusively under a separate
-    /// cutover admission. No algorithm is reimplemented here. Registration
-    /// runs [`HostComposition::validate_backup_dispatch_prepare_routing`]
-    /// over the table so the routing cannot rot unwired.
+    /// cutover admission; `RESTORE_STATUS` and `RECONCILE_RESTORE` resolve to
+    /// the status/reconciliation read
+    /// ([`HostComposition::backup_dispatch_reconcile`], which calls
+    /// [`DelegatedPreparation::reconcile`](crate::backup_preparation::DelegatedPreparation::reconcile))
+    /// over the preparation this Host retained and never re-prepares it. No
+    /// algorithm is reimplemented here. Registration runs
+    /// [`HostComposition::validate_backup_dispatch_prepare_routing`] over the
+    /// table so the routing cannot rot unwired.
     pub fn register_backup_dispatch() -> [(
         eliot_protocol::backup::BackupOperationKind,
         &'static str,
         bool,
-    ); 2] {
+    ); 4] {
         use eliot_protocol::backup::BackupOperationKind as BackupOp;
         let dispatch = [
             (
@@ -5812,6 +6033,16 @@ impl HostComposition {
                 "crate::backup_cutover::execute_cutover",
                 true,
             ),
+            (
+                BackupOp::RestoreStatus,
+                "crate::backup_preparation::DelegatedPreparation::reconcile",
+                false,
+            ),
+            (
+                BackupOp::ReconcileRestore,
+                "crate::backup_preparation::DelegatedPreparation::reconcile",
+                false,
+            ),
         ];
         // Pin the preparation routing validation into registration;
         // wiring-only, no backup operation runs here.
@@ -5822,17 +6053,19 @@ impl HostComposition {
     /// Builds the registered Host backup owner for the canonical Host
     /// runtime-control endpoint (#962).
     ///
-    /// The owner carries the exact closed prepare/cutover dispatch table in
-    /// the endpoint's own [`AcceptedOwnerMethod`] row type, so the endpoint
-    /// admits against one table shape and the composition's routing stays
-    /// load-bearing. Construction cross-checks that table against
-    /// [`HostComposition::register_backup_dispatch`] and against the
+    /// The owner carries the exact closed dispatch table in the endpoint's own
+    /// [`AcceptedOwnerMethod`] row type, so the endpoint admits against one
+    /// table shape and the composition's routing stays load-bearing, and it is
+    /// handed this composition's own bounded
+    /// [`HostBackupDispatchQueue`] so every operation it routes to actually
+    /// reaches this live composition. Construction cross-checks the table
+    /// against [`HostComposition::register_backup_dispatch`] and against the
     /// endpoint's own accepted Host backup table, so a registration that
     /// diverges from the routing refuses instead of serving a stale table.
     /// Registration only: no pipe is opened, no task is started, and no
     /// backup effect runs here.
     #[cfg(windows)]
-    fn backup_owner_registration() -> HostBackupOwnerRegistration {
+    fn backup_owner_registration(&self) -> HostBackupOwnerRegistration {
         use eliot_host_control_endpoint::backup;
         for (operation, _, needs_cutover_admission) in Self::register_backup_dispatch() {
             let Some(row) = backup::accepted_host_backup_methods()
@@ -5853,33 +6086,230 @@ impl HostComposition {
         }
         HostBackupOwnerRegistration::new(
             HOST_BACKUP_DISPATCH_REGISTRATION,
-            Arc::new(HostBackupDispatchOwner::accepted()),
+            Arc::new(HostBackupDispatchOwner::accepted(
+                self.backup_dispatch_queue(),
+            )),
         )
+    }
+
+    /// Answers every backup operation the registered owner handed to this live
+    /// composition (#962).
+    ///
+    /// This is the production drain, reached from the service loop next to
+    /// `process_user_automation_owner_requests` for the same reason: the pipe
+    /// server thread is not the component that holds the durable Host journal,
+    /// so the owner operation runs here, on the one serialized owner loop, with
+    /// `&self` access to the live composition's real retained state.
+    ///
+    /// It is a bounded, non-blocking sweep of an already-admitted queue: it
+    /// starts no work, opens no pipe, admits nothing, and never blocks
+    /// supervision. It returns how many admitted operations it answered, which
+    /// is real evidence rather than a constant — a sweep that drained nothing
+    /// reports zero.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn process_backup_dispatch_requests(&self, queue: &HostBackupDispatchQueue) -> usize {
+        let mut answered = 0usize;
+        while let Some(work) = queue.take_pending() {
+            answered += 1;
+            let outcome = self.dispatch_backup_owner_operation(&work.request);
+            // Delivering the answer is best effort: a requester that disconnected
+            // while the owner operation ran still had that operation run against
+            // real retained state, so the answer is dropped rather than the
+            // operation retried. The owner never re-enters an operation.
+            let _ = work.answer.send(outcome);
+        }
+        answered
+    }
+
+    /// Runs the one owner operation an admitted backup request resolved to,
+    /// against this composition's real retained owner state (#962).
+    ///
+    /// `Ok(())` means the owner operation really ran and reached its own
+    /// success case; every other outcome is the typed
+    /// [`BackupDispatchRefusal`] naming the owner obligation that is missing,
+    /// and is produced before any effect.
+    ///
+    /// # Terminal ownership (F-LOG-HOST-8, #983 W4)
+    ///
+    /// This method is the SINGLE named terminal emitter for one admitted backup
+    /// operation on the live registered-owner contour, and it is named rather
+    /// than deduplicated. It is the outermost frame the production contour
+    /// reaches — [`Self::process_backup_dispatch_requests`] runs it for every
+    /// request the closed prepare/cutover dispatch table admitted, and it is the
+    /// only frame that decides this operation's success or typed refusal — so the
+    /// guard spans exactly the operation.
+    ///
+    /// The non-overlap is structural, not cached: the only owner call below is
+    /// [`Self::backup_dispatch_reconcile`], which arms no guard, and none of the
+    /// four armed admitted ports (`backup_dispatch_prepare`,
+    /// `backup_dispatch_cutover`, `backup_dispatch_cutover_disposition`,
+    /// `backup_dispatch_cutover_retire`) is reachable from here. At most one
+    /// `HostTerminalGuard` is therefore armed for one operation, so no second
+    /// emitter exists to suppress and no process-wide "already reported" set is
+    /// needed. The leaf `backup_preparation` phase/refusal records stay
+    /// nonterminal and correlate beneath the armed guard by emission order.
+    ///
+    /// The pipe ingress
+    /// `HostBackupDispatchOwner::dispatch_backup_operation` deliberately arms
+    /// nothing: it does not run this operation. A refusal it returns is either a
+    /// closed-table routing miss already named by the nonterminal
+    /// `observe_live_cutover_dispatch` static category, or this boundary's own
+    /// refusal propagated back verbatim through
+    /// `HostBackupDispatchQueue::submit`; re-reporting the second kind there
+    /// would be precisely the duplicate terminal W4 forbids.
+    ///
+    /// `host-backup-dispatch-failed` names an OPERATION failure. It is a
+    /// distinct frozen code from the other admitted backup ports and from a
+    /// separate process shutdown failure (`host-stop-failed`,
+    /// `host-open-failed`). The returned [`BackupDispatchRefusal`], the
+    /// operation's order and its effect state are untouched: the guard only
+    /// observes the already-produced outcome.
+    #[cfg(windows)]
+    fn dispatch_backup_owner_operation(
+        &self,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    ) -> Result<(), BackupDispatchRefusal> {
+        // Armed on entry, disarmed on the operation's own `Ok` return below, so
+        // every other outcome — the closed-table miss, the reconciliation read's
+        // typed refusals, and the two named owner refusals for the prepare and
+        // cutover arms — emits exactly one terminal record for this operation.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_DISPATCH_TERMINAL);
+        let operation = request.operation;
+        let Some(target) = HostComposition::backup_dispatch_target(operation) else {
+            return Err(BackupDispatchRefusal::new(
+                operation,
+                "no Host backup owner operation is registered for this method",
+            ));
+        };
+        let outcome = match target {
+            // The status/reconciliation read. The operation identity is the
+            // admitted request's own authenticated `request_id`, and it is a
+            // READ selector only: the owner re-derives the record from its own
+            // durable journal, and no destination, epoch or digest is taken from
+            // it. It never calls prepare or cutover again.
+            BackupDispatchTarget::Reconcile => {
+                match self.backup_dispatch_reconcile(request.request_id.as_str()) {
+                    // The owner re-verified this operation's recorded result
+                    // against the live root. That is the owner's own success,
+                    // not a transport acknowledgement.
+                    Ok(crate::backup_preparation::ReconcileDisposition::Current(_)) => Ok(()),
+                    Ok(crate::backup_preparation::ReconcileDisposition::Absent) => {
+                        Err(BackupDispatchRefusal::new(
+                            operation,
+                            "this Host retains no isolated-restore preparation for the admitted operation",
+                        ))
+                    }
+                    Ok(
+                        crate::backup_preparation::ReconcileDisposition::AdmittedWithoutResult {
+                            ..
+                        },
+                    ) => Err(BackupDispatchRefusal::new(
+                        operation,
+                        "the admitted preparation is durable without a recorded result and must be reconciled, never re-prepared",
+                    )),
+                    Ok(crate::backup_preparation::ReconcileDisposition::Uncertain { .. }) => {
+                        Err(BackupDispatchRefusal::new(
+                            operation,
+                            "the retained preparation outcome is unestablished and is preserved, never re-prepared",
+                        ))
+                    }
+                    Err(_) => Err(BackupDispatchRefusal::new(
+                        operation,
+                        "the Host preparation journal refused to reconcile this admitted operation",
+                    )),
+                }
+            }
+            // Named owner refusal, not a blanket error. Preparing needs an
+            // owner-issued isolated-restore staging parent, and retained Host
+            // state has none: every root `RuntimeStateRoots` derives
+            // (host/kernel/store/watchdog) lives under the installation root,
+            // which IS the preparation source, and `admit_staging_parent`
+            // refuses any staging parent nested under the source. The missing
+            // owner is the installation root contract, which must derive a
+            // destination parent outside the source installation root.
+            BackupDispatchTarget::Prepare => Err(BackupDispatchRefusal::new(
+                operation,
+                "no owner-issued isolated-restore staging parent exists in retained Host state: every derived runtime root is the preparation source, and a staging parent nested under the source is refused",
+            )),
+            // Named owner refusal. A cutover needs a separately admitted
+            // `CutoverRequest` body that the closed `#954` envelope does not
+            // carry and that the Host cutover-intent owner has issued no record
+            // of, so no body can be constructed here without fabricating one.
+            BackupDispatchTarget::Cutover => Err(BackupDispatchRefusal::new(
+                operation,
+                "no separately admitted cutover body is retained by the Host cutover-intent owner for this operation",
+            )),
+        };
+        // The operation reached its own success case, so it owns no terminal
+        // record. This is the only disarm on the path: every `Err` arm above
+        // drops armed and emits exactly one, and the returned refusal is the
+        // owner's own value, unchanged.
+        if outcome.is_ok() {
+            host_terminal.disarm();
+        }
+        outcome
+    }
+
+    /// Reconciles one admitted backup operation against the preparation this
+    /// Host actually retained (#958 owner read, #962 dispatch).
+    ///
+    /// This is the real owner operation behind `RESTORE_STATUS` and
+    /// `RECONCILE_RESTORE`. It binds the same durable
+    /// [`HostStatePreparationJournal`](crate::backup_preparation::HostStatePreparationJournal)
+    /// sink that [`HostComposition::prepare_backup_destination`] writes through,
+    /// and runs
+    /// [`DelegatedPreparation::reconcile`](crate::backup_preparation::DelegatedPreparation::reconcile)
+    /// over the operation identity the admitted request authenticated. It
+    /// creates no destination, admits no cutover, and never calls prepare or
+    /// cutover again, so a repeated presentation of the same operation
+    /// reconciles against the retained record instead of taking a second
+    /// effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
+    /// when the operation identity is unusable or the owner's own journal
+    /// refuses the read. A refusal here is a real read failure, not a claim
+    /// that no preparation ran.
+    pub fn backup_dispatch_reconcile(
+        &self,
+        operation_id: &str,
+    ) -> Result<
+        crate::backup_preparation::ReconcileDisposition,
+        crate::backup_preparation::PreparationError,
+    > {
+        let sink = crate::backup_preparation::DelegatedPreparation::new(
+            crate::backup_preparation::HostStatePreparationJournal::new(&self.journal),
+        );
+        sink.reconcile(operation_id)
     }
 
     /// Validates the accepted backup dispatch routing shared by
     /// registration and preparation (#962).
     ///
-    /// Wiring-only pin: the closed two-entry table carries the preparation
-    /// path without cutover admission and the cutover path with it, while
-    /// rehearsal completion resolves to no entry so rehearsal can never
-    /// route to cutover. [`HostComposition::register_backup_dispatch`]
-    /// invokes this validation, and so does
-    /// [`HostComposition::backup_dispatch_prepare`] before delegating to
-    /// [`HostComposition::prepare_backup_destination`]; no backup operation
-    /// runs here.
+    /// Wiring-only pin: the closed four-entry table carries the preparation
+    /// path without cutover admission, the cutover path with it, and the two
+    /// status/reconciliation paths without it, while rehearsal completion
+    /// resolves to no entry so rehearsal can never route to cutover.
+    /// [`HostComposition::register_backup_dispatch`] invokes this validation,
+    /// and so does [`HostComposition::backup_dispatch_prepare`] before
+    /// delegating to [`HostComposition::prepare_backup_destination`]; no backup
+    /// operation runs here.
     fn validate_backup_dispatch_prepare_routing(
         dispatch: [(
             eliot_protocol::backup::BackupOperationKind,
             &'static str,
             bool,
-        ); 2],
+        ); 4],
     ) {
         use eliot_protocol::backup::BackupOperationKind as BackupOp;
-        // Length is pinned by the `[T; 2]` type; pin the routing contents.
+        // Length is pinned by the `[T; 4]` type; pin the routing contents.
         let [
             (prepare_op, prepare_marker, prepare_admission),
             (cutover_op, cutover_marker, cutover_admission),
+            (status_op, status_marker, status_admission),
+            (reconcile_op, reconcile_marker, reconcile_admission),
         ] = dispatch;
         debug_assert_eq!(prepare_op, BackupOp::PrepareIsolatedRestore);
         debug_assert!(!prepare_marker.is_empty());
@@ -5887,6 +6317,12 @@ impl HostComposition {
         debug_assert_eq!(cutover_op, BackupOp::AdmitCutover);
         debug_assert!(!cutover_marker.is_empty());
         debug_assert!(cutover_admission);
+        debug_assert_eq!(status_op, BackupOp::RestoreStatus);
+        debug_assert!(!status_marker.is_empty());
+        debug_assert!(!status_admission);
+        debug_assert_eq!(reconcile_op, BackupOp::ReconcileRestore);
+        debug_assert!(!reconcile_marker.is_empty());
+        debug_assert!(!reconcile_admission);
         debug_assert_eq!(
             Self::backup_dispatch_needs_cutover_admission(BackupOp::PrepareIsolatedRestore),
             Some(false)
@@ -5894,6 +6330,14 @@ impl HostComposition {
         debug_assert_eq!(
             Self::backup_dispatch_needs_cutover_admission(BackupOp::AdmitCutover),
             Some(true)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_needs_cutover_admission(BackupOp::RestoreStatus),
+            Some(false)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_needs_cutover_admission(BackupOp::ReconcileRestore),
+            Some(false)
         );
         debug_assert_eq!(
             Self::backup_dispatch_needs_cutover_admission(BackupOp::CompleteRehearsal),
@@ -5936,16 +6380,19 @@ impl HostComposition {
     /// Reports whether one backup operation needs a separate cutover
     /// admission on the dispatch table (#962).
     ///
-    /// Returns `Some(false)` for the preparation path, `Some(true)` for the
-    /// cutover path, and `None` for operations with no dispatch entry.
-    /// Rehearsal guard: `COMPLETE_REHEARSAL` returns `None`, so a rehearsal
-    /// completion can never resolve cutover.
+    /// Returns `Some(false)` for the preparation path and for the two
+    /// status/reconciliation reads, `Some(true)` for the cutover path, and
+    /// `None` for operations with no dispatch entry. Rehearsal guard:
+    /// `COMPLETE_REHEARSAL` returns `None`, so a rehearsal completion can never
+    /// resolve cutover.
     pub fn backup_dispatch_needs_cutover_admission(
         operation: eliot_protocol::backup::BackupOperationKind,
     ) -> Option<bool> {
         use eliot_protocol::backup::BackupOperationKind as BackupOp;
         match operation {
-            BackupOp::PrepareIsolatedRestore => Some(false),
+            BackupOp::PrepareIsolatedRestore
+            | BackupOp::RestoreStatus
+            | BackupOp::ReconcileRestore => Some(false),
             BackupOp::AdmitCutover => Some(true),
             // `CompleteRehearsal` and every other operation share this arm:
             // rehearsal completion has no dispatch entry, so it can never
@@ -5958,9 +6405,10 @@ impl HostComposition {
     /// target the Host composition actually follows (#961).
     ///
     /// The dispatch table's `&'static str` markers stay documentation; this
-    /// typed resolution is the routing decision the production cutover arm
-    /// is dispatched on, so a cutover reaches
-    /// [`HostComposition::backup_dispatch_cutover`] through a type-checked
+    /// typed resolution is the routing decision the production dispatch arm is
+    /// followed on, so a cutover reaches
+    /// [`HostComposition::backup_dispatch_cutover`] and a status read reaches
+    /// [`HostComposition::backup_dispatch_reconcile`] through a type-checked
     /// match instead of an unchecked string. `None` is returned for every
     /// operation with no dispatch entry, including `COMPLETE_REHEARSAL`.
     /// [`HostComposition::validate_backup_dispatch_prepare_routing`] pins
@@ -5974,6 +6422,13 @@ impl HostComposition {
         match operation {
             BackupOp::PrepareIsolatedRestore => Some(BackupDispatchTarget::Prepare),
             BackupOp::AdmitCutover => Some(BackupDispatchTarget::Cutover),
+            // Both accepted reads resolve to the ONE owner operation that
+            // re-reads the retained preparation. A status read therefore cannot
+            // select a prepare or a cutover, and a repeated reconcile cannot
+            // re-enter prepare.
+            BackupOp::RestoreStatus | BackupOp::ReconcileRestore => {
+                Some(BackupDispatchTarget::Reconcile)
+            }
             // No dispatch entry: rehearsal completion and every other
             // operation can never resolve a dispatch target.
             _ => None,
@@ -6192,7 +6647,15 @@ impl HostComposition {
         // is returned exactly as its owner observation produced it, so this
         // read model can never restate a retained unknown as progress (#2737).
         if committed.disposition != CutoverDisposition::Committed {
-            host_terminal.disarm();
+            // #983 R1: an unresolved execute outcome is returned exactly as
+            // its owner observation produced it, and a `Failed` one is a
+            // failure of THIS operation that still owes the terminal record
+            // its own armed boundary owns. Disarming on the `Ok` alone
+            // retired the guard for a failed cutover and emitted nothing.
+            // The guard stays armed only for the owner's own failure word.
+            if !crate::backup_cutover::cutover_disposition_reports_failure(committed.disposition) {
+                host_terminal.disarm();
+            }
             return Ok((committed, barrier));
         }
         // The registry and the journal are separate owners with no shared
@@ -6291,7 +6754,15 @@ impl HostComposition {
         // more, and the barrier still has to be presented to the separately
         // authorized `backup_dispatch_cutover_retire` step before any prior
         // generation is retired.
-        host_terminal.disarm();
+        //
+        // #983 R1: the reconcile projection is the OWNER's own read model, and
+        // it can return a `Failed` disposition for a commit this port's
+        // registry flip produced. The operation therefore failed and still
+        // owes its single terminal record; the returned disposition, the
+        // barrier and every owner read are unchanged by this decision.
+        if !crate::backup_cutover::cutover_disposition_reports_failure(reconciled.disposition) {
+            host_terminal.disarm();
+        }
         Ok((reconciled, barrier))
     }
 
@@ -6350,7 +6821,16 @@ impl HostComposition {
             &readback,
             retirement_receipt,
         )?;
-        host_terminal.disarm();
+        // #983 R1: this read returning `Ok` says the READ succeeded, not that
+        // the cutover it reports on did. When the owners' own projection
+        // resolves this operation to `Failed`, the disposition read operation
+        // has failed BY DISPOSITION and owes the terminal record its own armed
+        // boundary owns. `Unknown` and every progress/settlement word still
+        // disarm: preserved uncertainty is not a failure (I14.21), and the
+        // read's result, order and owner state are untouched either way.
+        if !crate::backup_cutover::cutover_disposition_reports_failure(outcome.disposition) {
+            host_terminal.disarm();
+        }
         Ok(outcome)
     }
 
@@ -6426,7 +6906,15 @@ impl HostComposition {
             barrier,
             retirement_authorization,
         )?;
-        host_terminal.disarm();
+        // #983 R1: the same disposition rule as the two sibling cutover
+        // boundaries. `retire_authorized_generation` returns `Ok` for a
+        // bounded `Unknown` retirement state, and a `Failed` word from the
+        // shared owner read model would be a failure of THIS operation, so
+        // the guard stays armed exactly for the owner's failure word and
+        // disarms for every other one.
+        if !crate::backup_cutover::cutover_disposition_reports_failure(retired.disposition) {
+            host_terminal.disarm();
+        }
         Ok(retired)
     }
 
@@ -6595,6 +7083,8 @@ impl HostComposition {
             user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
+            #[cfg(windows)]
+            backup_dispatch_queue: HostBackupDispatchQueue::bounded(),
             #[cfg(windows)]
             store_recovery_startup_fence,
             active_phase_b_rebind_recovery,
@@ -7352,11 +7842,13 @@ impl HostComposition {
             &capability,
         )
         .map_err(HostError::Platform)?
-        // Register the accepted prepare/cutover backup dispatch on the
-        // endpoint that already serves the canonical Host runtime-control
-        // pipe (#962). Registration only: it starts no task and opens no
-        // second pipe, so it cannot delay readiness.
-        .with_backup_owner(Self::backup_owner_registration());
+        // Register the accepted backup dispatch owner on the endpoint that
+        // already serves the canonical Host runtime-control pipe (#962), and
+        // hand it this composition's own bounded dispatch handoff so every
+        // operation it admits really reaches this live composition. No second
+        // pipe is opened and no second composition is built, so it cannot delay
+        // readiness.
+        .with_backup_owner(self.backup_owner_registration());
         host_terminal.disarm();
         host_lifecycle_observe_scm(BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT);
         Ok(control)
@@ -7483,6 +7975,17 @@ impl HostComposition {
     #[cfg(windows)]
     pub fn user_automation_execution_queue(&self) -> HostUserAutomationExecutionQueue {
         std::sync::Arc::clone(&self.user_automation_execution_queue)
+    }
+
+    /// Returns the bounded handoff this composition's registered backup owner
+    /// submits admitted operations through.
+    ///
+    /// Cloning the handle does not clone the queue, so the service loop is the
+    /// only component that can drain it and no second receiver can be built.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn backup_dispatch_queue(&self) -> HostBackupDispatchQueue {
+        self.backup_dispatch_queue.clone()
     }
 
     #[cfg(windows)]
@@ -8089,10 +8592,7 @@ impl HostComposition {
                 "live supervision binding has no admitted readiness predecessor".to_owned(),
             )
         })?;
-        if observation.fence.activation_id != next.activation_id
-            || observation.fence.activation_generation != next.fence.activation_generation
-            || observation.evidence_refs.is_empty()
-        {
+        if !is_fresh_admitting_observation(next, observation) {
             return Err(HostError::RecoveryRequired(
                 "admitted supervision predecessor is not fresh evidence for this generation"
                     .to_owned(),
@@ -8130,6 +8630,17 @@ impl HostComposition {
             ActivationState::ControlReady | ActivationState::Active
         ) {
             self.refresh_supervision_lease_binding(&mut next)?;
+            // I1.5 W4: the same live entry issues or renews the generation's
+            // `RuntimeLease` reference from the same fresh admitting
+            // observation — never on stale predecessors, which fail closed
+            // inside the binding.
+            self.refresh_runtime_lease_binding(&mut next)?;
+        }
+        if state == ActivationState::StoppedClean {
+            // I1.5 W4 release: the clear below is a proven release, not a
+            // silent drop — every cleared reference must be this generation's
+            // own lease.
+            prove_terminal_runtime_release(&current)?;
         }
         self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
@@ -8169,6 +8680,13 @@ impl HostComposition {
             ActivationState::ControlReady | ActivationState::Active
         ) {
             self.refresh_supervision_lease_binding(&mut next)?;
+            // I1.5 W4: same live-entry `RuntimeLease` issue/renew as
+            // `transition_activation` — the production admission contour
+            // (`start_manifest_contour` below) enters its live states here.
+            self.refresh_runtime_lease_binding(&mut next)?;
+        }
+        if state == ActivationState::StoppedClean {
+            prove_terminal_runtime_release(&current)?;
         }
         self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
@@ -9411,36 +9929,25 @@ impl HostComposition {
         host_lifecycle_observe_requested(BOUNDARY_RECONCILE_REQUESTED);
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_RECONCILE_TERMINAL);
         self.ensure_admission_open()?;
-        // #983: the outstanding installation-cutover disposition this Host
-        // journal owner currently retains, observed on the live approved
-        // contour reconcile. Observation only — the read appends nothing,
-        // activates nothing and retires nothing, and a failed read keeps the
-        // reconcile's own outcome rather than becoming one: this contour is a
-        // process/readiness reconcile, not a cutover gate, so a cutover
-        // disposition is never allowed to steer it.
+        // #983 W2: this contour deliberately performs NO retained-cutover
+        // disposition observation. The journal-slot read that used to stand
+        // here existed only to emit a progress log line whose value was
+        // discarded, and it cost up to `CUTOVER_DISPOSITION_READ_ATTEMPTS`
+        // exclusive registry opens plus six journal snapshots on every live
+        // contour tick of the occupied-slot path, purely for logging. W2 forbids
+        // additional owner reads and resource acquisition for logging, so the
+        // observation, its operation token and the retained-intent readback
+        // constructor that only it needed are removed rather than downgraded.
         //
-        // The corroboration lives in the projection, not here, and the value is
-        // deliberately not consumed by this caller. The observed artifact is
-        // the `observe_cutover_progress` record the projection emits, and that
-        // projection is the SHARED status read model: it resolves the
-        // disposition from BOTH owners on one coherence-bracketed read, through
-        // the same journal-owner retirement lookup and the same
-        // `reconcile_cutover_outcome` arms the separately admitted
-        // `backup_dispatch_cutover_disposition` port projects through, so a
-        // retained intent whose target is the active generation is reported
-        // `RetirementPending` only when the registry's own operation-bound
-        // receipt names this operation, and `Unknown` otherwise; a retained
-        // `Pending` intent reaches `Prepared` only when the installation
-        // registry's active generation is still the intent's own durable
-        // `expected_predecessor` and the cross-store pair read as one moment.
-        // So a journal slot alone cannot emit `Prepared` for a state the full
-        // owner read model calls ambiguous, and cannot emit a settlement claim
-        // either — which is what "nothing downstream to correct" means here: no
-        // observed word overstates what its two owners proved, and one durable
-        // state is no longer described two different ways. Nothing here needs
-        // the returned outcome, and reading it would add a gate this contour
-        // does not have.
-        let _retained_cutover = crate::backup_cutover::observe_retained_cutover_disposition(self);
+        // No gate, decision or outcome is lost with them. A cutover disposition
+        // was never allowed to steer this contour — it is a process/readiness
+        // reconcile — and the returned value was never read, so nothing
+        // downstream depended on the progress-log side effect. The retained
+        // disposition stays observable exactly where it is an owner-answered
+        // question: the separately admitted
+        // `backup_dispatch_cutover_disposition` port, which projects the same
+        // `reconcile_cutover_outcome` arms over the same coherence-bracketed
+        // two-owner read of the journal and the installation registry.
         let active =
             self.registry.active().cloned().ok_or_else(|| {
                 HostError::ProcessContour("no approved active generation".to_owned())

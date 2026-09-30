@@ -278,29 +278,15 @@ pub const CUTOVER_EVIDENCE_BOUND: usize = 16;
 /// loop (I14.21 — no blind duplicate).
 const CUTOVER_DISPOSITION_READ_ATTEMPTS: u8 = 3;
 
-/// Diagnostic operation token for the contour-reconcile retained-intent read.
-///
-/// [`observe_retained_cutover_disposition`] is not
-/// [`crate::HostComposition::backup_dispatch_cutover_disposition`]: both call
-/// the one shared [`read_cutover_disposition`], but this entrance names the
-/// operation from the journal's own `pending_cutover` slot rather than from an
-/// admitted request, so its records and its failed-read refusals carry this
-/// token. A failure on the contour is therefore never reported under the
-/// admitted read's `read_disposition` name, and the two contours stay
-/// distinguishable in the diagnostic stream. `op` selects nothing: both call the
-/// same read with the same owners and the same arms.
-const RETAINED_CUTOVER_OP: &str = "contour_reconcile";
-
 /// Diagnostic operation token for the live cutover admission decision.
 ///
 /// This is the token of the registered backup owner's cutover dispatch arm
 /// (`HostBackupDispatchOwner::dispatch_backup_operation`), the one production
 /// cutover ingress registered on the Host control endpoint's closed dispatch
-/// table. It is a separate token from [`RETAINED_CUTOVER_OP`] because it records
-/// an admission DECISION on the dispatch contour, not a two-owner disposition
-/// read on the reconcile contour: a routed cutover and an owner-observed cutover
+/// table. It records an admission DECISION on the dispatch contour, never a
+/// two-owner disposition read: a routed cutover and an owner-observed cutover
 /// disposition are different observations and must stay separately attributable
-/// in the stream.
+/// in the stream. The two-owner read keeps its own [`READ_DISPOSITION_OP`] name.
 const LIVE_CUTOVER_OP: &str = "cutover_dispatch";
 
 /// Diagnostic operation token for the admitted-request disposition read.
@@ -378,13 +364,8 @@ pub struct CutoverRequest {
 /// These are the only fields the status read model consumes: the operation
 /// identity the journal owner keys its records on, the approved target and
 /// expected predecessor, and the four owner-approved facts a retirement record
-/// must echo. They are read from exactly one of the two owners that holds them:
-///
-/// * [`CutoverReadback::from_request`] — the admitted cutover body the
-///   separately admitted status port is given, and
-/// * [`CutoverReadback::from_retained_intent`] — the Host journal owner's own
-///   durable [`CutoverIntentRecord`], which retains the same six bindings under
-///   the same operation identity.
+/// must echo. They are read from the admitted cutover body the separately
+/// admitted status port is given, through [`CutoverReadback::from_request`].
 ///
 /// It carries NO envelope, admission receipt, archive digest/class, activation
 /// fence or recovery evidence: those gate the EXECUTE path, and #2739's first
@@ -392,20 +373,13 @@ pub struct CutoverRequest {
 /// admission. So this value grants no authority and mints no permit; it names
 /// which operation a readback is about.
 ///
-/// On the contour path this value is BUILT FROM the durable record the mapper
-/// is handed, so the mapper's "is the retained intent this operation's" join
-/// is vacuous there and answers yes for every operation the slot still
-/// retains. That is honest rather than circular: the contour reports on the
-/// operation the slot itself names, and it holds no second owner holding a
-/// competing request. The join is load-bearing on the admitted-request path,
-/// where the journal slot and the admitted body are two independent records.
-/// The contour's presence probe and the shared read are two samples of the same
-/// single slot, so the join can only ever fail by reporting that the owners
-/// moved, never by granting anything. Neither the retirement re-proof nor the
-/// registry receipt comparison becomes vacuous on either path: the retirement
-/// record is selected from the journal log and the receipt is read from the
-/// registry owner, so both remain comparisons against independent durable
-/// facts.
+/// The mapper's "is the retained intent this operation's" join is therefore
+/// load-bearing here, not vacuous: the journal slot and the admitted body are
+/// two independent records, so the join can only ever fail by reporting that the
+/// owners moved, never by granting anything. Neither the retirement re-proof nor
+/// the registry receipt comparison becomes vacuous: the retirement record is
+/// selected from the journal log and the receipt is read from the registry
+/// owner, so both remain comparisons against independent durable facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CutoverReadback {
     operation: CutoverOperationIdentity,
@@ -431,27 +405,6 @@ impl CutoverReadback {
             user_broker_ref: request.user_broker_ref.clone(),
             target_build_digest: request.target_build_digest.clone(),
             target_config_digest: request.target_config_digest.clone(),
-        }
-    }
-
-    /// Names the operation the Host journal owner's own durable intent names.
-    ///
-    /// Every field is the durable record's own value, never a
-    /// caller-presented copy, so the readback and the intent the journal
-    /// returned describe the same operation by construction.
-    #[must_use]
-    pub fn from_retained_intent(intent: &CutoverIntentRecord) -> Self {
-        Self {
-            operation: CutoverOperationIdentity {
-                installation: intent.installation.clone(),
-                operation_id: intent.cutover_operation.clone(),
-                request_digest: intent.request_digest.clone(),
-            },
-            target_generation: intent.target_generation.clone(),
-            expected_predecessor: intent.expected_predecessor.clone(),
-            user_broker_ref: intent.user_broker_ref.clone(),
-            target_build_digest: intent.target_build_digest.clone(),
-            target_config_digest: intent.target_config_digest.clone(),
         }
     }
 
@@ -483,6 +436,76 @@ impl CutoverReadback {
     /// The owner-approved configuration digest a retirement record must echo.
     pub const fn target_config_digest(&self) -> &PlatformHandle {
         &self.target_config_digest
+    }
+}
+
+/// Bounded correlation handles carried by one cutover phase record
+/// (F-LOG-HOST-8, #983 W2).
+///
+/// W2 admits exactly one class of correlation for a phase observation: existing
+/// references the owners have ALREADY validated for this operation. This value
+/// holds that class and nothing else — the cutover operation identity triple
+/// plus the approved target generation, each a `PlatformHandle` the admitting
+/// envelope and the retained content-checked body already agreed on. It is built
+/// from a [`CutoverReadback`], which the EXECUTE contour takes from the sealed
+/// request (the seal proved the presented body equals the retained one, so the
+/// same identity survives) and the status contour already takes from the admitted
+/// body.
+///
+/// Every slot is an `Option`, exactly as
+/// `host_diagnostics::HostRequestProjection` renders its identity slots: a phase
+/// observed BEFORE that validation carries `None` and emits `<slot>_missing`,
+/// which is a positive statement that this boundary does not hold the fact. A
+/// pre-admission record therefore correlates by its static category alone — an
+/// unvalidated caller string is never a stand-in (I5.27).
+///
+/// Cost: copies of handles already in hand. No owner read, no registry or
+/// journal access, no archive hashing (in particular NOT
+/// `ValidatedCutover::sealed_operation`, whose `operation_request_digest()`
+/// would compute a digest that exists only for this log line), no resource
+/// acquisition, no retry and no mutation.
+struct CutoverPhaseCorrelation {
+    operation_id: Option<crate::host_diagnostics::BoundedField>,
+    request_digest: Option<crate::host_diagnostics::BoundedField>,
+    installation: Option<crate::host_diagnostics::BoundedField>,
+    target_generation: Option<crate::host_diagnostics::BoundedField>,
+}
+
+impl CutoverPhaseCorrelation {
+    /// The explicitly EMPTY correlation for a phase observed before this
+    /// operation's identity and target have been validated. Every slot renders
+    /// `missing`, so the record cannot be read as carrying an identity it does
+    /// not have.
+    fn unvalidated() -> Self {
+        Self {
+            operation_id: None,
+            request_digest: None,
+            installation: None,
+            target_generation: None,
+        }
+    }
+
+    /// The correlation for a phase observed AFTER the owners validated this
+    /// operation's identity and approved target. Each value is the
+    /// corresponding `PlatformHandle` text the readback already holds, bounded
+    /// by the facade's own helper; the handles themselves are not re-derived,
+    /// re-proved or re-hashed here.
+    fn for_readback(readback: &CutoverReadback) -> Self {
+        let operation = readback.operation();
+        Self {
+            operation_id: Some(crate::host_diagnostics::bound_field(
+                operation.operation_id.as_str(),
+            )),
+            request_digest: Some(crate::host_diagnostics::bound_field(
+                operation.request_digest.as_str(),
+            )),
+            installation: Some(crate::host_diagnostics::bound_field(
+                operation.installation.as_str(),
+            )),
+            target_generation: Some(crate::host_diagnostics::bound_field(
+                readback.target_generation().as_str(),
+            )),
+        }
     }
 }
 
@@ -843,13 +866,13 @@ pub enum OwnerObservationCoherence {
 /// the journal. Every status read path therefore samples the journal on BOTH
 /// sides of it AND on both sides of the `query_epoch_retirement` lookup:
 /// `read_cutover_disposition` — the shared model behind the admitted-request
-/// port AND the live Host contour — brackets `first / second / third` around
-/// the resolution, and `HostComposition::backup_dispatch_cutover` brackets
-/// `before / durable / resampled` the same way. In each case the retirement is
-/// resolved FROM the middle sample, so every journal-derived input the mapper
-/// receives comes from one read, and the pair is either one moment with respect
-/// to this cutover or is reported as `Moving`. What this function bounds is
-/// WHICH fields are compared, not who samples them.
+/// port — brackets `first / second / third` around the resolution, and
+/// `HostComposition::backup_dispatch_cutover` brackets `before / durable /
+/// resampled` the same way. In each case the retirement is resolved FROM the
+/// middle sample, so every journal-derived input the mapper receives comes from
+/// one read, and the pair is either one moment with respect to this cutover or
+/// is reported as `Moving`. What this function bounds is WHICH fields are
+/// compared, not who samples them.
 pub(crate) fn cutover_observation_unchanged(before: &HostState, after: &HostState) -> bool {
     before.pending_cutover == after.pending_cutover
         && before.epoch_retirements == after.epoch_retirements
@@ -1159,105 +1182,148 @@ pub enum CutoverError {
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static tokens, owner disposition tokens,
-// or counts; never operation/installation/archive/build/fence strings,
-// digests, reasons, receipts, or arbitrary error `Debug`/`Display` (a canary
-// stays absent even inside an alleged identity string). Truncation bounds
-// size, never sensitivity. Macro arguments are precomputed pure values; sink
-// outcome never alters call counts, order, results, receipts, rollback, or
-// cleanup, and stdout framing is untouched (facade stderr subscriber). No
-// owner reads, effects, hashing, retries, or mutation are added for logging.
-// Requested/validated/prepared/committed/reconciled/retirement-pending/
-// failed/unknown stay exactly the owner-observed dispositions: rehearsal
-// never emits success, ambiguity stays unknown, and retirement-pending never
-// implies erasure.
+// or counts. The ONE exception is the bounded correlation W2 admits on a phase
+// record: [`CutoverPhaseCorrelation`] carries the cutover operation identity
+// triple and the approved target generation, and only ever as handles the owners
+// ALREADY validated for this operation (the sealed admitted body, or the
+// readback the status model was built from). A phase observed before that
+// validation passes `CutoverPhaseCorrelation::unvalidated()` and renders every
+// slot `<slot>_missing`, so it correlates by a static category alone and never by
+// an unvalidated caller string. Nothing else is ever carried: no archive digest
+// or class, no build or config digest, no activation fence, no reason, no
+// receipt, no path, and no arbitrary error `Debug`/`Display` (a canary stays
+// absent even inside an alleged identity string). Truncation bounds size, never
+// sensitivity. Macro arguments are precomputed pure values; the correlation is
+// built from values already in hand, so no owner read, registry or journal
+// access, digest computation, resource acquisition, retry or mutation is added
+// for logging. Sink outcome never alters call counts, order, results, receipts,
+// rollback, or cleanup, and stdout framing is untouched (facade stderr
+// subscriber). Requested/validated/prepared/committed/reconciled/
+// retirement-pending/failed/unknown stay exactly the owner-observed
+// dispositions: rehearsal never emits success, ambiguity stays unknown, and
+// retirement-pending never implies erasure.
 //
 // Terminal ownership (W4, applied): the leaf emits nonterminal phase/refusal
 // evidence only, with no dedup cache and no terminal record of its own, and
 // hands the error back UNCHANGED so no leaf frame can become the terminal
-// emitter. The single terminal record per failed cutover operation is owned by
+// emitter. The single terminal record per failed backup operation is owned by
 // the outer caller boundary through the crate's own `HostTerminalGuard` in
-// lib.rs: `HostComposition::backup_dispatch_cutover`,
-// `HostComposition::backup_dispatch_cutover_disposition` and
-// `HostComposition::backup_dispatch_cutover_retire` each arm one guard, armed
-// on entry and disarmed on every success return, so an `Err` reaching any arm
-// emits exactly one terminal record for that operation and a success emits
-// none. The three frozen codes are
-// `host-backup-cutover-failed` / `host-backup-cutover-disposition-failed` /
-// `host-backup-cutover-retire-failed`, so the three operations stay
-// distinguishable from each other and each stays distinct from a separate
-// process shutdown failure (`host-stop-failed`, `host-open-failed`). Nothing
-// here is deduplicated away: there is no global dedup cache, so a second
+// lib.rs, and each boundary names exactly one operation:
+//
+//   - `HostComposition::dispatch_backup_owner_operation` owns the LIVE
+//     registered-owner operation (`host-backup-dispatch-failed`). It is the one
+//     boundary the production contour actually reaches: it is what
+//     `HostComposition::process_backup_dispatch_requests` runs for every
+//     admitted backup request, and it is the only place a failed
+//     `PrepareIsolatedRestore` / `AdmitCutover` / `RestoreStatus` /
+//     `ReconcileRestore` produced by the closed dispatch table is decided. It
+//     calls only `HostComposition::backup_dispatch_reconcile`, which arms no
+//     guard of its own, so at most one guard is ever armed for one operation.
+//   - `HostComposition::backup_dispatch_cutover`,
+//     `HostComposition::backup_dispatch_cutover_disposition`,
+//     `HostComposition::backup_dispatch_cutover_retire` and
+//     `HostComposition::backup_dispatch_prepare` each own the single operation
+//     they themselves run (`host-backup-cutover-failed` /
+//     `host-backup-cutover-disposition-failed` /
+//     `host-backup-cutover-retire-failed` / `host-backup-prepare-failed`). None
+//     of them is reachable from the dispatch-owner boundary, so their guards
+//     never nest inside it.
+//
+// `HostBackupDispatchOwner::dispatch_backup_operation` (host `lib.rs`), the pipe
+// ingress that hands a request to that owner boundary, deliberately arms NO
+// guard: it does not run the operation. A refusal it returns is either a
+// closed-table routing miss the nonterminal `observe_live_cutover_dispatch`
+// record already names by static category, or the owner boundary's own refusal
+// propagated back verbatim through `HostBackupDispatchQueue::submit` — and
+// re-reporting that second kind there is exactly the duplicate terminal report
+// W4 forbids. Every frozen code above stays distinct from the others and from a
+// separate process shutdown failure (`host-stop-failed`, `host-open-failed`).
+// Nothing here is deduplicated away: there is no global dedup cache, so a second
 // failed operation still reports its own terminal.
 //
-// Production call sites (#983). There are TWO distinct live cutover contours
-// and each is observed on its own token; they are not the same observation and
-// never claim the same thing.
+// An operation can fail BY DISPOSITION rather than by `Err`, and a
+// `Result`-driven guard alone would miss exactly that case: this module's
+// owners answer a refusal with `Ok(CutoverOutcome { disposition: Failed, .. })`
+// once the durable intent reached its terminal `CutoverIntentState::Failed`
+// state, and `reconcile_cutover_outcome` is the projection that produces that
+// word from the owners themselves. The three guards therefore settle through
+// [`cutover_disposition_reports_failure`] beside
+// [`cutover_disposition_token`] - the one owner that classifies every
+// disposition - and stay armed exactly for the owner's own failure word, so
+// the owed terminal record is emitted and the typed `CutoverOutcome` still
+// leaves the boundary unchanged. `Unknown` is not one of those words:
+// preserved uncertainty under the original operation identity is not a failure
+// (I14.21), and it must never be reported as one.
 //
-// 1. The live cutover DISPATCH contour. `HostBackupDispatchOwner::
-//    dispatch_backup_operation` (host `lib.rs`) is the one production cutover
-//    ingress in this base: `HostComposition::backup_owner_registration`
-//    registers it on the Host control endpoint's closed prepare/cutover
-//    dispatch table, and the endpoint installs that registration on the
-//    canonical runtime-control pipe, so `eliot-kernel`'s
-//    `HostBackupOwnerClient` dispatches a cutover through it across the process
-//    boundary. `observe_live_cutover_dispatch` observes that owner decision.
-//    Its `op` token is `LIVE_CUTOVER_OP` and its `disposition` field is always
-//    `"none"`: a ROUTED cutover proves only that it selected the cutover
-//    target, never that it was admitted, activated, committed or retired, and
-//    rehearsal completion is excluded from cutover admission upstream so it
-//    can never produce a cutover word of any kind from this path.
+// Production call site (#983). There is ONE live cutover contour observed by a
+// logging-only helper, and it is observed on its own token; the disposition
+// reads are the separately admitted ones, not this contour.
 //
-// 2. The live cutover DISPOSITION contour. `HostComposition::
-//    reconcile_approved_contour` (reached from `fn main` through
-//    `run_scm_contour_tick`) calls `observe_retained_cutover_disposition`, which
-//    reports the retained `pending_cutover` word that
-//    `cutover_disposition_token` projects from the OWNER'S returned evidence.
-//    Its `op` token is `RETAINED_CUTOVER_OP`.
+// The live cutover DISPATCH contour. `HostBackupDispatchOwner::
+// dispatch_backup_operation` (host `lib.rs`) is the one production cutover
+// ingress in this base: `HostComposition::backup_owner_registration`
+// registers it on the Host control endpoint's closed prepare/cutover
+// dispatch table, and the endpoint installs that registration on the
+// canonical runtime-control pipe, so `eliot-kernel`'s
+// `HostBackupOwnerClient` dispatches a cutover through it across the process
+// boundary. `observe_live_cutover_dispatch` observes that owner decision.
+// Its `op` token is `LIVE_CUTOVER_OP` and its `disposition` field is always
+// `"none"`: a ROUTED cutover proves only that it selected the cutover
+// target, never that it was admitted, activated, committed or retired, and
+// rehearsal completion is excluded from cutover admission upstream so it
+// can never produce a cutover word of any kind from this path.
 //
+// The two-owner DISPOSITION read is reached only from the separately admitted
+// `HostComposition::backup_dispatch_cutover_disposition` port, under
+// `READ_DISPOSITION_OP`, and it reports the `pending_cutover` word that
+// `cutover_disposition_token` projects from the OWNER'S returned evidence.
 // Requested (a routed cutover) and owner-observed commit (the two-owner
 // disposition read) therefore stay two distinct records under two distinct
 // tokens; neither is derived from the other's spelling.
 //
-// What contour 2 does NOT do is reach `validate_cutover_request`. Its owner
-// gate set requires an admitted `CutoverRequest` plus the #960 owner-issued
-// `IsolatedRecoveryEvidence`, and NEITHER is reconstructible from the durable
-// journal slot (`CutoverIntentRecord` retains no envelope, admission receipt,
-// archive digest/class, activation fence, or recovery evidence). Those two
-// values are held only by the admitted cutover dispatch
-// `HostComposition::backup_dispatch_cutover`, which is the port contour 1's
-// owner is defined in terms of but which this base does not itself invoke: the
-// live owner arm above refuses with a bounded typed refusal precisely because
-// no separately admitted cutover body is retained. Turning that refusal into a
-// real admitted call needs the #962/#945 transport surface this issue does not
-// own, so the gap is stated here rather than papered over with a fabricated
-// request. `validate_cutover_request` therefore has exactly one production
-// caller, `HostComposition::backup_dispatch_cutover`, and its diagnostic
-// records are emitted on the same `op` token the owner arm would file them
-// under, so the records line up if and when that transport lands.
+// There is NO contour-retained disposition observation, and its absence is
+// deliberate. `HostComposition::reconcile_approved_contour` (reached from
+// `fn main` through `run_scm_contour_tick`) used to call a helper whose whole
+// effect was progress logging: it discarded the outcome it read, and per tick
+// of an occupied slot it opened the installation registry up to
+// `CUTOVER_DISPOSITION_READ_ATTEMPTS` times and sampled the journal six times,
+// purely to emit log lines. W2 admits no additional owner reads, resource
+// acquisition, hashing, retries or mutation for logging, so the observation,
+// its operation token and the retained-intent readback constructor that only it
+// needed are removed rather than downgraded. Nothing loses a gate or a decision
+// with them: a cutover disposition was never allowed to steer that process /
+// readiness reconcile, and no caller ever read the returned outcome. The
+// retained disposition stays observable through the admitted status port.
 //
-// What that gap does NOT justify is projecting a disposition from the journal
-// slot alone. The `CutoverIntentRecord` DOES retain this operation's
-// installation, cutover operation, canonical request digest, target generation
-// and expected predecessor, and the installation registry DOES retain the
-// active generation AND its own operation-bound activation receipt, so the two
-// owners' discriminators for an OUTSTANDING cutover are reachable without an
-// admitted request. `observe_retained_cutover_disposition` therefore probes the
-// journal's own `pending_cutover` slot FIRST and returns without any registry
-// work when that slot is empty, and when the slot is occupied it hands
-// `CutoverReadback::from_retained_intent` to `read_cutover_disposition`.
+// `validate_cutover_request` is NOT reached by any logging-only observation.
+// Its owner gate set requires an admitted `CutoverRequest` plus the #960
+// owner-issued `IsolatedRecoveryEvidence`, and NEITHER is reconstructible from
+// the durable journal slot (`CutoverIntentRecord` retains no envelope, admission
+// receipt, archive digest/class, activation fence, or recovery evidence). Those
+// two values are held only by the admitted cutover dispatch
+// `HostComposition::backup_dispatch_cutover`, which is the port the dispatch
+// contour's owner is defined in terms of but which this base does not itself
+// invoke: the live owner arm above refuses with a bounded typed refusal
+// precisely because no separately admitted cutover body is retained. Turning
+// that refusal into a real admitted call needs the #962/#945 transport surface
+// this issue does not own, so the gap is stated here rather than papered over
+// with a fabricated request. `validate_cutover_request` therefore has exactly
+// one production caller, `HostComposition::backup_dispatch_cutover`, and its
+// diagnostic records are emitted on the same `op` token the owner arm would
+// file them under, so the records line up if and when that transport lands.
 //
-// There is ONE status read model, not two. The contour entrance and
-// `HostComposition::backup_dispatch_cutover_disposition` differ only in which
-// owner names the operation and in the diagnostic `op` token; both read the
-// registry and the journal, bracket the journal on BOTH sides of the registry
-// load with the same `cutover_observation_unchanged` coherence check and the
-// same `CUTOVER_DISPOSITION_READ_ATTEMPTS` ceiling, resolve the retirement
-// through the same journal-owner lookup, and project through the same
-// `reconcile_cutover_outcome` arms. A journal-slot read therefore cannot claim
-// "the effect has not been applied" from one owner, cannot claim a flip nobody
-// attributed to this operation, and cannot describe one durable state with a
-// different word than the status port — including a settled cutover the
-// retirement owner has resolved, which is `Reconciled` on BOTH paths.
+// There is ONE status read model, not two. Every disposition read enters
+// `read_cutover_disposition`; it reads the registry and the journal, brackets
+// the journal on BOTH sides of the registry load with the same
+// `cutover_observation_unchanged` coherence check and the same
+// `CUTOVER_DISPOSITION_READ_ATTEMPTS` ceiling, resolves the retirement through
+// the same journal-owner lookup, and projects through the same
+// `reconcile_cutover_outcome` arms, so no path can claim "the effect has not
+// been applied" from one owner, claim a flip nobody attributed to this
+// operation, or describe one durable state with a different word than the
+// status port — including a settled cutover the retirement owner has resolved,
+// which is `Reconciled` on both the admitted port and the post-commit
+// reconciliation.
 //
 // Explicit no-event list: `is_exact_replay`/`check_replay_identity` (pure
 // predicates; the observed replay is recorded at the committed-intent return
@@ -1321,96 +1387,33 @@ fn cutover_disposition_token(disposition: CutoverDisposition) -> &'static str {
     }
 }
 
-/// Observes the live disposition the Host journal owner currently retains for
-/// one outstanding installation cutover, on the Host's existing approved
-/// contour reconcile (`HostComposition::reconcile_approved_contour`).
+/// Whether one owner [`CutoverDisposition`] reports this cutover operation
+/// itself as terminally failed, so the caller boundary that owns this
+/// operation's single terminal record still owes that record even though the
+/// operation returned `Ok`.
 ///
-/// This is the live Host contour's half of the SHARED status read model. It
-/// reports through [`read_cutover_disposition`] and therefore
-/// [`reconcile_cutover_outcome`], with a [`CutoverReadback`] built by
-/// [`CutoverReadback::from_retained_intent`] from the Host journal owner's own
-/// durable [`CutoverIntentRecord`]. There is therefore ONE status read model
-/// with two entrances: this one and
-/// [`crate::HostComposition::backup_dispatch_cutover_disposition`]. Neither is
-/// a second projection — the same owners, the same three-sample journal
-/// bracket, the same journal-owner retirement lookup, and the same decision
-/// arms describe the same durable state on both, so the contour can no longer
-/// report a state the status port would describe differently.
-///
-/// The readback carries no authority, so the contour reports a historical
-/// result without reopening execution admission: it never reaches
-/// `validate_cutover_request`, and no envelope, admission receipt, archive
-/// digest/class, activation fence or recovery evidence is reconstructible from
-/// the durable slot (and none is needed for a status read). This path also
-/// passes no `AppendReceipt` hint, so nothing a caller once saw can be attached
-/// as if it proved a retirement here.
-///
-/// Strictly a read-and-observe owner path: it appends nothing, mutates no
-/// registry, activates nothing, retires nothing, and resolves no cutover.
-///
-/// # The journal slot is read BEFORE the registry
-///
-/// The single `pending_cutover` slot is the journal owner's own projection, and
-/// it is sampled first. An empty slot is the whole answer: there is no
-/// outstanding cutover and nothing to observe, so this returns `Ok(None)`
-/// without opening the registry at all. That ordering is what keeps an
-/// installation that never had a cutover free of ANY registry work on the
-/// contour — [`HostComposition::open_registry_store`] takes a short-lived
-/// EXCLUSIVE redb writer handle whose bounded contention retry can sleep for
-/// seconds, and paying that on every readiness contour tick for an
-/// installation that has no cutover would put a multi-second stall on the
-/// contour for a read whose answer is already known to be "nothing". The
-/// registry is therefore opened only when there is a retained intent to report
-/// against it.
-///
-/// That pre-sample is a PRESENCE PROBE and nothing more. It decides only
-/// whether there is anything to report; it supplies the operation identity the
-/// shared read model then re-reads and re-proves from the same journal owner,
-/// so a cutover that replaces the slot between the probe and the shared read
-/// is reported as the foreign-intent unknown the mapper already produces, and
-/// the NEXT contour tick reports the new one. The shared read is bracketed on
-/// BOTH sides by its own journal samples, so the reported pair still comes
-/// from one read; the early return removes registry work for an empty slot and
-/// does not weaken the coherence proof for a non-empty one.
-///
-/// When a cutover IS outstanding, the disposition repeats the owners' recorded
-/// observation verbatim through [`cutover_disposition_token`] and the bounded
-/// evidence count is a number, never a handle, digest, or request identity.
-/// The operation identity it reports is the retained intent's OWN durable
-/// installation, cutover operation and canonical request digest, so a caller
-/// can re-read this exact operation and it is never dropped because the
-/// outcome is ambiguous.
-///
-/// A read that FAILS is an error, never a disposition: a missing registry
-/// file, a failed journal load or a pair that never settles is not progress.
-/// That error is reported under this contour's own `op` token,
-/// `contour_reconcile`, which is the same token its
-/// [`observe_cutover_progress`] records use, so a failure here is never filed
-/// under [`read_cutover_disposition`]'s `read_disposition` name.
-pub fn observe_retained_cutover_disposition(
-    host: &HostComposition,
-) -> Result<Option<CutoverOutcome>, HostError> {
-    let probe = host.journal.snapshot().map_err(|error| {
-        note_cutover_read_error(RETAINED_CUTOVER_OP, super::HostError::from(error))
-    })?;
-    // An empty slot settles the whole observation before any registry work. A
-    // cutover that lands after this probe is simply not reported on this tick:
-    // no projection is produced from a read that cannot have seen the record.
-    let Some(intent) = probe.pending_cutover.as_ref() else {
-        return Ok(None);
-    };
-    // Every field is the durable record's own value, so the readback and the
-    // intent the journal owner holds describe the same operation by
-    // construction, and this is the constructor that takes no admitted body.
-    let readback = CutoverReadback::from_retained_intent(intent);
-    let outcome = read_cutover_disposition(host, RETAINED_CUTOVER_OP, &readback, None)?;
-    observe_cutover_progress(
-        RETAINED_CUTOVER_OP,
-        "retained_intent",
-        cutover_disposition_token(outcome.disposition),
-        backup_cutover_count(outcome.evidence_refs.len()),
-    );
-    Ok(Some(outcome))
+/// Exhaustive and closed on purpose. A cutover that fails BY DISPOSITION
+/// rather than by `Err` is a real, owner-observed failure of the operation,
+/// not an absent or incomplete channel: the durable intent for this exact
+/// operation reached the terminal `Failed` state, and that is the only thing
+/// this predicate reports. `Unknown` is deliberately NOT one of them — it is
+/// the preserved uncertainty of a lost response or a torn owner pair
+/// (I14.21), and reading it as a failure would manufacture a terminal the
+/// owners never proved. Every other variant is progress or a settlement, so
+/// each is named rather than defaulted, and a disposition added later cannot
+/// compile without being classified here.
+#[must_use]
+pub fn cutover_disposition_reports_failure(disposition: CutoverDisposition) -> bool {
+    match disposition {
+        CutoverDisposition::Failed => true,
+        CutoverDisposition::Requested
+        | CutoverDisposition::Validated
+        | CutoverDisposition::Prepared
+        | CutoverDisposition::Committed
+        | CutoverDisposition::Reconciled
+        | CutoverDisposition::RetirementPending
+        | CutoverDisposition::Unknown => false,
+    }
 }
 
 /// Observes the live cutover ADMISSION decision taken by the Host's registered
@@ -1450,10 +1453,10 @@ pub fn observe_retained_cutover_disposition(
 /// The `disposition` field is deliberately `"none"`: this records an admission
 /// DECISION, never an owner-observed cutover disposition. The disposition words
 /// come from the two-owner evidence read through [`cutover_disposition_token`]
-/// on the live contour, so a REQUESTED cutover here and an OWNER-OBSERVED
-/// disposition there stay distinct records rather than one overwriting the
-/// other, and a rehearsal or a routed-but-refused cutover can never produce a
-/// `committed` word from this path.
+/// on the admitted status contour, so a REQUESTED cutover here and an
+/// OWNER-OBSERVED disposition there stay distinct records rather than one
+/// overwriting the other, and a rehearsal or a routed-but-refused cutover can
+/// never produce a `committed` word from this path.
 ///
 /// It is an OBSERVATION beside the routing decision, not a second gate on it and
 /// not a recovery, readiness or authority receipt. It reads no journal, opens no
@@ -1474,24 +1477,85 @@ pub fn observe_live_cutover_dispatch(
                 "stale_cutover_registration"
             }
         }
-        (_, Some(crate::BackupDispatchTarget::Prepare)) => "admission_not_required",
+        // `Prepare` and `Reconcile` share this category on purpose. The
+        // status/reconciliation read carries no cutover admission and can never
+        // reach the `Cutover` arm, so it reports the same "no cutover admission
+        // required" category as the preparation path and adds no cutover word of
+        // its own.
+        (
+            _,
+            Some(crate::BackupDispatchTarget::Prepare | crate::BackupDispatchTarget::Reconcile),
+        ) => "admission_not_required",
     };
-    observe_cutover_progress(LIVE_CUTOVER_OP, outcome, "none", 0);
+    // #983 W2: this decision precedes every owner gate, so nothing about the
+    // operation is validated yet. The record therefore correlates by its static
+    // category alone and every identity slot renders `missing`; a presented
+    // operation id would be an unvalidated caller string and is never carried.
+    observe_cutover_progress(
+        LIVE_CUTOVER_OP,
+        outcome,
+        "none",
+        &CutoverPhaseCorrelation::unvalidated(),
+        0,
+    );
+}
+
+/// The [`CutoverPhaseCorrelation`] for a phase on any contour that holds a
+/// SEALED cutover.
+///
+/// Derived from the sealed request rather than from presented text:
+/// [`ValidatedCutover::seal`] already ran the authoritative admitted-payload
+/// check, so the retained content-checked body equals the admitted one and the
+/// presented operation triple equals the body-derived one —
+/// [`ValidatedCutover::sealed_operation`] says so explicitly, and
+/// [`CutoverReadback::from_request`] is then a pure field copy over the six
+/// bindings the status read model consumes. So this costs no owner read, no
+/// registry or journal access, no digest computation and no re-proof: it is the
+/// correlation the owners already established, reproduced for the record.
+///
+/// It is contour-neutral by design and used by the `validate`, `execute` and
+/// `retire_authorize` contours alike, because all three seal before they
+/// observe. A contour that has NOT sealed must not call this: it passes
+/// [`CutoverPhaseCorrelation::unvalidated`] instead.
+fn sealed_cutover_phase_correlation(validated: &ValidatedCutover) -> CutoverPhaseCorrelation {
+    CutoverPhaseCorrelation::for_readback(&CutoverReadback::from_request(validated.request()))
 }
 
 /// Observes one nonterminal cutover phase outcome after the decision exists.
 /// `disposition` repeats the owner-observed disposition (or `"none"` when the
 /// step produces none); `evidence_count` counts refs without naming them.
+///
+/// `correlation` carries the already-validated references W2 permits and nothing
+/// else. The pre-admission dispatch decision passes
+/// [`CutoverPhaseCorrelation::unvalidated`], which renders every slot `missing`,
+/// so a record filed before the owners validated this operation correlates by its
+/// static category alone. Every contour that has already sealed or read the
+/// admitted body passes the real correlation — the `validate`, `execute` and
+/// `retire_authorize` contours through
+/// [`sealed_cutover_phase_correlation`], the status and projection contours
+/// through [`CutoverPhaseCorrelation::for_readback`] — so the same stream ties a
+/// phase to the exact operation identity it belongs to. The record stays
+/// nonterminal: terminal ownership is the outer caller's, named beside the guard
+/// wiring.
 fn observe_cutover_progress(
     op: &'static str,
     outcome: &'static str,
     disposition: &'static str,
+    correlation: &CutoverPhaseCorrelation,
     evidence_count: u64,
 ) {
+    use crate::host_diagnostics::BoundedField;
     backup_cutover_note_event_log_unavailable();
     let op = crate::host_diagnostics::bound_field(op);
     let outcome = crate::host_diagnostics::bound_field(outcome);
     let disposition = crate::host_diagnostics::bound_field(disposition);
+    // A `None` slot renders empty WITH its `*_missing` flag true, so a reader
+    // checks the flag before the value and an absent correlation can never be
+    // mistaken for an identity this boundary did not hold.
+    let operation_id = correlation.operation_id.as_ref();
+    let request_digest = correlation.request_digest.as_ref();
+    let installation = correlation.installation.as_ref();
+    let target_generation = correlation.target_generation.as_ref();
     crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.cutover_phase",
@@ -1499,6 +1563,14 @@ fn observe_cutover_progress(
         outcome = outcome.text(),
         disposition = disposition.text(),
         evidence_count = evidence_count,
+        operation_id = operation_id.map_or("", BoundedField::text),
+        operation_id_missing = operation_id.is_none(),
+        request_digest = request_digest.map_or("", BoundedField::text),
+        request_digest_missing = request_digest.is_none(),
+        installation = installation.map_or("", BoundedField::text),
+        installation_missing = installation.is_none(),
+        target_generation = target_generation.map_or("", BoundedField::text),
+        target_generation_missing = target_generation.is_none(),
         "host backup cutover phase observed"
     );
 }
@@ -1525,11 +1597,9 @@ fn note_cutover_error(op: &'static str, error: CutoverError) -> CutoverError {
 /// a failed read is an error, never a disposition.
 ///
 /// `op` names the CALLING CONTOUR, so a failure is never filed under another
-/// contour's name: the admitted-request read passes `read_disposition` and
-/// [`observe_retained_cutover_disposition`] passes [`RETAINED_CUTOVER_OP`].
-/// Both are the same owner read through the same [`read_cutover_disposition`],
-/// but they are different contours and the diagnostic has to be attributable
-/// to one of them. `op` selects no branch.
+/// contour's name: the admitted-request read passes [`READ_DISPOSITION_OP`].
+/// It is an attribution field for the same owner read through the same
+/// [`read_cutover_disposition`], not a second one; `op` selects no branch.
 fn note_cutover_read_error(op: &'static str, error: super::HostError) -> super::HostError {
     backup_cutover_note_event_log_unavailable();
     let op = crate::host_diagnostics::bound_field(op);
@@ -1983,8 +2053,12 @@ pub fn plan_cutover_attempt(
 /// the expected predecessor.
 ///
 /// The outcome is observed once: success repeats the validated disposition,
-/// and each refusal carries its exact typed category. No request, evidence,
-/// or receipt string is logged.
+/// and each refusal carries its exact typed category. The success record is
+/// emitted only after the seal exists, so it may correlate with the operation
+/// identity and approved target the seal just proved
+/// ([`CutoverPhaseCorrelation`]); the refusal records precede the seal and
+/// carry their static category alone. No request, evidence, or receipt string is
+/// logged on either path.
 pub fn validate_cutover_request(
     request: &CutoverRequest,
     evidence: &IsolatedRecoveryEvidence,
@@ -1997,6 +2071,7 @@ pub fn validate_cutover_request(
                 "validate",
                 "validated",
                 "validated",
+                &sealed_cutover_phase_correlation(&validated),
                 backup_cutover_count(validated.evidence().fenced_introductions.len()),
             );
             Ok(validated)
@@ -2424,6 +2499,7 @@ fn execute_cutover_inner(
         "execute",
         "activation_settled",
         cutover_disposition_token(committed_outcome.disposition),
+        &sealed_cutover_phase_correlation(validated),
         backup_cutover_count(committed_outcome.evidence_refs.len()),
     );
     Ok((committed_outcome, barrier))
@@ -2461,6 +2537,7 @@ fn recover_retained_cutover(
                 "execute",
                 "replay_observed",
                 "committed",
+                &sealed_cutover_phase_correlation(validated),
                 backup_cutover_count(evidence_refs.len()),
             );
             CutoverOutcome {
@@ -2484,6 +2561,7 @@ fn recover_retained_cutover(
                 "execute",
                 "recovered_commit",
                 "committed",
+                &sealed_cutover_phase_correlation(validated),
                 backup_cutover_count(outcome.evidence_refs.len()),
             );
             outcome
@@ -2502,6 +2580,7 @@ fn recover_retained_cutover(
                 "execute",
                 "retained_unknown",
                 "unknown",
+                &sealed_cutover_phase_correlation(validated),
                 backup_cutover_count(outcome.evidence_refs.len()),
             );
             outcome
@@ -2874,6 +2953,7 @@ fn activate_cutover_contour(
         "execute",
         "activation_unestablished",
         cutover_disposition_token(outcome.disposition),
+        &sealed_cutover_phase_correlation(validated),
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     // The contour's own refusal is observed through the module's existing
@@ -2886,12 +2966,12 @@ fn activate_cutover_contour(
 
 /// Reads the exact cutover disposition for one operation from the real owners.
 ///
-/// This is the shared status read model. It backs
+/// This is the ONE status read model. It backs
 /// [`crate::HostComposition::backup_dispatch_cutover_disposition`] for the
-/// separately admitted request read, and
-/// [`observe_retained_cutover_disposition`] for the live Host contour, so both
-/// read the same owners through the same bracketing, resolve the retirement
-/// through the same journal-owner lookup, and project through the same
+/// separately admitted request read, and the post-commit reconciliation in
+/// [`crate::HostComposition::backup_dispatch_cutover`], so both read the same
+/// owners through the same bracketing, resolve the retirement through the same
+/// journal-owner lookup, and project through the same
 /// [`reconcile_cutover_outcome`] arms. `op` names the calling contour for the
 /// FAILED-READ attribution in the diagnostic stream only; it selects nothing.
 /// This read's own recheck record keeps [`READ_DISPOSITION_OP`], exactly as the
@@ -2994,6 +3074,7 @@ pub fn read_cutover_disposition(
             READ_DISPOSITION_OP,
             "recheck",
             "owner_moved",
+            &CutoverPhaseCorrelation::for_readback(readback),
             backup_cutover_count(usize::from(attempt)),
         );
         if attempt >= CUTOVER_DISPOSITION_READ_ATTEMPTS {
@@ -3767,7 +3848,31 @@ pub fn retire_authorized_generation(
     let PredecessorRelationResolution::Bound(relation) =
         resolve_predecessor_retirement_relation(host, request, &operation, &journal)
     else {
-        observe_cutover_progress("retire_authorize", "relation_unavailable", "unknown", 0);
+        // #983 W2: the real correlation, not the empty one. By this point
+        // `retire_authorized_generation` has SEALED the body
+        // (`ValidatedCutover::seal` at the top of this function ran the
+        // authoritative admitted-payload check), the durable intent above was
+        // matched against the SEALED body's own operation identity, and the
+        // barrier's activation id, activation generation and state fence were
+        // all proved equal to the admitted body's. So the operation identity
+        // triple and the target generation this record reports on are
+        // owner-validated references, which is exactly the class W2 admits.
+        //
+        // The alternative — `CutoverPhaseCorrelation::unvalidated()` — would be
+        // false here rather than merely cautious: it would claim this boundary
+        // holds no operation identity while `operation` sits in scope as the
+        // sealed derivation, and it would make this `Unknown` record the one
+        // retirement record in the module that cannot be attributed to the
+        // operation it is about (I5.27). The neighbouring `note_cutover_error`
+        // refusals on this contour stay on their static `category`, because a
+        // refusal is filed before its decision exists and carries no result.
+        observe_cutover_progress(
+            "retire_authorize",
+            "relation_unavailable",
+            "unknown",
+            &sealed_cutover_phase_correlation(&validated),
+            0,
+        );
         return Ok(CutoverOutcome {
             disposition: CutoverDisposition::Unknown,
             residual: CutoverResidual::PredecessorEpochUnknown,
@@ -4072,6 +4177,7 @@ fn retire_prior_generation(
         "retire",
         "reconciled",
         "reconciled",
+        &sealed_cutover_phase_correlation(validated),
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     Ok(outcome)
@@ -4092,9 +4198,9 @@ fn retire_prior_generation(
 /// `resolve_cutover_retirement` — a record selected from the log the journal
 /// replayed, never from a presented receipt.
 ///
-/// The `readback` is the SHARED status read model, so this pure mapper is
-/// reachable from BOTH contours — the separately admitted request read and the
-/// live Host contour's retained-intent observation — and both read the same
+/// The `readback` is the ONE status read model, so this pure mapper is
+/// reachable from both admitted status contours — the separately admitted
+/// request read and the post-commit reconciliation — and both read the same
 /// owners through the same bracketing. It reads only the six bindings a status
 /// projection consumes, and it grants no authority.
 ///
@@ -4420,10 +4526,19 @@ pub fn reconcile_cutover_outcome(
     // The projected disposition repeats the owner observations verbatim:
     // ambiguity stays unknown with the original operation identity, and no
     // rollback request or archive hash can surface as a commit here.
+    //
+    // #983 W2: this is the record that most needs the operation identity, and it
+    // is the one place that holds it in VALIDATED form — `readback` was built
+    // from the admitted cutover body through `CutoverReadback::from_request`, so
+    // every slot below is an owner-proved reference for exactly the operation
+    // this projection is about. An observed replay, an unknown, a superseded
+    // retirement and a proven commit therefore stay separately attributable
+    // instead of being four anonymous `cutover_phase` lines (I5.27).
     observe_cutover_progress(
         "reconcile",
         "projected",
         cutover_disposition_token(outcome.disposition),
+        &CutoverPhaseCorrelation::for_readback(readback),
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     outcome

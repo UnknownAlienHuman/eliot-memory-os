@@ -378,6 +378,13 @@ pub(super) fn phase_b_live_launch(
         )
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let mut live = live;
+    if live.user_broker_executable_path != template.user_broker_executable_path
+        || live.user_broker_artifact_digest != template.user_broker_artifact_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "Phase-B projection changed the approved User Broker artifact binding".to_owned(),
+        ));
+    }
     live.installation_epoch = phase_b_live_installation_epoch(host);
     live.with_computed_digest()
         .map_err(|error| HostError::ProcessContour(error.to_string()))

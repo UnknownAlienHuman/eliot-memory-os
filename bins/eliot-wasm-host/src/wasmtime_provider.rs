@@ -673,7 +673,7 @@ fn classify_trap(error: &wasmtime::Error) -> EngineTermination {
     }
 }
 
-fn is_instance_limit_error(error: &wasmtime::Error) -> bool {
+pub(crate) fn is_instance_limit_error(error: &wasmtime::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("instance") && (message.contains("limit") || message.contains("maximum"))
 }

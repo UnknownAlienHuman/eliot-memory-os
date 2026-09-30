@@ -111,7 +111,7 @@ fn lease() -> RuntimeLease {
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         },
-        "state": "ACTIVE"
+        "state": "ACTIVE", "expires_at_ms": 4000000000000
     })))
 }
 
@@ -346,6 +346,7 @@ impl SourceVerificationPort for SourceMock {
         }
         Ok(SourceVerification {
             assurance,
+            security_assessment: None,
             verification_revision: must(Revision::new(1)),
             verification_receipt_digest: digest('4'),
         })

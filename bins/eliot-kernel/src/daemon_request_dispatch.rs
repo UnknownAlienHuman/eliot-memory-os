@@ -25,11 +25,12 @@ use eliot_kernel_service::{
     UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
     UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
-    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
-    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
+    UserAutomationOperatorRuntime, UserAutomationOwnerLookup, UserAutomationRuntimeAdmission,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
+    resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -3757,6 +3758,15 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
         };
         if request_fence != &session.module_generation.state_fence {
             return Err(TransportError::SessionFenced);
@@ -3793,6 +3803,13 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_enumeration(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_horizon(session, request)
                         .await,
                 )
             }
@@ -3853,6 +3870,13 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_enumeration(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_horizon(session, request)
                         .await,
                 )
             }
@@ -3936,7 +3960,92 @@ impl KernelComposition {
                     Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
                 }
             }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request } => {
+                let answer = match Box::pin(client.publish_wake_horizon(request.clone())).await {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        return Ok(Self::user_automation_runtime_error_response(error));
+                    }
+                };
+                Ok(Self::user_automation_horizon_publication_response(
+                    "wake_horizon_published",
+                    request.as_ref(),
+                    &answer,
+                ))
+            }
+            UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                let answer =
+                    match Box::pin(client.read_wake_horizon_publication(request.clone())).await {
+                        Ok(answer) => answer,
+                        Err(error) => {
+                            return Ok(Self::user_automation_runtime_error_response(error));
+                        }
+                    };
+                Ok(Self::user_automation_horizon_publication_response(
+                    "wake_horizon_publication_readback",
+                    request.as_ref(),
+                    &answer,
+                ))
+            }
         }
+    }
+
+    #[cfg(windows)]
+    /// Projects one schedule owner's horizon answer against the exact request it
+    /// was asked for (issue #2806 items 4 and 9).
+    ///
+    /// The owner's acknowledgement is validated against the exact publication
+    /// through `UserAutomationWakePublication::validate_for`, which requires the
+    /// acknowledged and remaining sets to partition the requested set exactly.
+    /// An answer that does not account for the request is reported as unknown
+    /// rather than as a partial success, because a mismatched remainder is not
+    /// evidence about any occurrence.
+    ///
+    /// A remainder is never projected as completion. When the owner leaves
+    /// occurrences unacknowledged, the exact remaining set and the owner's own
+    /// replay handle are returned as the recovery directive, which forces
+    /// `status: "unknown"`; only an answer that acknowledged the whole requested
+    /// set settles the route.
+    ///
+    /// The answer is borrowed rather than taken by value: it is read twice — once
+    /// to validate it against the request and once to project it — and
+    /// `serde_json::json!` borrows every interpolated expression, so a by-value
+    /// parameter would be copied in and never consumed.
+    #[cfg(windows)]
+    fn user_automation_horizon_publication_response(
+        outcome: &str,
+        request: &UserAutomationWakeHorizonPublication,
+        answer: &UserAutomationWakePublication,
+    ) -> serde_json::Value {
+        if let Err(error) = answer.validate_for(request) {
+            return Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "the schedule owner answer does not account for the requested horizon: {error}"
+                )),
+            );
+        }
+        let recovery = if answer.acknowledged_all() {
+            None
+        } else {
+            Some(serde_json::json!({
+                "kind": "partial_horizon",
+                "reason": "the schedule owner did not acknowledge every requested occurrence, so \
+                           the exact remaining set is retained and must be replayed under its \
+                           handle",
+                "automation_id": &answer.automation_id,
+                "automation_revision": &answer.automation_revision,
+                "remaining_occurrence_ids": &answer.remaining_occurrence_ids,
+                "retry_handle": &answer.retry_handle,
+            }))
+        };
+        serde_json::json!({
+            "status": if recovery.is_none() { "known" } else { "unknown" },
+            "value": {
+                "outcome": outcome,
+                "publication": answer,
+            },
+            "recovery": recovery,
+        })
     }
 
     #[cfg(windows)]
@@ -4944,11 +5053,14 @@ impl KernelComposition {
     /// Every refusal happens before the effect owner is contacted, and a refusal
     /// returns the closed cause and the existing operation rather than prose.
     ///
-    /// After the Durable Job owner acknowledges the admission, the next bounded
-    /// recurring horizon slice is requested through the same schedule owner
-    /// (item 6). The advance recompiles the denominator from the immutable
-    /// revision the wake resolved against, so it never mutates that revision and
-    /// never produces a time outside its normalized contract.
+    /// After the Durable Job owner issues an owner-acknowledged disposition —
+    /// an admission, or a refusal it answered before any owner effect — the
+    /// next bounded recurring horizon slice is requested through the same
+    /// schedule owner (item 6). The advance recompiles the denominator from the
+    /// immutable revision the wake resolved against, so it never mutates that
+    /// revision and never produces a time outside its normalized contract. A
+    /// disposition the owner could not issue, or could not confirm, advances
+    /// nothing.
     #[cfg(windows)]
     async fn user_automation_due_wake_operation(
         &self,
@@ -5000,15 +5112,67 @@ impl KernelComposition {
         // Durable Job owner's own operation identity is the at-most-once
         // boundary; the revalidation above already refused any occurrence that
         // the complete owner projection shows as already admitted.
-        let execution = match client.admit_occurrence(request.clone()).await {
-            Ok(execution) => execution,
-            Err(error) => {
-                // No owner acknowledged a disposition, so the recurring horizon
-                // does not advance: this wake is still unconsumed and a later
-                // owner-issued submission can admit it.
-                return Ok(Self::user_automation_runtime_error_response(error));
-            }
-        };
+        //
+        // The admission is assembled from what the owners proved on this very
+        // delivery rather than forwarded from the caller's asserted carrier: the
+        // current canonical revision, the invocation `scheduled_invocation`
+        // re-derived from that revision for this occurrence, and the WakeIntent
+        // the schedule owner read back from its own journal. Nothing here is
+        // recomputed or re-derived by spelling.
+        //
+        // It is then submitted through the existing runtime execution join,
+        // `UserAutomationOperatorRuntime` — the production
+        // `UserAutomationRuntimePort` over this already-authenticated Host
+        // channel, the same join `run-now` composes in
+        // `dispatch_user_automation_operator_transition`. That join revalidates
+        // the exact admission, resolves the complete owner-issued
+        // `UserAutomationDurableJobMaterial` through
+        // `UserAutomationDurableJobMaterial::from_admitted_occurrence` when this
+        // ingress carries none, and validates the owner's answer. Calling
+        // `UserAutomationDurableJobPort::admit_occurrence` on the bare client,
+        // as this contour did, reached the Durable Job owner with no
+        // `UserAutomationDurableJobMaterial` at all and so could never reach
+        // `HostDurableJobOwner::dreamer_job`.
+        let execution =
+            match Self::user_automation_due_wake_join(client, &request, &resolution, &readback)
+                .await
+            {
+                Ok(execution) => execution,
+                // Item 6, terminal leg. A refusal the Durable Job owner answered
+                // before any owner effect is a decided disposition about this
+                // occurrence, exactly as an admission is: the occurrence will not be
+                // admitted now, so leaving the recurring horizon pinned to it would
+                // wedge every later occurrence of the revision behind one
+                // permanently-refused wake. It advances through the same
+                // owner-acknowledged path the admitted branch uses, and it is
+                // reported as its own disposition rather than as a success.
+                //
+                // `Unavailable`, `NotRetained`, `UnknownOutcome` and
+                // `OutcomeSettled` deliberately do not reach this arm: none of them
+                // is an owner-acknowledged disposition about this occurrence. They
+                // respectively mean the owner could not answer, it answered about
+                // another record, it cannot say whether the effect landed, and the
+                // effect provably landed. Those keep the pre-existing fail-closed
+                // projection and do not advance.
+                Err(error @ UserAutomationRuntimeError::Rejected(_)) => {
+                    return Self::user_automation_due_wake_terminal_response(
+                        session,
+                        &resolution,
+                        &occurrence_id,
+                        &request,
+                        &readback,
+                        client,
+                        error,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    // No owner acknowledged a disposition, so the recurring horizon
+                    // does not advance: this wake is still unconsumed and a later
+                    // owner-issued submission can admit it.
+                    return Ok(Self::user_automation_runtime_error_response(error));
+                }
+            };
         if let Err(error) = execution.validate() {
             return Ok(Self::user_automation_runtime_error_response(
                 UserAutomationRuntimeError::Rejected(error.to_string()),
@@ -5019,11 +5183,163 @@ impl KernelComposition {
                 UserAutomationRuntimeError::IdentityConflict,
             ));
         }
-        let horizon = Self::user_automation_due_wake_horizon(
+        Ok(Self::user_automation_due_wake_admitted_value(
             session,
             &resolution,
             &occurrence_id,
             &request,
+            &readback,
+            client,
+            execution,
+        )
+        .await)
+    }
+
+    /// Advances the recurring horizon after an owner-acknowledged admission and
+    /// reports the occurrence as admitted (issue #2806 item 6).
+    ///
+    /// The `status`/`recovery` pair is derived from the horizon alone, exactly as
+    /// before: only a fully acknowledged published horizon reports a settled
+    /// answer, and every partial, unknown or unavailable remainder keeps its
+    /// exact remaining occurrence set and replay handle.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_admitted_value(
+        session: &Session,
+        resolution: &UserAutomationDueWakeResolution,
+        occurrence_id: &str,
+        request: &UserAutomationRuntimeAdmission,
+        readback: &UserAutomationWakeReadback,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        execution: eliot_kernel_core::user_automation::AutomationExecutionReference,
+    ) -> serde_json::Value {
+        let horizon = Self::user_automation_due_wake_horizon(
+            session,
+            resolution,
+            occurrence_id,
+            request,
+            client,
+        )
+        .await;
+        let recovery = Self::user_automation_horizon_recovery(&horizon);
+        serde_json::json!({
+            "status": if recovery.is_none() { "known" } else { "unknown" },
+            "value": {
+                "outcome": "admitted",
+                "execution": execution,
+                "resolution": resolution,
+                "wake_readback": readback,
+                "horizon": horizon,
+            },
+            "recovery": recovery,
+        })
+    }
+
+    /// Assembles the admission this delivery submits to the runtime join.
+    ///
+    /// Every member is the owner-proven value from this delivery, not a field
+    /// forwarded from the caller's asserted carrier: the current canonical
+    /// revision and the occurrence `scheduled_invocation` re-derived from it,
+    /// plus the `WakeIntent` the schedule owner read back from its own journal.
+    /// `preflight` and any owner-issued Durable Job material are carried across
+    /// unchanged when the ingress supplies them, and the join resolves the
+    /// material itself when it does not.
+    #[cfg(windows)]
+    fn user_automation_due_wake_admission(
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        readback: &UserAutomationWakeReadback,
+    ) -> UserAutomationRuntimeAdmission {
+        UserAutomationRuntimeAdmission {
+            context: request.context.clone(),
+            authenticated_principal: request.authenticated_principal.clone(),
+            identity: request.identity.clone(),
+            revision: resolution.revision.clone(),
+            invocation: resolution.invocation.clone(),
+            preflight: request.preflight.clone(),
+            wake_intent: readback.intent.clone(),
+            durable_job: request.durable_job.clone(),
+        }
+    }
+
+    /// Submits one due occurrence to the runtime execution join and returns the
+    /// owner's answer (issue #2806 items 5 and 6).
+    ///
+    /// The admission is assembled and the join is awaited entirely inside this
+    /// contour, so `user_automation_due_wake_operation` never holds the join's
+    /// own state across its awaits. The join resolves the complete owner-issued
+    /// `UserAutomationDurableJobMaterial` through
+    /// `UserAutomationDurableJobMaterial::from_admitted_occurrence` whenever the
+    /// ingress carries none, and that compiler holds a whole canonical-JSON K0
+    /// `JobSubmission` and its digest inputs on the stack. Awaiting it inline
+    /// made the calling contour's future exceed the bounded size even though the
+    /// caller only ever reads the returned reference, so the join's future is
+    /// polled through one box: the transient allocation is released as soon as
+    /// the answer is back, and the caller's future stays bounded.
+    ///
+    /// The transport is already authenticated and bound to the current State
+    /// Fence by the caller, so this adds no channel, no retry and no second
+    /// admission: it is exactly the `UserAutomationOperatorRuntime` over that one
+    /// channel.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_join(
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        readback: &UserAutomationWakeReadback,
+    ) -> Result<
+        eliot_kernel_core::user_automation::AutomationExecutionReference,
+        UserAutomationRuntimeError,
+    > {
+        let runtime = UserAutomationOperatorRuntime::new(client);
+        Box::pin(
+            runtime.admit_occurrence(Self::user_automation_due_wake_admission(
+                request, resolution, readback,
+            )),
+        )
+        .await
+    }
+
+    /// Advances the recurring horizon after an owner-acknowledged terminal
+    /// refusal and reports the occurrence as terminal (issue #2806 item 6).
+    ///
+    /// The Durable Job owner refused this occurrence before any owner effect, so
+    /// it issued a decided answer about it rather than a lost one. The horizon
+    /// therefore advances exactly as it does after an admission, through the
+    /// same `user_automation_due_wake_horizon` slice request, and its outcome
+    /// and replay handle travel beside the refusal.
+    ///
+    /// The occurrence is reported as `accepted: false` with the owner's own
+    /// closed reason. It is not published, not admitted, and it carries no
+    /// Durable Job reference, so nothing here can be read as a success. The
+    /// route-level `recovery` stays derived from the horizon alone and is never
+    /// fabricated: a decided refusal with a fully acknowledged horizon owes the
+    /// caller nothing, which is the same convention
+    /// `user_automation_runtime_error_response` already uses for
+    /// `UserAutomationRuntimeError::Rejected`.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_terminal_response(
+        session: &Session,
+        resolution: &UserAutomationDueWakeResolution,
+        occurrence_id: &str,
+        request: &UserAutomationRuntimeAdmission,
+        readback: &UserAutomationWakeReadback,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        error: UserAutomationRuntimeError,
+    ) -> Result<serde_json::Value, TransportError> {
+        let UserAutomationRuntimeError::Rejected(reason) = error else {
+            return Ok(Self::user_automation_runtime_error_response(error));
+        };
+        let horizon = Self::user_automation_due_wake_horizon(
+            session,
+            resolution,
+            occurrence_id,
+            request,
             client,
         )
         .await;
@@ -5031,8 +5347,10 @@ impl KernelComposition {
         Ok(serde_json::json!({
             "status": if recovery.is_none() { "known" } else { "unknown" },
             "value": {
-                "outcome": "admitted",
-                "execution": execution,
+                "accepted": false,
+                "outcome": "rejected",
+                "reason": reason,
+                "occurrence_id": occurrence_id,
                 "resolution": resolution,
                 "wake_readback": readback,
                 "horizon": horizon,
@@ -5574,6 +5892,86 @@ impl KernelComposition {
                 .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
                 != request.revision_digest
             || owner_denominator != request.denominator
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        ensure_user_automation_store_receipt(&gateway, &lookup.state_fence, &request.identity)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates one bounded recurring wake horizon against the authenticated
+    /// owner and the canonical parent operation receipt before Host.
+    ///
+    /// A horizon publication belongs to the read/observation family, not the
+    /// occurrence family: it names an immutable revision and a State Fence but
+    /// no occurrence. `revalidate_user_automation_enumeration` is therefore its
+    /// exact analogue — the same `UserAutomationOwnerLookup`, the same canonical
+    /// owner readback, the same owner-recompiled occurrence denominator, and the
+    /// same parent Store receipt proof. `revalidate_user_automation_wake_read` is
+    /// not usable here because it keys on a `UserAutomationWakeReadRequest` and
+    /// its invocation.
+    ///
+    /// The caller-carried publication is never an authority source. The
+    /// automation identity, the revision, the owner principal and the complete
+    /// occurrence denominator are all recompiled from the canonical current
+    /// revision, and the carried `revision_digest` must equal that revision's
+    /// own `digest()` — a digest a caller could compute for itself would
+    /// otherwise name another revision's cursor. This is issue #2806 item 2's
+    /// "revalidate principal, revision, State Fence and owner denominator
+    /// before each owner call", applied to the publish leg and the read-back leg
+    /// alike.
+    async fn revalidate_user_automation_horizon(
+        &self,
+        session: &Session,
+        request: &UserAutomationWakeHorizonPublication,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal
+            || request.context.state_fence != session.module_generation.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.automation_id.clone(),
+            requested_revision: request.automation_revision.clone(),
+            authenticated_principal: authenticated_principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        let owner_occurrence_ids = owner
+            .revision
+            .compile_occurrence_identities()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        if owner.automation_id != request.automation_id
+            || owner.revision.revision != request.automation_revision
+            || owner.revision.owner_principal != authenticated_principal
+            || owner
+                .revision
+                .digest()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+                != request.revision_digest
+            || owner_occurrence_ids != request.denominator_occurrence_ids
         {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
@@ -6402,7 +6800,8 @@ impl KernelComposition {
         // with an empty cache and persisted write-ahead of the commit they
         // authorize, so a restart replays the same lineage. The response
         // stays a projection of that record, never a second ledger.
-        restore_pre_stage_corrections(&self.work_root, &self.pre_stage_identity_cache);
+        let restore_outcome =
+            restore_pre_stage_corrections(&self.work_root, &self.pre_stage_identity_cache);
         let (gate_outcome, pending_journal) = {
             let mut cache = self
                 .pre_stage_identity_cache
@@ -6420,28 +6819,47 @@ impl KernelComposition {
             let pending_journal = cache.take_journal_snapshot();
             (gate_outcome, pending_journal)
         };
-        if let Some(snapshot) = pending_journal {
-            // Write-ahead and best-effort: the helper below acknowledges the
-            // exact saved revision only after the rename commits, so a failed
-            // save stays pending and is offered again by the next take. The
-            // typed outcome is observed here but never fails the write whose
-            // retain it records.
-            let _persist_outcome = persist_pre_stage_corrections(
-                &self.work_root,
-                &self.pre_stage_identity_cache,
-                &snapshot,
-            );
-        }
-        let verified_correction = match gate_outcome {
+        // Write-ahead and best-effort: the helper below acknowledges the
+        // exact saved revision only after the checked durable replacement
+        // commits, so a failed save stays pending and is offered again
+        // by the next take. The typed outcome is consumed below but never
+        // fails the write whose retain it records.
+        let persist_outcome = pending_journal.as_ref().map(|snapshot| {
+            persist_pre_stage_corrections(&self.work_root, &self.pre_stage_identity_cache, snapshot)
+        });
+        // Consume the restore/save outcomes before admitting a dependent
+        // write (issue #1796, audit 5890973032 defect 2): a failed recovery
+        // or a failed save is reported on the commit response, and the write
+        // carries no correction lineage it cannot prove. Admission itself is
+        // unchanged: the write still proceeds, independent reads and
+        // unrelated subsystems are not stopped.
+        let journal_issue: Option<&'static str> = match restore_outcome {
+            JournalRestoreOutcome::RecoveryRequired => {
+                Some(JournalPersistOutcome::RecoveryRequired.issue_code())
+            }
+            JournalRestoreOutcome::Ready => match persist_outcome {
+                None | Some(JournalPersistOutcome::Persisted) => None,
+                Some(outcome) => Some(outcome.issue_code()),
+            },
+        };
+        let mut verified_correction = match gate_outcome {
             Err(rejection) => {
                 return Ok(Self::pre_stage_rejection_response(&rejection));
             }
             Ok(link) => link,
         };
+        if journal_issue.is_some() {
+            verified_correction = None;
+        }
         super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
         let gateway = self.retained_store_gateway()?;
         if let Some(replayed) = self
-            .replay_committed_apply_receipt(&gateway, &operation, verified_correction.as_ref())
+            .replay_committed_apply_receipt(
+                &gateway,
+                &operation,
+                verified_correction.as_ref(),
+                journal_issue,
+            )
             .await?
         {
             return Ok(replayed);
@@ -6616,7 +7034,11 @@ impl KernelComposition {
                         ));
                     }
                 }
-                Ok(store_apply_response(&receipt, verified_correction.as_ref()))
+                Ok(store_apply_response(
+                    &receipt,
+                    verified_correction.as_ref(),
+                    journal_issue,
+                ))
             }
             Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
         }
@@ -6639,6 +7061,7 @@ impl KernelComposition {
         gateway: &Arc<KernelStoreGateway>,
         operation: &StoreApplyOperation,
         verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
+        journal_issue: Option<&str>,
     ) -> Result<Option<serde_json::Value>, TransportError> {
         let Ok(Some(receipt)) = gateway
             .receipt(
@@ -6661,7 +7084,11 @@ impl KernelComposition {
         receipt
             .validate()
             .map_err(|_| TransportError::IdentityConflict)?;
-        Ok(Some(store_apply_response(&receipt, verified_correction)))
+        Ok(Some(store_apply_response(
+            &receipt,
+            verified_correction,
+            journal_issue,
+        )))
     }
 
     #[cfg(not(windows))]
@@ -7095,9 +7522,18 @@ impl KernelComposition {
             };
         }
         let gateway = self.retained_store_gateway()?;
+        let read_fence = operation.request.state_fence.clone();
         match gateway.execute_named_with_error(operation.request).await {
             Ok(response) => Ok(store_named_response(&response)),
-            Err(error) => Ok(Self::store_read_failure_response("store_named", &error)),
+            // This route is a bare closed named read with no Kernel-issued
+            // operation handle, so the directive carries no preserved identity
+            // rather than one invented at refusal time.
+            Err(error) => Ok(Self::store_read_failure_response(
+                "store_named",
+                &read_fence,
+                None,
+                &error,
+            )),
         }
     }
 
@@ -7182,8 +7618,23 @@ impl KernelComposition {
             // source moved (I15.7); nothing is re-executed, overwritten, or
             // narrowed here. The observed heads come from the Store's own head
             // read, so this is a causal join rather than a self-match.
-            self.check_retained_local_read_source_revisions(&record, &envelope)
-                .await?;
+            //
+            // When the canonical Store is unreachable the join is
+            // UNESTABLISHED rather than disproved: the retained bytes are
+            // withheld and the caller receives the typed unavailable answer with
+            // the full directive, so a cached view is never presented as current
+            // merely because the source that would disprove it was unreachable.
+            if let Err(error) = self
+                .check_retained_local_read_source_revisions(&record, &envelope)
+                .await?
+            {
+                return Ok(Self::store_read_failure_response(
+                    "local_read",
+                    &envelope.state_fence,
+                    Some(&host_request_operation_id(&envelope)),
+                    &error,
+                ));
+            }
             // The bytes are about to leave this process, so the CURRENT
             // disclosure permission is re-evaluated now, at the moment of
             // redelivery, against the durable row and the live owner reads —
@@ -7241,7 +7692,15 @@ impl KernelComposition {
         let response = match gateway.execute_named_with_error(read).await {
             Ok(response) => response,
             Err(error) => {
-                return Ok(Self::store_read_failure_response("local_read", &error));
+                // The Kernel-issued host-request handle is the admitted read's
+                // own identity, so the directive preserves THAT handle and the
+                // caller retries this read rather than a fresh one.
+                return Ok(Self::store_read_failure_response(
+                    "local_read",
+                    &envelope.state_fence,
+                    Some(&operation_id),
+                    &error,
+                ));
             }
         };
         if response.operation != NamedReadOperation::GetEvidencePack
@@ -7375,18 +7834,24 @@ impl KernelComposition {
     /// never erases an earlier delivery, and never spends another budget: a
     /// moved source simply fails the replay closed, leaving the original
     /// result identity and its evidence intact for its owner to replan.
+    ///
+    /// An unavailable canonical Store is returned as the typed cause rather than
+    /// collapsed into a fence, because freshness is then unestablished rather
+    /// than disproved: the caller reports the cached view's stale/unavailable
+    /// boundary with the full directive instead of presenting the retained bytes
+    /// as current or hiding why they were withheld.
     #[cfg(windows)]
     async fn check_retained_local_read_source_revisions(
         &self,
         record: &eliot_ors::HostRequestRecord,
         envelope: &HostRequestEnvelope,
-    ) -> Result<(), TransportError> {
+    ) -> Result<Result<(), NamedReadGatewayError>, TransportError> {
         let keys = host_request_route::retained_source_revision_keys(record)?;
         if keys.is_empty() {
-            return Ok(());
+            return Ok(Ok(()));
         }
         let gateway = self.retained_store_gateway()?;
-        let response = gateway
+        let response = match gateway
             .execute_named_with_error(NamedReadRequest {
                 operation: NamedReadOperation::GetRevisionHeads,
                 scope_id: None,
@@ -7395,7 +7860,16 @@ impl KernelComposition {
                 parameters: BTreeMap::new(),
             })
             .await
-            .map_err(|_| TransportError::SessionFenced)?;
+        {
+            Ok(response) => response,
+            // The Store's own typed refusal travels intact; only this one cause
+            // is distinguished, because it is the one where the source is
+            // unreachable rather than observed to have moved.
+            Err(NamedReadGatewayError::Store(StoreError::Unavailable)) => {
+                return Ok(Err(NamedReadGatewayError::Store(StoreError::Unavailable)));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
         if response.operation != NamedReadOperation::GetRevisionHeads
             || response.state_fence != envelope.state_fence
         {
@@ -7414,7 +7888,8 @@ impl KernelComposition {
                 .ok_or(TransportError::SessionFenced)?;
             observed.push(head);
         }
-        host_request_route::check_retained_source_revisions(record, &observed)
+        host_request_route::check_retained_source_revisions(record, &observed)?;
+        Ok(Ok(()))
     }
 
     /// Re-evaluates the CURRENT disclosure permission for one retained
@@ -8438,20 +8913,74 @@ impl KernelComposition {
         })
     }
 
+    /// Renders one refused canonical read as the truthful `DB_UNAVAILABLE`
+    /// answer (issue #1681 W3, I14.11, I14.5).
+    ///
+    /// The `Store` cause is read off the typed [`NamedReadGatewayError`] arm, so
+    /// the closed `DB_UNAVAILABLE` disposition follows from the enum variant the
+    /// Store API returned rather than from matching rendered text. The complete
+    /// versioned #1679 directive travels whole in `recovery`: commit status,
+    /// preserved state and evidence, forbidden actions, retry-versus-poll, the
+    /// preserved operation identity, the authorized bounded fallback, the next
+    /// action, and the escalation boundary. Nothing is dropped, and a directive
+    /// that fails the existing contract check is never partially emitted: the
+    /// answer keeps the same error status and code with a `null` directive rather
+    /// than a half-populated one.
+    ///
+    /// The read itself is never re-read, re-executed, or served from cache on
+    /// this path, and the answer carries no payload: an unavailable canonical
+    /// Store yields no result rather than an empty or stale one.
     #[cfg(windows)]
-    fn store_read_failure_response(kind: &str, error: &NamedReadGatewayError) -> serde_json::Value {
-        if matches!(error, NamedReadGatewayError::Store(StoreError::Unavailable)) {
-            return serde_json::json!({
-                "status": "error",
-                "code": "DB_UNAVAILABLE",
-                "reason": "Canonical Store is unavailable; named read was not completed.",
-                "value": { "kind": kind, "value": null },
-                "recovery": null,
-            });
-        }
-
-        Self::store_error_response_text(kind, &error.to_string())
+    fn store_read_failure_response(
+        kind: &str,
+        state_fence: &StateFence,
+        operation_id: Option<&str>,
+        error: &NamedReadGatewayError,
+    ) -> serde_json::Value {
+        let NamedReadGatewayError::Store(StoreError::Unavailable) = error else {
+            return Self::store_error_response_text(kind, &error.to_string());
+        };
+        let directive = store_read_unavailable_directive(state_fence, operation_id);
+        serde_json::json!({
+            "status": "error",
+            "code": "DB_UNAVAILABLE",
+            "reason": "Canonical Store is unavailable; named read was not completed.",
+            "value": { "kind": kind, "value": null },
+            "recovery": { "read_directive": directive },
+        })
     }
+}
+
+/// Builds the complete versioned I14.5 directive for one unavailable read, or
+/// `None` when the owner refuses to produce a valid one.
+///
+/// `operation_id` is the exact handle the admitted read already carries, so the
+/// directive preserves and the caller retries THAT read rather than a fresh one.
+/// A caller that holds no admitted read handle passes `None` and the directive
+/// reports that absence honestly instead of minting an identity for work that
+/// was never admitted.
+#[cfg(windows)]
+fn store_read_unavailable_directive(
+    state_fence: &StateFence,
+    operation_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    // `eliot_contracts::OperationId` is the I14.5 directive's operation identity
+    // and is distinct from this module's process-lane `OperationId` import.
+    let operation_id =
+        operation_id.map(|handle| eliot_contracts::OperationId::new(handle.to_owned()));
+    let operation_id = match operation_id {
+        Some(Err(_)) => return None,
+        Some(Ok(operation_id)) => Some(operation_id),
+        None => None,
+    };
+    let profile_revision = eliot_kernel_service::store_read_profile_revision().ok()?;
+    eliot_kernel_service::store_read_unavailable_response(
+        state_fence,
+        operation_id.as_ref(),
+        &profile_revision,
+    )
+    .ok()
+    .and_then(|directive| serde_json::to_value(directive).ok())
 }
 
 /// Closed outcome of the graceful WASM control half of one
@@ -9176,39 +9705,148 @@ fn pre_stage_correction_journal_path(work_root: &std::path::Path) -> std::path::
         .join(PRE_STAGE_CORRECTION_JOURNAL_FILE)
 }
 
+/// Serializes publication of the Kernel-owned durable pre-stage journal
+/// (issue #1796, audit 5890973032 defect 1): the single publication owner
+/// for this journal, separate from the cache's short state lock.
+///
+/// Held across freshness checking, owned temporary-file creation/write,
+/// checked durable replacement, and exact acknowledgement, so a stale saver
+/// can never replace newer acknowledged content. The cache mutex is still
+/// never held across filesystem I/O: only short state locks are taken while
+/// holding this guard. There is exactly one journal, and this is its one
+/// publication guard.
+#[cfg(windows)]
+static PRE_STAGE_JOURNAL_PUBLICATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Owned temporary-file sequence for journal publication, mirroring the
+/// shutdown-drain staging owner: every save stages a uniquely named file
+/// created with `create_new`, so two savers never share one temporary path.
+#[cfg(windows)]
+static PRE_STAGE_JOURNAL_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Typed outcome of one durable pre-stage journal restore attempt (issue
+/// #1796, audit 5890973032 defect 2).
+///
+/// Distinguishes genuine first-use absence from failed recovery at the caller
+/// boundary instead of leaving both as an empty cache.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalRestoreOutcome {
+    /// Genuine first-use absent journal or a validated restore: the cache
+    /// is the journal.
+    Ready,
+    /// An existing journal could not be read, decoded, or validated, or the
+    /// cache could not be reached: the cache is unrestored and the old
+    /// journal must be preserved, never overwritten as fresh state.
+    RecoveryRequired,
+}
+
+/// Records what one restore attempt proved about the durable pre-stage
+/// journal on the cache's explicit readiness state, independently of
+/// `is_empty()`, and returns the typed outcome for the caller boundary.
+#[cfg(windows)]
+fn record_journal_restore(
+    cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
+    outcome: JournalRestoreOutcome,
+) -> JournalRestoreOutcome {
+    let readiness = match outcome {
+        JournalRestoreOutcome::Ready => eliot_kernel_service::PreStageJournalReadiness::Ready,
+        JournalRestoreOutcome::RecoveryRequired => {
+            eliot_kernel_service::PreStageJournalReadiness::RecoveryRequired
+        }
+    };
+    match cache.lock() {
+        Ok(mut guard) => {
+            guard.set_journal_readiness(readiness);
+            outcome
+        }
+        // The cache cannot even be reached: nothing is proven, so the
+        // caller must treat the journal as unrecovered.
+        Err(_) => JournalRestoreOutcome::RecoveryRequired,
+    }
+}
+
 /// Restores retained refusals from the Kernel-owned durable pre-stage
-/// journal into a freshly started, still-empty gate cache (issue #1796 F1).
+/// journal into a freshly started gate cache (issue #1796 F1).
 ///
 /// A legitimate first-use absent journal restores nothing, which is exactly
-/// the pre-journal behavior. An existing journal that cannot be read,
-/// decoded, or validated leaves the cache unrestored instead of being
-/// claimed as an empty cache: it is re-read on the next request, and until
-/// then the gate issues no correction lineage at all rather than stamping
-/// an unproven one. A cache that already holds a live refusal is never
-/// overwritten by stale disk state. No store, receipt, or envelope format
-/// is touched.
+/// the pre-journal behavior, and records `Ready`. An existing journal that
+/// cannot be read, decoded, or validated records `RecoveryRequired` and
+/// leaves the cache unrestored instead of being claimed as an empty cache:
+/// it is re-read on the next request while it still holds no live refusal,
+/// and until then the gate issues no correction lineage at all rather than
+/// stamping an unproven one. A cache that already holds a live refusal is
+/// never overwritten by stale disk state. No store, receipt, or envelope
+/// format is touched.
 #[cfg(windows)]
 fn restore_pre_stage_corrections(
     work_root: &std::path::Path,
     cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
-) {
+) -> JournalRestoreOutcome {
+    // A cache that already reports its posture keeps it: `Ready` needs no
+    // re-read, live refusals are never overwritten, and a `RecoveryRequired`
+    // cache that still holds no live refusal re-attempts the read below, so
+    // a repaired journal heals on the next request.
+    if let Ok(guard) = cache.lock() {
+        let settled = match guard.journal_readiness() {
+            eliot_kernel_service::PreStageJournalReadiness::Ready => true,
+            eliot_kernel_service::PreStageJournalReadiness::RecoveryRequired => !guard.is_empty(),
+            eliot_kernel_service::PreStageJournalReadiness::Uninitialized => false,
+        };
+        if settled {
+            return match guard.journal_readiness() {
+                eliot_kernel_service::PreStageJournalReadiness::Ready => {
+                    JournalRestoreOutcome::Ready
+                }
+                _ => JournalRestoreOutcome::RecoveryRequired,
+            };
+        }
+    } else {
+        return JournalRestoreOutcome::RecoveryRequired;
+    }
     let bytes = match std::fs::read(pre_stage_correction_journal_path(work_root)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(_) => return,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return record_journal_restore(cache, JournalRestoreOutcome::Ready);
+        }
+        Err(_) => {
+            return record_journal_restore(cache, JournalRestoreOutcome::RecoveryRequired);
+        }
         Ok(bytes) => bytes,
     };
     let Ok(snapshot) =
         serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes)
     else {
-        return;
+        return record_journal_restore(cache, JournalRestoreOutcome::RecoveryRequired);
     };
-    let Ok(mut guard) = cache.lock() else {
-        return;
-    };
-    if guard.is_empty() {
-        // Validated merge: an inconsistent snapshot is refused without
-        // partial mutation, so the cache stays empty for the next attempt.
-        let _ = guard.restore(snapshot);
+    match cache.lock() {
+        Ok(mut guard) => {
+            if guard.is_empty() {
+                // Validated merge: an inconsistent snapshot is refused
+                // without partial mutation, and a successful merge carries
+                // the coherent revision baseline, so the cache stays empty
+                // for the next attempt on failure and continues the sequence
+                // on success.
+                if guard.restore(snapshot).is_err() {
+                    guard.set_journal_readiness(
+                        eliot_kernel_service::PreStageJournalReadiness::RecoveryRequired,
+                    );
+                    return JournalRestoreOutcome::RecoveryRequired;
+                }
+                guard.set_journal_readiness(eliot_kernel_service::PreStageJournalReadiness::Ready);
+                JournalRestoreOutcome::Ready
+            } else {
+                // A retain landed while restoring: keep the live refusals
+                // and keep whatever posture the retain path already proved.
+                match guard.journal_readiness() {
+                    eliot_kernel_service::PreStageJournalReadiness::Ready => {
+                        JournalRestoreOutcome::Ready
+                    }
+                    _ => JournalRestoreOutcome::RecoveryRequired,
+                }
+            }
+        }
+        Err(_) => JournalRestoreOutcome::RecoveryRequired,
     }
 }
 
@@ -9218,7 +9856,8 @@ fn restore_pre_stage_corrections(
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JournalPersistOutcome {
-    /// The rename committed and the exact saved revision was acknowledged.
+    /// The rename committed and the exact saved revision was acknowledged,
+    /// or another saver already made that exact revision durable.
     Persisted,
     /// The snapshot could not be encoded; nothing reached the disk.
     SerializeFailed,
@@ -9231,6 +9870,27 @@ enum JournalPersistOutcome {
     /// A newer retain landed while this save was in flight; the older save
     /// retired nothing and wrote nothing over the newer state.
     Superseded,
+    /// The cache is unrestored (`RecoveryRequired`): the existing journal
+    /// is preserved and nothing was written over it as fresh state.
+    RecoveryRequired,
+}
+
+#[cfg(windows)]
+impl JournalPersistOutcome {
+    /// Stable report code for the commit response: the local
+    /// recovery/persistence failure is reported without claiming durable
+    /// lineage, and carries no path or digest.
+    fn issue_code(self) -> &'static str {
+        match self {
+            JournalPersistOutcome::Persisted => "pre_stage_journal_persisted",
+            JournalPersistOutcome::SerializeFailed => "pre_stage_journal_serialize_failed",
+            JournalPersistOutcome::JournalDirUnreachable => "pre_stage_journal_dir_unreachable",
+            JournalPersistOutcome::JournalWriteFailed => "pre_stage_journal_write_failed",
+            JournalPersistOutcome::JournalCommitFailed => "pre_stage_journal_commit_failed",
+            JournalPersistOutcome::Superseded => "pre_stage_journal_superseded",
+            JournalPersistOutcome::RecoveryRequired => "pre_stage_journal_recovery_required",
+        }
+    }
 }
 
 /// Persists retained refusals to the Kernel-owned durable pre-stage journal
@@ -9240,39 +9900,96 @@ enum JournalPersistOutcome {
 /// between commit and response still replays the lineage. Best-effort: a
 /// failed write keeps the in-memory behavior and never fails the write it
 /// records. The pending journal stays pending until its exact revision is
-/// acknowledged after the rename commits, so a failed save is offered again
-/// instead of being forgotten; the revision comparison also keeps an older
-/// in-flight save from overwriting newer retained refusals. The
-/// tmp-plus-rename keeps a crash from leaving a half-written journal
-/// behind.
+/// acknowledged after the checked durable replacement commits, so a failed
+/// save is offered again instead of being forgotten.
+///
+/// The whole publication serializes under the one journal publication guard:
+/// staleness is checked while holding publication ownership, an obsolete
+/// save is rejected before replacing the destination, every save stages an
+/// owned temporary file, and the exact acknowledgement happens under the
+/// same guard. A delayed older saver therefore cannot replace newer
+/// acknowledged content, and two savers never share one temporary path. The
+/// cache mutex itself is never held across filesystem I/O: only short state
+/// locks are taken while holding the publication guard. The checked durable
+/// replacement mirrors the shutdown-drain owner: the staged file is synced
+/// before the rename, and the replaced destination is synced after it, so a
+/// rename alone is never the durability acknowledgement. The tmp-plus-rename
+/// keeps a crash from leaving a half-written journal behind.
 #[cfg(windows)]
 fn persist_pre_stage_corrections(
     work_root: &std::path::Path,
     cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
     snapshot: &eliot_kernel_service::PreStageIdentitySnapshot,
 ) -> JournalPersistOutcome {
-    let pending = match cache.lock() {
-        Ok(guard) => guard.pending_journal_revision(),
+    let Ok(_publication) = PRE_STAGE_JOURNAL_PUBLICATION.lock() else {
+        return JournalPersistOutcome::Superseded;
+    };
+    let (pending, acked, readiness) = match cache.lock() {
+        Ok(guard) => (
+            guard.pending_journal_revision(),
+            guard.acked_journal_revision(),
+            guard.journal_readiness(),
+        ),
         Err(_) => return JournalPersistOutcome::Superseded,
     };
+    if readiness == eliot_kernel_service::PreStageJournalReadiness::RecoveryRequired {
+        // The cache is unrestored: preserve the existing journal and never
+        // overwrite it as fresh state.
+        return JournalPersistOutcome::RecoveryRequired;
+    }
     if pending != Some(snapshot.revision()) {
+        if acked >= snapshot.revision() {
+            // Another saver already made this exact revision durable while
+            // holding publication ownership; there is nothing to replace.
+            return JournalPersistOutcome::Persisted;
+        }
         return JournalPersistOutcome::Superseded;
     }
     let Ok(bytes) = serde_json::to_vec_pretty(snapshot) else {
         return JournalPersistOutcome::SerializeFailed;
     };
     let path = pre_stage_correction_journal_path(work_root);
-    if path
-        .parent()
-        .is_some_and(|dir| std::fs::create_dir_all(dir).is_err())
-    {
+    let Some(dir) = path.parent() else {
+        return JournalPersistOutcome::JournalDirUnreachable;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
         return JournalPersistOutcome::JournalDirUnreachable;
     }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes).is_err() {
+    let (tmp, mut tmp_file) = loop {
+        let sequence =
+            PRE_STAGE_JOURNAL_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(
+            "{}-{}.{}.{sequence}.tmp",
+            PRE_STAGE_CORRECTION_JOURNAL_FILE,
+            std::process::id(),
+            snapshot.revision()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return JournalPersistOutcome::JournalWriteFailed,
+        }
+    };
+    if std::io::Write::write_all(&mut tmp_file, &bytes)
+        .and_then(|()| tmp_file.sync_all())
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
         return JournalPersistOutcome::JournalWriteFailed;
     }
+    drop(tmp_file);
     if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return JournalPersistOutcome::JournalCommitFailed;
+    }
+    if std::fs::File::open(&path)
+        .and_then(|file| file.sync_all())
+        .is_err()
+    {
         return JournalPersistOutcome::JournalCommitFailed;
     }
     let acknowledged = match cache.lock() {
@@ -9288,12 +10005,22 @@ fn persist_pre_stage_corrections(
 fn store_apply_response(
     receipt: &WriteReceipt,
     verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
+    journal_issue: Option<&str>,
 ) -> serde_json::Value {
     let mut response = serde_json::json!({
         "status": "known",
         "value": { "kind": "write_receipt", "value": receipt },
         "recovery": null,
     });
+    // A local recovery/persistence failure is reported here without claiming
+    // durable lineage: the caller already stripped the correction link, so a
+    // commit that cannot prove its lineage carries the stable issue code
+    // instead. Carries no path or digest.
+    if let Some(issue) = journal_issue {
+        response["recovery"] = serde_json::json!({
+            "pre_stage_journal_issue": issue,
+        });
+    }
     if let Some(link) = verified_correction {
         response["correction_lineage"] = serde_json::json!({
             "corrected_operation_id": link.corrected_operation_id,

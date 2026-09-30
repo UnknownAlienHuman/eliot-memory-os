@@ -343,6 +343,54 @@ pub(crate) fn recipe(recipe: &ContextRecipe) -> Result<(), AssemblyError> {
 pub(crate) fn quality(scorecard: &QualityScorecard) -> Result<(), AssemblyError> {
     let mut budget = Budget(0);
     binding(&scorecard.binding, &mut budget)?;
+    // The output binding is the scorecard's own description of the packet it
+    // graded, so it is a caller-supplied list and text exactly like every other
+    // field here. Bounding it refuses an oversized value; it never truncates it,
+    // and it never drops a result to make a card fit.
+    budget.text(
+        &scorecard.output.recipe_digest,
+        "quality.output.recipe_digest",
+    )?;
+    budget.text(
+        &scorecard.output.fence_digest,
+        "quality.output.fence_digest",
+    )?;
+    budget.text(
+        &scorecard.output.admitted_digest,
+        "quality.output.admitted_digest",
+    )?;
+    budget.text(
+        &scorecard.output.rendered_digest,
+        "quality.output.rendered_digest",
+    )?;
+    budget.text(
+        &scorecard.output.serializer_id,
+        "quality.output.serializer_id",
+    )?;
+    budget.text(
+        &scorecard.output.serializer_version,
+        "quality.output.serializer_version",
+    )?;
+    budget.text(
+        &scorecard.output.serializer_options_digest,
+        "quality.output.serializer_options_digest",
+    )?;
+    budget.text(&scorecard.output.route_id, "quality.output.route_id")?;
+    for (values, field) in [
+        (
+            &scorecard.output.evidence_revisions,
+            "quality.output.evidence_revisions",
+        ),
+        (
+            &scorecard.output.omission_handles,
+            "quality.output.omission_handles",
+        ),
+    ] {
+        count(values.len(), MAX_REFERENCES, field)?;
+        for value in values {
+            budget.text(value.as_str(), field)?;
+        }
+    }
     count(
         scorecard.applicability.resolved.len(),
         6,

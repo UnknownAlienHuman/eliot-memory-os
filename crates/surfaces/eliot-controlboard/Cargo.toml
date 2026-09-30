@@ -13,19 +13,27 @@ lifecycle_owner = "A-08"
 source_layer = "C3"
 proof_entrypoint = "cargo test -p eliot-controlboard --all-targets --all-features"
 # Disposition (#1213): bounded reference fixture, retained. The `eliot-cli`
-# catalogue edge is severed to an inlined `PLAN_GAP` literal. The only reverse
-# dependency with production call sites is the `bins/eliotd` daemon composition
-# over production adapters (`bins/eliotd/src/controlboard_adapters.rs`), and
-# that branch is source-reachable only: the closed local-read admission match
-# in `bins/eliot-kernel/src/host_request_route.rs` admits no `controlboard.read`
-# pair and no producer presents the capability. Package presence therefore
-# establishes no current ControlBoard capability (crates/meta/AGENTS.md).
-# Full delete belongs to the eliotd lane, which owns those call sites.
+# catalogue edge is severed to an inlined `PLAN_GAP` literal. Exactly two
+# reverse dependencies carry production call sites: the `bins/eliotd` daemon
+# composition over production adapters
+# (`bins/eliotd/src/controlboard_adapters.rs`), and the bounded
+# `crates/meta/eliot-runtime-status` projection/consumer/transport owner
+# (`controlboard_projection.rs`, `controlboard_consumer.rs`,
+# `controlboard_transport.rs`). Both are source-reachable only: the closed
+# local-read admission match in `bins/eliot-kernel/src/host_request_route.rs`
+# admits no `controlboard.read` pair and no producer presents the capability.
+# Package presence therefore establishes no current ControlBoard capability
+# (crates/meta/AGENTS.md). The projection's per-entry class is a bounded
+# contour field, not an I11.2 section: `RenderedControlBoardRow` carries no
+# entry-class field, so the served consumer cannot separate items from
+# reviews, and provenance survives only as `provenance_edge_count`, which the
+# served board does not carry. Full delete belongs to the eliotd lane, which
+# owns the remaining production call sites.
 # This crate is frozen: no board extension, owner bindings, authority, or
 # currentness.
 fixture_status = "bounded-reference-fixture"
-production_consumers = "bins/eliotd production daemon composition (source-reachable only; no admitted producer)"
-remaining_reverse_dependency = "bins/eliotd production adapters"
+production_consumers = "bins/eliotd daemon composition and crates/meta/eliot-runtime-status bounded projection/consumer/transport (both source-reachable only; no admitted producer)"
+remaining_reverse_dependency = "bins/eliotd production adapters; crates/meta/eliot-runtime-status bounded projection"
 follow_up = "full delete with eliotd lane"
 
 [dependencies]

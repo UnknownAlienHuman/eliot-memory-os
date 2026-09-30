@@ -41,7 +41,8 @@ use super::user_automation_execution::{
     UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
     UserAutomationRuntimePort, UserAutomationWakeCancellation,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 use super::user_automation_execution_client::{
     UserAutomationHostExecutionClient, UserAutomationHostExecutionObserver,
@@ -1378,10 +1379,33 @@ impl UserAutomationOperatorTransition {
                                 "a revision mutation carries a foreign execution phase".to_owned()
                             );
                         }
+                        // The committed `cancelled_wake_ids` is the canonical
+                        // Store's OWN claim about what it cancelled, and that
+                        // writer issues no wake effect, so it is empty for every
+                        // committed mutation (I11.12: "Configuration state and
+                        // execution state are separate"). The wake phase is the
+                        // WAKE OWNER's answer, and it is the only place the
+                        // owner's exact cancelled set exists. Requiring the two
+                        // to be equal therefore compares the owner answer
+                        // against a field that is structurally always empty,
+                        // which would refuse every proven non-empty
+                        // cancellation and turn it into a route-level unknown.
+                        // What this join must still prove is that the wake
+                        // phase does not CONTRADICT the commit: every wake
+                        // identity the Store itself claims to have cancelled is
+                        // covered by the owner-proven set. The owner set is
+                        // separately bound to independent owner evidence —
+                        // `UserAutomationOrchestrationRecord::validate_answer`
+                        // compares it by exact ordered equality with the target
+                        // batch of the retained Host enumeration receipt — so
+                        // this check adds the commit's own claims to that
+                        // binding instead of replacing it.
                         match &self.wake {
                             UserAutomationWakePhase::Cancelled {
                                 cancelled_wake_ids: observed,
-                            } if observed == cancelled_wake_ids => {}
+                            } if cancelled_wake_ids
+                                .iter()
+                                .all(|claimed| observed.contains(claimed)) => {}
                             UserAutomationWakePhase::NotApplicable { .. }
                                 if cancelled_wake_ids.is_empty() => {}
                             UserAutomationWakePhase::UnknownOutcome { .. }
@@ -1632,6 +1656,35 @@ impl<T> UserAutomationWakePort for UserAutomationOperatorRuntime<'_, T>
 where
     T: UserAutomationHostExecutionTransport,
 {
+    /// Publishes one bounded recurring horizon through the same authenticated
+    /// Host transport every other owner call on this adapter uses.
+    ///
+    /// This override is load-bearing: the operator route reaches
+    /// `publish_wake_horizon` through the `UserAutomationWakePort` trait on this
+    /// concrete type, so without it the Create/Edit/Resume handoff would resolve
+    /// to the trait default and answer `Unavailable` no matter what the client
+    /// publishes. It forwards to the client's own trait implementation, which is
+    /// bound to the client's single transport, so this adapter adds no second
+    /// transport path and no second wake owner.
+    async fn publish_wake_horizon(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        UserAutomationWakePort::publish_wake_horizon(self.client, request).await
+    }
+
+    /// Reconciles one exact horizon publication with the schedule owner. Like
+    /// the other readbacks here it resolves through the client's trait
+    /// implementation, and it issues no owner effect: a caller that crossed an
+    /// unknown boundary re-presents the same publication identity rather than
+    /// publishing the slice again.
+    async fn read_wake_horizon_publication(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        UserAutomationWakePort::read_wake_horizon_publication(self.client, request).await
+    }
+
     async fn read_pending_wake(
         &self,
         request: impl Into<Box<UserAutomationWakeReadRequest>>,

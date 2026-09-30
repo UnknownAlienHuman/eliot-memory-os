@@ -12,7 +12,7 @@ use eliot_user_broker::{
 };
 use eliot_user_broker_core::{
     CutoverReceipt, LaunchRequest, OPERATOR_HANDOFF_TTL_MS, OperatorEndpoint,
-    OperatorHandoffRequest,
+    OperatorHandoffRequest, OperatorNativeResourceSelectionInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,6 +39,11 @@ enum Request {
     /// before any state change.
     Launch {
         request: LaunchRequest,
+        /// Explicit authenticated Human-selected root/object candidate. The
+        /// broker measures it before Kernel authorization; this path pair is
+        /// never included in the Kernel request or child launch.
+        #[serde(default)]
+        resource_selection: Option<OperatorNativeResourceSelectionInput>,
         #[serde(default)]
         authority: Option<HumanStateAuthority>,
     },
@@ -498,24 +503,11 @@ fn dispatch(
         Err(message) => return message,
     };
     match request {
-        Request::Launch { request, authority } => {
-            // I11.6:3: normal `eliot-notify` delivery is launched through the
-            // authorized User Broker's notify-specific admitted path. A generic
-            // launch naming the canonical notify image is refused here, so no
-            // other request shape can produce a normal notification invocation.
-            if request_names_notify_image(&request) {
-                return Message::Error {
-                    code: "BROKER_NOTIFY_LAUNCH_REQUIRES_ADMISSION",
-                    detail: "the canonical notify image is only launchable through the admitted notify operation"
-                        .to_owned(),
-                };
-            }
-            let operation_key = request.approved.idempotency_key.clone();
-            match composition.admit_human_state_change(authority.as_ref(), &operation_key) {
-                Err(error) => composition_rejection(&error),
-                Ok(()) => dispatch_launch(composition.launch(request)),
-            }
-        }
+        Request::Launch {
+            request,
+            resource_selection,
+            authority,
+        } => dispatch_generic_launch(composition, request, resource_selection, authority.as_ref()),
         Request::NotifyLaunch { request, authority } => {
             let operation_key = request.approved.idempotency_key.clone();
             match composition.admit_human_state_change(authority.as_ref(), &operation_key) {
@@ -600,6 +592,34 @@ fn dispatch(
             Message::Ready { readiness }
         }
         Request::Stop => Message::Stopped,
+    }
+}
+
+fn dispatch_generic_launch(
+    composition: &mut BrokerComposition,
+    request: LaunchRequest,
+    resource_selection: Option<OperatorNativeResourceSelectionInput>,
+    authority: Option<&HumanStateAuthority>,
+) -> Message {
+    // I11.6:3: normal `eliot-notify` delivery is launched through the
+    // authorized User Broker's notify-specific admitted path. A generic
+    // launch naming the canonical notify image is refused here.
+    if request_names_notify_image(&request) {
+        return Message::Error {
+            code: "BROKER_NOTIFY_LAUNCH_REQUIRES_ADMISSION",
+            detail: "the canonical notify image is only launchable through the admitted notify operation"
+                .to_owned(),
+        };
+    }
+    let operation_key = request.approved.idempotency_key.clone();
+    match composition.admit_human_state_change(authority, &operation_key) {
+        Err(error) => composition_rejection(&error),
+        Ok(()) => dispatch_launch(match resource_selection {
+            Some(selection) => {
+                composition.launch_with_native_resource_selection(request, selection)
+            }
+            None => composition.launch(request),
+        }),
     }
 }
 

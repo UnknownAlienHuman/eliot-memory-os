@@ -2,7 +2,10 @@
 //!
 //! Field-to-owner mapping (map-first, no second record family): source
 //! checksum and capture identity reuse [`SourceRevisionHandle`], the exact
-//! temporal/spatial/byte/range anchor reuses [`SourceAnchorHandle`], and the
+//! temporal/spatial/byte/range anchor reuses [`SourceAnchorHandle`] — whose
+//! native coordinate is a typed [`crate::NativeCoordinate`] this owner validates
+//! against the same closed grammar the readback path resolves, so an admitted
+//! observation always carries a coordinate that path can open — and the
 //! capture route reuses [`CaptureRoute`]. Only material without an existing
 //! owner is defined here: source modality, per-property modality status,
 //! type-relative identity hypotheses, the before/after state diff, the
@@ -1202,7 +1205,7 @@ mod tests {
                 byte_offset: 0,
                 byte_length: 1024,
                 excerpt_sha256: test_sha256(),
-                native_mapping: Some("frame:12 region:(0,0,640,480)".to_owned()),
+                native_mapping: Some("line:1;column:1".to_owned()),
             },
             capture_route: CaptureRoute::BlobHandle,
             representation_limits: vec!["lossy-thumbnail 640x480".to_owned()],

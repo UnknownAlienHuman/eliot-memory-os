@@ -90,6 +90,7 @@ fn ctx(op: &str) -> RequestMeta {
 
 fn transition(op: &str, scopes: &[&str]) -> PreparedTransition {
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(op).unwrap(),
             idempotency_key: format!("idem-{op}"),

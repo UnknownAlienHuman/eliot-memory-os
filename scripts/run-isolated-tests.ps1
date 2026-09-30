@@ -687,23 +687,15 @@ if ($activeProfile -eq 'Run') {
         try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
         return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
     }.GetNewClosure()
-    $providerPortReservation = {
-        param($request)
-        # Ephemeral loopback port pick: bind :0, read the port, release.
-        # Documented pick-vs-bind race window (test-harness scope only);
-        # never a privileged or non-loopback endpoint.
-        $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
-        try {
-            $listener.Start()
-            $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
-        } finally {
-            $listener.Stop()
-        }
-        if ($port -lt 1024 -or $port -gt 65535) {
-            throw ("HARNESS-PORT-RESERVATION: picked port '{0}' is outside the ephemeral bound." -f $port)
-        }
-        return @{ host = '127.0.0.1'; port = $port }
-    }.GetNewClosure()
+    # #909 W1/A7: the Store module owns the loopback endpoint reservation, and
+    # this coordinator supplies the module's own exported seam -- exactly as it
+    # supplies New-RuntimeDefaultNamespaceReservation below. The exclusive bind
+    # is therefore HELD from Allocate until Start releases it at launch handoff.
+    # A local pick-and-release here handed Allocate a bare {host,port} name with
+    # no owner handle: anything could take the port between the release and the
+    # child bind, and Register-StorePortReservation correctly refuses a mapping
+    # that carries no live listener.
+    $providerPortReservation = New-StoreDefaultPortReservation
     # #911 W1 namespace half: a real, run-owned namespace reservation. The
     # canonical F-PIPE namespace is a mutable namespace, so the run holds it the
     # same way it holds a port: by winning the exclusive create and keeping the

@@ -1,0 +1,43 @@
+# Authoritative #13 contract source for the native-worker-core functional cell.
+# Package metadata supplies the cell identity, owner, source layer, and proof
+# entrypoint; the generator rejects disagreement between these sources.
+schema = "eliot.capability-cell-contract-v1"
+cell = "native-worker-core"
+contract_revision = "1.0.0"
+source_package = "eliot-native-worker-core"
+source_manifest = "crates/modules/eliot-native-worker-core/Cargo.toml"
+worker_bundle_package = "eliot-native-worker"
+worker_bundle_manifest = "bins/eliot-native-worker/Cargo.toml"
+source_layer = "C3"
+
+lifecycle_owner = "A-13"
+maintenance_owner = "A-13"
+semantic_owner = "A-13"
+generation_owner = "A-13"
+
+# WorkerCore owns these in-memory lifecycle values. Durable replay and
+# checkpoint storage, process execution, and admission remain injected ports.
+owned_state = "WorkerCore lifecycle, grant, process binding and start receipt, connection, and last-event sequence"
+state_owner = "A-13"
+stateless = false
+
+execution_contour = "DELEGATED_BUNDLE"
+runtime_bundle = "eliot-native-worker"
+allowed_effect_classes = []
+replacement_class = "isolate_dependency"
+removal_boundary = "Stop claim admission, drain and cancel the exact native-worker process generation through Kernel, then replace the worker bundle."
+
+# The package has a declared test command, but the capsule declares no edge or
+# product proof ceiling. Keep the registry claim at the static contract level.
+proof_ceiling = "STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY"
+proof_entrypoint_source = "package.metadata.eliot.proof_entrypoint"
+
+product_pulse_not_applicable_reason = "This internal process protocol core has no independent Product Pulse; product behavior is measured at the native-worker bundle contour."
+current_support = "CURRENT_UNVERIFIED"
+invalidation = []
+
+[manifest]
+owner = "A-13"
+contract_kit = "docs/code-navigation/capsules/native-worker-core/contract_kit.json"
+context_capsule = "docs/code-navigation/capsules/native-worker-core/context_capsule.json"
+test_capsule = "docs/code-navigation/capsules/native-worker-core/test_capsule.json"

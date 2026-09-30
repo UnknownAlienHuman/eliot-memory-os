@@ -100,15 +100,15 @@ use crate::{
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
-    UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
-    UserBrokerRegistrationReceipt, VersionedArtifactEntry, VersionedArtifactRegistry,
-    WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin, WorkerReplayCursors,
-    WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision, WorkerReplayRequestRecord,
-    WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor, WriteIdempotencyRecoveryEntry,
-    WriteIdempotencyRecoveryPage, WriteReservationRecoveryCursor, WriteReservationRecoveryPage,
-    WriterReservationToken, is_replay_terminal_phase, parse_replay_stream_id,
-    require_replay_claim_binding, signed_supervision_lease_from_verified,
-    signed_terminal_supervision_lease_from_verified,
+    UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerHeartbeat,
+    UserBrokerRegistration, UserBrokerRegistrationReceipt, UserBrokerRegistrationSnapshot,
+    VersionedArtifactEntry, VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord,
+    WorkerReplayBegin, WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent,
+    WorkerReplayRequestDecision, WorkerReplayRequestRecord, WorkerReplayStreamRecord,
+    WriteIdempotencyRecoveryCursor, WriteIdempotencyRecoveryEntry, WriteIdempotencyRecoveryPage,
+    WriteReservationRecoveryCursor, WriteReservationRecoveryPage, WriterReservationToken,
+    is_replay_terminal_phase, parse_replay_stream_id, require_replay_claim_binding,
+    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
 };
 
 /// The versioned-artifact family rides the same ORS persistence codec as every
@@ -210,12 +210,13 @@ const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
 /// Durable `RuntimeLease` current rows for the #1918 ACT-1/A4 retirement
 /// census (I1.5). Keyed by lease identity; one row per exact-fence durable
-/// runtime lease the Kernel may retire. The durable issuance writer belongs
-/// to #1751; until it lands, the table holds no rows and the census reports
-/// that observed store fact rather than a default. This is one more table in
-/// the existing ORS table family, owned by the same `RedbRecoveryStore` and
-/// written through the same `persistence_codec`; it is not a second journal
-/// or table owner.
+/// runtime lease the Kernel may retire. The durable issuance writer is
+/// [`RedbRecoveryStore::record_runtime_lease_current`], called by the Kernel
+/// when it grants activation; an absent table still reads as the observed
+/// empty set rather than a default. This is one more table in the existing
+/// ORS table family, owned by the same `RedbRecoveryStore` and written
+/// through the same `persistence_codec`; it is not a second journal or
+/// table owner.
 const RUNTIME_LEASE_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_runtime_lease_current_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
@@ -3333,14 +3334,31 @@ pub trait OperationalRecoveryStore: Send + Sync {
         binding: ActiveSessionBinding,
     ) -> Result<SessionBindingReceipt, OrsError>;
     fn detach_session(&self, detach: SessionDetach) -> Result<SessionBindingReceipt, OrsError>;
+    /// Loads the exact current User Broker row by its stable subject identity.
+    /// The payload remains opaque; this readback creates no authority.
+    fn load_user_broker_registration(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerRegistrationSnapshot>, OrsError>;
+    /// Writes the initial registration or replaces an exact fenced predecessor.
+    /// A missing expected receipt is accepted only when this subject has no row.
     fn register_user_broker(
         &self,
         registration: UserBrokerRegistration,
-    ) -> Result<UserBrokerRegistrationReceipt, OrsError>;
+        expected: Option<&UserBrokerRegistrationReceipt>,
+    ) -> Result<UserBrokerRegistrationSnapshot, OrsError>;
+    /// Renews the active registration only when its exact current receipt matches.
+    fn heartbeat_user_broker(
+        &self,
+        heartbeat: UserBrokerHeartbeat,
+        expected: &UserBrokerRegistrationReceipt,
+    ) -> Result<UserBrokerRegistrationSnapshot, OrsError>;
+    /// Fences the active registration only when its exact current receipt matches.
     fn fence_user_broker(
         &self,
         fence: UserBrokerFence,
-    ) -> Result<UserBrokerRegistrationReceipt, OrsError>;
+        expected: &UserBrokerRegistrationReceipt,
+    ) -> Result<UserBrokerRegistrationSnapshot, OrsError>;
     fn commit_authority_snapshot(
         &self,
         snapshot: KernelAuthoritySnapshot,
@@ -10049,6 +10067,65 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(record))
+    }
+
+    /// Binds the exact typed payload bytes to one staged operation (issue
+    /// #1739 W2).
+    ///
+    /// Persist-before-claim: the Kernel calls this before the observe claim is
+    /// handed out, so execution after a restart reads the exact bytes off the
+    /// durable row instead of relying on the payload digest alone. The body
+    /// must be a bounded JSON object whose canonical digest equals the staged
+    /// `payload_digest`; anything else fails closed. Binding is monotonic:
+    /// re-binding the same bytes returns the durable row unchanged, while
+    /// different bytes under the same operation/request identity fail with
+    /// [`OrsError::HostRequestIdentityConflict`] and can never replace the
+    /// admitted operation. Input cannot be bound after a result completed.
+    pub fn bind_host_request_payload(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        body: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        crate::model::validate_payload_body(body, &existing.payload_digest)?;
+        if let Some(staged) = existing.payload_body.as_ref() {
+            if staged == body {
+                return Ok(Some(existing));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if existing.result_digest.is_some() || existing.result_response.is_some() {
+            return Err(OrsError::InvalidTransition);
+        }
+        let mut next = existing.clone();
+        next.payload_body = Some(body.clone());
+        next.validate()?;
+        let payload = encode(&next)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
     }
 
     /// Persists one bounded local-read result body alongside its digest.
@@ -24164,6 +24241,31 @@ impl RedbRecoveryStore {
         Ok(runtime_leases)
     }
 
+    /// Records (or re-records) the current `RuntimeLease` row for one lease
+    /// identity (issue #1918; I18.53 ACT-1/ACT-4).
+    ///
+    /// The durable issuance writer for the activation-granted runtime lease:
+    /// the Kernel records the row when it grants activation and re-records it
+    /// on renewal or terminal transition, keyed by the lease identity exactly
+    /// like the supervision-lease current projection. The row is validated
+    /// before the write, so a blank identity or a zero expiry fails closed
+    /// without touching the table.
+    pub fn record_runtime_lease_current(&self, lease: &RuntimeLease) -> Result<(), OrsError> {
+        lease
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let encoded = encode(lease)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut current = write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+            current
+                .insert(lease.lease_id.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(())
+    }
+
     /// Loads the recorded effect operation lease for one exact authorized
     /// operation (issue #1885; I1.9).
     ///
@@ -24280,6 +24382,34 @@ impl RedbRecoveryStore {
                 Ok(manifest)
             })
             .transpose()
+    }
+
+    /// Loads and verifies the manifest-bound execution decision for one
+    /// generation (issue #22; I1.9).
+    ///
+    /// The manifest comes from the Generation Registry row keyed by the
+    /// request's exact module and generation. Readback validates the stored
+    /// manifest digest and key identity; the existing pure verifier then checks
+    /// the request's bound digest, Authority Epoch, candidate launch binding,
+    /// compatibility evidence, restart budget, and authorization-class
+    /// specific Catalog/Policy view, revocation, and delivery state. An absent
+    /// row remains a typed `ManifestAbsent` decision.
+    ///
+    /// The returned admitted decision carries the sealed immutable manifest,
+    /// including its exact digest, launch binding, Job Object/resource limits,
+    /// restart budget, readiness reference, and state-class behavior. This is
+    /// a read-only manifest authorization projection; it does not acquire a
+    /// State Fence, certify a live process/Job lineage, or start a process.
+    pub fn load_and_verify_kernel_execution_restart(
+        &self,
+        request: &crate::KernelExecutionRestartRequest,
+    ) -> Result<crate::KernelRestartDecision, OrsError> {
+        request.validate()?;
+        let manifest = self.load_kernel_execution_manifest(
+            request.module_id.as_str(),
+            request.generation.value(),
+        )?;
+        crate::verify_kernel_execution_restart(manifest.as_ref(), request)
     }
 
     /// Persists one effect-replay reconciliation intent (issue #1885; I1.9).
@@ -27317,6 +27447,126 @@ impl RedbRecoveryStore {
         Self::receipt_for(&record)
     }
 
+    fn user_broker_snapshot(
+        record: &DurableOperationalRecord,
+    ) -> Result<UserBrokerRegistrationSnapshot, OrsError> {
+        if record.kind != OperationalKind::UserBroker {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "user_broker_registration",
+                reason: "current row has a different operational kind".to_owned(),
+            });
+        }
+        UserBrokerRegistrationSnapshot::from_store(
+            record.input.clone(),
+            record.phase,
+            record.operation_order,
+            Self::receipt_for(record)?,
+        )
+    }
+
+    fn load_user_broker_registration(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerRegistrationSnapshot>, OrsError> {
+        let key = Self::operational_key(OperationalKind::UserBroker, subject_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        current
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: DurableOperationalRecord =
+                    decode_named(value.value(), "operational_current")?;
+                record.input.validate()?;
+                if record.kind != OperationalKind::UserBroker
+                    || record.input.subject_id != *subject_id
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "user_broker_registration",
+                        reason: "current row identity does not match its key".to_owned(),
+                    });
+                }
+                Self::user_broker_snapshot(&record)
+            })
+            .transpose()
+    }
+
+    fn mutate_user_broker_registration(
+        &self,
+        input: OperationalRecordInput,
+        expected: Option<&UserBrokerRegistrationReceipt>,
+        allowed_prior: &[OperationalPhase],
+        allow_absent: bool,
+        next_phase: OperationalPhase,
+    ) -> Result<UserBrokerRegistrationSnapshot, OrsError> {
+        input.validate()?;
+        if matches!(&input.payload, RecoveryPayload::CanonicalRequest { .. }) {
+            return Err(OrsError::InvalidField {
+                field: "user_broker_payload",
+                reason: "canonical requests are not User Broker records",
+            });
+        }
+        let key = Self::operational_key(OperationalKind::UserBroker, &input.subject_id);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+            current
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableOperationalRecord>(value.value(), "operational_current")
+                })
+                .transpose()?
+        };
+
+        if let Some(existing) = existing {
+            existing.input.validate()?;
+            if existing.kind != OperationalKind::UserBroker
+                || existing.input.subject_id != input.subject_id
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "user_broker_registration",
+                    reason: "current row identity does not match its key".to_owned(),
+                });
+            }
+            if existing.input.record_id == input.record_id {
+                if existing.input == input && existing.phase == next_phase {
+                    return Self::user_broker_snapshot(&existing);
+                }
+                return Err(OrsError::DuplicateConflict);
+            }
+            let prior_receipt = Self::receipt_for(&existing)?;
+            if expected.map(UserBrokerRegistrationReceipt::receipt) != Some(&prior_receipt) {
+                return Err(OrsError::DuplicateConflict);
+            }
+            if !allowed_prior.contains(&existing.phase) {
+                return Err(OrsError::InvalidTransition);
+            }
+            if !input
+                .authority_epoch
+                .succeeds(&existing.input.authority_epoch.current)
+            {
+                return Err(OrsError::InvalidEpochLineage);
+            }
+        } else if !allow_absent || expected.is_some() {
+            return Err(OrsError::InvalidTransition);
+        }
+
+        let record = DurableOperationalRecord {
+            kind: OperationalKind::UserBroker,
+            input,
+            phase: next_phase,
+            operation_order: Self::next_operational_order(&write)?,
+            terminal_receipt_id: None,
+            terminal_receipt_sha256: None,
+            admission_reservation: None,
+            generation_cutover: None,
+        };
+        Self::persist_operational_record(&write, &key, &record)?;
+        write.commit().map_err(storage)?;
+        Self::user_broker_snapshot(&record)
+    }
+
     fn transition_existing_operational(
         &self,
         kind: OperationalKind,
@@ -29826,32 +30076,53 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         .map(SessionBindingReceipt::from_receipt)
     }
 
+    fn load_user_broker_registration(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerRegistrationSnapshot>, OrsError> {
+        RedbRecoveryStore::load_user_broker_registration(self, subject_id)
+    }
+
     fn register_user_broker(
         &self,
         registration: UserBrokerRegistration,
-    ) -> Result<UserBrokerRegistrationReceipt, OrsError> {
-        self.mutate_operational(
-            OperationalKind::UserBroker,
+        expected: Option<&UserBrokerRegistrationReceipt>,
+    ) -> Result<UserBrokerRegistrationSnapshot, OrsError> {
+        self.mutate_user_broker_registration(
             registration.0,
-            false,
+            expected,
             &[OperationalPhase::Fenced],
+            true,
             OperationalPhase::Active,
         )
-        .map(UserBrokerRegistrationReceipt::from_receipt)
+    }
+
+    fn heartbeat_user_broker(
+        &self,
+        heartbeat: UserBrokerHeartbeat,
+        expected: &UserBrokerRegistrationReceipt,
+    ) -> Result<UserBrokerRegistrationSnapshot, OrsError> {
+        self.mutate_user_broker_registration(
+            heartbeat.into_record(),
+            Some(expected),
+            &[OperationalPhase::Active],
+            false,
+            OperationalPhase::Active,
+        )
     }
 
     fn fence_user_broker(
         &self,
         fence: UserBrokerFence,
-    ) -> Result<UserBrokerRegistrationReceipt, OrsError> {
-        self.mutate_operational(
-            OperationalKind::UserBroker,
+        expected: &UserBrokerRegistrationReceipt,
+    ) -> Result<UserBrokerRegistrationSnapshot, OrsError> {
+        self.mutate_user_broker_registration(
             fence.0,
-            true,
+            Some(expected),
             &[OperationalPhase::Active],
+            false,
             OperationalPhase::Fenced,
         )
-        .map(UserBrokerRegistrationReceipt::from_receipt)
     }
 
     fn commit_authority_snapshot(
@@ -33447,6 +33718,8 @@ mod host_request_result_tests {
             parent_operation_id: None,
             request_digest: digest.to_owned(),
             payload_digest: "b".repeat(64),
+            payload_schema_id: None,
+            payload_body: None,
             connection_ref: label("conn-1"),
             session_ref: Some(label("session-1")),
             task_ref: None,

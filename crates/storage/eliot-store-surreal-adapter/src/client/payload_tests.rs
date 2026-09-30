@@ -236,6 +236,7 @@ fn matrix() -> Value {
 
 fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransition {
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("issue10-write").expect("operation"),
             idempotency_key: "issue10-idempotency".into(),

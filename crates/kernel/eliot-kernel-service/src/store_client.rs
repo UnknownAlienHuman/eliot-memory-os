@@ -1687,6 +1687,7 @@ mod tests {
             state_fence: fence.clone(),
         }];
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("apply-op-1").expect("operation id"),
                 idempotency_key: "apply-idem-1".to_owned(),
@@ -2338,6 +2339,7 @@ mod tests {
             state_fence: fence.clone(),
         }];
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-991-k1").expect("operation id"),
                 idempotency_key: "idem-991-k1".to_owned(),

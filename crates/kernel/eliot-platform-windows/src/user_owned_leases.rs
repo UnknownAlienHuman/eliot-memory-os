@@ -53,6 +53,666 @@ pub struct UserOwnedRootReadLease {
     handle: std::fs::File,
 }
 
+/// The physical kind of one node in an Operator-selected resource contour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserSelectedResourceKind {
+    /// A regular file opened without following a reparse point.
+    File,
+    /// A directory opened without following a reparse point.
+    Directory,
+}
+
+/// Handle-derived identity and kind for one node from the local volume root
+/// through the selected object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSelectedResourceNodeMeasurement {
+    /// Identity queried from the retained handle.
+    pub identity: FileIdentity,
+    /// Kind queried from the retained handle.
+    pub kind: UserSelectedResourceKind,
+}
+
+/// Physical facts measured for one selected root and object.
+///
+/// This value contains no path or authority. The Broker computes any
+/// canonical digests and obtains the State Fence from the Kernel grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSelectedResourceMeasurement {
+    /// Identity of the selected directory root.
+    pub root_identity: FileIdentity,
+    /// Identity of the selected object.
+    pub object_identity: FileIdentity,
+    /// Position of `root_identity` in `ancestor_contour`.
+    pub root_contour_index: usize,
+    /// Full retained contour from the local volume root through the object.
+    pub ancestor_contour: Vec<UserSelectedResourceNodeMeasurement>,
+    /// Handle-derived object kind.
+    pub object_kind: UserSelectedResourceKind,
+    /// File byte length; absent for directories.
+    pub file_size_bytes: Option<u64>,
+    /// File last-write FILETIME in 100 ns ticks; absent for directories.
+    pub last_write_filetime_100ns: Option<u64>,
+    /// Handle-derived metadata `ChangeTime` in 100 ns ticks. This is not a
+    /// directory generation counter.
+    pub metadata_change_time_filetime_100ns: Option<u64>,
+    /// A true directory-generation source is unavailable on this owner.
+    pub directory_generation: Option<u64>,
+    /// Successful measurements are confined to a local fixed drive.
+    pub network: bool,
+    /// Successful measurements exclude device namespace and device objects.
+    pub device: bool,
+    /// Every opened contour node was checked as non-reparse.
+    pub reparse_free: bool,
+    /// Owner wall-clock sample after handle measurements; absent if the
+    /// system clock was before the Unix epoch or could not be represented.
+    pub measured_at_unix_ms: Option<u64>,
+}
+
+/// Failure to prove one read-only physical selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserSelectedResourceError {
+    /// A path was relative, escaped its selected root, or used an unsupported
+    /// Windows namespace form.
+    InvalidPath,
+    /// The selected path resolves to a remote/network drive.
+    NetworkPath,
+    /// The selected path names a device namespace, device object, or a
+    /// non-fixed/unknown drive class.
+    DevicePath,
+    /// A path component or selected object is a reparse point.
+    ReparsePoint,
+    /// A retained handle no longer reports its acquisition identity or kind.
+    IdentityMismatch,
+    /// A required handle-derived metadata query failed.
+    Io,
+    /// The one-shot at-use remeasurement has already been attempted.
+    AlreadyRemeasured,
+    /// The physical owner is available only on Windows.
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for UserSelectedResourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPath => "selected resource path is invalid or outside its root",
+            Self::NetworkPath => "selected resource is on a network drive",
+            Self::DevicePath => "selected resource is a device or unsupported drive",
+            Self::ReparsePoint => "selected resource contour contains a reparse point",
+            Self::IdentityMismatch => "selected resource identity changed",
+            Self::Io => "selected resource handle measurement failed",
+            Self::AlreadyRemeasured => "selected resource at-use remeasurement was consumed",
+            Self::UnsupportedPlatform => "selected resource leases require Windows",
+        })
+    }
+}
+
+impl std::error::Error for UserSelectedResourceError {}
+
+/// One read-only, no-follow physical proof for an Operator-selected root and
+/// object. Every directory handle from the volume root through the object
+/// parent is retained with delete sharing disabled; a directory object is
+/// itself retained in that contour. A file object is retained separately.
+///
+/// The lease does not authorize a later child to reopen the pathname. Broker
+/// must perform `remeasure_for_use` at its use boundary and keep this lease
+/// alive through the one operation it protects.
+pub struct UserSelectedResourceLease {
+    #[cfg(windows)]
+    directories: Vec<std::fs::File>,
+    #[cfg(windows)]
+    object_file: Option<std::fs::File>,
+    #[cfg(windows)]
+    expected_contour: Vec<UserSelectedResourceNodeMeasurement>,
+    #[cfg(windows)]
+    root_contour_index: usize,
+    #[cfg(windows)]
+    object_kind: UserSelectedResourceKind,
+    #[cfg(windows)]
+    volume_root: PathBuf,
+    #[cfg(windows)]
+    remeasure_consumed: bool,
+}
+
+impl std::fmt::Debug for UserSelectedResourceLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(windows)]
+        {
+            formatter
+                .debug_struct("UserSelectedResourceLease")
+                .field("retained_directory_count", &self.directories.len())
+                .field("object_kind", &self.object_kind)
+                .field("remeasure_consumed", &self.remeasure_consumed)
+                .finish_non_exhaustive()
+        }
+        #[cfg(not(windows))]
+        {
+            formatter
+                .debug_struct("UserSelectedResourceLease")
+                .finish_non_exhaustive()
+        }
+    }
+}
+
+impl UserSelectedResourceLease {
+    /// Opens one Operator-selected directory root and one existing object.
+    ///
+    /// Acquisition rejects network/device paths, requires the object to be
+    /// beneath the selected root, and retains each directory handle from the
+    /// local drive root through the object. It never changes a DACL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either path is invalid, remote, a device or
+    /// reparse point, outside the selected root, or cannot be measured from
+    /// retained handles. Non-Windows targets return
+    /// [`UserSelectedResourceError::UnsupportedPlatform`].
+    pub fn open(
+        root: &Path,
+        object: &Path,
+    ) -> Result<(Self, UserSelectedResourceMeasurement), UserSelectedResourceError> {
+        #[cfg(windows)]
+        {
+            open_user_selected_resource(root, object)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (root, object);
+            Err(UserSelectedResourceError::UnsupportedPlatform)
+        }
+    }
+
+    /// Consumes the one at-use remeasurement for this selection.
+    ///
+    /// The measurement is read from the original retained handles. The caller
+    /// must invoke this immediately before its one operation and keep `self`
+    /// alive until that operation returns. This does not authorize a child to
+    /// reopen the selected pathname.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the one-shot call was already attempted or a
+    /// retained identity, kind, network/device policy fact, or metadata query
+    /// cannot be re-established.
+    pub fn remeasure_for_use(
+        &mut self,
+    ) -> Result<UserSelectedResourceMeasurement, UserSelectedResourceError> {
+        #[cfg(windows)]
+        {
+            if self.remeasure_consumed {
+                return Err(UserSelectedResourceError::AlreadyRemeasured);
+            }
+            self.remeasure_consumed = true;
+            measure_user_selected_resource(self)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(UserSelectedResourceError::UnsupportedPlatform)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_user_selected_resource(
+    root: &Path,
+    object: &Path,
+) -> Result<(UserSelectedResourceLease, UserSelectedResourceMeasurement), UserSelectedResourceError>
+{
+    let selected_root = normalize_user_selected_path(root)?;
+    let selected_object = normalize_user_selected_path(object)?;
+    if !selected_object.path.starts_with(&selected_root.path)
+        || selected_root.components.len() > selected_object.components.len()
+    {
+        return Err(UserSelectedResourceError::InvalidPath);
+    }
+    if !selected_root
+        .drive
+        .eq_ignore_ascii_case(&selected_object.drive)
+    {
+        return Err(UserSelectedResourceError::InvalidPath);
+    }
+
+    let mut contour = open_user_selected_directory_contour(&selected_root, &selected_object)?;
+
+    let (object_kind, object_file) = if selected_object.components.is_empty() {
+        // The local volume root is already retained as contour node zero.
+        (UserSelectedResourceKind::Directory, None)
+    } else {
+        match crate::open_no_follow_directory(&selected_object.path) {
+            Ok((identity, handle)) => {
+                if identity.volume_serial_number != contour.volume_identity.volume_serial_number {
+                    return Err(UserSelectedResourceError::IdentityMismatch);
+                }
+                require_non_device_directory(&handle)?;
+                contour
+                    .expected_contour
+                    .push(UserSelectedResourceNodeMeasurement {
+                        identity,
+                        kind: UserSelectedResourceKind::Directory,
+                    });
+                contour.directories.push(handle);
+                (UserSelectedResourceKind::Directory, None)
+            }
+            Err(ProtectedPathError::InvalidPath) => {
+                let (identity, handle) = crate::open_no_follow_file(&selected_object.path)
+                    .map_err(map_selected_resource_path_error)?;
+                if identity.volume_serial_number != contour.volume_identity.volume_serial_number {
+                    return Err(UserSelectedResourceError::IdentityMismatch);
+                }
+                require_non_device_file(&handle)?;
+                contour
+                    .expected_contour
+                    .push(UserSelectedResourceNodeMeasurement {
+                        identity,
+                        kind: UserSelectedResourceKind::File,
+                    });
+                (UserSelectedResourceKind::File, Some(handle))
+            }
+            Err(error) => return Err(map_selected_resource_path_error(error)),
+        }
+    };
+
+    if object_kind == UserSelectedResourceKind::File
+        && contour.root_contour_index >= contour.expected_contour.len().saturating_sub(1)
+    {
+        return Err(UserSelectedResourceError::InvalidPath);
+    }
+
+    let lease = UserSelectedResourceLease {
+        directories: contour.directories,
+        object_file,
+        expected_contour: contour.expected_contour,
+        root_contour_index: contour.root_contour_index,
+        object_kind,
+        volume_root: contour.volume_root,
+        remeasure_consumed: false,
+    };
+    let measurement = measure_user_selected_resource(&lease)?;
+    Ok((lease, measurement))
+}
+
+#[cfg(windows)]
+struct SelectedDirectoryContour {
+    directories: Vec<std::fs::File>,
+    expected_contour: Vec<UserSelectedResourceNodeMeasurement>,
+    root_contour_index: usize,
+    volume_identity: FileIdentity,
+    volume_root: PathBuf,
+}
+
+#[cfg(windows)]
+fn open_user_selected_directory_contour(
+    root: &NormalizedUserSelectedPath,
+    object: &NormalizedUserSelectedPath,
+) -> Result<SelectedDirectoryContour, UserSelectedResourceError> {
+    let volume_root = PathBuf::from(format!("{}:\\", root.drive));
+    require_local_fixed_drive(&volume_root)?;
+    let parent_component_count = object.components.len().saturating_sub(1);
+    if root.components.len() > parent_component_count && !object.components.is_empty() {
+        return Err(UserSelectedResourceError::InvalidPath);
+    }
+
+    let mut directories = Vec::with_capacity(parent_component_count + 2);
+    let mut expected_contour = Vec::with_capacity(object.components.len() + 1);
+    let (volume_identity, volume_handle) =
+        crate::open_no_follow_directory(&volume_root).map_err(map_selected_resource_path_error)?;
+    require_non_device_directory(&volume_handle)?;
+    require_actual_volume_root(&volume_handle, root.drive)?;
+    directories.push(volume_handle);
+    expected_contour.push(UserSelectedResourceNodeMeasurement {
+        identity: volume_identity,
+        kind: UserSelectedResourceKind::Directory,
+    });
+
+    let mut current = volume_root.clone();
+    for component in object.components.iter().take(parent_component_count) {
+        current.push(component);
+        let (identity, handle) =
+            crate::open_no_follow_directory(&current).map_err(map_selected_resource_path_error)?;
+        if identity.volume_serial_number != volume_identity.volume_serial_number {
+            return Err(UserSelectedResourceError::IdentityMismatch);
+        }
+        require_non_device_directory(&handle)?;
+        directories.push(handle);
+        expected_contour.push(UserSelectedResourceNodeMeasurement {
+            identity,
+            kind: UserSelectedResourceKind::Directory,
+        });
+    }
+
+    let root_contour_index = root.components.len();
+    if root_contour_index >= expected_contour.len()
+        || expected_contour[root_contour_index].kind != UserSelectedResourceKind::Directory
+    {
+        return Err(UserSelectedResourceError::InvalidPath);
+    }
+    Ok(SelectedDirectoryContour {
+        directories,
+        expected_contour,
+        root_contour_index,
+        volume_identity,
+        volume_root,
+    })
+}
+
+#[cfg(not(windows))]
+fn map_selected_resource_path_error(error: ProtectedPathError) -> UserSelectedResourceError {
+    let _ = error;
+    UserSelectedResourceError::UnsupportedPlatform
+}
+
+#[cfg(windows)]
+struct NormalizedUserSelectedPath {
+    path: PathBuf,
+    drive: char,
+    components: Vec<std::ffi::OsString>,
+}
+
+#[cfg(windows)]
+fn normalize_user_selected_path(
+    path: &Path,
+) -> Result<NormalizedUserSelectedPath, UserSelectedResourceError> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Err(UserSelectedResourceError::InvalidPath);
+    };
+    let drive_byte = match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+        Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => {
+            return Err(UserSelectedResourceError::NetworkPath);
+        }
+        Prefix::DeviceNS(_) | Prefix::Verbatim(_) => {
+            return Err(UserSelectedResourceError::DevicePath);
+        }
+    };
+    if !drive_byte.is_ascii_alphabetic() || !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(UserSelectedResourceError::InvalidPath);
+    }
+    let drive = char::from(drive_byte);
+    let mut normal_components = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(normal) => {
+                let text = normal.to_string_lossy();
+                if text.contains(':') || text.ends_with('.') || text.ends_with(' ') {
+                    return Err(UserSelectedResourceError::InvalidPath);
+                }
+                normal_components.push(normal.to_os_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(UserSelectedResourceError::InvalidPath);
+            }
+        }
+    }
+
+    let mut normalized = PathBuf::from(format!("{drive}:\\"));
+    for component in &normal_components {
+        normalized.push(component);
+    }
+    Ok(NormalizedUserSelectedPath {
+        path: normalized,
+        drive,
+        components: normal_components,
+    })
+}
+
+#[cfg(windows)]
+fn require_local_fixed_drive(path: &Path) -> Result<(), UserSelectedResourceError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOTE};
+
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let drive_type = unsafe {
+        // SAFETY: `wide_path` is NUL-terminated and remains live for the call.
+        GetDriveTypeW(wide_path.as_ptr())
+    };
+    if drive_type == DRIVE_REMOTE {
+        return Err(UserSelectedResourceError::NetworkPath);
+    }
+    if drive_type != DRIVE_FIXED {
+        return Err(UserSelectedResourceError::DevicePath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn require_actual_volume_root(
+    handle: &std::fs::File,
+    expected_drive: char,
+) -> Result<(), UserSelectedResourceError> {
+    let final_path =
+        crate::final_windows_path_from_handle(handle).map_err(|_| UserSelectedResourceError::Io)?;
+    let resolved = normalize_user_selected_path(&final_path)?;
+    if !resolved.components.is_empty() || !resolved.drive.eq_ignore_ascii_case(&expected_drive) {
+        return Err(UserSelectedResourceError::InvalidPath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn map_selected_resource_path_error(error: ProtectedPathError) -> UserSelectedResourceError {
+    match error {
+        ProtectedPathError::InvalidPath | ProtectedPathError::InvalidRoot => {
+            UserSelectedResourceError::InvalidPath
+        }
+        ProtectedPathError::ReparsePoint => UserSelectedResourceError::ReparsePoint,
+        ProtectedPathError::IdentityMismatch => UserSelectedResourceError::IdentityMismatch,
+        ProtectedPathError::UnsupportedPlatform => UserSelectedResourceError::UnsupportedPlatform,
+        ProtectedPathError::AclMismatch
+        | ProtectedPathError::Io
+        | ProtectedPathError::Win32 { .. }
+        | ProtectedPathError::SizeExceeded => UserSelectedResourceError::Io,
+    }
+}
+
+#[cfg(windows)]
+fn require_non_device_directory(file: &std::fs::File) -> Result<(), UserSelectedResourceError> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let metadata = file.metadata().map_err(|_| UserSelectedResourceError::Io)?;
+    let attributes = metadata.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(UserSelectedResourceError::ReparsePoint);
+    }
+    if attributes & FILE_ATTRIBUTE_DEVICE != 0 || !metadata.is_dir() {
+        return Err(UserSelectedResourceError::DevicePath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn require_non_device_file(file: &std::fs::File) -> Result<(), UserSelectedResourceError> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let metadata = file.metadata().map_err(|_| UserSelectedResourceError::Io)?;
+    let attributes = metadata.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(UserSelectedResourceError::ReparsePoint);
+    }
+    if attributes & FILE_ATTRIBUTE_DEVICE != 0 {
+        return Err(UserSelectedResourceError::DevicePath);
+    }
+    if !metadata.is_file() {
+        return Err(UserSelectedResourceError::InvalidPath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn measure_user_selected_contour(
+    lease: &UserSelectedResourceLease,
+) -> Result<Vec<UserSelectedResourceNodeMeasurement>, UserSelectedResourceError> {
+    require_local_fixed_drive(&lease.volume_root)?;
+    if lease.expected_contour.is_empty() || lease.root_contour_index >= lease.expected_contour.len()
+    {
+        return Err(UserSelectedResourceError::IdentityMismatch);
+    }
+    let expected_directory_count = match lease.object_kind {
+        UserSelectedResourceKind::Directory => lease.expected_contour.len(),
+        UserSelectedResourceKind::File => lease.expected_contour.len().saturating_sub(1),
+    };
+    if lease.directories.len() != expected_directory_count {
+        return Err(UserSelectedResourceError::IdentityMismatch);
+    }
+
+    let mut observed = Vec::with_capacity(lease.expected_contour.len());
+    for (index, handle) in lease.directories.iter().enumerate() {
+        require_non_device_directory(handle)?;
+        let identity = crate::process_identity::file_identity_from_handle(handle)
+            .map_err(|_| UserSelectedResourceError::Io)?;
+        let node = UserSelectedResourceNodeMeasurement {
+            identity,
+            kind: UserSelectedResourceKind::Directory,
+        };
+        if lease.expected_contour.get(index) != Some(&node) {
+            return Err(UserSelectedResourceError::IdentityMismatch);
+        }
+        observed.push(node);
+    }
+
+    let object_handle = match lease.object_kind {
+        UserSelectedResourceKind::Directory => lease
+            .directories
+            .last()
+            .ok_or(UserSelectedResourceError::IdentityMismatch)?,
+        UserSelectedResourceKind::File => lease
+            .object_file
+            .as_ref()
+            .ok_or(UserSelectedResourceError::IdentityMismatch)?,
+    };
+    let object_node = UserSelectedResourceNodeMeasurement {
+        identity: crate::process_identity::file_identity_from_handle(object_handle)
+            .map_err(|_| UserSelectedResourceError::Io)?,
+        kind: lease.object_kind,
+    };
+    if lease.expected_contour.last() != Some(&object_node) {
+        return Err(UserSelectedResourceError::IdentityMismatch);
+    }
+    if lease.object_kind == UserSelectedResourceKind::File {
+        observed.push(object_node);
+    } else if observed.last() != Some(&object_node) {
+        return Err(UserSelectedResourceError::IdentityMismatch);
+    }
+    Ok(observed)
+}
+
+#[cfg(windows)]
+struct SelectedObjectMetadata {
+    file_size_bytes: Option<u64>,
+    last_write_filetime_100ns: Option<u64>,
+    metadata_change_time_filetime_100ns: Option<u64>,
+}
+
+#[cfg(windows)]
+fn measure_selected_object_metadata(
+    file: &std::fs::File,
+    kind: UserSelectedResourceKind,
+) -> Result<SelectedObjectMetadata, UserSelectedResourceError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    };
+
+    match kind {
+        UserSelectedResourceKind::File => require_non_device_file(file)?,
+        UserSelectedResourceKind::Directory => require_non_device_directory(file)?,
+    }
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let info_ok = unsafe {
+        // SAFETY: the retained handle is live and the initialized information
+        // structure is writable for the duration of the call.
+        GetFileInformationByHandle(handle, &raw mut information)
+    };
+    if info_ok == 0 {
+        return Err(UserSelectedResourceError::Io);
+    }
+
+    let mut basic = FILE_BASIC_INFO::default();
+    let basic_size = u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>())
+        .map_err(|_| UserSelectedResourceError::Io)?;
+    let basic_ok = unsafe {
+        // SAFETY: the retained handle is live and `basic` has the documented
+        // output size for `FileBasicInfo`.
+        GetFileInformationByHandleEx(handle, FileBasicInfo, (&raw mut basic).cast(), basic_size)
+    };
+    if basic_ok == 0
+        || basic.FileAttributes & (FILE_ATTRIBUTE_DEVICE | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(UserSelectedResourceError::Io);
+    }
+
+    let file_size_bytes = (kind == UserSelectedResourceKind::File).then(|| {
+        (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow)
+    });
+    let last_write_filetime_100ns = (kind == UserSelectedResourceKind::File).then(|| {
+        (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+            | u64::from(information.ftLastWriteTime.dwLowDateTime)
+    });
+    Ok(SelectedObjectMetadata {
+        file_size_bytes,
+        last_write_filetime_100ns,
+        metadata_change_time_filetime_100ns: u64::try_from(basic.ChangeTime).ok(),
+    })
+}
+
+#[cfg(windows)]
+fn measure_user_selected_resource(
+    lease: &UserSelectedResourceLease,
+) -> Result<UserSelectedResourceMeasurement, UserSelectedResourceError> {
+    let observed = measure_user_selected_contour(lease)?;
+    let object_node = observed
+        .last()
+        .copied()
+        .ok_or(UserSelectedResourceError::IdentityMismatch)?;
+    let object_handle = match lease.object_kind {
+        UserSelectedResourceKind::Directory => lease
+            .directories
+            .last()
+            .ok_or(UserSelectedResourceError::IdentityMismatch)?,
+        UserSelectedResourceKind::File => lease
+            .object_file
+            .as_ref()
+            .ok_or(UserSelectedResourceError::IdentityMismatch)?,
+    };
+    let metadata = measure_selected_object_metadata(object_handle, lease.object_kind)?;
+    let measured_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+
+    Ok(UserSelectedResourceMeasurement {
+        root_identity: lease.expected_contour[lease.root_contour_index].identity,
+        object_identity: object_node.identity,
+        root_contour_index: lease.root_contour_index,
+        ancestor_contour: observed,
+        object_kind: lease.object_kind,
+        file_size_bytes: metadata.file_size_bytes,
+        last_write_filetime_100ns: metadata.last_write_filetime_100ns,
+        metadata_change_time_filetime_100ns: metadata.metadata_change_time_filetime_100ns,
+        directory_generation: None,
+        network: false,
+        device: false,
+        reparse_free: true,
+        measured_at_unix_ms,
+    })
+}
+
 impl std::fmt::Debug for UserOwnedRootReadLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

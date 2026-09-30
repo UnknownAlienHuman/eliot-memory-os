@@ -178,6 +178,10 @@ fn runtime_launch() -> RuntimeLaunchDescriptor {
             handle("6".repeat(64)),
             handle("--native-worker-artifact-sha256"),
             handle("7".repeat(64)),
+            handle("--user-broker-executable"),
+            handle(r"C:\ProgramData\Eliot\packages\generation-test\eliot-user-broker.exe"),
+            handle("--user-broker-artifact-sha256"),
+            handle("e".repeat(64)),
             handle("--eliotd-descriptor"),
             handle(r"C:\ProgramData\Eliot\eliotd.json"),
             handle("--eliotd-descriptor-sha256"),
@@ -211,6 +215,10 @@ fn runtime_launch() -> RuntimeLaunchDescriptor {
         testd_artifact_digest: handle("6".repeat(64)),
         native_worker_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-native-worker.exe"),
         native_worker_artifact_digest: handle("7".repeat(64)),
+        user_broker_executable_path: handle(
+            r"C:\ProgramData\Eliot\packages\generation-test\eliot-user-broker.exe",
+        ),
+        user_broker_artifact_digest: handle("e".repeat(64)),
         wasm_host_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-wasm-host.exe"),
         wasm_host_artifact_digest: handle("f".repeat(64)),
         descriptor_digest: handle("0".repeat(64)),
@@ -338,6 +346,7 @@ fn transition() -> PreparedTransition {
     let entries = eliot_store_api::generated_operation_manifests().unwrap();
     let set_digest = eliot_store_api::operation_manifest_set_digest(&entries).unwrap();
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-991-d1").unwrap(),
             idempotency_key: "idem-991-d1".to_owned(),

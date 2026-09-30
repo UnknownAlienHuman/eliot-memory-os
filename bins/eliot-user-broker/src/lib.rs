@@ -40,9 +40,9 @@ use eliot_user_broker_core::{
     AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
     CutoverReceipt, DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest,
     IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest,
-    LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest, PortError,
-    ProcessEffectLineage, ProcessPort, ProcessStartOutcome, RegistrationReceipt,
-    RegistrationStatus, RequiredProvider, UserBroker,
+    LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest,
+    OperatorNativeResourceSelectionInput, PortError, ProcessEffectLineage, ProcessPort,
+    ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider, UserBroker,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -50,6 +50,8 @@ use thiserror::Error;
 
 mod bridge_contract;
 mod kernel_authority_port;
+#[cfg(windows)]
+mod native_resource_resolver;
 mod notify_fallback_ensure;
 pub mod notify_launch_callin;
 mod operation_identity;
@@ -1362,6 +1364,10 @@ impl BrokerComposition {
         }
         let providers_admitted = authority.is_some() && process.is_some();
         let mut broker = UserBroker::new(authority, process, Some(Box::new(durable)));
+        #[cfg(windows)]
+        broker.attach_native_resource_resolver(Box::new(
+            native_resource_resolver::WindowsNativeResourceResolver::new(),
+        ));
         // The live identity ledger must be attached before recovery so the
         // snapshot is republished with the exact identities this process
         // issues, and before the first Kernel call can mint.
@@ -1727,6 +1733,21 @@ impl BrokerComposition {
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
         self.broker.launch(request).map_err(Self::classify)
+    }
+
+    /// Authenticated generic Human launch with an explicit selected native
+    /// resource. The selected path stays in Broker memory and is reduced to a
+    /// handle-derived candidate before `authorize_launch` is called.
+    pub fn launch_with_native_resource_selection(
+        &mut self,
+        request: LaunchRequest,
+        selection: OperatorNativeResourceSelectionInput,
+    ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
+        self.verify_launch_lease()?;
+        let _ = self.heartbeat()?;
+        self.broker
+            .launch_with_native_resource_selection(request, selection)
+            .map_err(Self::classify)
     }
 
     /// Admits one authenticated Human acknowledgement without spawning a

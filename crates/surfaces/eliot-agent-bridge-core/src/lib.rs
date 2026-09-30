@@ -330,6 +330,8 @@ pub struct AttachRequest {
     connection_id: ConnectionId,
     attach_kind: AttachKind,
     pre_attach_blind_interval: Option<BlindInterval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_selector: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -339,6 +341,8 @@ struct RawAttachRequest {
     connection_id: ConnectionId,
     attach_kind: AttachKind,
     pre_attach_blind_interval: Option<BlindInterval>,
+    #[serde(default)]
+    workspace_selector: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for AttachRequest {
@@ -347,13 +351,19 @@ impl<'de> Deserialize<'de> for AttachRequest {
         D: Deserializer<'de>,
     {
         let raw = RawAttachRequest::deserialize(deserializer)?;
-        Self::new(
+        let request = Self::new(
             raw.demand_id,
             raw.connection_id,
             raw.attach_kind,
             raw.pre_attach_blind_interval,
         )
-        .map_err(de::Error::custom)
+        .map_err(de::Error::custom)?;
+        match raw.workspace_selector {
+            Some(selector) => request
+                .with_workspace_selector(selector)
+                .map_err(de::Error::custom),
+            None => Ok(request),
+        }
     }
 }
 
@@ -364,6 +374,7 @@ impl AttachRequest {
             connection_id,
             attach_kind: AttachKind::Managed,
             pre_attach_blind_interval: None,
+            workspace_selector: None,
         }
     }
 
@@ -413,6 +424,7 @@ impl AttachRequest {
             connection_id,
             attach_kind,
             pre_attach_blind_interval,
+            workspace_selector: None,
         })
     }
 
@@ -430,6 +442,35 @@ impl AttachRequest {
 
     pub const fn pre_attach_blind_interval(&self) -> Option<&BlindInterval> {
         self.pre_attach_blind_interval.as_ref()
+    }
+
+    /// Carries an explicit inert workspace selector for the authenticated
+    /// daemon Host observer. The string is a selector only: it does not
+    /// authenticate workspace identity or grant filesystem authority.
+    #[allow(
+        clippy::result_large_err,
+        reason = "preserves the established BridgeError contract for attach request validation"
+    )]
+    pub fn with_workspace_selector(
+        mut self,
+        selector: impl Into<String>,
+    ) -> Result<Self, BridgeError> {
+        let selector = selector.into();
+        if selector.trim().is_empty()
+            || selector.chars().any(char::is_control)
+            || selector.len() > 4096
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "workspace_selector",
+                reason: "must be bounded nonblank text without control characters",
+            });
+        }
+        self.workspace_selector = Some(selector);
+        Ok(self)
+    }
+
+    pub fn workspace_selector(&self) -> Option<&str> {
+        self.workspace_selector.as_deref()
     }
 }
 
@@ -509,6 +550,7 @@ pub struct ActivationPortResult {
     activation_generation: Generation,
     state_fence: FencingToken,
     task_binding: Box<TaskBinding>,
+    cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
 }
 
 impl ActivationPortResult {
@@ -540,7 +582,29 @@ impl ActivationPortResult {
             activation_generation,
             state_fence,
             task_binding: Box::new(task_binding),
+            cold_start_question: None,
         })
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "preserves the established BridgeError contract while sealing owner question evidence"
+    )]
+    pub fn with_cold_start_question(
+        mut self,
+        question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
+    ) -> Result<Self, BridgeError> {
+        if let Some(question) = &question {
+            question
+                .validate()
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        }
+        self.cold_start_question = question;
+        Ok(self)
+    }
+
+    pub fn cold_start_question(&self) -> Option<&eliot_protocol::AgentActivationColdStartQuestion> {
+        self.cold_start_question.as_ref()
     }
 }
 
@@ -551,6 +615,7 @@ struct ActivationGrant {
     activation_generation: Generation,
     state_fence: FencingToken,
     task_binding: TaskBinding,
+    cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
 }
 
 impl ActivationGrant {
@@ -566,6 +631,7 @@ impl ActivationGrant {
             activation_generation: result.activation_generation,
             state_fence: result.state_fence,
             task_binding: *result.task_binding,
+            cold_start_question: result.cold_start_question,
         })
     }
 }
@@ -987,6 +1053,7 @@ pub struct AttachView {
     binding: AttachBinding,
     reconciliation_required: bool,
     pre_attach_proof_ceiling: Option<ProofCeiling>,
+    cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
 }
 
 impl AttachView {
@@ -1000,6 +1067,10 @@ impl AttachView {
 
     pub const fn pre_attach_proof_ceiling(&self) -> Option<ProofCeiling> {
         self.pre_attach_proof_ceiling
+    }
+
+    pub fn cold_start_question(&self) -> Option<&eliot_protocol::AgentActivationColdStartQuestion> {
+        self.cold_start_question.as_ref()
     }
 }
 
@@ -3783,6 +3854,7 @@ struct ActiveAttach {
     reconciliation_required: bool,
     blind_interval: Option<BlindInterval>,
     recovery: Option<RecoveryWindow>,
+    cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
 }
 
 /// One stream's imported recovery state inside the declared window.
@@ -4285,6 +4357,7 @@ impl AgentBridgeCore {
             reconciliation_required: request.attach_kind == AttachKind::External,
             blind_interval: request.pre_attach_blind_interval,
             recovery: None,
+            cold_start_question: grant.cold_start_question,
         };
         self.active = Some(active);
         self.replay = ReplayLedger::new();
@@ -5030,6 +5103,7 @@ impl AgentBridgeCore {
                 .blind_interval
                 .as_ref()
                 .map(|_| ProofCeiling::CandidateOnly),
+            cold_start_question: active.cold_start_question.clone(),
         })
     }
 

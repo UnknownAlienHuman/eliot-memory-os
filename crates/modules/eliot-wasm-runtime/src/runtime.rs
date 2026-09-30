@@ -986,24 +986,41 @@ fn validate_resolutions(
     {
         return Err(RuntimeError::StaleFence);
     }
+    // Instruction/data separation is decided here, at the use boundary, and
+    // before any optional diagnosis could matter. A recorded assessment is
+    // resolved against the assurance in force for this exact invocation: it
+    // can only narrow the permitted uses and effects, never widen them, and a
+    // source, profile or fence that moved after diagnosis fails closed here.
+    // Independent work with no recorded assessment keeps its own assurance.
+    let (permitted_uses, permitted_effects, instruction_taint) = match &source.security_assessment {
+        Some(assessment) => {
+            let use_authority = assessment
+                .resolve_source_use(&source.assurance, &governor.generation.state_fence)
+                .map_err(|_| RuntimeError::SourceNotAdmitted)?;
+            (
+                use_authority.permitted_uses,
+                use_authority.permitted_effects,
+                use_authority.instruction_taint,
+            )
+        }
+        None => (
+            source.assurance.allowed_epistemic_use.clone(),
+            source.assurance.allowed_effects.clone(),
+            source.assurance.instruction_taint,
+        ),
+    };
     if !matches!(source.assurance.integrity, IntegrityStatus::Verified)
         || !matches!(source.assurance.freshness, FreshnessStatus::Current)
         || !matches!(
-            source.assurance.instruction_taint,
+            instruction_taint,
             InstructionTaint::Cleared | InstructionTaint::DataOnly
         )
         || !matches!(
             source.assurance.quarantine,
             QuarantineState::None | QuarantineState::Released
         )
-        || !source
-            .assurance
-            .allowed_epistemic_use
-            .contains(&EpistemicUse::VerificationInput)
-        || !source
-            .assurance
-            .allowed_effects
-            .contains(&SourceEffectCeiling::NoExternalEffect)
+        || !permitted_uses.contains(&EpistemicUse::VerificationInput)
+        || !permitted_effects.contains(&SourceEffectCeiling::NoExternalEffect)
         || source.assurance.required_verifier.as_deref()
             != Some(governor.manifest.required_verifier.as_str())
         || !governor

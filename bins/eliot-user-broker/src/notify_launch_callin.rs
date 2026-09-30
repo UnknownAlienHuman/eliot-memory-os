@@ -123,6 +123,9 @@ pub enum BrokerNotifyError {
     /// on it means some other operation's bytes reached this one, and the
     /// acknowledgement is the only admitted request that carries bytes.
     UnexpectedStdinPayload,
+    /// Generic Operator resource selection was attached to a notification
+    /// operation without an independently admitted notification resource.
+    UnexpectedResourceSelection,
 }
 
 impl BrokerNotifyError {
@@ -137,6 +140,9 @@ impl BrokerNotifyError {
             Self::BindingRejected => "BROKER_NOTIFY_BINDING_REJECTED",
             Self::NotNotifyImage => "BROKER_NOTIFY_IMAGE_REQUIRED",
             Self::UnexpectedStdinPayload => "BROKER_NOTIFY_UNEXPECTED_STDIN_PAYLOAD",
+            Self::UnexpectedResourceSelection => {
+                "BROKER_NOTIFY_RESOURCE_SELECTION_REQUIRES_GENERIC_LAUNCH"
+            }
         }
     }
 }
@@ -354,6 +360,9 @@ pub fn admit_notify_request(
     authority: &BrokerNotifyLaunchAuthority,
     request: &eliot_user_broker_core::LaunchRequest,
 ) -> Result<(), BrokerNotifyError> {
+    if request.resource_selection_candidate.is_some() {
+        return Err(BrokerNotifyError::UnexpectedResourceSelection);
+    }
     if request.stdin_payload.is_some() {
         return Err(BrokerNotifyError::UnexpectedStdinPayload);
     }
@@ -594,5 +603,8 @@ fn stage_deferral_code(error: &BrokerNotifyError) -> &'static str {
         // match cannot silently report a request refusal as a deferred
         // declaration.
         BrokerNotifyError::UnexpectedStdinPayload => "UNEXPECTED_STDIN_PAYLOAD",
+        BrokerNotifyError::UnexpectedResourceSelection => {
+            "RESOURCE_SELECTION_REQUIRES_GENERIC_LAUNCH"
+        }
     }
 }

@@ -5,9 +5,9 @@ use std::path::Path;
 
 use eliot_wasm_host::{
     CliError, ContourGateError, PrototypeContourDecision, TypedWorld, admit_generation,
-    admit_prototype, default_experimental_limits, execute_describe_experimental,
-    experimental_manifest, parse_args, read_bounded_artifact, run_guest_exec,
-    run_ordinary_request_loop, typed_wit_digest,
+    admit_prototype, check_governed_admission, default_experimental_limits,
+    execute_describe_experimental, experimental_manifest, parse_args, read_bounded_artifact,
+    run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -103,6 +103,10 @@ fn main() {
                     "MISSING_EXPERIMENTAL_WORLD",
                     "--experimental-typed-component requires --world".to_owned(),
                 ),
+                CliError::MissingGovernedWorld => (
+                    "MISSING_GOVERNED_WORLD",
+                    "--governed-typed-component requires --world".to_owned(),
+                ),
                 CliError::UnknownWorld(_) => ("UNKNOWN_WORLD", "world is unknown".to_owned()),
             };
             emit_error(code, &detail);
@@ -117,6 +121,17 @@ fn main() {
     // contaminate stdout.
     if let Some(guest) = &config.guest_exec {
         std::process::exit(run_guest_exec(guest));
+    }
+
+    // Explicit governed typed attempt: the default lane binds no Kernel
+    // admission channel, so deny with the typed admission denial before any
+    // artifact acquisition, compilation, or instantiation. This lane never
+    // falls back to the experimental path. Borrows only: the experimental
+    // branch below moves its own selection.
+    if let (Some(component_path), Some(world_name)) =
+        (&config.governed_typed_component, &config.experimental_world)
+    {
+        run_governed_typed_denial(component_path.as_path(), world_name.as_str());
     }
 
     if let (Some(component_path), Some(world_name)) = (
@@ -154,13 +169,46 @@ fn main() {
         // `WasmHostResultFrame` and rejects with the producer's own validator
         // instead of re-deriving a weaker local check. That consumer must be
         // written against the current `WASM_HOST_RESULT_WIRE_VERSION`:
-        // every event now names the command that produced it
-        // (`command_sequence`, the #2785 handover token), and a control event
-        // admitted from an owner delivery names that exact delivery and the
-        // acknowledgement the child staged for it (`delivery_ack`, #2786).
+        // every event now names the handover correlation token of the command
+        // whose reply it observes (`command_sequence`, a process-local counter
+        // that distinguishes which handover an event came from within one
+        // recorded stream), and a control event admitted from an owner delivery
+        // names that exact delivery and the acknowledgement the child staged for
+        // it (`delivery_ack`, #2786). The durable order of one operation's
+        // observations is `sequence` together with the complete
+        // `observation_predecessors` prefix, not that token and not arrival.
         // `emit_receipt` stays for the separate experimental describe mode
         // only.
         Ok(_) => {}
+        Err(error) => {
+            emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
+    }
+}
+
+/// Denies an explicit governed typed attempt through the real admission
+/// gate. No Kernel admission channel is bound in this host, so no digest is
+/// bound and no admission record exists: the gate denies before any artifact
+/// acquisition, compilation, or instantiation, and the caller-supplied path
+/// marks this as an arbitrary-path attempt on the governed lane. The typed
+/// denial propagates with the governed lane's stable code. This mode is
+/// separate from the experimental lane and never stands in for it.
+fn run_governed_typed_denial(component_path: &Path, world_name: &str) -> ! {
+    let Some(world) = TypedWorld::parse(world_name) else {
+        emit_error("UNKNOWN_WORLD", "world is unknown");
+        std::process::exit(INVALID_ARGUMENT_EXIT);
+    };
+    match check_governed_admission(world, None, Some(component_path), None) {
+        // The gate owns no live admission channel, so even a future
+        // non-denial here must not execute: fail closed on the same code.
+        Ok(()) => {
+            emit_error(
+                "KERNEL_ADMISSION_REQUIRED",
+                "governed admission is required",
+            );
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
         Err(error) => {
             emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());
             std::process::exit(ADMISSION_REQUIRED_EXIT);

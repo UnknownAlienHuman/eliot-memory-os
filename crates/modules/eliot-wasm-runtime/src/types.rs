@@ -5,7 +5,9 @@ use eliot_process::{
     FencingToken, Generation, OperationId, ProcessRequest, ProcessStartReceipt, ProcessTreeId,
 };
 use eliot_runtime_contracts::{ModuleGeneration, RuntimeContractError, RuntimeLease};
-use eliot_security_contracts::{PrivacyClass, SecurityContractError, SourceAssurance};
+use eliot_security_contracts::{
+    PrivacyClass, SecurityContractError, SourceAssurance, SourceSecurityAssessment,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -416,6 +418,11 @@ pub struct AuthorityResolution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceVerification {
     pub assurance: SourceAssurance,
+    /// Recorded security assessment for this source, when the security owner
+    /// has produced one. Absent means no assessment exists and the current
+    /// assurance alone bounds the use; a present assessment is resolved against
+    /// that same assurance at the use boundary and can only narrow it.
+    pub security_assessment: Option<SourceSecurityAssessment>,
     pub verification_revision: Revision,
     pub verification_receipt_digest: Sha256Digest,
 }

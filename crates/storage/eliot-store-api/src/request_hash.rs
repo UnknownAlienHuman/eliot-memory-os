@@ -675,6 +675,7 @@ mod tests {
     fn from_apply_rebinds_context_and_expected_heads() {
         let view = golden_view();
         let transition = PreparedTransition {
+            contract_version: crate::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: view.operation_id.clone(),
                 idempotency_key: view.idempotency_key.clone(),
@@ -708,6 +709,7 @@ mod tests {
     fn bound_transition() -> PreparedTransition {
         let view = golden_view();
         let mut transition = PreparedTransition {
+            contract_version: crate::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: view.operation_id.clone(),
                 idempotency_key: view.idempotency_key.clone(),

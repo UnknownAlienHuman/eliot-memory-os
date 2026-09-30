@@ -25,6 +25,7 @@ dependency_rule = "Assignment depends_on lists logical contract prerequisites; C
 supersession_rule = "The stale cognitive-crates-prototypes-01 branch is not an assignment source."
 scope_rule = "Cells 76-86 are TO-BE-CREATED static assignments grounded in I12-21/I12-19/I07-25/I09-16/I16-23/I06-16/A00-07/A06-07/I12-34; orders 1-43 are never renumbered or reused."
 contract_placement_rule = "Issue #259 measured the four physical crates and found zero [[field_contract]], [[field_contract_index]], [[ownership]], [[crate_manifest]], [[validation_gate]], [[assignment]] and [[agent_brief]] tables in all four module.toml files: the wave tables existed only in this catalogue. Each field contract is therefore also written into the owning crate's own module.toml, where the implementation agent receives the manifest. The crate copy is the owner-located copy and this catalogue is the wave-level index of the same contract id; neither is a second owner, and the two are required to stay byte-identical on id, owner_crate, fields, denominator, denominator_rule, complete_rule, fence, omission_semantics and invariants. Every catalogue row that names a manifest points at the crate file that now carries the contract."
+family_contract_rule = "One field-complete public contract per causal family, not one per crate. eliot-cognitive-quality owns six causal families and therefore carries six field contract ids, each indexed by its own [[field_contract_index]] row, named by its own [[ownership]] row and read by the [[agent_brief]] of the order that owns it: SkillLifecycleView (order 80), ToolSurfaceAssessment (81), DreamerJobEconomics (82), EliotSelfQualityView (83), LearningBottleneckDiagnosis (83, same order and a different family) and SelfQualityInterventionReceipt (84). CognitiveQualityAssessment is the crate-level projection composed of those six and is declared as such by its composed_of row, so no family is frozen twice and no family is left unowned. A second contract for a family that already has one is a ContractChallenge."
 disjointness_rule = "This catalogue does not modify bins/, 233 memory-curation/dreamer-cycle files, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, or generated indexes."
 
 [[stage]]
@@ -236,7 +237,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 80
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.skill.lifecycle"
-field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::SkillLifecycleView"
 objective = "Maintain one derived SkillLifecycleView per Skill revision from execution evidence; lifecycle changes remain reversible candidates."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable Skill execution evidence by handle", "HarnessActivationReceipt candidates by handle"]
@@ -251,7 +252,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 81
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.tool.surface"
-field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::ToolSurfaceAssessment"
 objective = "Assess tool-surface fit from exact tool-definition versions, eligibility/activation/adherence checkpoints, and false-activation history; mark stale before material use on definition change."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable tool-definition versions by handle", "HarnessActivationReceipt candidates by handle"]
@@ -266,7 +267,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 82
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.dreamer.job_economics"
-field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::DreamerJobEconomics"
 objective = "Project Dreamer job/family economics from durable job, route-usage, curation, and outcome receipts; promotion requires declared downstream utility exceeding full cost plus measured harms."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable Durable Job receipts by handle", "route-usage/curation/outcome receipts by handle"]
@@ -281,8 +282,8 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 83
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.self.quality_view"
-field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
-objective = "Project one problem-oriented EliotSelfQualityView with counter-metrics and learning-bottleneck diagnosis; identify failing contours, never emit a global score."
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::EliotSelfQualityView"
+objective = "Project one problem-oriented EliotSelfQualityView with counter-metrics; identify failing contours, never emit a global score. The learning-bottleneck diagnosis of the same order is a separate family contract at crates/smart/eliot-cognitive-quality/module.toml::LearningBottleneckDiagnosis and is read from there, not invented here."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt projections by handle", "product/runtime evidence by handle"]
 outputs = ["EliotSelfQualityView candidate", "LearningBottleneckDiagnosis candidate"]
@@ -296,7 +297,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 84
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.self.intervention_candidate"
-field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::SelfQualityInterventionReceipt"
 objective = "Propose one advisory SelfQualityInterventionReceipt with causal hypothesis, rivals, discriminator, authority refs, rollback, and terminal disposition; recurring same-hypothesis failure yields Mechanism Review."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable Problem/ImprovementCandidate refs by handle", "applicable verifier/Product Pulse refs by handle"]
@@ -383,6 +384,8 @@ status = "FROZEN_STATIC_FIELD_CONTRACT"
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+composed_of = ["SkillLifecycleView", "ToolSurfaceAssessment", "DreamerJobEconomics", "EliotSelfQualityView", "LearningBottleneckDiagnosis", "SelfQualityInterventionReceipt"]
+composed_of_rule = "This is the crate-level projection of eliot-cognitive-quality, not a seventh causal family. Each of the six named sections is owned by its own field contract id, and that family contract is the one an implementation agent reads for the family's fields, denominator, denominator_rule, complete_rule, fence, omission_semantics and invariants. The section prefixes here name where each family's fields are carried in this projection; the two lists must not be edited independently."
 fields = ["skill_ref_and_revision", "skill_task_host_route_and_governance_scope", "skill_applies_when_and_does_not_apply_when", "skill_dependency_and_tool_definition_versions", "skill_delivered_expanded_and_executed_counts", "skill_eligibility_activation_and_activation_latency", "skill_adherence_at_early_mid_and_final_checkpoints", "skill_verified_success_failure_and_uncertain_outcomes", "skill_observed_decision_or_verifier_delta", "skill_false_activation_and_distractor_history", "skill_interactions_ordering_and_mutual_exclusion", "skill_stale_or_quarantine_reason", "skill_proposed_action_keep_or_patch_or_split_or_merge_or_suppress_or_archive_or_quarantine_or_restore", "skill_evidence_review_and_rollback", "tool_surface_eligibility_retrieval_delivery_activation_adherence_per_attempt_with_exact_tool_definition_version", "tool_surface_where_not_apply_stop_and_escalation_first_class", "dreamer_job_accepted_rejected_expired_candidates", "dreamer_job_verified_decision_verifier_and_downstream_outcome_delta", "dreamer_job_false_merge_split_procedure_and_negative_transfer", "dreamer_job_source_coverage_missed_material_evidence_and_unresolved_uncertainty", "dreamer_job_model_agent_swarm_calls_raw_route_usage_and_retries", "dreamer_job_cpu_ram_storage_network_queue_wait_wall_latency_and_human_attention", "dreamer_job_context_reconstruction_savings_without_shifted_cost", "dreamer_job_clarification_usefulness_backlog_age_and_expiry", "dreamer_job_model_route_calibration_rollback_and_invalidation", "self_quality_agent_loop_and_no_progress", "self_quality_observation_coverage_and_integration_gaps", "self_quality_context_packet_size_quality_and_feedback", "self_quality_memory_growth_staleness_duplicates_false_activation_and_use", "self_quality_dreamer_watchdog_doctor_job_utility_and_failures", "self_quality_configuration_maintenance_and_update_outcomes", "self_quality_orphan_descendant_and_unknown_effect_state", "self_quality_product_pulse_and_user_outcome_delta", "self_quality_open_problems_improvement_candidates_and_human_actions", "self_quality_counter_metrics_context_bytes_vs_usefulness_delivery_vs_use_growth_vs_resolved_activity_vs_progress_cost_vs_delta_maintenance_vs_recurrence_resolution_latency", "bottleneck_diagnosis_update_quality_high_activation_low_or_activation_high_adherence_low_or_adherence_high_no_delta_or_delta_present_outcome_worse_or_immediate_gain_retention_regression", "intervention_id_and_trigger_observation_refs", "intervention_affected_capability_scope_and_owner", "intervention_causal_hypothesis_rivals_and_discriminator", "intervention_selected_action_observe_or_repair_or_configure_or_reroute_or_experiment_or_abstain_or_escalate", "intervention_candidate_change_and_authority_refs", "intervention_proof_ceiling_verifier_and_counter_metrics", "intervention_rollback_and_validity_scope", "intervention_immediate_and_delayed_outcomes", "intervention_terminal_disposition_retained_or_narrowed_or_rolled_back_or_reopened_or_escalated_or_inconclusive", "intervention_system_observation_and_experience_writeback_refs"]
 denominator = "per_sub_assessment_denominators: skill_counts_over_task_host_route_scope_with_tool_versions; job_window_over_declared_job_family_with_full_cost_ledger; self_quality_observations_over_obligation_profile; intervention_scope_closure_over_affected_capability"
 denominator_rule = "RECHECK: for Skill/tool-surface recompute delivered/expanded/executed and eligibility/activation/adherence from per-attempt HarnessActivationReceipt refs at the named scope; for Dreamer economics re-resolve the declared job/job-family window and full compute/storage/context/Human cost ledger plus held-out/live outcome refs; for SelfQuality compare observations against the ObservationObligationProfile; for intervention re-enumerate the affected capability closure. Each Complete sub-assessment requires its own exact denominator; aggregate counts never substitute for per-attempt receipts."
@@ -391,6 +394,114 @@ fence = "Task/host/route/governance scope plus StateFence; tool-definition versi
 omission_semantics = "Silence about adherence is unknown, not compliance; shared success may remain distributed or uncertain; missing observability stays unknown; each owner projection is consumed as a whole with its own coverage, so per-role input digests never collide in one flat digest list."
 invariants = ["no aggregate intelligence/confidence/utility score and no aggregate learning score", "installed != delivered != executed != useful, and acknowledgement is not use, use is not adherence, adherence is not benefit", "retrieval/repetition/model-agreement do not reinforce a Skill", "retrieval/popularity/completion/delivery/tool-availability/model-agreement do not establish utility, support or understanding", "tool availability is not utility proof and a tool-definition change marks the surface stale before material use", "Dreamer/Curator proposals remain reversible candidates until governed promotion", "one model's delete recommendation is never its own oracle", "EliotSelfQualityView is a problem-oriented projection: no global intelligence score, no second projection owner, no self-certification, no self-promotion, no silent system rewrite", "learning-bottleneck diagnosis is a table lookup over observed combinations, never a single aggregate self-learning score", "recurring failure without a changed hypothesis or discriminator opens Mechanism Review rather than another equivalent retry", "consume immutable owner-produced projections only", "no Skill, tool, configuration or route mutation, no scheduler, effect, authority or task finish", "every Complete state requires the exact independently recheckable denominator", "this crate owns no canonical state or lifecycle transition"]
 proof_depth_rule = "Transport/Retrieval/Use/DecisionDelta/OutcomeBenefit/Retention/Transfer ceilings per I12-34 apply; proof depth follows effect per I12-21 lifecycle rules."
+
+[[field_contract]]
+id = "SkillLifecycleView"
+owner_crate = "eliot-cognitive-quality"
+owner_manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+family = "Skill lifecycle"
+source_handles = ["I07-25", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["skill_ref_and_revision", "skill_task_host_route_and_governance_scope", "skill_applies_when_and_does_not_apply_when", "skill_dependency_and_tool_definition_versions", "skill_delivered_expanded_and_executed_counts", "skill_eligibility_activation_and_activation_latency", "skill_adherence_at_early_mid_and_final_checkpoints", "skill_verified_success_failure_and_uncertain_outcomes", "skill_observed_decision_or_verifier_delta", "skill_false_activation_and_distractor_history", "skill_interactions_ordering_and_mutual_exclusion", "skill_stale_or_quarantine_reason", "skill_proposed_action_keep_or_patch_or_split_or_merge_or_suppress_or_archive_or_quarantine_or_restore", "skill_evidence_review_and_rollback"]
+denominator = "delivered_expanded_and_executed_attempts over the declared_task_host_route_and_governance_scope_at_a_named_StateFence_pinned_to_exact_dependency_and_tool_definition_versions_with_explicit_exclusions"
+denominator_rule = "RECHECK: re-resolve the declared task/host/route/governance scope and the named StateFence; recompute delivered, expanded and executed counts together with eligibility, activation, activation latency and early/mid/final adherence from the per-attempt HarnessActivationReceipt refs at that scope; recompute the outcome classes and the decision/verifier delta from the same refs. An aggregate lifecycle count never substitutes for that exact receipt, and any Complete coverage state without this exact denominator is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable denominator above; installed != delivered != executed != useful, acknowledgement is not use, use is not adherence, and adherence is not benefit. A proposed_action and its evidence_review_and_rollback are present, or the assessment is INCONCLUSIVE."
+fence = "Task/host/route/governance scope plus StateFence; dependency and tool-definition versions pin staleness before Material use."
+omission_semantics = "Silence about adherence is unknown, not compliance; shared success may remain distributed or uncertain rather than being assigned to one Skill; an unobserved interaction, ordering or mutual-exclusion constraint stays unrecorded rather than inferred; missing execution evidence is listed per field as unknown with reason and the coverage state is INCONCLUSIVE."
+invariants = ["installed != delivered != executed != useful, and acknowledgement is not use, use is not adherence, adherence is not benefit", "eligible != activated != adhered, so an update may be eligible and never retrieved, retrieved and never used, or used early and abandoned by the final turn", "retrieval, repetition and model agreement do not reinforce a Skill", "retrieval, popularity, completion, delivery, tool availability and model agreement do not establish utility, support or understanding", "low observed utility changes exposure or review priority, not epistemic status or authority", "conflicting Skills create an Instruction Conflict and are never resolved by prompt order", "a dependency or tool-definition change marks the Skill stale before Material use", "SkillExecutionEvidence shows that a procedure was followed and what happened, and never proves that the Skill alone caused the result", "where-not-apply, stop and escalation are first-class fields", "Dreamer/Curator lifecycle changes remain reversible candidates until governed promotion", "consume immutable owner-produced projections only", "no configuration, route, tool or Skill mutation, no scheduler, effect, authority or task finish, and no self-promotion", "every Complete state requires the exact independently recheckable denominator", "this family owns no canonical state and no lifecycle transition"]
+
+[[field_contract]]
+id = "ToolSurfaceAssessment"
+owner_crate = "eliot-cognitive-quality"
+owner_manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+family = "tool surface"
+source_handles = ["I07-25", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["tool_surface_eligibility_retrieval_delivery_activation_adherence_per_attempt_with_exact_tool_definition_version", "tool_surface_where_not_apply_stop_and_escalation_first_class"]
+denominator = "per_attempt_tool_eligibility_retrieval_delivery_activation_and_adherence_records over the declared_scope_at_a_named_StateFence_pinned_to_exact_tool_definition_versions_with_explicit_exclusions"
+denominator_rule = "RECHECK: re-resolve the exact tool-definition version carried by every counted attempt, re-resolve the declared scope and the named StateFence, and recompute eligibility, retrieval, delivery, activation and adherence per attempt from the per-attempt HarnessActivationReceipt refs; recompute the false-activation and distractor history from the same refs. An aggregate invocation, offer or availability count never substitutes for a per-attempt record, and any Complete coverage state without this exact denominator is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable denominator above; a tool-definition change marks the surface stale before material use, and where-not-apply, stop and escalation are recorded as first-class fields rather than as absences."
+fence = "Declared tool/task/host/route scope plus StateFence; the exact tool-definition version is part of the denominator and pins staleness."
+omission_semantics = "A tool that is defined and available but never offered is recorded as available-only, which is unknown for eligibility, activation and adherence; an attempt with no receipt is omitted and listed, never counted as compliant; an attempt whose tool-definition version cannot be resolved is uncountable rather than stale."
+invariants = ["tool availability is not utility proof, and an installed, defined or offered tool is never evidence of eligibility, activation, adherence or utility", "retrieval, popularity, completion, delivery, tool availability and model agreement do not establish utility, support or understanding", "eligible != activated != adhered, so a tool may be offered and never used, and used early and abandoned by the final turn", "a dependency or tool-definition change marks the surface stale before Material use", "where-not-apply, stop and escalation are first-class outcomes and never a silent absence", "the surface-fit result is a reversible candidate and never silently widens a tool's scope", "aggregate invocation or availability counts never substitute for per-attempt HarnessActivationReceipt evidence", "consume immutable owner-produced projections only", "no configuration, route, tool or Skill mutation, no scheduler, effect, authority or task finish, and no self-promotion", "every Complete state requires the exact independently recheckable denominator", "this family owns no canonical state and no lifecycle transition"]
+
+[[field_contract]]
+id = "DreamerJobEconomics"
+owner_crate = "eliot-cognitive-quality"
+owner_manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+family = "Dreamer economics"
+source_handles = ["I09-16", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["dreamer_job_accepted_rejected_expired_candidates", "dreamer_job_verified_decision_verifier_and_downstream_outcome_delta", "dreamer_job_false_merge_split_procedure_and_negative_transfer", "dreamer_job_source_coverage_missed_material_evidence_and_unresolved_uncertainty", "dreamer_job_model_agent_swarm_calls_raw_route_usage_and_retries", "dreamer_job_cpu_ram_storage_network_queue_wait_wall_latency_and_human_attention", "dreamer_job_context_reconstruction_savings_without_shifted_cost", "dreamer_job_clarification_usefulness_backlog_age_and_expiry", "dreamer_job_model_route_calibration_rollback_and_invalidation"]
+denominator = "accepted_rejected_and_expired_candidates over the declared_job_or_job_family_window_with_the_full_compute_storage_context_and_Human_cost_ledger_and_held_out_or_live_outcome_refs"
+denominator_rule = "RECHECK: re-resolve the declared job/job-family window and its expiry; recompute the full CPU/RAM/storage/network, queue-wait, wall-latency and Human-attention cost ledger and the model/agent/swarm call, raw-route-usage and retry counts from the same Durable Job, route-usage and curation receipts; recompute the declared downstream utility and the measured harms from the held-out or live outcome refs. An elegant synthesis with no later use or expired validity is not utility, no single intelligence score is derived, and any Complete coverage state without this exact denominator is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable denominator above; declared downstream utility is compared against full compute, storage, context and Human cost plus measured harms before any promotion candidate is proposed, and a missing or expired outcome window is INCONCLUSIVE rather than a pass."
+fence = "Declared job or job-family window plus StateFence; the window bounds the cost ledger, the outcome window and the expiry."
+omission_semantics = "Context or reconstruction savings are recorded net only when acquisition and recovery cost are present; a shifted cost is unknown, never a saving; a missing cost-ledger component makes the window INCONCLUSIVE; unresolved uncertainty and missed material evidence are listed rather than netted away."
+invariants = ["DreamerJobEconomics is a projection of Durable Job, route-usage, curation and outcome receipts, never a new owner of a job, route, curation class or schedule", "no aggregate intelligence, confidence, utility or learning score is emitted", "elegant-but-unused synthesis is not utility, and an expired validity invalidates a candidate rather than closing it", "a Dreamer route, curation class or autonomous schedule is promoted only when declared downstream utility exceeds full compute, storage, context and Human cost plus measured harms on held-out or live work", "context or reconstruction savings never hide shifted acquisition or recovery cost", "retrieval, popularity, completion, delivery, tool availability and model agreement do not establish utility, support or understanding", "one model's delete recommendation is never its own oracle", "every emitted value is a reversible candidate", "consume immutable owner-produced projections only", "no configuration, route, tool or Skill mutation, no scheduler, effect, authority or task finish, and no self-promotion", "every Complete state requires the exact independently recheckable denominator", "this family owns no canonical state and no lifecycle transition"]
+
+[[field_contract]]
+id = "EliotSelfQualityView"
+owner_crate = "eliot-cognitive-quality"
+owner_manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+family = "EliotSelfQualityView"
+source_handles = ["I16-23", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["self_quality_agent_loop_and_no_progress", "self_quality_observation_coverage_and_integration_gaps", "self_quality_context_packet_size_quality_and_feedback", "self_quality_memory_growth_staleness_duplicates_false_activation_and_use", "self_quality_dreamer_watchdog_doctor_job_utility_and_failures", "self_quality_configuration_maintenance_and_update_outcomes", "self_quality_orphan_descendant_and_unknown_effect_state", "self_quality_product_pulse_and_user_outcome_delta", "self_quality_open_problems_improvement_candidates_and_human_actions", "self_quality_counter_metrics_context_bytes_vs_usefulness_delivery_vs_use_growth_vs_resolved_activity_vs_progress_cost_vs_delta_maintenance_vs_recurrence_resolution_latency"]
+denominator = "actual_observations_and_their_coverage over the declared_ObservationObligationProfile_at_a_named_StateFence_with_explicit_gaps_and_exclusions"
+denominator_rule = "RECHECK: re-resolve the declared ObservationObligationProfile and the named StateFence, re-enumerate the actual observations together with the coverage and integration gaps, and recompute every required counter-metric (context bytes/tokens versus acknowledged usefulness and decision delta, delivered memory versus use/verification/outcome, candidate/duplicate/stale growth versus resolved knowledge, agent/tool activity versus evidence/artifact/product progress, Dreamer/Watchdog cost versus accepted diagnosis or repair delta, maintenance frequency versus recurring failure and operator burden, feedback resolution latency and repeated wrong-scope/context complaints) from the same SystemObservationJournal, EliotSystemExperienceBank and AgentFeedbackReceipt refs. Watchdog, Dreamer and Doctor supply observations and candidates only, and any Complete coverage state without this exact denominator is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable denominator above; the failing contours and the next discriminative observation are both named, and an uncovered obligation is reported as a gap rather than resolved by default."
+fence = "Principal session and observation window plus StateFence; the declared ObservationObligationProfile and the projection owner bound the scope."
+omission_semantics = "A missing observation stays unknown with its reason and counts against observation coverage, never as a passing contour; feedback that cannot be resolved to an owner is an integration gap, not resolution; a counter-metric with a missing arm is unknown, never zero."
+invariants = ["EliotSelfQualityView is a problem-oriented projection with no global intelligence score, no second projection owner, no self-certification, no self-promotion and no silent system rewrite", "no aggregate intelligence, confidence, utility or learning score is emitted", "Watchdog, Dreamer and Doctor supply observations and candidates and never edit the projection as a second owner", "agent, tool or activity volume is not evidence of artifact or product progress, and maintenance completion is not resolution", "retrieval, popularity, completion, delivery, tool availability and model agreement do not establish utility, support or understanding", "a persistent self-quality regression creates a Problem or ImprovementCandidate and never lets Meta silently rewrite the active system", "every required counter-metric is reported against a named denominator and is never collapsed into one number", "every emitted value is a reversible candidate", "consume immutable owner-produced projections only", "no configuration, route, tool or Skill mutation, no scheduler, effect, authority or task finish, and no self-promotion", "every Complete state requires the exact independently recheckable denominator", "this family owns no canonical state and no lifecycle transition"]
+
+[[field_contract]]
+id = "LearningBottleneckDiagnosis"
+owner_crate = "eliot-cognitive-quality"
+owner_manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+family = "learning-bottleneck diagnosis"
+source_handles = ["I16-23", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["bottleneck_diagnosis_update_quality_high_activation_low_or_activation_high_adherence_low_or_adherence_high_no_delta_or_delta_present_outcome_worse_or_immediate_gain_retention_regression"]
+denominator = "observed_update_quality_activation_adherence_decision_delta_outcome_and_retention_combination over the re_enumerated_observation_set_behind_the_owning_EliotSelfQualityView_at_a_named_StateFence"
+denominator_rule = "RECHECK: re-enumerate the observation set behind the owning EliotSelfQualityView, verify the named combination is present with each of its observed arms, and select the bottleneck from the observed combination alone: update quality high with activation low locates retrieval, cue, trigger or context budget; activation high with adherence low locates route competence, instruction wording, or state loss between turns; adherence high with no decision delta locates an update that is irrelevant or too weak; decision delta present with outcome worse locates a bad lesson, a bad evaluator or an unresolved confounder; immediate gain with retention regression locates overfitting and harness-level forgetting. An unobserved arm is unknown and never a default, and any Complete state without this exact denominator is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable denominator above; the diagnosis names the observed combination, the selected bottleneck, the selected intervention (change delivery, route, update, evaluator, or roll back) and the next discriminative observation, and a single aggregate self-learning score is never an accepted substitute."
+fence = "The owning EliotSelfQualityView scope and StateFence; the diagnosis is re-derived whenever that view's denominator is re-resolved."
+omission_semantics = "An unobserved arm makes the row INCONCLUSIVE rather than selecting a bottleneck; a combination observed once is reported with its sample count of one and is never generalized; two applicable rows are reported as competing candidates rather than merged into one score."
+invariants = ["one aggregate self-learning score is prohibited; the diagnosis is a lookup over the observed combination", "the diagnosis locates a bottleneck and selects the intervention, and never certifies the system or self-promotes a change", "the diagnosis proposes only; it never changes delivery, route, update, evaluator or configuration itself", "recurring failure without a changed hypothesis or discriminator opens Mechanism Review rather than another equivalent retry", "retrieval, popularity, completion, delivery, tool availability and model agreement do not establish utility, support or understanding", "every emitted value is a reversible candidate", "consume immutable owner-produced projections only", "no configuration, route, tool or Skill mutation, no scheduler, effect, authority or task finish, and no self-promotion", "every Complete state requires the exact independently recheckable denominator", "this family owns no canonical state and no lifecycle transition"]
+
+[[field_contract]]
+id = "SelfQualityInterventionReceipt"
+owner_crate = "eliot-cognitive-quality"
+owner_manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+family = "advisory intervention candidate"
+source_handles = ["I16-23", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["intervention_id_and_trigger_observation_refs", "intervention_affected_capability_scope_and_owner", "intervention_causal_hypothesis_rivals_and_discriminator", "intervention_selected_action_observe_or_repair_or_configure_or_reroute_or_experiment_or_abstain_or_escalate", "intervention_candidate_change_and_authority_refs", "intervention_proof_ceiling_verifier_and_counter_metrics", "intervention_rollback_and_validity_scope", "intervention_immediate_and_delayed_outcomes", "intervention_terminal_disposition_retained_or_narrowed_or_rolled_back_or_reopened_or_escalated_or_inconclusive", "intervention_system_observation_and_experience_writeback_refs"]
+denominator = "re_enumerated_affected_capability_closure over the loop_instance_trigger_observations_at_a_named_StateFence_with_declared_authority_scope_and_rollback_scope_and_exclusions"
+denominator_rule = "RECHECK: re-enumerate the affected capability closure and its owner from the trigger observation refs at the named StateFence; verify the causal hypothesis carries explicit rivals and a discriminator, that the candidate change names its authority refs without owning authority, and that rollback and validity scope are present; recompute the proof ceiling, verifier and counter-metric set, the immediate and delayed outcomes and the terminal disposition from the same refs. Activity volume, summary volume or maintenance completion alone cannot close the loop, and any Complete state without this exact denominator is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable denominator above; selected_action is one of observe, repair, configure, reroute, experiment, abstain or escalate, the terminal disposition is one of retained, narrowed, rolled_back, reopened, escalated or inconclusive, and the SystemObservationJournal and EliotSystemExperienceBank writeback refs are present. A receipt without rivals, a discriminator, authority refs or rollback scope is INCONCLUSIVE."
+fence = "Affected capability scope and its owner plus StateFence; the trigger observation refs, the authority refs and the rollback scope bound the loop instance."
+omission_semantics = "Absence of an applicable verifier is recorded as the proof ceiling of the candidate, never as a pass; an undecided owner is escalated rather than assumed; an inconclusive terminal disposition is a valid outcome and is never rewritten into a completed intervention; missing writeback refs keep the loop open."
+invariants = ["the intervention is advisory only: this crate proposes one reversible candidate and never performs it", "recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry", "activity volume, summary volume and maintenance completion alone cannot close the loop", "one model's delete recommendation is never its own oracle", "the candidate change names its authority refs but never owns authority, never finishes a task and never self-promotes", "rollback and validity scope are present before any terminal disposition other than inconclusive", "retrieval, popularity, completion, delivery, tool availability and model agreement do not establish utility, support or understanding", "every emitted value is a reversible candidate", "consume immutable owner-produced projections only", "no configuration, route, tool or Skill mutation, no scheduler, effect, authority or task finish, and no self-promotion", "every Complete state requires the exact independently recheckable denominator", "this family owns no canonical state and no lifecycle transition"]
 
 [[field_contract]]
 id = "UnderstandingAssessment"
@@ -443,7 +554,7 @@ owner_crate = "eliot-cognitive-quality"
 defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.skill.lifecycle"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
-contract_index = "CognitiveQualityAssessment"
+contract_index = "SkillLifecycleView"
 consumers = ["Dreamer/Curator review surface (candidate only)"]
 
 [[ownership]]
@@ -452,10 +563,10 @@ owner_crate = "eliot-cognitive-quality"
 defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.tool.surface"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
-contract_index = "CognitiveQualityAssessment"
+contract_index = "ToolSurfaceAssessment"
 consumers = ["Dreamer/Curator review surface (candidate only)"]
 coverage_state = "INCONCLUSIVE"
-coverage_state_rule = "Order 81 has no measured per-attempt tool-eligibility/activation/adherence denominator in this static freeze, so no Complete coverage state is claimed. The ToolSurfaceAssessment rows of CognitiveQualityAssessment (eligibility, retrieval, delivery, activation and adherence per attempt against an exact tool-definition version, plus where-not-apply/stop/escalation) are frozen; the recheckable denominator stays NOT_EXECUTED until per-attempt receipt fixtures exist."
+coverage_state_rule = "Order 81 has no measured per-attempt tool-eligibility/activation/adherence denominator in this static freeze, so no Complete coverage state is claimed. The tool-surface family is frozen on its own contract id ToolSurfaceAssessment (eligibility, retrieval, delivery, activation and adherence per attempt against an exact tool-definition version, plus where-not-apply/stop/escalation); the recheckable denominator stays NOT_EXECUTED until per-attempt receipt fixtures exist."
 
 [[ownership]]
 public_type = "DreamerJobEconomics"
@@ -463,7 +574,7 @@ owner_crate = "eliot-cognitive-quality"
 defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.dreamer.job_economics"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
-contract_index = "CognitiveQualityAssessment"
+contract_index = "DreamerJobEconomics"
 consumers = ["Dreamer route/curation review surface (projection only)"]
 
 [[ownership]]
@@ -472,7 +583,7 @@ owner_crate = "eliot-cognitive-quality"
 defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.self.quality_view"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
-contract_index = "CognitiveQualityAssessment"
+contract_index = "EliotSelfQualityView"
 consumers = ["Governor/Diagnostic Compiler projection owner (this crate supplies candidates only)"]
 
 [[ownership]]
@@ -481,10 +592,10 @@ owner_crate = "eliot-cognitive-quality"
 defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.self.quality_view"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
-contract_index = "CognitiveQualityAssessment"
+contract_index = "LearningBottleneckDiagnosis"
 consumers = ["Dreamer/Doctor diagnosis review surface (candidate only)"]
 coverage_state = "INCONCLUSIVE"
-coverage_state_rule = "Order 83 names LearningBottleneckDiagnosis as an output and I16-23 prohibits one aggregate self-learning score, so the diagnosis is frozen as a table lookup over the observed update-quality/activation/adherence/decision-delta/outcome/retention combination and names the intervention. No Complete coverage state is claimed: the denominator is the actual observation set compared against the ObservationObligationProfile, and that comparison is NOT_EXECUTED here."
+coverage_state_rule = "Order 83 names LearningBottleneckDiagnosis as an output and I16-23 prohibits one aggregate self-learning score, so the diagnosis is frozen on its own contract id LearningBottleneckDiagnosis as a lookup over the observed update-quality/activation/adherence/decision-delta/outcome/retention combination that names the intervention. No Complete coverage state is claimed: the denominator is the actual observation set compared against the ObservationObligationProfile, and that comparison is NOT_EXECUTED here."
 
 [[ownership]]
 public_type = "SelfQualityInterventionReceipt"
@@ -492,7 +603,7 @@ owner_crate = "eliot-cognitive-quality"
 defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.self.intervention_candidate"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
-contract_index = "CognitiveQualityAssessment"
+contract_index = "SelfQualityInterventionReceipt"
 consumers = ["Human/Main Agent/Governor decision owner (candidate only)"]
 
 [[ownership]]
@@ -559,6 +670,96 @@ denominator_observed = "NO"
 denominator_observed_rule = "No Complete sub-assessment is claimed for this contract at STATIC_FIELD_CONTRACT_ONLY. Each of the six sub-assessments carries its own recheckable-in-form denominator, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_COGNITIVE_QUALITY_PULSE_01 are all NOT_EXECUTED, so the per-sub-assessment denominators are declared, not observed."
 
 [[field_contract_index]]
+contract_id = "SkillLifecycleView"
+owner_crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+owner_located_copy = "crates/smart/eliot-cognitive-quality/module.toml::SkillLifecycleView"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::SkillLifecycleView"
+denominator_ref = "delivered/expanded/executed attempts over the declared task/host/route/governance scope, pinned to exact dependency and tool-definition versions"
+source_handles = ["I07-25", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete coverage state is claimed for the Skill lifecycle family at STATIC_FIELD_CONTRACT_ONLY. The delivered/expanded/executed denominator above is frozen and recheckable in form, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_COGNITIVE_QUALITY_PULSE_01 are all NOT_EXECUTED, so the denominator is declared, not observed."
+
+[[field_contract_index]]
+contract_id = "ToolSurfaceAssessment"
+owner_crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+owner_located_copy = "crates/smart/eliot-cognitive-quality/module.toml::ToolSurfaceAssessment"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::ToolSurfaceAssessment"
+denominator_ref = "per-attempt eligibility/retrieval/delivery/activation/adherence records pinned to exact tool-definition versions"
+source_handles = ["I07-25", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete coverage state is claimed for the tool-surface family at STATIC_FIELD_CONTRACT_ONLY. Order 81 has no measured per-attempt tool-eligibility/activation/adherence denominator in this static freeze, so the ToolSurfaceAssessment rows (eligibility, retrieval, delivery, activation and adherence per attempt against an exact tool-definition version, plus where-not-apply/stop/escalation) are frozen while the recheckable denominator stays NOT_EXECUTED until per-attempt receipt fixtures exist."
+
+[[field_contract_index]]
+contract_id = "DreamerJobEconomics"
+owner_crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+owner_located_copy = "crates/smart/eliot-cognitive-quality/module.toml::DreamerJobEconomics"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::DreamerJobEconomics"
+denominator_ref = "accepted/rejected/expired candidates over the declared job window with the full cost ledger and held-out or live outcome refs"
+source_handles = ["I09-16", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete coverage state is claimed for the Dreamer economics family at STATIC_FIELD_CONTRACT_ONLY. The job-window denominator with its full cost ledger and held-out or live outcome refs is frozen and recheckable in form, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_COGNITIVE_QUALITY_PULSE_01 are all NOT_EXECUTED, so the denominator is declared, not observed."
+
+[[field_contract_index]]
+contract_id = "EliotSelfQualityView"
+owner_crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+owner_located_copy = "crates/smart/eliot-cognitive-quality/module.toml::EliotSelfQualityView"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::EliotSelfQualityView"
+denominator_ref = "actual observations and coverage over the declared ObservationObligationProfile at a named StateFence"
+source_handles = ["I16-23", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete coverage state is claimed for the EliotSelfQualityView family at STATIC_FIELD_CONTRACT_ONLY. The ObservationObligationProfile comparison is frozen and recheckable in form, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_COGNITIVE_QUALITY_PULSE_01 are all NOT_EXECUTED, so the denominator is declared, not observed."
+
+[[field_contract_index]]
+contract_id = "LearningBottleneckDiagnosis"
+owner_crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+owner_located_copy = "crates/smart/eliot-cognitive-quality/module.toml::LearningBottleneckDiagnosis"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::LearningBottleneckDiagnosis"
+denominator_ref = "the observed update-quality/activation/adherence/decision-delta/outcome/retention combination over the re-enumerated observation set"
+source_handles = ["I16-23", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete coverage state is claimed for the learning-bottleneck diagnosis family at STATIC_FIELD_CONTRACT_ONLY. Order 83 names LearningBottleneckDiagnosis as an output and I16-23 prohibits one aggregate self-learning score, so the diagnosis is frozen as a lookup over the observed combination and names the intervention. The denominator is the actual observation set compared against the ObservationObligationProfile, and that comparison is NOT_EXECUTED here, so no Complete state is claimed."
+
+[[field_contract_index]]
+contract_id = "SelfQualityInterventionReceipt"
+owner_crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+owner_located_copy = "crates/smart/eliot-cognitive-quality/module.toml::SelfQualityInterventionReceipt"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::SelfQualityInterventionReceipt"
+denominator_ref = "re-enumerated affected capability closure over the loop-instance trigger observations, with authority and rollback scope"
+source_handles = ["I16-23", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete coverage state is claimed for the advisory intervention candidate family at STATIC_FIELD_CONTRACT_ONLY. The affected-capability closure denominator is frozen and recheckable in form, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_COGNITIVE_QUALITY_PULSE_01 are all NOT_EXECUTED, so the denominator is declared, not observed."
+
+[[field_contract_index]]
 contract_id = "UnderstandingAssessment"
 owner_crate = "eliot-understanding-assessment"
 manifest = "crates/smart/eliot-understanding-assessment/module.toml"
@@ -608,8 +809,8 @@ crate = "eliot-cognitive-quality"
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
 status = "PROTOTYPE"
 functional_cells = ["smart.skill.lifecycle", "smart.tool.surface", "smart.dreamer.job_economics", "smart.self.quality_view", "smart.self.intervention_candidate"]
-field_contract_ids = ["CognitiveQualityAssessment"]
-owner_located_copies = ["crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"]
+field_contract_ids = ["CognitiveQualityAssessment", "SkillLifecycleView", "ToolSurfaceAssessment", "DreamerJobEconomics", "EliotSelfQualityView", "LearningBottleneckDiagnosis", "SelfQualityInterventionReceipt"]
+owner_located_copies = ["crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment", "crates/smart/eliot-cognitive-quality/module.toml::SkillLifecycleView", "crates/smart/eliot-cognitive-quality/module.toml::ToolSurfaceAssessment", "crates/smart/eliot-cognitive-quality/module.toml::DreamerJobEconomics", "crates/smart/eliot-cognitive-quality/module.toml::EliotSelfQualityView", "crates/smart/eliot-cognitive-quality/module.toml::LearningBottleneckDiagnosis", "crates/smart/eliot-cognitive-quality/module.toml::SelfQualityInterventionReceipt"]
 owned_public_types = ["SkillLifecycleView", "ToolSurfaceAssessment", "DreamerJobEconomics", "EliotSelfQualityView", "LearningBottleneckDiagnosis", "SelfQualityInterventionReceipt"]
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
@@ -670,6 +871,12 @@ status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
+id = "W9-CQ-ONE-CONTRACT-PER-FAMILY"
+rule = "The six eliot-cognitive-quality causal families each have exactly one field-complete public contract id in this catalogue and the same id in the owning crate manifest: SkillLifecycleView, ToolSurfaceAssessment, DreamerJobEconomics, EliotSelfQualityView, LearningBottleneckDiagnosis, SelfQualityInterventionReceipt. A second contract for the same family, a family whose fields are split across two contracts, or a family contract re-owned from another W9 crate is a ContractChallenge. CognitiveQualityAssessment is the crate-level projection carrying the six candidate sections, not a seventh family, and it never collapses them into an aggregate score."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
 id = "W9-HARD-BOUNDARIES-FROZEN"
 rule = "All nine Issue #259 hard boundaries are frozen as binding invariants or omission rules in the contracts: immutable owner-produced projections only; no canonical state, lifecycle transition, Skill/tool/config/route mutation, scheduler, effect, authority, task finish or self-promotion; no aggregate intelligence/confidence/utility score; retrieval, popularity, completion, delivery, tool availability and model agreement never establish utility, support or understanding; negative-memory extinction changes only an advisory activation/influence candidate and preserves the original failure history; LOCALLY_ADEQUATE stays scoped and requires rival-aware model, prediction before observation, discriminator, applicable outcome/verifier and revision discipline; Common Ground is public causal inheritance, not summary similarity or native continuation state; every Complete coverage state requires an exact independently recheckable denominator; recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry."
 status = "TARGET"
@@ -719,7 +926,7 @@ compile_link = "contract_only"
 
 [[edge]]
 producer = "eliot-cognitive-quality"
-contract = "CognitiveQualityAssessment (SkillLifecycleView, DreamerJobEconomics, EliotSelfQualityView, SelfQualityInterventionReceipt)"
+contract = "CognitiveQualityAssessment (the crate-level projection over SkillLifecycleView, ToolSurfaceAssessment, DreamerJobEconomics, EliotSelfQualityView, LearningBottleneckDiagnosis and SelfQualityInterventionReceipt, each frozen as its own field contract)"
 consumer = "Dreamer/Curator/Human/Governor review surfaces"
 compile_link = "contract_only"
 

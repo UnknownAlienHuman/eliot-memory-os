@@ -1,20 +1,66 @@
-# Frozen migration denominator for issue #706 ([F-CUE-L0]).
+# FINAL migration handoff for issue #835 [F-CUE-RETIRE].
 #
-# `eliot-types::ul::cue::CueKind` is explicit legacy V1 (`LegacyCueKindV1`).
-# Every variant/spelling/serialization/hash row, every import/alias/reexport/
-# field/constructor/match/fixture row, and every duplicate definition is frozen
-# below with source, digest, compatibility class, owner, migration issue and
-# expiry/invalidation. Missing owner stays uncovered, never a wildcard.
+# This file is the serialized handoff from the frozen #706 [F-CUE-L0] baseline to
+# the final current row dispositions after the transitional
+# `eliot-types::ul::cue::CueKind` alias and its allowed-consumer mechanism were
+# retired. Every #706 row is still here: no row, digest or historical obligation
+# was deleted. Each row additionally carries the #835 final disposition.
 #
-# Base SHA: e80611de30878aa6ab521418da23bbfe4570af13
+# Disposition key: `final_disposition`. One key name, one value vocabulary, on
+# every row and every section table; see `[disposition_vocabulary]`. The
+# vocabulary is `current-authority`, `migrated-to-#804-current`,
+# `legacy-preserved`, `retired`. Each row also carries `disposition_evidence`
+# (the checkable claim), `named_migration` (B29: every retained historical
+# meaning has a named migration) and `baseline_digest_state`.
+#
+# The frozen #706 baseline identity stays recoverable in place:
+#   * `[meta]` keeps `baseline_issue`, `baseline_base_sha`, `baseline_oracle`
+#     and `baseline_proof` next to the #835 handoff keys;
+#   * `match_count` / `matched_digest` are the pair the boundary oracle
+#     recomputes, so they carry the current verified baseline of their row. A
+#     row whose source legitimately moved after the frozen #706 capture also
+#     carries its original frozen #706 pair verbatim in
+#     `frozen_baseline_match_count` / `frozen_baseline_matched_digest` beside
+#     them, and `baseline_digest_state` says per row how the frozen pair
+#     relates to the current one: `reproduces` (frozen pair still live),
+#     `re-derived` (row re-derived and verified against the current tree; the
+#     frozen pair is retained under the `frozen_baseline_` keys),
+#     `drifted` (frozen pair does not reproduce and no re-derivation exists),
+#     or `frozen` (variant rows, which carry a name and a position instead);
+#   * `LegacyCueKindV1`, its wire bytes and
+#     `LegacyCueKindV1MigrationDescriptor` (crates/eliot-types/src/ul/cue.rs:63)
+#     are the retained historical vocabulary and are never removed here.
+#
+# Baseline SHA: e80611de30878aa6ab521418da23bbfe4570af13
+# Handoff by: #835, on the branch base recorded in `[meta].handoff_observed_at`
 # Digest algorithm for every digest in this file: blake3 hex.
-# Row digests cover the matched lines (in file order, joined with "\n") for the
-# stated match lens: `type` = lines containing "CueKind", `field` = lines
-# containing "cue_kind". The boundary oracle
+# Row digests cover the matched lines (in file order, joined with a newline) for
+# the stated match lens: `type_row` lens = lines containing CueKind, `field_row`
+# lens = lines containing cue_kind. The boundary oracle
 # (crates/eliot-types/tests/cue_kind_legacy_boundary.rs) recomputes every row.
-
 [meta]
-issue = 706
+issue = 835
+handoff_state = "final"
+handoff_of_issue = 706
+handoff_of_issue_note = "this file finalizes the frozen #706 denominator; it does not replace it"
+handoff_reason = "the transitional eliot-types ul::cue CueKind alias and its allowed-consumer mechanism are retired; exactly one current CueKind owner remains, A-10 #804"
+handoff_observed_at = "branch chore/835-cue-alias-retirement at d2b5b4588a592472c52febc9ed7f5e076f44fdf2, rechecked against origin/main 4a8e9f9dc: every row path below is byte-identical at that tip, so the dispositions and the per-row digest states hold unchanged"
+baseline_issue = 706
+baseline_base_sha = "e80611de30878aa6ab521418da23bbfe4570af13"
+baseline_oracle = "crates/eliot-types/tests/cue_kind_legacy_boundary.rs"
+baseline_proof = "cue_kind_legacy_boundary 35 WORK_UNIT_CASE 706/1..35 over frozen source, wire, golden, consumer, duplicate and oracle rows"
+disposition_key = "final_disposition"
+disposition_vocabulary_section = "disposition_vocabulary"
+coverage_section = "retirement_coverage"
+row_proof_map_section = "row_proof_map"
+retired_mechanism_section = "retired_mechanism"
+row_digest_algorithm = "blake3"
+row_digest_lens = "type_row lens = lines containing CueKind; field_row lens = lines containing cue_kind"
+row_digest_input = "the matched lines in file order, joined with a newline"
+row_digest_oracle_rule = "recomputed, never reimplemented: crates/eliot-types/tests/cue_kind_legacy_boundary.rs matched_lines (line 63) keeps the lines of Rust str::lines() whose text contains the lens substring, and matched_digest (line 67) is blake3 hex over those lines joined with a single newline; check_row_complete (line 805) feeds that pair to check_row_digest (line 784), which compares it to match_count and matched_digest. type_row lens is the bare substring CueKind (case 706/23, line 1327); field_row lens is the bare substring cue_kind (case 706/24, line 1345)"
+row_digest_rederived_at = "origin/main 4d6d4f9a6e6a9e75dd6f34051a3cb91379f3a61c; the two commits between this worktree's HEAD (babe0736a8af5429203e8778756583421ca3e063) and that tip change no manifest row path, so every value below is identical at both"
+final_disposition = "current-authority"
+disposition_evidence = "this file is the #835 final handoff; its baseline_ keys keep the frozen #706 identity recoverable without deleting it"
 base_sha = "e80611de30878aa6ab521418da23bbfe4570af13"
 source_schema = "eliot-types.ul.cue.LegacyCueKindV1"
 source_generation = "v1"
@@ -30,8 +76,9 @@ manifest_self = "crates/eliot-types/tests/data/cue_kind_migration.toml"
 fixture_dir = "crates/eliot-types/tests/data/cue-kind-legacy"
 invalidation = "any change to the pinned target revision or digest, or to the frozen variant/spelling/serialization rows, invalidates this descriptor; revalidate against smart.cue.contracts before migration use"
 proof = "cue_kind_legacy_boundary 35 WORK_UNIT_CASE 706/1..35 over frozen source, wire, golden, consumer, duplicate and oracle rows"
-
 [wire]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the frozen V1 wire shape is unchanged: snake_case rename, no alias, no untagged, no default impl, no catch-all variant, and the schema title is the explicit historical name"
 rename_all = "snake_case"
 deny_unknown_fields = false
 aliases = []
@@ -42,46 +89,98 @@ schema_title = "LegacyCueKindV1"
 schema_type = "string"
 
 [variant.file_path]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "FilePath"
 position = 1
 
 [variant.dir_path]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "DirPath"
 position = 2
 
 [variant.symbol]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "Symbol"
 position = 3
 
 [variant.error_signature]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "ErrorSignature"
 position = 4
 
 [variant.command_pattern]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "CommandPattern"
 position = 5
 
 [variant.dependency]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "Dependency"
 position = 6
 
 [variant.api_surface]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "ApiSurface"
 position = 7
 
 [variant.task_class]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "TaskClass"
 position = 8
 
 [variant.subsystem]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "Subsystem"
 position = 9
 
 [variant.concept]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the historical V1 variant and its exact snake_case wire spelling survive unchanged; LegacyCueKindV1 is still the declared enum and this variant is still in its frozen position"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "frozen"
+baseline_digest_basis = "variant rows carry a name and a frozen position rather than a matched-line digest; the boundary oracle case 706/1 recomputes the variant list and every position against the live enum"
 name = "Concept"
 position = 10
 
 [correspondence]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every frozen V1 to current pair stays byte-exact; no correspondence was widened and no ambiguous spelling was added"
 file_path = "file_path"
 dir_path = "dir_path"
 symbol = "symbol"
@@ -94,20 +193,81 @@ subsystem = "subsystem"
 concept = "concept"
 
 [unsupported]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the frozen reject set is unchanged; unknown, empty, wrong-case and near-miss spellings still never claim conversion"
 inputs = ["", "unknown", "FilePath", "FILE_PATH", "file-path", "file path", "cue", "null", "relation_edge", "binding_candidate", "comparison_key", "none"]
 
 [wire_strings]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the frozen wire-consumer inventory is unchanged; every listed file still carries its historical V1 wire key, and no new wire consumer appeared"
 files = ["crates/eliot-app/src/mcp_stdio/verification.rs", "crates/eliot-app/src/ul_cross_agent_runner.rs", "crates/eliot-app/tests/ul_contract_errors.rs", "crates/eliot-app/tests/ul_mvp_done.rs", "crates/eliot-store/src/canonical_store.rs", "crates/eliot-types/tests/cue_kind_legacy_boundary.rs", "crates/eliot-types/tests/ul_cue_normalize.rs"]
 
 [api]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the transitional alias is no longer part of the recorded public type surface; every retained name is explicit Legacy and every retained meaning has a named migration"
 pub_types = ["CueBinding", "CueBindingError", "CueBindingPage", "CueIndexRow", "CueMatchMode", "CueRecordSource", "CueStrength", "LegacyCueKindV1", "LegacyCueKindV1MigrationDescriptor"]
 pub_fns = ["as_str", "cue_binding_page_id", "cue_binding_page_set_hash", "cue_row_id", "normalize_binding", "normalize_binding_pages", "normalize_bindings", "ul_token_estimate"]
 pub_consts = ["CUE_BINDING_PAGE_SCHEMA_VERSION_V1", "CUE_BINDING_PAGE_SCHEMA_VERSION_V2", "MAX_CUE_BINDINGS_PER_PAGE", "MAX_CUE_BINDING_PAGE_BYTES"]
 
 [schema_changes]
+final_disposition = "retired"
+disposition_evidence = "count stays 0: the retirement changed no serialized shape, so no data rewrite and no durable migration is owed to any stored record"
 count = 0
 
+
+# --------------------------------------------------------------- #835 sections
+#
+# These four tables are #835 additions. They never remove or reword a #706 row.
+
+[disposition_vocabulary]
+final_disposition = "current-authority"
+key_name = "final_disposition"
+applies_to = "every type_row, field_row and variant row below, and every section table in this file"
+values = ["current-authority", "migrated-to-#804-current", "legacy-preserved", "retired"]
+value_meaning = "current-authority: the row is the single current owner of the cue-kind vocabulary, the A-10 enum at crates/smart/eliot-cue-contracts/src/normalization.rs line 40 owned by #804 | migrated-to-#804-current: the row is a consumer or facade whose cue-kind now resolves to that A-10 owner and which carries no legacy-as-current alias | legacy-preserved: the row retains a historical meaning under an explicit Legacy name with a named owner, version and decoder, and its wire bytes are unchanged | retired: the subject the row froze is the transitional alias or its allowed-consumer mechanism, that subject has no live definition, and the row is kept as baseline evidence rather than deleted"
+check_rule = "current-authority is checked against crates/smart/eliot-cue-contracts/src/normalization.rs line 40; migrated-to-#804-current is checked against a real eliot_cue_contracts::CueKind resolution on the row path; legacy-preserved is checked against a real LegacyCueKindV1 or LegacyContextCueKind occurrence on the row path; retired is checked against the absence of pub type CueKind and of the deprecated-consumer suppression. The #835 oracle recomputes all four from source; this file only states them."
+row_carries = ["final_disposition", "disposition_evidence", "named_migration", "baseline_digest_state"]
+
+[retirement_coverage]
+final_disposition = "retired"
+claim = "no current decoder, config, IPC, provider, WASM or persisted fixture depends on the transitional eliot-types ul::cue CueKind alias, and every retained historical meaning has a named migration"
+coverage_fixture = "scripts/testdata/cue-kind-retirement/persisted_ipc_provider_wasm_coverage.json"
+coverage_fixture_status = "already satisfies this item; it is referenced here, not duplicated and not rewritten"
+coverage_classes = ["config", "ipc", "persisted", "provider", "wasm"]
+coverage_class_members = ["crates/smart/eliot-cues/tests/data/legacy_facade.json", "crates/smart/eliot-cue-contracts/tests/contract_shape.rs", "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml", "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs", "crates/smart/eliot-cue-activation-wasm/tests/proof.rs"]
+coverage_vectors = ["scripts/testdata/cue-kind-retirement/wire_vectors.json", "scripts/testdata/cue-kind-retirement/malformed_current_legacy.json"]
+recomputed_by = "scripts/audit_cue_kind_retirement.py, checked by scripts/tests/test_cue_kind_retirement.py case 835/21, and by the legacy boundary oracle cases 706/23 and 706/24"
+alias_absent_observed = "the string pub type CueKind and the path form eliot_types::CueKind occur nowhere in the coverage class members listed above on the observed tree"
+named_migration_anchor = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor at crates/eliot-types/src/ul/cue.rs line 63"
+named_migration_secondary = "eliot_context::decode_legacy_cue_kind at crates/smart/eliot-context/src/lib.rs owned by #832"
+not_a_pass_file = "no coverage result, count or passed marker is written here; every disposition in this file is a statement about source that the oracle recomputes"
+
+[row_proof_map]
+final_disposition = "current-authority"
+scope = "B47: every disposition class below keeps its earlier wire regression and names the proof that recomputes it"
+current-authority_proof = "scripts/tests/test_cue_kind_retirement.py cases 835/1, 835/2, 835/16, 835/19, 835/25 over crates/smart/eliot-cue-contracts/src/normalization.rs and crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"
+migrated_to_current_proof = "scripts/tests/test_cue_kind_retirement.py cases 835/4 and 835/8 over crates/smart/eliot-cues/src/lib.rs line 86 and crates/smart/eliot-cues/tests/integrity.rs"
+legacy-preserved_proof = "scripts/tests/test_cue_kind_retirement.py cases 835/6, 835/7, 835/8, 835/10, 835/27 and crates/eliot-types/tests/cue_kind_retirement.rs preservation tests over LegacyCueKindV1"
+retired_proof = "scripts/tests/test_cue_kind_retirement.py cases 835/3, 835/5, 835/12, 835/15, 835/17 and crates/eliot-types/tests/cue_kind_legacy_boundary.rs cases 706/11, 706/12, 706/13, 706/14, 706/29"
+wire_regressions_preserved = "cases 835/2, 835/10, 835/11, 835/13, 835/24, 835/26, 835/27, 835/34 over scripts/testdata/cue-kind-retirement/wire_vectors.json, malformed_current_legacy.json and v1_enum_golden.txt, plus the 35 frozen boundary oracle cases 706/1..35"
+legacy_wire_fixture = "crates/eliot-types/tests/data/cue-kind-legacy"
+row_count_attestation = "the row denominator below is the #706 denominator unchanged; the boundary oracle cases 706/23 and 706/24 recompute it from source"
+
+[retired_mechanism]
+final_disposition = "retired"
+mechanism = "the transitional eliot-types ul::cue CueKind type alias, which let #831 consumers keep compiling against the historical V1 enum under the current name"
+definition_removed_from = "crates/eliot-types/src/ul/cue.rs"
+observed_state = "pub type CueKind is absent from every production file on the observed tree; the only remaining mentions of the bare spelling in Rust are negative assertions inside boundary tests and the A-10 current owner itself"
+suppression_removed = "the allow(deprecated consumer suppression that let the alias be used silently is gone; no production file under crates contains that suppression"
+historical_meaning_retained = "LegacyCueKindV1 and its exact wire bytes stay, named by LegacyCueKindV1MigrationDescriptor at crates/eliot-types/src/ul/cue.rs line 63"
+preserved_negative_assertions = ["crates/eliot-types/tests/cue_kind_legacy_boundary.rs", "crates/eliot-types/tests/cue_kind_internal_legacy_boundary.rs", "crates/eliot-types/tests/cue_kind_retirement.rs"]
+recomputed_by = "scripts/audit_cue_kind_retirement.py type_alias_hits, reexport_lines, deprecated_suppression_violations and permissive_enum_escapes; cases 835/3, 835/4, 835/5, 835/14, 835/15, 835/17"
 [type_row."crates/eliot-types/src/ul/cue.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the enum is declared as pub enum LegacyCueKindV1 at crates/eliot-types/src/ul/cue.rs line 24 and the named migration LegacyCueKindV1MigrationDescriptor at line 63; the single transitional-alias spelling left in the file is the line 80 doc pointer to the current A-10 CueKind definition, and pub type CueKind is absent"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 27, digest 434db8de98a5ee6380ad1da0076aac012f9d41898b363df61604de461eaf649f; recomputed against crates/eliot-types/src/ul/cue.rs on the #835 handoff tree: count 27, digest 434db8de98a5ee6380ad1da0076aac012f9d41898b363df61604de461eaf649f"
 role = "source"
 owner = "#706"
 migration = 706
@@ -118,6 +278,11 @@ matched_digest = "434db8de98a5ee6380ad1da0076aac012f9d41898b363df61604de461eaf64
 variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
 
 [type_row."crates/eliot-types/src/lib.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the transitional root reexport of CueKind is retired; line 452 reexports LegacyCueKindV1 and no CueKind reexport exists"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 1, digest d44bcdda02c1e5d12fb76843376f586992bda11bf09bc85afb10b8526298a087; recomputed against crates/eliot-types/src/lib.rs on the #835 handoff tree: count 1, digest d44bcdda02c1e5d12fb76843376f586992bda11bf09bc85afb10b8526298a087"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -128,16 +293,30 @@ matched_digest = "d44bcdda02c1e5d12fb76843376f586992bda11bf09bc85afb10b8526298a0
 variants = []
 
 [type_row."crates/eliot-types/src/ul/injection.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "re-derived"
+baseline_digest_rule = "recomputed with the boundary oracle's own rule, unchanged: str::lines() of the row file, filtered by the bare substring CueKind, joined with a single newline, blake3 hex (cue_kind_legacy_boundary.rs matched_lines line 63, matched_digest line 67, reached through check_row_complete line 805 and check_row_digest line 784; the type_row lens is set at case 706/23 line 1327)"
+baseline_digest_basis = "frozen #706 baseline for this row, retained verbatim and not deleted: CueKind lens, count 2, digest 5d611fd538dcdb50b41bae9df588d08111d39d2f7e1bb874ce237e9e028160a1 (frozen_baseline_match_count / frozen_baseline_matched_digest below). RECHECK: that frozen pair was confirmed real, not a transcription error - the same rule reproduces it byte for byte at f8ea75df0880f373a9aa951e8457bb6d7dd5fbdd (831: internal/root cue consumers to explicit LegacyCueKindV1) and at 92dba12c9e39f4c109fceb08a33639c407190a1e, the last two states of this file that carried it. RECHECK: re-running the same rule against this path at origin/main 4d6d4f9a6e6a9e75dd6f34051a3cb91379f3a61c gives count 3, digest 0ce24455fc8b4a59f48bd42ddb5b5745cb7021e3a0ceec16db3b5323cf1d38b4, and that pair is now the current verified baseline in match_count / matched_digest. Cause, measured rather than assumed: the field declaration moved from line 8 to line 9 and the file gained one further CueKind line at line 49, 'let mut kind: Option<LegacyCueKindV1> = None;', in the 2026-09-26 bounded UL contract decoders work (64d446492 first reached four matched lines, 37fc9601c settled at three). Every commit that has touched this file since 37fc9601c yields count 3 and this digest, so it is a settled baseline and not a transient. All three current lines name LegacyCueKindV1 explicitly, so the row's disposition is unchanged. The drift record is preserved in this sentence rather than erased: the frozen pair above is what the row froze, the pair below is what the current tree holds."
+frozen_baseline_match_count = 2
+frozen_baseline_matched_digest = "5d611fd538dcdb50b41bae9df588d08111d39d2f7e1bb874ce237e9e028160a1"
+frozen_baseline_issue = 706
 role = "internal"
 owner = "#831"
 migration = 831
 expiry = "migrate-to-LegacyCueKindV1-under-#831; alias removal #835"
 risk = "none"
-match_count = 2
-matched_digest = "5d611fd538dcdb50b41bae9df588d08111d39d2f7e1bb874ce237e9e028160a1"
+match_count = 3
+matched_digest = "0ce24455fc8b4a59f48bd42ddb5b5745cb7021e3a0ceec16db3b5323cf1d38b4"
 variants = []
 
 [type_row."crates/eliot-types/tests/ul_cue_normalize.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest ab6bcf9293c8c493bb09609588cfc27212357637683b4962d08b84d5614595e4; recomputed against crates/eliot-types/tests/ul_cue_normalize.rs on the #835 handoff tree: count 2, digest ab6bcf9293c8c493bb09609588cfc27212357637683b4962d08b84d5614595e4"
 role = "test"
 owner = "#831"
 migration = 831
@@ -148,6 +327,11 @@ matched_digest = "ab6bcf9293c8c493bb09609588cfc27212357637683b4962d08b84d5614595
 variants = []
 
 [type_row."crates/eliot-app/src/mcp_stdio/protocol_tests.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 3, digest 36a4e7a675098d5f89f3eb297d5036a6b84a54c88c9d999f288277649f5d9037; recomputed against crates/eliot-app/src/mcp_stdio/protocol_tests.rs on the #835 handoff tree: count 3, digest 36a4e7a675098d5f89f3eb297d5036a6b84a54c88c9d999f288277649f5d9037"
 role = "root"
 owner = "#831"
 migration = 831
@@ -158,6 +342,11 @@ matched_digest = "36a4e7a675098d5f89f3eb297d5036a6b84a54c88c9d999f288277649f5d90
 variants = []
 
 [type_row."crates/eliot-app/src/mcp_stdio/ul.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 1, digest 1d0b30f95a6d5ec985dab4f6d5fe36b6da6ae9e1489b11cbbbab83805cef786d; recomputed against crates/eliot-app/src/mcp_stdio/ul.rs on the #835 handoff tree: count 1, digest 1d0b30f95a6d5ec985dab4f6d5fe36b6da6ae9e1489b11cbbbab83805cef786d"
 role = "root"
 owner = "#831"
 migration = 831
@@ -168,6 +357,11 @@ matched_digest = "1d0b30f95a6d5ec985dab4f6d5fe36b6da6ae9e1489b11cbbbab83805cef78
 variants = []
 
 [type_row."crates/eliot-app/src/mcp_stdio/verification.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 7, digest f391e791404e1283b1c3583afa8663b1e79c9e3e9b70a25fac5b61218b63acdc; recomputed against crates/eliot-app/src/mcp_stdio/verification.rs on the #835 handoff tree: count 7, digest f391e791404e1283b1c3583afa8663b1e79c9e3e9b70a25fac5b61218b63acdc"
 role = "root"
 owner = "#831"
 migration = 831
@@ -178,6 +372,11 @@ matched_digest = "f391e791404e1283b1c3583afa8663b1e79c9e3e9b70a25fac5b61218b63ac
 variants = []
 
 [type_row."crates/eliot-app/tests/ul_behavior_cli.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 3, digest 296448ba66c23d77cb18bfee9b0935706aac39d06e0ef9a7b47283caa1429357; recomputed against crates/eliot-app/tests/ul_behavior_cli.rs on the #835 handoff tree: count 3, digest 296448ba66c23d77cb18bfee9b0935706aac39d06e0ef9a7b47283caa1429357"
 role = "test"
 owner = "#831"
 migration = 831
@@ -188,6 +387,11 @@ matched_digest = "296448ba66c23d77cb18bfee9b0935706aac39d06e0ef9a7b47283caa14293
 variants = []
 
 [type_row."crates/eliot-app/tests/ul_control_treatment.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 5, digest 8cc618f7ecf8bbf6da912ec241929196a536b814ed8767834bc1918d7cd1a28d; recomputed against crates/eliot-app/tests/ul_control_treatment.rs on the #835 handoff tree: count 5, digest 8cc618f7ecf8bbf6da912ec241929196a536b814ed8767834bc1918d7cd1a28d"
 role = "test"
 owner = "#831"
 migration = 831
@@ -198,6 +402,11 @@ matched_digest = "8cc618f7ecf8bbf6da912ec241929196a536b814ed8767834bc1918d7cd1a2
 variants = []
 
 [type_row."crates/eliot-app/tests/ul_cue_candidate.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest 7254f6673e3452c86102130e0c330513462e9a40b35680f7f36f4a6057ad5f9b; recomputed against crates/eliot-app/tests/ul_cue_candidate.rs on the #835 handoff tree: count 2, digest 7254f6673e3452c86102130e0c330513462e9a40b35680f7f36f4a6057ad5f9b"
 role = "test"
 owner = "#831"
 migration = 831
@@ -208,6 +417,11 @@ matched_digest = "7254f6673e3452c86102130e0c330513462e9a40b35680f7f36f4a6057ad5f
 variants = []
 
 [type_row."crates/eliot-app/tests/ul_mvp_done.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest 6f5e1b3a2dca05890239ad4f74423b321e8a73b336a30901a419471ceb7ebd0f; recomputed against crates/eliot-app/tests/ul_mvp_done.rs on the #835 handoff tree: count 2, digest 6f5e1b3a2dca05890239ad4f74423b321e8a73b336a30901a419471ceb7ebd0f"
 role = "test"
 owner = "#831"
 migration = 831
@@ -218,6 +432,11 @@ matched_digest = "6f5e1b3a2dca05890239ad4f74423b321e8a73b336a30901a419471ceb7ebd
 variants = []
 
 [type_row."crates/eliot-app/tests/ul_push_first_value.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest 022fb9993d9acc05d55499c65f217cd9d9d73fa0805bcd19f2c593ea1e9b25bf; recomputed against crates/eliot-app/tests/ul_push_first_value.rs on the #835 handoff tree: count 2, digest 022fb9993d9acc05d55499c65f217cd9d9d73fa0805bcd19f2c593ea1e9b25bf"
 role = "test"
 owner = "#831"
 migration = 831
@@ -228,6 +447,11 @@ matched_digest = "022fb9993d9acc05d55499c65f217cd9d9d73fa0805bcd19f2c593ea1e9b25
 variants = []
 
 [type_row."crates/eliot-app/tests/ul_pyramid_delivery.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest 2731575eb4529fad2dbafc4c5311424c2a27cd9f58d3de0867ebf320cb9cea62; recomputed against crates/eliot-app/tests/ul_pyramid_delivery.rs on the #835 handoff tree: count 2, digest 2731575eb4529fad2dbafc4c5311424c2a27cd9f58d3de0867ebf320cb9cea62"
 role = "test"
 owner = "#831"
 migration = 831
@@ -238,6 +462,11 @@ matched_digest = "2731575eb4529fad2dbafc4c5311424c2a27cd9f58d3de0867ebf320cb9cea
 variants = []
 
 [type_row."crates/eliot-engine/src/cognitive_projection.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 4, digest e07d9924524cea44cc30432d7b8457cc3ff1215ad041e4b3f99b7dcc49539244; recomputed against crates/eliot-engine/src/cognitive_projection.rs on the #835 handoff tree: count 4, digest e07d9924524cea44cc30432d7b8457cc3ff1215ad041e4b3f99b7dcc49539244"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -248,6 +477,11 @@ matched_digest = "e07d9924524cea44cc30432d7b8457cc3ff1215ad041e4b3f99b7dcc495392
 variants = []
 
 [type_row."crates/eliot-engine/src/ul/capsule.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest 3f0348bb211a46b89a8e0c19872969a86d861125233ea35b83c36353c96af688; recomputed against crates/eliot-engine/src/ul/capsule.rs on the #835 handoff tree: count 2, digest 3f0348bb211a46b89a8e0c19872969a86d861125233ea35b83c36353c96af688"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -258,6 +492,11 @@ matched_digest = "3f0348bb211a46b89a8e0c19872969a86d861125233ea35b83c36353c96af6
 variants = []
 
 [type_row."crates/eliot-engine/src/ul/cards.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 3, digest 35fbed023606cea6f53e1f89cd0d85774004a691436c6ab5c500b1ef3f38ef81; recomputed against crates/eliot-engine/src/ul/cards.rs on the #835 handoff tree: count 3, digest 35fbed023606cea6f53e1f89cd0d85774004a691436c6ab5c500b1ef3f38ef81"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -268,6 +507,11 @@ matched_digest = "35fbed023606cea6f53e1f89cd0d85774004a691436c6ab5c500b1ef3f38ef
 variants = []
 
 [type_row."crates/eliot-engine/src/ul/cue_index.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 14, digest 62406c086d55162a7efd5fe3f331fa983be13f04fd5d4ef1327519f50aa6a0f0; recomputed against crates/eliot-engine/src/ul/cue_index.rs on the #835 handoff tree: count 14, digest 62406c086d55162a7efd5fe3f331fa983be13f04fd5d4ef1327519f50aa6a0f0"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -278,6 +522,11 @@ matched_digest = "62406c086d55162a7efd5fe3f331fa983be13f04fd5d4ef1327519f50aa6a0
 variants = []
 
 [type_row."crates/eliot-engine/src/ul/injection.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 13, digest 33a73ab2ab9a8afd0b0efb0c993b26ac779bd55fa4e9f1555e3db3d4041f334f; recomputed against crates/eliot-engine/src/ul/injection.rs on the #835 handoff tree: count 13, digest 33a73ab2ab9a8afd0b0efb0c993b26ac779bd55fa4e9f1555e3db3d4041f334f"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -288,6 +537,11 @@ matched_digest = "33a73ab2ab9a8afd0b0efb0c993b26ac779bd55fa4e9f1555e3db3d4041f33
 variants = []
 
 [type_row."crates/eliot-engine/src/ul/maintenance.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest bce445bd736ef0ce32867b71b1ce30d16aa5f9a1c44f30214c1627c94044c98c; recomputed against crates/eliot-engine/src/ul/maintenance.rs on the #835 handoff tree: count 2, digest bce445bd736ef0ce32867b71b1ce30d16aa5f9a1c44f30214c1627c94044c98c"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -298,6 +552,11 @@ matched_digest = "bce445bd736ef0ce32867b71b1ce30d16aa5f9a1c44f30214c1627c94044c9
 variants = []
 
 [type_row."crates/eliot-engine/src/ul/metacog.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 3, digest c3c70ea0072258157f291a75b4d85878a8383014abad0c55e0f1aaf38b92ad62; recomputed against crates/eliot-engine/src/ul/metacog.rs on the #835 handoff tree: count 3, digest c3c70ea0072258157f291a75b4d85878a8383014abad0c55e0f1aaf38b92ad62"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -308,6 +567,11 @@ matched_digest = "c3c70ea0072258157f291a75b4d85878a8383014abad0c55e0f1aaf38b92ad
 variants = []
 
 [type_row."crates/eliot-engine/src/ul/onboarding.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 6, digest 58a17534ec7a4fcd51327722b655b57d44177ac04892ae84652fbd80d7aaf01a; recomputed against crates/eliot-engine/src/ul/onboarding.rs on the #835 handoff tree: count 6, digest 58a17534ec7a4fcd51327722b655b57d44177ac04892ae84652fbd80d7aaf01a"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -318,6 +582,11 @@ matched_digest = "58a17534ec7a4fcd51327722b655b57d44177ac04892ae84652fbd80d7aaf0
 variants = []
 
 [type_row."crates/eliot-engine/src/ul/touched.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 9, digest a589d8de77519bde95ef0ee1a69e7decf08b3dd248443ea471b0659fbf784c48; recomputed against crates/eliot-engine/src/ul/touched.rs on the #835 handoff tree: count 9, digest a589d8de77519bde95ef0ee1a69e7decf08b3dd248443ea471b0659fbf784c48"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -328,6 +597,11 @@ matched_digest = "a589d8de77519bde95ef0ee1a69e7decf08b3dd248443ea471b0659fbf784c
 variants = []
 
 [type_row."crates/eliot-engine/tests/ul_cue_firing.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 4, digest cde4f30f53a412065a63ea5630b0e75723fc7529f2c9061c4204124f7e204488; recomputed against crates/eliot-engine/tests/ul_cue_firing.rs on the #835 handoff tree: count 4, digest cde4f30f53a412065a63ea5630b0e75723fc7529f2c9061c4204124f7e204488"
 role = "test"
 owner = "#831"
 migration = 831
@@ -338,6 +612,11 @@ matched_digest = "cde4f30f53a412065a63ea5630b0e75723fc7529f2c9061c4204124f7e2044
 variants = []
 
 [type_row."crates/eliot-engine/tests/ul_measurement.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest 123249dc0a95904ba9ba3a087dd3216be532767824d0b95cd42ee4b36251d0e7; recomputed against crates/eliot-engine/tests/ul_measurement.rs on the #835 handoff tree: count 2, digest 123249dc0a95904ba9ba3a087dd3216be532767824d0b95cd42ee4b36251d0e7"
 role = "test"
 owner = "#831"
 migration = 831
@@ -348,6 +627,11 @@ matched_digest = "123249dc0a95904ba9ba3a087dd3216be532767824d0b95cd42ee4b36251d0
 variants = []
 
 [type_row."crates/eliot-engine/tests/ul_pyramid.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest 60f2e0253c15c71437f92e5452b524b1632dcb982c0dd26c82617e15586daf3d; recomputed against crates/eliot-engine/tests/ul_pyramid.rs on the #835 handoff tree: count 2, digest 60f2e0253c15c71437f92e5452b524b1632dcb982c0dd26c82617e15586daf3d"
 role = "test"
 owner = "#831"
 migration = 831
@@ -358,6 +642,11 @@ matched_digest = "60f2e0253c15c71437f92e5452b524b1632dcb982c0dd26c82617e15586daf
 variants = []
 
 [type_row."crates/eliot-engine/tests/ul_touched_injection.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 5, digest 0abd60a9c8a4a174d7910627c47c3a3e810a885f24dbcf2cc755591175e19574; recomputed against crates/eliot-engine/tests/ul_touched_injection.rs on the #835 handoff tree: count 5, digest 0abd60a9c8a4a174d7910627c47c3a3e810a885f24dbcf2cc755591175e19574"
 role = "test"
 owner = "#831"
 migration = 831
@@ -368,6 +657,11 @@ matched_digest = "0abd60a9c8a4a174d7910627c47c3a3e810a885f24dbcf2cc755591175e195
 variants = []
 
 [type_row."crates/eliot-types/tests/cue_kind_internal_legacy_boundary.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 80, digest 1b108ddae176339123c0a00874faed537b700b331f5f6468a9e0c7af67b4cd73; recomputed against crates/eliot-types/tests/cue_kind_internal_legacy_boundary.rs on the #835 handoff tree: count 80, digest 1b108ddae176339123c0a00874faed537b700b331f5f6468a9e0c7af67b4cd73"
 role = "test"
 owner = "#831"
 migration = 831
@@ -378,6 +672,11 @@ matched_digest = "1b108ddae176339123c0a00874faed537b700b331f5f6468a9e0c7af67b4cd
 variants = []
 
 [type_row."crates/eliot-store/src/blob_store.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 4, digest b5943b60f0c83b9870830feb84aa04049c19c596988f6de146bdeba218f30fc3; recomputed against crates/eliot-store/src/blob_store.rs on the #835 handoff tree: count 4, digest b5943b60f0c83b9870830feb84aa04049c19c596988f6de146bdeba218f30fc3"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -388,6 +687,11 @@ matched_digest = "b5943b60f0c83b9870830feb84aa04049c19c596988f6de146bdeba218f30f
 variants = []
 
 [type_row."crates/eliot-store/tests/memory_retrieval.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 2, digest 24290464c7073ce7586e99aed5a77f54f633515dc610f00a1a5f200a35600e1b; recomputed against crates/eliot-store/tests/memory_retrieval.rs on the #835 handoff tree: count 2, digest 24290464c7073ce7586e99aed5a77f54f633515dc610f00a1a5f200a35600e1b"
 role = "test"
 owner = "#831"
 migration = 831
@@ -398,6 +702,11 @@ matched_digest = "24290464c7073ce7586e99aed5a77f54f633515dc610f00a1a5f200a35600e
 variants = []
 
 [type_row."crates/eliot-types/tests/cue_kind_legacy_boundary.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 89, digest 0c70604cb34d527e18fc68ebb8ebee6bc0e1deab5cf9fe15a02c3e308b280fcd; recomputed against crates/eliot-types/tests/cue_kind_legacy_boundary.rs on the #835 handoff tree: count 89, digest 0c70604cb34d527e18fc68ebb8ebee6bc0e1deab5cf9fe15a02c3e308b280fcd"
 role = "oracle"
 owner = "#706"
 migration = 706
@@ -408,6 +717,11 @@ matched_digest = "0c70604cb34d527e18fc68ebb8ebee6bc0e1deab5cf9fe15a02c3e308b280f
 variants = []
 
 [type_row."crates/eliot-types/tests/cue_kind_retirement.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 35, digest 4e603eebd05cfb3b827e4b7294e28fb803b587902c563de138dc1e396775e751; recomputed against crates/eliot-types/tests/cue_kind_retirement.rs on the #835 handoff tree: count 35, digest 4e603eebd05cfb3b827e4b7294e28fb803b587902c563de138dc1e396775e751"
 role = "test"
 owner = "#835"
 migration = 835
@@ -418,6 +732,11 @@ matched_digest = "4e603eebd05cfb3b827e4b7294e28fb803b587902c563de138dc1e396775e7
 variants = []
 
 [field_row."crates/eliot-types/tests/cue_kind_retirement.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 3, digest ba1cd0ad758ee131fed9ea92b4b5650a562ee666e65bfecc00fe87b52485135f; recomputed against crates/eliot-types/tests/cue_kind_retirement.rs on the #835 handoff tree: count 3, digest ba1cd0ad758ee131fed9ea92b4b5650a562ee666e65bfecc00fe87b52485135f"
 role = "test"
 owner = "#835"
 migration = 835
@@ -427,6 +746,11 @@ match_count = 3
 matched_digest = "ba1cd0ad758ee131fed9ea92b4b5650a562ee666e65bfecc00fe87b52485135f"
 
 [type_row."crates/smart/eliot-context/src/lib.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the historical v1-context cue_kind field declarations typed LegacyContextCueKind; the local current duplicate definition is retired and current resolution goes through the named A-10 import"
+named_migration = "eliot_context::decode_legacy_cue_kind (named historical decoder, owner #832, frozen #40 compatibility behaviour) over LegacyContextCueKind / LegacyCueKindError"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 46, digest bb13ce5a7ba203f62fd0c78b9f6ae400be9b221ada0e20df9366d7a18b6a3142; recomputed against crates/smart/eliot-context/src/lib.rs on the #835 handoff tree: count 46, digest bb13ce5a7ba203f62fd0c78b9f6ae400be9b221ada0e20df9366d7a18b6a3142"
 role = "internal"
 owner = "#832"
 migration = 832
@@ -437,6 +761,11 @@ matched_digest = "bb13ce5a7ba203f62fd0c78b9f6ae400be9b221ada0e20df9366d7a18b6a31
 variants = []
 
 [type_row."crates/smart/eliot-cues/src/lib.rs"]
+final_disposition = "migrated-to-#804-current"
+disposition_evidence = "the surviving match set is the legitimate A-10 reexport pub use eliot_cue_contracts::{CueKind, MatchMode}; at crates/smart/eliot-cues/src/lib.rs line 86 plus its reexport ledger; no legacy-as-current alias remains on this path"
+named_migration = "eliot_cue_contracts::CueKind (current authority, #804, revision 2.0.0)"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 5, digest 52fe5b71c80f39045b257fc409bba3a960b2e443fe7df7ba4db8cda83714aea7; recomputed against crates/smart/eliot-cues/src/lib.rs on the #835 handoff tree: count 5, digest 52fe5b71c80f39045b257fc409bba3a960b2e443fe7df7ba4db8cda83714aea7"
 role = "internal"
 owner = "#833"
 migration = 833
@@ -447,6 +776,11 @@ matched_digest = "52fe5b71c80f39045b257fc409bba3a960b2e443fe7df7ba4db8cda83714ae
 variants = []
 
 [type_row."crates/smart/eliot-cues/tests/integrity.rs"]
+final_disposition = "migrated-to-#804-current"
+disposition_evidence = "every match resolves through eliot_cue_contracts::CueKind, the A-10 current owner; this row is the reexport-identity regression"
+named_migration = "eliot_cue_contracts::CueKind (current authority, #804, revision 2.0.0)"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 5, digest 188333ab1a99b1cdaa9c2f93b769a26215a45ca96fb30a709d428b0a7d226ad1; recomputed against crates/smart/eliot-cues/tests/integrity.rs on the #835 handoff tree: count 5, digest 188333ab1a99b1cdaa9c2f93b769a26215a45ca96fb30a709d428b0a7d226ad1"
 role = "duplicate-test"
 owner = "#833"
 migration = 833
@@ -457,6 +791,11 @@ matched_digest = "188333ab1a99b1cdaa9c2f93b769a26215a45ca96fb30a709d428b0a7d226a
 variants = []
 
 [type_row."crates/smart/eliot-cue-contracts/src/normalization.rs"]
+final_disposition = "current-authority"
+disposition_evidence = "every match resolves to the single current enum declared at crates/smart/eliot-cue-contracts/src/normalization.rs line 40 pub enum CueKind, owner #804, CONTRACT_REVISION 2.0.0"
+named_migration = "eliot_cue_contracts::CueKind (current authority, #804, revision 2.0.0)"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 8, digest 8669c70e25a0c837d42a2a35db24e0c36e9ad3f2652175b55dc97c58a7023e97; recomputed against crates/smart/eliot-cue-contracts/src/normalization.rs on the #835 handoff tree: count 8, digest 8669c70e25a0c837d42a2a35db24e0c36e9ad3f2652175b55dc97c58a7023e97"
 role = "current-definition"
 owner = "#804"
 migration = 804
@@ -467,6 +806,11 @@ matched_digest = "8669c70e25a0c837d42a2a35db24e0c36e9ad3f2652175b55dc97c58a7023e
 variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
 
 [type_row."crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"]
+final_disposition = "current-authority"
+disposition_evidence = "every match resolves to the A-10 current type owned at crates/smart/eliot-cue-contracts/src/normalization.rs line 40, owner #804; this row is that owner package's own acceptance evidence"
+named_migration = "eliot_cue_contracts::CueKind (current authority, #804, revision 2.0.0)"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: CueKind lens, count 50, digest d0783444dc7596bee1c6ebf5590eb448972d0b8143276dedd282ad62e1768dcf; recomputed against crates/smart/eliot-cue-contracts/tests/acceptance_804.rs on the #835 handoff tree: count 50, digest d0783444dc7596bee1c6ebf5590eb448972d0b8143276dedd282ad62e1768dcf"
 role = "current-test"
 owner = "#804"
 migration = 804
@@ -477,16 +821,30 @@ matched_digest = "d0783444dc7596bee1c6ebf5590eb448972d0b8143276dedd282ad62e1768d
 variants = []
 
 [type_row."crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "re-derived"
+baseline_digest_rule = "recomputed with the boundary oracle's own rule, unchanged: str::lines() of the row file, filtered by the bare substring CueKind, joined with a single newline, blake3 hex (cue_kind_legacy_boundary.rs matched_lines line 63, matched_digest line 67, reached through check_row_complete line 805 and check_row_digest line 784; the type_row lens is set at case 706/23 line 1327). This is a type_row, so the lens is CueKind and not cue_kind; the separate field_row for this same file carries its own cue_kind count 94 and still reproduces."
+baseline_digest_basis = "frozen #706 baseline for this row, retained verbatim and not deleted: CueKind lens, count 28, digest 67fe8f0c54580e5d0cc068ae8e03f6189d5216cdf8eb05c9d5a8952947367044 (frozen_baseline_match_count / frozen_baseline_matched_digest below). RECHECK: that frozen pair was confirmed real - the same rule reproduces it byte for byte at 1f592cf065f46047845c58d9c037963d0a0f6ccb, e7d303284f356e13cd26997331e5b5eb899cc290 and 7922061f259c18321f7d7e5e2159972dc537ded3 (the #929 freeze of the serialized-boundary denominator), the last states of this file that carried it. RECHECK: re-running the same rule against this path at origin/main 4d6d4f9a6e6a9e75dd6f34051a3cb91379f3a61c gives count 28, digest dee51255d2a9edc459b55f5ff6244ded88792f60cce3f6c9e9603f67fe492daf, and that pair is now the current verified baseline in match_count / matched_digest. Cause, measured by diffing the 28 matched lines frozen against current rather than guessed: the count is unchanged and exactly one matched line changed content - the line-number anchor of the inventory row id = eliot-context:crates/smart/eliot-context/src/lib.rs:LegacyContextCueKind, from :944 to :1498, because the eliot-context module grew. Every other matched line, including the types = [...] line carrying LegacyCueKindV1 and the eliot-types:crates/eliot-types/src/ul/cue.rs:LegacyCueKindV1 inventory row that case 706/24 line 1357 requires, is byte-identical. Every commit that has touched this file since 1c1c09451ce458ebb7acfed416fc9929226d95 yields count 28 and this digest, so it is a settled baseline. The drift record is preserved in this sentence rather than erased: the frozen pair above is what the row froze, the pair below is what the current inventory holds."
+frozen_baseline_match_count = 28
+frozen_baseline_matched_digest = "67fe8f0c54580e5d0cc068ae8e03f6189d5216cdf8eb05c9d5a8952947367044"
+frozen_baseline_issue = 706
 role = "inventory"
 owner = "#929/#710"
 migration = 929
 expiry = "retain-both-current-and-legacy-rows-per-#929-and-#710; invalid-on-row-loss"
 risk = "inventory-drift"
 match_count = 28
-matched_digest = "67fe8f0c54580e5d0cc068ae8e03f6189d5216cdf8eb05c9d5a8952947367044"
+matched_digest = "dee51255d2a9edc459b55f5ff6244ded88792f60cce3f6c9e9603f67fe492daf"
 variants = []
 
 [field_row."crates/eliot-types/src/ul/cue.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. the enum is declared as pub enum LegacyCueKindV1 at crates/eliot-types/src/ul/cue.rs line 24 and the named migration LegacyCueKindV1MigrationDescriptor at line 63; the single transitional-alias spelling left in the file is the line 80 doc pointer to the current A-10 CueKind definition, and pub type CueKind is absent"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 14, digest 7b7be9dbdbe48b70d0272c29013d14e9d8cd87e3d91ee761859c964e6973b7dc; recomputed against crates/eliot-types/src/ul/cue.rs on the #835 handoff tree: count 14, digest 7b7be9dbdbe48b70d0272c29013d14e9d8cd87e3d91ee761859c964e6973b7dc"
 role = "source"
 owner = "#706"
 migration = 706
@@ -496,6 +854,11 @@ match_count = 14
 matched_digest = "7b7be9dbdbe48b70d0272c29013d14e9d8cd87e3d91ee761859c964e6973b7dc"
 
 [field_row."crates/eliot-types/tests/ul_cue_normalize.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest e8a9705154f0f0425a4591136cabe5d50120d2472899b4a09fd1da70106f0024; recomputed against crates/eliot-types/tests/ul_cue_normalize.rs on the #835 handoff tree: count 2, digest e8a9705154f0f0425a4591136cabe5d50120d2472899b4a09fd1da70106f0024"
 role = "test"
 owner = "#831"
 migration = 831
@@ -505,6 +868,11 @@ match_count = 2
 matched_digest = "e8a9705154f0f0425a4591136cabe5d50120d2472899b4a09fd1da70106f0024"
 
 [field_row."crates/eliot-app/src/mcp_stdio/protocol_tests.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 3, digest 36a4e7a675098d5f89f3eb297d5036a6b84a54c88c9d999f288277649f5d9037; recomputed against crates/eliot-app/src/mcp_stdio/protocol_tests.rs on the #835 handoff tree: count 3, digest 36a4e7a675098d5f89f3eb297d5036a6b84a54c88c9d999f288277649f5d9037"
 role = "root"
 owner = "#831"
 migration = 831
@@ -514,6 +882,11 @@ match_count = 3
 matched_digest = "36a4e7a675098d5f89f3eb297d5036a6b84a54c88c9d999f288277649f5d9037"
 
 [field_row."crates/eliot-app/src/mcp_stdio/verification.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 6, digest 037b928baf5290a16682c64308dfbc4f2de3f23ccd6c518b417f2652db15878f; recomputed against crates/eliot-app/src/mcp_stdio/verification.rs on the #835 handoff tree: count 6, digest 037b928baf5290a16682c64308dfbc4f2de3f23ccd6c518b417f2652db15878f"
 role = "root"
 owner = "#831"
 migration = 831
@@ -523,6 +896,11 @@ match_count = 6
 matched_digest = "037b928baf5290a16682c64308dfbc4f2de3f23ccd6c518b417f2652db15878f"
 
 [field_row."crates/eliot-app/src/ul_cross_agent_runner.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. the surviving matches are raw historical V1 wire access: a JSON object-key read of the frozen cue_kind key and one emitted wire fixture, both byte-identical to the frozen #706 occurrences"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest b4209df454d8e2faa01b7b3b3488fb859ddf24716166eb9cf2a540fd491d3c27; recomputed against crates/eliot-app/src/ul_cross_agent_runner.rs on the #835 handoff tree: count 2, digest b4209df454d8e2faa01b7b3b3488fb859ddf24716166eb9cf2a540fd491d3c27"
 role = "root"
 owner = "#831"
 migration = 831
@@ -532,6 +910,11 @@ match_count = 2
 matched_digest = "b4209df454d8e2faa01b7b3b3488fb859ddf24716166eb9cf2a540fd491d3c27"
 
 [field_row."crates/eliot-app/tests/ul_behavior_cli.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest 00de6baa141dfb1b25fa7266ff3df5281872a437ee6d66701993544d769c8319; recomputed against crates/eliot-app/tests/ul_behavior_cli.rs on the #835 handoff tree: count 2, digest 00de6baa141dfb1b25fa7266ff3df5281872a437ee6d66701993544d769c8319"
 role = "test"
 owner = "#831"
 migration = 831
@@ -541,6 +924,11 @@ match_count = 2
 matched_digest = "00de6baa141dfb1b25fa7266ff3df5281872a437ee6d66701993544d769c8319"
 
 [field_row."crates/eliot-app/tests/ul_control_treatment.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 4, digest f97b7615be1618fa839adab055453d2aa460b01d9b1740a69288531daddca64e; recomputed against crates/eliot-app/tests/ul_control_treatment.rs on the #835 handoff tree: count 4, digest f97b7615be1618fa839adab055453d2aa460b01d9b1740a69288531daddca64e"
 role = "test"
 owner = "#831"
 migration = 831
@@ -550,6 +938,11 @@ match_count = 4
 matched_digest = "f97b7615be1618fa839adab055453d2aa460b01d9b1740a69288531daddca64e"
 
 [field_row."crates/eliot-app/tests/ul_cue_candidate.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest 87144d34cd152cd47a2ec90f266b7869da7c00169ac6f754b1758537ba44ae61; recomputed against crates/eliot-app/tests/ul_cue_candidate.rs on the #835 handoff tree: count 1, digest 87144d34cd152cd47a2ec90f266b7869da7c00169ac6f754b1758537ba44ae61"
 role = "test"
 owner = "#831"
 migration = 831
@@ -559,6 +952,11 @@ match_count = 1
 matched_digest = "87144d34cd152cd47a2ec90f266b7869da7c00169ac6f754b1758537ba44ae61"
 
 [field_row."crates/eliot-app/tests/ul_contract_errors.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. the surviving match is the emitted historical V1 cue_kind wire key inside an integration fixture, byte-identical to the frozen #706 occurrence"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest dda4c4f1dce8d6832eee22d972f554db2ffa504783e91e379b79e7bf7b640fb0; recomputed against crates/eliot-app/tests/ul_contract_errors.rs on the #835 handoff tree: count 1, digest dda4c4f1dce8d6832eee22d972f554db2ffa504783e91e379b79e7bf7b640fb0"
 role = "test"
 owner = "#831"
 migration = 831
@@ -568,6 +966,11 @@ match_count = 1
 matched_digest = "dda4c4f1dce8d6832eee22d972f554db2ffa504783e91e379b79e7bf7b640fb0"
 
 [field_row."crates/eliot-app/tests/ul_mvp_done.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest 0d79c4c3c17b380a5973dc03eec8ae5ea1cd6d8458575ba915323719c488ea90; recomputed against crates/eliot-app/tests/ul_mvp_done.rs on the #835 handoff tree: count 2, digest 0d79c4c3c17b380a5973dc03eec8ae5ea1cd6d8458575ba915323719c488ea90"
 role = "test"
 owner = "#831"
 migration = 831
@@ -577,6 +980,11 @@ match_count = 2
 matched_digest = "0d79c4c3c17b380a5973dc03eec8ae5ea1cd6d8458575ba915323719c488ea90"
 
 [field_row."crates/eliot-app/tests/ul_push_first_value.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest a45398ab5975c2ea7982a7a005e2e2be0881f3ba3a5d2c3e43fb12f5d38c8faa; recomputed against crates/eliot-app/tests/ul_push_first_value.rs on the #835 handoff tree: count 1, digest a45398ab5975c2ea7982a7a005e2e2be0881f3ba3a5d2c3e43fb12f5d38c8faa"
 role = "test"
 owner = "#831"
 migration = 831
@@ -586,6 +994,11 @@ match_count = 1
 matched_digest = "a45398ab5975c2ea7982a7a005e2e2be0881f3ba3a5d2c3e43fb12f5d38c8faa"
 
 [field_row."crates/eliot-app/tests/ul_pyramid_delivery.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest a526c737897abb9a8a71fd8e5997cc3445250b8ad1e1820c8e772a6a8c01decb; recomputed against crates/eliot-app/tests/ul_pyramid_delivery.rs on the #835 handoff tree: count 1, digest a526c737897abb9a8a71fd8e5997cc3445250b8ad1e1820c8e772a6a8c01decb"
 role = "test"
 owner = "#831"
 migration = 831
@@ -595,6 +1008,11 @@ match_count = 1
 matched_digest = "a526c737897abb9a8a71fd8e5997cc3445250b8ad1e1820c8e772a6a8c01decb"
 
 [field_row."crates/eliot-engine/src/cognitive_projection.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest 8ebfec0d30f989805b13a744d333fc050aa8430278dc9856bdc4be055b0e0450; recomputed against crates/eliot-engine/src/cognitive_projection.rs on the #835 handoff tree: count 2, digest 8ebfec0d30f989805b13a744d333fc050aa8430278dc9856bdc4be055b0e0450"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -604,6 +1022,11 @@ match_count = 2
 matched_digest = "8ebfec0d30f989805b13a744d333fc050aa8430278dc9856bdc4be055b0e0450"
 
 [field_row."crates/eliot-engine/src/ul/capsule.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest f1bc37c50d5602dfa92f2b4272998d811e9284e943d17006fc56aa549e407dc8; recomputed against crates/eliot-engine/src/ul/capsule.rs on the #835 handoff tree: count 1, digest f1bc37c50d5602dfa92f2b4272998d811e9284e943d17006fc56aa549e407dc8"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -613,6 +1036,11 @@ match_count = 1
 matched_digest = "f1bc37c50d5602dfa92f2b4272998d811e9284e943d17006fc56aa549e407dc8"
 
 [field_row."crates/eliot-engine/src/ul/cards.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest 15cf18871dd5a0296b8501f5d3097cb78b1f25748ed764b540cc03bfc902a8e5; recomputed against crates/eliot-engine/src/ul/cards.rs on the #835 handoff tree: count 2, digest 15cf18871dd5a0296b8501f5d3097cb78b1f25748ed764b540cc03bfc902a8e5"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -622,6 +1050,11 @@ match_count = 2
 matched_digest = "15cf18871dd5a0296b8501f5d3097cb78b1f25748ed764b540cc03bfc902a8e5"
 
 [field_row."crates/eliot-engine/src/ul/cue_index.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 5, digest e62f990887f00f49df285bc32795659bcfece2d8cae3ad0a8357510fcb630a2a; recomputed against crates/eliot-engine/src/ul/cue_index.rs on the #835 handoff tree: count 5, digest e62f990887f00f49df285bc32795659bcfece2d8cae3ad0a8357510fcb630a2a"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -631,6 +1064,11 @@ match_count = 5
 matched_digest = "e62f990887f00f49df285bc32795659bcfece2d8cae3ad0a8357510fcb630a2a"
 
 [field_row."crates/eliot-engine/src/ul/injection.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest 64d0082439a7ccead47ae1596aa178ff7830e4b296d724776a5983146eaf0588; recomputed against crates/eliot-engine/src/ul/injection.rs on the #835 handoff tree: count 2, digest 64d0082439a7ccead47ae1596aa178ff7830e4b296d724776a5983146eaf0588"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -640,6 +1078,11 @@ match_count = 2
 matched_digest = "64d0082439a7ccead47ae1596aa178ff7830e4b296d724776a5983146eaf0588"
 
 [field_row."crates/eliot-engine/src/ul/maintenance.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest a28e43981db5a1376decc836986794b0d17bb2a39d61f7b7b0034c9bad8e5f0b; recomputed against crates/eliot-engine/src/ul/maintenance.rs on the #835 handoff tree: count 1, digest a28e43981db5a1376decc836986794b0d17bb2a39d61f7b7b0034c9bad8e5f0b"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -649,6 +1092,11 @@ match_count = 1
 matched_digest = "a28e43981db5a1376decc836986794b0d17bb2a39d61f7b7b0034c9bad8e5f0b"
 
 [field_row."crates/eliot-engine/src/ul/metacog.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest 257774eb2824a4ab789de666444c439bc23488286aa0c462d5219719244d6346; recomputed against crates/eliot-engine/src/ul/metacog.rs on the #835 handoff tree: count 2, digest 257774eb2824a4ab789de666444c439bc23488286aa0c462d5219719244d6346"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -658,6 +1106,11 @@ match_count = 2
 matched_digest = "257774eb2824a4ab789de666444c439bc23488286aa0c462d5219719244d6346"
 
 [field_row."crates/eliot-engine/src/ul/onboarding.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 5, digest 5eed3bbc1f82aa0536ab734e769388ff638819c8ea62cc7465f8278a8fbd6722; recomputed against crates/eliot-engine/src/ul/onboarding.rs on the #835 handoff tree: count 5, digest 5eed3bbc1f82aa0536ab734e769388ff638819c8ea62cc7465f8278a8fbd6722"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -667,6 +1120,11 @@ match_count = 5
 matched_digest = "5eed3bbc1f82aa0536ab734e769388ff638819c8ea62cc7465f8278a8fbd6722"
 
 [field_row."crates/eliot-engine/tests/ul_cue_firing.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest a986bd70da6bd17766ec3f957ddea99cc949b61ea307e4ab03607d5498c1032a; recomputed against crates/eliot-engine/tests/ul_cue_firing.rs on the #835 handoff tree: count 1, digest a986bd70da6bd17766ec3f957ddea99cc949b61ea307e4ab03607d5498c1032a"
 role = "test"
 owner = "#831"
 migration = 831
@@ -676,6 +1134,11 @@ match_count = 1
 matched_digest = "a986bd70da6bd17766ec3f957ddea99cc949b61ea307e4ab03607d5498c1032a"
 
 [field_row."crates/eliot-engine/tests/ul_measurement.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest 87144d34cd152cd47a2ec90f266b7869da7c00169ac6f754b1758537ba44ae61; recomputed against crates/eliot-engine/tests/ul_measurement.rs on the #835 handoff tree: count 1, digest 87144d34cd152cd47a2ec90f266b7869da7c00169ac6f754b1758537ba44ae61"
 role = "test"
 owner = "#831"
 migration = 831
@@ -685,6 +1148,11 @@ match_count = 1
 matched_digest = "87144d34cd152cd47a2ec90f266b7869da7c00169ac6f754b1758537ba44ae61"
 
 [field_row."crates/eliot-engine/tests/ul_pyramid.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest 4d7ab4eff0a4825ac651775a365e55b1281d450d4b8bff15071bae66c371e236; recomputed against crates/eliot-engine/tests/ul_pyramid.rs on the #835 handoff tree: count 1, digest 4d7ab4eff0a4825ac651775a365e55b1281d450d4b8bff15071bae66c371e236"
 role = "test"
 owner = "#831"
 migration = 831
@@ -694,6 +1162,11 @@ match_count = 1
 matched_digest = "4d7ab4eff0a4825ac651775a365e55b1281d450d4b8bff15071bae66c371e236"
 
 [field_row."crates/eliot-types/tests/cue_kind_internal_legacy_boundary.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 14, digest 1bfd971aa2077332d4578c28a6429ea696f4a730b3af64761f2769808835a874; recomputed against crates/eliot-types/tests/cue_kind_internal_legacy_boundary.rs on the #835 handoff tree: count 14, digest 1bfd971aa2077332d4578c28a6429ea696f4a730b3af64761f2769808835a874"
 role = "test"
 owner = "#831"
 migration = 831
@@ -703,6 +1176,11 @@ match_count = 14
 matched_digest = "1bfd971aa2077332d4578c28a6429ea696f4a730b3af64761f2769808835a874"
 
 [field_row."crates/eliot-store/src/blob_store.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 3, digest 578d9fc356c19dcaa51fe2ccadade3bb5e89859264fb6c07b25b4360222e8169; recomputed against crates/eliot-store/src/blob_store.rs on the #835 handoff tree: count 3, digest 578d9fc356c19dcaa51fe2ccadade3bb5e89859264fb6c07b25b4360222e8169"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -712,6 +1190,11 @@ match_count = 3
 matched_digest = "578d9fc356c19dcaa51fe2ccadade3bb5e89859264fb6c07b25b4360222e8169"
 
 [field_row."crates/eliot-store/src/canonical_store.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. the surviving match is the durable historical V1 projection key emitted from CueIndexRow.cue_kind, typed LegacyCueKindV1 and byte-identical to the frozen #706 occurrence"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest 951ce58ed087c0f3b93b863a5612779498d83ca3235ca0afbf4060257c9f9b2f; recomputed against crates/eliot-store/src/canonical_store.rs on the #835 handoff tree: count 1, digest 951ce58ed087c0f3b93b863a5612779498d83ca3235ca0afbf4060257c9f9b2f"
 role = "internal"
 owner = "#831"
 migration = 831
@@ -721,6 +1204,11 @@ match_count = 1
 matched_digest = "951ce58ed087c0f3b93b863a5612779498d83ca3235ca0afbf4060257c9f9b2f"
 
 [field_row."crates/eliot-store/tests/memory_retrieval.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 1, digest f1bc37c50d5602dfa92f2b4272998d811e9284e943d17006fc56aa549e407dc8; recomputed against crates/eliot-store/tests/memory_retrieval.rs on the #835 handoff tree: count 1, digest f1bc37c50d5602dfa92f2b4272998d811e9284e943d17006fc56aa549e407dc8"
 role = "test"
 owner = "#831"
 migration = 831
@@ -730,6 +1218,11 @@ match_count = 1
 matched_digest = "f1bc37c50d5602dfa92f2b4272998d811e9284e943d17006fc56aa549e407dc8"
 
 [field_row."crates/eliot-types/tests/cue_kind_legacy_boundary.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 11, digest 3cc6054f0d8b45947527416c3ff1bd4c530695a29de4f79d595b6bd9b06d56d7; recomputed against crates/eliot-types/tests/cue_kind_legacy_boundary.rs on the #835 handoff tree: count 11, digest 3cc6054f0d8b45947527416c3ff1bd4c530695a29de4f79d595b6bd9b06d56d7"
 role = "oracle"
 owner = "#706"
 migration = 706
@@ -739,6 +1232,11 @@ match_count = 11
 matched_digest = "3cc6054f0d8b45947527416c3ff1bd4c530695a29de4f79d595b6bd9b06d56d7"
 
 [field_row."crates/smart/eliot-context/src/lib.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. the surviving matches are the historical v1-context cue_kind field declarations typed LegacyContextCueKind; the local current duplicate definition is retired and current resolution goes through the named A-10 import"
+named_migration = "eliot_context::decode_legacy_cue_kind (named historical decoder, owner #832, frozen #40 compatibility behaviour) over LegacyContextCueKind / LegacyCueKindError"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 9, digest 3e49155d2282ecd79d0829e302aa22be1ff114c56628c0805583800263054f1a; recomputed against crates/smart/eliot-context/src/lib.rs on the #835 handoff tree: count 9, digest 3e49155d2282ecd79d0829e302aa22be1ff114c56628c0805583800263054f1a"
 role = "internal"
 owner = "#832"
 migration = 832
@@ -748,6 +1246,11 @@ match_count = 9
 matched_digest = "3e49155d2282ecd79d0829e302aa22be1ff114c56628c0805583800263054f1a"
 
 [field_row."crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"]
+final_disposition = "current-authority"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. the surviving matches are current A-10 cue_kind field declarations typed CueKind, owned at crates/smart/eliot-cue-contracts/src/normalization.rs line 40; no historical V1 field survives on this path"
+named_migration = "eliot_cue_contracts::CueKind (current authority, #804, revision 2.0.0)"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 2, digest e17afd70369dbf10ef4322808bc988b824f49103491517fa54cfb4de13a14b24; recomputed against crates/smart/eliot-cue-contracts/tests/acceptance_804.rs on the #835 handoff tree: count 2, digest e17afd70369dbf10ef4322808bc988b824f49103491517fa54cfb4de13a14b24"
 role = "current-test"
 owner = "#804"
 migration = 804
@@ -757,6 +1260,11 @@ match_count = 2
 matched_digest = "e17afd70369dbf10ef4322808bc988b824f49103491517fa54cfb4de13a14b24"
 
 [field_row."crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the surviving matches are the frozen cue_kind field declarations and accesses, still typed LegacyCueKindV1; the file carries zero transitional-alias spellings and zero extra current owners. every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "frozen #706 row: cue_kind lens, count 94, digest 8354fe6ebafc206a271ce742de84f45a751c27ed1c750cb2454bca327e7b4fb3; recomputed against crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml on the #835 handoff tree: count 94, digest 8354fe6ebafc206a271ce742de84f45a751c27ed1c750cb2454bca327e7b4fb3"
 role = "inventory"
 owner = "#929/#710"
 migration = 929
@@ -766,7 +1274,17 @@ match_count = 94
 matched_digest = "8354fe6ebafc206a271ce742de84f45a751c27ed1c750cb2454bca327e7b4fb3"
 
 [notes]
+final_disposition = "legacy-preserved"
+disposition_evidence = "the #706 provenance notes are preserved and extended, never replaced"
 memory_donor = "no memory-donor duplicate CueKind definition exists on base e80611de; #834 scope resolves at its own inventory, not as an unlisted row here"
 reservation = "no issue-owned reservation file for #706 exists on base; nothing to remove"
 queue_risk = "#804 is queue-HOLD-SUPERSEDED while #706 pins its accepted vocabulary at revision 2.0.0 digest a5412833; revalidate at integration"
 schema_title_note = "JsonSchema title moves CueKind to LegacyCueKindV1 as a rename artifact; the frozen wire enum values are unchanged"
+handoff_835 = "this file finalizes the #706 denominator for #835; every row, digest and historical obligation below is preserved and now carries a final_disposition. No row was deleted because it was inconvenient."
+handoff_835_alias = "the transitional eliot-types ul::cue CueKind alias was already absent from production source on the observed tree; this file records that fact per row instead of re-asserting a removal."
+handoff_835_row_denominator = "the type_row, field_row and variant denominators are byte-identical to the frozen #706 baseline; the boundary oracle recomputes them from source."
+handoff_835_drift = "no row in this file currently reads baseline_digest_state drifted. The two rows that did (type_row crates/eliot-types/src/ul/injection.rs and type_row crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml) were re-derived against origin/main 4d6d4f9a6e6a9e75dd6f34051a3cb91379f3a61c with the boundary oracle's own rule, stated in [meta].row_digest_oracle_rule and repeated in each row's baseline_digest_rule. Both now read re-derived: their original frozen #706 count and digest are still present verbatim under frozen_baseline_match_count and frozen_baseline_matched_digest, their match_count and matched_digest hold the current verified baseline, and their baseline_digest_basis names the exact commits at which the frozen pair and the current pair each reproduce plus the measured source change between them. A row that had failed to re-derive would still read drifted; the state was moved only because the re-derivation reproduced."
+handoff_835_lens = "the frozen field_row lens is the bare substring cue_kind, as this file header has always stated, and that is what the oracle passes: case 706/24 calls check_row_complete(&doc, \"field_row.\", \"cue_kind\") at line 1345. The quoted \"cue_kind\" at line 1346 of the same case is a different call with a different job: it is the wire-consumer path denominator scan_files(&LEGACY_DIRS, \"\\\"cue_kind\\\"\"), which selects files carrying a quoted JSON key and is compared against the wire_strings file list, not against a row digest. No digest is ever computed under a quoted lens. Every field_row in this file reproduces under the bare lens, including field_row crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml at count 94 while its type_row sibling was the drifted one. git log --all -S finds no committed revision of cue_kind_legacy_boundary.rs that passed a quoted lens to check_row_complete, so the quoted-lens explanation for the two drifted rows was wrong; both were genuine source movement and are now re-derived."
+handoff_835_coverage = "B29 is carried by the existing finite coverage fixture scripts/testdata/cue-kind-retirement/persisted_ipc_provider_wasm_coverage.json, referenced from [retirement_coverage]. That fixture already enumerates the config, ipc, persisted, provider and wasm classes, so no second coverage file was created and none was rewritten."
+handoff_835_no_pass_file = "no row in this file carries a pass marker, a passed result or an aggregate count. Every disposition is a statement about current source that scripts/audit_cue_kind_retirement.py recomputes."
+handoff_835_scope = "this data file is the whole deliverable for the issue item; it owns no Rust symbol and needs no impl anchor beyond its own path."

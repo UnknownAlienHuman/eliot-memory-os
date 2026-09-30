@@ -355,7 +355,9 @@ impl RootTransitionActivationReceipt {
     /// any committed field disagrees with the presented request,
     /// [`AuthorityError::ReceiptMismatch`] when the Kernel activation receipt is
     /// not a validated `Active` receipt for the presented snapshot and epoch,
-    /// and [`AuthorityError::StaleTransitionEvidence`] when a non-committed
+    /// and [`AuthorityError::UnreconciledTransitionEvidence`] when the owner
+    /// reports an unproven commit outcome for this exact operation identity,
+    /// plus [`AuthorityError::StaleTransitionEvidence`] when a terminal
     /// disposition is claimed as authority.
     pub fn validate(
         &self,
@@ -462,10 +464,26 @@ impl RootTransitionActivationReceipt {
         {
             return Err(AuthorityError::ReceiptMismatch);
         }
-        if self.disposition != RootTransitionDisposition::Committed {
-            return Err(AuthorityError::StaleTransitionEvidence(
-                "root_transition_receipt.disposition",
-            ));
+        match self.disposition {
+            RootTransitionDisposition::Committed => {}
+            // A possible commit is not stale evidence. It is the owner saying
+            // it cannot tell whether THIS operation identity committed, so the
+            // crossing stays unadmitted under its own typed refusal and the
+            // only way out is reconciliation against that exact identity.
+            // Reporting it as stale would invite a fresh presentation, which
+            // cannot conflict with this attempt and can apply it twice.
+            RootTransitionDisposition::UnknownOutcome => {
+                return Err(AuthorityError::UnreconciledTransitionEvidence(
+                    "root_transition_receipt.outcome_unknown",
+                ));
+            }
+            // A terminal disposition is final: the owner will not commit this
+            // operation, so its evidence never becomes current.
+            RootTransitionDisposition::Terminal => {
+                return Err(AuthorityError::StaleTransitionEvidence(
+                    "root_transition_receipt.disposition",
+                ));
+            }
         }
         Ok(())
     }
@@ -486,6 +504,17 @@ pub struct AdmittedRootTransition {
     canonical_request_digest: String,
     kernel_activation_id: String,
     ors_record_ref: String,
+    /// Owner-reconciled disposition of the admitted operation, copied verbatim
+    /// from the presenting [`RootTransitionActivationReceipt`] and never
+    /// decided here. It carries no free choice: both admission paths run the
+    /// committed-disposition guard first, which refuses every value other
+    /// than [`RootTransitionDisposition::Committed`], so the only disposition
+    /// an admitted transition can hold is the owner's committed one. Binding
+    /// it means this record RESTATES the owner's reconciled outcome instead of
+    /// asserting a disposition of its own, and it keeps the observable
+    /// outcome attached to the operation identity, digest, activation, and
+    /// durable ORS reference the transition already carries.
+    disposition: RootTransitionDisposition,
 }
 
 impl AdmittedRootTransition {
@@ -524,6 +553,7 @@ impl AdmittedRootTransition {
             request.canonical_request_digest(),
             &receipt.kernel_activation.activation_id,
             &receipt.ors_record_ref,
+            receipt.disposition,
             parent,
             child,
             current_revision,
@@ -565,6 +595,7 @@ impl AdmittedRootTransition {
             &row.canonical_request_digest,
             &row.kernel_activation_id,
             &row.ors_record_ref,
+            receipt.disposition,
             parent,
             child,
             current_revision,
@@ -621,6 +652,14 @@ impl AdmittedRootTransition {
         self.ors_record_ref.as_str()
     }
 
+    /// Owner-reconciled disposition of the admitted operation, restated from
+    /// the presenting activation receipt. Reading it returns the owner's
+    /// concluded outcome; it is not a local decision this crate can vary.
+    #[must_use]
+    pub const fn disposition(&self) -> RootTransitionDisposition {
+        self.disposition
+    }
+
     /// Graph revision the crossing was admitted at.
     #[must_use]
     pub const fn admitted_at_revision(&self) -> u64 {
@@ -630,6 +669,10 @@ impl AdmittedRootTransition {
     /// Shared admission body: structural shape, exact edge/root correspondence,
     /// issuer, narrowing, fence/epoch readback, effect ceiling, grant
     /// commitments recomputed from CURRENT grants, and revision currency.
+    ///
+    /// `disposition` is the presenting owner receipt's own reconciled value,
+    /// passed through untouched: this body records what the owner concluded
+    /// and does not derive, upgrade, or default it.
     #[allow(
         clippy::too_many_arguments,
         reason = "one fail-closed readback covers the whole committed record"
@@ -639,6 +682,7 @@ impl AdmittedRootTransition {
         canonical_request_digest: &str,
         kernel_activation_id: &str,
         ors_record_ref: &str,
+        disposition: RootTransitionDisposition,
         parent: &CapabilityGrant,
         child: &CapabilityGrant,
         current_revision: u64,
@@ -704,6 +748,7 @@ impl AdmittedRootTransition {
             canonical_request_digest: canonical_request_digest.to_owned(),
             kernel_activation_id: kernel_activation_id.to_owned(),
             ors_record_ref: ors_record_ref.to_owned(),
+            disposition,
         })
     }
 }

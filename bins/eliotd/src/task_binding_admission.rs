@@ -55,9 +55,11 @@
 //!
 //! - [`bind_current_task_selection`] — the applicability recheck admission
 //!   needs (issue #1746, W4). It refuses a current task until the readiness
-//!   receipt carries owner-proven selection source/evidence. Once that owner
-//!   producer exists, the activation snapshot and receipt can be compared at
-//!   the live fence. Structural validation of request-supplied
+//!   receipt carries owner-proven selection source/evidence. The owner
+//!   producer is `GovernorComposition::current_task_selection` and the
+//!   composition caller is `DaemonComposition::resolve_current_task_selection`
+//!   (itself STITCH-called: no live dispatch ingress supplies the lease key
+//!   terms yet). Structural validation of request-supplied
 //!   `TaskSelectionEvidence` is never sufficient.
 //!
 //! No entry creates a second write path, re-derives a downstream layer's
@@ -142,18 +144,38 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_bootstrap::capture::observe_workspace_instance;
+use eliot_bootstrap::capture::{WorkspaceInstanceFacts, observe_workspace_instance};
+use eliot_contracts::sha256_hex;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
     CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
     WorkScopeDescriptor, derive_observed_resources,
 };
+use eliot_integration_coverage::{GovernanceProfile, IntegrationCoverageProfile};
 use eliot_observation::TaskSelectionEvidence;
+use eliot_protocol::{
+    AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+};
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
-    ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt, TaskBindingState,
+    BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
+    DiscoveryRead, DiscoveryReadLease, ManifestEvidence, ObservedScopeResources, OnboardingLease,
+    OnboardingReadinessReceipt, ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState,
+    TaskBindingState, issue_discovery_lease, task_selection_required,
 };
+
+/// Authenticated activation's bounded filesystem/VCS observation and its
+/// scanner inputs. The ticket binds the explicit selector to the admitted
+/// Bridge request and peer receipt; all identity/evidence fields below are
+/// derived from the Host observer, never accepted from the caller.
+#[derive(Clone, Debug)]
+pub struct ColdStartDiscoveryInput {
+    pub lease: DiscoveryReadLease,
+    pub key: DiscoveryLeaseKey,
+    pub discovery: BootstrapDiscoveryInputs,
+}
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
@@ -170,6 +192,164 @@ pub enum CompatibilityDisposition {
     Compatible,
     /// Selection names another scope or an incompatible contract revision.
     Incompatible,
+}
+
+/// Requirement class of one canonical operation before any gating
+/// (issue #1746, W1; frozen against I7.6 and I5.5, not renegotiated per
+/// request).
+///
+/// - `DiscoveryReadOnly` — authenticated discovery/read-only preview. Reachable
+///   without a selected task (`state`/task-selection/bootstrap must stay
+///   reachable or the user cannot select one). Never grants a task effect.
+/// - `SafeRawCapture` — `observe` raw capture. May retain an explicitly
+///   unbound/provisional cold candidate under its valid identity, privacy, and
+///   staging policy ([`admit_capture`]); grants no task effect.
+/// - `TaskRelativeEffectful` — task-bound promotion, control, action,
+///   verification, and Finish. Requires the exact applicable task evidence
+///   ([`admit_task_bound`]). Unauthenticated requests never gain exceptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanonicalOperationRequirement {
+    DiscoveryReadOnly,
+    SafeRawCapture,
+    TaskRelativeEffectful,
+}
+
+/// Maps the eight canonical MCP operations (I7.6) to their requirement class.
+///
+/// `state`/`query`/`packet` are authenticated read-only previews;
+/// `observe` is the single safe raw capture surface; `act`/`verify`/
+/// `coordinate`/`finish` are task-relative/effectful. A `None` return means
+/// the name is not a canonical operation and is refused upstream, never
+/// defaulted to a weaker class.
+///
+/// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher
+/// maps tool names through this table before submitting; the daemon write path
+/// re-derives its own requirement from the typed [`NamedMutationOperation`]
+/// via [`requirement_for_named_mutation`], so a renamed tool cannot smuggle a
+/// weaker class past the gate.
+#[must_use]
+pub fn classify_canonical_operation(operation: &str) -> Option<CanonicalOperationRequirement> {
+    match operation {
+        "eliot.state" | "eliot.query" | "eliot.packet" => {
+            Some(CanonicalOperationRequirement::DiscoveryReadOnly)
+        }
+        "eliot.observe" => Some(CanonicalOperationRequirement::SafeRawCapture),
+        "eliot.act" | "eliot.verify" | "eliot.coordinate" | "eliot.finish" => {
+            Some(CanonicalOperationRequirement::TaskRelativeEffectful)
+        }
+        _ => None,
+    }
+}
+
+/// Maps one `eliot.observe` typed suboperation (I7.6) to its requirement.
+///
+/// Every capture suboperation — `observation`, `decision`, `failure`,
+/// `outcome`, `influence_ack` — is safe raw capture at admission: whether one
+/// capture becomes task-bound is decided by the exact selection evidence in
+/// [`admit_capture`], never by the suboperation name.
+///
+/// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher,
+///
+/// together with [`classify_canonical_operation`].
+#[must_use]
+pub fn classify_observe_suboperation(suboperation: &str) -> Option<CanonicalOperationRequirement> {
+    match suboperation {
+        "observation" | "decision" | "failure" | "outcome" | "influence_ack" => {
+            Some(CanonicalOperationRequirement::SafeRawCapture)
+        }
+        _ => None,
+    }
+}
+
+/// Maps one `eliot.coordinate` operation discriminator (I7.6) to its
+/// requirement.
+///
+/// `inspect`/`wait` are read-only orientation over run lineage and durable
+/// state; `delegate`/`audit`/`compare`/`cancel`/`send` create or reconcile
+/// execution effects and are task-relative.
+///
+/// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher,
+/// together with [`classify_canonical_operation`].
+#[must_use]
+pub fn classify_coordinate_suboperation(
+    suboperation: &str,
+) -> Option<CanonicalOperationRequirement> {
+    match suboperation {
+        "inspect" | "wait" => Some(CanonicalOperationRequirement::DiscoveryReadOnly),
+        "delegate" | "audit" | "compare" | "cancel" | "send" => {
+            Some(CanonicalOperationRequirement::TaskRelativeEffectful)
+        }
+        _ => None,
+    }
+}
+
+/// Maps one typed store mutation to its requirement class (issue #1746, W1).
+///
+/// This is the write-path side of the frozen table: `CaptureObservation` is
+/// the safe raw capture leg, `UpdateTaskState`/`RecordFinishDecision`/
+/// `RecordFinishEvidence` are the task-relative/effectful legs, and every
+/// other named operation needs no task binding. Called by
+/// [`admit_canonical_write`] to derive its capture/task-relative split, so the
+/// split cannot drift from the table.
+#[must_use]
+pub fn requirement_for_named_mutation(
+    operation: NamedMutationOperation,
+) -> CanonicalOperationRequirement {
+    match operation {
+        NamedMutationOperation::CaptureObservation => CanonicalOperationRequirement::SafeRawCapture,
+        NamedMutationOperation::UpdateTaskState
+        | NamedMutationOperation::RecordFinishDecision
+        | NamedMutationOperation::RecordFinishEvidence => {
+            CanonicalOperationRequirement::TaskRelativeEffectful
+        }
+        _ => CanonicalOperationRequirement::DiscoveryReadOnly,
+    }
+}
+
+/// Daemon dispatch entrypoint presenting one admission attempt
+/// (issue #1746, A6).
+///
+/// Both entrypoints enforce the same binding through the same rule table
+/// ([`entrypoint_requires_binding`]): the bridge transport edge
+/// (`DaemonKernelClient::apply_prepared` via [`admit_named_mutation_capture`])
+/// and the direct internal composition-root intake
+/// ([`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
+/// via [`admit_canonical_write`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchEntrypoint {
+    /// Bridge transport edge (`DaemonKernelClient::apply_prepared`).
+    BridgeTransport,
+    /// Direct internal composition-root intake
+    /// (`DaemonComposition::commit_canonical_and_refresh`).
+    DirectInternal,
+}
+
+/// Whether one dispatch entrypoint requires owner task evidence for one
+/// requirement class (issue #1746, A6).
+///
+/// The table is deliberately entrypoint-independent: task-relative/effectful
+/// work requires exact evidence at every entrypoint, while discovery/read-only
+/// and safe raw capture (cold quarantined route) never do. The `entrypoint`
+/// parameter forces every dispatch edge to declare itself and consult this one
+/// shared rule instead of carrying a local copy. Consulted by
+/// [`admit_canonical_write`] (`DirectInternal`) and
+/// [`admit_named_mutation_capture`] (`BridgeTransport`).
+#[must_use]
+pub fn entrypoint_requires_binding(
+    entrypoint: DispatchEntrypoint,
+    requirement: CanonicalOperationRequirement,
+) -> bool {
+    match (entrypoint, requirement) {
+        (
+            DispatchEntrypoint::BridgeTransport | DispatchEntrypoint::DirectInternal,
+            CanonicalOperationRequirement::TaskRelativeEffectful,
+        ) => true,
+        (
+            DispatchEntrypoint::BridgeTransport | DispatchEntrypoint::DirectInternal,
+            CanonicalOperationRequirement::DiscoveryReadOnly
+            | CanonicalOperationRequirement::SafeRawCapture,
+        ) => false,
+    }
 }
 
 /// Safe raw cold candidate retained when selection is absent or ambiguous.
@@ -261,12 +441,26 @@ pub enum CaptureAdmission {
 /// candidate carries no task activation, support/influence promotion, or
 /// finish relevance, while `TaskBound` is only ever returned after the exact
 /// selection evidence passed [`admit_task_bound`].
+#[expect(
+    clippy::large_enum_variant,
+    reason = "TaskBound carries the sealed dispatch identity by value so the effect gate revalidates the exact admitted bytes"
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskBindingAdmission {
     /// Cold unbound capture: durable bytes with no task effect.
     ColdUnbound(ObservationCandidate),
     /// Exact task-bound transition admitted toward the governed owner commit.
-    TaskBound,
+    ///
+    /// Carries the sealed [`DispatchedBinding`] (issue #1746, W6): the admitted
+    /// operation identity is the evidence plus its task, scope, principal,
+    /// session, presented fence, and bootstrap/profile revision — never a
+    /// mutable ambient selection. The dispatch edge must revalidate it against
+    /// the live fence at the effect gate (see [`revalidate_dispatched_binding`]
+    /// and [`revalidate_task_bound_for_effect`]) instead of reusing the
+    /// caller-presented fence; a moved fence, task, revision, digest, scope,
+    /// principal, session, or profile revision conflicts for rebind, it is
+    /// never rewritten under the old operation identity.
+    TaskBound(DispatchedBinding),
     /// Task-relative transition whose selection decision belongs to the
     /// caller that owns the exact selection evidence, never to a capture
     /// edge. Reported, never admitted and never silently downgraded.
@@ -328,6 +522,220 @@ pub enum TaskSelectionResponse {
     },
     /// One exact current `TaskContract` revision with its owner evidence.
     Current(TaskSelectionEvidence),
+}
+
+/// Typed identity correlation of one activation result to its exact ticket
+/// (issue #1746, W2).
+///
+/// Every arm carries only owner-resolved values: the `Resolved` arm repeats
+/// the principal/session/task/scope/revision the Governor's typed resolution
+/// bound to the exact ticket, never a caller-supplied principal/task string
+/// and never the bridge-process identity. Selection/retry/denial arms preserve
+/// the exact owner-issued candidate handles and retry terms instead of
+/// selecting the latest or most similar task. Stored Resolved/READY values are
+/// projections, not authority: this correlation is valid only for the exact
+/// ticket it was computed against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActivationCorrelation {
+    /// Exact ticket-bound application identity with its owner revision fence.
+    Resolved {
+        principal_id: String,
+        session_id: String,
+        task_id: String,
+        work_scope_id: String,
+        task_revision: u64,
+        owner_revision: u64,
+        state_fence: StateFence,
+    },
+    /// No task is selected; the bounded eligible task handles survive verbatim.
+    TaskSelectionRequired {
+        candidate_handles: Vec<String>,
+        candidate_coverage: AgentActivationCandidateCoverage,
+        recovery_handle: String,
+    },
+    /// No scope is selected; the bounded eligible scope handles survive verbatim.
+    ScopeSelectionRequired {
+        candidate_handles: Vec<String>,
+        candidate_coverage: AgentActivationCandidateCoverage,
+        recovery_handle: String,
+    },
+    /// Several scopes survived; none is chosen.
+    ScopeAmbiguous {
+        candidate_handles: Vec<String>,
+        candidate_coverage: AgentActivationCandidateCoverage,
+        recovery_handle: String,
+    },
+    /// Transient hold: retry only under the exact owner-issued retry terms.
+    Retry {
+        recovery_handle: String,
+        dependency_ref: String,
+        observed_dependency_revision: String,
+        not_before_unix_ms: u64,
+    },
+    /// The ticket fence moved; re-resolve at the observed fence, never reuse.
+    Stale {
+        recovery_handle: String,
+        observed_state_fence: Option<StateFence>,
+    },
+    /// Terminal owner denial; carries no identity and selects nothing.
+    Denied { failure_handle: String },
+}
+
+/// Correlates one typed activation result to its exact ticket through the
+/// existing activation route (issue #1746, W2).
+///
+/// Runs the existing owner join
+/// (`AgentActivationResolutionResult::validate_against`, owned by
+/// `eliot-protocol`): exact ticket identity/digest/fence/cancellation match,
+/// deadline and successor-observation terms. A result for another ticket, a
+/// mismatching digest/fence, or an expired/cancelled identity fails closed
+/// with `TASK_SCOPE_INCOMPATIBLE`. The typed disposition is then projected
+/// without invention: `Resolved` repeats the owner binding plus the
+/// authenticated owner revision; every selection arm preserves the exact
+/// owner-issued candidate handles; `NotReady` preserves the exact retry terms;
+/// `StaleFence` preserves the observed fence; `FailedInternal` stays a denial.
+/// No caller principal/task string enters on any arm, and the bridge-process
+/// identity is never copied as the end user.
+///
+/// Designated caller (STITCH, activation lane): the activation resolution
+/// projection (`bins/eliotd/src/activation_projection.rs`,
+/// `map_governor_outcome_to_protocol`, behind
+/// `GovernorComposition::resolve_activation_outcome`) correlates each produced
+/// ticket/result pair here before the daemon derives the
+/// `GovernorActivationSnapshot` that [`bind_current_task_selection`] consumes.
+/// Until that wiring lands, this entry selects nothing and stores nothing.
+pub fn correlate_activation_result(
+    ticket: &AgentActivationResolutionTicket,
+    result: &AgentActivationResolutionResult,
+) -> Result<ActivationCorrelation, TaskBindingError> {
+    result.validate_against(ticket).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "activation result does not correlate to the exact ticket/request: {error}"
+        ))
+    })?;
+    match &result.disposition {
+        AgentActivationResolutionDisposition::Resolved { binding } => {
+            let task_revision = binding.task_revision.parse::<u64>().map_err(|_| {
+                TaskBindingError::scope_incompatible(
+                    "activation binding carries no current task revision",
+                )
+            })?;
+            if task_revision == 0 {
+                return Err(TaskBindingError::scope_incompatible(
+                    "activation binding carries no current task revision",
+                ));
+            }
+            let evidence = result.owner_evidence.as_ref().ok_or_else(|| {
+                TaskBindingError::scope_incompatible(
+                    "resolved activation carries no authenticated owner evidence",
+                )
+            })?;
+            Ok(ActivationCorrelation::Resolved {
+                principal_id: binding.principal_id.clone(),
+                session_id: binding.session_id.clone(),
+                task_id: binding.task_id.clone(),
+                work_scope_id: binding.work_scope_id.clone(),
+                task_revision,
+                owner_revision: evidence.owner_revision,
+                state_fence: evidence.state_fence.clone(),
+            })
+        }
+        AgentActivationResolutionDisposition::TaskSelectionRequired { selection } => {
+            Ok(ActivationCorrelation::TaskSelectionRequired {
+                candidate_handles: selection.candidate_handles.clone(),
+                candidate_coverage: selection.candidate_coverage,
+                recovery_handle: selection.recovery_handle.clone(),
+            })
+        }
+        AgentActivationResolutionDisposition::ScopeSelectionRequired { selection } => {
+            Ok(ActivationCorrelation::ScopeSelectionRequired {
+                candidate_handles: selection.candidate_handles.clone(),
+                candidate_coverage: selection.candidate_coverage,
+                recovery_handle: selection.recovery_handle.clone(),
+            })
+        }
+        AgentActivationResolutionDisposition::ScopeAmbiguous { selection } => {
+            Ok(ActivationCorrelation::ScopeAmbiguous {
+                candidate_handles: selection.candidate_handles.clone(),
+                candidate_coverage: selection.candidate_coverage,
+                recovery_handle: selection.recovery_handle.clone(),
+            })
+        }
+        AgentActivationResolutionDisposition::NotReady {
+            recovery_handle,
+            retry,
+        } => Ok(ActivationCorrelation::Retry {
+            recovery_handle: recovery_handle.clone(),
+            dependency_ref: retry.dependency_ref.clone(),
+            observed_dependency_revision: retry.observed_dependency_revision.clone(),
+            not_before_unix_ms: retry.not_before_unix_ms,
+        }),
+        AgentActivationResolutionDisposition::StaleFence {
+            recovery_handle,
+            observed_state_fence,
+        } => Ok(ActivationCorrelation::Stale {
+            recovery_handle: recovery_handle.clone(),
+            observed_state_fence: observed_state_fence.clone(),
+        }),
+        AgentActivationResolutionDisposition::FailedInternal { failure_handle } => {
+            Ok(ActivationCorrelation::Denied {
+                failure_handle: failure_handle.clone(),
+            })
+        }
+    }
+}
+
+/// Builds the agent-facing task-selection response for one caller-presented
+/// readiness receipt (issue #1746, W4).
+///
+/// This is the typed Absent/Ambiguous-bounded answer constructor behind
+/// [`resolve_task_selection`]: `Absent` carries this scope's bounded intake
+/// shape from the existing task-intake owner
+/// (`eliot_workscope::task_selection_required`); `Ambiguous` preserves the
+/// exact owner-issued candidate handles verbatim, and the receipt validation
+/// in [`resolve_task_selection`] enforces the owner bound (2..=16) on this
+/// exact receipt before they are returned, so the caller answers with the
+/// eligible set instead of choosing; `Exploratory` stays explicitly read-only; `Stale` preserves the
+/// exact revision for a refresh/rebind answer; `Current` without
+/// owner-proven selection source/evidence is refused with
+/// `TASK_SELECTION_REQUIRED` (structural validation of request-supplied
+/// evidence is never sufficient). No task is ever auto-created to remove an
+/// absence, and no cold capture is retroactively attached here.
+///
+/// Called by [`admit_canonical_write`] to derive its selection legs.
+pub fn selection_response_for_receipt(
+    receipt: &OnboardingReadinessReceipt,
+) -> Result<TaskSelectionResponse, TaskBindingError> {
+    match resolve_task_selection(receipt)? {
+        TaskSelectionDisposition::Absent => {
+            let intake = task_selection_required(&receipt.scope.scope_ref).map_err(|_| {
+                TaskBindingError::selection_required(
+                    "task selection is absent and no intake shape is available",
+                )
+            })?;
+            Ok(TaskSelectionResponse::Absent(Box::new(intake)))
+        }
+        TaskSelectionDisposition::Exploratory {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        } => Ok(TaskSelectionResponse::Exploratory {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        }),
+        TaskSelectionDisposition::Ambiguous(candidate_handles) => {
+            Ok(TaskSelectionResponse::Ambiguous(candidate_handles))
+        }
+        TaskSelectionDisposition::Stale {
+            task_ref,
+            task_revision,
+        } => Ok(TaskSelectionResponse::Stale {
+            task_ref,
+            task_revision,
+        }),
+        TaskSelectionDisposition::Current(evidence) => Ok(TaskSelectionResponse::Current(evidence)),
+    }
 }
 
 /// Admits one `eliot.observe` capture without ever guessing a task.
@@ -445,6 +853,124 @@ pub fn admit_task_bound(
     }
 }
 
+/// Refuses a task-identity conflict between the admitted request context and
+/// the write envelope (issue #1746, A2).
+///
+/// A task-relative write whose envelope names a different task than the
+/// admitted context — or names no task at all — can never receive a task-bound
+/// write: the former fails closed with `TASK_SCOPE_INCOMPATIBLE`, the latter
+/// with `TASK_SELECTION_REQUIRED`. Neither arm changes a task. Called by
+/// [`admit_canonical_write`] for its task-relative leg, so the wrong
+/// workspace/task case rejects before any selection evidence is consulted.
+pub fn refuse_task_identity_conflict(
+    context_task_ref: Option<&str>,
+    envelope_task_ref: Option<&str>,
+) -> Result<String, TaskBindingError> {
+    let Some(envelope_task_ref) = envelope_task_ref else {
+        return Err(TaskBindingError::selection_required(
+            "task-relative write names no task binding",
+        ));
+    };
+    if envelope_task_ref.trim().is_empty() || envelope_task_ref.chars().any(char::is_control) {
+        return Err(TaskBindingError::selection_required(
+            "task-relative write names no task binding",
+        ));
+    }
+    if let Some(context_task_ref) = context_task_ref
+        && context_task_ref != envelope_task_ref
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-relative write names a different task than the admitted context",
+        ));
+    }
+    Ok(envelope_task_ref.to_owned())
+}
+
+/// Refuses a material effect without owner-proven selection evidence
+/// (issue #1746, A7).
+///
+/// A READY lifecycle token, a successful handshake, or a pure DTO shape grants
+/// nothing by itself: without owner evidence this entry fails closed with
+/// `TASK_SELECTION_REQUIRED` however material the receipt claims to be, and
+/// the READY token is never even read. With owner evidence the bootstrap must
+/// additionally rest on an authenticated scope at material readiness, or the
+/// effect is withheld with `TASK_SCOPE_INCOMPATIBLE`. Called by
+/// [`admit_canonical_write`] for its task-relative leg before
+/// [`admit_task_bound`].
+pub fn refuse_ready_string_without_evidence(
+    receipt: &OnboardingReadinessReceipt,
+    has_owner_evidence: bool,
+) -> Result<(), TaskBindingError> {
+    if !has_owner_evidence {
+        return Err(TaskBindingError::selection_required(
+            "task-relative effect has no owner-proven selection evidence; readiness tokens grant nothing",
+        ));
+    }
+    if receipt.scope_resolution != ScopeResolutionState::Authenticated
+        || receipt.readiness != ReadinessLifecycle::ReadyMaterial
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-relative effect rests on a bootstrap that is not authenticated material readiness",
+        ));
+    }
+    Ok(())
+}
+
+/// Runs the existing `WorkScope` guard legs at one use boundary and returns
+/// the typed disposition (issue #1746, W3; I4.2.1).
+///
+/// The observed binding is derived from the actual live workspace/resource
+/// observation through the existing owner (`eliot_workscope::observed_scope_binding`:
+/// exact instance/root, lineage, and resource generation — never a caller cwd
+/// or a normalized path string), then checked with the existing
+/// sources-independent identity legs (`eliot_workscope::identity_legs`).
+/// `MATCHED` admits; stale, different-instance, ambiguous, or conflicted
+/// observations fail closed with `TASK_SCOPE_INCOMPATIBLE` carrying the exact
+/// disposition, and the retained binding, task state, and project memory stay
+/// untouched. A relocation is not a silent move: the legs compare the exact
+/// instance/root, lineage, and generation, so a moved observation reports
+/// `DIFFERENT_INSTANCE` (or `STALE_BINDING` for a moved revision) and fails
+/// closed; only an explicit owner receipt (`produce_attach_receipt` /
+/// `rebind_with_receipt`, owned by `eliot-workscope` and admitted by
+/// `GovernorComposition::admit_observed_scope_attach`) can establish a new
+/// binding. A provisional scope never admits a
+/// task-bound effect here: scope uncertainty permits only the quarantined
+/// capture route ([`admit_capture`] `ColdUnbound`, conflicting lineage
+/// preserved).
+///
+/// Called by [`admit_task_bound_with_observed_scope`].
+pub fn scope_guard_disposition(
+    expected: &ScopeBinding,
+    observed: &ObservedScopeResources,
+) -> Result<ScopeBindingDisposition, TaskBindingError> {
+    let observed_binding = eliot_workscope::observed_scope_binding(
+        expected,
+        observed,
+        expected.privacy_class,
+        expected.governing_source_generation,
+    )
+    .map_err(|error| match error {
+        eliot_workscope::WorkScopeError::AmbiguousObservation { observed_instances } => {
+            TaskBindingError::scope_incompatible(format!(
+                "task observation scope identity check AMBIGUOUS: {observed_instances} workspace instances observed"
+            ))
+        }
+        other => TaskBindingError::scope_incompatible(format!(
+            "task observation scope identity could not be established: {other}"
+        )),
+    })?;
+    match eliot_workscope::identity_legs(expected, &observed_binding) {
+        eliot_workscope::IdentityLegOutcome::IdentityClear => Ok(ScopeBindingDisposition::Matched),
+        eliot_workscope::IdentityLegOutcome::DifferentInstance => {
+            Ok(ScopeBindingDisposition::DifferentInstance)
+        }
+        eliot_workscope::IdentityLegOutcome::Ambiguous => Ok(ScopeBindingDisposition::Ambiguous),
+        eliot_workscope::IdentityLegOutcome::StaleBinding => {
+            Ok(ScopeBindingDisposition::StaleBinding)
+        }
+    }
+}
+
 /// Admits one task-relative transition with observed workspace identity.
 ///
 /// Extends [`admit_task_bound`] with the sources-independent scope-identity
@@ -479,37 +1005,27 @@ pub fn admit_task_bound_with_observed_scope(
             compatibility,
         );
     }
-    let observed_binding = eliot_workscope::observed_scope_binding(
-        expected,
-        observed,
-        expected.privacy_class,
-        expected.governing_source_generation,
-    )
-    .map_err(|error| match error {
-        eliot_workscope::WorkScopeError::AmbiguousObservation { observed_instances } => {
-            TaskBindingError::scope_incompatible(format!(
-                "task observation scope identity check AMBIGUOUS: {observed_instances} workspace instances observed"
-            ))
-        }
-        other => TaskBindingError::scope_incompatible(format!(
-            "task observation scope identity could not be established: {other}"
-        )),
-    })?;
-    match eliot_workscope::identity_legs(expected, &observed_binding) {
-        eliot_workscope::IdentityLegOutcome::IdentityClear => {}
-        eliot_workscope::IdentityLegOutcome::DifferentInstance => {
+    let observed_binding = scope_guard_disposition(expected, observed)?;
+    match observed_binding {
+        ScopeBindingDisposition::Matched => {}
+        ScopeBindingDisposition::DifferentInstance => {
             return Err(TaskBindingError::scope_incompatible(
                 "task observation scope identity check DIFFERENT_INSTANCE",
             ));
         }
-        eliot_workscope::IdentityLegOutcome::Ambiguous => {
+        ScopeBindingDisposition::Ambiguous => {
             return Err(TaskBindingError::scope_incompatible(
                 "task observation scope identity check AMBIGUOUS",
             ));
         }
-        eliot_workscope::IdentityLegOutcome::StaleBinding => {
+        ScopeBindingDisposition::StaleBinding => {
             return Err(TaskBindingError::scope_incompatible(
                 "task observation scope identity check STALE_BINDING",
+            ));
+        }
+        ScopeBindingDisposition::ProvisionalRebind | ScopeBindingDisposition::Conflicted => {
+            return Err(TaskBindingError::scope_incompatible(
+                "task observation scope identity check CONFLICTED: rebind with an explicit owner receipt",
             ));
         }
     }
@@ -524,6 +1040,12 @@ pub fn admit_task_bound_with_observed_scope(
 
 /// Resolves the exact task-selection disposition of one caller-presented
 /// readiness receipt (I5.6 step 4, issue #1929).
+///
+/// The caller-presented receipt is an owner artifact, so its bound references
+/// are validated first: Absent/Ambiguous answers always carry the owner's
+/// bounded intake/handles (ambiguous handles 2..=16, enforced by the receipt
+/// owner on this exact receipt), never an unbounded caller set. An invalid
+/// receipt fails closed with `TASK_SCOPE_INCOMPATIBLE` and resolves nothing.
 ///
 /// A current binding lacks owner-proven selection source/evidence in the
 /// receipt, so this function returns `TASK_SELECTION_REQUIRED` rather than
@@ -546,6 +1068,11 @@ pub fn admit_task_bound_with_observed_scope(
 pub fn resolve_task_selection(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
+    receipt.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "compiled readiness receipt is invalid: {error}"
+        ))
+    })?;
     match &receipt.task_binding {
         TaskBindingState::CurrentTaskContract { .. } => Err(TaskBindingError::selection_required(
             "current task has no owner-proven selection source/evidence",
@@ -579,11 +1106,15 @@ pub fn resolve_task_selection(
 /// [`resolve_task_selection`] refuses `CurrentTaskContract` today because the
 /// readiness receipt has no owner-proven selection source/evidence. If that
 /// owner producer is added, this entry is the applicability leg required by
-/// the issue: the acceptance digest, `TaskContract` revision, and `WorkScope`
-/// from the owner-compiled receipt must name exactly what the activation route
-/// proved at this exact fence — principal, session, task, non-zero revision,
-/// and `WorkScope`. A selection naming another task, moved revision, or other
-/// scope rejects with `TASK_SCOPE_INCOMPATIBLE` and admits nothing. Until then,
+/// the issue: the ORIGINAL owner evidence is validated as compiled
+/// (non-zero `TaskContract` revision, acceptance-digest shape, `WorkScope`,
+/// selection source and evidence handles), then every selection field is
+/// rechecked at this exact fence — revision and `WorkScope` against what the
+/// activation route proved (principal, session, task, non-zero revision,
+/// `WorkScope`), and the acceptance digest against the owner-compiled receipt
+/// original, which the activation snapshot does not carry. A selection naming
+/// another task, moved revision, moved digest, or other scope rejects with
+/// `TASK_SCOPE_INCOMPATIBLE` and admits nothing. Until then,
 /// no current selection evidence escapes this entry.
 ///
 /// Structure preserved, never resolved:
@@ -645,12 +1176,42 @@ pub fn bind_current_task_selection(
             "compiled readiness receipt is bound to another principal, session, or WorkScope",
         ));
     }
+    // Issue #1746, W4: validate the ORIGINAL owner evidence as compiled
+    // before rechecking its fields. Structural validation of a
+    // request-supplied copy is never sufficient; this validates the
+    // Governor-compiled original (revision, digest shape, scope, selection
+    // source/evidence handles) and then compares every field at this fence.
+    evidence.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
+    })?;
+    if evidence.is_contaminated() {
+        return Err(TaskBindingError::selection_required(
+            "task selection is contaminated",
+        ));
+    }
     if evidence.task_ref != activation.task_id.as_str()
         || evidence.task_revision != activation.task_revision
         || evidence.work_scope_ref != activation.work_scope_id
     {
         return Err(TaskBindingError::scope_incompatible(
             "task selection is no longer the applicable TaskContract revision",
+        ));
+    }
+    // The activation snapshot carries no acceptance digest, so the digest is
+    // rechecked against the owner-compiled receipt original: a selection whose
+    // digest is not the currently applicable one rejects here, never admitted.
+    let TaskBindingState::CurrentTaskContract {
+        acceptance_digest: receipt_digest,
+        ..
+    } = &receipt.task_binding
+    else {
+        return Err(TaskBindingError::scope_incompatible(
+            "task selection acceptance digest has no current TaskContract original",
+        ));
+    };
+    if evidence.acceptance_digest != *receipt_digest {
+        return Err(TaskBindingError::scope_incompatible(
+            "task selection acceptance digest is not the currently applicable digest",
         ));
     }
     if receipt.scope_resolution != eliot_workscope::ScopeResolutionState::Authenticated {
@@ -664,6 +1225,263 @@ pub fn bind_current_task_selection(
         ));
     }
     Ok(disposition)
+}
+
+/// Agent-facing bootstrap admission assembled from real owners
+/// (issue #1746, W5; I7.8 step 4, I7.11).
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Material carries the owner-evidenced bootstrap identity by value so the dispatch gate sees the exact admitted fields"
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BootstrapAdmission {
+    /// Complete owner-evidenced bootstrap: may proceed to Material work only
+    /// through the #1742 owner gate
+    /// (`GovernorComposition::commit_canonical_with_readiness`, which runs
+    /// `check_material_readiness_for_write`). This value is not Material
+    /// authority by itself.
+    Material(MaterialBootstrap),
+    /// Diagnostic bootstrap: selection/intake data, never Material-ready.
+    /// A bootstrap without a task always lands here.
+    Diagnostic {
+        reason: &'static str,
+        next_safe_action: String,
+    },
+    /// No task is selected: answer with this scope's bounded intake shape.
+    IntakeRequired(Box<eliot_workscope::TaskSelectionRequired>),
+}
+
+/// Owner-evidenced bootstrap identity carried toward the #1746 dispatch gate.
+///
+/// Every field repeats an owner-issued value bound to the same
+/// session/scope/selection-state and source revisions: the receipt revision
+/// and fence from the compiled [`OnboardingReadinessReceipt`], the governance
+/// profile revision from the Governor-derived [`GovernanceProfile`], the
+/// coverage fingerprint from the verified [`IntegrationCoverageProfile`], and
+/// the projection source/generation from #8's `ColdStartSurfaceView`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterialBootstrap {
+    pub receipt_ref: String,
+    pub lease_ref: String,
+    pub principal_ref: String,
+    pub session_ref: String,
+    pub scope_ref: String,
+    pub task: TaskSelectionEvidence,
+    pub state_fence: StateFence,
+    pub receipt_revision: u64,
+    pub governance_profile_ref: String,
+    pub governance_revision: u64,
+    pub coverage_fingerprint: String,
+    pub projection_source_ref: String,
+    pub projection_generation: u64,
+}
+
+/// Assembles one bootstrap from its real owners and admits it for dispatch
+/// (issue #1746, W5; I7.8 step 4, I7.11).
+///
+/// Joins #8's response surface (`ColdStartSurfaceView` with boot delta) to the
+/// compiled [`OnboardingReadinessReceipt`], the [`IntegrationCoverageProfile`],
+/// and the derived [`GovernanceProfile`], all bound to the same
+/// session/scope/task-or-selection-state and source revisions: receipt/lease,
+/// principal/session, scope/instance/lineage, task binding, state fence,
+/// governing-source set/generation, governance/route profile refs, receipt
+/// revision, and projection source/generation must name the same values on
+/// both sides, or the join fails closed with `TASK_SCOPE_INCOMPATIBLE`.
+///
+/// Unknown/unavailable/partial profile evidence is preserved, never defaulted:
+/// absent coverage/governance profiles, or present-but-unverified ones, yield
+/// `Diagnostic`, never `Material`. Empty sensor lists or a caller READY flag
+/// cannot imply full readiness — and the surface's string readiness token is
+/// never even read here (issue #1746, A7): only the receipt's typed
+/// [`ReadinessLifecycle`] and the surface's typed [`ScopeResolutionState`]
+/// decide. `Material` additionally requires an authenticated scope, material
+/// readiness, exact current selection evidence, and fingerprint-matched
+/// verified profiles; anything else is `Diagnostic` (without a task, always)
+/// or `IntakeRequired` (no task selected). Budget previews and expansion
+/// handles travel on the owners' surfaces; required selection, authority, and
+/// recovery information is never dropped by this join.
+///
+/// Designated caller (STITCH, daemon composition lane):
+/// `DaemonComposition::read_cold_start_surface_for_attach` supplies the exact
+/// retained surface for the lease, and
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
+/// carries the admitted bootstrap toward the #1742 Material gate. This entry
+/// mints no profile, receipt, or lease of its own.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bootstrap joins the receipt, surface, both profiles, and the live fence in one edge"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one owner join over receipt, surface, coverage, governance, and fence; splitting would scatter the fail-closed ordering"
+)]
+pub fn admit_bootstrap_context(
+    receipt: &OnboardingReadinessReceipt,
+    surface: &ColdStartSurfaceView,
+    coverage: Option<&IntegrationCoverageProfile>,
+    governance: Option<&GovernanceProfile>,
+    live_fence: &StateFence,
+) -> Result<BootstrapAdmission, TaskBindingError> {
+    receipt.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "compiled readiness receipt is invalid: {error}"
+        ))
+    })?;
+    if !eliot_contracts::fences_match_exact(&receipt.state_fence, live_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "compiled readiness receipt was compiled at another fence",
+        ));
+    }
+    // Same session/scope/selection-state and source revisions on both sides.
+    // Each comparison names its field so a drifted join diagnoses exactly.
+    let bound = |field: &'static str, left: &str, right: &str| -> Result<(), TaskBindingError> {
+        if left != right {
+            return Err(TaskBindingError::scope_incompatible(format!(
+                "bootstrap surface is bound to another {field}"
+            )));
+        }
+        Ok(())
+    };
+    bound("receipt", &receipt.receipt_ref, &surface.receipt_ref)?;
+    bound("lease", &receipt.lease_ref, &surface.lease_ref)?;
+    bound("principal", &receipt.principal_ref, &surface.principal_ref)?;
+    bound("session", &receipt.session_ref, &surface.session_ref)?;
+    bound("scope", &receipt.scope.scope_ref, &surface.scope.scope_ref)?;
+    bound(
+        "instance",
+        &receipt.instance.instance_ref,
+        &surface.instance.instance_ref,
+    )?;
+    bound(
+        "lineage",
+        receipt
+            .lineage
+            .as_ref()
+            .map_or("", |lineage| lineage.lineage_ref.as_str()),
+        surface
+            .lineage
+            .as_ref()
+            .map_or("", |lineage| lineage.lineage_ref.as_str()),
+    )?;
+    if receipt.task_binding != surface.task_binding {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another task-or-selection-state",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(&receipt.state_fence, &surface.state_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface was projected at another fence",
+        ));
+    }
+    bound(
+        "governing-source set",
+        &receipt.governing_source_set_ref,
+        &surface.governing_source_set_ref,
+    )?;
+    if receipt.governing_source_generation != surface.governing_source_generation {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another governing-source generation",
+        ));
+    }
+    bound(
+        "governance profile",
+        &receipt.governance_profile_ref,
+        &surface.governance_profile_ref,
+    )?;
+    bound(
+        "route profile",
+        &receipt.route_profile_ref,
+        &surface.route_profile_ref,
+    )?;
+    if receipt.receipt_revision != surface.receipt_revision {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another receipt revision",
+        ));
+    }
+    bound(
+        "projection source",
+        &receipt.projection_source_ref,
+        &surface.projection_source_ref,
+    )?;
+    if receipt.projection_generation != surface.projection_generation {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another projection generation",
+        ));
+    }
+    // Profiles are owner evidence, never caller claims. Absent or unverified
+    // profiles stay unknown: they cap the bootstrap at Diagnostic.
+    let verified_profiles = match (coverage, governance) {
+        (Some(coverage), Some(governance)) => {
+            coverage.validate().map_err(|error| {
+                TaskBindingError::scope_incompatible(format!(
+                    "integration coverage profile is invalid: {error}"
+                ))
+            })?;
+            if coverage.fingerprint != governance.fingerprint {
+                return Err(TaskBindingError::scope_incompatible(
+                    "coverage and governance profiles name different fingerprints",
+                ));
+            }
+            coverage.verified && governance.verified
+        }
+        _ => false,
+    };
+    match selection_response_for_receipt(receipt)? {
+        TaskSelectionResponse::Absent(intake) => Ok(BootstrapAdmission::IntakeRequired(intake)),
+        TaskSelectionResponse::Ambiguous(_) => Ok(BootstrapAdmission::Diagnostic {
+            reason: "task selection is ambiguous; answer with the bounded eligible handles",
+            next_safe_action: receipt.next_safe_action.clone(),
+        }),
+        TaskSelectionResponse::Exploratory { .. } => Ok(BootstrapAdmission::Diagnostic {
+            reason: "exploratory binding is read-only orientation, not material work",
+            next_safe_action: receipt.next_safe_action.clone(),
+        }),
+        TaskSelectionResponse::Stale { .. } => Ok(BootstrapAdmission::Diagnostic {
+            reason: "task selection is stale; refresh or rebind before material work",
+            next_safe_action: receipt.next_safe_action.clone(),
+        }),
+        TaskSelectionResponse::Current(task) => {
+            // `resolve_task_selection` refuses `CurrentTaskContract` until the
+            // readiness receipt carries owner-proven selection source/evidence,
+            // so this arm is unreachable today and becomes reachable only
+            // through that owner producer — never through a caller READY flag.
+            if receipt.scope_resolution != ScopeResolutionState::Authenticated
+                || receipt.readiness != ReadinessLifecycle::ReadyMaterial
+            {
+                return Ok(BootstrapAdmission::Diagnostic {
+                    reason: "bootstrap is not authenticated material readiness",
+                    next_safe_action: receipt.next_safe_action.clone(),
+                });
+            }
+            if !verified_profiles {
+                return Ok(BootstrapAdmission::Diagnostic {
+                    reason: "coverage or governance profile evidence is unknown or unverified",
+                    next_safe_action: receipt.next_safe_action.clone(),
+                });
+            }
+            let (Some(coverage), Some(governance)) = (coverage, governance) else {
+                return Ok(BootstrapAdmission::Diagnostic {
+                    reason: "coverage or governance profile evidence is unknown or unverified",
+                    next_safe_action: receipt.next_safe_action.clone(),
+                });
+            };
+            Ok(BootstrapAdmission::Material(MaterialBootstrap {
+                receipt_ref: receipt.receipt_ref.clone(),
+                lease_ref: receipt.lease_ref.clone(),
+                principal_ref: receipt.principal_ref.clone(),
+                session_ref: receipt.session_ref.clone(),
+                scope_ref: receipt.scope.scope_ref.clone(),
+                task,
+                state_fence: receipt.state_fence.clone(),
+                receipt_revision: receipt.receipt_revision,
+                governance_profile_ref: receipt.governance_profile_ref.clone(),
+                governance_revision: governance.revision,
+                coverage_fingerprint: coverage.fingerprint.clone(),
+                projection_source_ref: receipt.projection_source_ref.clone(),
+                projection_generation: receipt.projection_generation,
+            }))
+        }
+    }
 }
 
 /// Computes the `TaskContract` compatibility disposition for one write from
@@ -721,7 +1539,15 @@ fn compatibility_for(
 /// recency, proximity, or the newest/open task. Its typed evidence is exactly
 /// what the store bridge cannot see: the store gate re-derives presence and
 /// agreement from the opaque proof handles, this gate verifies the
-/// `TaskSelectionEvidence` values against the caller's own receipt.
+/// `TaskSelectionEvidence` values against the caller's own receipt. A
+/// `TaskBound` admission carries the sealed [`DispatchedBinding`] forward; the
+/// dispatch effect gate revalidates it against the live owners through
+/// [`revalidate_dispatched_binding`] (and [`revalidate_task_bound_for_effect`]
+/// for the fence leg) (issue #1746, W6/A5).
+#[expect(
+    clippy::too_many_lines,
+    reason = "single dispatch edge sealing identity, scope, fence, and bootstrap revisions; splitting would scatter the conflict/rebind ordering"
+)]
 pub fn admit_canonical_write(
     candidate_id: String,
     context: &RequestMetadata,
@@ -730,30 +1556,30 @@ pub fn admit_canonical_write(
     write_fence: &StateFence,
 ) -> Result<TaskBindingAdmission, TaskBindingError> {
     let compatibility = compatibility_for(receipt, envelope, write_fence);
-    let carries = |operation: NamedMutationOperation| {
+    // Issue #1746, W1: the capture/task-relative split is derived from the
+    // frozen requirement table, so gating cannot drift from the mapped
+    // operation classes.
+    let carries_requirement = |requirement: CanonicalOperationRequirement| {
         envelope
             .semantic_commands
             .iter()
-            .any(|command| command.operation == operation)
+            .any(|command| requirement_for_named_mutation(command.operation) == requirement)
     };
-    let captures = carries(NamedMutationOperation::CaptureObservation);
+    let captures = carries_requirement(CanonicalOperationRequirement::SafeRawCapture);
     let task_relative = envelope.task_id.is_some()
-        || carries(NamedMutationOperation::UpdateTaskState)
-        || carries(NamedMutationOperation::RecordFinishDecision)
-        || carries(NamedMutationOperation::RecordFinishEvidence);
-    let selection_resolution = resolve_task_selection(receipt);
-    let (selection, candidate_count) = match selection_resolution {
+        || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful);
+    // Issue #1746, W4: Absent stays absent and Ambiguous keeps its bounded
+    // eligible handles through the single typed response constructor.
+    // A task-free capture remains cold and unrelated non-task writes need
+    // no task selection. Task-relative effects return the typed error.
+    let (selection, candidate_count) = match selection_response_for_receipt(receipt) {
         Ok(
-            TaskSelectionDisposition::Absent
-            | TaskSelectionDisposition::Exploratory { .. }
-            | TaskSelectionDisposition::Stale { .. },
+            TaskSelectionResponse::Absent(_)
+            | TaskSelectionResponse::Exploratory { .. }
+            | TaskSelectionResponse::Stale { .. },
         ) => (None, 0_usize),
-        Ok(TaskSelectionDisposition::Ambiguous(candidate_handles)) => {
-            (None, candidate_handles.len())
-        }
-        Ok(TaskSelectionDisposition::Current(evidence)) => (Some(evidence), 1_usize),
-        // A task-free capture remains cold and unrelated non-task writes need
-        // no task selection. Task-relative effects return the typed error.
+        Ok(TaskSelectionResponse::Ambiguous(candidate_handles)) => (None, candidate_handles.len()),
+        Ok(TaskSelectionResponse::Current(evidence)) => (Some(evidence), 1_usize),
         Err(_) if !task_relative => (None, 0_usize),
         Err(error) => return Err(error),
     };
@@ -809,35 +1635,362 @@ pub fn admit_canonical_write(
                     write_fence,
                     compatibility,
                 )?;
-                Ok(TaskBindingAdmission::TaskBound)
+                // Issue #1746, W6: seal the admitted identity (task, scope,
+                // principal, session, presented fence, bootstrap/profile
+                // revision) so the effect gate revalidates it instead of
+                // reusing the caller fence.
+                Ok(TaskBindingAdmission::TaskBound(seal_dispatched_binding(
+                    evidence,
+                    admitted_task_ref,
+                    envelope.scope_id.as_str(),
+                    &receipt.principal_ref,
+                    &receipt.session_ref,
+                    write_fence,
+                    receipt.receipt_revision,
+                    &receipt.governance_profile_ref,
+                    receipt.projection_generation,
+                    cold_candidate_id,
+                )?))
             }
         };
     }
 
     if task_relative {
-        let Some(expected_task_ref) = envelope.task_id.as_deref() else {
+        // Issue #1746, A6: the direct internal entrypoint enforces the same
+        // binding rule as the bridge transport edge. Unreachable fail-closed:
+        // the frozen table requires owner evidence for task-relative work at
+        // every entrypoint.
+        if !entrypoint_requires_binding(
+            DispatchEntrypoint::DirectInternal,
+            CanonicalOperationRequirement::TaskRelativeEffectful,
+        ) {
             return Err(TaskBindingError::selection_required(
-                "task-relative write names no task binding",
-            ));
-        };
-        if let Some(context_task) = context.task_id.as_ref().map(TaskId::as_str)
-            && context_task != expected_task_ref
-        {
-            return Err(TaskBindingError::scope_incompatible(
-                "task-relative write names a different task than the admitted context",
+                "direct internal entrypoint cannot admit a task-relative effect without owner evidence",
             ));
         }
+        // Issue #1746, A2: a wrong workspace/task identity cannot receive a
+        // task-bound write. Issue #1746, A7: READY tokens grant nothing.
+        let expected_task_ref = refuse_task_identity_conflict(
+            context.task_id.as_ref().map(TaskId::as_str),
+            envelope.task_id.as_deref(),
+        )?;
+        refuse_ready_string_without_evidence(receipt, selection.is_some())?;
         admit_task_bound(
             selection.as_ref(),
-            expected_task_ref,
+            &expected_task_ref,
             envelope.scope_id.as_str(),
             write_fence,
             compatibility,
         )?;
-        return Ok(TaskBindingAdmission::TaskBound);
+        let Some(evidence) = selection else {
+            return Err(TaskBindingError::selection_required(
+                "task-relative write admitted without selection evidence",
+            ));
+        };
+        // Issue #1746, W6: seal the admitted identity for the effect gate.
+        return Ok(TaskBindingAdmission::TaskBound(seal_dispatched_binding(
+            evidence,
+            &expected_task_ref,
+            envelope.scope_id.as_str(),
+            &receipt.principal_ref,
+            &receipt.session_ref,
+            write_fence,
+            receipt.receipt_revision,
+            &receipt.governance_profile_ref,
+            receipt.projection_generation,
+            candidate_id,
+        )?));
     }
 
     Ok(TaskBindingAdmission::NotTaskRelative)
+}
+
+/// Admitted operation/payload identity carried through dispatch
+/// (issue #1746, W6).
+///
+/// The admitted binding is the exact [`TaskSelectionEvidence`] plus the task,
+/// scope, principal, session, presented fence, and bootstrap/profile revision
+/// it was admitted under — never a mutable ambient selection. The effect gate
+/// revalidates it with [`revalidate_dispatched_binding`]: a mismatch conflicts
+/// for rebind, it is never rewritten to a new task under the old operation
+/// identity, never duplicated, and already-possible effects keep this original
+/// identity for reconciliation. Sealed only by [`seal_dispatched_binding`];
+/// minted nowhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchedBinding {
+    /// Exact admitted selection evidence.
+    pub evidence: TaskSelectionEvidence,
+    /// Task the admitted request named (request-context task, or the envelope
+    /// task when the context names none) — never the evidence's own value.
+    pub admitted_task_ref: String,
+    /// Write scope the binding was admitted for.
+    pub scope_ref: String,
+    /// Principal the binding was admitted for: an intervening logout or
+    /// rebind to another principal conflicts at the effect gate.
+    pub principal_ref: String,
+    /// Session the binding was admitted for: an intervening logout or
+    /// rebind to another session conflicts at the effect gate.
+    pub session_ref: String,
+    /// Caller-presented fence admission ran against.
+    pub presented_fence: StateFence,
+    /// Bootstrap receipt revision admission ran against.
+    pub receipt_revision: u64,
+    /// Governance profile reference admission ran against.
+    pub governance_profile_ref: String,
+    /// Projection generation admission ran against.
+    pub projection_generation: u64,
+    /// Stable operation identity; preserved across revalidation, never mutated.
+    pub operation_id: String,
+}
+
+/// Seals one admitted task-bound transition into its dispatch identity
+/// (issue #1746, W6).
+///
+/// Checks the ORIGINAL evidence shape and then the evidence against the exact
+/// admitted request task and write scope before sealing: invalid or
+/// contaminated evidence, a selection naming another task or scope, or a blank
+/// principal, session, or operation identity fails closed with the typed code
+/// and seals nothing. Called by [`admit_canonical_write`] for both task-bound
+/// arms, so every [`TaskBindingAdmission::TaskBound`] carries its principal,
+/// session, fence, and bootstrap/profile revision from birth.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "seal joins the evidence, admitted identities, presented fence, bootstrap revisions, and operation identity in one edge"
+)]
+pub fn seal_dispatched_binding(
+    evidence: TaskSelectionEvidence,
+    admitted_task_ref: &str,
+    scope_ref: &str,
+    principal_ref: &str,
+    session_ref: &str,
+    presented_fence: &StateFence,
+    receipt_revision: u64,
+    governance_profile_ref: &str,
+    projection_generation: u64,
+    operation_id: String,
+) -> Result<DispatchedBinding, TaskBindingError> {
+    evidence.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
+    })?;
+    if evidence.is_contaminated() {
+        return Err(TaskBindingError::selection_required(
+            "task selection is contaminated",
+        ));
+    }
+    if evidence.task_ref != admitted_task_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch names a different task than the admitted context",
+        ));
+    }
+    if evidence.work_scope_ref != scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch names a different WorkScope than the admitted write",
+        ));
+    }
+    if principal_ref.trim().is_empty() || principal_ref.chars().any(char::is_control) {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no admitted principal",
+        ));
+    }
+    if session_ref.trim().is_empty() || session_ref.chars().any(char::is_control) {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no admitted session",
+        ));
+    }
+    if operation_id.trim().is_empty() || operation_id.chars().any(char::is_control) {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no operation identity",
+        ));
+    }
+    Ok(DispatchedBinding {
+        evidence,
+        admitted_task_ref: admitted_task_ref.to_owned(),
+        scope_ref: scope_ref.to_owned(),
+        principal_ref: principal_ref.to_owned(),
+        session_ref: session_ref.to_owned(),
+        presented_fence: presented_fence.clone(),
+        receipt_revision,
+        governance_profile_ref: governance_profile_ref.to_owned(),
+        projection_generation,
+        operation_id,
+    })
+}
+
+/// Revalidates one sealed dispatch identity at the effect gate against the
+/// live owners (issue #1746, W6/A5).
+///
+/// The live task/scope, principal/session, task revision, acceptance digest,
+/// bootstrap receipt revision, governance profile reference, projection
+/// generation, and fence come from the live owners at the existing
+/// queued-claim/launch/effect gate —
+/// never from the request. An intervening rebind, task revision, acceptance
+/// change, logout, or generation change fails closed with
+/// `TASK_SCOPE_INCOMPATIBLE` for conflict/rebind: the old operation is not
+/// rewritten to the new task under its identity, never duplicated, and
+/// already-possible effects keep their original identity for reconciliation.
+/// Shared safe status/recovery remains available under its own authority and
+/// never passes through this entry.
+///
+/// Designated caller (STITCH, daemon composition lane): the pre-commit effect
+/// gate in `DaemonComposition::commit_canonical_and_refresh`
+/// (`bins/eliotd/src/lib.rs`), between the `ColdUnbound` admission projection
+/// and the scope-sensitive trigger, passing the live Governor task/scope,
+/// principal/session, task revision, acceptance digest, receipt revision,
+/// governance profile reference, projection generation (the live receipt's own
+/// `projection_generation`, alongside its revision), and kernel-snapshot fence.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "revalidation joins the sealed identity against every live owner value that can invalidate it in one fail-closed edge"
+)]
+pub fn revalidate_dispatched_binding(
+    binding: &DispatchedBinding,
+    live_task_ref: Option<&str>,
+    live_scope_ref: &str,
+    live_principal_ref: &str,
+    live_session_ref: &str,
+    live_task_revision: u64,
+    live_acceptance_digest: &str,
+    live_receipt_revision: u64,
+    live_governance_profile_ref: &str,
+    live_projection_generation: u64,
+    live_fence: &StateFence,
+) -> Result<(), TaskBindingError> {
+    let Some(live_task_ref) = live_task_ref else {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch revalidation names no live task",
+        ));
+    };
+    if live_task_ref != binding.admitted_task_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatched task is not the admitted task; rebind under a new operation, no rewrite",
+        ));
+    }
+    if live_scope_ref != binding.scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatched WorkScope is not the admitted WorkScope; rebind, no rewrite",
+        ));
+    }
+    // An intervening logout or rebind moved the live principal/session. The
+    // old operation conflicts for rebind under a new operation identity; it is
+    // never rewritten to the new principal/session.
+    if live_principal_ref != binding.principal_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatched principal is not the admitted principal; logout or rebind under a new operation, no rewrite",
+        ));
+    }
+    if live_session_ref != binding.session_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatched session is not the admitted session; logout or rebind under a new operation, no rewrite",
+        ));
+    }
+    // An intervening task revision or acceptance change moved the contract the
+    // operation was admitted under. The evidence revision/digest sealed at
+    // admission is compared with the live owner values here, never refreshed
+    // in place.
+    if live_task_revision != binding.evidence.task_revision {
+        return Err(TaskBindingError::scope_incompatible(
+            "admitted task revision moved before effect; rebind at the live revision, no silent rebind",
+        ));
+    }
+    if live_acceptance_digest != binding.evidence.acceptance_digest {
+        return Err(TaskBindingError::scope_incompatible(
+            "admitted acceptance digest moved before effect; rebind at the live digest, no silent rebind",
+        ));
+    }
+    if live_receipt_revision != binding.receipt_revision
+        || live_governance_profile_ref != binding.governance_profile_ref
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "admitted bootstrap/profile revision moved before effect; rebind at the live revision, no silent rebind",
+        ));
+    }
+    // The admitted projection generation is sealed alongside the receipt
+    // revision at admission (`seal_dispatched_binding`) and rechecked here
+    // against the live receipt's own generation: a re-projected bootstrap
+    // under the same receipt revision still conflicts for rebind, it is never
+    // silently adopted under the old operation identity.
+    if live_projection_generation != binding.projection_generation {
+        return Err(TaskBindingError::scope_incompatible(
+            "admitted projection generation moved before effect; rebind at the live projection, no silent rebind",
+        ));
+    }
+    revalidate_task_bound_for_effect(
+        &binding.evidence,
+        Some(binding.admitted_task_ref.as_str()),
+        &binding.scope_ref,
+        &binding.presented_fence,
+        live_fence,
+    )
+}
+
+/// Revalidates one admitted task-bound transition at the effect gate against
+/// the live fence (issue #1746, W6/A5).
+///
+/// [`admit_canonical_write`] admits against the caller-presented write fence;
+/// between that admission (bootstrap) and the commit (dispatch) the task,
+/// scope, or generation may have moved. This entry carries the exact admitted
+/// [`TaskSelectionEvidence`] forward and rejoins it here: the ORIGINAL
+/// evidence is validated with the existing [`TaskSelectionEvidence::validate`],
+/// contamination still refuses, the evidence task/scope must name exactly the
+/// admitted request task and the write scope, and the presented fence must
+/// still match the live owner fence exactly. A mismatch fails closed with
+/// `TASK_SCOPE_INCOMPATIBLE` for conflict/rebind: the old operation is never
+/// rewritten to the new task under its identity, never duplicated, and already
+/// possible effects keep their original identity for reconciliation. This entry
+/// mints no evidence and selects no task; `admitted_task_ref` is the exact
+/// task the admitted request names (the request-context task, or the envelope
+/// task when the context names none — the same value admission compared),
+/// never the evidence's own value.
+///
+/// Designated caller (STITCH, daemon composition lane): the pre-commit effect
+/// gate in `DaemonComposition::commit_canonical_and_refresh`
+/// (`bins/eliotd/src/lib.rs`), between the `ColdUnbound` admission projection
+/// and the scope-sensitive trigger, passing the admitted request task, the
+/// envelope scope, the readiness fence as presented, and the live Governor
+/// kernel-snapshot fence as live. Callers holding a sealed [`DispatchedBinding`]
+/// prefer [`revalidate_dispatched_binding`], which checks the carried
+/// task/scope/bootstrap revision first and delegates here for the fence leg.
+pub fn revalidate_task_bound_for_effect(
+    evidence: &TaskSelectionEvidence,
+    admitted_task_ref: Option<&str>,
+    expected_scope_ref: &str,
+    presented_fence: &StateFence,
+    live_fence: &StateFence,
+) -> Result<(), TaskBindingError> {
+    let Some(admitted_task_ref) = admitted_task_ref else {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no admitted task",
+        ));
+    };
+    if admitted_task_ref.trim().is_empty() || admitted_task_ref.chars().any(char::is_control) {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch admitted task is blank",
+        ));
+    }
+    evidence.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
+    })?;
+    if evidence.is_contaminated() {
+        return Err(TaskBindingError::selection_required(
+            "task selection is contaminated",
+        ));
+    }
+    if evidence.task_ref != admitted_task_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatched task is not the admitted task; rebind under a new operation, no rewrite",
+        ));
+    }
+    if evidence.work_scope_ref != expected_scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatched WorkScope is not the admitted WorkScope; rebind, no rewrite",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(presented_fence, live_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "admitted fence moved before effect; rebind at the live fence, no silent rebind",
+        ));
+    }
+    Ok(())
 }
 
 /// Admits the capture leg of one prepared transition at the daemon transport
@@ -893,7 +2046,20 @@ pub fn admit_named_mutation_capture(
     }
     let names_a_task = transition.task_id.is_some() || context.task_id.is_some();
     if names_a_task {
-        return Ok(TaskBindingAdmission::TaskRelative);
+        // Issue #1746, A6: the bridge transport edge enforces the same binding
+        // rule as the direct internal intake — a task-relative effect needs
+        // owner evidence, so its binding decision belongs to the ingress that
+        // owns the exact selection. The terminal arm is unreachable
+        // fail-closed if the frozen table ever stops requiring it.
+        if entrypoint_requires_binding(
+            DispatchEntrypoint::BridgeTransport,
+            CanonicalOperationRequirement::TaskRelativeEffectful,
+        ) {
+            return Ok(TaskBindingAdmission::TaskRelative);
+        }
+        return Err(TaskBindingError::selection_required(
+            "bridge transport edge cannot admit a task-relative effect without owner evidence",
+        ));
     }
     match admit_capture(
         transition.identity.operation_id.as_str().to_owned(),
@@ -1160,13 +2326,152 @@ pub fn observe_explicit_workspace(
     workspace_root: &Path,
     fence: &StateFence,
 ) -> Result<ObservedScopeResources, TaskBindingError> {
+    observe_explicit_workspace_facts(workspace_root, fence).map(|(_, observed)| observed)
+}
+
+fn observe_explicit_workspace_facts(
+    workspace_root: &Path,
+    fence: &StateFence,
+) -> Result<(WorkspaceInstanceFacts, ObservedScopeResources), TaskBindingError> {
     let facts = observe_workspace_instance(workspace_root).map_err(|error| {
         TaskBindingError::scope_incompatible(format!("workspace observation failed: {error}"))
     })?;
-    derive_observed_resources(&facts, fence.resource_generation, None).map_err(|error| {
+    let observed =
+        derive_observed_resources(&facts, fence.resource_generation, None).map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "observed workspace resources invalid: {error}"
+            ))
+        })?;
+    Ok((facts, observed))
+}
+
+/// Observes one authenticated activation selector and creates the exact
+/// discovery lease/evidence inputs admitted by the privacy-bounded scanner.
+///
+/// Only Host-observed filesystem, VCS and root-manifest name facts are
+/// populated. Known-format inspection and governing-source discovery remain
+/// explicitly unresolved. No privacy class, boundary, source closure, or
+/// task is inferred here; the scanner returns its smallest privacy question
+/// until the applicable owner supplies those inputs.
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded Host observations and the matching discovery lease are assembled in one auditable path"
+)]
+pub fn observe_cold_start_discovery(
+    ticket: &eliot_protocol::AgentActivationResolutionTicket,
+    fence: &StateFence,
+    now: u64,
+) -> Result<ColdStartDiscoveryInput, TaskBindingError> {
+    let selector = ticket.workspace_selector.as_deref().ok_or_else(|| {
+        TaskBindingError::selection_required(
+            "activation has no explicit workspace selector for bounded discovery",
+        )
+    })?;
+    let workspace_root = Path::new(selector);
+    if !workspace_root.is_absolute() {
+        return Err(TaskBindingError::scope_incompatible(
+            "activation workspace selector must be an explicit absolute path",
+        ));
+    }
+    if now == 0 {
+        return Err(TaskBindingError::selection_required(
+            "activation discovery clock is not available",
+        ));
+    }
+    let (facts, observed) = observe_explicit_workspace_facts(workspace_root, fence)?;
+    let instance = observed.instances.first().ok_or_else(|| {
+        TaskBindingError::scope_incompatible("Host observer returned no workspace instance")
+    })?;
+    let instance_ref = instance.instance_ref.clone();
+    let root_identity = instance.root_identity.clone();
+    let proposed_kind = observed.kind;
+    let mut allowed_reads = vec![DiscoveryRead::FilesystemIdentity];
+    if facts.has_git {
+        allowed_reads.push(DiscoveryRead::VcsIdentity);
+    }
+    if !facts.manifest_names.is_empty() {
+        allowed_reads.push(DiscoveryRead::ManifestNamesAndHashes);
+    }
+    let request = DiscoveryLeaseRequest {
+        proposer_ref: ticket.activation_request_id.as_str().to_owned(),
+        session_ref: ticket.connection_id.clone(),
+        host_ref: ticket.peer_admission_receipt_sha256.clone(),
+        candidate_root_ref: root_identity.clone(),
+        root_filesystem_identity_ref: root_identity.clone(),
+        allowed_reads,
+        consumption_limit: 3,
+        deadline: ticket.kernel_deadline_unix_ms,
+    };
+    let key = DiscoveryLeaseKey {
+        proposer_ref: request.proposer_ref.clone(),
+        session_ref: request.session_ref.clone(),
+        host_ref: request.host_ref.clone(),
+        root_filesystem_identity_ref: request.root_filesystem_identity_ref.clone(),
+    };
+    let lease = issue_discovery_lease(&request).map_err(|error| {
         TaskBindingError::scope_incompatible(format!(
-            "observed workspace resources invalid: {error}"
+            "Host-observed discovery lease refused: {error}"
         ))
+    })?;
+    let mut attested_reads = vec![DiscoveryRead::FilesystemIdentity];
+    if facts.has_git {
+        attested_reads.push(DiscoveryRead::VcsIdentity);
+    }
+    let mut manifests = facts
+        .manifest_names
+        .iter()
+        .map(|name| {
+            let name_hash = sha256_hex(name.as_bytes());
+            ManifestEvidence {
+                manifest_ref: format!("manifest:{name_hash}"),
+                name_hash,
+            }
+        })
+        .collect::<Vec<_>>();
+    manifests.sort_by(|left, right| left.manifest_ref.cmp(&right.manifest_ref));
+    if !manifests.is_empty() {
+        attested_reads.push(DiscoveryRead::ManifestNamesAndHashes);
+    }
+    let evidence = BootstrapScanEvidence {
+        canonical_root_ref: root_identity.clone(),
+        filesystem_identity_ref: root_identity,
+        vcs_branch_ref: observed.generation.branch_ref.clone(),
+        vcs_commit_ref: observed.generation.commit_ref.clone(),
+        vcs_dirty_summary_ref: observed.generation.dirty_summary_ref.clone(),
+        file_distribution: Vec::new(),
+        manifests,
+        build_profiles: Vec::new(),
+        root_services: Vec::new(),
+        editor_workspaces: Vec::new(),
+        existing_records: Vec::new(),
+        adapters: Vec::new(),
+        recent_changes: Vec::new(),
+        artifact_dirs: Vec::new(),
+        execution_identity: None,
+        broker_attached: None,
+        redacted_literal_identities: Vec::new(),
+        unresolved_fields: vec![
+            DiscoveryRead::KnownFormatHeaders,
+            DiscoveryRead::GoverningSourceCandidates,
+        ],
+        attested_reads,
+    };
+    let discovery = BootstrapDiscoveryInputs {
+        scan_ref: format!("scan:{}", ticket.ticket_id),
+        candidate_privacy: None,
+        privacy_boundary: None,
+        observed,
+        policy: None,
+        proposed_kind,
+        identity_fingerprint: instance_ref,
+        evidence,
+        governing_source_refs: Vec::new(),
+        now,
+    };
+    Ok(ColdStartDiscoveryInput {
+        lease,
+        key,
+        discovery,
     })
 }
 

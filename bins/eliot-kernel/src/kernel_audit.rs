@@ -64,7 +64,7 @@ use eliot_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::shutdown_drain::ShutdownPublication;
+use super::shutdown_drain::{DrainCommitDecision, ShutdownPublication};
 
 /// Canonical audit record/anchor format version (I16.3 normalization version).
 pub const KERNEL_AUDIT_FORMAT_VERSION: u16 = 1;
@@ -2030,16 +2030,34 @@ impl AuditEventDraft {
     }
 
     /// Returns the drain-committed draft for one linearized decision.
+    ///
+    /// I14.23/W1: the body carries the whole `DrainCommitRecord` boundary
+    /// contract Host persists into its journal, not a correlation id and a
+    /// count, so Host and Watchdog can read over the chain they already read
+    /// which authority the Kernel actually linearized against and compare it
+    /// with the durable record they hold, rather than inferring agreement from
+    /// the fact that a commit happened. Every value is the one the coordinator
+    /// persisted and handed back through
+    /// [`ShutdownDrainCoordinator::committed_decision`](super::shutdown_drain::ShutdownDrainCoordinator::committed_decision),
+    /// and the disposition is stated in the `WakeDisposition` wire vocabulary
+    /// the durable record uses, so the two records are directly comparable.
     #[must_use]
-    pub fn shutdown_drain_committed(generation: &str, fenced_epoch_count: usize) -> Self {
+    pub fn shutdown_drain_committed(decision: &DrainCommitDecision) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.controller = Some("kernel".to_owned());
         Self {
             kind: AuditEventKind::SHUTDOWN_DRAIN_COMMITTED,
             lineage,
             body: serde_json::json!({
-                "drain_generation": generation,
-                "authority_epochs_fenced": fenced_epoch_count,
+                "drain_generation": decision.generation,
+                "authority_epochs_fenced": &decision.authority_epochs_fenced,
+                "activation_generation_fenced": decision.activation_generation_fenced.as_ref().map(
+                    |fenced| format!("{}:{}", fenced.lineage_id, fenced.sequence),
+                ),
+                "branches_to_stop": &decision.branches_to_stop,
+                "wake_disposition": decision.wake_disposition.as_str(),
+                "irreversible_stage": decision.irreversible_stage,
+                "recovery_owner": decision.recovery_owner,
             }),
         }
     }

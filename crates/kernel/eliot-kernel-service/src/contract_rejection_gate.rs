@@ -272,6 +272,27 @@ struct IssuedCorrection {
     rejection_id: String,
 }
 
+/// Explicit recovery posture of the Kernel-owned durable pre-stage journal,
+/// tracked independently of whether any refusal is currently retained (issue
+/// #1796, audit 5890973032 defect 2).
+///
+/// An empty cache is ambiguous on its own: it is either genuine first use or
+/// a failed recovery. This state records which one the last restore attempt
+/// proved, so callers never treat an unrestored cache as an empty journal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreStageJournalReadiness {
+    /// No restore attempt has completed yet.
+    #[default]
+    Uninitialized,
+    /// Genuine first-use absent journal or a validated restore: the cache
+    /// is the journal.
+    Ready,
+    /// An existing journal could not be read, decoded, or validated: the
+    /// cache is unrestored and the old journal must be preserved, never
+    /// overwritten as fresh state.
+    RecoveryRequired,
+}
+
 /// In-memory pre-stage identity cache.
 ///
 /// Preserves exact same-hash retry identity and `IDENTITY_CONFLICT` without
@@ -306,6 +327,7 @@ pub struct PreStageIdentityCache {
     journal_revision: u64,
     acked_journal_revision: u64,
     pending_journal: Option<PreStageIdentitySnapshot>,
+    journal_readiness: PreStageJournalReadiness,
 }
 
 /// Durable snapshot of the pre-stage identity cache (issue #1796, I6.8).
@@ -374,14 +396,42 @@ impl PreStageIdentityCache {
             .map(|pending| pending.revision)
     }
 
+    /// Revision of the last acknowledged journal save.
+    ///
+    /// A save for a revision at or below this one is already durable, so a
+    /// stale saver holding publication ownership can report it without
+    /// writing anything over newer content.
+    #[must_use]
+    pub fn acked_journal_revision(&self) -> u64 {
+        self.acked_journal_revision
+    }
+
+    /// Explicit recovery posture of the durable pre-stage journal,
+    /// independently of [`PreStageIdentityCache::is_empty`].
+    #[must_use]
+    pub fn journal_readiness(&self) -> PreStageJournalReadiness {
+        self.journal_readiness
+    }
+
+    /// Records what the last restore attempt proved about the durable
+    /// pre-stage journal: genuine first-use absence or a validated restore
+    /// is [`PreStageJournalReadiness::Ready`], any unreadable, undecodable,
+    /// or invalid existing journal is
+    /// [`PreStageJournalReadiness::RecoveryRequired`].
+    pub fn set_journal_readiness(&mut self, readiness: PreStageJournalReadiness) {
+        self.journal_readiness = readiness;
+    }
+
     /// Validates one durable journal snapshot without touching this cache.
     ///
     /// Runs the existing [`PreStageRejection::validate`] over every retained
     /// refusal, then checks the cross-record invariants the validator cannot
     /// see: each keyed entry must carry its own rejection's idempotency key
     /// and canonical hash, every refusal's rejected operation identity must
-    /// be recorded, and every issued-correction key must re-derive from its
-    /// own rejected operation and rejection identity through the one shared
+    /// be recorded, every retained rejection must carry its exact issued
+    /// correction with the matching parent/rejection tuple, and every
+    /// issued-correction key must re-derive from its own rejected operation
+    /// and rejection identity through the one shared
     /// [`derive_corrected_operation_id`] primitive. Private fields plus
     /// `Deserialize` are shape only; this is the validation.
     fn validate_snapshot(snapshot: &PreStageIdentitySnapshot) -> Result<(), PreStageGateError> {
@@ -407,6 +457,25 @@ impl PreStageIdentityCache {
                     field: "snapshot.refused_operations",
                     reason: "every retained refusal must record its rejected operation identity",
                 });
+            }
+            // Every retained rejection must carry its exact issued correction
+            // with the matching parent/rejection tuple: without this direction
+            // a snapshot missing its correction index restores accepted while
+            // the resubmission it names returns no correction link. A missing
+            // relationship is refused here, never dropped or regenerated.
+            match snapshot
+                .issued_corrections
+                .get(&rejection.corrected_operation_id)
+            {
+                Some(issued)
+                    if issued.rejected_operation_id == rejection.proposed_operation_id
+                        && issued.rejection_id == rejection.rejection_id => {}
+                _ => {
+                    return Err(PreStageGateError::InvalidField {
+                        field: "snapshot.issued_corrections",
+                        reason: "every retained rejection must carry its exact issued correction and matching parent/rejection tuple",
+                    });
+                }
             }
         }
         for operation in &snapshot.refused_operations {
@@ -457,7 +526,10 @@ impl PreStageIdentityCache {
     /// mutation. The merge itself is conflict-preserving: re-merging the
     /// same snapshot is idempotent, a retain that landed after the snapshot
     /// was read is never lost, and a conflicting record is refused instead
-    /// of replacing a retained identity. Merging never publishes a pending
+    /// of replacing a retained identity. A successful merge also carries the
+    /// snapshot's revision as the coherent baseline for both the published
+    /// and the acknowledged revision, so loading a nonzero snapshot never
+    /// restarts the sequence at zero. Merging never publishes a pending
     /// journal, so a bare restore schedules no write-back.
     pub fn restore(&mut self, snapshot: PreStageIdentitySnapshot) -> Result<(), PreStageGateError> {
         Self::validate_snapshot(&snapshot)?;
@@ -485,6 +557,7 @@ impl PreStageIdentityCache {
                 });
             }
         }
+        let snapshot_revision = snapshot.revision;
         for (key, record) in snapshot.entries {
             self.entries.entry(key).or_insert(record);
         }
@@ -494,6 +567,11 @@ impl PreStageIdentityCache {
                 .entry(corrected_operation_id)
                 .or_insert(issued);
         }
+        // The merged snapshot is durable disk state, so its revision is the
+        // coherent baseline: the next retain publishes above it instead of
+        // restarting the sequence at zero.
+        self.journal_revision = self.journal_revision.max(snapshot_revision);
+        self.acked_journal_revision = self.acked_journal_revision.max(snapshot_revision);
         Ok(())
     }
 
@@ -888,6 +966,7 @@ mod tests {
 
     fn transition(op: &str, idem: &str, hash: &str) -> PreparedTransition {
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new(op).expect("op"),
                 idempotency_key: idem.to_owned(),

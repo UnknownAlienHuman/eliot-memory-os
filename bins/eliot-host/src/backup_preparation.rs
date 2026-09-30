@@ -138,6 +138,49 @@
 //! are what exclude a second installer/registry, same-installation
 //! Store-recovery rewrite, archive restore and cutover today.
 //!
+//! # Cleanup ownership, custody and retirement state
+//!
+//! A preparation receipt proves that this operation once created that exact
+//! directory. It does not prove that the directory is still empty, that no
+//! restore has populated it, or that no other owner has adopted or activated it,
+//! so a reconciled `Current` destination is a *candidate* for reclamation and
+//! never a sufficient reason for one. [`cleanup_preparations`] decides four
+//! further questions before anything is destroyed, in this order:
+//!
+//! - **Ownership, carried into the effect.** [`reverify_recorded_destination`]
+//!   returns the retained [`ProtectedRootLease`] instead of `Ok(())`, and the
+//!   reclamation hands that lease straight to
+//!   [`ProtectedRootLease::into_removal_proof`]. The irreversible operation is
+//!   applied to the retained `DELETE` handle the proof pinned, so there is no
+//!   longer a window in which a proved root is re-resolved by name and deleted
+//!   through a reopened, unprotected path. This is the same conclusion the
+//!   platform owner already reached for itself: recursive deletion "cannot be
+//!   made identity-bound by checking a pathname, closing the check handle, and
+//!   then calling `remove_dir_all`"
+//!   (`crates/kernel/eliot-platform-windows/src/directory_publication.rs`), so
+//!   the removal lives beside that capability as
+//!   [`ProtectedRootRemovalProof`] rather than being re-implemented here.
+//! - **A bounded empty-root effect.** There is no recursive sweep on this path
+//!   at all. [`ProtectedRootRemovalProof::remove_if_empty`] observes one entry
+//!   and then applies one handle-bound delete disposition, so a root that a
+//!   restore populated, or that another owner adopted, is reported as preserved
+//!   for the owning cleanup protocol instead of being destroyed. A count or byte
+//!   bound is not a substitute for that disposition and none is invented here.
+//! - **Current destination and custody disposition.**
+//!   [`PreparationJournal::destination_custody`] must read
+//!   [`DestinationCustody::Released`] — a retained cutover intent claiming this
+//!   exact destination, or a sink that cannot read the custody records at all,
+//!   preserves the root. Cancellation is a separate transition and is never
+//!   read as proof that a populated root is safe to destroy.
+//! - **An owner-authorized cleanup transition.**
+//!   [`CleanupTransitionState::CleanupPending`] is retained through the journal
+//!   *before* the effect and [`CleanupTransitionState::Reclaimed`] only *after*
+//!   the absence has been observed. A sink that refuses the transition has not
+//!   authorized the reclamation, so the root is preserved. An operation whose
+//!   `Reclaimed` retention is refused is reported as preserved rather than
+//!   removed, so [`CleanupReport`] never claims a durable lifecycle state this
+//!   module could not write.
+//!
 //! # Staging parent, generation and sweep bounds
 //!
 //! Three admissions carry the guarantees issue #958 requires, and each one is
@@ -150,12 +193,12 @@
 //!   the directory chain by retained handle. A client-supplied arbitrary path
 //!   is refused with [`PreparationError::ArbitraryPath`], and the parent this
 //!   module proceeds with is the owner-resolved canonical path rather than a
-//!   name-based canonicalise. That is also what makes removal reachable:
+//!   name-based canonicalise. That is also what makes reclamation reachable:
 //!   [`reverify_recorded_destination`] requires the same containment, so a
-//!   root created here is by construction one whose removal path
+//!   root created here is by construction one whose reclamation path
 //!   ([`remove_reverified_destination`]) can be reached. The proof is taken at
 //!   admission; the recorded root is proved again through the same owner
-//!   immediately before any removal, and preserved when that proof fails.
+//!   immediately before any reclamation, and preserved when that proof fails.
 //! - **The generation comparison is an owner comparison on the delegated
 //!   path.**
 //!   [`DelegatedPreparation::prepare`] sources
@@ -175,8 +218,11 @@
 //!   [`MAX_CLEANUP_REQUESTED_IDS`], [`MAX_CLEANUP_SWEEP_OPERATIONS`] and
 //!   [`CLEANUP_SWEEP_BUDGET`], and refuses with
 //!   [`PreparationError::SweepBudget`] instead of letting an unbounded journal
-//!   drive unbounded reconciles and `remove_dir_all` calls (A13.9: a Durable
-//!   Job carries a budget).
+//!   drive unbounded reconciles and reclamations (A13.9: a Durable Job carries
+//!   a budget). The bound is a work bound only: it is never read as an ownership
+//!   or emptiness decision, and once the first reclamation has happened the
+//!   sweep reports through [`CleanupReport`] rather than through an error, so a
+//!   later stop can never discard the record of an effect that already occurred.
 //!
 //! # Target build and profile are owner-approved identities
 //!
@@ -209,7 +255,8 @@ use eliot_installation::{
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     FileIdentity, HostOwnerLease, ProtectedPathError, ProtectedRootLease,
-    ProtectedRuntimePathLease, windows_paths_equal,
+    ProtectedRootRemovalOutcome, ProtectedRootRemovalProof, ProtectedRuntimePathLease,
+    windows_paths_equal,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -233,7 +280,8 @@ pub const MAX_CLEANUP_REQUESTED_IDS: usize = 256;
 ///
 /// Each swept operation costs one journal load, one protected-root lease open
 /// (which pins the whole directory contour by retained handle) and at most one
-/// `remove_dir_all`, so the swept key set is the sweep's real work bound. 256
+/// bounded empty-root reclamation, so the swept key set is the sweep's real work
+/// bound. 256
 /// covers every realistic leftover of one Host's preparation history while
 /// staying far below the handle and time pressure of an unbounded journal; a
 /// larger set is refused whole and swept in bounded passes, never truncated
@@ -253,14 +301,15 @@ pub const MAX_CLEANUP_SWEEP_OPERATIONS: usize = 256;
 ///
 /// The clock starts before the owned set is listed and is checked after the
 /// listing returns and again before every swept operation, so the bound caps the
-/// number of *subsequent* reconciles and removals rather than interrupting one in
-/// flight (`remove_dir_all` cannot be cancelled once issued) and the listing's
-/// own unbounded cost still falls inside the window even though the call itself
-/// cannot be interrupted. 30 s is generous headroom for 256 individually
-/// re-proven owned roots on a loaded volume and still far below any caller wait
-/// that a runaway sweep could justify; exhaustion refuses with
-/// [`PreparationError::SweepBudget`], names any roots already removed in the same
-/// call, and preserves everything not yet swept.
+/// number of *subsequent* reconciles and reclamations rather than interrupting
+/// one in flight (a delete disposition cannot be cancelled once issued) and the
+/// listing's own unbounded cost still falls inside the window even though the
+/// call itself cannot be interrupted. 30 s is generous headroom for 256
+/// individually re-proven owned roots on a loaded volume and still far below any
+/// caller wait that a runaway sweep could justify. Exhaustion before the first
+/// reclamation refuses with [`PreparationError::SweepBudget`]; exhaustion after
+/// one reports through [`CleanupReport`], so the roots already reclaimed in the
+/// same call and every operation not yet swept both stay visible.
 pub const CLEANUP_SWEEP_BUDGET: Duration = Duration::from_secs(30);
 /// Domain separator for owner-evidence-bound destination identities.
 pub const DESTINATION_ID_DOMAIN: &str = "eliot.backup.destination.v1";
@@ -352,34 +401,13 @@ pub enum PreparationError {
     ///
     /// A refused sweep stops before the next operation: nothing further is
     /// deleted and nothing is deleted by truncation, so every root this module
-    /// created stays individually re-provable on the next bounded pass. When
-    /// the refusal follows removals already performed in the same call, `reason`
-    /// additionally names those completed operation ids — a budget error raised
-    /// after an irreversible effect must never hide which effects occurred.
+    /// created stays individually re-provable on the next bounded pass. This
+    /// variant is therefore only ever raised **before** the first irreversible
+    /// effect of the call: once a root has been reclaimed, the sweep returns its
+    /// [`CleanupReport`] instead, so the record of what was already removed can
+    /// never be discarded by a later refusal.
     #[error("cleanup sweep budget exceeded on {field}: {reason}")]
     SweepBudget { field: &'static str, reason: String },
-}
-
-impl PreparationError {
-    /// Names the operations this call already removed, so a refusal raised after
-    /// an irreversible effect still carries the evidence of that effect.
-    ///
-    /// Appended to the static reason, never replacing it, and bounded to the
-    /// number of ids the sweep can have completed under
-    /// [`MAX_CLEANUP_SWEEP_OPERATIONS`]. An empty set leaves the reason exactly
-    /// as it was.
-    fn with_removed(self, removed: &[String]) -> Self {
-        if removed.is_empty() {
-            return self;
-        }
-        match self {
-            Self::SweepBudget { field, reason } => Self::SweepBudget {
-                field,
-                reason: format!("{reason}; already removed in this call: {removed:?}"),
-            },
-            other => other,
-        }
-    }
 }
 
 // F-LOG-HOST-8 (#983) backup preparation diagnostics: observation-only helpers.
@@ -426,18 +454,23 @@ impl PreparationError {
 // always-refuse stub with no production path),
 // `conflict_field`/`admission_digest`/`derive_*`/`hash_path`/`capture_identity`
 // /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
-// /`projection_to_preparation`/`intent_json`/`result_json`/`destination_from_result`
-// /`owner_identity_evidence`/`reject_audit_note`
+// /`projection_to_preparation`/`intent_json`/`result_json`/`cleanup_transition_json`
+// /`destination_from_result`/`owner_identity_evidence`/`reject_audit_note`
 // (private steps whose outcome surfaces with its exact category at the owning
 // boundary). The durable sink adds only the same shape of step:
-// `HostStatePreparationJournal::{snapshot, record_fence, retained, append}` and
+// `HostStatePreparationJournal::{snapshot, record_fence, retained, append,
+// destination_custody}` and
 // `preparation_handle`/`preparation_mutation`/`preparation_state_spelling` are
 // private steps whose outcome surfaces with its exact category at the owning
 // boundary; `HostStatePreparationJournal::{record_intent, record_result, load,
 // list_operations}` are the `PreparationJournal` port itself, whose refusals
 // propagate through the existing `record_intent`/`record_result` phase records
-// of `prepare_isolated_destination`, and `load`/`list_operations` are read-only
-// projections that observe no phase. No record asserts destination readiness,
+// of `prepare_isolated_destination`, and `load`/`list_operations`/
+// `destination_custody` are read-only projections that observe no phase. The
+// cleanup path adds `remove_reverified_destination` and `record_sweep_stop` as
+// owning boundaries of their own, so every reclamation refusal surfaces there
+// with its exact category and no second terminal record is produced. No record
+// asserts destination readiness,
 // source retirement, or activation: `destination_epoch` is preparation scope,
 // never authority.
 
@@ -783,13 +816,39 @@ pub enum ReconcileDisposition {
     Uncertain { reason: String },
 }
 
-/// Cleanup report: removed owned-unactivated roots vs preserved unknowns.
+/// Cleanup report: reclaimed owned-unactivated roots vs preserved unknowns.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CleanupReport {
-    /// Operation ids whose owned roots were removed.
+    /// Operation ids whose owned roots were reclaimed.
+    ///
+    /// Only an operation whose whole protocol completed is listed here: the
+    /// ownership proof, the custody disposition, the retained `CleanupPending`
+    /// transition, the bounded empty-root removal AND the retained `Reclaimed`
+    /// transition. A root that was removed but whose `Reclaimed` retention was
+    /// refused is reported under [`Self::preserved`] instead, so `removed` is
+    /// never a claim about a durable state this module could not write.
     pub removed: Vec<String>,
-    /// Operation ids preserved with reasons (unknown/foreign/mismatch).
+    /// Operation ids preserved with reasons (unknown/foreign/mismatch/populated/
+    /// unauthorized). An operation the sweep stopped before is preserved here
+    /// too, so a partial sweep is always visible in the returned report.
     pub preserved: Vec<(String, String)>,
+}
+
+/// Current disposition of any unresolved restore/cutover custody claim over one
+/// destination root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DestinationCustody {
+    /// The owners this sink reads retain no unresolved custody claim over this
+    /// exact destination.
+    Released,
+    /// Custody is unresolved, or this sink cannot observe the records that
+    /// would settle it. The destination is preserved, never reclaimed.
+    ///
+    /// Absence of proof is never proof of absence: a sink that cannot see the
+    /// custody records must never be read as "no custody", so the port default
+    /// is this variant and only an owner that actually reads them may report
+    /// [`Self::Released`].
+    Unresolved(String),
 }
 
 /// Durable intent/result sink port (issue #958).
@@ -854,6 +913,13 @@ pub trait PreparationJournal {
         intent: &serde_json::Value,
     ) -> Result<(), PreparationError>;
     /// Records the preparation result (receipt).
+    ///
+    /// The same port carries the owner-authorized **cleanup transition**
+    /// ([`cleanup_transition_json`]): a sink that accepts the transition has
+    /// authorized the reclamation, and a sink that refuses it has not, so the
+    /// sweep preserves the destination rather than deleting on a receipt alone.
+    /// Cancellation and cleanup stay separate transitions and neither is proof
+    /// that a populated root is safe to destroy.
     fn record_result(
         &mut self,
         operation_id: &str,
@@ -866,6 +932,21 @@ pub trait PreparationJournal {
     ) -> Result<Option<(serde_json::Value, Option<serde_json::Value>)>, PreparationError>;
     /// Lists known operation ids for sweeps.
     fn list_operations(&self) -> Result<Vec<String>, PreparationError>;
+    /// Current disposition of unresolved restore/cutover custody over one
+    /// destination root.
+    ///
+    /// Defaults to [`DestinationCustody::Unresolved`] because a sink that does
+    /// not read the custody records cannot prove they are clear: the default is
+    /// the fail-closed answer, not a permissive stub, and a reclamation is
+    /// refused unless an implementation that actually reads the owners reports
+    /// [`DestinationCustody::Released`].
+    fn destination_custody(&self, _root: &Path) -> DestinationCustody {
+        DestinationCustody::Unresolved(
+            "this sink observes no restore/cutover custody records; an unobservable claim is \
+             unresolved, not absent"
+                .to_owned(),
+        )
+    }
 }
 
 /// Durable [`PreparationJournal`] over the owner's Host state journal.
@@ -1303,6 +1384,46 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
             .map(|record| record.preparation_operation.as_str().to_owned())
             .collect())
     }
+
+    /// Reads the durable restore/cutover custody records this journal owns.
+    ///
+    /// The join is deliberately narrow and exact: the retained cutover intent
+    /// must name the **same destination identity** the durable preparation
+    /// record holds for this exact root. `HostState::pending_cutover` is a
+    /// single slot, so a claim over some other installation says nothing about
+    /// this root and is not custody of it; a claim over this destination — at
+    /// any disposition, because an intent that already committed is an
+    /// *adopted* destination, not an unactivated preparation root — leaves the
+    /// root unresolved and therefore unreclaimable.
+    ///
+    /// An unreadable snapshot is `Unresolved` for the same reason the port
+    /// default is: absence of proof is never proof of absence.
+    fn destination_custody(&self, root: &Path) -> DestinationCustody {
+        let state = match self.snapshot() {
+            Ok(state) => state,
+            Err(error) => {
+                return DestinationCustody::Unresolved(format!(
+                    "durable custody records are unavailable: {error}"
+                ));
+            }
+        };
+        let Some(intent) = state.pending_cutover.as_ref() else {
+            return DestinationCustody::Released;
+        };
+        let claimed = state.backup_preparations.iter().any(|record| {
+            windows_paths_equal(Path::new(record.destination_root.as_str()), root)
+                && intent.installation == record.destination_id
+        });
+        if claimed {
+            return DestinationCustody::Unresolved(
+                "a retained cutover intent claims this exact destination; an unactivated \
+                 preparation root is never reclaimed while restore/cutover custody over it is \
+                 unresolved or has already activated it"
+                    .to_owned(),
+            );
+        }
+        DestinationCustody::Released
+    }
 }
 
 fn check_identity(value: &str, field: &'static str) -> Result<(), PreparationError> {
@@ -1669,11 +1790,12 @@ fn protected_path_to_preparation(
     }
 }
 
-/// Re-proves one recorded destination through the real protected-root owner.
+/// Re-proves one recorded destination through the real protected-root owner and
+/// **returns the retained proof**, never `Ok(())`.
 ///
 /// A recorded receipt is evidence of a past effect, not proof of a live root.
 /// Before a recorded destination is reused ([`reconcile_preparation`]) or
-/// removed ([`cleanup_preparations`]), the recorded root is re-opened through
+/// reclaimed ([`cleanup_preparations`]), the recorded root is re-opened through
 /// [`ProtectedRootLease::open_existing`] — the owner that containment-checks
 /// the path and pins the whole directory contour by retained handle — and only
 /// then are the canonical path, the retained-handle alias defence
@@ -1681,10 +1803,18 @@ fn protected_path_to_preparation(
 /// [`FileIdentity`] compared against the recorded values. Any failure is a
 /// typed [`PreparationError`]: the recorded root is no longer an owned
 /// protected object, and the caller preserves it rather than acting on a name.
+///
+/// The return value is the point. The lease owns the pinned directory contour
+/// and dies at `return`, so a caller that received only `Ok(())` would have to
+/// re-resolve the pathname to act on it, and between the proof and that
+/// re-resolution the name can be rebound to a different object. Handing the
+/// lease back instead makes the caller either use it (as
+/// [`ProtectedRootLease::into_removal_proof`] does) or drop it, and there is no
+/// longer a shape in which a proved-then-reopened deletion can be written.
 fn reverify_recorded_destination(
     operation_id: &str,
     destination: &PreparedDestination,
-) -> Result<(), PreparationError> {
+) -> Result<ProtectedRootLease, PreparationError> {
     let recorded = &destination.root;
     let lease = ProtectedRootLease::open_existing(recorded)
         .map_err(|error| protected_path_to_preparation(operation_id, recorded, error))?;
@@ -1707,7 +1837,7 @@ fn reverify_recorded_destination(
             observed,
         });
     }
-    Ok(())
+    Ok(lease)
 }
 
 /// Validates one admission without effects (cases 958/5-7).
@@ -1894,6 +2024,78 @@ fn result_json(destination: &PreparedDestination) -> serde_json::Value {
         "config_projection_digest": destination.config_projection_digest,
         "audit_fence_note": destination.audit_fence_note,
     })
+}
+
+/// Version of the owner-authorized cleanup transition record (issue #958, A4).
+///
+/// Distinct from [`PREPARATION_VERSION`], which versions the *preparation*
+/// receipt. The cleanup transition is a separate lifecycle with a separate
+/// owner decision, and reusing the preparation version would make a reclaimed
+/// root indistinguishable from a prepared one in the same durable frame.
+pub const CLEANUP_TRANSITION_VERSION: u32 = 1;
+
+/// The two states of the owner-authorized cleanup transition.
+///
+/// `CleanupPending` is retained **before** the reclamation effect and
+/// `Reclaimed` only **after** the effect has been observed, so a crash between
+/// them leaves a durable "may have been reclaimed" record rather than a
+/// receipt that claims a root is gone when nobody looked.
+///
+/// This is deliberately not a second preparation lifecycle. The preparation
+/// lifecycle is the Host journal owner's (`BackupPreparationState`), and
+/// cancellation is a third, separate transition: none of them is proof that a
+/// populated root is safe to destroy, and a `Cancelled` record in particular
+/// says only that the operation was withdrawn, not that its root is empty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupTransitionState {
+    /// Reclamation is authorized and about to be attempted.
+    CleanupPending,
+    /// The reclamation was attempted and its absence was observed.
+    Reclaimed,
+}
+
+impl CleanupTransitionState {
+    /// Stable wire spelling of one cleanup transition state.
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::CleanupPending => "cleanup_pending",
+            Self::Reclaimed => "reclaimed",
+        }
+    }
+}
+
+/// Renders the durable frame for one owner-authorized cleanup transition.
+///
+/// The frame carries the exact binding the reclamation is authorized against —
+/// the operation identity, the owner-issued destination identity and lineage
+/// marker, the admission digest and the pinned OS identity — so a retained
+/// transition names *this* destination and can never be read as authorization
+/// for a different one. The prior receipt is preserved beside it, exactly as
+/// [`cancel_preparation`] preserves its own, so no evidence is destroyed by
+/// moving the operation into cleanup.
+///
+/// The frame is a superset of [`result_json`]: a reader that only understands
+/// preparation receipts still decodes it. That is a transitional property, not
+/// a design goal — the typed lifecycle decoder this issue's first fix requires
+/// is what makes the state a decoded value rather than a field this writer
+/// happens to add, and until it lands nothing may read a cleanup frame as a
+/// usable prepared destination.
+fn cleanup_transition_json(
+    destination: &PreparedDestination,
+    state: CleanupTransitionState,
+) -> serde_json::Value {
+    let mut frame = result_json(destination);
+    frame["transition"] = serde_json::json!({
+        "version": CLEANUP_TRANSITION_VERSION,
+        "operation_id": destination.operation_id,
+        "state": state.spelling(),
+        "destination_id": destination.destination_id,
+        "destination_epoch": destination.destination_epoch,
+        "admission_digest": destination.admission_digest,
+        "root_identity": destination.root_identity.identity,
+    });
+    frame["prior_receipt"] = result_json(destination);
+    frame
 }
 
 fn destination_from_result(
@@ -2167,7 +2369,11 @@ pub fn reconcile_preparation<J: PreparationJournal>(
         });
     };
     match reverify_recorded_destination(operation_id, &destination) {
-        Ok(()) => {
+        // The retained lease is dropped here on purpose: reconciliation only
+        // needs to decide whether the recorded root is still the owned object,
+        // and a decision is not a reason to hold delete authority over it. The
+        // reclamation path takes its own proof immediately before its effect.
+        Ok(_lease) => {
             observe_prepare_progress(
                 OP_RECONCILE,
                 "outcome",
@@ -2250,30 +2456,55 @@ pub fn cancel_preparation<J: PreparationJournal>(
 /// owns its key set — and an explicitly requested id narrows that set instead
 /// of extending it. A requested id the journal does not own is refused into
 /// [`CleanupReport::preserved`]; a caller can never nominate a deletion.
-///
-/// Removal happens only for a reconciled `Current` destination whose recorded
-/// root is re-proved through the real protected-root owner immediately before
-/// the irreversible delete ([`reverify_recorded_destination`], applied again
-/// here so the proof is adjacent to the effect, not merely somewhere earlier
-/// in the reconcile). Anything uncertain, foreign, mismatched, unleased, or
-/// source-related is preserved with its reason. Never deletes by bare path
-/// name: every removal is keyed by operation id through the journal, and
-/// `ARCH-RES-03` (A13.7) holds — recovery preserves what it cannot prove it
-/// owns. That removal is reachable at all because
+/// Anything uncertain, foreign, mismatched, unleased, or source-related is
+/// preserved with its reason. Reclamation is reachable at all because
 /// [`admit_staging_parent`] proved every parent through the same protected
-/// contour this re-proof requires.
+/// contour the re-proof requires, and `ARCH-RES-03` (A13.7) holds throughout:
+/// recovery preserves what it cannot prove it owns.
 ///
 /// The sweep is budgeted (case 958/16, A13.9): the presented narrowing list is
 /// bounded by [`MAX_CLEANUP_REQUESTED_IDS`], the journal-owned set by
 /// [`MAX_CLEANUP_SWEEP_OPERATIONS`], and elapsed time by
-/// [`CLEANUP_SWEEP_BUDGET`]. A bound that is reached refuses the sweep with
-/// [`PreparationError::SweepBudget`] — it never truncates the set, because a
-/// silent truncation would report a partial sweep as complete and strand owned
-/// roots that still exist. Every operation already swept in that call had been
-/// individually re-proven owned before its removal, and the remainder stays
-/// reconcilable by the next bounded pass.
+/// [`CLEANUP_SWEEP_BUDGET`]. A bound reached *before* the first irreversible
+/// effect refuses the sweep with [`PreparationError::SweepBudget`] — it never
+/// truncates the set, because a silent truncation would report a partial sweep
+/// as complete and strand owned roots that still exist. A bound reached
+/// *after* a reclamation reports through [`CleanupReport`] instead
+/// ([`record_sweep_stop`]), so the roots this call already reclaimed and the
+/// operations it never reached both survive the stop.
+///
+/// Reclamation of a `Current` destination is not a consequence of being
+/// `Current`. A preparation receipt proves that this operation once created that
+/// exact directory; it does not prove that the directory is still empty, that no
+/// restore has populated it, and that no other owner has adopted or activated
+/// it. A reconciled `Current` destination is therefore only a *candidate*, and
+/// the candidate must clear four further conditions before anything is
+/// destroyed, in this order:
+///
+/// 1. **Ownership, carried into the effect.**
+///    [`reverify_recorded_destination`] returns the retained
+///    [`ProtectedRootLease`], and that lease is handed straight to
+///    [`ProtectedRootLease::into_removal_proof`]. The removal is then applied to
+///    the retained `DELETE` handle, never to a reopened name.
+/// 2. **Current custody disposition.**
+///    [`PreparationJournal::destination_custody`] must read
+///    [`DestinationCustody::Released`]; unresolved restore/cutover custody, or a
+///    sink that cannot read it, preserves the root.
+/// 3. **An owner-authorized cleanup transition.**
+///    [`CleanupTransitionState::CleanupPending`] is retained through the journal
+///    *before* the effect. A sink that refuses the transition has not authorized
+///    the reclamation, and the root is preserved.
+/// 4. **An empty root.**
+///    [`ProtectedRootRemovalProof::remove_if_empty`] is bounded to one empty
+///    directory applied to the retained handle. A populated root is reported as
+///    preserved and needs the owning cleanup protocol, not a recursive sweep.
+///
+/// [`CleanupTransitionState::Reclaimed`] is retained only after the absence has
+/// actually been observed, and an operation whose `Reclaimed` retention is
+/// refused is reported as preserved rather than removed, so [`CleanupReport`]
+/// never claims a durable state this module could not write.
 pub fn cleanup_preparations<J: PreparationJournal>(
-    journal: &J,
+    journal: &mut J,
     operation_ids: &[String],
 ) -> Result<CleanupReport, PreparationError> {
     let budget_start = Instant::now();
@@ -2328,70 +2559,97 @@ pub fn cleanup_preparations<J: PreparationJournal>(
             ));
         }
     }
-    for operation_id in &owned {
-        if !operation_ids.is_empty() && !operation_ids.contains(operation_id) {
-            continue;
-        }
+    let swept = owned
+        .iter()
+        .filter(|operation_id| operation_ids.is_empty() || operation_ids.contains(operation_id))
+        .cloned()
+        .collect::<Vec<String>>();
+    for (index, operation_id) in swept.iter().enumerate() {
         if budget_start.elapsed() >= CLEANUP_SWEEP_BUDGET {
-            // Removals already performed in THIS call are named in the refusal.
-            // Returning a bare error here would discard the only record of roots
-            // this module already deleted, which is evidence loss immediately
-            // after an irreversible effect.
-            return Err(sweep_budget_refusal(
-                "sweep_elapsed",
-                "sweep budget exhausted; the remainder is preserved for a later pass",
-            )
-            .with_removed(&report.removed));
+            // Post-effect stop. Every bound that is still reachable here is
+            // reported through the report, never through a bare `Err`: once a
+            // root has been reclaimed in this call, the record of that effect
+            // must survive whatever happens to the operations after it, and the
+            // unprocessed remainder has to be visible with it.
+            record_sweep_stop(
+                &mut report,
+                &swept[index..],
+                "sweep budget exhausted; the remainder is preserved for a later bounded pass",
+            );
+            return Ok(report);
         }
-        match reconcile_preparation(journal, operation_id)
-            .map_err(|error| note_prepare_error(OP_CLEANUP, "reconcile", error, 0))?
-        {
-            ReconcileDisposition::Current(destination) => {
-                remove_reverified_destination(operation_id, &destination, &mut report);
+        match reconcile_preparation(journal, operation_id) {
+            Ok(ReconcileDisposition::Current(destination)) => {
+                remove_reverified_destination(journal, operation_id, &destination, &mut report);
             }
-            ReconcileDisposition::Absent => {
+            Ok(ReconcileDisposition::Absent) => {
                 observe_prepare_progress(OP_CLEANUP, "sweep", "absent", 0, 0);
                 report
                     .preserved
-                    .push((operation_id.clone(), "nothing recorded".to_owned()));
+                    .push((operation_id.to_owned(), "nothing recorded".to_owned()));
             }
-            ReconcileDisposition::AdmittedWithoutResult { admission_digest } => {
+            Ok(ReconcileDisposition::AdmittedWithoutResult { admission_digest }) => {
                 // No result and no observable root: there is nothing to re-prove
                 // and nothing that may be deleted by inference. The operation is
                 // preserved, and the digest travels with the reason so the owner
                 // can prove which recorded admission is unresolved.
                 observe_prepare_progress(OP_CLEANUP, "sweep", "preserved", 0, 0);
                 report.preserved.push((
-                    operation_id.clone(),
+                    operation_id.to_owned(),
                     format!(
                         "admitted without a recorded result; outcome unknown, intent preserved \
                          (admission digest {admission_digest})"
                     ),
                 ));
             }
-            ReconcileDisposition::Uncertain { reason } => {
+            Ok(ReconcileDisposition::Uncertain { reason }) => {
                 observe_prepare_progress(OP_CLEANUP, "sweep", "preserved", 0, 0);
-                report.preserved.push((operation_id.clone(), reason));
+                report.preserved.push((operation_id.to_owned(), reason));
+            }
+            Err(error) => {
+                // A journal fault is a failure of the record this sweep is
+                // authorised by, not of one root. Roots already reclaimed in
+                // this call stay in the report and the unprocessed remainder is
+                // preserved with it, so no post-effect failure can discard the
+                // evidence of an irreversible effect.
+                let reason = note_prepare_error(OP_CLEANUP, "reconcile", error, 0).to_string();
+                record_sweep_stop(&mut report, &swept[index..], &reason);
+                return Ok(report);
             }
         }
     }
     Ok(report)
 }
 
+/// Records a stopped sweep: the operation the stop happened on keeps the stop
+/// reason, and every operation after it is preserved with one static sentence,
+/// so a partial sweep is never reported as a complete one.
+fn record_sweep_stop(report: &mut CleanupReport, remaining: &[String], reason: &str) {
+    observe_prepare_progress(OP_CLEANUP, "sweep", "stopped", 0, 0);
+    for (position, operation_id) in remaining.iter().enumerate() {
+        let recorded = if position == 0 {
+            reason.to_owned()
+        } else {
+            "sweep stopped before this operation; preserved for a later bounded pass".to_owned()
+        };
+        report.preserved.push((operation_id.clone(), recorded));
+    }
+}
+
 /// One typed refusal for a cleanup sweep that reached an explicit bound.
 ///
-/// Bound exhaustion is a refusal, not a partial success: the sweep stops, the
-/// operation after the last completed one is never reconciled or removed, and
-/// the static reason names the bound without naming a path, identity, or count.
-/// The budget facts are not observed numerically because the observation
-/// contract admits only validated generation/epoch facts, so a count or a
-/// duration is reported as this stable category plus its static field only.
+/// Bound exhaustion is a refusal, not a partial success: the sweep stops before
+/// the first irreversible effect, the operation after the last completed one is
+/// never reconciled or removed, and the static reason names the bound without
+/// naming a path, identity, or count. The budget facts are not observed
+/// numerically because the observation contract admits only validated
+/// generation/epoch facts, so a count or a duration is reported as this stable
+/// category plus its static field only.
 ///
-/// When the refusal follows removals that already happened in the same call, the
-/// caller appends those operation ids to the reason through `with_removed`. A
-/// budget error that arrived after irreversible effects must never hide which
-/// effects occurred, so the removed set travels with the refusal instead of
-/// being dropped with the local report.
+/// This is only ever produced while [`CleanupReport::removed`] is still empty.
+/// A bound reached after a reclamation is reported through the report instead
+/// ([`record_sweep_stop`]), so a refusal can never hide an effect that already
+/// happened.
 fn sweep_budget_refusal(field: &'static str, reason: &'static str) -> PreparationError {
     note_prepare_error(
         OP_CLEANUP,
@@ -2404,35 +2662,103 @@ fn sweep_budget_refusal(field: &'static str, reason: &'static str) -> Preparatio
     )
 }
 
-/// Removes one re-proven owned root, or preserves it with the reason.
+/// Reclaims one candidate destination, or preserves it with the reason.
 ///
-/// The protected-root proof is repeated here, immediately before the
-/// irreversible effect: [`reconcile_preparation`] proves the recorded root at
-/// reconcile time, and this is the last chance to notice that the object at
-/// that path is no longer the one this lane created.
-fn remove_reverified_destination(
+/// The four conditions in [`cleanup_preparations`] are decided here, in order,
+/// and each refusal is a preserved entry rather than a silent skip. The
+/// protected-root proof is taken here rather than reused from
+/// [`reconcile_preparation`], so the handle the removal is applied to is the one
+/// that was just proved.
+fn remove_reverified_destination<J: PreparationJournal>(
+    journal: &mut J,
     operation_id: &str,
     destination: &PreparedDestination,
     report: &mut CleanupReport,
 ) {
-    if let Err(error) = reverify_recorded_destination(operation_id, destination) {
-        observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
-        report
-            .preserved
-            .push((operation_id.to_owned(), error.to_string()));
+    let lease = match reverify_recorded_destination(operation_id, destination) {
+        Ok(lease) => lease,
+        Err(error) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
+            report
+                .preserved
+                .push((operation_id.to_owned(), error.to_string()));
+            return;
+        }
+    };
+    // The retained proof is carried into the removal: this is the only step
+    // where an ownership proof becomes a destructive capability, and it happens
+    // without releasing a single ancestor pin or resolving the leaf by name.
+    let proof: ProtectedRootRemovalProof = match lease.into_removal_proof() {
+        Ok(proof) => proof,
+        Err(error) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
+            let refused = protected_path_to_preparation(operation_id, &destination.root, error);
+            report
+                .preserved
+                .push((operation_id.to_owned(), refused.to_string()));
+            return;
+        }
+    };
+    if let DestinationCustody::Unresolved(reason) = journal.destination_custody(&destination.root) {
+        observe_prepare_progress(OP_CLEANUP, "custody", "preserved", 0, 0);
+        report.preserved.push((operation_id.to_owned(), reason));
         return;
     }
-    match std::fs::remove_dir_all(&destination.root) {
-        Ok(()) => {
+    if let Err(error) = journal.record_result(
+        operation_id,
+        &cleanup_transition_json(destination, CleanupTransitionState::CleanupPending),
+    ) {
+        observe_prepare_progress(OP_CLEANUP, "transition", "preserved", 0, 0);
+        report.preserved.push((
+            operation_id.to_owned(),
+            format!("no owner-authorized cleanup transition: {error}"),
+        ));
+        return;
+    }
+    match proof.remove_if_empty() {
+        Ok(ProtectedRootRemovalOutcome::Removed) => {
+            if let Err(error) = journal.record_result(
+                operation_id,
+                &cleanup_transition_json(destination, CleanupTransitionState::Reclaimed),
+            ) {
+                // The effect is real and observed, but the durable record of it
+                // could not be written. Reporting it as removed would claim a
+                // reclaimed lifecycle state that does not exist, so it is
+                // preserved with the exact gap and stays reconcilable.
+                observe_prepare_progress(OP_CLEANUP, "transition", "preserved", 0, 0);
+                report.preserved.push((
+                    operation_id.to_owned(),
+                    format!("absence observed but the reclaimed transition was refused: {error}"),
+                ));
+                return;
+            }
             observe_prepare_progress(OP_CLEANUP, "remove", "removed", 0, 0);
             report.removed.push(operation_id.to_owned());
         }
-        Err(error) => {
+        Ok(ProtectedRootRemovalOutcome::NotEmpty) => {
             observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
             report.preserved.push((
                 operation_id.to_owned(),
-                format!("removal failed, preserved: {error}"),
+                "destination is populated; only an empty preparation root may be reclaimed, and a \
+                 populated one needs the owning cleanup protocol"
+                    .to_owned(),
             ));
+        }
+        Ok(ProtectedRootRemovalOutcome::CommittedUnconfirmed) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
+            report.preserved.push((
+                operation_id.to_owned(),
+                "a delete disposition committed but the final absence could not be confirmed; \
+                 preserved and never reported as removed"
+                    .to_owned(),
+            ));
+        }
+        Err(error) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
+            let refused = protected_path_to_preparation(operation_id, &destination.root, error);
+            report
+                .preserved
+                .push((operation_id.to_owned(), refused.to_string()));
         }
     }
 }
@@ -2771,8 +3097,12 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     ///
     /// The swept set is this sink's own journal operation list; a presented id
     /// narrows that set and is refused when the journal does not own it.
-    pub fn cleanup(&self, operation_ids: &[String]) -> Result<CleanupReport, PreparationError> {
-        cleanup_preparations(&self.journal, operation_ids)
+    ///
+    /// Takes the sink mutably because reclamation retains an owner-authorized
+    /// cleanup transition around the effect; a sweep that could not write one
+    /// has no authorization to destroy anything.
+    pub fn cleanup(&mut self, operation_ids: &[String]) -> Result<CleanupReport, PreparationError> {
+        cleanup_preparations(&mut self.journal, operation_ids)
     }
 }
 
@@ -2809,6 +3139,61 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
                     .to_owned(),
             }
         }
+    }
+}
+
+/// The **owner-issued** projection of the active manifest binding, in the shape
+/// the Kernel's `DestinationManifestEvidence` producer consumes (issue #962,
+/// AUDIT-7).
+///
+/// This is a *projection of owner records*, not a second binding. The Host
+/// binding itself is the [`ApprovedGenerationRegistry`] plus the
+/// [`ApprovedGeneration`] it committed; every field below is copied out of a
+/// record that [`OwnerEvidence::inspect`] already validated, and no field is a
+/// copy of a caller value, a recomputed digest, or a default. The Kernel-side
+/// consumer names this owner as its issuer and cannot substitute for the Host
+/// binding: the two registry records stay in this crate, and a projection of
+/// three validated values is not the registry.
+///
+/// Deliberately three values and a counter. The Host roots type
+/// ([`RuntimeStateRoots`]) is never carried: the roots digest is what a restore
+/// can verify, and shipping the roots themselves would create a second readable
+/// copy of the mutable root topology on a boundary that has no other reason to
+/// hold it.
+///
+/// No credential-typed or secret-typed value is read to build it. The committed
+/// fence's `credential_receipt_digest` and `host_process_nonce_digest` are
+/// visible on a record this owner reads and are, as everywhere else in this
+/// module, deliberately not extracted (I5.13).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostManifestBinding {
+    /// The active approved manifest's own configuration digest.
+    pub manifest_digest: String,
+    /// The manifest-bound runtime roots' own digest.
+    pub roots_digest: String,
+    /// The registry CAS revision observed at inspection time.
+    pub registry_revision: u64,
+}
+
+impl HostManifestBinding {
+    /// Shape-checks the two owner-issued digests with this module's existing
+    /// 64-lowercase-hex rule.
+    ///
+    /// This is a guard on owner-issued content, exactly like
+    /// [`AuditFenceNote::validate`] inside [`OwnerEvidence::owner_audit_note`]:
+    /// the values are owner records, so a shape failure is a broken owner record
+    /// rather than an expected outcome, and it must fail here at the owner
+    /// boundary instead of after being carried into a restore. It is not a
+    /// substitute for the consumer's own comparison of these values.
+    ///
+    /// # Errors
+    ///
+    /// [`PreparationError::InvalidRequest`] naming the offending field, with the
+    /// module's static reason. The owner's own error text is never echoed.
+    pub fn validate(&self) -> Result<(), PreparationError> {
+        check_digest(&self.manifest_digest, "owner_manifest_digest")?;
+        check_digest(&self.roots_digest, "owner_roots_digest")?;
+        Ok(())
     }
 }
 
@@ -3499,6 +3884,106 @@ impl OwnerEvidence {
             Err(error) => Err(note_prepare_error(
                 OP_OWNER_EVIDENCE,
                 "purge_revision",
+                error,
+                0,
+            )),
+        }
+    }
+
+    /// Returns the **owner-issued** active-manifest binding projection the
+    /// Kernel's `DestinationManifestEvidence` is built from (issue #962,
+    /// AUDIT-7; I5.13 `full_recovery` manifest; A13.7 provenance/integrity).
+    ///
+    /// Three owner records, one value each, and no fourth:
+    ///
+    /// - `manifest_digest` is the ACTIVE approved generation's own manifest
+    ///   `config_digest` — the manifest [`OwnerEvidence::inspect`] already
+    ///   validated through its own `validate`, which proves it is a 64-hex
+    ///   digest, binds `runtime_state_roots_digest` to the launch roots, and
+    ///   agrees with the committed activation fence on generation, configuration
+    ///   digest and authority generation. It is the same value
+    ///   [`OwnerEvidence::project_backup_configuration`] hands the configuration
+    ///   projector as `binding.config_digest`, read from the same record, so a
+    ///   caller cannot present a competing configuration digest and this method
+    ///   does not re-derive one.
+    /// - `roots_digest` is the manifest-bound runtime roots' OWN `roots_digest`
+    ///   field. It is not an owner-computed summary: `RuntimeStateRoots::validate`,
+    ///   which [`OwnerEvidence::inspect`] ran on these exact roots, recomputes it
+    ///   from the nine root fields and refuses a mismatch, and the manifest's own
+    ///   `validate` independently requires
+    ///   `runtime_state_roots_digest == runtime_launch.runtime_state_roots.roots_digest`.
+    ///   So the value read here is a digest the owner proved against the roots
+    ///   it committed. The roots THEMSELVES are not carried: this projection
+    ///   crosses into a restore, and a restore needs to verify the digest, not
+    ///   to re-read the Host's mutable root topology.
+    /// - `registry_revision` is [`OwnerEvidence::revision`], the registry CAS
+    ///   revision observed at inspection time — the same observation
+    ///   `HostComposition` already compares to detect registry movement between
+    ///   inspection and use. It is deliberately NOT the purge-ledger revision,
+    ///   whose authority belongs to the backup domain and whose counter belongs
+    ///   to the ORS owner ([`OwnerEvidence::owner_purge_ledger_revision`]).
+    ///
+    /// The retained protected-root lease is **re-proved here**, not at
+    /// inspection only, by calling [`OwnerEvidence::owner_lease_ref`] and
+    /// requiring it to succeed: the same identity-plus-current-final-path proof
+    /// that accessor performs is reused rather than duplicated, so there is one
+    /// implementation of "the retained lease still pins the inspected source
+    /// root" in this module. A source root that moved or was replaced refuses
+    /// typed here rather than yielding a manifest binding read from a lineage
+    /// the rest of this chain no longer admits.
+    ///
+    /// ## What this proves, and what it does not
+    ///
+    /// PROVED: the three values are the ones this owner validated and still
+    /// holds; the retained lease still pins the same source object at the same
+    /// path; the roots digest is the digest of the roots the active manifest
+    /// binds; and the revision is a real observed registry revision, not a
+    /// placeholder.
+    ///
+    /// NOT PROVED, and deliberately not claimed:
+    ///
+    /// - the registry is NOT re-read at issue time. `OwnerEvidence::inspect`
+    ///   observed it once; this projection is a snapshot of that read, exactly
+    ///   like the audit note's. The window between inspection and issue is
+    ///   covered by the caller's own revision comparison, the same way it is for
+    ///   every other fact in this bundle — not by anything here.
+    /// - the digests are NOT recomputed. A fresh checksum here would replace the
+    ///   owner's proof with a local one, so both are read from records the
+    ///   owner's own validators checked.
+    /// - nothing about the CURRENT contents of the roots. `roots_digest` binds
+    ///   the approved root TOPOLOGY, not the bytes under those roots; a tree
+    ///   that changed under an unchanged topology leaves this value untouched.
+    /// - no destination readiness, no archive integrity, no cutover authority,
+    ///   and no restore effect of any kind.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with a static [`PreparationError`]: a stale or moved retained
+    /// lease is whatever typed error [`OwnerEvidence::owner_lease_ref`] reports
+    /// (re-proved, never re-derived here), and a digest that is not 64 lowercase
+    /// hex is [`PreparationError::InvalidRequest`] from
+    /// [`HostManifestBinding::validate`]. The outcome is observed once through
+    /// `note_prepare_error`, and no owner error text, path or record body is
+    /// echoed.
+    pub fn owner_manifest_binding(&self) -> Result<HostManifestBinding, PreparationError> {
+        let issued = (|| -> Result<HostManifestBinding, PreparationError> {
+            // The retained lease is re-proved at issue time, through the one
+            // accessor that already implements that proof. Its value is not part
+            // of this projection; the refusal it raises is the point.
+            self.owner_lease_ref()?;
+            let binding = HostManifestBinding {
+                manifest_digest: self.approved.manifest.config_digest.as_str().to_owned(),
+                roots_digest: self.runtime_roots().roots_digest.as_str().to_owned(),
+                registry_revision: self.revision(),
+            };
+            binding.validate()?;
+            Ok(binding)
+        })();
+        match issued {
+            Ok(binding) => Ok(binding),
+            Err(error) => Err(note_prepare_error(
+                OP_OWNER_EVIDENCE,
+                "manifest_binding",
                 error,
                 0,
             )),

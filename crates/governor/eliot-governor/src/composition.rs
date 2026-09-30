@@ -19,6 +19,7 @@ use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
 use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
+use crate::migration_inventory::PRODUCT_PROOF_PLAN;
 use crate::negative_memory_gate::{
     self, NegativeMemoryGateDecision, NegativeMemoryGateInput, evaluate_negative_memory_gate,
 };
@@ -32,7 +33,7 @@ use crate::owner_closure_feed::{
     synchronize_owner_feed_with_quarantine_evidence,
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
-use crate::scan_disclosure_owner::InstallationScanDisclosureStore;
+use crate::scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 use crate::scope_identity_admission::{ensure_snapshot_fresh, require_fresh_matched_binding};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
@@ -84,6 +85,7 @@ use eliot_maintenance::{
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_ors::ScanDisclosureRecordOwner;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
 use eliot_runtime_contracts::{
@@ -147,7 +149,7 @@ pub use genesis_owner_packet::{
 mod native_worker_binding;
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
-    NativeWorkerExecutableBinding, process_invocation_digest_for,
+    NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
 };
 
 /// Canonical write result kept together with the negative-memory decision
@@ -995,27 +997,125 @@ fn product_proof_execution(action: FinishLifecycleAction) -> ExecutionStatus {
     }
 }
 
+/// The exact required proof this composition's installed-route stage names.
+///
+/// The acceptance owner builds the parked stage in `eliot-finish`, and this
+/// constant is the identical text the revision here uses, so the parked record
+/// and its later revision name the same missing proof rather than drifting into
+/// two requirements an operator would read as two different gaps.
+const INSTALLED_ROUTE_REQUIRED_PROOF: &str =
+    "installed Windows route pulse executed end to end on the target generation";
+
+/// The observed installed-route stage a real finish receipt justifies.
+///
+/// A terminal succeeded position alone is NOT an installed-route observation.
+/// The acceptance owner requires an installed-route receipt, so this reads the
+/// Product Proof plan's own concrete receipt identity out of the decision's
+/// *independently derived* artifact/verifier bindings — the set
+/// `eliot-canonical` assembles from rehydrated evidence, not from this
+/// product-proof path — and compares it against the plan's expected receipt
+/// name. The decision's own digest and its own lifecycle action are the same
+/// operation being measured, so neither can stand in for the independent
+/// expected set. A finish decision that closed successfully while carrying no
+/// installed-route receipt therefore yields no observed stage at all.
+fn observed_installed_route_stage(
+    receipt: &FinishDecisionReceipt,
+) -> Option<eliot_reports::product_proof::ProductProofStageReceipt> {
+    let expected = PRODUCT_PROOF_PLAN.installed_route_receipt;
+    let observed = receipt
+        .decision
+        .proof
+        .artifact_and_verifier_bindings
+        .iter()
+        .find_map(|binding| installed_route_receipt_id(binding, expected))?;
+    Some(
+        eliot_reports::product_proof::ProductProofStageReceipt::Observed {
+            receipt_id: observed.to_owned(),
+        },
+    )
+}
+
+/// Extracts the installed-route receipt identity a binding handle names.
+///
+/// The handle is compared by content, not by shape: a binding cites the
+/// concrete receipt name the plan requires, optionally qualified by the
+/// generation or decision that produced it. Only an exact `ProductPulseReceipt`
+/// name, on its own or as a trailing segment, counts — a binding that merely
+/// contains the word is not an installed-route receipt.
+fn installed_route_receipt_id<'a>(binding: &'a str, expected: &str) -> Option<&'a str> {
+    let trimmed = binding.trim();
+    if trimmed == expected {
+        return Some(trimmed);
+    }
+    trimmed
+        .rsplit([':', '/', '@', '#'])
+        .find(|segment| segment.trim() == expected)
+}
+
 /// The installed-route stage receipt a real finish receipt justifies.
 ///
-/// An attempt that actually succeeded cites the receipt's own digest; every
-/// other position records the stage as explicitly missing, naming what the
-/// absent execution would have proven. A non-successful attempt therefore can
-/// never mark the installed route observed.
+/// The stage cites the installed-route receipt the decision actually carried —
+/// never the finish decision's own digest — so the record names the evidence
+/// that proves the stage. Every other case, including a successfully closed
+/// decision that carried no installed-route receipt, records the stage as
+/// explicitly missing and names what the absent execution would have proven. A
+/// simulated or absent launch receipt can never mark the installed route
+/// observed, and the `PASS` refusal above it is untouched.
 fn installed_route_stage(
     receipt: &FinishDecisionReceipt,
-    observed: bool,
 ) -> eliot_reports::product_proof::ProductProofStageReceipt {
-    if observed {
-        eliot_reports::product_proof::ProductProofStageReceipt::Observed {
-            receipt_id: receipt.receipt_digest.clone(),
-        }
-    } else {
-        eliot_reports::product_proof::ProductProofStageReceipt::Missing {
-            required_proof:
-                "installed Windows route pulse executed end to end on the target generation"
-                    .to_owned(),
-        }
+    match observed_installed_route_stage(receipt) {
+        Some(observed) => observed,
+        None => eliot_reports::product_proof::ProductProofStageReceipt::Missing {
+            required_proof: INSTALLED_ROUTE_REQUIRED_PROOF.to_owned(),
+        },
     }
+}
+
+/// The raw readback handles a retained finish decision actually carries.
+///
+/// The parked record must retain the evidence handles an operator needs for
+/// forensic readback, and it may not invent one: these are the decision's own
+/// derived artifact/verifier bindings, which `eliot-canonical` assembles from
+/// rehydrated evidence and `FinishDecisionReceipt::validate()` already checks
+/// for internal consistency. A decision that carries no binding therefore
+/// retains an empty handle set, which is a recorded absence rather than a
+/// fabricated log reference.
+fn product_proof_raw_log_refs(receipt: Option<&FinishDecisionReceipt>) -> Vec<String> {
+    receipt.map_or_else(Vec::new, |receipt| {
+        let mut refs = Vec::new();
+        refs.clone_from_slice(&receipt.decision.proof.artifact_and_verifier_bindings);
+        refs
+    })
+}
+
+/// Re-derives the evidence an unobserved product proof is still missing.
+///
+/// This is computed from the record's own retained stage and the plan's
+/// concrete installed-route requirement rather than carried forward from a
+/// prior revision's list, so a requirement can never be cleared by repeating
+/// the same caller list. The installed-route proof text is read back off the
+/// record's own `Missing` stage, so the two always name the same thing, and
+/// the plan's receipt requirement is added independently so an operator sees
+/// the concrete receipt that was never produced. The result is sorted, which
+/// `ProductProofStatus::validate()` independently requires.
+fn product_proof_missing_evidence(
+    previous: &eliot_reports::product_proof::ProductProofStatus,
+) -> Vec<String> {
+    let mut missing: BTreeSet<String> = previous
+        .missing_evidence
+        .iter()
+        .filter(|requirement| **requirement != INSTALLED_ROUTE_REQUIRED_PROOF)
+        .cloned()
+        .collect();
+    if !previous.retained.installed_route_observed() {
+        missing.insert(INSTALLED_ROUTE_REQUIRED_PROOF.to_owned());
+        missing.insert(format!(
+            "{} receipt bound to the installed route (expected by the Product Proof plan {})",
+            PRODUCT_PROOF_PLAN.installed_route_receipt, PRODUCT_PROOF_PLAN.plan_path
+        ));
+    }
+    missing.into_iter().collect()
 }
 
 /// Errors raised before daemon readiness.
@@ -1030,6 +1130,15 @@ pub enum CompositionError {
     /// Durable recovery did not prove the complete owner set.
     #[error("Governor recovery failed: {0}")]
     Recovery(String),
+    /// Installation-bound scan disclosure refused an attach trigger's
+    /// completion with its exact owner cause preserved (issue #2900 B6).
+    ///
+    /// Missing, inaccessible, corrupt, replaced, stale, invalidated,
+    /// conflicted or unknown-commit scan records block completed readiness
+    /// here instead of collapsing into a recovery string, so the caller can
+    /// tell a lost record from a replaced one without re-reading the owner.
+    #[error(transparent)]
+    ScanDisclosure(#[from] WorkScopeError),
     /// Material readiness denied one effect with its exact receipt, directive,
     /// and missing-input details preserved for the caller.
     #[error(
@@ -4465,6 +4574,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         skill_id: &str,
         skill_revision: &str,
         package_digest: &str,
+        ingest_attempt_id: &str,
         entry: &eliot_skill::SkillCatalogueEntry,
         executions: &[eliot_skill::SkillExecutionEvidence],
     ) -> Result<SkillLifecycleView, eliot_skill::SkillError> {
@@ -4472,6 +4582,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             skill_id,
             skill_revision,
             package_digest,
+            ingest_attempt_id,
             entry,
             executions,
         )
@@ -4968,12 +5079,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let observed = receipts
             .iter()
             .find(|receipt| receipt.decision.outcome == FinishDecisionOutcome::VerifiedComplete);
+        // The readback handles are bound to a local first: the stage inputs
+        // borrow them, so the record must not hold a reference into a
+        // temporary that ends with this statement.
+        let raw_log_refs = product_proof_raw_log_refs(observed);
         let inputs = eliot_finish::product_proof::ProductProofStageInputs {
             finish_authority_ref: &finish_authority_ref,
             proof_ceiling: PRODUCT_PROOF_CEILING,
             decision_receipt_digest: observed.map(|receipt| receipt.receipt_digest.as_str()),
             runtime_receipt_ref: None,
-            raw_log_refs: &[],
+            raw_log_refs: &raw_log_refs,
             executable: Some(executable),
             environment: Some(environment),
         };
@@ -5025,7 +5140,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         CompositionError,
     > {
         let execution = product_proof_execution(receipt.lifecycle_action);
-        let observed = execution == ExecutionStatus::Succeeded;
+        // The installed-route stage is observed only when the decision actually
+        // carries the plan's installed-route receipt, NOT merely because it
+        // closed as completed. A succeeded position without that receipt leaves
+        // the stage missing, so a simulated absent launch receipt can never be
+        // rolled up as `PASS`.
+        let installed_route = installed_route_stage(receipt);
+        let observed = installed_route.is_observed();
         let outcome = eliot_finish::product_proof::outcome_of_decision(&receipt.decision);
         let attempt = match eliot_finish::product_proof::failure_class_of_execution(execution) {
             Some(failure_class) => {
@@ -5049,6 +5170,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ),
         }
         .map_err(product_proof_error)?;
+        // The installed-route receipt identity is read once, here, before the
+        // stage receipt is moved into the retained record below, so the live
+        // evidence below cites the same value rather than a recomputed one.
+        let observed_receipt_id = match &installed_route {
+            eliot_reports::product_proof::ProductProofStageReceipt::Observed { receipt_id } => {
+                Some(receipt_id.clone())
+            }
+            eliot_reports::product_proof::ProductProofStageReceipt::Missing { .. } => None,
+        };
         // The retained evidence is rebuilt from this same record's identities
         // plus the receipt's own raw-log handles, so the revision never drops a
         // previously retained fact and never invents one.
@@ -5057,22 +5187,37 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             executable: previous.retained.executable.clone(),
             environment: previous.retained.environment.clone(),
             stage_receipts: eliot_reports::product_proof::ProductProofStageReceipts {
-                installed_route: installed_route_stage(receipt, observed),
+                installed_route,
             },
         };
+        // The still-missing evidence is recomputed from this record's own state
+        // and the plan's concrete requirement, not copied from the prior
+        // revision's list. Copying the same caller list forward would let an
+        // attempt "clear" the requirement without ever satisfying it; here an
+        // unobserved installed route always re-derives the exact proof that is
+        // still absent. A record whose installed route is observed clears the
+        // list only because this same call established that observation.
         let missing_evidence = if observed {
             Vec::new()
         } else {
-            previous.missing_evidence.clone()
+            product_proof_missing_evidence(previous)
         };
         let live_evidence = if observed {
+            // The live evidence cites the *installed-route* receipt identity the
+            // decision carried, not the finish decision's own digest, so the
+            // evidence bound to the product property is the one that actually
+            // proves it. The revision still binds to the exact retained finish
+            // bytes, so the digest is computed from content, never supplied.
+            let receipt_id = observed_receipt_id
+                .clone()
+                .ok_or_else(|| product_proof_error("product proof stage receipt disappeared"))?;
             vec![
                 eliot_reports::product_proof::ProductProofEvidence::new(
                     eliot_reports::product_proof::ProductProofEvidenceDomain::Runtime,
-                    format!("installed-route-receipt:{}", receipt.receipt_digest),
+                    format!("installed-route-receipt:{receipt_id}"),
                     format!(
-                        "installed route attempt {} produced finish receipt {}",
-                        receipt.decision_id, receipt.decision_id
+                        "installed route attempt {} produced the installed-route receipt {receipt_id}",
+                        receipt.decision_id
                     ),
                     eliot_reports::projection::ReportInputRevision::new(
                         eliot_reports::projection::ReportInputSource::ProductSupport,
@@ -6132,6 +6277,61 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
+    /// Maps a cold-start driver failure to its typed composition cause
+    /// (issue #2900 B6).
+    ///
+    /// A compilation failure already carries its typed [`WorkScopeError`]
+    /// owner cause — including the scan receipt missing/inaccessible/corrupt/
+    /// replaced states that block completed readiness — so it travels
+    /// unchanged instead of collapsing into a recovery string. A lease
+    /// refusal has no owner cause and keeps the existing recovery string.
+    fn cold_start_driver_error(error: eliot_workscope::CompileDriverError) -> CompositionError {
+        match error {
+            eliot_workscope::CompileDriverError::Compile(inner) => inner.into(),
+            eliot_workscope::CompileDriverError::Lease(_) => {
+                CompositionError::Recovery(error.to_string())
+            }
+        }
+    }
+
+    /// Binds the installation-owned durable scan disclosure store (issue
+    /// #2900, defect D + W12 construction ingress).
+    ///
+    /// The installation/session owner admits the contour (installation
+    /// identity plus admitted ORS object and generation) and supplies the
+    /// canonical Store/ORS owner handle; this entry only admits the binding
+    /// and maps it into [`InstallationScanDisclosureStore`]. The adapter owns
+    /// no filesystem, takes no paths, launches no processes and makes no
+    /// model calls. The bound store is the exact port
+    /// [`Self::run_cold_start_trigger_scan`] takes before
+    /// [`BootstrapScanner::scan`]: no trigger scan completes without the
+    /// owner receipt, and the live terminal readiness receipt references the
+    /// durable scan handle through
+    /// [`Self::compile_cold_start_at_trigger`]'s `scan_receipt`.
+    ///
+    /// Caller: STITCH. The canonical owner handle lives with the Kernel
+    /// installation owner (`RedbRecoveryStore::open` in
+    /// `bins/eliot-kernel/src/composition_bootstrap.rs` implements
+    /// `ScanDisclosureRecordOwner`); no live Governor/`eliotd` producer
+    /// threads that handle to this entry yet, so no live attach ingress
+    /// constructs the store today. A malformed contour fails closed without
+    /// touching the durable owner.
+    pub fn bind_installation_scan_store(
+        installation_id: &str,
+        ors_object_ref: &str,
+        ors_generation: u64,
+        owner: std::sync::Arc<dyn ScanDisclosureRecordOwner>,
+    ) -> Result<InstallationScanDisclosureStore, CompositionError> {
+        let contour = InstallationScanContour::bind(
+            installation_id.to_owned(),
+            ors_object_ref.to_owned(),
+            ors_generation,
+        )
+        .map_err(CompositionError::ScanDisclosure)?;
+        InstallationScanDisclosureStore::bind(contour, owner)
+            .map_err(CompositionError::ScanDisclosure)
+    }
+
     /// Runs one I4.4.1 cold-start trigger's discovery pass through the
     /// privacy-bounded scanner (issue #1790, cold-start trigger production
     /// caller; issue #2900, installation-bound durable owner).
@@ -6149,7 +6349,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// only then does [`BootstrapScanner::scan`] run and durably persist the
     /// receipt through the owner. No trigger reaches the scanner past an
     /// unadmitted or unattested read, and no trigger scan completes without
-    /// the owner receipt.
+    /// the owner receipt. A completed outcome is additionally replayed
+    /// through the same owner before return: the persisted handle is read
+    /// back under the same binding and its receipt identity is compared
+    /// against this operation's receipt, so a missing, inaccessible,
+    /// corrupt, replaced, stale, invalidated or unknown-commit record
+    /// surfaces its typed [`WorkScopeError`] cause through
+    /// [`CompositionError::ScanDisclosure`] instead of a completed outcome
+    /// (issue #2900 B2/B6).
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the scanner inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
@@ -6173,11 +6380,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_refs: Vec<String>,
         now: u64,
     ) -> Result<BootstrapScanOutcome, CompositionError> {
-        ColdStartController::run_trigger_scan(
+        let outcome = ColdStartController::run_trigger_scan(
             trigger,
             discovery_lease,
             lease_key,
-            store,
+            &mut *store,
             binding,
             candidate_privacy,
             privacy_boundary,
@@ -6188,7 +6395,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             governing_source_refs,
             now,
         )
-        .map_err(|error| CompositionError::Recovery(error.to_string()))
+        .map_err(Self::cold_start_driver_error)?;
+        match &outcome {
+            BootstrapScanOutcome::Completed { persisted, .. } => {
+                persisted
+                    .validate()
+                    .map_err(CompositionError::ScanDisclosure)?;
+                let replayed =
+                    eliot_workscope::ScanDisclosureStore::readback(store, persisted, binding)
+                        .map_err(CompositionError::ScanDisclosure)?;
+                if replayed.scan_ref != persisted.receipt_ref {
+                    return Err(CompositionError::ScanDisclosure(
+                        WorkScopeError::ScanReceiptReplaced,
+                    ));
+                }
+            }
+            BootstrapScanOutcome::PrivacyBoundaryRequired { .. } => {}
+        }
+        Ok(outcome)
     }
 
     /// Quarantines one loose `scan-disclosure-*.json` capture left by the
@@ -6207,7 +6431,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<LooseScanQuarantine, CompositionError> {
         store
             .quarantine_loose_capture(file_name, bytes)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(CompositionError::ScanDisclosure)
     }
 
     /// Joins one I4.4.1 trigger to the retained cold-start single-flight
@@ -6270,18 +6494,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// [`ColdStartController::compile`] before the first scope-sensitive work
     /// and publishes it as the lease terminal, so compatible concurrent
     /// attaches receive the same receipt and no worker independently creates
-    /// a second `WorkScope` or "latest task" while the lease is active. A
-    /// supplied scan handle binds the terminal receipt to the exact durable
-    /// scan receipt that fed the compilation; without one the scan evidence
-    /// reference stays explicitly empty, never an in-memory or loose-file
-    /// fallback. An
+    /// a second `WorkScope` or "latest task" while the lease is active. The
+    /// terminal receipt always references the exact durable scan receipt
+    /// that fed the compilation: the caller supplies the installation-bound
+    /// scan store, the owner binding admitted for this trigger, and the
+    /// durable handle the trigger scan returned, and this entry reads the
+    /// handle back through the owner before compiling. A missing handle, or
+    /// a missing, inaccessible, corrupt, replaced, stale, invalidated or
+    /// unknown-commit record, fails with its typed [`WorkScopeError`] cause
+    /// through [`CompositionError::ScanDisclosure`] and never produces a
+    /// terminal receipt — there is no in-memory-only or loose-file fallback,
+    /// and an absent scan reference is never compiled as empty (issue #2900
+    /// W12/B2/B6). An
     /// already-terminal lease returns its `JoinedTerminal` surface without
     /// recompiling; a lease owned by an in-flight trigger returns `Joined`
     /// without a second compilation.
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the compilation inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery or onboarding lease).
+    /// discovery or onboarding lease). Caller: STITCH.
     #[allow(
         clippy::too_many_arguments,
         reason = "cold-start compilation joins every frozen receipt field in one owner-checked entry"
@@ -6313,11 +6544,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan_store: &InstallationScanDisclosureStore,
+        scan_binding: &ScanDisclosureOwnerBinding,
         scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
     ) -> Result<LeaseJoin, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
+        }
+        let scan_handle = scan_receipt.ok_or(CompositionError::ScanDisclosure(
+            WorkScopeError::ScanReceiptMissing,
+        ))?;
+        let replayed =
+            eliot_workscope::ScanDisclosureStore::readback(scan_store, scan_handle, scan_binding)
+                .map_err(CompositionError::ScanDisclosure)?;
+        if replayed.scan_ref != scan_handle.receipt_ref {
+            return Err(CompositionError::ScanDisclosure(
+                WorkScopeError::ScanReceiptReplaced,
+            ));
         }
         self.cold_start
             .compile_and_publish(
@@ -6346,10 +6590,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 projection_generation,
                 privacy,
                 task,
-                scan_receipt,
+                Some(scan_handle),
                 now,
             )
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(Self::cold_start_driver_error)
     }
 
     /// Projects the retained terminal cold-start surface for one exact lease
@@ -6897,6 +7141,30 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(())
     }
 
+    fn validate_native_binding_facet_and_catalog(
+        &self,
+        facet_manifest_ref: &str,
+        module_catalog_revision: u64,
+    ) -> Result<String, CompositionError> {
+        let canonical_facet_ref = native_worker_binding::canonical_native_worker_facet_ref()
+            .map_err(CompositionError::Recovery)?;
+        if facet_manifest_ref != canonical_facet_ref {
+            return Err(CompositionError::Recovery(
+                "native binding facet manifest ref does not match the canonical ELIOT native-worker facet ref"
+                    .to_owned(),
+            ));
+        }
+        // A catalog change requires new admission; a stale caller cannot
+        // refresh this binding against its own revision.
+        if module_catalog_revision != self.owners.module_registry.revision() {
+            return Err(CompositionError::Recovery(
+                "native binding catalog revision is not the live Module Catalog revision"
+                    .to_owned(),
+            ));
+        }
+        Ok(canonical_facet_ref)
+    }
+
     /// Publishes one versioned Governor-owned executable binding projection
     /// (T9-01 M1, `T9.md` 3.2) for a registered native-worker attempt.
     ///
@@ -6918,13 +7186,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// This method performs no transport: the caller commits a sibling
     /// `PreparedTransition` through the existing `commit_canonical` path and
     /// correlates by `operation_id` / `canonical_request_hash` / `state_fence`.
-    /// The admitted capability cell and Module Catalog revision are required
-    /// caller-supplied owner inputs; this method does not infer either value.
+    /// The admitted capability cell, Module Catalog revision and
+    /// `NativeWorkerLifecycleBinding` are required caller-supplied owner
+    /// inputs; this method does not infer or refresh those values.
     /// The supplied revision must equal the live `module_registry` revision at
     /// publish: a binding is compiled against the current catalog, never a
     /// stale one (Implements #22 W1). A catalog change makes the binding
     /// stale; it needs a new admission, never a local repair.
     /// All parameters are required; blank or malformed input fails closed.
+    /// `facet_manifest_ref` must match the canonical ELIOT-owned native-worker
+    /// facet contract exactly; Governor does not accept a caller-invented ref.
     #[allow(
         clippy::too_many_arguments,
         reason = "M1 binding joins every T9.md 3.2 denominator field in one versioned projection"
@@ -6963,6 +7234,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         effective_ceiling: eliot_store_api::EffectClass,
         credential_refs: Vec<String>,
         resource_refs: Vec<String>,
+        lifecycle_binding: NativeWorkerLifecycleBinding,
         replay_stream_id: &str,
         launch_nonce: &str,
         process_invocation_digest: &str,
@@ -6977,6 +7249,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
+        let canonical_facet_ref = self.validate_native_binding_facet_and_catalog(
+            facet_manifest_ref,
+            module_catalog_revision,
+        )?;
         let fence = self.snapshot.state_fence();
         let authority_epoch = self.snapshot.authority_epoch.clone();
         let generation = self.snapshot.generation;
@@ -7006,17 +7282,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             route_ref,
             work_scope_id,
         )?;
-        // Catalog-revision pin (Implements #22 W1): the binding is compiled
-        // against the admitted Module Catalog revision, so the supplied
-        // revision must equal the live `module_registry` revision at publish.
-        // A stale revision fails closed as `Recovery`; the owner advances the
-        // revision through a new admission, never a local repair here.
-        if module_catalog_revision != self.owners.module_registry.revision() {
-            return Err(CompositionError::Recovery(
-                "native binding catalog revision is not the live Module Catalog revision"
-                    .to_owned(),
-            ));
-        }
         let mut binding = NativeWorkerExecutableBinding {
             claim_id: claim_id.to_owned(),
             registration_id: registration_id.to_owned(),
@@ -7032,6 +7297,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             session_id: session_id.to_owned(),
             worker_generation,
             process_tree_id: process_tree_id.to_owned(),
+            job_object_lineage_ref: lifecycle_binding.job_object_lineage_ref,
             process_generation,
             process_fence: process_fence.to_owned(),
             route_ref: route_ref.to_owned(),
@@ -7041,12 +7307,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             config_digest: config_digest.to_owned(),
             protocol_digest: protocol_digest.to_owned(),
             command_ref: command_ref.to_owned(),
-            facet_manifest_ref: facet_manifest_ref.to_owned(),
+            facet_manifest_ref: canonical_facet_ref,
             capability_cell,
             introduction_refs,
             supporting_grant_refs,
             grant_graph_revision,
             module_catalog_revision,
+            capability_cell_registry_digest: lifecycle_binding.capability_cell_registry_digest,
+            kernel_execution_manifest_digest: lifecycle_binding.kernel_execution_manifest_digest,
+            resource_limits_digest: lifecycle_binding.resource_limits_digest,
+            cancellation_policy_ref: lifecycle_binding.cancellation_policy_ref,
+            checkpoint_policy_digest: lifecycle_binding.checkpoint_policy_digest,
+            drain_policy_ref: lifecycle_binding.drain_policy_ref,
+            restart_policy_digest: lifecycle_binding.restart_policy_digest,
             effective_ceiling,
             credential_refs,
             resource_refs,
@@ -7127,6 +7400,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         effective_ceiling: eliot_store_api::EffectClass,
         credential_refs: Vec<String>,
         resource_refs: Vec<String>,
+        lifecycle_binding: NativeWorkerLifecycleBinding,
         replay_stream_id: &str,
         launch_nonce: &str,
         process_invocation: &serde_json::Value,
@@ -7173,6 +7447,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             effective_ceiling,
             credential_refs,
             resource_refs,
+            lifecycle_binding,
             replay_stream_id,
             launch_nonce,
             &derived,
@@ -11505,6 +11780,16 @@ mod tests {
                 eliot_store_api::EffectClass::ReversibleMutation,
                 vec!["cred-1".to_owned()],
                 vec!["res-1".to_owned()],
+                NativeWorkerLifecycleBinding {
+                    capability_cell_registry_digest: "5".repeat(64),
+                    kernel_execution_manifest_digest: "9".repeat(64),
+                    job_object_lineage_ref: "job-lineage-1".to_owned(),
+                    resource_limits_digest: "8".repeat(64),
+                    cancellation_policy_ref: "cancel-policy-1".to_owned(),
+                    checkpoint_policy_digest: "7".repeat(64),
+                    drain_policy_ref: "drain-policy-1".to_owned(),
+                    restart_policy_digest: "6".repeat(64),
+                },
                 "stream-1",
                 "0123456789abcdef",
                 invocation,

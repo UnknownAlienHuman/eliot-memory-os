@@ -542,16 +542,33 @@ static GET_AUTHORITY_REVOCATION_HISTORY_PARAMETERS: [ParameterDeclaration; 2] = 
 /// Owner-approved canonical-erasure fields for the explicit user-requested
 /// `ApplyErasure` named transaction (issue #1712, built by
 /// `erasure_admission::admit_erasure_transition`): the exact admitted target
-/// `subject`, the canonical surface denominator `surfaces` (sorted,
+/// `subject`, the exact `payload_ref` and `encryption_key_ref` identities the
+/// erasure is bound to, the exact `erasure_deadline_unix_ms` deadline
+/// identity, the canonical surface denominator `surfaces` (sorted,
 /// comma-joined handler-surface names; closed-enum membership is enforced at
 /// dispatch), the explicit user `reason`, the user-initiated `requester`
 /// identity handle, and the stable `erasure_operation_id` binding the
 /// recorded intent to its execution and receipt. Automatic
 /// maintenance/curation/Dreamer/scheduler paths furnish no reason, requester,
 /// or approval handles, so they can never satisfy this contract.
-static APPLY_ERASURE_PARAMETERS: [ParameterDeclaration; 5] = [
+static APPLY_ERASURE_PARAMETERS: [ParameterDeclaration; 8] = [
     ParameterDeclaration {
         name: "subject",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "payload_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "encryption_key_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "erasure_deadline_unix_ms",
         shape: ParameterShape::Subject,
         required: true,
     },

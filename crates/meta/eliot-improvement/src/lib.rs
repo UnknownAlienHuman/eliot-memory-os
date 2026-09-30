@@ -11,6 +11,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::candidate_bounds::canonical_evidence_lineage;
+
 pub mod application_class;
 pub mod brief;
 pub mod budget_proof;
@@ -101,6 +103,27 @@ pub enum ImprovementSurface {
     Scheduler,
 }
 
+impl ImprovementSurface {
+    /// The closed `snake_case` name, identical to the `Serialize` spelling.
+    ///
+    /// Total and allocation-free, so a value that participates in a content
+    /// digest (see [`ImprovementCandidate::derive_candidate_id`]) names the
+    /// surface without restating a literal that a variant rename could
+    /// desynchronize from the wire spelling.
+    #[must_use]
+    pub const fn closed_name(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Skill => "skill",
+            Self::ToolProfile => "tool_profile",
+            Self::Rule => "rule",
+            Self::PacketCompiler => "packet_compiler",
+            Self::Verifier => "verifier",
+            Self::Scheduler => "scheduler",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateState {
@@ -153,6 +176,78 @@ impl ImprovementLifecycle {
                 | Self::Archived
         )
     }
+
+    /// The promoting dispositions of the I12.24:70 pipeline step
+    /// "→ promote, narrow, rollback or archive →".
+    ///
+    /// `Supported` is "promote" and `Narrowed` is "narrow"; `RolledBack` and
+    /// `Archived` are the other two dispositions in that same step and are not
+    /// promotions. I12.24:76 makes these two the only dispositions a
+    /// replay-only record can never reach, so every transition INTO one of them
+    /// is gated by
+    /// [`require_matched_budget_for_promotion`](crate::budget_proof::require_matched_budget_for_promotion).
+    pub fn is_promoting_disposition(self) -> bool {
+        matches!(self, Self::Supported | Self::Narrowed)
+    }
+}
+
+/// The complete owner-decision lifecycle edge table (I12.24:36-37).
+///
+/// Held as one free function so both transition entry points — the
+/// ungated [`ImprovementCandidate::transition_lifecycle`] and the
+/// budget-gated [`ImprovementCandidate::promote_lifecycle`] — validate the
+/// exact same edges, and so no entry point can hold a divergent copy of the
+/// table that decides legality.
+fn lifecycle_edge_allowed(from: ImprovementLifecycle, to: ImprovementLifecycle) -> bool {
+    matches!(
+        (from, to),
+        (
+            ImprovementLifecycle::Proposed,
+            ImprovementLifecycle::Triaged
+        ) | (
+            ImprovementLifecycle::Triaged,
+            ImprovementLifecycle::AcceptedForExperiment
+        ) | (
+            ImprovementLifecycle::AcceptedForExperiment,
+            ImprovementLifecycle::Running
+        ) | (
+            ImprovementLifecycle::Running,
+            ImprovementLifecycle::Supported
+        ) | (
+            ImprovementLifecycle::Running,
+            ImprovementLifecycle::Narrowed
+        ) | (
+            ImprovementLifecycle::Running,
+            ImprovementLifecycle::Rejected
+        ) | (
+            ImprovementLifecycle::Running,
+            ImprovementLifecycle::RolledBack
+        ) | (
+            ImprovementLifecycle::Triaged,
+            ImprovementLifecycle::Rejected
+        ) | (
+            ImprovementLifecycle::Proposed,
+            ImprovementLifecycle::Rejected
+        ) | (ImprovementLifecycle::Proposed, ImprovementLifecycle::Stale)
+            | (ImprovementLifecycle::Triaged, ImprovementLifecycle::Stale)
+            | (
+                ImprovementLifecycle::Narrowed,
+                ImprovementLifecycle::Archived
+            )
+            | (
+                ImprovementLifecycle::Supported,
+                ImprovementLifecycle::Archived
+            )
+            | (
+                ImprovementLifecycle::Rejected,
+                ImprovementLifecycle::Archived
+            )
+            | (
+                ImprovementLifecycle::RolledBack,
+                ImprovementLifecycle::Archived
+            )
+            | (ImprovementLifecycle::Stale, ImprovementLifecycle::Archived)
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -233,11 +328,30 @@ impl ImprovementCandidate {
         baseline_metrics: BTreeMap<String, f64>,
     ) -> Result<Self, ImprovementError> {
         let now = OffsetDateTime::now_utc();
-        let candidate = Self {
-            candidate_id: Uuid::now_v7().to_string(),
-            project_id: project_id.into(),
+        let project_id = project_id.into();
+        let proposed_change = proposed_change.into();
+        // Content-derived identity (I12.24:20-38, W3). The id is a digest over
+        // the project, the target surface, the proposed change, both scope-rule
+        // sets and the CANONICAL evidence lineage, so the same lineage always
+        // yields the same candidate identity. A fresh random id per pass made
+        // lineage deduplication unreachable and minted a new durable record key
+        // on every repeat — the opposite of "deduplicated by target surface and
+        // evidence lineage". Two different lineages still differ, so this never
+        // collapses two different problems onto one candidate.
+        let candidate_id = Self::derive_candidate_id(
+            &project_id,
             target_surface,
-            proposed_change: proposed_change.into(),
+            &proposed_change,
+            &applies_when,
+            &does_not_apply_when,
+            &source_trace_refs,
+            &evidence_refs,
+        );
+        let candidate = Self {
+            candidate_id,
+            project_id,
+            target_surface,
+            proposed_change,
             applies_when,
             does_not_apply_when,
             source_trace_refs,
@@ -317,6 +431,58 @@ impl ImprovementCandidate {
         Ok(())
     }
 
+    /// Derives the stable candidate identity from candidate CONTENT.
+    ///
+    /// The digest covers the fields that decide WHICH improvement this is —
+    /// project, target surface, proposed change, the applies/does-not-apply
+    /// scope rules, the source trace and the canonical evidence lineage — and
+    /// nothing that varies per pass or per owner action. `created_at`,
+    /// `updated_at`, `revision` and `lifecycle` are deliberately excluded, so
+    /// re-observing the same evidence under the same change yields the same
+    /// id and the lineage merge in `BoundedBacklog::admit_reporting_pressure`
+    /// becomes reachable in production.
+    ///
+    /// Component boundaries are length-prefixed rather than concatenated, so no
+    /// two different field splittings can produce the same digest input.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one hashed component per identity field; the point is the digest input, not the arity"
+    )]
+    fn derive_candidate_id(
+        project_id: &str,
+        target_surface: ImprovementSurface,
+        proposed_change: &str,
+        applies_when: &[String],
+        does_not_apply_when: &[String],
+        source_trace_refs: &[String],
+        evidence_refs: &[String],
+    ) -> String {
+        let mut hasher = Hasher::new();
+        let mut component = |value: &str| {
+            hasher.update(&(value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        };
+        component(project_id.trim());
+        component(target_surface.closed_name());
+        component(proposed_change.trim());
+        for rule in applies_when {
+            component(rule.trim());
+        }
+        for rule in does_not_apply_when {
+            component(rule.trim());
+        }
+        for reference in source_trace_refs {
+            component(reference.trim());
+        }
+        // The lineage is canonicalised (sorted, deduplicated, blank-free) so two
+        // orderings of the same refs are ONE identity, matching the comparison
+        // `BoundedBacklog` already performs on admission.
+        for reference in canonical_evidence_lineage(evidence_refs) {
+            component(&reference);
+        }
+        format!("cand-{}", hasher.finalize().to_hex())
+    }
+
     /// Base structural checks that hold for every candidate, including
     /// freshly constructed ones whose I12.24 decision details are attached
     /// later via [`Self::set_details`].
@@ -388,60 +554,73 @@ impl ImprovementCandidate {
     /// `CandidateState` machine is untouched; lifecycle transitions only
     /// refresh `updated_at` and never touch `revision`, so pipeline guards
     /// keep their exact semantics.
+    ///
+    /// This entry point carries every NON-promoting disposition of the I12.24:70
+    /// step "→ promote, narrow, rollback or archive →": triage, experiment
+    /// acceptance, experiment start, rejection, rollback, staleness, and every
+    /// archival closure. It cannot promote. `Supported` and `Narrowed` are the
+    /// promoting dispositions, and I12.24:76 states the guarantee on the move
+    /// INTO them — "Replay-only evidence cannot promote… An unmatched ledger or
+    /// inconclusive complexity delta cannot promote the candidate merely because
+    /// replay or a local metric improved" — so a caller reaching one of them
+    /// here is refused with a typed
+    /// [`ImprovementError::BudgetGateViolation`] and must use
+    /// [`ImprovementCandidate::promote_lifecycle`], which is the only seam that
+    /// admits a budget record. The gate therefore lives on the transition to
+    /// promotion itself, not only on the intake path.
     pub fn transition_lifecycle(
         &mut self,
         next: ImprovementLifecycle,
     ) -> Result<(), ImprovementError> {
-        let allowed = matches!(
-            (self.lifecycle, next),
-            (
-                ImprovementLifecycle::Proposed,
-                ImprovementLifecycle::Triaged
-            ) | (
-                ImprovementLifecycle::Triaged,
-                ImprovementLifecycle::AcceptedForExperiment
-            ) | (
-                ImprovementLifecycle::AcceptedForExperiment,
-                ImprovementLifecycle::Running
-            ) | (
-                ImprovementLifecycle::Running,
-                ImprovementLifecycle::Supported
-            ) | (
-                ImprovementLifecycle::Running,
-                ImprovementLifecycle::Narrowed
-            ) | (
-                ImprovementLifecycle::Running,
-                ImprovementLifecycle::Rejected
-            ) | (
-                ImprovementLifecycle::Running,
-                ImprovementLifecycle::RolledBack
-            ) | (
-                ImprovementLifecycle::Triaged,
-                ImprovementLifecycle::Rejected
-            ) | (
-                ImprovementLifecycle::Proposed,
-                ImprovementLifecycle::Rejected
-            ) | (ImprovementLifecycle::Proposed, ImprovementLifecycle::Stale)
-                | (ImprovementLifecycle::Triaged, ImprovementLifecycle::Stale)
-                | (
-                    ImprovementLifecycle::Narrowed,
-                    ImprovementLifecycle::Archived
-                )
-                | (
-                    ImprovementLifecycle::Supported,
-                    ImprovementLifecycle::Archived
-                )
-                | (
-                    ImprovementLifecycle::Rejected,
-                    ImprovementLifecycle::Archived
-                )
-                | (
-                    ImprovementLifecycle::RolledBack,
-                    ImprovementLifecycle::Archived
-                )
-                | (ImprovementLifecycle::Stale, ImprovementLifecycle::Archived)
-        );
-        if !allowed {
+        if next.is_promoting_disposition() && lifecycle_edge_allowed(self.lifecycle, next) {
+            return Err(ImprovementError::BudgetGateViolation(
+                "promote or narrow requires a matched budget-equivalence ledger and \
+                 conclusive complexity-economics delta; use promote_lifecycle",
+            ));
+        }
+        self.apply_lifecycle_edge(next)
+    }
+
+    /// Move the candidate to a promoting disposition under the I12.24:76 gate.
+    ///
+    /// `next` must be `Supported` ("promote") or `Narrowed` ("narrow"); every
+    /// other disposition is the ungated [`Self::transition_lifecycle`], which
+    /// refuses the two promoting values outright. `proof` is required by
+    /// signature — there is no form of this call that omits the budget record —
+    /// and it is judged solely by
+    /// [`require_matched_budget_for_promotion`](crate::budget_proof::require_matched_budget_for_promotion),
+    /// the single owner of the matched-budget decision: this method adds no
+    /// check, revalidation, or digest of its own. A replay-only candidate
+    /// therefore cannot be promoted or narrowed, and cannot reach either
+    /// disposition by any other route, because no other seam accepts them.
+    ///
+    /// Fails closed and validate-then-commit: the lifecycle is left at its
+    /// previous value when the edge is illegal or the gate refuses, so a
+    /// refused promotion is never half-applied.
+    pub fn promote_lifecycle(
+        &mut self,
+        next: ImprovementLifecycle,
+        proof: &BudgetProof,
+    ) -> Result<(), ImprovementError> {
+        if !next.is_promoting_disposition() {
+            return Err(ImprovementError::BudgetGateViolation(
+                "the budget gate admits only the promote and narrow dispositions",
+            ));
+        }
+        if !lifecycle_edge_allowed(self.lifecycle, next) {
+            return Err(ImprovementError::InvalidLifecycleTransition {
+                from: self.lifecycle,
+                to: next,
+            });
+        }
+        require_matched_budget_for_promotion(Some(proof))?;
+        self.apply_lifecycle_edge(next)
+    }
+
+    /// Commit one validated lifecycle edge. Both entry points reach this only
+    /// after the edge is legal under [`lifecycle_edge_allowed`].
+    fn apply_lifecycle_edge(&mut self, next: ImprovementLifecycle) -> Result<(), ImprovementError> {
+        if !lifecycle_edge_allowed(self.lifecycle, next) {
             return Err(ImprovementError::InvalidLifecycleTransition {
                 from: self.lifecycle,
                 to: next,

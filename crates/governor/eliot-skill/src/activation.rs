@@ -16,9 +16,9 @@ use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DependencyVersion, ExecutionOutcome, LifecycleAction, LifecycleCounters, SkillCatalogueEntry,
-    SkillError, SkillExecutionEvidence, SkillInteractionView, SkillLifecycleView, SkillRef,
-    SkillScope, SkillStatus, digest, text, unique,
+    DependencyVersion, ExecutionOutcome, LifecycleAction, LifecycleCounters, LiveSkillWorld,
+    SkillCatalogueEntry, SkillError, SkillExecutionEvidence, SkillInteractionView,
+    SkillLifecycleView, SkillRef, SkillScope, SkillStatus, digest, text, unique,
 };
 
 /// How retrieval of the Skill for one attempt was observed.
@@ -419,13 +419,19 @@ pub struct ResolvedOutcome {
 /// * the attempt must show observed activation, and
 /// * adherence must combine to [`SkillAdherenceStatus::Followed`], and
 /// * at least one of the receipt's presented `verified_outcome_refs` must
-///   resolve to an owner record that itself validates.
+///   resolve to an owner record that itself validates, and
+/// * that record's owner-stamped observation binding must name this exact
+///   Skill, this exact subject attempt and this exact fence: a real verifier
+///   record filed for an unrelated attempt, Skill or fence is insufficient
+///   (issue #2663, I7.25/I12.24). A pre-binding row, which carries no stamp,
+///   can never satisfy this leg.
 ///
 /// Anything short of that reports [`SkillUsefulness::Unknown`] — never
 /// `OwnerBacked`, and never a negative fact about the Skill. A foreign or
 /// substituted outcome reference cannot produce a positive claim: a reference
-/// the receipt never presented is ignored outright, and one that resolves to
-/// a record failing its own validation is discarded.
+/// the receipt never presented is ignored outright, a record failing its own
+/// validation is discarded, and a record bound to another attempt, Skill or
+/// fence stays unresolved for this receipt.
 ///
 /// Causal credit is never consumed here. Usefulness never converts
 /// [`CausalCredit::NoCausalCredit`] or a distributed/uncertain credit into a
@@ -443,11 +449,18 @@ pub fn qualify_useful_outcomes(
         return summary;
     }
     let matched = resolved.iter().any(|candidate| {
-        // The reference must be one this receipt actually presented, and the
+        // The reference must be one this receipt actually presented, the
         // record must be the one that reference resolved to, validated as
-        // recorded.
+        // recorded, and its owner-stamped binding must name this exact Skill,
+        // subject attempt and fence. A genuine record filed for another
+        // attempt, Skill or fence — or a pre-binding row carrying no stamp —
+        // cannot support this receipt's claim.
         receipt.verified_outcome_refs.contains(&candidate.reference)
             && candidate.record.execution_ref == candidate.reference
+            && candidate.record.observed_skill_id.as_deref() == Some(receipt.skill_id.as_str())
+            && candidate.record.observed_attempt_ref.as_deref()
+                == Some(receipt.attempt_ref.as_str())
+            && candidate.record.observed_fence.as_ref() == Some(&receipt.state_fence)
             && candidate.record.validate().is_ok()
     });
     summary.useful = if matched {
@@ -738,6 +751,80 @@ pub fn gate_material_use(
         return Err(SkillError::InvalidField {
             field: "entry.dependencies",
             reason: "dependency versions changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    Ok(())
+}
+
+/// Material-use gate binding every declared dependency leg to the observed
+/// live world (`I7.13`, issue #1882 W2/A2).
+///
+/// [`gate_material_use`] covers stored status plus the dependency set; this
+/// is the full-leg variant the bridge activation path runs before Material
+/// use once it can supply the operation-observed live world: structural
+/// validation, stored status,
+/// the promotion-evidence binding for `Current`, the dependency set, the
+/// host/profile versions, the admitted Tool Definition version, and the
+/// declared tool basis rechecked against the tool owner's view. Any drift
+/// refuses with its own typed field, so an unvalidated or stale Skill cannot
+/// reach Material use through a stored-status lag; a drifted Skill passes
+/// again only after revalidation or explicit scoped/provisional admission
+/// through the governed lifecycle path. Evidence is compared, never
+/// synthesized: every leg reads the caller-observed world.
+///
+/// # STITCH: designated Material-use caller
+///
+/// `caller: STITCH`. The designated caller is the bridge Material-use
+/// admission drive (`skill_admit_material_attempt`) once it observes the live
+/// dependency set and host/profile versions alongside the entry pins it
+/// already reads; until then admission flows through `is_usable` plus the
+/// dependency-set gate with the tool/definition legs enforced upstream.
+pub fn gate_material_use_against(
+    entry: &SkillCatalogueEntry,
+    world: &LiveSkillWorld<'_>,
+) -> Result<(), SkillError> {
+    entry.validate()?;
+    if !material_use_allowed(entry.status) {
+        return Err(SkillError::InvalidField {
+            field: "entry.status",
+            reason: "stale or quarantined Skills are blocked from Material use until governed review or restore",
+        });
+    }
+    if entry.status == SkillStatus::Current && entry.promotion_evidence.is_none() {
+        return Err(SkillError::InvalidField {
+            field: "entry.promotion_evidence",
+            reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
+        });
+    }
+    if detect_dependency_staleness(&entry.dependencies, world.current_dependencies).is_some() {
+        return Err(SkillError::InvalidField {
+            field: "entry.dependencies",
+            reason: "dependency versions changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    if entry.host_version != world.live_host_version
+        || entry.profile_version != world.live_profile_version
+    {
+        return Err(SkillError::InvalidField {
+            field: "entry.host_version",
+            reason: "host or profile versions changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    if entry.admitted_definition_version != world.live_definition_version {
+        return Err(SkillError::InvalidField {
+            field: "entry.definition_version",
+            reason: "tool definition version changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    if entry
+        .body
+        .tool_refs
+        .iter()
+        .any(|tool| !world.tools.knows_tool(tool))
+    {
+        return Err(SkillError::InvalidField {
+            field: "entry.tool_basis",
+            reason: "declared tools changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
         });
     }
     Ok(())
@@ -1275,11 +1362,14 @@ pub fn project_execution_outcomes(
             .iter()
             .position(|held| held.execution_ref == record.execution_ref)
         {
-            // Same identity, same bytes: a replay of the same evidence. It
-            // folds once and never inflates a class.
-            Some(index) if owner[index] == *record => {}
-            // Same identity, changed bytes: the retained set disagrees with
-            // itself. A contradictory revision is never resolved by position.
+            // Same identity, same recorded content: a replay of the same
+            // evidence. It folds once and never inflates a class. The
+            // comparison excludes the owner-stamped filing binding, which
+            // names the filing rather than the observation.
+            Some(index) if owner[index].same_recorded_content(record) => {}
+            // Same identity, changed recorded content: the retained set
+            // disagrees with itself. A contradictory revision is never
+            // resolved by position.
             Some(_) => return Err(SkillError::RevisionConflict),
             None => owner.push(record.clone()),
         }
@@ -1292,7 +1382,7 @@ pub fn project_execution_outcomes(
             .iter()
             .find(|held| held.execution_ref == record.execution_ref)
         {
-            Some(held) if *held == *record => {}
+            Some(held) if held.same_recorded_content(record) => {}
             Some(_) => conflicting_refs.push(record.execution_ref.clone()),
             None => unowned_refs.push(record.execution_ref.clone()),
         }

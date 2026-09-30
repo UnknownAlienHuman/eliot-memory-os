@@ -140,6 +140,7 @@ be promoted to live multi-agent/runtime proof.
 | Script | Purpose | Boundary |
 |---|---|---|
 | `provision-surrealdb-release.py` | Materialize pinned SurrealDB evidence into project-local ignored state | Local evidence provision only |
+| `provision-dependency-scanner.py` | Materialize the exact dependency-policy scanner version/archive/executable digests declared in `config/dependency-policy.toml` into project-local ignored state (#3004/#1229/#1225) | Local scanner-input provision only; never "latest", never a lock/receipt/verdict write |
 | `build-eliot-windows-x64-release.ps1` | Build declared Windows x64 release inputs and an unsigned bundle | Build/staging only |
 | `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back declared release artifacts | Release-artifact evidence only |
 | `write-operator-build-receipt.ps1` | Write the commit-bound Eliot.Operator build receipt consumed by `build-eliot-windows-x64-release.ps1` (#2391) | Operator build-input evidence only |

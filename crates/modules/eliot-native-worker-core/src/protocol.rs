@@ -9,13 +9,14 @@ use eliot_process::{
     CancellationStatus, OperationId, ProcessLifecycle, ProcessStartReceipt, ResourceLimits,
     SecretRef,
 };
-use eliot_protocol::AckPhase;
+use eliot_protocol::{AckPhase, EncodingProfile};
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::WorkerError;
+pub use crate::generated::{NativeWorkerExecuteEbpCallV1, WorkerRequest};
 
 /// Stable version of A-13's language-neutral native-worker protocol.
 pub const PROTOCOL_VERSION: &str = "eliot-native-worker/v2";
@@ -112,9 +113,7 @@ impl WorkerHello {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(WorkerError::UnsupportedVersion);
         }
-        if self.encoding_profile != JSON_ENCODING_PROFILE {
-            return Err(WorkerError::UnsupportedEncoding);
-        }
+        require_ebp_encoding_profile(&self.encoding_profile)?;
         for (field, value) in [
             ("connection_id", &self.connection_id),
             ("artifact_manifest_digest", &self.artifact_manifest_digest),
@@ -170,33 +169,6 @@ pub struct WorkerReady {
     pub stream_id: String,
     pub process_start_receipt: ProcessStartReceipt,
     pub ready_event: WorkerEventEnvelope,
-}
-
-/// A public request is only a proposal until the injected admission port accepts it.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerRequest {
-    pub attempt_id: AttemptId,
-    pub capability: String,
-    pub payload: BTreeMap<String, String>,
-    pub proposed_effect: Option<ProposedEffect>,
-}
-
-impl WorkerRequest {
-    pub(crate) fn validate_shape(&self) -> Result<(), WorkerError> {
-        if self.capability.trim().is_empty() {
-            return Err(WorkerError::InvalidRequest("capability"));
-        }
-        if self.payload.len() > 128 {
-            return Err(WorkerError::InvalidRequest("payload"));
-        }
-        if let Some(effect) = &self.proposed_effect
-            && effect.attempt_id != self.attempt_id
-        {
-            return Err(WorkerError::InvalidRequest("effect_attempt"));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -266,9 +238,7 @@ impl WorkerFrame {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(WorkerError::UnsupportedVersion);
         }
-        if self.encoding_profile != JSON_ENCODING_PROFILE {
-            return Err(WorkerError::UnsupportedEncoding);
-        }
+        require_ebp_encoding_profile(&self.encoding_profile)?;
         for (field, value) in [
             ("connection_id", &self.connection_id),
             ("admission_revision", &self.admission_revision),
@@ -310,7 +280,7 @@ impl WorkerFrame {
     content = "payload"
 )]
 pub enum WorkerFrameBody {
-    Execute(WorkerRequest),
+    Execute(NativeWorkerExecuteEbpCallV1),
     Cancel(CancelRequest),
     Heartbeat,
     Health,
@@ -527,12 +497,12 @@ pub const NATIVE_WORKER_CLAIM_WIRE_VERSION: u16 = 2;
 /// explicitly at the executable gate instead of promoting them silently.
 pub const NATIVE_WORKER_CLAIM_WIRE_VERSION_V1: u16 = 1;
 /// Expected wire revision of the owner-produced executable binding (T9-01
-/// `NativeWorkerExecutableBinding` v1).
+/// `NativeWorkerExecutableBinding` v2).
 ///
 /// Carried by value, never imported: this crate must not depend on
 /// `eliot-governor`. A binding-wire drift changes the owner digest as well,
 /// so this pin fails closed twice.
-pub const NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION: u16 = 1;
+pub const NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION: u16 = 2;
 /// Maximum length of bounded claim/registration text fields, in UTF-8 bytes.
 pub const MAX_CLAIM_TEXT_LEN: usize = 1_024;
 /// Maximum length of one native-worker operation identity, in UTF-8 bytes.
@@ -804,12 +774,12 @@ impl NativeWorkerRegistration {
 
 /// Worker-side projection of the owner-produced executable binding (T9-02).
 ///
-/// Carries the M1 currentness inputs the start path needs for refusal —
+/// Carries the M1 currentness inputs the start path needs for refusal:
 /// route, adapter, config, facet, cell, grant and catalog revisions, replay
-/// stream, launch nonce, invocation digest, epoch/generation/fence, and the
-/// binding window — plus the opaque owner-produced `NativeWorkerExecutableBinding` v1
-/// digest. Field names reuse the T9-01 names where they exist, matching the
-/// Kernel-side `eliot-kernel-service` projection field-for-field. This is an
+/// stream, launch nonce, invocation digest, epoch/generation/fence, binding
+/// window, and eight lifecycle lineage/policy digests. Field names reuse the
+/// T9-01 names where they exist, matching the Kernel-side
+/// eliot-kernel-service projection field-for-field. This is an
 /// identity/epoch/fence/ordering projection only: it carries references and
 /// revisions, never task meaning, plan/policy content, effective ceilings,
 /// credential or resource values, or Governor composition. The full T9-01
@@ -859,6 +829,22 @@ pub struct NativeWorkerExecutableBinding {
     pub executable_wire_version: u16,
     /// Opaque owner-produced executable digest (lowercase SHA-256).
     pub executable_binding_digest: String,
+    /// Lowercase SHA-256 of the capability-cell registry snapshot.
+    pub capability_cell_registry_digest: String,
+    /// Lowercase SHA-256 of the admitted Kernel execution manifest.
+    pub kernel_execution_manifest_digest: String,
+    /// Owner reference for the Durable Job lineage.
+    pub job_object_lineage_ref: String,
+    /// Lowercase SHA-256 of the admitted resource limits.
+    pub resource_limits_digest: String,
+    /// Owner reference for the cancellation policy.
+    pub cancellation_policy_ref: String,
+    /// Lowercase SHA-256 of the checkpoint policy.
+    pub checkpoint_policy_digest: String,
+    /// Owner reference for the drain policy.
+    pub drain_policy_ref: String,
+    /// Lowercase SHA-256 of the restart policy.
+    pub restart_policy_digest: String,
 }
 
 impl NativeWorkerExecutableBinding {
@@ -882,43 +868,7 @@ impl NativeWorkerExecutableBinding {
     /// epoch disagreement, and [`WorkerError::StaleFence`] for
     /// generation/fence disagreement.
     pub fn validate(&self) -> Result<(), WorkerError> {
-        for (text, field) in [
-            (&self.route_ref, "executable_binding.route_ref"),
-            (&self.adapter_id, "executable_binding.adapter_id"),
-            (
-                &self.facet_manifest_ref,
-                "executable_binding.facet_manifest_ref",
-            ),
-            (
-                &self.replay_stream_id,
-                "executable_binding.replay_stream_id",
-            ),
-        ] {
-            validate_claim_text(text, field)?;
-        }
-        validate_claim_text(&self.launch_nonce, "executable_binding.launch_nonce")?;
-        if self.launch_nonce.len() < Self::MIN_NONCE_LEN
-            || self.launch_nonce.len() > Self::MAX_NONCE_LEN
-        {
-            return Err(WorkerError::InvalidRequest(
-                "executable_binding.launch_nonce",
-            ));
-        }
-        for (digest, field) in [
-            (&self.config_digest, "executable_binding.config_digest"),
-            (
-                &self.process_invocation_digest,
-                "executable_binding.process_invocation_digest",
-            ),
-            (
-                &self.executable_binding_digest,
-                "executable_binding.executable_binding_digest",
-            ),
-        ] {
-            if !is_lowercase_sha256(digest) {
-                return Err(WorkerError::InvalidRequest(field));
-            }
-        }
+        self.validate_identity_fields()?;
         if self.adapter_revision == 0 || self.grant_graph_revision == 0 {
             return Err(WorkerError::InvalidRequest("executable_binding.revisions"));
         }
@@ -953,6 +903,83 @@ impl NativeWorkerExecutableBinding {
         }
         Ok(())
     }
+
+    fn validate_identity_fields(&self) -> Result<(), WorkerError> {
+        for (text, field) in [
+            (&self.route_ref, "executable_binding.route_ref"),
+            (&self.adapter_id, "executable_binding.adapter_id"),
+            (
+                &self.facet_manifest_ref,
+                "executable_binding.facet_manifest_ref",
+            ),
+            (
+                &self.replay_stream_id,
+                "executable_binding.replay_stream_id",
+            ),
+        ] {
+            validate_claim_text(text, field)?;
+        }
+        validate_claim_text(&self.launch_nonce, "executable_binding.launch_nonce")?;
+        if self.launch_nonce.len() < Self::MIN_NONCE_LEN
+            || self.launch_nonce.len() > Self::MAX_NONCE_LEN
+        {
+            return Err(WorkerError::InvalidRequest(
+                "executable_binding.launch_nonce",
+            ));
+        }
+        for (digest, field) in [
+            (&self.config_digest, "executable_binding.config_digest"),
+            (
+                &self.process_invocation_digest,
+                "executable_binding.process_invocation_digest",
+            ),
+            (
+                &self.executable_binding_digest,
+                "executable_binding.executable_binding_digest",
+            ),
+            (
+                &self.capability_cell_registry_digest,
+                "executable_binding.capability_cell_registry_digest",
+            ),
+            (
+                &self.kernel_execution_manifest_digest,
+                "executable_binding.kernel_execution_manifest_digest",
+            ),
+            (
+                &self.resource_limits_digest,
+                "executable_binding.resource_limits_digest",
+            ),
+            (
+                &self.checkpoint_policy_digest,
+                "executable_binding.checkpoint_policy_digest",
+            ),
+            (
+                &self.restart_policy_digest,
+                "executable_binding.restart_policy_digest",
+            ),
+        ] {
+            if !is_lowercase_sha256(digest) {
+                return Err(WorkerError::InvalidRequest(field));
+            }
+        }
+        for (text, field) in [
+            (
+                &self.job_object_lineage_ref,
+                "executable_binding.job_object_lineage_ref",
+            ),
+            (
+                &self.cancellation_policy_ref,
+                "executable_binding.cancellation_policy_ref",
+            ),
+            (
+                &self.drain_policy_ref,
+                "executable_binding.drain_policy_ref",
+            ),
+        ] {
+            validate_claim_text(text, field)?;
+        }
+        Ok(())
+    }
 }
 
 /// Current owner-produced executable authority one claim is checked against.
@@ -969,6 +996,29 @@ pub struct NativeWorkerExecutableExpectation {
     pub current: NativeWorkerExecutableBinding,
     /// True when current records show the binding withdrawn or superseded.
     pub revoked: bool,
+}
+
+/// Requires the presented encoding profile to be the EBP-owned `json-v1`
+/// profile (Implements #22 W2).
+///
+/// Parses through the shared `eliot-protocol` contract type instead of
+/// comparing a worker-local string, so an EBP vocabulary change fails this
+/// wire closed instead of drifting. Only `json-v1` is admitted on this
+/// contour; any other profile — including a future EBP profile this contour
+/// does not speak — is refused without dispatch.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::UnsupportedEncoding`] for any profile that is not
+/// the EBP-owned `json-v1` vocabulary value.
+fn require_ebp_encoding_profile(profile: &str) -> Result<(), WorkerError> {
+    let parsed =
+        serde_json::from_value::<EncodingProfile>(serde_json::Value::String(profile.to_owned()))
+            .map_err(|_| WorkerError::UnsupportedEncoding)?;
+    if parsed != EncodingProfile::JsonV1 {
+        return Err(WorkerError::UnsupportedEncoding);
+    }
+    Ok(())
 }
 
 /// Resolves the owner-admitted facet identity governing one `Execute`
@@ -1465,11 +1515,7 @@ fn compare_executable_currentness(
             "executable_binding.process_invocation_digest",
         ));
     }
-    if presented.executable_binding_digest != current.executable_binding_digest {
-        return Err(WorkerError::InvalidRequest(
-            "executable_binding.executable_binding_digest",
-        ));
-    }
+    compare_executable_owner_fields(presented, current)?;
     if presented.executable_wire_version != current.executable_wire_version {
         return Err(WorkerError::UnsupportedVersion);
     }
@@ -1484,6 +1530,58 @@ fn compare_executable_currentness(
     }
     if presented.state_fence != current.state_fence {
         return Err(WorkerError::StaleFence);
+    }
+    Ok(())
+}
+
+fn compare_executable_owner_fields(
+    presented: &NativeWorkerExecutableBinding,
+    current: &NativeWorkerExecutableBinding,
+) -> Result<(), WorkerError> {
+    if presented.executable_binding_digest != current.executable_binding_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.executable_binding_digest",
+        ));
+    }
+    if presented.capability_cell_registry_digest != current.capability_cell_registry_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.capability_cell_registry_digest",
+        ));
+    }
+    if presented.kernel_execution_manifest_digest != current.kernel_execution_manifest_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.kernel_execution_manifest_digest",
+        ));
+    }
+    if presented.job_object_lineage_ref != current.job_object_lineage_ref {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.job_object_lineage_ref",
+        ));
+    }
+    if presented.resource_limits_digest != current.resource_limits_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.resource_limits_digest",
+        ));
+    }
+    if presented.cancellation_policy_ref != current.cancellation_policy_ref {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.cancellation_policy_ref",
+        ));
+    }
+    if presented.checkpoint_policy_digest != current.checkpoint_policy_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.checkpoint_policy_digest",
+        ));
+    }
+    if presented.drain_policy_ref != current.drain_policy_ref {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.drain_policy_ref",
+        ));
+    }
+    if presented.restart_policy_digest != current.restart_policy_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.restart_policy_digest",
+        ));
     }
     Ok(())
 }
@@ -1639,13 +1737,18 @@ impl NativeReadyReport {
     /// registration-bound in `ClaimAdmissionRequest::validate_binding`); this
     /// gate additionally requires the consulted lease to be the report's own
     /// registration lease (registration identity and generation equality).
+    /// Credential authority is further scoped to the exact epoch and fence
+    /// that admitted it: fencing (epoch advance or fence cutover) revokes
+    /// credential scope even while the lease window is still live, and only
+    /// a new admission seals new authority.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::InvalidRequest`] for a report answering another
-    /// registration or an unbound lease/declaration time, and
-    /// [`WorkerError::StaleLease`] when credential references outlive the
-    /// registration lease.
+    /// registration or an unbound lease/declaration time,
+    /// [`WorkerError::StaleEpoch`]/[`WorkerError::StaleFence`] for a report
+    /// outside the admitting epoch/fence, and [`WorkerError::StaleLease`]
+    /// when credential references outlive the registration lease.
     pub fn validate_credential_lease(
         &self,
         registration: &NativeWorkerRegistration,
@@ -1657,6 +1760,15 @@ impl NativeReadyReport {
             || self.worker_generation != registration.worker_generation
         {
             return Err(WorkerError::InvalidRequest("credential_lease"));
+        }
+        if !self
+            .authority_epoch
+            .is_same_authority(&registration.authority_epoch)
+        {
+            return Err(WorkerError::StaleEpoch);
+        }
+        if self.state_fence != registration.state_fence {
+            return Err(WorkerError::StaleFence);
         }
         if registration.lease_expires_at_unix_ms == 0 || self.ready_at_unix_ms == 0 {
             return Err(WorkerError::InvalidRequest("credential_lease"));

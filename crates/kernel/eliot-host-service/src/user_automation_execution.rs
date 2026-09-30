@@ -96,12 +96,15 @@ where
                     readback,
                 })
             }
-            // Cancellation, enumeration, and exact batch readback bind a
-            // server-authenticated channel. This convenience dispatch has no
-            // server-authored session and cannot authorize any of them.
+            // Cancellation, enumeration, exact batch readback, and horizon
+            // publication bind a server-authenticated channel. This convenience
+            // dispatch has no server-authored session and cannot authorize any
+            // of them.
             UserAutomationHostExecutionOperation::CancelPendingWakes { .. }
             | UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. }
-            | UserAutomationHostExecutionOperation::ReadCancellationBatch { .. } => {
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { .. }
+            | UserAutomationHostExecutionOperation::PublishWakeHorizon { .. }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
         }
@@ -184,6 +187,31 @@ where
                         state_fence,
                         authenticated_channel_binding_sha256: channel_binding_sha256,
                         readback: Box::new(readback),
+                    },
+                )
+            }
+            // Publication and its readback share one owner answer. The wake
+            // owner is the sole writer of its journal, so the returned
+            // acknowledgement is the owner's own accounting of the exact
+            // requested occurrence set and nothing is inferred from the
+            // request.
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request } => {
+                let publication = self.wake.publish_wake_horizon(request).await?;
+                Ok(
+                    UserAutomationHostExecutionResponse::WakeHorizonPublication {
+                        request_sha256,
+                        state_fence,
+                        publication: Box::new(publication),
+                    },
+                )
+            }
+            UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                let publication = self.wake.read_wake_horizon_publication(request).await?;
+                Ok(
+                    UserAutomationHostExecutionResponse::WakeHorizonPublication {
+                        request_sha256,
+                        state_fence,
+                        publication: Box::new(publication),
                     },
                 )
             }

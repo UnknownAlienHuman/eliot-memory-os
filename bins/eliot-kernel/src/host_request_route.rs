@@ -87,6 +87,15 @@ use std::collections::BTreeMap;
 
 mod daemon_claim_queue;
 
+/// Kernel-owned ChangeMonitor ledger (issue #1824, I10.21): hint ingest,
+/// content checksum/re-read confirmation, governed-tool records, and
+/// the unknown-origin acceptance block. The canonical file lives beside
+/// this route at `src/change_monitor.rs`; it is nested here because the
+/// in-tree producer is the Kernel process-effect lane and the gate
+/// consumer is the finish-acceptance leg below.
+#[path = "change_monitor.rs"]
+pub(crate) mod change_monitor;
+
 use self::daemon_claim_queue::{
     campaign_packet_admission, check_finish_admission, check_task_controller_admission,
 };
@@ -154,8 +163,9 @@ fn observe_trace_seal(manifest: &TraceManifest) {
 ///
 /// Names follow the `agent_activation_*` daemon-operation style. The payload
 /// carries the exact envelope under `envelope` (plus the exact admission
-/// receipt under `receipt` for rehydrate, or the typed resolve query under
-/// `query` for resolve); the operation string only selects which closed entry — admit, cancel, reconcile, rehydrate, or resolve — consumes it.
+/// receipt under `receipt` for rehydrate, the typed resolve query under
+/// `query` for resolve, or the exact canonical tool bytes under `tool` for
+/// invoke-read and preview); the operation string only selects which closed entry — admit, cancel, reconcile, rehydrate, resolve, invoke-read, or preview — consumes it.
 /// There is no generic JSON command dispatch: the envelope is decoded as the
 /// typed [`HostRequestEnvelope`] (with its canonical digest check) and the
 /// envelope kind is re-enforced by the callee.
@@ -184,6 +194,22 @@ pub(crate) const AGENT_HOST_REQUEST_RESOLVE_OPERATION: &str = "agent_host_reques
 /// digest-only in spirit; the tool bytes only prove the presented operation
 /// is the admitted one.
 pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
+/// Closed dry-run preview entry for invocation dry runs (issue #1939, I7.17).
+///
+/// Carries a lookup-only `Status` envelope (never a parent: previews stage
+/// nothing) plus the exact canonical tool bytes it previews. The entry runs
+/// the existing invoke-read validator and lane checks over immutable owner
+/// inputs only: it never stages a row, issues a receipt, enqueues a pair,
+/// advances state, or runs provider work. Tools in a serving read lane
+/// (`query`, `skill`, `campaign-packet`, `state`) answer the exact preview
+/// with its source/currentness ceiling; every other tool answers the typed
+/// unsupported value with the best static preview and an explicit
+/// no-simulation statement.
+pub(crate) const AGENT_HOST_REQUEST_PREVIEW_OPERATION: &str = "agent_host_request_preview";
+/// Source identity emitted on every preview-entry answer (issue #1939, I7.17).
+pub(crate) const HOST_REQUEST_PREVIEW_SOURCE: &str = "kernel-owner-preview.v1";
+/// Route label answered when the previewed tool has no serving read lane.
+pub(crate) const HOST_REQUEST_PREVIEW_ROUTE_WITHHELD: &str = "withheld-no-simulator";
 
 /// Closed agent-bridge event-delivery entries (Implements #2561, I7.2/I7.23).
 ///
@@ -264,6 +290,7 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
             | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
             | AGENT_HOST_REQUEST_RESOLVE_OPERATION
             | AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
+            | AGENT_HOST_REQUEST_PREVIEW_OPERATION
             | AGENT_BRIDGE_EVENT_FORWARD_OPERATION
             | AGENT_BRIDGE_HOOK_FORWARD_OPERATION
             | AGENT_BRIDGE_EVENT_GAP_OPERATION
@@ -1179,6 +1206,64 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         }
         Ok((receipt, record))
+    }
+
+    /// Answers one invocation dry-run preview without staging, receipt, or
+    /// dispatch (issue #1939, I7.17).
+    ///
+    /// Observation-only entry: the envelope must be the lookup-only `Status`
+    /// kind with no parent, and the same read-only gates as the resolve entry
+    /// prove the presenting connection, application binding, service profile,
+    /// descriptor, and fence are current. The existing invoke-read validator
+    /// ([`host_request_tool_from_payload`] linkage plus
+    /// [`check_local_read_admission`] / [`check_local_state_admission`] lane
+    /// checks) then runs over immutable owner inputs only: no row is staged,
+    /// no receipt is issued, no pair is enqueued, no audit event is observed,
+    /// and no provider work runs. Tools in a serving read lane answer the
+    /// exact preview with its source/currentness ceiling; every other tool
+    /// answers the typed unsupported value. No operation identity is minted
+    /// on any path: the echoed digest names the request, never an operation.
+    fn preview_host_request(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        if envelope.kind != HostRequestKind::Status {
+            return Err(TransportError::SessionFenced);
+        }
+        if envelope.identity.parent_operation_id.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+        let (descriptor, _) = self.host_request_connection_gate_under_transition(envelope)?;
+        self.host_request_application_binding_gate_under_transition(envelope, None)?;
+        self.host_request_service_gate(&descriptor, envelope)?;
+        {
+            let profile = self
+                .agent_bridge_profile
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            if envelope.descriptor_sha256 != profile.admission.descriptor_sha256
+                || envelope.state_fence != profile.admission.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let lane = match check_local_read_admission(envelope, tool) {
+            Ok(LocalReadAdmission::Query(_)) => Some("query"),
+            Ok(LocalReadAdmission::Skill) => Some("skill"),
+            Ok(LocalReadAdmission::CampaignPacket { .. }) => Some("campaign-packet"),
+            Err(_) => match check_local_state_admission(envelope, tool) {
+                Ok(_) => Some("state"),
+                Err(_) => None,
+            },
+        };
+        match lane {
+            Some(lane) => host_request_preview_response(envelope, lane),
+            None => Ok(host_request_preview_unsupported_response(envelope)),
+        }
     }
 
     /// Rehydrates one previously admitted host request after restart or an
@@ -2361,10 +2446,9 @@ impl KernelComposition {
                         && candidate.request_digest == envelope.envelope_sha256
                 })
                 .map(|_| connection_id.as_str())
-        }) {
-            if existing_connection != envelope.connection_id {
-                return Err(TransportError::IdentityConflict);
-            }
+        }) && existing_connection != envelope.connection_id
+        {
+            return Err(TransportError::IdentityConflict);
         }
         let refs = index.entry(envelope.connection_id.clone()).or_default();
         if !refs.iter().any(|candidate| {
@@ -2493,12 +2577,41 @@ impl KernelComposition {
         }
     }
 
+    /// Refuses a materially repeated expensive call on unchanged inputs
+    /// without new owner-observed evidence (I7.24 step 5). The retained
+    /// per-route stage is the kernel-owned attempt history; the repeat is
+    /// refused with the existing identity-conflict signal so it is never
+    /// staged as progress. The class derives from the accepted admission
+    /// and a reworded expected delta alone is not progress.
+    fn refuse_staged_local_read_repeat(
+        index: &std::collections::BTreeMap<String, Vec<HostRequestOperationRef>>,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        admission: &LocalReadAdmission,
+    ) -> Result<(), TransportError> {
+        if let Some(current) =
+            super::tool_exposure::build_tool_call_request(envelope, tool, admission)
+        {
+            let retained = index.values().flatten().filter_map(|candidate| {
+                Some((
+                    candidate.local_read_envelope.as_ref()?,
+                    candidate.local_read_tool.as_ref()?,
+                ))
+            });
+            if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_local_read_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
-        match check_local_read_admission(envelope, tool)? {
+        let admission = check_local_read_admission(envelope, tool)?;
+        match admission {
             LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {}
             LocalReadAdmission::CampaignPacket { .. } => {
                 return Err(TransportError::SessionFenced);
@@ -2521,22 +2634,9 @@ impl KernelComposition {
             LocalReadReplay::AlreadyStaged => return Ok(()),
             LocalReadReplay::Fresh => {}
         }
-        // I7.24 W3/A2: a materially repeated expensive call on unchanged
-        // inputs without a new expected delta is a loop/no-progress signal,
-        // not a fresh dispatch. The retained per-route stage above is the
-        // kernel-owned store; the repeat is refused with the existing
-        // identity-conflict signal so it is never staged as progress.
-        if let Some(current) = super::tool_exposure::build_tool_call_request(envelope, tool) {
-            let retained = index.values().flatten().filter_map(|candidate| {
-                Some((
-                    candidate.local_read_envelope.as_ref()?,
-                    candidate.local_read_tool.as_ref()?,
-                ))
-            });
-            if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
-                return Err(TransportError::IdentityConflict);
-            }
-        }
+        // I7.24 step 5: refuse materially repeated calls with no new
+        // owner-observed evidence before staging them as progress.
+        Self::refuse_staged_local_read_repeat(&index, envelope, tool, &admission)?;
         let queued = index
             .values()
             .flatten()
@@ -4102,6 +4202,24 @@ impl KernelComposition {
         let retained_result = current.state == HostRequestState::ResultReceived
             && current.result_digest.is_some()
             && current.result_response.is_some();
+        // Issue #1739 W2: bind the exact typed payload bytes durably before
+        // the in-memory observe pair is attached and the claim is handed out.
+        // A digest alone cannot execute after a restart.
+        if executable {
+            match self.bind_observe_payload_before_claim(
+                envelope,
+                tool,
+                &admitted.1.operation_id,
+                token,
+                had_reference,
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    drop(admission_owner);
+                    return Err(error);
+                }
+            }
+        }
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -4138,6 +4256,56 @@ impl KernelComposition {
             Ok((admitted.0, current))
         } else {
             Err(TransportError::SessionFenced)
+        }
+    }
+
+    /// Binds the exact typed payload bytes durably before the observe claim.
+    ///
+    /// An out-of-band body that is not the admitted bytes conflicts instead
+    /// of replacing the admitted operation; every failure rolls the observe
+    /// reservation back so no claim is handed out for unbound bytes.
+    fn bind_observe_payload_before_claim(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        operation_id: &OperationIdentity,
+        token: u64,
+        had_reference: bool,
+    ) -> Result<(), TransportError> {
+        let bound = self.generation_gateway.ors.bind_host_request_payload(
+            operation_id,
+            &envelope.envelope_sha256,
+            tool,
+        );
+        match bound {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                self.rollback_observe_reservation(
+                    operation_id.as_str(),
+                    &envelope.envelope_sha256,
+                    token,
+                    had_reference,
+                );
+                Err(TransportError::UnknownRequest)
+            }
+            Err(OrsError::HostRequestIdentityConflict { .. }) => {
+                self.rollback_observe_reservation(
+                    operation_id.as_str(),
+                    &envelope.envelope_sha256,
+                    token,
+                    had_reference,
+                );
+                Err(TransportError::IdentityConflict)
+            }
+            Err(_) => {
+                self.rollback_observe_reservation(
+                    operation_id.as_str(),
+                    &envelope.envelope_sha256,
+                    token,
+                    had_reference,
+                );
+                Err(TransportError::SessionFenced)
+            }
         }
     }
 
@@ -4278,8 +4446,17 @@ impl KernelComposition {
                     refs.remove(position);
                     continue;
                 }
+                // Issue #1739 W2: execution consumes the exact typed bytes off
+                // the durable #1713 row; a queue body that is not the admitted
+                // bytes conflicts instead of replacing the admitted operation.
+                // Rows staged before this binding existed keep serving their
+                // linkage-checked pair.
+                let tool = match stored.payload_body.as_ref() {
+                    Some(durable) if tool == durable => durable.clone(),
+                    Some(_) => return Err(TransportError::IdentityConflict),
+                    None => tool.clone(),
+                };
                 let envelope = envelope.clone();
-                let tool = tool.clone();
                 let durable_attempt = self.persist_observe_claim_attempt(
                     &operation_id,
                     &request_digest,
@@ -5053,8 +5230,10 @@ fn retained_result_provenance(
 /// Builds the `Requested` ORS record for one validated envelope.
 ///
 /// Every identity is preserved opaquely: Session, task, scope, capability,
-/// fence, and payload values become exact bytes or digests for replay
-/// comparison and are never interpreted here.
+/// fence, payload schema, and payload values become exact bytes or digests
+/// for replay comparison and are never interpreted here. The exact payload
+/// bytes bind later through `bind_host_request_payload`, before the observe
+/// claim is handed out (issue #1739 W2).
 pub(crate) fn requested_host_request_record(
     envelope: &HostRequestEnvelope,
 ) -> Result<HostRequestRecord, TransportError> {
@@ -5081,6 +5260,8 @@ pub(crate) fn requested_host_request_record(
         parent_operation_id: optional_label(envelope.identity.parent_operation_id.as_ref())?,
         request_digest: envelope.envelope_sha256.clone(),
         payload_digest: envelope.identity.payload_sha256.clone(),
+        payload_schema_id: Some(label(&envelope.identity.payload_schema_id)?),
+        payload_body: None,
         connection_ref: label(&envelope.connection_id)?,
         session_ref: optional_label(envelope.identity.session_id.as_ref())?,
         task_ref: optional_label(envelope.identity.task_id.as_ref())?,
@@ -5350,6 +5531,10 @@ impl KernelComposition {
                     // admitted shape is the result-bearing response: no second
                     // shape, no duplicated body, no frame-ceiling risk.
                     host_request_admitted_response(&receipt, &record)
+                }
+                AGENT_HOST_REQUEST_PREVIEW_OPERATION => {
+                    let tool = host_request_tool_from_payload(payload)?;
+                    self.preview_host_request(envelope, &tool)?
                 }
                 _ => return Err(TransportError::SessionFenced),
             })
@@ -7061,6 +7246,10 @@ fn watchdog_intent_projection_record(
         parent_operation_id: None,
         request_digest: intent.record_digest.clone(),
         payload_digest: intent.payload_digest.clone(),
+        // Digest-only reconciliation intent: no envelope, hence no staged
+        // schema or payload bytes. Any future bind still proves the digest.
+        payload_schema_id: None,
+        payload_body: None,
         connection_ref: label(&payload.sink_id)?,
         session_ref: None,
         task_ref: None,
@@ -7752,13 +7941,8 @@ pub(crate) fn local_read_admission_from_tool(
         .and_then(serde_json::Value::as_str)
         .ok_or(TransportError::SessionFenced)?;
     // I7.24: expensive-class calls require a valid intent before dispatch.
-    if super::tool_exposure::requires_intent(name) {
-        let request = super::tool_exposure::build_tool_call_request(envelope, tool)
-            .ok_or(TransportError::SessionFenced)?;
-        super::tool_exposure::authorize_pre_dispatch(&request)
-            .map_err(|_| TransportError::SessionFenced)?;
-    }
-    match name {
+    // The call class derives from the accepted admission, never the tool name.
+    let admission = match name {
         "eliot.packet" => campaign_packet_admission(envelope, tool),
         "eliot.query" => local_read_selectors_from_tool(envelope, tool)
             .map_err(|_| TransportError::SessionFenced)?
@@ -7768,7 +7952,14 @@ pub(crate) fn local_read_admission_from_tool(
             Ok(LocalReadAdmission::Skill)
         }
         _ => Err(TransportError::SessionFenced),
+    }?;
+    if super::tool_exposure::requires_intent(&admission) {
+        let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
+            .ok_or(TransportError::SessionFenced)?;
+        super::tool_exposure::authorize_pre_dispatch(&request)
+            .map_err(|_| TransportError::SessionFenced)?;
     }
+    Ok(admission)
 }
 
 /// Validates one local-read admission before any store read (no IO).
@@ -8192,6 +8383,90 @@ pub(crate) fn host_request_resolve_unresolved_response(
     serde_json::json!({
         "status": "known",
         "value": value,
+        "recovery": null,
+    })
+}
+
+/// Derives the owner-confirmed scope echo for one preview answer.
+///
+/// The trusted envelope scope (work scope else session — never an MCP
+/// argument), mirroring [`trusted_local_read_scope`]; absent only when the
+/// envelope carries neither, which its own validation already refuses.
+fn preview_envelope_scope(envelope: &HostRequestEnvelope) -> Option<String> {
+    envelope
+        .identity
+        .work_scope_id
+        .clone()
+        .filter(|scope| !scope.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .clone()
+                .filter(|session| !session.trim().is_empty())
+        })
+}
+
+/// Typed dry-run preview answer for a tool in a serving read lane
+/// (issue #1939, I7.17).
+///
+/// The exact preview: the validated lane, the would-be invoke-read route
+/// entry, the request digest, capability, payload digest, envelope scope,
+/// connection, and the exact owner fence as the currentness ceiling, all
+/// under [`HOST_REQUEST_PREVIEW_SOURCE`]. No operation identity is minted:
+/// the echoed `envelope_sha256` names the request, never an operation.
+pub(crate) fn host_request_preview_response(
+    envelope: &HostRequestEnvelope,
+    lane: &'static str,
+) -> Result<serde_json::Value, TransportError> {
+    let fence =
+        serde_json::to_value(&envelope.state_fence).map_err(|_| TransportError::SessionFenced)?;
+    Ok(serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "preview": "dry_run_preview",
+            "lane": lane,
+            "route": AGENT_HOST_REQUEST_INVOKE_READ_OPERATION,
+            "envelope_sha256": envelope.envelope_sha256.as_str(),
+            "capability": envelope.identity.capability.as_str(),
+            "payload_sha256": envelope.identity.payload_sha256.as_str(),
+            "scope": preview_envelope_scope(envelope),
+            "connection_id": envelope.connection_id.as_str(),
+            "state_fence": fence,
+            "source": HOST_REQUEST_PREVIEW_SOURCE,
+        },
+        "recovery": null,
+    }))
+}
+
+/// Typed dry-run answer for a tool with no serving read lane
+/// (issue #1939, I7.17).
+///
+/// `DRY_RUN_UNSUPPORTED` with the best static preview: the request digest,
+/// capability, payload digest, envelope scope, connection, and fence echo
+/// what was presented without claiming the target accepted, staged, or
+/// simulated anything. The route stays withheld and no operation identity
+/// is minted.
+pub(crate) fn host_request_preview_unsupported_response(
+    envelope: &HostRequestEnvelope,
+) -> serde_json::Value {
+    let fence = serde_json::to_value(&envelope.state_fence).unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "preview": "dry_run_unsupported",
+            "lane": null,
+            "route": HOST_REQUEST_PREVIEW_ROUTE_WITHHELD,
+            "envelope_sha256": envelope.envelope_sha256.as_str(),
+            "capability": envelope.identity.capability.as_str(),
+            "payload_sha256": envelope.identity.payload_sha256.as_str(),
+            "scope": preview_envelope_scope(envelope),
+            "connection_id": envelope.connection_id.as_str(),
+            "state_fence": fence,
+            "source": HOST_REQUEST_PREVIEW_SOURCE,
+        },
         "recovery": null,
     })
 }

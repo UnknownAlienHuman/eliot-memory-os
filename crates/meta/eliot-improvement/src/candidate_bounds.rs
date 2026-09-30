@@ -68,6 +68,21 @@
 //! methods below are each documented with exactly what a verified permit
 //! authenticates and what an owner merely declares.
 //!
+//! # The deduplication registry is restorable (#1867 W3)
+//!
+//! A `BoundedBacklog` held by one caller for one pass can never take its
+//! lineage-merge branch: it starts empty every time, so a repeat of the same
+//! evidence lineage is indistinguishable from a first observation.
+//! [`BoundedBacklog::restored`] closes that. It rebuilds the registry from
+//! [`DurableCandidateRecord`]s a caller read back from a durable owner store,
+//! re-proves every candidate through [`ImprovementCandidate::validate`], and
+//! COMPUTES each entry's [`TrackedCandidate::lineage_digest`] from that
+//! candidate's own canonical lineage through [`canonical_evidence_lineage`]
+//! and [`evidence_lineage_digest`] rather than accepting one from the caller.
+//! The merge decision is therefore driven by the candidates' own content, in
+//! every path, and a record that merely exists — or whose key looks right —
+//! is not a prior candidate.
+//!
 //! All records here are advisory/candidate evidence. Nothing in this module
 //! performs promotion, activation, publication, mutation, or task Finish;
 //! Governor admission is referenced, never minted.
@@ -165,6 +180,90 @@ pub fn evidence_lineage_digest(canonical_lineage: &[String]) -> String {
         hasher.update(b"\0");
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// One durable candidate record, offered for restoration into a bounded
+/// backlog (issue #1867 W3).
+///
+/// This is the CONTENT a caller can actually prove about a candidate it read
+/// back from a durable owner record. Every field is a value the record itself
+/// carries; none is inferred from the record's key, its existence, or a list
+/// the caller holds:
+///
+/// - `candidate` — the stored candidate, which
+///   [`ImprovementCandidate::validate`] re-proves and whose own canonical
+///   evidence lineage [`BoundedBacklog::restored`] digests. The lineage
+///   comparison a restored entry is later matched on is therefore the
+///   candidate's own content, never a copy of the caller's evidence list.
+/// - `owner` — the entry's decision authority, taken from the candidate's own
+///   recorded `owner_and_decision_authority` (I12.24:31). `validate` already
+///   refuses a blank one, so an entry restored from a valid candidate is
+///   never ownerless.
+/// - `admitted_under_authority` — the Governor authority the entry was
+///   admitted under, read from the `enforced_bound` the durable record
+///   committed beside the candidate. That bound's `governor_authority_ref` IS
+///   the admission authority: `admit_reporting_pressure` validated it against
+///   the live permit's `authority_ref` and retained exactly that value. It is
+///   therefore the entry's ADMISSION EPOCH across a restart, which is what
+///   makes `archive_cause_for`'s staleness claim work on a restored entry.
+/// - `admitted_value_floor` — the owner-decided value floor of that same
+///   recorded bound.
+///
+/// `admitted_value_floor` is deliberately NOT the daemon's per-candidate
+/// assessed value: the durable record does not carry one, and inventing a
+/// number for it would let the bound order and the `LowValue` archive cause
+/// act on a claim no record makes. A restored entry is therefore retained AT
+/// the floor, and the consequences are stated in full on
+/// [`BoundedBacklog::restored`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableCandidateRecord {
+    pub candidate: ImprovementCandidate,
+    pub owner: Option<String>,
+    pub admitted_under_authority: Option<String>,
+    pub admitted_value_floor: f64,
+}
+
+impl DurableCandidateRecord {
+    /// The entry this record restores to, with its lineage digest computed
+    /// here from the candidate's OWN canonical evidence lineage.
+    ///
+    /// The digest is never accepted from the caller, so a restored entry
+    /// cannot claim a lineage it does not carry. The `owner` and
+    /// `admitted_under_authority` are normalised exactly as
+    /// [`BoundedBacklog::push_entry`] normalises them, so a padded string
+    /// cannot bind here and then read back unmatchable.
+    fn into_entry(self) -> Result<TrackedCandidate, BoundsError> {
+        self.candidate.validate().map_err(BoundsError::Candidate)?;
+        if !self.admitted_value_floor.is_finite() || self.admitted_value_floor < 0.0 {
+            return Err(BoundsError::InvalidValue);
+        }
+        let lineage = canonical_evidence_lineage(&self.candidate.evidence_refs);
+        if lineage.is_empty() {
+            return Err(BoundsError::EmptyEvidenceLineage);
+        }
+        Ok(TrackedCandidate {
+            lineage_digest: evidence_lineage_digest(&lineage),
+            candidate: self.candidate,
+            value: self.admitted_value_floor,
+            owner: normalise_owner(self.owner),
+            merged_from: Vec::new(),
+            admitted_under_authority: self
+                .admitted_under_authority
+                .map(|authority| authority.trim().to_string())
+                .filter(|authority| !authority.is_empty()),
+        })
+    }
+}
+
+/// Trim a decision-owner label to the stored spelling, or `None` when it
+/// carries no usable owner at all.
+///
+/// One normalisation point for both writers of [`TrackedCandidate::owner`],
+/// so a restored entry and an admitted one cannot differ on whitespace alone.
+fn normalise_owner(owner: Option<String>) -> Option<String> {
+    owner
+        .map(|owner| owner.trim().to_string())
+        .filter(|owner| !owner.is_empty())
 }
 
 /// One tracked backlog entry: the advisory candidate plus backlog metadata.
@@ -450,6 +549,121 @@ impl BoundedBacklog {
             entries: Vec::new(),
             bound_overlays: Vec::new(),
             bound_reusables: Vec::new(),
+        })
+    }
+
+    /// Restores a bounded backlog from durable candidate records, so the
+    /// evidence-lineage merge registry survives the process that wrote it.
+    ///
+    /// This is the missing half of I12.24:297's "Duplicates merge by evidence
+    /// lineage" on the daemon's real path. A backlog that exists only for the
+    /// duration of one admission pass can never take its lineage-merge branch:
+    /// every pass starts empty, so a repeat of the same evidence lineage is
+    /// indistinguishable from a first observation. Restoring the records a
+    /// previous pass COMMITTED makes the merge branch reachable across a pass
+    /// boundary and across a restart.
+    ///
+    /// # What is checked, and on what
+    ///
+    /// Every restored entry is checked on its own CONTENT, never on the fact
+    /// that a record exists or on a key that looks right:
+    ///
+    /// 1. [`ImprovementCandidate::validate`] re-proves the stored candidate;
+    /// 2. the canonical evidence lineage must be non-empty, and the entry's
+    ///    [`TrackedCandidate::lineage_digest`] is COMPUTED here by
+    ///    [`evidence_lineage_digest`] over
+    ///    [`canonical_evidence_lineage`] of the candidate's own
+    ///    `evidence_refs`. The caller cannot supply it, so a restored entry
+    ///    cannot claim a lineage it does not carry, and
+    ///    [`BoundedBacklog::merge_target`] compares two candidates' own
+    ///    lineages rather than the caller's list against itself;
+    /// 3. the recorded value floor must be finite and non-negative, the same
+    ///    check the admission path applies to an assessed value.
+    ///
+    /// A record that fails any of these is a REFUSAL, not a silent skip: a
+    /// partially-restored registry is exactly the "looks empty" state this
+    /// entry exists to prevent, so a caller cannot proceed on half a lineage
+    /// set.
+    ///
+    /// # What a restored entry's value does and does not mean
+    ///
+    /// The durable record does not carry the per-candidate assessed value, so
+    /// a restored entry is retained AT the owner-decided floor its own record
+    /// names (see [`DurableCandidateRecord::admitted_value_floor`]). Three
+    /// consequences, all deliberate and none of them a weakened check:
+    ///
+    /// - It is never `LowValue`. `archive_cause_for` claims that cause only
+    ///   when `value < min_value`, and a floor-valued entry is not below the
+    ///   floor, so the bound-relief path can never retire a candidate on a
+    ///   value claim no record makes.
+    /// - It still sorts first among the owned entries under bound pressure,
+    ///   because the floor is the cheapest value the owner has ever decided
+    ///   for this surface. Releasing the least valuable is what I12.24:297's
+    ///   "bounded by target surface and value" orders.
+    /// - The next merge into that entry raises its value: `merge_into` keeps
+    ///   the greater of the two, so a re-admission carrying a real assessment
+    ///   replaces the floor immediately.
+    ///
+    /// # What is deliberately not restored
+    ///
+    /// [`TrackedCandidate::merged_from`] is empty on every restored entry.
+    /// The durable record is the candidate document; the id list of what it
+    /// absorbed is a registry-side annotation with no durable record of its
+    /// own. The MERGED LINEAGE itself is not lost, because `merge_into` unions
+    /// `evidence_refs` into the candidate and the candidate is what is
+    /// committed — so a restored entry's canonical lineage already contains
+    /// every reference it absorbed, and the digest computed above is taken
+    /// over exactly that union. Only the bookkeeping of WHICH candidate ids
+    /// were absorbed is process-local, and this states that rather than
+    /// reconstructing it from the caller's own history.
+    ///
+    /// The owner-retained overlay and reusable-candidate registries
+    /// (`bound_overlays` and `bound_reusables`) are likewise NOT restored: they
+    /// are bound under an owner-verified permit, and no permit survives a
+    /// restart. A backlog restored without them refuses retrieval, which is
+    /// the fail-closed direction already documented on those fields.
+    pub fn restored(
+        policies: Vec<CandidateBoundPolicy>,
+        records: Vec<DurableCandidateRecord>,
+    ) -> Result<Self, BoundsError> {
+        let backlog = Self::new(policies)?;
+        // Resolve every record BEFORE mutating the backlog, so a refusal
+        // leaves nothing half-restored. `into_entry` is the only place a
+        // restored entry is built, so a restored entry cannot exist that did
+        // not pass the same content checks an admitted one does.
+        let mut entries = Vec::with_capacity(records.len());
+        for record in records {
+            entries.push(record.into_entry()?);
+        }
+        // Two records naming ONE candidate would make the active set count a
+        // single candidate twice and give `merge_target` two merge targets for
+        // the same subject. The store keys rows by (kind, handle, digest), so
+        // a re-commit under a new digest legitimately produces a second row
+        // for the same candidate; the highest candidate REVISION is the
+        // surviving one, because `merge_into` and `ImprovementCandidate::
+        // transition` both advance it monotonically. Ties keep the first row
+        // in the caller's order, which is the store's `(record_kind, handle,
+        // record_digest)` order and therefore deterministic.
+        let mut deduplicated: Vec<TrackedCandidate> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // `position` over a shared borrow, resolved before the match, so
+            // the append arm is not a second live mutable borrow.
+            let existing = deduplicated
+                .iter()
+                .position(|kept| kept.candidate.candidate_id == entry.candidate.candidate_id);
+            match existing {
+                Some(index)
+                    if entry.candidate.revision > deduplicated[index].candidate.revision =>
+                {
+                    deduplicated[index] = entry;
+                }
+                Some(_) => {}
+                None => deduplicated.push(entry),
+            }
+        }
+        Ok(Self {
+            entries: deduplicated,
+            ..backlog
         })
     }
 
@@ -759,9 +973,7 @@ impl BoundedBacklog {
         self.entries.push(TrackedCandidate {
             candidate,
             value,
-            owner: owner
-                .map(|o| o.trim().to_string())
-                .filter(|o| !o.is_empty()),
+            owner: normalise_owner(owner),
             lineage_digest,
             merged_from: Vec::new(),
             admitted_under_authority: governed_authority.map(str::to_string),
@@ -901,9 +1113,7 @@ impl BoundedBacklog {
             merged.value = value;
         }
         if merged.owner.is_none() {
-            merged.owner = owner
-                .map(|o| o.trim().to_string())
-                .filter(|o| !o.is_empty());
+            merged.owner = normalise_owner(owner);
         }
         if merged.admitted_under_authority.is_none() {
             merged.admitted_under_authority = governed_authority.map(str::to_string);
@@ -936,6 +1146,15 @@ impl BoundedBacklog {
     /// edge is validated by `transition_lifecycle`, so an illegal move is a
     /// refusal with the entry untouched up to the advisory chain — the same
     /// validate-then-commit discipline the lineage merge uses.
+    ///
+    /// Archival is not promotion. Every hop in this chain is a non-promoting
+    /// disposition (`Stale`, `Rejected`, `Archived`) of the I12.24:70 step
+    /// "→ promote, narrow, rollback or archive →", so it needs no budget record
+    /// and carries no budget-proof argument. The I12.24:76 matched-budget gate
+    /// is bound to the transition INTO `Supported` or `Narrowed`
+    /// (`ImprovementCandidate::promote_lifecycle`) and cannot be sidestepped by
+    /// routing a candidate out of the active set instead: closing an entry never
+    /// promotes one, and never produces a promoted disposition.
     ///
     /// Both terminal lifecycles are produced. A stale candidate's recorded
     /// disposition is `Stale` FIRST — the contract's own vocabulary for
@@ -1336,7 +1555,10 @@ impl BoundedBacklog {
 /// Every hop is validated by `ImprovementCandidate::transition_lifecycle`, so a
 /// state this function does not anticipate is a typed refusal rather than a
 /// silent skip, and no candidate can leave the active set without its
-/// archival being a recorded `ImprovementLifecycle::Archived`.
+/// archival being a recorded `ImprovementLifecycle::Archived`. No hop is a
+/// promoting disposition, so this chain needs no budget record: the I12.24:76
+/// matched-budget gate is bound to `ImprovementCandidate::promote_lifecycle`,
+/// the only seam that admits `Supported` or `Narrowed`.
 fn archive_cause_lifecycles(
     cause: ArchiveCause,
     current: ImprovementLifecycle,
@@ -1381,8 +1603,10 @@ fn archive_cause_lifecycles(
 /// - [`TrackedCandidate::admitted_under_authority`] — the Governor authority
 ///   the entry was admitted under, written from the owner-verified permit by
 ///   [`BoundedBacklog::admit_governed`] and
-///   [`BoundedBacklog::admit_reporting_pressure`], and `None` for a
-///   registry-only [`BoundedBacklog::admit`];
+///   [`BoundedBacklog::admit_reporting_pressure`], read back from the
+///   `enforced_bound` a durable record committed beside the candidate by
+///   [`BoundedBacklog::restored`], and `None` for a registry-only
+///   [`BoundedBacklog::admit`];
 /// - [`CandidateBoundPolicy::governor_authority_ref`] — the Governor decision
 ///   that owns this surface's bound right now.
 ///

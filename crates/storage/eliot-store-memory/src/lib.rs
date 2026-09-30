@@ -28,7 +28,8 @@ use eliot_store_api::{
     AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
     DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
-    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
+    ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF, ERASURE_PARAM_OPERATION_ID,
+    ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
     EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, MAX_RECOVERY_RECORD_BYTES,
     NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
@@ -142,14 +143,19 @@ impl StoreSurfaceOutcome {
 ///
 /// `operation_id` is the caller-supplied stable identity (never regenerated
 /// on retry, so replaying the same id names the same operation); `subject` +
-/// `scope_id` name the exact admitted pair; `surfaces` is the exact admitted
-/// surface denominator; `state_fence` pins the fence the destructive calls
-/// execute under.
+/// `scope_id` name the exact admitted pair; `payload_ref` and
+/// `encryption_key_ref` name the exact payload/blob and key identities the
+/// deletion touches; `deadline_unix_ms` is the exact deadline identity;
+/// `surfaces` is the exact admitted surface denominator; `state_fence` pins
+/// the fence the destructive calls execute under.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StoreErasureIntent {
     pub operation_id: String,
     pub subject: String,
+    pub payload_ref: String,
+    pub encryption_key_ref: String,
+    pub deadline_unix_ms: u64,
     pub scope_id: ScopeId,
     pub surfaces: Vec<StoreErasureSurface>,
     pub state_fence: StateFence,
@@ -160,6 +166,14 @@ impl StoreErasureIntent {
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_erasure_text(&self.operation_id, "erasure.operation_id")?;
         validate_erasure_text(&self.subject, "erasure.subject")?;
+        validate_erasure_text(&self.payload_ref, "erasure.payload_ref")?;
+        validate_erasure_text(&self.encryption_key_ref, "erasure.encryption_key_ref")?;
+        if self.deadline_unix_ms == 0 {
+            return Err(StoreError::InvalidField {
+                field: "erasure.deadline_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
@@ -415,7 +429,18 @@ fn record_erasure_intent_state(
     // return its current outcomes, while divergent content is an identity
     // conflict rather than a replacement.
     if let Some(existing) = state.erasure_intents.get(intent.operation_id.as_str()) {
-        if existing.intent == intent {
+        // The erasure is bound to the exact subject, payload/blob handle,
+        // encryption key, deadline, scope, and fence. Re-recording the same
+        // operation identity naming a different one of those is refused here by
+        // identity comparison, before any destructive call, rather than
+        // replacing the recorded plan.
+        let same_identities = existing.intent.subject == intent.subject
+            && existing.intent.payload_ref == intent.payload_ref
+            && existing.intent.encryption_key_ref == intent.encryption_key_ref
+            && existing.intent.deadline_unix_ms == intent.deadline_unix_ms
+            && existing.intent.scope_id == intent.scope_id
+            && existing.intent.state_fence == intent.state_fence;
+        if same_identities && existing.intent == intent {
             return Ok(existing.outcomes.clone());
         }
         return Err(StoreError::IdentityConflict);
@@ -568,13 +593,16 @@ fn store_surface_by_name(name: &str) -> Result<StoreErasureSurface, StoreError> 
 /// Dispatches the admitted `ApplyErasure` named operation (issue #1712).
 ///
 /// No-op for every other transition class. For the erasure class the bridge
-/// applies only the recorded plan: subject, scope, and surfaces are copied
-/// verbatim from the admitted parameters into the local intent (recorded
-/// idempotently, so same-operation retry replays instead of duplicating),
-/// then the recorded intent is applied. The stable intent identity must equal
-/// the transition identity, binding record, execution, and receipt under one
-/// identity; divergence is an [`StoreError::IdentityConflict`] with no
-/// destructive effect beyond the already-recorded identical intent.
+/// applies only the recorded plan: subject, payload/blob handle, encryption
+/// key, deadline, scope, and surfaces are copied verbatim from the admitted
+/// parameters into the local intent (recorded idempotently, so same-operation
+/// retry replays instead of duplicating), then the recorded intent is
+/// applied. The stable intent identity must equal the transition identity,
+/// binding record, execution, and receipt under one identity, and the
+/// recorded intent must already exist with byte-identical identities before
+/// any destructive call: a second request naming a different subject, payload,
+/// encryption key, or deadline under the same operation identity is refused by
+/// [`StoreError::IdentityConflict`] with no destructive effect.
 fn dispatch_apply_erasure(
     state: &mut MemoryState,
     transition: &PreparedTransition,
@@ -599,6 +627,14 @@ fn dispatch_apply_erasure(
             })
     };
     let subject = text_param(ERASURE_PARAM_SUBJECT)?;
+    let payload_ref = text_param(ERASURE_PARAM_PAYLOAD_REF)?;
+    let encryption_key_ref = text_param(ERASURE_PARAM_ENCRYPTION_KEY_REF)?;
+    let deadline_unix_ms = text_param(ERASURE_PARAM_DEADLINE_UNIX_MS)?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: ERASURE_PARAM_DEADLINE_UNIX_MS,
+            reason: "must be a decimal Unix millisecond deadline",
+        })?;
     let surfaces_value = text_param(ERASURE_PARAM_SURFACES)?;
     let operation_id = text_param(ERASURE_PARAM_OPERATION_ID)?;
     if operation_id != transition.identity.operation_id.to_string() {
@@ -611,6 +647,9 @@ fn dispatch_apply_erasure(
     let intent = StoreErasureIntent {
         operation_id: operation_id.to_owned(),
         subject: subject.to_owned(),
+        payload_ref: payload_ref.to_owned(),
+        encryption_key_ref: encryption_key_ref.to_owned(),
+        deadline_unix_ms,
         scope_id: transition.scope_id.clone(),
         surfaces,
         state_fence: transition.state_fence.clone(),
@@ -2281,7 +2320,11 @@ fn learning_range_payload(
 /// rows scope-free — with scope gating at the decision layer per
 /// I12-26). Fence agreement is enforced by the caller: this helper runs
 /// only after `execute_named_sync` proves the query fence equals the
-/// state fence. Reads beyond
+/// state fence. Erasure disposition is checked here as well as on
+/// `GetEvidencePack` (issue #1142): an evidence-backed erased
+/// `(scope_id, subject)` pair is omitted by exact pair, so a purge
+/// cannot be undone by reading the same capture through this projection.
+/// Reads beyond
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
 /// fail closed with [`StoreError::PayloadTooLarge`] instead of
 /// truncating: a truncated audit range cannot prove journal
@@ -2331,6 +2374,20 @@ fn audit_range_payload(
         else {
             continue;
         };
+        // Erasure disposition is checked on this read too, not only on
+        // `GetEvidencePack` (issue #1142): this projection serves the same
+        // durable `CaptureObservation` rows, so an evidence-backed erased
+        // `(scope_id, subject)` pair must not reappear here after the
+        // evidence pack suppressed it. The check is the exact admitted pair
+        // under the row's own retained scope — the same key the erasure
+        // recorded — never a substring, a default scope, or a guess. A
+        // non-envelope subject is skipped below exactly as before.
+        if state
+            .erased_subjects
+            .contains(&(record.scope_id.to_string(), subject.to_owned()))
+        {
+            continue;
+        }
         let Some(candidate) = eliot_store_api::audit_envelope_candidate(subject) else {
             continue;
         };
@@ -5623,6 +5680,7 @@ mod tests {
         // non-empty expected heads must rebind via `transition_with_heads`.
         let operation_id = OperationId::new(operation).map_err(StoreError::Foundation)?;
         let mut prepared = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: eliot_store_api::OperationIdentity {
                 operation_id,
                 idempotency_key: format!("idem-{operation}"),
@@ -7111,6 +7169,9 @@ mod tests {
         let intent = StoreErasureIntent {
             operation_id: "erasure-op-1".to_owned(),
             subject: "evidence-erased".to_owned(),
+            payload_ref: "payload:blob-erasure-1".to_owned(),
+            encryption_key_ref: "key:erasure-1".to_owned(),
+            deadline_unix_ms: 1_700_000_000_000,
             scope_id: ScopeId::new("scope-1")?,
             surfaces: vec![
                 StoreErasureSurface::CanonicalPayload,
@@ -7201,6 +7262,9 @@ mod tests {
             ordering_scope: OrderingScopeId::new("scope-1")?,
             state_fence: state_fence.clone(),
             subject: subject.to_owned(),
+            payload_ref: format!("payload:blob-{subject}"),
+            encryption_key_ref: "key:erasure-test-1".to_owned(),
+            deadline_unix_ms: 1_700_000_000_000,
             surfaces: vec!["CanonicalPayload".to_owned()],
             reason: "user requested deletion".to_owned(),
             requester: "user:test".to_owned(),
@@ -7467,6 +7531,7 @@ mod tests {
     ) -> Result<PreparedTransition, StoreError> {
         let operation_id = OperationId::new(operation).map_err(StoreError::Foundation)?;
         let mut prepared = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: eliot_store_api::OperationIdentity {
                 operation_id,
                 idempotency_key: format!("idem-{operation}"),

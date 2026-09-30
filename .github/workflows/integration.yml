@@ -116,9 +116,12 @@ jobs:
           # Issue #1923 (I18.44): the key separates the entry by every
           # dimension that changes whether reusing it is safe — runner
           # platform/arch, dependency lock, toolchain, source manifests, and
-          # the run's trust class. scripts/verify-github-workflows.py rejects a
-          # key that drops one (GWF-020).
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/integration.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
+          # the run's trust class. The source dimension hashes every workspace
+          # member root the root manifest declares, workspace/tools/**
+          # included. scripts/verify-github-workflows.py rejects a key that
+          # drops one (GWF-020) or whose manifest globs miss a member root
+          # (GWF-021).
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/integration.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml', 'workspace/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
 
       - name: Produce run-local ignored-test inventory
         shell: pwsh
@@ -203,9 +206,12 @@ jobs:
           # Issue #1923 (I18.44): the key separates the entry by every
           # dimension that changes whether reusing it is safe — runner
           # platform/arch, dependency lock, toolchain, source manifests, and
-          # the run's trust class. scripts/verify-github-workflows.py rejects a
-          # key that drops one (GWF-020).
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/integration.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
+          # the run's trust class. The source dimension hashes every workspace
+          # member root the root manifest declares, workspace/tools/**
+          # included. scripts/verify-github-workflows.py rejects a key that
+          # drops one (GWF-020) or whose manifest globs miss a member root
+          # (GWF-021).
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/integration.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml', 'workspace/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
 
       - name: Re-derive run-local inventory with the single #905 owner
         shell: pwsh
@@ -269,9 +275,12 @@ jobs:
           # Issue #1923 (I18.44): the key separates the entry by every
           # dimension that changes whether reusing it is safe — runner
           # platform/arch, dependency lock, toolchain, source manifests, and
-          # the run's trust class. scripts/verify-github-workflows.py rejects a
-          # key that drops one (GWF-020).
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/integration.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
+          # the run's trust class. The source dimension hashes every workspace
+          # member root the root manifest declares, workspace/tools/**
+          # included. scripts/verify-github-workflows.py rejects a key that
+          # drops one (GWF-020) or whose manifest globs miss a member root
+          # (GWF-021).
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/integration.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml', 'workspace/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
 
       - name: Re-derive run-local inventory with the single #905 owner
         shell: pwsh

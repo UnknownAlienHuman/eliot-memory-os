@@ -174,6 +174,7 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
     let fence = fence();
     let ctx = ctx_for(operation, &fence);
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(operation).expect("operation"),
             idempotency_key: format!("idem-994-{operation}"),

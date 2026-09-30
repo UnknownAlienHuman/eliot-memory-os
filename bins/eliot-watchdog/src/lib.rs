@@ -176,7 +176,10 @@ pub use self_admission::{
     project_service_runtime_inspection,
 };
 use watchdog_admission::validate_runtime_binding;
-pub use watchdog_admission::{FileWatchdogAdmission, WatchdogRuntimeBinding};
+pub use watchdog_admission::{
+    AdmittedIsolatedDestination, FileWatchdogAdmission, WatchdogRuntimeBinding,
+    admit_isolated_destination,
+};
 pub use watchdog_composition::{
     WatchdogAuthorityState, WatchdogBackupPort, WatchdogComposition, WatchdogReadiness,
 };
@@ -2048,10 +2051,12 @@ mod tests {
             "doctor_artifact_digest": "b".repeat(64),
             "testd_artifact_digest": "c".repeat(64),
             "native_worker_artifact_digest": "e".repeat(64),
+            "user_broker_artifact_digest": "d".repeat(64),
             "wasm_host_artifact_digest": "f".repeat(64),
             "doctor_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-doctor.exe",
             "testd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-testd.exe",
             "native_worker_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-native-worker.exe",
+            "user_broker_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-user-broker.exe",
             "wasm_host_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-wasm-host.exe",
             "descriptor_digest": "9".repeat(64)
         });
@@ -2065,6 +2070,7 @@ mod tests {
             "doctor_artifact_digest": "b".repeat(64),
             "testd_artifact_digest": "c".repeat(64),
             "native_worker_artifact_digest": "e".repeat(64),
+            "user_broker_artifact_digest": "d".repeat(64),
             "wasm_host_artifact_digest": "f".repeat(64),
             "kernel_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-kernel.exe",
             "store_bridge_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-store-surreal.exe",
@@ -2073,6 +2079,7 @@ mod tests {
             "doctor_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-doctor.exe",
             "testd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-testd.exe",
             "native_worker_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-native-worker.exe",
+            "user_broker_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-user-broker.exe",
             "wasm_host_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-wasm-host.exe",
             "config_path": r"C:\ProgramData\Eliot\packages\generation-7\store.json",
             "dependency_closure_refs": ["evidence-dependencies"],

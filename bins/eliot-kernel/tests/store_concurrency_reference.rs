@@ -128,6 +128,7 @@ fn admitting_manifest() -> NamedOperationManifest {
     let entries = generated_operation_manifests().expect("generated catalogue");
     assert!(!entries.is_empty(), "catalogue must be non-empty");
     let mut probe = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-994-probe").expect("operation"),
             idempotency_key: "idem-994-probe".to_owned(),
@@ -191,6 +192,7 @@ fn build_transition(
     orderings: &[OrderingHeadExpectation],
 ) -> PreparedTransition {
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(operation).expect("operation"),
             idempotency_key: format!("idem-994-{operation}"),

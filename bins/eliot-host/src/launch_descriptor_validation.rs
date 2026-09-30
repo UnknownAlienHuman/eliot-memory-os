@@ -190,6 +190,31 @@ pub(super) fn verify_host_artifact_at(
 }
 
 #[cfg(windows)]
+pub(super) fn verify_user_broker_artifact(
+    manifest: &CandidateManifest,
+    portable_root: Option<&UserOwnedRootLease>,
+) -> Result<(), HostError> {
+    let launch = &manifest.runtime_launch;
+    let approved_path = approved_locator(
+        Path::new(launch.user_broker_executable_path.as_str()),
+        &launch.user_broker_executable_path,
+        launch.profile,
+    )?;
+    let lease = open_launch_lease(launch.profile, portable_root, &approved_path)?;
+    lease.verify().map_err(|error| {
+        HostError::RecoveryRequired(format!("User Broker artifact identity changed: {error}"))
+    })?;
+    verify_launch_digest(
+        &lease,
+        &launch.user_broker_artifact_digest,
+        "runtime.user_broker_artifact",
+    )
+    .map_err(|error| {
+        HostError::RecoveryRequired(format!("User Broker artifact digest is not exact: {error}"))
+    })
+}
+
+#[cfg(windows)]
 pub(super) fn verify_current_host_artifact(manifest: &CandidateManifest) -> Result<(), HostError> {
     // The OS-reported current image is process identity evidence, never a
     // fallback for the approved launch descriptor.

@@ -646,6 +646,23 @@ impl KernelComposition {
             )
             .map_err(|_| TransportError::SessionFenced)?;
         }
+        #[cfg(windows)]
+        if is_probe && let Some((renewed_head, live_receipt)) = supervision_publication.as_ref() {
+            // I1.5 W4 (#1751): the probe that just renewed supervision is
+            // fresh observable evidence for the runtime-lease tick beside
+            // the issuance site below. Past-due rows for this fence reach
+            // their terminal revision through the owner transition, and
+            // live rows held by this activation renew from this probe's
+            // renewed head and live receipt. A failed tick fails the probe
+            // closed rather than serving readiness over stale rows.
+            let outcome = self.renew_runtime_leases_for_probe(
+                &request,
+                renewed_head,
+                live_receipt,
+                crate::unix_ms(),
+            )?;
+            observe_runtime_lease_tick(&outcome);
+        }
         // The renewed supervision head above proves lease continuity only. It
         // does not by itself prove an independent Watchdog response, so no
         // Material/Critical admission may be derived from it either; that path
@@ -740,6 +757,49 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
             _ => None,
         };
+        // I18.53 ACT-1 (#1918 A4): a granted activation issues its durable
+        // runtime lease. The row is keyed by the stable activation operation
+        // identity, fenced exactly like the activation itself, and expires
+        // after the validity window; the retirement census reads it back
+        // through the canonical ORS owner. No lock is held across the ORS
+        // write: the service lock above is released before this statement.
+        if let (KernelControlCommand::Activate(_), Some(receipt)) =
+            (&request.command, &activation_receipt)
+        {
+            let fence = StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+            let expires_at_ms = crate::unix_ms()
+                .checked_add(RUNTIME_LEASE_VALIDITY_MS)
+                .ok_or(TransportError::SessionFenced)?;
+            let lease = RuntimeLease {
+                lease_id: receipt.operation_id.as_str().to_owned(),
+                scope_ref: request.candidate.activation_id.as_str().to_owned(),
+                authority_epoch: receipt.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                state: LeaseState::Active,
+                expires_at_ms,
+            };
+            self.generation_gateway
+                .ors
+                .record_runtime_lease_current(&lease)
+                .map_err(|_| TransportError::SessionFenced)?;
+            // I1.5 W4 (#1751): grant-time reconciliation beside issuance. The
+            // tick clock terminalizes past-due rows for this fence, and the
+            // grant supersedes stale same-scope identities, so a retried or
+            // replaced activation operation never leaves two live rows for
+            // one activation. Both move through the owner transition; the
+            // census keeps classifying recorded rows and never rewrites them.
+            let now_ms = crate::unix_ms();
+            let outcome = RuntimeLeaseTickOutcome {
+                expired: self.expire_past_due_runtime_leases(&fence, now_ms)?,
+                superseded: self.supersede_stale_runtime_leases(
+                    &fence,
+                    request.candidate.activation_id.as_str(),
+                    receipt.operation_id.as_str(),
+                )?,
+                ..Default::default()
+            };
+            observe_runtime_lease_tick(&outcome);
+        }
         #[cfg(windows)]
         if matches!(&request.command, KernelControlCommand::Activate(_))
             && self
@@ -797,6 +857,14 @@ impl KernelComposition {
                 // here keeps it out of the terminal-transition path whose
                 // unauthenticated `transition` correctly refuses it.
                 | KernelControlCommand::ReadRuntimeLeaseCensus(_) => {}
+                // I1.5 W4 (#1751): administrative revocation is an explicit
+                // owner write through the single-revocation helper below,
+                // never a service state transition. Drain and stop never
+                // revoke, so reconciliation duties cannot be abandoned
+                // implicitly.
+                KernelControlCommand::RevokeRuntimeLease(query) => {
+                    self.revoke_runtime_lease(&query.state_fence, &query.lease_id)?;
+                }
                 command => {
                     self.apply_control_with_terminal(command.clone(), false)
                         .map_err(ControlRequestFailure::Transition)?;
@@ -859,6 +927,44 @@ impl KernelComposition {
         }
         .with_computed_digest()
         .map_err(|_| TransportError::SessionFenced.into())
+    }
+
+    /// Revokes one exact-fence `RuntimeLease` on explicit administrative
+    /// command through the owner legality (I1.5 W4, #1751).
+    ///
+    /// Only the named non-terminal row bound to this exact fence moves, to
+    /// `Revoked`, re-recorded through the canonical ORS owner; terminal rows
+    /// are never rewritten and an unknown identity fails closed with the
+    /// boundary's own `SessionFenced`. Drain and stop never revoke:
+    /// revocation is explicit-command only, so reconciliation duties cannot
+    /// be abandoned implicitly. The census keeps classifying recorded rows
+    /// and never rewrites them.
+    fn revoke_runtime_lease(
+        &self,
+        fence: &StateFence,
+        lease_id: &str,
+    ) -> Result<(), TransportError> {
+        let rows = self
+            .generation_gateway
+            .ors
+            .load_runtime_leases_by_state_fence(fence)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let row = rows
+            .iter()
+            .find(|row| row.lease_id.as_str() == lease_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if row.state_fence != *fence {
+            return Err(TransportError::SessionFenced);
+        }
+        row.validate().map_err(|_| TransportError::SessionFenced)?;
+        let revoked = row
+            .transition_to(LeaseState::Revoked)
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.generation_gateway
+            .ors
+            .record_runtime_lease_current(&revoked)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(())
     }
 
     /// Revalidates the presented pre-suspend resume identities against live
@@ -1358,6 +1464,259 @@ const fn disposition_code(disposition: DrainWakeDisposition) -> &'static str {
 
 /// Stable domain for the ACT-4 boot identity derivation.
 const RESUME_BOOT_ID_DOMAIN: &str = "eliot-kernel.resume-boot.v1";
+
+/// Validity window in milliseconds for an activation-granted runtime lease
+/// (I18.53 ACT-1, #1918 A4). The lease blocks the retirement census while
+/// non-terminal and unexpired; afterwards the census observes it as expired
+/// without rewriting it. Mirrors the supervision renewal policy's 60-second
+/// validity in the same drain gate: one window for both halves of ACT-1, so
+/// neither half can outlive the other's proof.
+const RUNTIME_LEASE_VALIDITY_MS: u64 = 60_000;
+
+/// Maximum age in milliseconds of probe-published evidence admitted as fresh
+/// by the runtime-lease renewal tick (I1.5 W4, #1751). The tick builds its
+/// evidence inline from the probe it is serving — the supervision head
+/// renewed and the live receipt published earlier on that same probe — so
+/// both timestamps fall inside one request handling; the window absorbs
+/// clock-read skew between those two reads, never a stored observation.
+/// Anything older fails the probe closed instead of renewing from stale
+/// evidence.
+#[cfg(windows)]
+const RUNTIME_LEASE_EVIDENCE_FRESHNESS_MS: u64 = 5_000;
+
+/// Counts of [`RuntimeLease`] rows one tick moved through the owner
+/// [`RuntimeLease::transition_to`] legality and re-recorded through the
+/// canonical ORS owner.
+#[derive(Debug, Default)]
+struct RuntimeLeaseTickOutcome {
+    renewed: usize,
+    expired: usize,
+    superseded: usize,
+}
+
+/// Observes one runtime-lease tick that moved at least one row.
+///
+/// F-LOG-KERNEL-4 (#903): fixed `kernel.control.*` event name plus bounded
+/// counts only; no lease identity, scope, fence, or owner error string ever
+/// leaves this boundary (I15.4, I07.20). Ticks that move nothing stay
+/// unlogged, exactly like the supervision leg's routine not-due ticks.
+fn observe_runtime_lease_tick(outcome: &RuntimeLeaseTickOutcome) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    if outcome.renewed == 0 && outcome.expired == 0 && outcome.superseded == 0 {
+        return;
+    }
+    let event_bound = bound_field("kernel.control.runtime_lease_tick");
+    let renewed_bound = bound_field(&outcome.renewed.to_string());
+    let expired_bound = bound_field(&outcome.expired.to_string());
+    let superseded_bound = bound_field(&outcome.superseded.to_string());
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        renewed = renewed_bound.text(),
+        expired = expired_bound.text(),
+        superseded = superseded_bound.text(),
+        "control plane runtime lease tick"
+    );
+}
+
+/// Terminal [`LeaseState`] set for the runtime-lease tick. Mirrors the
+/// retirement gate the Host consumes
+/// (`RuntimeLeaseCensus::is_fully_retired`) and the `idle_lease_census`
+/// runtime leg: only a terminal row stops blocking the drain.
+fn runtime_lease_is_terminal(state: LeaseState) -> bool {
+    matches!(
+        state,
+        LeaseState::Released
+            | LeaseState::Expired
+            | LeaseState::Revoked
+            | LeaseState::Superseded
+            | LeaseState::Closed
+    )
+}
+
+impl KernelComposition {
+    /// Loads the exact-fence [`RuntimeLease`] current set and re-validates
+    /// every row before the tick trusts it.
+    ///
+    /// The loader already selects by exact fence equality and key-checks each
+    /// row against its own lease identity; the tick re-checks the fence and
+    /// runs the owner [`RuntimeLease::validate`] anyway, so a corrupt row
+    /// fails the request closed instead of being renewed, expired, or
+    /// silently skipped.
+    fn load_validated_runtime_leases(
+        &self,
+        fence: &StateFence,
+    ) -> Result<Vec<RuntimeLease>, TransportError> {
+        let rows = self
+            .generation_gateway
+            .ors
+            .load_runtime_leases_by_state_fence(fence)
+            .map_err(|_| TransportError::SessionFenced)?;
+        for row in &rows {
+            if row.state_fence != *fence {
+                return Err(TransportError::SessionFenced);
+            }
+            row.validate().map_err(|_| TransportError::SessionFenced)?;
+        }
+        Ok(rows)
+    }
+
+    /// Terminalizes past-due non-terminal rows through the owner
+    /// [`RuntimeLease::transition_to`] legality and re-records each terminal
+    /// revision through the canonical ORS owner (I1.5 W4, #1751).
+    ///
+    /// The tick clock is the only evidence expiry needs — "if renewal cannot
+    /// be proved, coverage ends at expiry and is reported honestly" — so no
+    /// observation is consumed here; renewal evidence enters only through
+    /// [`Self::renew_runtime_leases_for_probe`]. A past-due row in any
+    /// non-terminal state moves to `Expired`; terminal rows are never
+    /// rewritten. The census keeps classifying recorded `expires_at_ms`
+    /// values and never rewrites them itself.
+    fn expire_past_due_runtime_leases(
+        &self,
+        fence: &StateFence,
+        now_ms: u64,
+    ) -> Result<usize, TransportError> {
+        let rows = self.load_validated_runtime_leases(fence)?;
+        let mut expired = 0;
+        for row in &rows {
+            if runtime_lease_is_terminal(row.state) || now_ms < row.expires_at_ms {
+                continue;
+            }
+            let terminal = row
+                .transition_to(LeaseState::Expired)
+                .map_err(|_| TransportError::SessionFenced)?;
+            self.generation_gateway
+                .ors
+                .record_runtime_lease_current(&terminal)
+                .map_err(|_| TransportError::SessionFenced)?;
+            expired += 1;
+        }
+        Ok(expired)
+    }
+
+    /// Supersedes stale same-scope identities after a new grant through the
+    /// owner [`RuntimeLease::transition_to`] legality (I1.5 W4, #1751).
+    ///
+    /// Only non-terminal rows bound to this exact fence and scope but
+    /// carrying another lease identity move, to `Superseded`: a retried or
+    /// replaced activation operation must never leave two live rows for one
+    /// activation, and old and new authority never overlap merely to make
+    /// wake-up appear fast. Rows held by another activation are another
+    /// obligation and are never touched; only `Active` rows are superseded —
+    /// no writer records any other live state, and anything else converges
+    /// through the expiry pass instead of a contorted transition.
+    fn supersede_stale_runtime_leases(
+        &self,
+        fence: &StateFence,
+        scope_ref: &str,
+        current_lease_id: &str,
+    ) -> Result<usize, TransportError> {
+        let rows = self.load_validated_runtime_leases(fence)?;
+        let mut superseded = 0;
+        for row in &rows {
+            if row.lease_id.as_str() == current_lease_id
+                || row.scope_ref.as_str() != scope_ref
+                || row.state != LeaseState::Active
+            {
+                continue;
+            }
+            let terminal = row
+                .transition_to(LeaseState::Superseded)
+                .map_err(|_| TransportError::SessionFenced)?;
+            self.generation_gateway
+                .ors
+                .record_runtime_lease_current(&terminal)
+                .map_err(|_| TransportError::SessionFenced)?;
+            superseded += 1;
+        }
+        Ok(superseded)
+    }
+
+    /// Renews the live rows this probe holds from this probe's fresh
+    /// observable evidence, expiring what is past due (I1.5 W4, #1751).
+    ///
+    /// The evidence is the renewed supervision head plus the live receipt
+    /// published earlier on this same probe: the head must still be `Active`
+    /// and fenced exactly like this candidate, and the receipt must name
+    /// this installation with a publication time inside
+    /// [`RUNTIME_LEASE_EVIDENCE_FRESHNESS_MS`] of the tick clock. Anything
+    /// else fails the probe closed instead of renewing from stale evidence;
+    /// process survival alone never renews.
+    ///
+    /// Renewal is a new revision of the same lease identity through the owner
+    /// legality — `Active` passes through `Expiring` back to `Active`,
+    /// `Expiring` returns to `Active` directly — with a fresh
+    /// [`RUNTIME_LEASE_VALIDITY_MS`] window, re-validated and re-recorded
+    /// through the canonical ORS owner. Only live rows held by this
+    /// activation (`scope_ref` equal to the candidate activation) renew;
+    /// another activation's live rows are never touched, and live rows in no
+    /// renewable state fail closed rather than being skipped silently.
+    #[cfg(windows)]
+    fn renew_runtime_leases_for_probe(
+        &self,
+        request: &KernelControlRequest,
+        renewed: &SupervisionLeaseSnapshot,
+        live_receipt: &EliotdLiveReceipt,
+        now_ms: u64,
+    ) -> Result<RuntimeLeaseTickOutcome, TransportError> {
+        let fence = StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+        if renewed.record.state != LeaseState::Active || renewed.record.binding.state_fence != fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if live_receipt.installation_id.as_str() != request.candidate.installation_id.as_str()
+            || live_receipt.published_at_unix_ms > now_ms
+            || now_ms.saturating_sub(live_receipt.published_at_unix_ms)
+                > RUNTIME_LEASE_EVIDENCE_FRESHNESS_MS
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let rows = self.load_validated_runtime_leases(&fence)?;
+        let activation_id = request.candidate.activation_id.as_str();
+        let mut outcome = RuntimeLeaseTickOutcome::default();
+        for row in &rows {
+            if runtime_lease_is_terminal(row.state) {
+                continue;
+            }
+            if now_ms >= row.expires_at_ms {
+                let terminal = row
+                    .transition_to(LeaseState::Expired)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                self.generation_gateway
+                    .ors
+                    .record_runtime_lease_current(&terminal)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                outcome.expired += 1;
+                continue;
+            }
+            if row.scope_ref.as_str() != activation_id {
+                continue;
+            }
+            let active = match row.state {
+                LeaseState::Active => row
+                    .transition_to(LeaseState::Expiring)
+                    .and_then(|next| next.transition_to(LeaseState::Active)),
+                LeaseState::Expiring => row.transition_to(LeaseState::Active),
+                _ => return Err(TransportError::SessionFenced),
+            }
+            .map_err(|_| TransportError::SessionFenced)?;
+            let mut renewed_row = active;
+            renewed_row.expires_at_ms = now_ms
+                .checked_add(RUNTIME_LEASE_VALIDITY_MS)
+                .ok_or(TransportError::SessionFenced)?;
+            renewed_row
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            self.generation_gateway
+                .ors
+                .record_runtime_lease_current(&renewed_row)
+                .map_err(|_| TransportError::SessionFenced)?;
+            outcome.renewed += 1;
+        }
+        Ok(outcome)
+    }
+}
 
 /// What the Kernel's own supervision-lease authority actually observed for the
 /// lease identity a resume presents.

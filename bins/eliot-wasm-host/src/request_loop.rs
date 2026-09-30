@@ -23,12 +23,15 @@
 //!
 //! - **The engine worker owns the runner.** Synchronous guest work never
 //!   runs on the control loop, and no untracked timer or detached thread is
-//!   introduced: exactly one worker is spawned, every return path joins it
-//!   (the containment path joins a worker its drain bound expired on under a
+//!   introduced: exactly one worker is spawned, every return path either
+//!   joins it or hands it to a named owner that still holds it (the
+//!   containment path joins a worker its drain bound expired on under a
 //!   bound of its own — the same admitted window — so an expiry can neither
-//!   leave the guest-executing thread detached into a running process nor
-//!   hang the process on a join that can never return), and the control loop
-//!   talks to it over a bounded command channel.
+//!   hang the process on a join that can never return nor leave the
+//!   guest-executing thread detached into a running process: a thread still
+//!   running when that bound expires has its handle retained by
+//!   [`RETAINED_CONTAINED_WORKERS`], which outlives the loop), and the
+//!   control loop talks to it over a bounded command channel.
 //! - **Authority is re-checked, never inherited.** The admitted grant is a
 //!   window ([`LiveAuthority`]); the control loop refreshes the observed
 //!   clock on every tick and the local owner proxies inside the worker
@@ -64,12 +67,13 @@
 //! - **Execution evidence** is the projected result event sequence; the
 //!   uncertain `Unknown` event and the later containment/reconciliation
 //!   event are separate retained observations, never one rewritten record.
-//!   Each names the command that produced it — the #2785 handover token
-//!   carried as `command_sequence` — so a consumer orders events by the
-//!   command, not by when the loop happened to observe it, and a control
-//!   event admitted from an owner delivery names that exact delivery and the
-//!   acknowledgement the child staged for it (#2786), never an order or an
-//!   identity inferred from arrival.
+//!   Each names the command that produced it — the process-local handover
+//!   correlation token carried as `command_sequence` — so within one
+//!   recorded stream a consumer can tell which handover each event came
+//!   from, using the retained `sequence`/`observation_predecessors` order for
+//!   the order itself, and a control event admitted from an owner delivery
+//!   names that exact delivery and the acknowledgement the child staged for
+//!   it (#2786), never an order or an identity inferred from arrival.
 //! - **Cleanup evidence** is this loop's own termination record: whether
 //!   the tracked worker was asked to stop, whether its Shutdown reply
 //!   arrived, and whether the thread was actually joined. A clean stop is
@@ -114,11 +118,11 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
 };
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eliot_contracts::sha256_hex;
@@ -175,18 +179,19 @@ pub const WASM_HOST_RESULT_WIRE_ID: &str = "eliot.wasm.host-result";
 /// version 1. Consumers must reject every other version. (Prior emissions
 /// carried the request constant by defect.)
 ///
-/// Version 3 adds the two exact coordination identities this family was
-/// missing: the observed worker command's own command sequence
-/// ([`WasmHostResultFrame::command_sequence`], issue #2787 S3.5, coordinate
-/// with #2785) and the owner's exact control delivery identity plus the
-/// acknowledgement phase the child actually staged for it
+/// Version 3 adds the two exact coordination facts this family was
+/// missing: the process-local handover correlation token of the observed
+/// worker command ([`WasmHostResultFrame::command_sequence`], issue #2787
+/// S3.5, coordinate with #2785) and the owner's exact control delivery
+/// identity plus the acknowledgement the child actually staged for it
 /// ([`WasmHostResultFrame::delivery_ack`], issue #2787 S6.2, #2786's exact
 /// delivery identity/acknowledgement). Before this version both fields did
-/// not exist, so an event's position in the stream was the arrival order of
-/// the loop's own counter and a control event named no delivery it answered.
-/// An external consumer of version 2 must be migrated: the producer no
-/// longer emits it, and every other version is rejected by
-/// [`validate_frame`].
+/// not exist, so an event named no handover it came from and a control event
+/// named no delivery it answered. The token is a process counter, not an
+/// owner-issued identity: it is valid inside the recorded stream that carries
+/// it and is never compared across processes. An external consumer of
+/// version 2 must be migrated: the producer no longer emits it, and every
+/// other version is rejected by [`validate_frame`].
 pub const WASM_HOST_RESULT_WIRE_VERSION: u16 = 3;
 /// Closed observation phase: the frame observes guest execution.
 pub const RESULT_PHASE_EXECUTE: &str = "execute";
@@ -259,6 +264,13 @@ const OUTPUT_DEADLINE: Duration = Duration::from_secs(5);
 /// was handed over rather than only its kind, and so a stale token from
 /// another operation in this process can never settle this one. It is
 /// bookkeeping, not an operation authority.
+///
+/// It is a process `static` starting at 1, so a value it mints is comparable
+/// only with another value minted by this process without a restart. It is
+/// not owner-issued, not durable, and not a command identity any owner ever
+/// issued. The order of one operation's observations is not this counter: it
+/// is `sequence` with its complete `observation_predecessors` prefix in the
+/// retained record (#2787 S3.5), which is written to disk and replayed.
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Fixed field name for the loop's own Execute command, used by the
@@ -271,8 +283,10 @@ const EXECUTE_COMMAND: &str = "execute";
 const UNATTESTED_OPERATION: &str = "unattested";
 
 /// How far the loop's own termination protocol has progressed. The worker
-/// thread stays joinable in every one of these states; the caller only
-/// joins once this is `Terminated`.
+/// thread stays owned in every one of these states: the caller joins it only
+/// on the paths that observed it finished, and a thread the bounded reap
+/// could not join inside its own bound is handed to the process-lifetime
+/// owner [`RETAINED_CONTAINED_WORKERS`] rather than dropped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerState {
     /// The worker owns the runner and no termination step has been taken.
@@ -286,15 +300,18 @@ enum WorkerState {
     /// A bound expired with the worker still alive: the operation is
     /// contained, not terminated, and no clean shutdown may be claimed. The
     /// thread itself is then joined into `Reaped` when the bounded reap finds
-    /// it finished, which changes no verdict.
+    /// it finished, which changes no verdict. A reap whose own bound expired
+    /// first never joins it: the handle is retained by the process-lifetime
+    /// owner [`RETAINED_CONTAINED_WORKERS`] and the thread keeps that owner
+    /// instead of being detached.
     Contained,
     /// A bound expired and the bounded reap then observed the worker thread
     /// finished and joined it, so the thread itself is reaped rather than
     /// dropped. This is a thread fact only: the operation is still contained,
     /// `Contained` is not upgraded to `Terminated`, and no process
     /// termination is claimed from it. A reap whose own bound expired first
-    /// stays `Contained` — that thread was never joined and this state is not
-    /// claimed for it.
+    /// stays `Contained` — that thread was never joined here, and this state
+    /// is not claimed for it.
     Reaped,
 }
 
@@ -423,9 +440,11 @@ pub enum LoopError {
         command: &'static str,
     },
     /// The tracked worker was still alive when the process-level containment
-    /// path took over. The thread is not a detached worker: the process that
-    /// owns it is ending, and the owner is told the operation stayed
-    /// unresolved instead of being told a clean shutdown happened.
+    /// path took over. The thread is not a detached worker: its handle was
+    /// retained by this process rather than dropped, so the thread keeps an
+    /// owner that can still observe whether it finished, and the owner is
+    /// told the operation stayed unresolved instead of being told a clean
+    /// shutdown happened.
     WorkerContained {
         /// Exact command that was still executing inside the worker.
         command: &'static str,
@@ -820,13 +839,17 @@ pub struct ControlDeliveryAcknowledgement {
 /// - a publication failure surfaces through the loop error and the retained
 ///   observation, never as an ad hoc fallback object.
 ///
-/// Every event additionally names the coordination identity of the command
-/// that produced it ([`command_sequence`](Self::command_sequence), the #2785
-/// handover token) and, for a control event admitted from an owner delivery,
-/// the exact delivery it answers and the acknowledgement the child staged
-/// for it ([`delivery_ack`](Self::delivery_ack), #2786). A consumer orders
-/// events by the command that produced them, never by arrival, and joins a
-/// control event to the exact owner spool slot it belongs to.
+/// Every event additionally names the process-local handover correlation
+/// token of the command that produced it
+/// ([`command_sequence`](Self::command_sequence)) and, for a control event
+/// admitted from an owner delivery, the exact delivery it answers and the
+/// acknowledgement the child staged for it
+/// ([`delivery_ack`](Self::delivery_ack), #2786). The token distinguishes
+/// which handover each event came from within one recorded stream; the order
+/// itself is `sequence` with its complete `observation_predecessors` prefix,
+/// which is durable. The token is not an owner-issued identity and is never
+/// compared across processes, while `delivery_ack` joins a control event to
+/// the exact owner spool slot it belongs to.
 ///
 /// Consumers must reject mixed versions, duplicate terminal events, sequence
 /// gaps, contradictory command sequences, and contradictory identities. That
@@ -865,18 +888,32 @@ pub struct WasmHostResultFrame {
     /// this event. The first event has no predecessors; each follow-up names
     /// every retained event before it, bounded by `sequence`.
     pub observation_predecessors: Vec<u64>,
-    /// The observed worker command's OWN command sequence (#2787 S3.5,
-    /// coordinated with #2785) — the `COMMAND_SEQUENCE` correlation token
-    /// this loop stamped on the accepted command handover.
+    /// The handover correlation token of the worker command whose reply this
+    /// event observes (#2787 S3.5) — the `COMMAND_SEQUENCE` value this loop
+    /// stamped on that one accepted command.
     ///
-    /// This is the ordering evidence the issue requires and `sequence` is
-    /// not: `sequence` is the loop's own arrival counter over retained
-    /// observations, while this token is assigned by the single command
-    /// handover that produced the observed reply. The two are independent —
-    /// a control follow-up can be requested only after the slot that carried
-    /// the previous token was retired — so a consumer can order events by the
-    /// command that produced them rather than by when they happened to be
-    /// observed, and two events of one operation can never share a token.
+    /// What it is: the process-local number of that single command handover,
+    /// read from the accepted command slot while the slot still holds that
+    /// command. The bound-1 worker slot means two observations of one
+    /// operation can never name the same token, so within a recorded stream
+    /// it distinguishes which handover each event came from.
+    ///
+    /// What it is not, and what no code here enforces: it is not
+    /// owner-issued, not durable, and not comparable across processes or
+    /// across a restart of this one, because it is a process counter rather
+    /// than an identity. It therefore does not order events by a command
+    /// identity the owner issued, and it must not be compared with a token
+    /// from another process or another run. The retained order of one
+    /// operation's observations is `sequence` together with the complete
+    /// `observation_predecessors` prefix, both of which live in the durable
+    /// retained record. This token adds one more within-stream fact — which
+    /// handover produced the event — and is checked only for that internal
+    /// consistency (`validate_command_coordination` for its presence
+    /// pairing, [`validate_result_stream`] for strict increase within the
+    /// stream). A control event's owner-issued delivery identity travels
+    /// separately in [`delivery_ack`](Self::delivery_ack); where the owner
+    /// did issue a sequence for a command, that is the field that carries it,
+    /// not this one.
     ///
     /// `None` for a frame that refuses before any worker command ran: there
     /// was no handover, so there is no command sequence to report and none is
@@ -1181,15 +1218,17 @@ fn validate_observation_predecessors(frame: &WasmHostResultFrame) -> Result<(), 
 /// a command must carry the token and an event that observed none must not.
 /// A frame claiming the handover of a command it also says never ran is a
 /// contradiction. No value is refused beyond that pairing: the token is the
-/// producer's own [`COMMAND_SEQUENCE`] handover number, and judging its
-/// magnitude would be a policy this contract does not own.
+/// producer's own process-local [`COMMAND_SEQUENCE`] handover number, so
+/// there is nothing about it to judge — it is not owner-issued, and judging
+/// its magnitude or comparing it to another producer's would be a policy this
+/// contract does not own.
 fn validate_command_coordination(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
     match (
         frame.worker_command.is_some(),
         frame.command_sequence.is_some(),
     ) {
         // Observed command with no token: the producer must report the
-        // handover it stamped, never leave the ordering evidence absent.
+        // handover it stamped, never leave that correlation absent.
         (true, false) | (false, true) => Err(invalid("command-sequence")),
         (true, true) | (false, false) => Ok(()),
     }
@@ -1453,13 +1492,16 @@ pub fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), Loop
         if event.sequence != expected {
             return Err(invalid("sequence-gap"));
         }
-        // Command order (#2787 S3.5): each observation's handover token must
-        // be strictly greater than its predecessor's. The bound-1 command
-        // slot means two observations can never share one handover, and the
-        // loop can only request a follow-up after the previous slot was
-        // retired, so a repeat or a step backwards is a contradiction a
-        // consumer must reject rather than reorder. The check is against the
-        // ORIGINAL recorded values, not against arrival position.
+        // Handover order within this one stream (#2787 S3.5): each
+        // observation's handover token must be strictly greater than its
+        // predecessor's. The bound-1 command slot means two observations can
+        // never share one handover, and the loop can only request a
+        // follow-up after the previous slot was retired, so a repeat or a
+        // step backwards is a contradiction a consumer must reject rather
+        // than reorder. This compares the ORIGINAL recorded values, and
+        // because the token is a process-local counter, it holds only over
+        // this stream — the recorded `sequence` is what orders events, and
+        // the owner-issued identity of a control command is `delivery_ack`.
         if let Some(token) = event.command_sequence
             && previous_command.is_some_and(|previous| token <= previous)
         {
@@ -3089,14 +3131,14 @@ fn command_name(command: WorkerCommand) -> &'static str {
     }
 }
 
-/// The exact coordination identity of one command the worker accepted
+/// The coordination facts of one command the worker accepted
 /// (#2787 S3.5/S6.2).
 ///
 /// `CommandDelivery::Accepted` already holds the #2785 handover token, and
 /// the channel reader holds #2786's exact owner delivery identity for the
 /// command it enqueued from one. This pairs the two so a result event reports
-/// the command that PRODUCED it, instead of inferring its position from when
-/// the loop happened to observe it.
+/// the handover it came from, instead of leaving that implicit, alongside the
+/// owner delivery it answers.
 ///
 /// It is read while the accepted slot still holds that command and is never
 /// reconstructed afterwards: an event whose handover token is not held here
@@ -3180,6 +3222,62 @@ struct EngineWorker {
     outcomes: Receiver<WorkerOutcome>,
     /// The single worker handle the control loop joins.
     handle: std::thread::JoinHandle<()>,
+}
+
+/// Process-lifetime owner of every worker handle this process still holds
+/// (issue #2785 A6).
+///
+/// A handle reaches this owner on exactly one path: the bounded reap's own
+/// bound expired while the guest-executing thread was still running, so the
+/// loop could neither join it inside that bound nor claim it terminated. The
+/// loop state is not that owner — the loop state is dropped when
+/// `run_request_loop` returns, so a handle parked there would be dropped a
+/// moment later, and `JoinHandle::drop` detaches: the thread would then be an
+/// untracked live worker, which is what this issue forbids. The process is
+/// the one owner that outlives the loop, so the handle is retained here and
+/// stays owned for as long as this process runs.
+///
+/// The retained handle keeps the thread's status knowable rather than
+/// untracked: [`JoinHandle::is_finished`] is a live observation, and the next
+/// contained worker to be retained joins every retained handle that has
+/// finished by then, so a thread that ends after its loop is reaped rather
+/// than abandoned. Only an already-finished thread is ever joined, so
+/// retaining one can never hang this process.
+///
+/// Retention owns a thread; it claims nothing about the operation. The
+/// unresolved containment residual still reaches the caller, and
+/// [`WorkerState::Reaped`] is still set only by the joined path in
+/// [`join_contained_worker`].
+static RETAINED_CONTAINED_WORKERS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Hands one unjoined contained worker handle to the process-lifetime owner
+/// [`RETAINED_CONTAINED_WORKERS`], reaping any retained worker that has
+/// finished in the meantime.
+///
+/// A poisoned lock is taken back rather than dropped: the handle being
+/// retained is precisely the thing that must not be lost, so a panic
+/// elsewhere in this process must not cost it that ownership. The new handle
+/// is stored unconditionally, so no return path here can leave a live thread
+/// without an owner.
+fn retain_contained_worker(handle: std::thread::JoinHandle<()>) {
+    let mut retained = match RETAINED_CONTAINED_WORKERS.lock() {
+        Ok(retained) => retained,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Tracked termination, not a second reap path: only a thread already
+    // observed finished is joined here, so this never waits and never claims
+    // termination. The same `is_finished`-then-`join` discipline the stdout
+    // helper owner uses for its own retained handle.
+    let mut still_running = Vec::new();
+    for worker in retained.drain(..) {
+        if worker.is_finished() {
+            let _ = worker.join();
+        } else {
+            still_running.push(worker);
+        }
+    }
+    still_running.push(handle);
+    *retained = still_running;
 }
 
 /// Spawns the single tracked engine worker that owns the runner.
@@ -3717,13 +3815,16 @@ impl BoundedRequestLoop {
     /// The #2785 handover correlation token of the accepted command, or `None`
     /// when no command is outstanding.
     ///
-    /// This is the ordering evidence a result event carries as
+    /// This is the correlation a result event carries as
     /// [`WasmHostResultFrame::command_sequence`]: it is stamped by
     /// [`Self::send`] on the one command handover the worker received, so two
-    /// observations of one operation can never name the same token, and a
-    /// consumer orders events by the command that produced them rather than
-    /// by arrival. It is read while the accepted slot still holds that
-    /// command, and never guessed afterwards.
+    /// observations of one operation can never name the same token and a
+    /// consumer can tell which handover produced which event inside the
+    /// recorded stream. It is that process counter, nothing more — it
+    /// orders nothing by itself, it is not owner-issued, and it is never
+    /// compared outside the stream that recorded it. It is read while the
+    /// accepted slot still holds that command, and never guessed
+    /// afterwards.
     fn accepted_command_sequence(&self) -> Option<u64> {
         match self.delivery {
             Some(CommandDelivery::Accepted { token, .. }) => Some(token),
@@ -3742,11 +3843,11 @@ impl BoundedRequestLoop {
     /// either way the original operation identity is retained for the
     /// owner-side reconciliation record rather than reissued.
     ///
-    /// `identity` is the coordination identity of the command whose reply
-    /// this is (#2787 S3.5/S6.2). The caller reads it from the accepted
-    /// command slot BEFORE that slot is retired here, so the event carries
-    /// the handover token of the command that produced it and the exact
-    /// owner delivery it answers — never an order inferred from arrival, and
+    /// `identity` is the coordination facts of the command whose reply this
+    /// is (#2787 S3.5/S6.2). The caller reads it from the accepted command
+    /// slot BEFORE that slot is retired here, so the event carries the
+    /// handover correlation of the command that produced it and the exact
+    /// owner delivery it answers — never a value inferred from arrival, and
     /// never a delivery identity the command did not come from.
     fn on_outcome(
         &mut self,
@@ -3797,9 +3898,9 @@ impl BoundedRequestLoop {
             .flatten()
             .map(|previous| previous.sequence)
             .collect();
-        // The event's own coordination identity, read from the accepted
-        // command that produced it (#2787 S3.5/S6.2). It is applied before
-        // the budget check so an identity ever larger than the frame budget
+        // The event's own coordination facts, read from the accepted command
+        // that produced it (#2787 S3.5/S6.2). It is applied before the
+        // budget check so an identity ever larger than the frame budget
         // is caught by the same omission rule as any other field, and before
         // the event joins the retained sequence so the durable record carries
         // it too.
@@ -3992,7 +4093,7 @@ impl BoundedRequestLoop {
             .flatten()
             .map(|previous| previous.sequence)
             .collect();
-        // The lost command's own coordination identity (#2787 S3.5/S6.2),
+        // The lost command's own coordination facts (#2787 S3.5/S6.2),
         // read from the accepted slot that still holds it: the loss is
         // attributed to the exact command whose reply never arrived, not to
         // the operation as a whole. A `Shutdown` loss projects the demand
@@ -4215,8 +4316,10 @@ impl RequestLoopReport {
 /// The containment edge is the one place the worker may still be running when
 /// the deadline arrives, and its join is bounded by the same admitted window
 /// rather than left open: the report returns either way, and what differs is
-/// only whether the thread was additionally reaped before this process hands
-/// the unresolved operation to that owner.
+/// only whether the thread was reaped inside that bound or, when the bound
+/// expired first, retained by [`RETAINED_CONTAINED_WORKERS`] — an owner that
+/// outlives this loop — before this process hands the unresolved operation to
+/// the outer process-containment owner.
 ///
 /// Every disposition — success, denial, drain failure, and the
 /// process-level containment path — runs all three steps, so no path can
@@ -4332,11 +4435,12 @@ fn drain_and_shutdown_request_worker(
         // forbids, and a join with no bound of its own is precisely the hang.
         // The reap is therefore bounded by the same admitted window the drain
         // used and changes no verdict either way — whether the thread was
-        // reaped inside that bound or the bound expired first, the report
-        // below is the unresolved containment failure and the process
-        // terminates through the outer process-containment owner. Only the
-        // reaped/contained thread fact differs, and it is recorded on the loop
-        // state rather than in the verdict.
+        // reaped inside that bound, or the bound expired first and the handle
+        // was retained by the process-lifetime owner that outlives this loop,
+        // the report below is the unresolved containment failure and the
+        // process terminates through the outer process-containment owner. Only
+        // the reaped/retained thread fact differs, and it is recorded on the
+        // loop state rather than in the verdict.
         join_contained_worker(state, channel, &worker.outcomes, worker.handle);
         return failed_loop_report(state, contained);
     }
@@ -4499,17 +4603,25 @@ fn request_tracked_shutdown(
 /// admitted ceiling from here is what keeps this the reap of a worker admitted
 /// under that ceiling rather than an open-ended wait.
 ///
-/// On expiry the handle goes out of scope unjoined, and that is the
-/// termination rather than an abandonment: the bound expiring is the last
-/// thing this loop does, because the caller's containment residual makes the
-/// drive return `Err(OrdinaryDriveError::Loop(..))` and `main` then ends the
-/// process, so the outer process-containment owner terminates the thread with
-/// the process instead of the process hanging on a join that can never
-/// return. The thread is never a live worker outliving its owner, the
-/// unresolved operation/effect state is retained in the report the owner
-/// reads, and the loop reports an explicit unresolved result rather than a
-/// false clean drain. It never claims the thread was reaped when it was not:
-/// `WorkerState::Reaped` is set only on the joined path.
+/// On expiry the handle is handed to the process-lifetime owner
+/// [`RETAINED_CONTAINED_WORKERS`] rather than dropped, so the thread keeps a
+/// named owner and stays knowable through
+/// `JoinHandle::is_finished` instead of becoming a detached thread this
+/// process can no longer see. Neither the loop state nor this function's own
+/// scope can own it: the loop state is dropped when `run_request_loop`
+/// returns, and a handle left in this frame would be dropped one line later,
+/// which is the same detach with a shorter fuse. The process outlives both,
+/// so the process is the owner — and the outer process-containment owner
+/// remains the terminal termination for a thread still running when the
+/// process ends, as an additional safety net this no longer depends on.
+///
+/// Retention never upgrades a verdict. `WorkerState::Contained` stays exactly
+/// as [`contained_failure`] set it, the accepted command's outcome is still
+/// owed rather than lost — so no `WorkerTerminatedWithoutOutcome` is invented
+/// for a worker that has not exited, and no `Reaped` is claimed for a thread
+/// that was not joined — and the unresolved operation/effect state stays in
+/// the report the owner reads, so the loop ends in an explicit unresolved
+/// result rather than a false clean drain.
 ///
 /// This join proves thread termination only. It is deliberately NOT process
 /// termination evidence: the caller keeps its unresolved containment report
@@ -4526,7 +4638,7 @@ fn request_tracked_shutdown(
 /// containment edge, and the caller holds its unresolved residual from
 /// [`contained_failure`]. What the bounded wait changes is only whether the
 /// thread is additionally joined — a thread fact that never changes the
-/// verdict, exactly as the joined path below shows. The reaped/contained
+/// verdict, exactly as the joined path below shows. The reaped/retained
 /// distinction stays in [`BoundedRequestLoop::worker`]; the reported residual
 /// stays the containment either way, so a reap that expired can never be
 /// reported as joined and can never be reported as a clean drain.
@@ -4582,18 +4694,29 @@ fn join_contained_worker(
         if handle.join().is_err() {
             state.record_residual(denied("worker-panicked"));
         }
+    } else {
+        // The reap bound expired with the thread still running. This is the
+        // only return path that does not join, and it is precisely the path
+        // that must not let the handle fall out of scope: `JoinHandle::drop`
+        // detaches, so dropping it here is what turned this worker into the
+        // untracked live thread the file's own invariant at
+        // `drain_and_shutdown_request_worker` forbids. The handle is therefore
+        // moved to the process-lifetime owner, which outlives both this frame
+        // and the loop state `run_request_loop` is about to drop.
+        //
+        // Nothing on this path claims the thread ended: `WorkerState::Contained`
+        // stays exactly as `contained_failure` set it, and the accepted
+        // command's outcome is still owed rather than lost — so no
+        // `WorkerTerminatedWithoutOutcome` is invented for a worker that has
+        // not exited, and no `Reaped` is claimed for a thread that was not
+        // joined. The caller's containment residual, which names the command
+        // still executing inside the worker, is unchanged: this is the result
+        // this process hands to the outer process-containment owner.
+        // `is_finished` is re-read rather than remembered, so a thread that
+        // finished inside the last admitted poll is still joined above instead
+        // of being retained.
+        retain_contained_worker(handle);
     }
-    // Reaching here with the thread still live means the reap bound expired.
-    // Nothing on that path may claim the thread ended: `WorkerState::Contained`
-    // stays exactly as `contained_failure` set it, and the accepted command's
-    // outcome is still owed rather than lost — so no
-    // `WorkerTerminatedWithoutOutcome` is invented for a worker that has not
-    // exited, and no `Reaped` is claimed for a thread that was not joined. The
-    // caller's containment residual, which names the command still executing
-    // inside the worker, is the result this process hands to the outer
-    // process-containment owner. `is_finished` is re-read rather than
-    // remembered, so a thread that finished inside the last admitted poll is
-    // still joined instead of being reported as unreaped.
 }
 
 /// Joins the terminated worker and confirms its observed Shutdown outcome.
@@ -5036,7 +5159,7 @@ fn consume_worker_outcome(
     // before the accepted slot is retired, because only an owner-sourced
     // command may be completed against one (issue #2896 A2/A3).
     let owner = state.accepted_owner_delivery();
-    // The command's coordination identity (#2787 S3.5/S6.2), read from the
+    // The command's coordination facts (#2787 S3.5/S6.2), read from the
     // accepted slot while it still holds that command and before the slot is
     // retired below. An owner-sourced command names the exact delivery the
     // channel reader holds for it, with the acknowledgement phase the reader
@@ -5237,7 +5360,7 @@ fn observe_residual_outcome(
         state.record_residual(denied("uncorrelated-outcome"));
         return;
     }
-    // The command's coordination identity (#2787 S3.5/S6.2), read from the
+    // The command's coordination facts (#2787 S3.5/S6.2), read from the
     // accepted slot while it still holds that command. The phase is whatever
     // the channel reader itself recorded; this supervisor completes no owner
     // delivery — it owns no command sender, so it stages no `completed` ack —

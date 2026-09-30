@@ -200,6 +200,18 @@ fn count_retained_references(view: &ContextPlanningView) -> Result<usize, Reacti
         )?;
         checked_reference_add(&mut references, usize::from(result.invalidation.is_some()))?;
     }
+    // The scorecard's output binding carries two caller-supplied reference
+    // lists of its own, so it is counted against the same finite planning
+    // denominator as every other retained reference. An oversized value is
+    // refused; no reference is dropped to make a handoff fit.
+    checked_reference_add(
+        &mut references,
+        view.view.quality.output.evidence_revisions.len(),
+    )?;
+    checked_reference_add(
+        &mut references,
+        view.view.quality.output.omission_handles.len(),
+    )?;
     for omission in &view.admitted.economy.omissions {
         checked_reference_add(&mut references, 2)?; // omission.source_id and decision
         checked_reference_add(&mut references, usize::from(omission.expires.is_some()))?;

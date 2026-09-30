@@ -23,8 +23,9 @@ use crate::{
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
     McpProtocolVersion, PermittedTaskSurface, QueryInput, QueryMode, SemanticRegistry,
     TaskSurfaceConditions, ToolRequest, ToolSchema, TypedRejection, bind_act_owner_inputs,
-    bind_list_surface_budget, canonical_tool_schemas, classify_tool_request,
-    compile_task_relative_surface, decode_protected_request_bytes, published_mcp_tool_surface,
+    bind_list_surface_budget, canonical_registry, canonical_tool_schemas, classify_tool_request,
+    compile_discovery_surface_decision, compile_task_relative_surface,
+    decode_protected_request_bytes, derive_permitted_surface, published_mcp_tool_surface,
     reject_duplicate_keys, validate_proof_ceiling, validate_tool_request_owner,
 };
 
@@ -2320,39 +2321,50 @@ pub fn initialize_result(version: NegotiatedWireVersion, server_version: &str) -
 
 /// Builds the no-task discovery `tools/list` result from the generated schemas.
 ///
-/// Every entry comes from `canonical_tool_schemas`, generated from the same
-/// `serde`/`schemars` contract types EBP clients use. A method with no
+/// Every entry comes from the owner-joined published surface
+/// ([`published_mcp_tool_surface`]): `canonical_tool_schemas`, generated from
+/// the same `serde`/`schemars` contract types EBP clients use, with each
+/// descriptor bound to its registered semantic owner. A method with no
 /// registered semantic owner is absent here, so the listing follows the
 /// owner and never advertises an unimplemented tool.
 ///
 /// Discovery carries no owner-supplied task conditions, so no task-relative
 /// narrowing applies here: the bridge never mints task, role, grant, or
-/// capability facts. Discovery still renders through
-/// [`tools_list_result_for_permitted_surface`] with an empty withheld set,
-/// so discovery and task-relative listings share one projection entry and
-/// cannot drift. Task-bound publication compiles a decision from real
-/// owner facts (#1745) and renders through the same entry.
+/// capability facts. Discovery still passes through #1745's admitted subset
+/// ([`derive_permitted_surface`]) over a no-task decision compiled from the
+/// live registry ([`compile_discovery_surface_decision`]), then renders
+/// through [`tools_list_result_for_permitted_surface`], so discovery and
+/// task-relative listings share one subset derivation and one projection
+/// entry and cannot drift. Task-bound publication compiles a decision from
+/// real owner facts (#1745) and renders through the same entry.
 pub fn tools_list_result() -> Result<Value, WireRejection> {
+    let registry = canonical_registry().map_err(|_| {
+        WireRejection::new(WIRE_INTERNAL_ERROR, "tool semantic owner is unavailable")
+    })?;
+    let decision = compile_discovery_surface_decision(&registry).map_err(|_| {
+        WireRejection::new(WIRE_INTERNAL_ERROR, "tool surface decision is unavailable")
+    })?;
     let schemas = published_mcp_tool_surface().map_err(|_| {
         WireRejection::new(
             WIRE_INTERNAL_ERROR,
             "generated tool schemas are unavailable",
         )
     })?;
-    tools_list_result_for_permitted_surface(&PermittedTaskSurface {
-        permitted: schemas,
-        withheld: Vec::new(),
-    })
+    let surface = derive_permitted_surface(&registry, &decision, &schemas).map_err(|_| {
+        WireRejection::new(WIRE_INTERNAL_ERROR, "tool surface decision is unavailable")
+    })?;
+    tools_list_result_for_permitted_surface(&surface)
 }
 
-/// Builds a task-relative `tools/list` result from a #1745 permitted subset.
+/// Projects a #1745 permitted subset onto the advertised `tools/list` shape.
 ///
 /// This entry is the single funnel for every advertised listing: discovery
-/// arrives with the owner-joined descriptors and an empty withheld set,
-/// while task-bound publication arrives already derived from a decision
-/// compiled over owner-supplied task conditions. Both project through the
-/// same envelopes, identity `_meta`, dialect record, and budget binding,
-/// so withheld methods stay absent without a second projection.
+/// arrives already derived from the owner-joined published surface through
+/// #1745's admitted subset over a no-task decision, while task-bound
+/// publication arrives already derived from a decision compiled over
+/// owner-supplied task conditions. Both project through the same envelopes,
+/// identity `_meta`, dialect record, and budget binding, so withheld methods
+/// stay absent without a second projection.
 pub fn tools_list_result_for_permitted_surface(
     surface: &PermittedTaskSurface,
 ) -> Result<Value, WireRejection> {

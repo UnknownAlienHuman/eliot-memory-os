@@ -24,6 +24,7 @@ mod snapshot_model;
 mod status;
 mod status_projection;
 mod store;
+mod user_broker;
 mod versioned_artifact;
 
 #[cfg(feature = "test-support")]
@@ -76,7 +77,8 @@ pub use execution_manifest::{
 pub use maintenance_trigger_staging::{
     MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,
     MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest,
-    MaintenanceTriggerStagingRoute, stage_maintenance_trigger_intake,
+    MaintenanceTriggerStagingRoute, prove_maintenance_trigger_staging,
+    stage_maintenance_trigger_intake,
 };
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
@@ -122,6 +124,7 @@ pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
     RuntimeLeaseCensusRows, ScanDisclosureRecordOwner,
 };
+pub use user_broker::{UserBrokerHeartbeat, UserBrokerRegistrationSnapshot};
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, CompatibilityRefusal, VersionedArtifact,
     VersionedArtifactCutoverRecord, VersionedArtifactEntry, VersionedArtifactRegistry,

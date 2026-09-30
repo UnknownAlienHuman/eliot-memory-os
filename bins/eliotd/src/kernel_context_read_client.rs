@@ -82,9 +82,10 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
-    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextError, ContextOutcome, ContextRecipe,
-    DecisionContextIncomplete, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
-    QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement, SuppliedOmissionBinding,
+    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
+    ContextRecipe, DecisionContextIncomplete, MeasurementCompositionProfile,
+    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
@@ -1306,6 +1307,33 @@ pub enum PacketCompositionError {
     /// The assembly owner rejected the admitted set.
     #[error("packet assembly failed: {0}")]
     Assembly(Box<AssemblyError>),
+    /// The compilation could not produce a complete grade for the packet it
+    /// attempted, and it did not fabricate a successful Active View in place of
+    /// one.
+    ///
+    /// The attempted recipe revision, the exact compilation binding and the
+    /// COMPLETE card — all twelve dimension results, including every failed,
+    /// unknown, degraded and not-applicable one with the missing evidence it
+    /// names — cross this boundary typed. They are not collapsed into the
+    /// generic [`PacketCompositionError::Assembly`] string, and no result is
+    /// dropped so the failure fits a smaller payload. The refusal is the
+    /// operation-scoped answer the assembly owner already produced, so a host
+    /// reader does not re-derive which operation was blocked, by which
+    /// dimension, or by which unresolved applicability input.
+    #[error("packet quality is incomplete for attempted recipe {attempted_recipe_digest}")]
+    QualityIncomplete {
+        /// Canonical digest of the recipe this compilation actually attempted.
+        attempted_recipe_digest: String,
+        /// Exact task/attempt/scope/decision/fence the attempt was made under.
+        /// Boxed like every other payload-carrying variant here, so this typed
+        /// refusal does not make the composition error large.
+        attempted_binding: Box<ContextBinding>,
+        /// The complete graded card, refused rather than truncated.
+        quality: Box<QualityScorecard>,
+        /// The typed operation-scoped refusal naming the blocking results and
+        /// the unresolved applicability inputs.
+        refusal: Box<QualityRefusal>,
+    },
     /// The assembled packet does not carry exactly the materials the
     /// per-material rank traces reported as delivered. The admission owner's
     /// trace set is the delivery acceptance record, so a divergence between it
@@ -1335,6 +1363,126 @@ pub struct PacketAdmissionBundle {
     pub supplied_omissions: Vec<SuppliedOmissionBinding>,
     /// Caller-supplied measurements the decision must close over.
     pub measurements: Vec<AdmissionMeasurement>,
+}
+
+/// Owner-minted admission pieces closed into one bundle.
+///
+/// The future suppliers (Decision Safety Floor owner, candidate-policy
+/// owner, quality scorecard owner, route capacity/measurement owner) hand
+/// these pieces to [`PacketAdmissionBundle::build`], which validates each
+/// through its owner's own `validate` and proves closure over one
+/// compilation. Grouped so the builder takes an owner-pieces value instead
+/// of a long argument list.
+pub struct PacketAdmissionParts {
+    /// Owner-minted protected floor identity.
+    pub floor: SafetyFloorIdentity,
+    /// Owner-minted priority policy identity.
+    pub priority: PriorityPolicyIdentity,
+    /// Owner-minted admission rule identity.
+    pub rule: AdmissionRuleIdentity,
+    /// Owner-minted measurement composition profile.
+    pub measurement_profile: MeasurementCompositionProfile,
+    /// Caller-supplied omission bindings the decision must close over.
+    pub supplied_omissions: Vec<SuppliedOmissionBinding>,
+    /// Caller-supplied measurements the decision must close over.
+    pub measurements: Vec<AdmissionMeasurement>,
+}
+
+impl PacketAdmissionBundle {
+    /// Builds the one validated admission closure for a packet compilation
+    /// from owner-minted pieces (#2564 I3).
+    ///
+    /// Every identity arrives minted by its owner — the protected floor, the
+    /// priority policy, the admission rule, and the measurement composition
+    /// profile — and every supplied omission and measurement arrives from the
+    /// owners that issued it. This builder mints nothing: it validates each
+    /// piece through its owner's own `validate`, then proves the pieces close
+    /// over one compilation — the floor, priority and rule decisions name the
+    /// compilation decision, the recipe binds the same task/attempt/scope/fence
+    /// decision, every recipe mandatory role is covered by the floor, the
+    /// floor reserves reconcile, and every omission and measurement binds the
+    /// same context. A fabricated all-pass floor, a campaign selector reused
+    /// as policy, or a foreign measurement fails here as a typed composition
+    /// error, never as an admitted bundle.
+    ///
+    /// STITCH-2564-PACKET-SUPPLY: no production owner mints these pieces yet
+    /// (measured on `origin/main`: `SafetyFloorIdentity`,
+    /// `PriorityPolicyIdentity`, `AdmissionRuleIdentity` and
+    /// `MeasurementCompositionProfile` are constructed only in `tests/`
+    /// fixtures). The future suppliers — Decision Safety Floor owner,
+    /// candidate-policy owner, quality scorecard owner, route
+    /// capacity/measurement owner — call this builder and feed the resulting
+    /// bundle to [`KernelContextReadClient::compile_context_packet`]; until
+    /// they do, the campaign packet reports the unbound-closure gap instead
+    /// of compiling.
+    pub fn build(
+        parts: PacketAdmissionParts,
+        recipe: &ContextRecipe,
+        binding: &ContextBinding,
+    ) -> Result<Self, PacketCompositionError> {
+        let PacketAdmissionParts {
+            floor,
+            priority,
+            rule,
+            measurement_profile,
+            supplied_omissions,
+            measurements,
+        } = parts;
+        floor
+            .validate()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        priority
+            .validate()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        rule.validate()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        measurement_profile
+            .validate()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        if floor.decision.decision_id != binding.decision_id
+            || priority.decision.decision_id != binding.decision_id
+            || rule.decision.decision_id != binding.decision_id
+        {
+            return Err(PacketCompositionError::BindingMismatch);
+        }
+        if recipe.binding != *binding {
+            return Err(PacketCompositionError::BindingMismatch);
+        }
+        let floor_roles: BTreeSet<_> = floor.floor.mandatory_roles.iter().collect();
+        if !recipe
+            .mandatory_roles
+            .iter()
+            .all(|role| floor_roles.contains(role))
+        {
+            return Err(PacketCompositionError::BindingMismatch);
+        }
+        floor
+            .floor
+            .capacity
+            .validate()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        for omission in &supplied_omissions {
+            omission
+                .validate(binding)
+                .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        }
+        for measurement in &measurements {
+            measurement
+                .validate()
+                .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+            if measurement.binding.context != *binding {
+                return Err(PacketCompositionError::BindingMismatch);
+            }
+        }
+        Ok(Self {
+            floor,
+            priority,
+            rule,
+            measurement_profile,
+            supplied_omissions,
+            measurements,
+        })
+    }
 }
 
 impl KernelContextReadClient {
@@ -1367,23 +1515,40 @@ impl KernelContextReadClient {
     ///   owner: generic authority rows are not automatically admitted
     ///   Cue/negative-memory/capability inputs.
     ///
-    /// The admission closure (`floor`, `priority`, `rule`, `measurement_profile`,
-    /// omissions, measurements), the `quality` scorecard, the assembly `policy`,
-    /// and the `measure` callback all arrive from their owners: a protected
-    /// floor, reservations, and scorecard evidence are never assembled here
-    /// merely to satisfy the renderer. An explicit admission gap fails as
+    /// The admission closure pieces (`floor`, `priority`, `rule`,
+    /// `measurement_profile`, omissions, measurements), the `quality`
+    /// scorecard, the assembly `policy`, and the `measure` callback all arrive
+    /// from their owners: a protected floor, reservations, and scorecard
+    /// evidence are never assembled here merely to satisfy the renderer. The
+    /// pieces are closed into the one admission bundle by
+    /// [`PacketAdmissionBundle::build`], so an unvalidated or foreign piece
+    /// fails before any candidate is admitted. An explicit admission gap fails as
     /// [`PacketCompositionError::AdmissionIncomplete`] with the owner's gaps,
     /// never as a silently cut view. The packet dispatch invokes this edge with
     /// the admitted pair's binding, recipe, and owner evidence; large output
     /// cannot pass `policy.max_serialized_bytes`, and genuinely deferred
     /// compilation uses a durable job, never an unconsumed handle.
+    ///
+    /// STITCH-2564-PACKET-SUPPLY: the production invoker is the campaign
+    /// packet composition
+    /// (`bins/eliotd/src/campaign_packet.rs::resolve_compile_and_bind_result`),
+    /// which holds the admitted binding and the owner recipe today and still
+    /// lacks the remaining owner suppliers (seven-role converters, candidate
+    /// policy, admission identities, quality card, assembly policy,
+    /// measurement). Until those suppliers call this edge with owner-minted
+    /// pieces, the packet keeps its unbound-closure gap.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
         request: &CandidateRequest,
         recipe: &ContextRecipe,
         policy: &CandidatePolicy,
-        admission: &PacketAdmissionBundle,
+        floor: SafetyFloorIdentity,
+        priority: PriorityPolicyIdentity,
+        rule: AdmissionRuleIdentity,
+        measurement_profile: MeasurementCompositionProfile,
+        supplied_omissions: Vec<SuppliedOmissionBinding>,
+        measurements: Vec<AdmissionMeasurement>,
         quality: QualityScorecard,
         assembly: &AssemblyPolicy,
         measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
@@ -1403,6 +1568,18 @@ impl KernelContextReadClient {
         policy
             .validate()
             .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        let admission = PacketAdmissionBundle::build(
+            PacketAdmissionParts {
+                floor,
+                priority,
+                rule,
+                measurement_profile,
+                supplied_omissions,
+                measurements,
+            },
+            recipe,
+            &request.binding,
+        )?;
         let scope_revision = observed_scope_revision(seven)?;
         let task_frame = required_projection(
             &seven.task_frame,
@@ -1467,10 +1644,50 @@ impl KernelContextReadClient {
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         let (admitted, delivery) = admit_packet_candidates(&input)?;
         let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
-            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
+            .map_err(|error| composition_failure(error, recipe, &request.binding))?;
         check_delivered_traces(&delivery, &assembled)
             .map_err(PacketCompositionError::TraceDelivery)?;
+        // #1727: the assembled packet is not delivered on the strength of its
+        // rendered atoms alone. Each logical unit must still round-trip through
+        // packing with its own source identity, scope/fence and admitted source
+        // order intact, and the whole set must still match the output identity
+        // bound at production against the upstream admission receipt. The check
+        // is made here, at the delivery-acceptance owner, so a substituted
+        // boundary, a reordered source member, a foreign source revision or a
+        // lost unit fails closed before the packet leaves this composition
+        // rather than after it has been consumed.
+        assembled
+            .verify_boundaries()
+            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
         Ok((assembled, delivery))
+    }
+}
+
+/// Projects one assembly refusal onto the daemon-facing composition error
+/// without losing the typed detail it carries.
+///
+/// [`AssemblyError::QualityIncomplete`] already retains the complete scorecard
+/// and the typed operation-scoped refusal the assembly owner produced. That
+/// refusal is re-projected here with the recipe revision that was actually
+/// attempted and the exact compilation binding, so the host-facing response
+/// names what was tried, every failed or unknown dimension result, and the
+/// unresolved applicability inputs. Every other assembly failure keeps its own
+/// typed variant: nothing is stringified and no result is dropped.
+fn composition_failure(
+    error: AssemblyError,
+    recipe: &ContextRecipe,
+    binding: &ContextBinding,
+) -> PacketCompositionError {
+    match error {
+        AssemblyError::QualityIncomplete(quality, refusal) => {
+            PacketCompositionError::QualityIncomplete {
+                attempted_recipe_digest: recipe.recipe_sha256.clone(),
+                attempted_binding: Box::new(binding.clone()),
+                quality,
+                refusal,
+            }
+        }
+        other => PacketCompositionError::Assembly(Box::new(other)),
     }
 }
 

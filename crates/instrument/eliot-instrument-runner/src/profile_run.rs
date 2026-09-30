@@ -30,7 +30,7 @@ use eliot_instrument_api::{
     BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
     TARGET_LAYOUT_REVISION,
 };
-use eliot_process::{ExitDisposition, ProcessEvidenceSink, ProcessExecutor};
+use eliot_process::{ExitDisposition, ProcessEvidenceSink, ProcessExecutor, ProcessRequest};
 use eliot_process_executor::ExecutableObservation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -958,20 +958,78 @@ impl StageOrchestrator {
         runs
     }
 
+    /// Refuses a launcher invocation that skews from the admitted stage.
+    ///
+    /// The route identity comes from the admitting profile while the stage
+    /// carries its own recorded revision: both must agree, and the requested
+    /// arguments must equal the admitted fixed template, before the owning
+    /// port binds the invocation shape.
+    fn invocation_skew_reason(
+        route: &TestExecutionPlaneRoute,
+        stage: &AdmittedStage,
+        invocation: &InstrumentInvocation,
+    ) -> Option<&'static str> {
+        if route.stage().profile_revision != stage.profile_revision {
+            return Some(
+                "stage admission refused: route revision differs from admitted stage revision",
+            );
+        }
+        if invocation.arguments != stage.argument_template {
+            return Some(
+                "stage admission refused: requested arguments differ from the admitted fixed template",
+            );
+        }
+        None
+    }
+
+    /// Refuses a sealed grant/request pair that skews from the admitted stage.
+    ///
+    /// Revalidates the minted grant against the admitted route and stage at
+    /// use, and binds the sealed process request's executable identity to the
+    /// grant's content digest, so neither the grant nor the request can drift
+    /// after admission.
+    fn grant_at_use_skew_reason(
+        route: &TestExecutionPlaneRoute,
+        stage: &AdmittedStage,
+        grant: &InstrumentAdmissionGrant,
+        process_request: &ProcessRequest,
+    ) -> Option<&'static str> {
+        if grant.profile != route.stage().profile
+            || grant.profile_revision != route.stage().profile_revision
+        {
+            return Some("stage admission refused: grant profile differs from the admitted route");
+        }
+        if grant.spec_digest != stage.spec_digest
+            || grant.parser.as_str() != stage.parser.as_str()
+            || grant.parser_generation != stage.parser_generation
+            || grant.arguments != stage.argument_template
+        {
+            return Some("stage admission refused: grant differs from the admitted stage");
+        }
+        if process_request.executable_sha256() != grant.content_digest.as_str() {
+            return Some(
+                "stage admission refused: sealed request carries a different executable identity than the grant",
+            );
+        }
+        None
+    }
+
     /// Binds and launches one stage through the existing runner primitives.
     ///
     /// The pre-launch closure runs in fixed order before any child process
-    /// exists: the owning port binds the invocation shape into the sealed
-    /// process request (adapter schema authority), the executable
-    /// hash/file identity resolves from the machine against the
-    /// intent-sealed digest, the shared admission gate checks the fixed
-    /// argument template and executable identity into a sealed grant, and
-    /// only then does the runner launch. A changed executable, an unknown
-    /// identity, or an off-template argument combination becomes an
-    /// explicit missing run here instead of a child process. The tool
-    /// version stays unobserved (`None`): no version is attested on this
-    /// path, so none is claimed, while a spec-pinned version still gates
-    /// inside admission.
+    /// exists: the invocation profile, revision, and exact argument template
+    /// are checked against the admitted stage before the owning port binds
+    /// the invocation shape into the sealed process request (adapter schema
+    /// authority), the executable hash/file identity resolves from the
+    /// machine against the intent-sealed digest, the shared admission gate
+    /// checks the fixed argument template and executable identity into a
+    /// sealed grant, the grant is revalidated against the planned stage and
+    /// the sealed request at use, and only then does the runner launch. A
+    /// changed executable, an unknown identity, or an off-template argument
+    /// combination becomes an explicit missing run here instead of a child
+    /// process. The tool version stays unobserved (`None`): no version is
+    /// attested on this path, so none is claimed, while a spec-pinned
+    /// version still gates inside admission.
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         plan: &StagePlan,
@@ -1008,6 +1066,9 @@ impl StageOrchestrator {
                 route,
                 "stage admission refused: invocation profile differs from admitted stage",
             );
+        }
+        if let Some(reason) = Self::invocation_skew_reason(route, &planned.stage, &invocation) {
+            return InstrumentRun::missing(route, reason);
         }
         let process_request = match launcher.port(planned).bind(&invocation) {
             Ok(request) => request,
@@ -1052,6 +1113,11 @@ impl StageOrchestrator {
                     );
                 }
             };
+        if let Some(reason) =
+            Self::grant_at_use_skew_reason(route, &planned.stage, &grant, &process_request)
+        {
+            return InstrumentRun::missing(route, reason);
+        }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
             Err(error) => {

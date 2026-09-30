@@ -255,7 +255,16 @@ pub fn store_bootstrap_descriptor(
 /// through the typed `StoreFailure` mapping and the plan is never widened,
 /// translated, or given extra commands. A staged transition therefore
 /// survives daemon replacement only when the replacement store bridge
-/// explicitly supports its recorded contract digest and operation manifest.
+/// explicitly supports its recorded protocol revision and operation manifest.
+/// Both halves are decided by CONTENT against this build's own live values: the
+/// recorded [`eliot_store_api::CONTRACT_VERSION`] through
+/// [`PreparedTransition::validate`], and the recorded `operation_manifest_digest`
+/// through `validate_against_catalogue` against the generated manifests.
+///
+/// `admission_contract_set_digest` is not claimed here either: it is carried and
+/// hash-bound, but the bridge holds no live contract-set value to compare it
+/// against, because I05-15 records that no generated authoritative catalogue
+/// exists yet. This boundary refuses to invent one.
 fn admit_prepared_for_execution(
     context: &RequestMeta,
     transition: &PreparedTransition,
@@ -2017,6 +2026,7 @@ mod tests {
         let entries = generated_operation_manifests().expect("catalogue");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-1927-bridge-1").expect("operation id"),
                 idempotency_key: "idem-1927-bridge-1".to_owned(),
@@ -2218,6 +2228,10 @@ mod tests {
                 handle("6".repeat(64)),
                 handle("--native-worker-artifact-sha256"),
                 handle("7".repeat(64)),
+                handle("--user-broker-executable"),
+                handle(r"C:\ProgramData\Eliot\packages\generation-test\eliot-user-broker.exe"),
+                handle("--user-broker-artifact-sha256"),
+                handle("e".repeat(64)),
                 handle("--eliotd-descriptor"),
                 handle(r"C:\ProgramData\Eliot\eliotd.json"),
                 handle("--eliotd-descriptor-sha256"),
@@ -2253,6 +2267,10 @@ mod tests {
                 r"C:\ProgramData\Eliot\bin\eliot-native-worker.exe",
             ),
             native_worker_artifact_digest: handle("7".repeat(64)),
+            user_broker_executable_path: handle(
+                r"C:\ProgramData\Eliot\packages\generation-test\eliot-user-broker.exe",
+            ),
+            user_broker_artifact_digest: handle("e".repeat(64)),
             wasm_host_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-wasm-host.exe"),
             wasm_host_artifact_digest: handle("f".repeat(64)),
             descriptor_digest: handle("0".repeat(64)),
@@ -2349,7 +2367,8 @@ mod tests {
             &config.runtime_launch.authority_state_fence,
             eliot_store_surreal_adapter::PINNED_SURREALDB_MAJOR,
             "test-provider-artifact-digest",
-        );
+        )
+        .expect("derived migration operation identity");
         let receipt = binding
             .receipt(&provider_receipt)
             .expect("typed authoritative receipt");
@@ -3100,6 +3119,7 @@ mod tests {
             ScopeId, SecurityContext, TransitionClass,
         };
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-bridge").expect("operation id"),
                 idempotency_key: "idem-bridge".to_owned(),
@@ -3176,6 +3196,7 @@ mod tests {
             ScopeId, SecurityContext, TransitionClass,
         };
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-erasure-bridge").expect("operation id"),
                 idempotency_key: "idem-erasure-bridge".to_owned(),
@@ -3199,6 +3220,18 @@ mod tests {
                 operation: NamedMutationOperation::ApplyErasure,
                 parameters: std::collections::BTreeMap::from([
                     ("subject".to_owned(), serde_json::json!("subject-bridge")),
+                    (
+                        "payload_ref".to_owned(),
+                        serde_json::json!("payload:blob-bridge"),
+                    ),
+                    (
+                        "encryption_key_ref".to_owned(),
+                        serde_json::json!("key:erasure-bridge"),
+                    ),
+                    (
+                        "erasure_deadline_unix_ms".to_owned(),
+                        serde_json::json!("1700000000000"),
+                    ),
                     (
                         "surfaces".to_owned(),
                         serde_json::json!("CanonicalPayload,Index"),

@@ -8,6 +8,9 @@
 #![forbid(unsafe_code)]
 
 mod action_envelope;
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/native_worker_facets_v1.rs"));
+}
 mod ports;
 mod protocol;
 
@@ -32,6 +35,9 @@ use eliot_process::{
     ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
 };
 use eliot_receipts::{ProofCeiling, ReceiptDisposition};
+pub use generated::{
+    NativeWorkerExecuteEbpCallV1, NativeWorkerFacetStubError, compile_native_worker_execute_call_v1,
+};
 use thiserror::Error;
 
 pub use eliot_protocol::AckPhase;
@@ -160,6 +166,62 @@ pub enum WorkerError {
         code: &'static str,
         detail: &'static str,
     },
+}
+
+fn map_native_worker_facet_stub_error(
+    error: crate::generated::NativeWorkerFacetStubError,
+) -> WorkerError {
+    match error {
+        crate::generated::NativeWorkerFacetStubError::InvalidField(field) => {
+            WorkerError::InvalidRequest(field)
+        }
+        crate::generated::NativeWorkerFacetStubError::InvalidSource => {
+            WorkerError::InvalidRequest("execute_facet_source")
+        }
+        crate::generated::NativeWorkerFacetStubError::Serialization => {
+            WorkerError::InvalidRequest("execute_facet_encoding")
+        }
+    }
+}
+
+fn prepare_execute_call_and_fingerprint(
+    frame: &WorkerFrame,
+    grant: &CapabilityGrant,
+) -> Result<String, WorkerError> {
+    if let WorkerFrameBody::Execute(call) = &frame.body {
+        let admitted_facet = crate::protocol::admitted_facet_ref_for_dispatch(
+            grant.claim_binding_digest(),
+            grant.executable_expectation(),
+        )?;
+        if let Some(facet_ref) = admitted_facet {
+            let binding = &grant
+                .executable_expectation()
+                .ok_or(WorkerError::InvalidRequest("executable_binding"))?
+                .current;
+            if frame.authority_epoch != binding.authority_epoch {
+                return Err(WorkerError::StaleEpoch);
+            }
+            if frame.state_fence != binding.state_fence {
+                return Err(WorkerError::StaleFence);
+            }
+            let admitted_attempt = grant
+                .claim_attempt_id()
+                .ok_or(WorkerError::InvalidRequest("execute_attempt_binding"))?;
+            if &call.input.attempt_id != admitted_attempt {
+                return Err(WorkerError::AdmissionMismatch("attempt_id"));
+            }
+            call.validate_for_dispatch(facet_ref, &binding.capability_cell)
+                .map_err(map_native_worker_facet_stub_error)?;
+        } else {
+            // Pre-claim starts have no owner-produced executable join. Keep
+            // their existing compatibility contour while requiring a valid,
+            // generated Execute call from the canonical ELIOT facet source.
+            call.validate_for_dispatch(&call.facet_manifest_ref, &call.capability_cell)
+                .map_err(map_native_worker_facet_stub_error)?;
+        }
+        return serde_json::to_string(call).map_err(|_| WorkerError::InvalidFrame("fingerprint"));
+    }
+    serde_json::to_string(&frame.body).map_err(|_| WorkerError::InvalidFrame("fingerprint"))
 }
 
 /// A-13's composition core. Generic P-03 injection is required because the
@@ -717,8 +779,7 @@ where
             return Ok(Vec::new());
         }
 
-        let fingerprint = serde_json::to_string(&frame.body)
-            .map_err(|_| WorkerError::InvalidFrame("fingerprint"))?;
+        let fingerprint = prepare_execute_call_and_fingerprint(&frame, &grant)?;
         match self
             .replay
             .as_mut()
@@ -764,7 +825,7 @@ where
         }
 
         match frame.body.clone() {
-            WorkerFrameBody::Execute(request) => self.execute(&frame, request, prepared_effect),
+            WorkerFrameBody::Execute(call) => self.execute(&frame, call.input, prepared_effect),
             WorkerFrameBody::Cancel(request) => self.cancel(&frame, request).await,
             WorkerFrameBody::Heartbeat => self.heartbeat(&frame),
             WorkerFrameBody::Health => self.health(&frame),
@@ -822,27 +883,22 @@ where
         grant: &CapabilityGrant,
     ) -> Result<Option<AuthorizedEffect>, WorkerError> {
         match body {
-            WorkerFrameBody::Execute(request) => {
+            WorkerFrameBody::Execute(call) => {
+                let request = &call.input;
                 if !matches!(
                     self.lifecycle,
                     WorkerLifecycle::Ready | WorkerLifecycle::Running
                 ) {
                     return Err(WorkerError::InvalidLifecycle);
                 }
-                request.validate_shape()?;
+                request
+                    .validate_shape()
+                    .map_err(WorkerError::InvalidRequest)?;
                 if !grant.capabilities().contains(&request.capability) {
                     return Err(WorkerError::AdmissionRejected(
                         "capability was not admitted".to_owned(),
                     ));
                 }
-                // Facet-identity gate (Implements #22 W2): a claimed dispatch
-                // executes only under the owner-admitted facet identity
-                // carried by the v2 executable expectation. A legacy start
-                // without a claim echo dispatches unchanged.
-                let _admitted_facet = crate::protocol::admitted_facet_ref_for_dispatch(
-                    grant.claim_binding_digest(),
-                    grant.executable_expectation(),
-                )?;
                 request
                     .proposed_effect
                     .as_ref()

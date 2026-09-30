@@ -135,12 +135,12 @@ pub const AGENT_BRIDGE_ACTIVATION_OPERATION: &str = "eliot.agent-bridge.activate
 pub const AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-request";
 /// Current pre-semantic agent-bridge activation request wire version.
-pub const AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION: u16 = 1;
+pub const AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for an agent-bridge activation response.
 pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-response";
 /// Current agent-bridge activation response wire version.
-pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 2;
+pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 3;
 /// Stable denial code for a Kernel-owned activation refusal with no typed
 /// daemon semantic result (pre-ticket immediate denial or result-less expiry).
 /// It never stands in for one of the six typed disposition codes below.
@@ -161,7 +161,7 @@ pub const AGENT_BRIDGE_FAILED_INTERNAL: &str = "FAILED_INTERNAL";
 pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-ticket";
 /// Current semantic-resolution ticket wire version.
-pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION: u16 = 1;
+pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION: u16 = 2;
 const FRAME_PREFIX_BYTES: usize = 4;
 
 /// A protocol contract validation or compatibility failure.
@@ -1776,6 +1776,12 @@ pub struct AgentBridgeActivationRequest {
     pub demand_id: String,
     /// Kernel-created transport connection identity.
     pub connection_id: String,
+    /// Explicit inert workspace selector supplied by the Bridge attach
+    /// surface. Kernel binds it to the admitted request/ticket; eliotd must
+    /// observe it through the Host workspace owner before using it. It grants
+    /// no scope, privacy, task, or filesystem authority by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_selector: Option<String>,
     /// Whether the attach originated inside or outside a governed route.
     pub attach_kind: AgentBridgeAttachKind,
     /// Required evidence gap for an external attach and forbidden for a managed attach.
@@ -1833,6 +1839,13 @@ impl AgentBridgeActivationRequest {
             "agent_bridge_activation_request.connection_id",
             512,
         )?;
+        if let Some(selector) = &self.workspace_selector {
+            bounded_text(
+                selector,
+                "agent_bridge_activation_request.workspace_selector",
+                4096,
+            )?;
+        }
         match (self.attach_kind, &self.pre_attach_blind_interval) {
             (AgentBridgeAttachKind::Managed, None) => {}
             (AgentBridgeAttachKind::External, Some(interval)) => interval.validate()?,
@@ -1977,6 +1990,11 @@ pub struct AgentActivationResolutionTicket {
     pub peer_admission_receipt_sha256: String,
     /// Kernel-created transport connection identity.
     pub connection_id: String,
+    /// Exact inert workspace selector carried by the authenticated activation
+    /// request, if the Bridge supplied one. The selector is never authority;
+    /// the daemon re-observes it through the Host workspace owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_selector: Option<String>,
     /// Exact cancellation identity from the original activation request.
     /// It is inert semantic data, but remains part of the immutable ticket
     /// join so a result cannot outlive a cancelled request identity.
@@ -2056,6 +2074,13 @@ impl AgentActivationResolutionTicket {
             "agent_activation_resolution_ticket.connection_id",
             512,
         )?;
+        if let Some(selector) = &self.workspace_selector {
+            bounded_text(
+                selector,
+                "agent_activation_resolution_ticket.workspace_selector",
+                4096,
+            )?;
+        }
         bounded_text(
             &self.cancellation_id,
             "agent_activation_resolution_ticket.cancellation_id",
@@ -2106,6 +2131,7 @@ impl AgentActivationResolutionTicket {
             || self.activation_request_sha256 != request.request_sha256
             || self.peer_admission_receipt_sha256 != receipt.receipt_sha256
             || self.connection_id != receipt.connection_id
+            || self.workspace_selector != request.workspace_selector
             || self.cancellation_id != request.request_identity.cancellation_id
             || self.state_fence != receipt.state_fence
             || self.kernel_deadline_unix_ms != receipt.activation_deadline_unix_ms
@@ -2186,6 +2212,10 @@ pub struct AgentBridgeAuthenticatedBinding {
     pub plan_id: String,
     /// Exact admitted plan revision.
     pub plan_revision: String,
+    /// Scanner-owned non-ready question from a resolved activation, if a
+    /// bounded workspace observation found a missing privacy boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_start_question: Option<crate::AgentActivationColdStartQuestion>,
 }
 
 impl AgentBridgeAuthenticatedBinding {
@@ -2227,6 +2257,9 @@ impl AgentBridgeAuthenticatedBinding {
             bounded_text(value, field, 512)?;
         }
         self.state_fence.validate()?;
+        if let Some(question) = &self.cold_start_question {
+            question.validate()?;
+        }
         if self.activation_generation != self.state_fence.generation {
             return Err(ProtocolError::InvalidField {
                 field: "agent_bridge_activation_response.activation_generation",
@@ -5509,6 +5542,7 @@ mod tests {
             operation: AGENT_BRIDGE_ACTIVATION_OPERATION.to_owned(),
             demand_id: "agent-bridge-demand-1".to_owned(),
             connection_id: receipt.connection_id.clone(),
+            workspace_selector: None,
             attach_kind,
             pre_attach_blind_interval,
             request_identity: RequestIdentity {
@@ -5547,6 +5581,7 @@ mod tests {
             activation_request_sha256: request.request_sha256.clone(),
             peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
             connection_id: receipt.connection_id.clone(),
+            workspace_selector: request.workspace_selector.clone(),
             cancellation_id: request.request_identity.cancellation_id.clone(),
             state_fence: receipt.state_fence.clone(),
             kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
@@ -5848,6 +5883,7 @@ mod tests {
             task_revision: "task-revision-1".to_owned(),
             plan_id: "plan-1".to_owned(),
             plan_revision: "plan-revision-1".to_owned(),
+            cold_start_question: None,
         };
         binding.validate()?;
 

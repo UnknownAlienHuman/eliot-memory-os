@@ -87,7 +87,22 @@ pub mod governed_source_readback;
 mod governor_authority_feed;
 mod governor_local_read;
 mod governor_observe_serve;
+/// Issue #1145: the live constructor and caller of the Governor improvement
+/// candidate route. `ImprovementRouteRequest` borrows seven Governor-owned
+/// records, so it had no constructor anywhere in the repository and
+/// `route_improvement_candidate` had no caller. This module assembles that
+/// request from the advisory improvement artifact, the `G-19` improvement
+/// admission policy and the admitted Kernel fence the daemon already holds on
+/// the same maintenance observation, and runs the route over it.
+pub mod improvement_candidate_dispatch;
 pub mod improvement_candidate_route;
+/// Issue #1867 W3: the deduplication-registry read-back. This module reads
+/// the candidate records `improvement_intake_dispatch` commits back through
+/// the existing authenticated `GetLearningRecordRange` route and rebuilds the
+/// bounded backlog from them, so the evidence-lineage merge branch is
+/// reachable across a pass boundary and across a restart instead of running
+/// against a registry that is empty at every admission.
+pub mod improvement_dedup_read;
 pub mod improvement_intake;
 /// Issue #1867 W1: the production improvement-intake dispatch. This is the
 /// live call site that reaches `eliot-improvement` from the daemon run loop
@@ -247,6 +262,7 @@ pub use freshness_admission::{
     observed_publication, publication_serves_candidate,
 };
 pub use governor_authority_feed::{
+    GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, GovernorAuthorityObservation,
     maintain_governor_authority_feed, maintain_governor_authority_route_mismatch,
 };
 pub use governor_local_read::{
@@ -257,6 +273,7 @@ pub use governor_observe_serve::{
     ObserveDeferral, ObserveOwnerRoute, ObserveSuboperation, decode_observe_suboperation,
     observe_suboperation_owner, serve_admitted_observe,
 };
+pub use improvement_candidate_dispatch::dispatch_improvement_candidate_route;
 pub use improvement_candidate_route::{
     ImprovementRouteRequest, assess_improvement_repeat, improvement_candidate_retry_permitted,
     improvement_operation_owners, improvement_route_owner, reconcile_improvement_unknown,
@@ -1865,8 +1882,191 @@ impl DaemonComposition {
             ));
         }
         let outcome = self.map_activation_outcome(ticket, now, successor_observation.as_ref());
+        let outcome = match outcome {
+            Ok(result)
+                if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() =>
+            {
+                // Issue #2900 W12/B2: the installation-bound owner supply is
+                // STITCH — no live `eliotd` thread holds the canonical
+                // `Arc<dyn ScanDisclosureRecordOwner>` (Kernel
+                // `RedbRecoveryStore` lives in the separate kernel process;
+                // `eliotd` owns no store client and takes no new store
+                // dependency) and no installation/session owner issues the
+                // per-operation `ScanDisclosureOwnerBinding` yet — so the
+                // port stays disconnected and the question leg runs
+                // storeless with typed fail-closed completion.
+                Self::attach_cold_start_question(ticket, now, result, None)
+            }
+            other => other,
+        };
         emit_activation_admission_diagnostics(ticket, &outcome);
         outcome
+    }
+
+    /// Runs the reachable, non-ready attach discovery leg for an explicit
+    /// workspace selector. The Host observer supplies filesystem/VCS facts;
+    /// the scanner may return only its smallest privacy-boundary question
+    /// until an installation-backed disclosure owner is supplied.
+    ///
+    /// Issue #2900 W12: this is the live attach/cold-start ingress that
+    /// reaches the scan port. When the installation-bound durable owner is
+    /// supplied, it is connected before `BootstrapScanner::scan` through
+    /// [`Self::attach_cold_start_owner_receipt`]: the scan charges the
+    /// observed lease once, persists through the owner, replays the handle
+    /// back under the same binding, and the completed activation stands on
+    /// that durable receipt — no in-memory-only or loose-file fallback
+    /// exists anywhere on this route. An owner refusal of
+    /// `ScanContourNotAdmitted` (no persistable inputs) falls through to
+    /// the storeless question projection below, which charges nothing and
+    /// persists nothing; any other owner refusal fails closed with its
+    /// typed cause. Without the owner the pre-owner question leg below
+    /// runs without a store (no lease charge, no persistence), and a
+    /// completed scan fails closed with the typed inaccessible cause.
+    /// Caller: live `DaemonComposition::resolve_agent_activation_v2`; the
+    /// owner supply behind the owner arm is STITCH (see call site).
+    fn attach_cold_start_question(
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+        result: AgentActivationResolutionResult,
+        owner: Option<(
+            &mut eliot_governor::InstallationScanDisclosureStore,
+            &eliot_workscope::ScanDisclosureOwnerBinding,
+        )>,
+    ) -> Result<AgentActivationResolutionResult, DaemonError> {
+        let mut observed = crate::task_binding_admission::observe_cold_start_discovery(
+            ticket,
+            &ticket.state_fence,
+            now.max(1),
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        if let Some((store, binding)) = owner {
+            match Self::attach_cold_start_owner_receipt(store, binding, &mut observed) {
+                // The durable owner receipt stays retained in the
+                // installation-bound owner under its operation key with
+                // exact-replay semantics; the activation stands as
+                // resolved. The trigger-driven terminal compilation takes
+                // its own trigger-scan handle through
+                // `GovernorComposition::compile_cold_start_at_trigger`,
+                // which reads it back through the same store and binding
+                // before compiling.
+                Ok(_handle) => return Ok(result),
+                Err(eliot_workscope::WorkScopeError::ScanContourNotAdmitted) => {}
+                Err(error) => {
+                    return Err(DaemonError::Composition(CompositionError::ScanDisclosure(
+                        error,
+                    )));
+                }
+            }
+        }
+        let scan = eliot_workscope::run_bootstrap_discovery(
+            None,
+            None,
+            &mut observed.lease,
+            &observed.key,
+            &observed.discovery,
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        Self::project_cold_start_question(result, scan)
+    }
+
+    /// Projects one storeless scan outcome onto the resolved activation.
+    ///
+    /// Issue #2900 B6: the question travels on the result; a completed scan
+    /// with no durable owner behind it is never a completed outcome — it
+    /// fails closed with the typed inaccessible cause. This leg charges no
+    /// lease and persists nothing, so reaching it after a refused owner
+    /// attempt is side-effect-free.
+    ///
+    /// Caller: live [`Self::attach_cold_start_question`].
+    fn project_cold_start_question(
+        result: AgentActivationResolutionResult,
+        scan: eliot_workscope::BootstrapScanOutcome,
+    ) -> Result<AgentActivationResolutionResult, DaemonError> {
+        match scan {
+            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
+                code,
+                discriminative_question,
+            } => result
+                .with_cold_start_question(
+                    eliot_protocol::AgentActivationColdStartQuestion::new(
+                        code,
+                        discriminative_question,
+                    )
+                    .map_err(|error| DaemonError::Lifecycle(error.to_string()))?,
+                )
+                .map_err(|error| DaemonError::Lifecycle(error.to_string())),
+            eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. } => {
+                persisted
+                    .validate()
+                    .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+                Err(DaemonError::Composition(CompositionError::ScanDisclosure(
+                    eliot_workscope::WorkScopeError::ScanReceiptInaccessible,
+                )))
+            }
+        }
+    }
+
+    /// Runs the installation-bound owner completion leg for one attach
+    /// discovery (issue #2900 W12/B2/B6).
+    ///
+    /// This is the live attach/cold-start ingress's completion join to the
+    /// exact durable port: the observed lease, key and discovery inputs run
+    /// through `eliot_workscope::run_bootstrap_discovery` with the
+    /// installation-bound `eliot_governor::InstallationScanDisclosureStore`
+    /// and the owner binding, so `BootstrapScanner::scan` executes only
+    /// against the durable owner and the completed scan returns the exact
+    /// replayable owner receipt. The persisted handle is read back through
+    /// the same store before return: a missing, inaccessible, corrupt,
+    /// replaced, stale, invalidated or unknown-commit record fails with its
+    /// typed `eliot_workscope::WorkScopeError` cause and never produces a
+    /// completed outcome, so no terminal readiness receipt may reference it.
+    /// The persisted handle stays retained in the installation-bound owner
+    /// under its operation key with exact-replay semantics. The
+    /// trigger-driven terminal compilation takes its own trigger-scan
+    /// handle: `GovernorComposition::compile_cold_start_at_trigger`
+    /// reads that handle back through the same store and binding before
+    /// compiling, so the terminal readiness receipt references a validated
+    /// durable scan receipt and never an in-memory or loose-file handle.
+    /// A question outcome means the observed discovery carries no
+    /// persistable privacy inputs, which fails as `ScanContourNotAdmitted`:
+    /// there is no in-memory-only or loose-file fallback. The live ingress
+    /// ([`Self::attach_cold_start_question`]) falls through to the
+    /// storeless question projection on exactly this cause, preserving the
+    /// progressive-onboarding question.
+    ///
+    /// Caller: live [`Self::attach_cold_start_question`] (owner arm). The
+    /// store+binding supply behind that arm is STITCH: no live `eliotd`
+    /// thread holds the `Arc<dyn eliot_governor::ScanDisclosureRecordOwner>`
+    /// (the Kernel `RedbRecoveryStore::open` implements it, unwired across
+    /// the process boundary), and the discovery-lease ingress carries no
+    /// owner-issued binding yet.
+    pub fn attach_cold_start_owner_receipt(
+        store: &mut eliot_governor::InstallationScanDisclosureStore,
+        binding: &eliot_workscope::ScanDisclosureOwnerBinding,
+        observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
+    ) -> Result<eliot_workscope::ScanReceiptHandle, eliot_workscope::WorkScopeError> {
+        let port: &mut (dyn eliot_workscope::ScanDisclosureStore + '_) = &mut *store;
+        let outcome = eliot_workscope::run_bootstrap_discovery(
+            Some(port),
+            Some(binding),
+            &mut observed.lease,
+            &observed.key,
+            &observed.discovery,
+        )?;
+        match outcome {
+            eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. } => {
+                persisted.validate()?;
+                let verified =
+                    eliot_workscope::ScanDisclosureStore::readback(store, &persisted, binding)?;
+                if verified.scan_ref != persisted.receipt_ref {
+                    return Err(eliot_workscope::WorkScopeError::ScanReceiptReplaced);
+                }
+                Ok(*persisted)
+            }
+            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { .. } => {
+                Err(eliot_workscope::WorkScopeError::ScanContourNotAdmitted)
+            }
+        }
     }
 
     /// Resolves this Governor's typed activation outcome for one already
@@ -2421,10 +2621,22 @@ impl DaemonComposition {
     /// the updated view in the existing in-process Skill owner before the
     /// caller assesses it. This owner update is not durable restart storage.
     ///
-    /// Evidence is historical. It keeps the Skill revision, package digest and
-    /// attempt it was observed at, so ingesting it now never reactivates a
-    /// superseded Skill: the owner binds it to the stored view's exact
-    /// revision and package and refuses a mismatch.
+    /// Evidence is historical and stays historical. A presented revision the
+    /// live catalogue still names files on the current path. A presented
+    /// revision the catalogue no longer names files ONLY with the plan-resolved
+    /// retained-history binding — a committed accept-row for this exact
+    /// skill/package from retained lifecycle-policy rows — as a linked
+    /// revision that keeps the stored view's current Skill revision/package,
+    /// scope, fence and status, so ingesting it now never reactivates a
+    /// superseded Skill nor re-stamps it with today's fence. A non-current
+    /// revision with no such binding is a substituted identity and is refused.
+    ///
+    /// `ingest_attempt_id` is this ingest's own authenticated attempt id, from
+    /// the Kernel route. The owner stamps it onto every retained record as the
+    /// observation binding (with the Skill identity and the retained fence),
+    /// so a later usefulness claim can require the exact filing attempt —
+    /// never a wire-carried attempt field, which would be self-declared
+    /// (issue #2663, I15.2).
     ///
     /// The crate error travels by value here like every neighboring
     /// composition seam feeding the Governor lifecycle API, so the size
@@ -2433,6 +2645,8 @@ impl DaemonComposition {
     pub fn skill_publish_execution_evidence(
         &mut self,
         payload: &eliot_agent_bridge_core::SkillExecutionPayload,
+        ingest_attempt_id: &str,
+        historical: Option<&crate::skill_evidence_read::HistoricalPackageBinding>,
     ) -> Result<eliot_skill::SkillLifecycleView, eliot_skill::SkillError> {
         self.skill_reconcile_tool_basis()?;
         let entry = {
@@ -2444,18 +2658,30 @@ impl DaemonComposition {
                 .get(&payload.skill_id)
                 .ok_or(eliot_skill::SkillError::NotFound)?;
             entry.validate()?;
-            // The evidence is bound to the exact identity the retained
-            // catalogue entry names, so a substituted revision or package
-            // cannot be filed under the stored view's identity.
-            if entry.body.body_version != payload.skill_revision {
-                return Err(eliot_skill::SkillError::IdentityMismatch);
-            }
             entry.clone()
         };
+        // The evidence is bound to an owner-held identity, never to a bare
+        // revision string. The live entry names the current identity; a
+        // differing presented revision must arrive with the retained-history
+        // binding the plan resolved, holding this exact skill/package —
+        // otherwise it is refused here, before the owner, as a substituted
+        // binding.
+        if entry.body.body_version != payload.skill_revision {
+            let Some(binding) = historical else {
+                return Err(eliot_skill::SkillError::IdentityMismatch);
+            };
+            if !binding.holds()
+                || binding.skill_id != payload.skill_id
+                || binding.package_digest != payload.package_digest
+            {
+                return Err(eliot_skill::SkillError::IdentityMismatch);
+            }
+        }
         self.governor.record_skill_execution_evidence(
             &payload.skill_id,
             &payload.skill_revision,
             &payload.package_digest,
+            ingest_attempt_id,
             &entry,
             &payload.executions,
         )
@@ -2495,18 +2721,20 @@ impl DaemonComposition {
     }
 
     /// Reconciles installed entries against the live canonical tool view,
-    /// marking changed bases stale (issue #1882).
+    /// marking changed bases and drifted versions stale (issue #1882).
     ///
     /// Production startup/refresh driver: builds the canonical tool source
     /// through the Governor hook with the default-empty Skill-owned alias
     /// table (frozen H-A call site) and marks every installed entry whose
-    /// declared tool references no longer resolve. Returns the count of
-    /// newly staled entries. Entries installed under provider renames need
-    /// their alias table at install time; this pass assumes the composed-act
-    /// invariant (canonical references, see `inject_hotset`). Definition-
-    /// version drift is NOT rechecked here: entries carry no admitted-version
-    /// record, so standing version comparison needs the entry-schema seam
-    /// (reported); version drift is caught at install and display time.
+    /// declared tool references no longer resolve through the versioned
+    /// projection, or whose recorded admitted definition version no longer
+    /// equals the live bound version. Returns the count of newly staled
+    /// entries. Entries installed under provider renames need their alias
+    /// table at install time; this pass assumes the composed-act invariant
+    /// (canonical references, see `inject_hotset`). The display path enforces
+    /// the same two legs per call through the versioned acknowledge entry,
+    /// so a registry move between refreshes still marks the subject stale
+    /// instead of displaying a drifted body as generally delivered.
     pub fn skill_reconcile_tool_basis(&self) -> Result<usize, eliot_skill::SkillError> {
         let (source, _) = eliot_governor::canonical_skill_tool_source()?;
         let aliases = eliot_skill::ToolAliasTable::new();

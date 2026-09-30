@@ -609,6 +609,12 @@ impl KernelService {
                     reason: "RuntimeLease census requires the authenticated Kernel composition boundary",
                 });
             }
+            KernelControlCommand::RevokeRuntimeLease(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "runtime_lease_revoke",
+                    reason: "RuntimeLease revocation requires the authenticated Kernel composition boundary",
+                });
+            }
             KernelControlCommand::ReadIntroductionRows(_) => {
                 return Err(KernelServiceError::InvalidField {
                     field: "introduction_readback",

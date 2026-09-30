@@ -43,6 +43,7 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::{EpochId, StateFence};
+use eliot_ors::{OperationalRecoveryStore, OrsError, prove_maintenance_trigger_staging};
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_CLAIM_WIRE_ID, MAINTENANCE_TRIGGER_CLAIM_WIRE_VERSION,
     MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_ID, MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_VERSION,
@@ -122,6 +123,9 @@ pub enum MaintenanceTriggerDeliveryError {
     /// The Kernel service boundary refused session or authority admission.
     #[error("maintenance trigger service admission refused: {0}")]
     Service(#[from] KernelServiceError),
+    /// The ORS owner could not prove the record's staged trigger payload.
+    #[error("maintenance trigger staging proof failed: {0}")]
+    StagingProof(#[from] OrsError),
 }
 
 /// Durable delivery row for one retained trigger.
@@ -344,7 +348,10 @@ impl MaintenanceTriggerDeliveryLedger {
     /// An exact retry (same revision, delivery identity, fence, session)
     /// returns the live claim without minting a competing one; a concurrent
     /// claim under another identity is refused. Expired eligibility blocks
-    /// stale execution: the caller must record terminal expiry first.
+    /// stale execution: the caller must record terminal expiry first. A claim
+    /// against an acknowledged or terminal row conflicts with the settled
+    /// identity: it reconciles through the recorded receipt or terminal
+    /// disposition, never through a fresh claim.
     /// Claim timeout does not rename the trigger: the owner releases the
     /// expired claim back to `Pending` through [`Self::release_expired`]
     /// and reissues under the same identity.
@@ -366,6 +373,18 @@ impl MaintenanceTriggerDeliveryLedger {
             .rows
             .get_mut(&trigger_id)
             .ok_or(MaintenanceTriggerDeliveryError::UnknownTrigger)?;
+        // A settled identity never re-opens for a fresh claim: an exact
+        // retry or a competing claim against an acknowledged or terminal
+        // row conflicts with the recorded outcome and reconciles through
+        // the stored receipt or terminal disposition instead.
+        if matches!(
+            row.disposition,
+            MaintenanceTriggerDisposition::Acknowledged
+                | MaintenanceTriggerDisposition::Expired
+                | MaintenanceTriggerDisposition::Superseded
+        ) {
+            return Err(ProtocolError::ReplayConflict.into());
+        }
         row.record
             .validate_at(now_unix_ms)
             .map_err(|_| MaintenanceTriggerDeliveryError::ExpiredEligibility)?;
@@ -1191,18 +1210,26 @@ fn live_fence(
 
 /// Admits one retained trigger intake through live Kernel authority.
 ///
-/// Re-validates the session, then delegates to
-/// [`MaintenanceTriggerDeliveryLedger::admit_intake`]: the complete opaque
-/// input must already be staged through the ORS owner, exact identity/hash
-/// replay returns the same staging receipt, and changed content conflicts.
-/// Any failure admits nothing, so the producer keeps its retry identity.
+/// Re-validates the session, proves the record's delivery obligation names
+/// a durably staged ORS envelope through the existing ORS owner, then
+/// delegates to [`MaintenanceTriggerDeliveryLedger::admit_intake`]: the
+/// complete opaque input must already be staged, exact identity/hash replay
+/// returns the same staging receipt, and changed content conflicts. Any
+/// failure admits nothing and acknowledges nothing, so the producer keeps
+/// its retry identity and its cursor must not advance.
 pub fn handle_maintenance_trigger_intake(
     service: &KernelService,
     session: &AuthenticatedMaintenanceTriggerSession,
     ledger: &mut MaintenanceTriggerDeliveryLedger,
+    store: &impl OperationalRecoveryStore,
     record: MaintenanceTriggerRecord,
 ) -> Result<MaintenanceTriggerIntakeReceipt, MaintenanceTriggerDeliveryError> {
     session.service_context(service)?;
+    prove_maintenance_trigger_staging(
+        store,
+        &record.payload.envelope_reference,
+        &record.payload.payload_hash,
+    )?;
     ledger.admit_intake(record)
 }
 

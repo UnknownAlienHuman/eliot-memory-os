@@ -304,7 +304,7 @@ enum InstallationCommand {
         #[arg(long)]
         transaction_id: Option<String>,
     },
-    /// Materialize an exact thirteen-role Phase-A source bundle and feed it through
+    /// Materialize an exact fifteen-role Phase-A source bundle and feed it through
     /// the publication-bound generation planner. `--store` is required because
     /// the durable transaction store is the sole authority for a generated plan.
     MaterializeSourceBundle {
@@ -328,6 +328,9 @@ enum InstallationCommand {
         eliot_native_worker: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliot_wasm_host: PathBuf,
+        /// Release per-user `eliot-user-broker.exe` path.
+        #[arg(long, value_parser = absolute_path)]
+        eliot_user_broker: PathBuf,
         /// Release per-user `eliot-notify.exe` adapter path (I1.3/I1.4).
         #[arg(long, value_parser = absolute_path)]
         eliot_notify: PathBuf,
@@ -2118,6 +2121,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_testd,
             eliot_native_worker,
             eliot_wasm_host,
+            eliot_user_broker,
             eliot_notify,
             agent_bridge_exe,
             agent_bridge_account,
@@ -2146,6 +2150,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_testd,
             eliot_native_worker,
             eliot_wasm_host,
+            eliot_user_broker,
             eliot_notify,
             output_bundle,
             output,
@@ -2626,6 +2631,7 @@ fn run_installation_materialize_source_bundle(
     eliot_testd: PathBuf,
     eliot_native_worker: PathBuf,
     eliot_wasm_host: PathBuf,
+    eliot_user_broker: PathBuf,
     eliot_notify: PathBuf,
     output_bundle: PathBuf,
     output: PathBuf,
@@ -2655,6 +2661,7 @@ fn run_installation_materialize_source_bundle(
         eliot_testd_exe: eliot_testd,
         eliot_native_worker_exe: eliot_native_worker,
         eliot_wasm_host_exe: eliot_wasm_host,
+        eliot_user_broker_exe: eliot_user_broker,
         eliot_notify_exe: eliot_notify,
         agent_bridge_exe,
         agent_bridge_account,

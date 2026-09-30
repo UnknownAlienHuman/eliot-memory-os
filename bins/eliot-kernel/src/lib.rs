@@ -507,7 +507,7 @@ pub use eliot_runtime_contracts::{
 };
 use eliot_runtime_contracts::{
     HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, ResumeBrokerIdentity,
-    ResumeIdentitySnapshot, ResumeProcessIdentity, SupervisionGenerationBinding,
+    ResumeIdentitySnapshot, ResumeProcessIdentity, RuntimeLease, SupervisionGenerationBinding,
     SupervisionJournalEpoch, revalidate_resume_identities,
 };
 use eliot_store_api::StoreHealth;
@@ -639,6 +639,11 @@ pub struct KernelComposition {
     wasm_host_executable_path: Option<PathBuf>,
     /// Digest bound to `wasm_host_executable_path`, validated at assembly.
     wasm_host_artifact_sha256: Option<String>,
+    /// Installer-pinned User Broker executable path. Live peer admission
+    /// revalidates its bytes and file identity before creating a profile.
+    user_broker_executable_path: Option<PathBuf>,
+    /// Digest bound to `user_broker_executable_path`.
+    user_broker_artifact_sha256: Option<String>,
     /// Retained owner-side WASM join table (#2786 step 3): the single
     /// cross-call registry of published delivery-bound joins. The
     /// dispatch operation merges each published bundle here and admits
@@ -3778,6 +3783,16 @@ impl KernelComposition {
                     OrsError::SupervisionLeaseBindingMismatch,
                 ))?;
         if now_ms >= current_snapshot.record.binding.expires_at_ms {
+            // I1.5 W4 (expiry): the refusal tick also records the proved
+            // expiry durably, so the ORS head reaches `Expired`/terminal
+            // instead of lingering `Active` past its validity interval and
+            // blocking exact-fence generation retirement. The tick clock and
+            // the supervised contour fence are the fresh evidence; a fence
+            // mismatch fails closed inside the authority owner. A commit
+            // failure replaces the refusal with the fenced authority error
+            // and is retried on the next tick through the staged-ticket
+            // resume.
+            authority.expire_past_due_lease(lease_id, &contour.state_fence, now_ms)?;
             return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
         }
         authority.verify_active_snapshot(&current_snapshot, lease_id, now_ms)?;
@@ -4127,8 +4142,26 @@ impl KernelComposition {
             .current_snapshot(lease_id)
             .map_err(|_| KernelServiceError::ReadinessNotProven)?
             .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let now_ms = unix_ms();
+        if now_ms >= before.record.binding.expires_at_ms {
+            // I1.5 W4 (expiry, probe pre-check): the probe meets the same
+            // past-due `Active` head the renewal-refusal tick terminalizes in
+            // `renew_current_supervision_with_progress`, but on the past-due
+            // path that tick is never reached because the verify below
+            // refuses first. The probe clock and the admitted contour fence
+            // are the fresh evidence; the authority re-reads the head and
+            // commits the fenced `Expire` revision (or resumes it by
+            // identity), so the ORS head reaches `Expired`/terminal instead
+            // of lingering `Active` past its validity interval and blocking
+            // exact-fence generation retirement. A fenced authority failure
+            // refuses the probe closed and is retried on the next probe
+            // through the staged-ticket resume.
+            authority
+                .expire_past_due_lease(lease_id, &contour.state_fence, now_ms)
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        }
         authority
-            .verify_active_snapshot(&before, lease_id, unix_ms())
+            .verify_active_snapshot(&before, lease_id, now_ms)
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         if !supervision_binding_matches_contour(&before.record.binding, &contour)
             .map_err(|_| KernelServiceError::ReadinessNotProven)?
@@ -4610,18 +4643,21 @@ impl KernelComposition {
         }
 
         // ModulesQuiescedReverse: dependents stop before the stores and
-        // bridges they depend on. The contour is the live composition state:
-        // the store bridge (dependency) ordered before the daemon
-        // (dependent), then reversed for quiescence. This phase records the
-        // quiesce *request* against the live contour; each owner's completed
-        // stop is recorded separately at the phase that owner stops in, from
-        // that owner's own post-stop state.
-        let mut dependency_order = Vec::new();
+        // bridges they depend on. The contour is the live composition state
+        // collected as an unordered *set* — the order branches are observed
+        // in carries no meaning and is not consulted. The quiesce order comes
+        // from `KERNEL_QUIESCENCE_EDGES`, the declared edges, inside
+        // `reverse_quiescence_order`; a branch that no declared edge names is
+        // refused there rather than placed by assumption. This phase records
+        // the quiesce *request* against that derived order; each owner's
+        // completed stop is recorded separately at the phase that owner stops
+        // in, from that owner's own post-stop state.
+        let mut live_branches: Vec<String> = Vec::new();
         #[cfg(windows)]
         match self.canonical_store_gateway.lock() {
             Ok(gateway) => {
                 if gateway.is_some() {
-                    dependency_order.push("store-bridge".to_owned());
+                    live_branches.push(shutdown_drain::STORE_BRIDGE_BRANCH.to_owned());
                 }
             }
             Err(_) => return Err(DrainHalt::new("store-contour-unavailable")),
@@ -4629,13 +4665,13 @@ impl KernelComposition {
         match self.daemon_active_launch.lock() {
             Ok(launch) => {
                 if launch.is_some() {
-                    dependency_order.push("daemon".to_owned());
+                    live_branches.push(shutdown_drain::DAEMON_BRANCH.to_owned());
                 }
             }
             Err(_) => return Err(DrainHalt::new("daemon-contour-unavailable")),
         }
-        let quiescence = reverse_quiescence_order(&dependency_order)
-            .map_err(|_| DrainHalt::new("module-contour-ambiguous"))?;
+        let quiescence = reverse_quiescence_order(&live_branches)
+            .map_err(|_| DrainHalt::new("module-contour-unprovable"))?;
         record(
             ShutdownPhase::ModulesQuiescedReverse,
             format!("quiesce-requested:{}", quiescence.join(">")),
@@ -4762,11 +4798,16 @@ impl KernelComposition {
         coordinator.commit_drain(decision.clone()).map_err(|_| {
             DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
         })?;
-        // Issue #1837: durable audit evidence for the drain commit.
-        self.audit_observe(AuditEventDraft::shutdown_drain_committed(
-            &decision.generation,
-            decision.authority_epochs_fenced.len(),
-        ));
+        // Issue #1837 / I14.23 W1: durable audit evidence for the drain commit,
+        // read back from the coordinator *after* the linearization is durable
+        // so the record carries the boundary that was actually persisted rather
+        // than the one this branch intended to persist. A commit the
+        // coordinator cannot hand back is a refused commit, never a published
+        // one, and the halt still produces the incomplete-shutdown terminal.
+        let committed = coordinator
+            .committed_decision()
+            .ok_or_else(|| DrainHalt::new("drain-commit-not-persisted"))?;
+        self.audit_observe(AuditEventDraft::shutdown_drain_committed(&committed));
 
         // Service stop follows linearization; a committed drain without a
         // clean stop is incomplete recovery state, never a silent success.

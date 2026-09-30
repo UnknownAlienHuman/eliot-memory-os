@@ -54,7 +54,7 @@ fn materializer_genesis_epoch() -> Result<EpochId, MaterializeError> {
 ///
 /// `authority.json` and `store-bootstrap.json` are intentionally absent. They
 /// are Host-owned Phase-B material and can never be supplied by this command.
-pub const REQUIRED_ROLES: [(&str, bool); 14] = [
+pub const REQUIRED_ROLES: [(&str, bool); 15] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -65,6 +65,7 @@ pub const REQUIRED_ROLES: [(&str, bool); 14] = [
     ("eliot-testd.exe", true),
     ("eliot-native-worker.exe", true),
     ("eliot-wasm-host.exe", true),
+    ("eliot-user-broker.exe", true),
     ("eliot-notify.exe", true),
     ("generation.json", false),
     ("eliotd-governor.json", false),
@@ -94,6 +95,8 @@ pub struct CanarySourceBundleMaterializeInput {
     pub eliot_native_worker_exe: PathBuf,
     /// Release `eliot-wasm-host.exe` path.
     pub eliot_wasm_host_exe: PathBuf,
+    /// Release per-user `eliot-user-broker.exe` path.
+    pub eliot_user_broker_exe: PathBuf,
     /// Release `eliot-notify.exe` path (per-user one-shot adapter, I1.3).
     pub eliot_notify_exe: PathBuf,
     /// Optional explicit external agent-bridge executable source.
@@ -174,7 +177,7 @@ pub struct CanarySourceBundleReceipt {
     pub bundle_path: String,
     /// Canonical relative generation identity.
     pub generation: String,
-    /// Full fourteen-role canonical artifact evidence digest.
+    /// Full fifteen-role canonical artifact evidence digest.
     pub evidence_digest: String,
     /// Exact role inventory, identities and byte facts.
     pub files: Vec<MaterializedRoleReceipt>,
@@ -185,7 +188,7 @@ pub struct CanarySourceBundleReceipt {
 }
 
 /// The non-wire proof handed directly to the generation planner.  It carries
-/// only the exact published root identity, ordered fourteen-role byte facts and
+/// only the exact published root identity, ordered fifteen-role byte facts and
 /// full evidence digest; the planner independently reopens and observes the
 /// path before accepting these facts.
 #[derive(Clone, Debug)]
@@ -204,7 +207,7 @@ impl CanarySourceBundleReceipt {
             || self.source_identity != self.directory_publication.destination_identity
         {
             return Err(MaterializeError::Invalid(
-                "published source receipt is not an exact fourteen-role directory publication"
+                "published source receipt is not an exact fifteen-role directory publication"
                     .to_owned(),
             ));
         }
@@ -243,7 +246,7 @@ pub enum CanarySourceBundleReconciliationReason {
     /// The platform move committed but exact directory receipt readback was
     /// unavailable.
     DirectoryPublicationUnknown,
-    /// Directory publication was exact, but the complete fourteen-role
+    /// Directory publication was exact, but the complete fifteen-role
     /// post-commit source-bundle readback was rejected.
     #[allow(
         dead_code,
@@ -260,7 +263,7 @@ pub struct CanarySourceBundleReconciliation {
     pub bundle_path: String,
     /// Canonical relative generation identity.
     pub generation: String,
-    /// Full fourteen-role canonical artifact evidence digest.
+    /// Full fifteen-role canonical artifact evidence digest.
     pub evidence_digest: String,
     /// Complete role facts measured before the atomic commit.
     pub precommit_files: Vec<MaterializedRolePrecommitReceipt>,
@@ -492,13 +495,13 @@ fn validate_executable(
 fn validate_role_inventory(roles: &[(&str, bool)]) -> Result<(), MaterializeError> {
     if roles.len() != REQUIRED_ROLES.len() {
         return Err(MaterializeError::Invalid(
-            "Phase-A source bundle must contain exactly thirteen roles".to_owned(),
+            "Phase-A source bundle must contain exactly fifteen roles".to_owned(),
         ));
     }
     for (actual, expected) in roles.iter().zip(REQUIRED_ROLES) {
         if actual != &expected {
             return Err(MaterializeError::Invalid(format!(
-                "role inventory must be the exact ordered fourteen-role Phase-A set; got {}",
+                "role inventory must be the exact ordered fifteen-role Phase-A set; got {}",
                 actual.0
             )));
         }
@@ -730,6 +733,7 @@ fn build_typed_bundle(
     let testd_path = role_path("eliot-testd.exe")?;
     let native_worker_path = role_path("eliot-native-worker.exe")?;
     let wasm_host_path = role_path("eliot-wasm-host.exe")?;
+    let user_broker_path = role_path("eliot-user-broker.exe")?;
     let config_path = role_path("generation.json")?;
     let governor_path = role_path("eliotd-governor.json")?;
     let descriptor_path = role_path("eliotd.json")?;
@@ -752,6 +756,7 @@ fn build_typed_bundle(
     let testd = by_name("eliot-testd.exe")?;
     let native_worker = by_name("eliot-native-worker.exe")?;
     let wasm_host = by_name("eliot-wasm-host.exe")?;
+    let user_broker = by_name("eliot-user-broker.exe")?;
     let governor = governor_bytes(&input.generation, &input.installation_epoch, &kernel.sha256)?;
     let protected_snapshot_digest = protected_snapshot_digest_from_governor_bytes(&governor)?;
     bridge_source_plan(input, &kernel.sha256, protected_snapshot_digest.as_str())?;
@@ -775,6 +780,11 @@ fn build_typed_bundle(
             &native_worker.sha256,
         )?,
         package_digest("eliot-wasm-host.exe", wasm_host.size, &wasm_host.sha256)?,
+        package_digest(
+            "eliot-user-broker.exe",
+            user_broker.size,
+            &user_broker.sha256,
+        )?,
         package_digest(
             "eliotd-governor.json",
             governor.len() as u64,
@@ -831,6 +841,10 @@ fn build_typed_bundle(
         testd.sha256.clone(),
         "--native-worker-artifact-sha256".to_owned(),
         native_worker.sha256.clone(),
+        "--user-broker-executable".to_owned(),
+        user_broker_path.as_str().to_owned(),
+        "--user-broker-artifact-sha256".to_owned(),
+        user_broker.sha256.clone(),
         "--eliotd-descriptor".to_owned(),
         descriptor_path.as_str().to_owned(),
         "--eliotd-descriptor-sha256".to_owned(),
@@ -968,10 +982,12 @@ fn build_typed_bundle(
             "Native worker digest",
         )?,
         wasm_host_artifact_digest: make_digest(wasm_host.sha256.clone(), "WASM host digest")?,
+        user_broker_artifact_digest: make_digest(user_broker.sha256.clone(), "User Broker digest")?,
         doctor_executable_path: doctor_path,
         testd_executable_path: testd_path,
         native_worker_executable_path: native_worker_path,
         wasm_host_executable_path: wasm_host_path,
+        user_broker_executable_path: user_broker_path,
         descriptor_digest: PlatformHandle::new("0".repeat(64))
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
     }
@@ -1240,7 +1256,7 @@ fn typed_bundle_from_journal(
 > {
     if journal.precommit_files.len() != REQUIRED_ROLES.len() {
         return Err(MaterializeError::Invalid(
-            "publication journal does not retain the complete fourteen-role inventory".to_owned(),
+            "publication journal does not retain the complete fifteen-role inventory".to_owned(),
         ));
     }
     let mut manifest_files = Vec::with_capacity(REQUIRED_ROLES.len());
@@ -1887,7 +1903,7 @@ fn materialize_with_executables(
     }
 }
 
-/// Materialize one exact fourteen-role Phase-A source bundle.
+/// Materialize one exact fifteen-role Phase-A source bundle.
 pub fn materialize_canary_source_bundle(
     input: &CanarySourceBundleMaterializeInput,
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
@@ -1911,6 +1927,7 @@ pub fn materialize_canary_source_bundle(
             "eliot-native-worker.exe",
         ),
         (input.eliot_wasm_host_exe.clone(), "eliot-wasm-host.exe"),
+        (input.eliot_user_broker_exe.clone(), "eliot-user-broker.exe"),
         (input.eliot_notify_exe.clone(), "eliot-notify.exe"),
     ];
     let executables = executable_inputs
@@ -2027,6 +2044,7 @@ mod tests {
             eliot_testd_exe: PathBuf::new(),
             eliot_native_worker_exe: PathBuf::new(),
             eliot_wasm_host_exe: PathBuf::new(),
+            eliot_user_broker_exe: PathBuf::new(),
             eliot_notify_exe: PathBuf::new(),
             agent_bridge_exe: None,
             agent_bridge_account: None,

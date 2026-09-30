@@ -266,6 +266,95 @@ impl RestartPolicyAdmissionBinding {
     }
 }
 
+/// Explicit disposition of a supervised child whose declared restart policy is
+/// absent, legacy or unsupported.
+///
+/// I14.10 requires every supervised child to carry a bounded restart-intensity
+/// window, backoff, cooldown, stable-uptime reset condition and quarantine
+/// threshold, so a declaration this contract cannot admit is dispositioned
+/// rather than interpreted. There is deliberately no variant that means
+/// "restart without limit" or "assume the widest authority": a withheld child
+/// performs no automatic restart at all and keeps exactly the effect authority
+/// it was already admitted with, until its owner admits an explicit policy.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPolicyDisposition {
+    /// The declared policy is the admitted version of this contract.
+    Admitted {
+        /// Digest of the admitted policy, which is what the admitted
+        /// generation and the operational record are bound to.
+        policy_digest: String,
+    },
+    /// No automatic restart is permitted for this child.
+    Withheld {
+        /// Policy version the unadmittable declaration named, or `None` when
+        /// the desired manifest declared no versioned policy at all.
+        declared_version: Option<u16>,
+        /// The exact reason the declaration could not be admitted.
+        reason: String,
+    },
+}
+
+impl RestartPolicyDisposition {
+    /// Whether this disposition permits any automatic restart. `Withheld`
+    /// never does, so an absent or unsupported declaration cannot restart a
+    /// child or be read as an unlimited budget.
+    #[must_use]
+    pub const fn permits_automatic_restart(&self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+
+    /// The admitted policy digest, or `None` when no policy was admitted.
+    #[must_use]
+    pub fn policy_digest(&self) -> Option<&str> {
+        match self {
+            Self::Admitted { policy_digest } => Some(policy_digest.as_str()),
+            Self::Withheld { .. } => None,
+        }
+    }
+
+    /// Validates the disposition's own content.
+    pub fn validate(&self) -> Result<(), RuntimeContractError> {
+        match self {
+            Self::Admitted { policy_digest } => text(policy_digest, "policy_digest")?,
+            Self::Withheld { reason, .. } => text(reason, "reason")?,
+        }
+        Ok(())
+    }
+}
+
+/// Resolves the explicit disposition of one supervised child's declared restart
+/// policy.
+///
+/// A declaration this contract admits is bound by the digest of that exact
+/// policy, so the disposition records the declaration rather than
+/// re-interpreting it. A missing declaration, or one this contract does not
+/// admit, is withheld: it never becomes an unlimited restart budget and never
+/// widens the child's effect authority, and the exact rejection reason travels
+/// with the disposition so the gap is named rather than defaulted away.
+pub fn dispose_restart_policy(
+    declared: Option<&RestartPolicyV1>,
+) -> Result<RestartPolicyDisposition, RestartPolicyError> {
+    let Some(policy) = declared else {
+        return Ok(RestartPolicyDisposition::Withheld {
+            declared_version: None,
+            reason: "the desired manifest declares no versioned restart policy".to_owned(),
+        });
+    };
+    // The original declared value is validated with the contract's own
+    // validator; its rejection reason is recorded rather than replaced by a
+    // permissive interpretation of an unadmitted declaration.
+    if let Err(rejection) = policy.validate() {
+        return Ok(RestartPolicyDisposition::Withheld {
+            declared_version: Some(policy.policy_version),
+            reason: rejection.to_string(),
+        });
+    }
+    Ok(RestartPolicyDisposition::Admitted {
+        policy_digest: policy.digest()?,
+    })
+}
+
 /// Current owner lifecycle relevant to automatic restart eligibility.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

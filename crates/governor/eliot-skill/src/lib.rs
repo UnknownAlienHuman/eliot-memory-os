@@ -70,8 +70,9 @@ pub use activation::{
     SkillExecutionOwnerPosition, SkillHarnessActivationReceipt, SkillRetrievalStatus,
     SkillUsefulness, SourceRevision, apply_dependency_staleness, assess_execution_reconciliation,
     changed_dependency_names, derive_attempt_summary, derive_lifecycle_view,
-    detect_dependency_staleness, fold_execution_evidence, gate_material_use, material_use_allowed,
-    project_execution_outcomes, qualify_useful_outcomes, record_instruction_conflict,
+    detect_dependency_staleness, fold_execution_evidence, gate_material_use,
+    gate_material_use_against, material_use_allowed, project_execution_outcomes,
+    qualify_useful_outcomes, record_instruction_conflict,
 };
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
@@ -370,9 +371,41 @@ pub struct SkillExecutionEvidence {
     pub verifier_refs: Vec<String>,
     pub outcome: ExecutionOutcome,
     pub causal_credit: CausalCredit,
+    /// Skill identity this observation was filed under, stamped by the
+    /// lifecycle owner at record time from the carried ingest context (issue
+    /// #2663, I7.25). `None` is a pre-binding row: it can never support a
+    /// usefulness claim, only fail closed to unknown.
+    pub observed_skill_id: Option<String>,
+    /// Ingest attempt that filed this observation, stamped by the lifecycle
+    /// owner at record time from the authenticated ingest context (issue
+    /// #2663, I15.2). Wire-carried values are replaced, never trusted.
+    /// `None` is a pre-binding row: it can never support a usefulness claim.
+    pub observed_attempt_ref: Option<String>,
+    /// Owner-retained fence at record time, stamped by the lifecycle owner
+    /// from its own stored view (issue #2663, I7.25). `None` is a pre-binding
+    /// row: it can never support a usefulness claim.
+    pub observed_fence: Option<StateFence>,
 }
 
 impl SkillExecutionEvidence {
+    /// Content equality excluding the owner-stamped observation binding.
+    ///
+    /// The binding names which ingest filed the record, not what was
+    /// observed: replay and reconciliation compare what was observed, so a
+    /// re-filed identical window stays idempotent and only changed observed
+    /// material conflicts. Binding enforcement lives in
+    /// [`qualify_useful_outcomes`](crate::qualify_useful_outcomes) and the
+    /// evidence-owner read, never in this comparison.
+    #[must_use]
+    pub fn same_recorded_content(&self, other: &Self) -> bool {
+        self.execution_ref == other.execution_ref
+            && self.exact_step_refs == other.exact_step_refs
+            && self.artifact_refs == other.artifact_refs
+            && self.verifier_refs == other.verifier_refs
+            && self.outcome == other.outcome
+            && self.causal_credit == other.causal_credit
+    }
+
     pub fn validate(&self) -> Result<(), SkillError> {
         text(&self.execution_ref, "execution.execution_ref")?;
         for (values, field) in [
@@ -390,6 +423,22 @@ impl SkillExecutionEvidence {
                 field: "execution.exact_step_refs",
                 reason: "observed execution requires exact step evidence",
             });
+        }
+        // The observation binding is stamped by the owner at record time, so
+        // shape validation only checks it when present: a pre-binding row (or
+        // a wire window, which carries no binding) validates on its observed
+        // content, and enforcement of the binding happens at qualification,
+        // never here.
+        if let Some(skill_id) = &self.observed_skill_id {
+            text(skill_id, "execution.observed_skill_id")?;
+        }
+        if let Some(attempt_ref) = &self.observed_attempt_ref {
+            text(attempt_ref, "execution.observed_attempt_ref")?;
+        }
+        if let Some(fence) = &self.observed_fence {
+            fence
+                .validate()
+                .map_err(|error| SkillError::Surface(error.to_string()))?;
         }
         // Causal attribution is never a sole-cause claim: only the
         // distributed/uncertain/associated representations exist, and any
@@ -1037,6 +1086,28 @@ impl SkillRegistry {
         Ok(conflict)
     }
 
+    /// Stamps the owner-observed filing binding onto presented execution records.
+    ///
+    /// Wire-carried binding values are replaced wholesale, so a forged stamp
+    /// on the wire can never reach the store.
+    fn stamp_filing_binding(
+        skill_id: &str,
+        ingest_attempt_id: &str,
+        observed_fence: &StateFence,
+        executions: &[SkillExecutionEvidence],
+    ) -> Result<Vec<SkillExecutionEvidence>, SkillError> {
+        let mut stamped = Vec::with_capacity(executions.len());
+        for evidence in executions {
+            let mut bound = evidence.clone();
+            bound.observed_skill_id = Some(skill_id.to_owned());
+            bound.observed_attempt_ref = Some(ingest_attempt_id.to_owned());
+            bound.observed_fence = Some(observed_fence.clone());
+            bound.validate()?;
+            stamped.push(bound);
+        }
+        Ok(stamped)
+    }
+
     /// Admits one attempt for Material use behind its exact harness receipt.
     ///
     /// The receipt is validated, bound to the stored view's exact skill
@@ -1077,76 +1148,167 @@ impl SkillRegistry {
     /// Records one window of execution evidence through this lifecycle owner
     /// and returns only after the owner accepted it (issue #2663, I7.25).
     ///
-    /// The daemon previously persisted only the outer host-response body and
-    /// returned "accepted" on that basis, discarding the very evidence the
-    /// ingest was admitted to carry. This entry is the existing owner write
-    /// path: the evidence is appended to the stored view's own
-    /// `execution_evidence` and the view is RE-DERIVED from the retained
-    /// records, so no counter can outrun the evidence behind it.
+    /// This is the existing owner write path: the evidence is appended to the
+    /// stored view's own `execution_evidence` and the resulting view is
+    /// RE-RECORDED through [`record_view`](Self::record_view), so the owner
+    /// actually retains what the ingest carried. The returned view is the
+    /// owner's result verbatim: a claim never outruns persistence, and the
+    /// same-identity conflict branch below is reachable in production because
+    /// the next ingest seeds from the retained set, not from a stale copy.
     ///
-    /// Evidence is HISTORICAL and stays historical: it is bound to the exact
-    /// Skill revision and package digest the caller presented, and a record
-    /// that disagrees with the stored view is refused rather than merged, so
-    /// ingesting evidence now can never reactivate a superseded Skill. Exact
-    /// replay under the same execution identity is idempotent; a CHANGED
-    /// record under that identity is a conflict, never a silent rewrite.
+    /// Evidence is HISTORICAL and stays historical. The ingest is bound to the
+    /// exact Skill revision and package digest the caller presented:
     ///
-    /// The caller supplies the retained catalogue entry the view is derived
-    /// against, because the registry does not own the catalogue; the identity
-    /// legs it names are still compared against the stored view.
+    /// * when the presented identity equals the stored view's identity, the
+    ///   view is re-derived for that identity as before, and the supplied
+    ///   entry must name that identity;
+    /// * when it differs, the observation is filed as a linked revision only
+    ///   when the supplied entry names the STORED identity: the caller proves
+    ///   it holds the current catalogue position (issue #2663 item 1: a
+    ///   current collector reports an older attempt only through an explicit
+    ///   permitted historical binding), while the historical package authority
+    ///   — a committed accept-row for the presented digest — is enforced from
+    ///   retained lifecycle-policy rows by the daemon seam, the sole
+    ///   production caller. An entry naming neither identity is a substituted
+    ///   binding and is refused. The linked observation appends the new
+    ///   records, advances the lifecycle revision, and keeps the stored view's
+    ///   current Skill revision/package, scope, fence, dependencies and
+    ///   status, so ingesting historical evidence now can never reactivate a
+    ///   superseded Skill nor re-stamp it with today's fence.
+    ///
+    /// A presented identity matching neither the stored view nor the supplied
+    /// entry is refused with [`SkillError::IdentityMismatch`]: a
+    /// substituted revision or package cannot be filed under any identity.
+    /// Exact replay under the same execution identity is idempotent and
+    /// returns the stored view unchanged; a CHANGED record under that identity
+    /// is a [`SkillError::RevisionConflict`], never a silent rewrite.
     ///
     /// Usefulness is never established here: the derived counters consult each
     /// receipt's [`SkillUsefulness`], which only
     /// [`qualify_useful_outcomes`] can raise to `OwnerBacked`.
+    ///
+    /// Every retained record is stamped with the observation binding it was
+    /// filed under: the presented Skill identity, the authenticated ingest
+    /// attempt that carried it, and the owner-retained fence at record time
+    /// (issue #2663, I7.25/I15.2). Any wire-carried binding is replaced,
+    /// never trusted. The stamp names the filing, not the content, so replay
+    /// and conflict compare recorded content only: an identical window
+    /// re-filed under any ingest is idempotent, while changed observed
+    /// material under the same execution identity is a
+    /// [`SkillError::RevisionConflict`].
     pub fn record_execution_evidence(
         &mut self,
         skill_id: &str,
         skill_revision: &str,
         package_digest: &str,
+        ingest_attempt_id: &str,
         entry: &SkillCatalogueEntry,
         executions: &[SkillExecutionEvidence],
     ) -> Result<SkillLifecycleView, SkillError> {
         text(skill_id, "execution.skill_id")?;
         text(skill_revision, "execution.skill_revision")?;
         digest(package_digest, "execution.package_digest")?;
+        text(ingest_attempt_id, "execution.ingest_attempt_id")?;
         for evidence in executions {
             evidence.validate()?;
+        }
+        // The supplied entry is the caller's CURRENT catalogue position for
+        // this Skill — the live entry, never a reconstruction from payload
+        // fields. It must name the Skill; which identity it must name depends
+        // on the path below: the presented identity on the current path, the
+        // stored identity on the historical path. An entry naming neither is
+        // a substituted binding and cannot file evidence here.
+        if entry.index.skill_id != skill_id {
+            return Err(SkillError::IdentityMismatch);
         }
         let key = skill_id.to_owned();
         let previous = self.views.get(&key).ok_or(SkillError::NotFound)?.clone();
         // The evidence is bound to the exact Skill identity it was observed
-        // under: a substituted revision or package cannot be filed under the
-        // stored view's identity.
-        if previous.skill_ref.registration.revision != skill_revision
-            || previous.skill_ref.package_digest != package_digest
-        {
+        // under. A presented identity equal to the stored view is the current
+        // path; a differing presented identity is accepted only as a
+        // historical linked observation — never merged as current, never a
+        // reactivation.
+        let historical = previous.skill_ref.registration.revision != skill_revision
+            || previous.skill_ref.package_digest != package_digest;
+        if historical {
+            if entry.body.body_version != previous.skill_ref.registration.revision {
+                return Err(SkillError::IdentityMismatch);
+            }
+        } else if entry.body.body_version != skill_revision {
             return Err(SkillError::IdentityMismatch);
         }
         let mut retained = previous.execution_evidence.clone();
-        let mut changed = false;
-        for evidence in executions {
+        // The owner stamps the filing binding onto its own retained copy: the
+        // presented Skill identity, the authenticated ingest attempt, and the
+        // retained fence.
+        let stamped = Self::stamp_filing_binding(
+            skill_id,
+            ingest_attempt_id,
+            &previous.state_fence,
+            executions,
+        )?;
+        for evidence in &stamped {
             // Exact replay under the same execution identity is idempotent; a
             // changed record under that identity is a conflict, not an
-            // overwrite.
+            // overwrite. The comparison is over recorded content: the filing
+            // binding names the filing, never the observation.
             match retained
                 .iter()
                 .position(|held| held.execution_ref == evidence.execution_ref)
             {
-                Some(index) if retained[index] != *evidence => {
+                Some(index) if !retained[index].same_recorded_content(evidence) => {
                     return Err(SkillError::RevisionConflict);
                 }
                 Some(_) => {}
                 None => {
                     retained.push(evidence.clone());
-                    changed = true;
                 }
             }
         }
-        // Exact replay is a read of the same owner position, not a new
-        // revision. In particular, an empty or duplicate-only page cannot
-        // advance the lifecycle frontier.
-        if !changed {
+        if retained == previous.execution_evidence {
+            // Nothing new was presented: the ingest replays the retained set
+            // exactly, so the stored view is returned unchanged — no revision
+            // inflation, no silent rewrite.
             return Ok(previous);
+        }
+        if historical {
+            // Later evidence is a LINKED revision, never a silent rewrite: the
+            // historical observation is appended to the retained set, the
+            // revision advances so the owner can order the observations, and
+            // every other view field — Skill revision/package, scope, fence,
+            // dependencies, status, applicability — stays exactly as stored.
+            // The derivation fold is deliberately not reused here: it would
+            // project the supplied (historical) entry's dependencies and
+            // applicability into the current view.
+            let mut view = previous.clone();
+            view.execution_evidence = retained;
+            view.counters.executed = view
+                .execution_evidence
+                .iter()
+                .filter(|evidence| evidence.outcome == ExecutionOutcome::Observed)
+                .count() as u64;
+            view.counters.failed = view
+                .execution_evidence
+                .iter()
+                .filter(|evidence| evidence.outcome == ExecutionOutcome::Failed)
+                .count() as u64;
+            view.counters.uncertain = view
+                .execution_evidence
+                .iter()
+                .filter(|evidence| evidence.outcome == ExecutionOutcome::Uncertain)
+                .count() as u64;
+            view.counters.verified = view
+                .execution_evidence
+                .iter()
+                .filter(|evidence| {
+                    evidence.outcome == ExecutionOutcome::Observed
+                        && !evidence.verifier_refs.is_empty()
+                })
+                .count() as u64;
+            view.lifecycle_revision = previous.lifecycle_revision.saturating_add(1);
+            view.validate()?;
+            self.record_view(view.clone())?;
+            return Ok(view);
         }
         let mut view = derive_lifecycle_view(LifecycleEvidence {
             skill_ref: previous.skill_ref.clone(),

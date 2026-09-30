@@ -30,18 +30,25 @@
 //! receipt, and never treats a live process, an open pipe or a stale heartbeat
 //! as a lease.
 //!
-//! Census honesty: the RuntimeLease row family I1.5 assigns to the Kernel's ORS
-//! does not exist in the current source, so the runtime-lease leg of
-//! [`HostComposition::idle_lease_census`] reports exactly the durable
-//! runtime-lease references the current activation generation holds. An empty
-//! reference set means "this generation holds no runtime-lease reference", so
-//! the gate is generation-scoped by construction and a future Kernel/ORS lease
-//! family must replace that leg rather than sit beside it. A `StoppedClean`
-//! terminal releases the held references (`transition_activation_record`
-//! clears them once the `DrainCommitRecord` snapshot carries the obligations);
-//! recovery terminals keep them because reconciliation is still owed. The
-//! supervision leg re-uses the one published, Kernel-signed supervision-lease
-//! mirror Host already commits and verifies for the Watchdog spool
+//! Census honesty: the `RuntimeLease` row family I1.5 assigns to the Kernel's ORS
+//! now exists as durable state (`ors_runtime_lease_current_v1`, record type
+//! `runtime_lease_current`, selected by exact `StateFence` equality through
+//! `RedbRecoveryStore::load_runtime_leases_by_state_fence`), but the ORS row
+//! writer and the Kernel renewal/expiry tick are still the crates/Kernel
+//! lane's work (STITCH, out of contour). The Host half below is durable and
+//! complete on its own side: the current activation generation holds its
+//! generation-bound `RuntimeLease` reference (issued, renewed, and released
+//! here from fresh admitting observations), the idle-drain gate reads exactly
+//! those held references plus the published supervision mirror, and
+//! [`project_runtime_lease`] projects the owner-validated row
+//! content the writer lane persists under the same key/fence scheme — never a
+//! sidecar, never beside the ORS family. A `StoppedClean` terminal releases
+//! the held references (`transition_activation_record` clears them once the
+//! `DrainCommitRecord` snapshot carries the obligations, proven by
+//! [`prove_terminal_runtime_release`]); recovery terminals
+//! keep them because reconciliation is still owed. The supervision leg re-uses
+//! the one published, Kernel-signed supervision-lease mirror Host already
+//! commits and verifies for the Watchdog spool
 //! (`watchdog_publication::live_supervision_obligation`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,11 +56,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_host_state::{
     ActivationState, DrainRecord, DrainState, EliotActivationRecord, EpochIdentity,
-    EpochTransition, HostState, HostStateRecord, ServiceSafetyClass, WakeDisposition, WakeRecord,
-    record_checksum,
+    EpochTransition, HostState, HostStateRecord, KernelReadinessObservationRecord,
+    ServiceSafetyClass, WakeDisposition, WakeRecord, record_checksum,
 };
 use eliot_platform::PlatformHandle;
-use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
+use eliot_runtime_contracts::{LeaseState, RuntimeLease, WakeIntent, WakeIntentState};
 
 use super::watchdog_publication::live_supervision_obligation;
 use super::{
@@ -765,6 +772,68 @@ impl HostComposition {
         )
     }
 
+    /// (Re)binds the pending activation record's held `RuntimeLease` reference
+    /// from the admitted observable obligation of this generation.
+    ///
+    /// I1.5 W4 (`RuntimeLease` issuance/renewal, Host leg): a transition into
+    /// a live state holds exactly one runtime lease — the deterministic
+    /// [`runtime_lease_id_for`] identity of this activation generation — and
+    /// only when the latest durable readiness observation already admitted
+    /// this generation on fresh evidence. I1.5: "A `RuntimeLease` is acquired
+    /// automatically for an active authenticated ... Session, `AgentAttempt`,
+    /// Durable Job, upgrade/repair or unresolved external effect" and "A lease
+    /// renewal is a new revision of the same active lease identity and must
+    /// carry fresh observed evidence". The generation is the obligation the
+    /// Host serves, so issuance binds the identity when the generation first
+    /// goes live holding nothing, and renewal re-asserts that same identity on
+    /// every later live entry carrying fresh evidence — never a second
+    /// identity, never on a stale predecessor. A held reference that is not
+    /// this generation's identity fails the transition closed: a stale
+    /// predecessor lease is never renewed, and reconciliation stays owed
+    /// instead of vanishing into a live state.
+    ///
+    /// The durable writer is the journal append the caller performs with this
+    /// revision; the ORS row commit for the projected
+    /// [`project_runtime_lease`] content stays STITCH with the crates-side
+    /// writer lane (see that function for the named adopters).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state cannot be read, when no
+    /// admitted readiness observation exists, when the admitting observation
+    /// is not fresh evidence for this generation, or when the held references
+    /// are not this generation's lease.
+    pub(super) fn refresh_runtime_lease_binding(
+        &self,
+        next: &mut EliotActivationRecord,
+    ) -> Result<(), HostError> {
+        let expected =
+            runtime_lease_id_for(&next.activation_id, &next.fence.activation_generation)?;
+        let snapshot = self.snapshot()?;
+        let observation = snapshot.readiness_observations.last().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "runtime-lease binding has no admitted readiness predecessor".to_owned(),
+            )
+        })?;
+        if !is_fresh_admitting_observation(next, observation) {
+            return Err(HostError::RecoveryRequired(
+                "admitted runtime-lease predecessor is not fresh evidence for this generation"
+                    .to_owned(),
+            ));
+        }
+        if next.runtime_lease_refs.is_empty() {
+            next.runtime_lease_refs = vec![expected];
+            return Ok(());
+        }
+        if next.runtime_lease_refs.as_slice() == core::slice::from_ref(&expected) {
+            return Ok(());
+        }
+        Err(HostError::RecoveryRequired(
+            "held runtime-lease reference is not this generation's lease; stale predecessor leases never renew"
+                .to_owned(),
+        ))
+    }
+
     /// Returns the durable next-generation `WakeIntent` reference queued after
     /// `DrainCommitRecord`, if the current generation holds a pending one.
     ///
@@ -1001,6 +1070,155 @@ pub fn requires_capability(required: &[PlatformHandle], capability: &str) -> boo
     required.iter().any(|value| value.as_str() == capability)
 }
 
+/// ORS identity prefix for one Host-held generation runtime lease.
+///
+/// The spelling is the durable key the canonical
+/// `ors_runtime_lease_current_v1` table selects by
+/// (`RedbRecoveryStore::load_runtime_leases_by_state_fence` requires
+/// `key == lease_id`), so the crates-side writer lane adopts this identity
+/// without a second scheme.
+pub const RUNTIME_LEASE_ID_PREFIX: &str = "runtime-lease";
+
+/// Deterministic `RuntimeLease` identity for one activation generation.
+///
+/// One lease per live generation: the generation is the obligation the Host
+/// serves, and I1.5 renewal is "a new revision of the same active lease
+/// identity", so renewal re-asserts this identity on fresh evidence instead of
+/// minting a second one. Derived from the durable record content only — never
+/// carried, never cached — so a stale predecessor identity can never pass as
+/// this generation's lease.
+///
+/// # Errors
+///
+/// Returns an error when the identity spelling is not a valid handle.
+pub fn runtime_lease_id_for(
+    activation_id: &PlatformHandle,
+    generation: &EpochTransition,
+) -> Result<PlatformHandle, HostError> {
+    PlatformHandle::new(format!(
+        "{RUNTIME_LEASE_ID_PREFIX}:{}:{}:{}",
+        activation_id.as_str(),
+        generation.current.lineage_id,
+        generation.current.sequence
+    ))
+    .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+/// Whether the admitting observation is fresh evidence for this generation.
+///
+/// Same activation identity and generation, carrying evidence — content
+/// compared on the durable records. A stale predecessor observation, or one
+/// carrying no evidence, is never freshness: every lease caller fails it
+/// closed instead of admitting, issuing, or renewing on observation it did
+/// not make. Shared by the supervision binding and
+/// [`HostComposition::refresh_runtime_lease_binding`] so both legs enforce
+/// one rule (I1.5: "must carry fresh observed evidence").
+#[must_use]
+pub(super) fn is_fresh_admitting_observation(
+    activation: &EliotActivationRecord,
+    observation: &KernelReadinessObservationRecord,
+) -> bool {
+    observation.fence.activation_id == activation.activation_id
+        && observation.fence.activation_generation == activation.fence.activation_generation
+        && !observation.evidence_refs.is_empty()
+}
+
+/// Proves the terminal `RuntimeLease` release of a clean stop.
+///
+/// `transition_activation_record` clears the held runtime-lease references on
+/// `StoppedClean` because the obligations were snapshotted into the
+/// `DrainCommitRecord` at linearization. This proof runs on that same edge and
+/// requires every cleared reference to be this generation's own
+/// [`runtime_lease_id_for`] identity: a foreign or stale predecessor reference
+/// must never vanish silently — reconciliation is still owed there, so the
+/// stop fails closed instead of reporting a clean release it did not prove.
+///
+/// # Errors
+///
+/// Returns an error when a held reference is not this generation's lease.
+pub(super) fn prove_terminal_runtime_release(
+    current: &EliotActivationRecord,
+) -> Result<(), HostError> {
+    let expected =
+        runtime_lease_id_for(&current.activation_id, &current.fence.activation_generation)?;
+    if current
+        .runtime_lease_refs
+        .iter()
+        .all(|held| *held == expected)
+    {
+        return Ok(());
+    }
+    Err(HostError::RecoveryRequired(
+        "clean stop would silently release a runtime-lease reference that is not this generation's lease"
+            .to_owned(),
+    ))
+}
+
+/// Projects the exact canonical ORS `runtime_lease_current` row content for a
+/// held generation lease.
+///
+/// I1.5 assigns the `RuntimeLease` row family to Kernel-owned ORS
+/// (`ors_runtime_lease_current_v1`, record type `runtime_lease_current`). The
+/// Host journal holds the lease *reference*; this projection is the row
+/// content the crates-side writer persists under it: the key is the held
+/// [`runtime_lease_id_for`] identity, the row is selected by exact
+/// `state_fence` equality
+/// (`RedbRecoveryStore::load_runtime_leases_by_state_fence`), the scope is the
+/// generation's admitted frozen trigger-class spelling, the authority epoch is
+/// the generation's Kernel epoch, and the owner [`RuntimeLease::validate`]
+/// runs before return. The contour fence is caller-supplied: the writer lane
+/// owns the live contour, so the Host never invents it here.
+///
+/// STITCH, out of contour (other lane): the durable row commit and the Kernel
+/// renewal/expiry tick. Named adopters are the `ors_runtime_lease_current_v1`
+/// commit path beside
+/// Validity window in milliseconds for a Host-projected runtime lease
+/// (issue #1751 W4; I1.5). Mirrors the Kernel
+/// `RUNTIME_LEASE_VALIDITY_MS` and the supervision renewal policy's
+/// 60-second validity: one window for both halves of the lease census, so
+/// the projected expiry can never outlive the owner's proof.
+const RUNTIME_LEASE_VALIDITY_MS: u64 = 60_000;
+
+/// `RedbRecoveryStore::{load_runtime_leases_by_state_fence,
+/// load_runtime_lease_census_by_state_fence}`, consumed by the Kernel
+/// `idle_lease_census` runtime leg over the authenticated
+/// `ReadRuntimeLeaseCensus` wire. Until that commit lands, an empty ORS table
+/// reads as "no durable rows" — exactly like the supervision-status
+/// `has_table` precedent — never as a caller-supplied default. No mirror or
+/// queued `WakeIntent` can reactivate a terminal revision this projection once
+/// closed: revision chaining through the owner `transition_to` legality is the
+/// writer lane's own commit rule.
+///
+/// # Errors
+///
+/// Returns an error when the lease identity, scope, or fence is not
+/// owner-valid.
+pub fn project_runtime_lease(
+    activation: &EliotActivationRecord,
+    contour_fence: &StateFence,
+    state: LeaseState,
+) -> Result<RuntimeLease, HostError> {
+    let lease = RuntimeLease {
+        lease_id: runtime_lease_id_for(
+            &activation.activation_id,
+            &activation.fence.activation_generation,
+        )?
+        .as_str()
+        .to_owned(),
+        scope_ref: activation.trigger_class.as_str().to_owned(),
+        authority_epoch: activation.lineage.kernel_epoch.clone(),
+        state_fence: contour_fence.clone(),
+        state,
+        expires_at_ms: unix_millis()?
+            .checked_add(RUNTIME_LEASE_VALIDITY_MS)
+            .ok_or_else(|| HostError::Platform("runtime lease expiry overflowed".to_owned()))?,
+    };
+    lease
+        .validate()
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    Ok(lease)
+}
+
 fn activation_admission_from(state: &HostState) -> Result<ActivationAdmission, HostError> {
     let activation = state
         .activation
@@ -1074,6 +1292,13 @@ fn lease_census_reason(error: &HostError) -> &'static str {
         HostError::WatchdogCoverageUnavailable(_) => "supervision-spool-unreadable",
         #[cfg(windows)]
         HostError::StoreRecoveryRequired(_) => "durable-state-unreadable",
+        // Ownership of the planned Store endpoint is unproven, so the durable
+        // supervision state behind it could not be established either; the
+        // census must not report `Idle` on an unverified endpoint.
+        #[cfg(windows)]
+        HostError::OriginCollisionUnproven(_) => "durable-state-unreadable",
+        #[cfg(windows)]
+        HostError::StoreEndpointOwnerUnreadable(_) => "durable-state-unreadable",
     }
 }
 

@@ -407,6 +407,10 @@ fn admitted_lease(
         state_fence: fence.clone(),
         // The material binder already refuses every spelling but "active".
         state: LeaseState::Active,
+        // The admitted lease expires exactly when the owner grant does; the
+        // same value drives the live-authority window below, so the lease
+        // and the authority it mirrors can never disagree on expiry.
+        expires_at_ms: material.grant.expires_at,
     }
 }
 
@@ -660,6 +664,11 @@ impl SourceVerificationPort for AdmittedOwnerPorts {
         request.validate().map_err(|_| PortError::Denied)?;
         Ok(SourceVerification {
             assurance: self.assurance.clone(),
+            // This port admits owner-authored source assurance only. It never
+            // manufactures a security assessment; the neutral runtime resolves
+            // one against this same assurance at the use boundary when the
+            // security owner has recorded it.
+            security_assessment: None,
             verification_revision: self.verification_revision,
             verification_receipt_digest: self.source_receipt.clone(),
         })

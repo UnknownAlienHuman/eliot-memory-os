@@ -134,15 +134,16 @@ fn record(handle: &str) -> SourceRecord {
     SourceRecord::new(source_params(handle)).expect("source record")
 }
 
-// Fixture for the owner-bound absence preconditions: the two former
+// Fail-closed fixture for the owner-bound absence preconditions: the two former
 // caller-supplied booleans are no longer inputs, and the caller-authored
 // `NoMatchEvaluation` that replaced them is gone with them. `Proven` now needs a
 // real vetted record behind every closing member, an authorized manifest that
 // commits those exact records, and an owner-issued per-member result whose
 // identity is recomputed from the predicate and revisions actually in force.
-// This helper therefore supplies no evaluation and no manifest, which is the
-// fail-closed state the ordinary Researcher route is in; building the positive
-// evidence is the fixture work item 10 of #2893 owns.
+// This helper supplies neither an evaluation nor a manifest, which is the state
+// the ordinary Researcher route is in and is the fail-closed answer; the positive
+// evidence is built by `proven_absence` below, which is the fixture work item 10
+// of #2893.
 fn preconditions(
     account: &CoverageAccount,
     evaluation: Option<NoMatchEvaluation>,
@@ -157,6 +158,166 @@ fn preconditions(
         evaluation,
     )
     .expect("preconditions")
+}
+
+/// The instant every absence case in this suite is judged at.
+///
+/// It sits after the `retrieved_ms` of every record `source_params` builds
+/// (1_700_000_200_000) and before that record's frozen freshness boundary
+/// (1_800_000_000_000), so a record built from those parameters is current here
+/// and an owner observation taken at or after the retrieval time can cover it.
+const ASSESSMENT_MS: i64 = 1_700_000_300_000;
+
+/// One real owner-issued evaluation over the exact closed members of `account`.
+///
+/// This is the positive evidence #2893's fixture work item 10 asks for, and every
+/// commitment it hands to [`NoMatchEvaluationIssuer::new`] is an owner value this
+/// suite already produced rather than a literal written to satisfy a validator:
+///
+/// * `scope_digest` and the `frozen_scope_digest` passed to
+///   [`AbsencePreconditions::derive`] are the *same* string, so
+///   `check_scope_binding` compares the issuer against itself rather than against
+///   a caller-selected one. It is the digest of the frozen scope snapshot this
+///   evaluation is bounded to, which is what the scope-binding check means;
+/// * `denominator_digest`, `manifest_digest` and `manifest_revision` are read off
+///   the very [`AuthorizedManifest`] the evaluation is presented with, so
+///   `check_manifest_binding` measures the issuer against that manifest;
+/// * the per-member results are minted by `issue_for` itself, which joins each
+///   closed member's handle, vetted record, currentness, manifest allowlist,
+///   manifest record binding and observation order before a result exists, so
+///   none of them is a member name copied out of the accounting.
+///
+/// The one thing no in-crate check can establish is that the predicate actually
+/// ran: the issuer attests that as the evaluator owner's irreducible claim, which
+/// is the residual trust boundary documented on [`NoMatchEvaluation`]. What this
+/// fixture does establish is the part that was previously absent — that every
+/// closing member resolves to a real vetted record under a manifest that commits
+/// that exact record, and that the member list alone is no longer what carries
+/// the negative.
+fn issued_evaluation(
+    account: &CoverageAccount,
+    records: &BTreeMap<String, SourceRecord>,
+    manifest: &AuthorizedManifest,
+    frozen_scope_digest: &str,
+) -> NoMatchEvaluation {
+    let issuer = NoMatchEvaluationIssuer::new(NoMatchEvaluationIssuerParams {
+        predicate_id: "no-match/absent-valley-alloy".to_owned(),
+        predicate_revision: "r1".to_owned(),
+        predicate_form: "exists(snapshot_bytes, alloy == member_alloy) == false".to_owned(),
+        issuer_id: "evaluator-owner-700".to_owned(),
+        evaluator_id: "no-match-evaluator-700".to_owned(),
+        evaluator_revision: "evaluator-700.1".to_owned(),
+        admission_receipt_id: "admission-700.1".to_owned(),
+        fence: fence(),
+        work_scope: "propulsion thermal envelope".to_owned(),
+        scope_digest: frozen_scope_digest.to_owned(),
+        scope_revision: "scope-700.1".to_owned(),
+        denominator_digest: inquiry_denominator_digest(),
+        manifest_digest: manifest.canonical_digest().expect("manifest commitment"),
+        manifest_revision: manifest.revision,
+        index_revision: "index-700.1".to_owned(),
+        source_revision: "corpus-700.1".to_owned(),
+        // At or after every record's retrieval time and at or before the
+        // assessment instant, and the currentness bound at or after both, so the
+        // observation window covers this assessment rather than merely parsing.
+        observed_at_ms: 1_700_000_250_000,
+        current_until_ms: 1_700_000_400_000,
+        applicability: NoMatchApplicability::Current,
+        // Grade 2 is the weakest grade `source_params` gives every record, so a
+        // ceiling at that rank is checkable against the joined records rather
+        // than an overclaim `check_ceiling` would refuse.
+        proof_ceiling_grade: Some(2),
+    })
+    .expect("owner issuer");
+    issuer
+        .issue_for(
+            account,
+            records,
+            manifest,
+            frozen_scope_digest,
+            ASSESSMENT_MS,
+        )
+        .expect("owner-issued evaluation")
+}
+
+/// The denominator digest of the single frozen inquiry this suite shares.
+///
+/// Both the authorized manifest and the issuer name the same denominator, because
+/// `check_manifest_binding` compares the issuer's held denominator against the
+/// presented manifest's — the two are one concept, so they are read from one
+/// value rather than spelled twice.
+fn inquiry_denominator_digest() -> String {
+    FrozenInquiry::freeze(inquiry_params())
+        .expect("inquiry")
+        .denominator_digest()
+}
+
+/// The real positive-absence case: one frozen authorized manifest committing one
+/// real vetted record per closed member, and the owner-issued evaluation over
+/// exactly those records.
+///
+/// Returns the account, the vetted record map, the manifest and the evaluation, so
+/// the case can assert the positive verdict over them and then assert that the
+/// *same* evidence stops proving anything once a single member's record is
+/// withheld.
+fn proven_absence() -> (
+    CoverageAccount,
+    BTreeMap<String, SourceRecord>,
+    AuthorizedManifest,
+    NoMatchEvaluation,
+) {
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    let mut account = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    let mut records: BTreeMap<String, SourceRecord> = BTreeMap::new();
+    for member in &members {
+        // The handle is derived from the member so the accounting handle and the
+        // record identity are bound to each other by construction; a synthetic
+        // handle with no record behind it is exactly what the join now refuses
+        // with `INCOMPATIBLE_SUBSTITUTED_RECORD` / `INCOMPATIBLE_MISSING_RECORD`.
+        let handle = format!("src-{member}");
+        let entry = record(&handle);
+        account
+            .record(member, entry.acquisition, Some(entry.handle.clone()))
+            .expect("record");
+        records.insert(entry.handle.clone(), entry);
+    }
+    // The manifest is frozen over exactly those records and the exact accounting
+    // and denominator the issuer will name, through the same `freeze` call the
+    // audit path uses at `audit_binding`.
+    let allowlist: Vec<String> = records.keys().cloned().collect();
+    let manifest = AuthorizedManifest::freeze(AuthorizedManifestParams {
+        inquiry_digest: inquiry.digest.clone(),
+        denominator_digest: inquiry.denominator_digest(),
+        sources: records
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    handle.clone(),
+                    ManifestSource {
+                        record_digest: entry.digest().expect("source record commitment"),
+                        content_digest: entry.content_digest.clone(),
+                        transformed_from: entry.transformed_from.clone(),
+                    },
+                )
+            })
+            .collect(),
+        dependence_edges: BTreeSet::new(),
+        coverage_digest: account.digest(),
+        grade_limits: vec!["grade: weakest link applies".to_owned()],
+        counterevidence: Vec::new(),
+        conflicts: Vec::new(),
+        unknowns: Vec::new(),
+        allowlist,
+        revoked: Vec::new(),
+        disclosure: DisclosureClass::ProjectBound,
+        expires_ms: 1_900_000_000_000,
+        revision: 1,
+    })
+    .expect("authorized manifest");
+    let evaluation =
+        issued_evaluation(&account, &records, &manifest, &inquiry.denominator_digest());
+    (account, records, manifest, evaluation)
 }
 
 fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> AuditReferenceBinding {
@@ -501,9 +662,93 @@ fn acquisition_dispositions_stay_distinct() {
 fn absence_requires_complete_authoritative_lookup() {
     let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
     let members: Vec<String> = inquiry.denominator_members().into_iter().collect();
-    let mut proven = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    // The positive case first, because it is the one this item exists to make
+    // reachable: real vetted records behind every closing member, a frozen
+    // authorized manifest that commits exactly those records, and an evaluation
+    // minted by the owner issuer over them. `Proven` is now reached, and it is
+    // reached *over evidence* rather than over a member list.
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let proven = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        Some(evaluation.clone()),
+    )
+    .expect("preconditions over real evidence");
+    assert_eq!(
+        assess_absence(&account, &proven),
+        AbsenceVerdict::Proven,
+        "real vetted records under a committed authorized manifest, with an \
+         owner-issued per-member result, must prove the scoped absence"
+    );
+    // The evaluation is what carries the claim, so it is bound: it names every
+    // closed member exactly once, it re-proves its own identity, and it carries
+    // the proof ceiling the receipt revalidates against. That it names a member
+    // only once, and only a member the accounting closed, is not asserted here
+    // from the member list — `AbsencePreconditions::derive` recomputes every
+    // result identity from the record's own commitments and refuses the record
+    // otherwise, so the `Proven` above is itself the proof that each result is
+    // the recomputed commitment of the exact record behind its member rather
+    // than a name copied out of the accounting.
+    let evaluated: Vec<String> = evaluation.evaluated_members();
+    assert_eq!(
+        evaluated, members,
+        "one owner-issued result per closed member, in canonical member order"
+    );
     for member in &members {
-        proven
+        let handle = format!("src-{member}");
+        let entry = &records[&handle];
+        assert_eq!(
+            entry.handle, handle,
+            "the accounting handle is the vetted record's own, not a stand-in"
+        );
+    }
+    assert_eq!(
+        evaluation.proof_ceiling_grade(),
+        Some(2),
+        "the issued record carries the ceiling the receipt revalidates against"
+    );
+    evaluation
+        .verify_integrity()
+        .expect("an issued evaluation re-proves its own identity");
+    // The evaluation is bound to the exact scope snapshot the claim is scoped to.
+    assert!(
+        evaluation.covers_scope(&scope_digest),
+        "the issued record is bounded to the same frozen scope snapshot the claim names"
+    );
+    // Withholding one member's record is the same evidence with one join unmet:
+    // the negative is refused and the specific member and reason are retained.
+    let withheld = members
+        .iter()
+        .find(|member| *member == "primary#0")
+        .expect("member");
+    let mut short = records.clone();
+    short.remove(&format!("src-{withheld}"));
+    let blocked = AbsencePreconditions::derive(
+        &account,
+        &short,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        Some(evaluation.clone()),
+    )
+    .expect("preconditions over a withheld record");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &blocked) else {
+        panic!("a withheld vetted record must not prove absence");
+    };
+    assert!(
+        reason.contains(&format!("{withheld}=missing_vetted_record")),
+        "the withheld member and its specific unmet join must be retained: {reason}"
+    );
+    // The same accounting with no records at all — the shape this case used to
+    // assert as `Proven` — still cannot prove anything, and the member list alone
+    // never carried the negative.
+    let mut synthetic = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
+        synthetic
             .record(
                 member,
                 SourceDisposition::Observed,
@@ -515,7 +760,7 @@ fn absence_requires_complete_authoritative_lookup() {
     // `Proven` — closed `Observed` members, an empty `SourceRecord` map and a
     // caller-authored member list — can no longer prove a predicate ran. Every
     // member is retained with the specific unmet join instead.
-    let verdict = assess_absence(&proven, &preconditions(&proven, None, DIGEST_A));
+    let verdict = assess_absence(&synthetic, &preconditions(&synthetic, None, DIGEST_A));
     let AbsenceVerdict::Unproven { reason } = verdict else {
         panic!("a caller-authored member list over an empty record map must not prove absence");
     };

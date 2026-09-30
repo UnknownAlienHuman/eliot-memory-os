@@ -171,6 +171,7 @@ impl SkillIndexEntry {
         check_text(&self.skill_id, "index.skill_id")?;
         check_text(&self.name, "index.name")?;
         check_single_line(&self.trigger, "index.trigger", MAX_TRIGGER_CHARS)?;
+        check_no_authority_claim(&self.trigger, "index.trigger")?;
         if self.eligible_routes.is_empty()
             && self.eligible_profiles.is_empty()
             && self.eligible_policies.is_empty()
@@ -473,10 +474,19 @@ impl SkillCatalogueEntry {
         Ok(())
     }
 
-    /// Scoped or current entries with valid structure may be used.
-    /// Stale, suppressed, archived and quarantined entries are blocked.
+    /// Scoped or provisionally admitted entries with valid structure may be
+    /// used. Stale, suppressed, archived and quarantined entries are blocked.
+    /// `Current` additionally requires the bound promotion record: a current
+    /// entry carrying no promotion evidence never passed promotion
+    /// validation, so it is unvalidated and cannot reach Material use (the
+    /// same rule `activation_display` and `HotsetDeliveryReceipt::issue`
+    /// enforce; the use gate agrees so the bridge admission path refuses it
+    /// too).
     #[must_use]
     pub fn is_usable(&self) -> bool {
+        if self.status == SkillStatus::Current && self.promotion_evidence.is_none() {
+            return false;
+        }
         matches!(self.status, SkillStatus::Current | SkillStatus::Provisional)
             && self.validate().is_ok()
     }
@@ -754,21 +764,22 @@ pub struct SkillCatalogue {
 /// observed dependency set, so added, removed, and changed names all count as
 /// drift.
 ///
-/// # STITCH: no production caller in this slice
+/// # STITCH: full-world driver pending; legs driven per caller
 ///
-/// `caller: STITCH`. The sweep implementation is present but no production
-/// driver builds this world yet. The designated caller is the bridge
-/// activation display path ([`activation_display_against`](SkillCatalogue::activation_display_against))
-/// once its owner can observe the full live world for the operation: the
-/// versioned display entry the daemon drives today carries only the
-/// tool-owner view and the admitted Tool Definition version — no live
-/// dependency set and no live host/profile versions — so the owning crate
-/// cannot build this world without inventing live terms, which would be a
-/// fake caller. Install-time legs already mark drift from the presented
-/// material and the promote path observes the committed candidate set; this
-/// world covers the remaining display-time leg. A timer, startup, or refresh
-/// arm must never synthesize the world: every leg must compare against
-/// caller-observed live content.
+/// `caller: STITCH` for the full world only. Verified per-leg production
+/// drivers (issue #1882): install-time legs mark from the presented material
+/// (`install_package` in `install.rs`); the promote path observes the
+/// committed candidate set pre-commit and feeds it post-commit; the display
+/// path marks the tool leg (`invalidate_unknown_tool_basis`) and the
+/// definition leg (`acknowledge_and_display_versioned`) per call under the
+/// live tool-owner source, driven by the bridge display port
+/// (`BridgeSkillForwarder::display_skill`). Undriven: the dependency-set and
+/// host/profile legs at display and refresh — the versioned display entry
+/// carries only the tool-owner view and the admitted definition version, so
+/// the owning crate cannot build those legs without inventing live terms,
+/// which would be a fake caller. A timer, startup, or refresh arm must never
+/// synthesize the world: every leg must compare against caller-observed live
+/// content.
 pub struct LiveSkillWorld<'a> {
     /// Currently registered dependency versions (the full live set).
     pub current_dependencies: &'a [DependencyVersion],
@@ -1055,17 +1066,21 @@ impl SkillCatalogue {
     /// activation instead of displaying a drifted body. Returns the skill ids
     /// that became stale, in catalogue order.
     ///
-    /// # STITCH: production drivers adopt per leg
+    /// # STITCH: full-sweep driver pending; legs driven per caller
     ///
-    /// `caller: STITCH`. Install-time legs mark from the presented material
-    /// (`install_package`), the promote path observes the committed candidate
-    /// set, and the tool/definition display legs mark upstream of
-    /// `activation_display`; the full-sweep production driver is the pre-serve
-    /// entry [`activation_display_against`](Self::activation_display_against)
-    /// once its display-path owner supplies the observed world. The
-    /// install-wide sweep is deliberately not restored here: without an
-    /// operation-observed world it false-marks. No caller is manufactured
-    /// from the owning crate — bins-owned live terms stay with their lanes.
+    /// `caller: STITCH` for the full sweep only. Install-time legs mark from
+    /// the presented material (`install_package`), the promote path observes
+    /// the committed candidate set, and the tool/definition display legs mark
+    /// upstream of `activation_display` per call under the live tool-owner
+    /// source (bridge display port into the versioned acknowledge entry);
+    /// the refresh driver covers the tool/definition legs across entries.
+    /// The full-sweep production driver is the pre-serve entry
+    /// [`activation_display_against`](Self::activation_display_against)
+    /// once its display-path owner additionally supplies the observed live
+    /// dependency set and host/profile versions. The install-wide sweep is
+    /// deliberately not restored here: without an operation-observed world it
+    /// false-marks. No caller is manufactured from the owning crate —
+    /// bins-owned live terms stay with their lanes.
     pub fn reconcile_staleness(
         &mut self,
         world: &LiveSkillWorld<'_>,
@@ -1273,8 +1288,10 @@ impl SkillCatalogue {
     }
 
     /// Fail-closed use gate: unknown, invalid, or non-current/provisional
-    /// entries are blocked. A stale entry stays blocked until its dependency
-    /// drift is reviewed and re-admitted as a new validated revision.
+    /// entries are blocked, as is a current entry carrying no bound promotion
+    /// record (unvalidated: it never passed promotion validation). A stale
+    /// entry stays blocked until its dependency drift is reviewed and
+    /// re-admitted as a new validated revision.
     #[must_use]
     pub fn is_usable(&self, skill_id: &str) -> bool {
         self.entries
@@ -1409,20 +1426,25 @@ impl SkillCatalogue {
     /// marking reuses the existing mark paths with first-drift-wins, and a
     /// mark rotates the catalogue digest so Hotset receipts issued before the
     /// sweep fail closed at `activation_display` instead of displaying a
-    /// drifted body. The pinned dependency set is then compared against the
-    /// currently registered versions through the activation Material-use
-    /// gate, so an unvalidated or stale Skill cannot reach Material use
+    /// drifted body. Every declared leg is then compared against the observed
+    /// world through the full Material-use gate
+    /// (`activation::gate_material_use_against`: status, promotion binding,
+    /// dependency set, host/profile, definition, tool basis), so an
+    /// unvalidated or stale Skill cannot reach Material use
     /// through a stored-status lag; stale entries stay refused through the
     /// existing `is_usable`/display refusal, and bounded use returns only as
     /// provisional. A passing display keeps the full receipt chain
     /// (validation + catalogue-staleness + delivery-ack records).
     ///
-    /// # STITCH: designated display-path caller
+    /// # STITCH: designated display-path caller, two live terms short
     ///
-    /// `caller: STITCH`. The designated caller is the daemon display drive
-    /// (`skill_carry_receipt_to_display` into the versioned acknowledge
-    /// entry) once it can supply the operation-observed [`LiveSkillWorld`];
-    /// until then production display flows through
+    /// `caller: STITCH`. The designated caller is the daemon display drive —
+    /// the bridge display port (`BridgeSkillForwarder::display_skill`) into
+    /// the versioned acknowledge entry
+    /// (`skill_carry_receipt_to_display` path) — once it can additionally
+    /// supply the operation-observed live dependency set and host/profile
+    /// versions alongside the live tool-owner view it already resolves per
+    /// call. Until then production display flows through
     /// [`activation_display`](Self::activation_display) with the
     /// tool/definition drift legs enforced upstream. The owning crate holds
     /// the catalogue behind its own handle and cannot observe the bins-owned
@@ -1441,11 +1463,7 @@ impl SkillCatalogue {
         self.reconcile_staleness(world)?;
         let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
         entry.validate()?;
-        super::activation::gate_material_use(
-            entry.status,
-            &entry.dependencies,
-            world.current_dependencies,
-        )?;
+        super::activation::gate_material_use_against(entry, world)?;
         self.activation_display(skill_id, receipt, ack, world.tools)
     }
 }
@@ -1719,6 +1737,17 @@ impl ActivatedSkillDisplay {
             return Err(SkillError::InvalidField {
                 field: "activation.status",
                 reason: "only current or provisional Skills display",
+            });
+        }
+        // Promotion-grade binding (`I7.13`, issue #1882 A4): `Current` is
+        // earned only through the evidence path, so a current-grade display
+        // without the bound promotion record is unvalidated and never
+        // representable as generally delivered. Bounded use stays
+        // `Provisional` with its provisional delivery ceiling.
+        if self.status == SkillStatus::Current && self.promotion_digest.is_none() {
+            return Err(SkillError::InvalidField {
+                field: "activation.promotion_digest",
+                reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
             });
         }
         check_digest(

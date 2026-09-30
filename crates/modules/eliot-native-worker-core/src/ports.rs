@@ -1457,6 +1457,14 @@ mod single_shape_constructors {
             expires_at_unix_ms: 9_000_000_100_000,
             executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
             executable_binding_digest: "e".repeat(64),
+            capability_cell_registry_digest: "1".repeat(64),
+            kernel_execution_manifest_digest: "2".repeat(64),
+            job_object_lineage_ref: "job-lineage-r2-1".to_owned(),
+            resource_limits_digest: "3".repeat(64),
+            cancellation_policy_ref: "cancel-r2-1".to_owned(),
+            checkpoint_policy_digest: "4".repeat(64),
+            drain_policy_ref: "drain-r2-1".to_owned(),
+            restart_policy_digest: "5".repeat(64),
         }
     }
 

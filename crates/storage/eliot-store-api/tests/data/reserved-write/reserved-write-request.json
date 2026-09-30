@@ -23,6 +23,11 @@
     }
   },
   "transition": {
+    "contract_version": {
+      "major": 1,
+      "minor": 0,
+      "patch": 0
+    },
     "identity": {
       "operation_id": "op-991-1",
       "idempotency_key": "idem-991-1",
@@ -82,8 +87,8 @@
     "operation_id": "op-991-1",
     "idempotency_key": "idem-991-1",
     "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "prepared_transition_digest": "030c1c31ccd378e38f8f090c8cba568e6b3dd10c456efb63ccc339f827c7bf62",
-    "reservation_token_digest": "e2402b85ab962f72c9490eb15770779cfc6e59cd5d24fbac6fa1e6cf1ce10f39",
+    "prepared_transition_digest": "4e7e23a72acd25774d1b959733e55c60e7bd20acf167c8f33d74281482e19ec3",
+    "reservation_token_digest": "802bac488d74e21033c9e2ae283f86ca8b6e36b4b26e8eaa128fa932f6c79395",
     "scopes": [
       {
         "scope": "scope-991-1",

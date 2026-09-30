@@ -421,7 +421,12 @@ impl McpInvocationCorrelation {
             tool_name = self.tool_name.as_deref().unwrap_or(""),
             operation_present = !self.operation.is_empty(),
             idempotency_key_present = self.operation.idempotency_key.is_some(),
-            operation_write_id = self.operation.write_id.as_deref().unwrap_or(""),
+            // #2899 item 12: the caller hint is UNVALIDATED text read straight
+            // out of `params.arguments`, so only its presence is recorded. The
+            // value itself stays out of the record, exactly as the owner-side
+            // producer already records `operation_hint_present` and
+            // `idempotency_key_present` without the values.
+            operation_write_id_present = self.operation.write_id.is_some(),
             owner_operation_bound = self.operation_binding.is_some(),
             receipt_write_id = self.receipt_write_id.as_deref().unwrap_or(""),
             session_id = self.session_id.as_deref().unwrap_or(""),

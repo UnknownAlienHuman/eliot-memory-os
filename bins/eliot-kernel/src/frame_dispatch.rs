@@ -1297,10 +1297,12 @@ impl KernelComposition {
             // or inside their owner; the generic process arm below admits
             // `Start` only from `Ready` and keeps `Inspect`/`Cancel`/
             // `Reconcile` — pure observations and terminal recovery — reachable
-            // from `Degraded`. A `Start` then passes
-            // `admit_material_authority_for_fence`, which additionally requires
-            // the current Ready, unfenced activation contour and the verified
-            // independent Watchdog branch.
+            // from `Degraded`. A `Start` admits its effect only at spawn
+            // through `admit_material_process_start` under the live
+            // Governor-issued revision
+            // (`admit_material_authority_for_governor_issued_fence`), which
+            // additionally requires the current Ready, unfenced activation
+            // contour and the verified independent Watchdog branch.
             let request_id = frame
                 .request_id
                 .clone()

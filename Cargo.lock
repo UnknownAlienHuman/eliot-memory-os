@@ -2122,6 +2122,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-context-contracts",
  "eliot-contracts",
+ "eliot-evaluation-contracts",
  "eliot-evidence",
  "eliot-governor",
  "eliot-learning-contracts",
@@ -2490,7 +2491,9 @@ dependencies = [
 name = "eliot-maintenance"
 version = "0.1.0"
 dependencies = [
+ "eliot-authority",
  "eliot-contracts",
+ "eliot-receipts",
  "eliot-runtime-contracts",
  "schemars",
  "serde",
@@ -2638,6 +2641,7 @@ name = "eliot-module-registry"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-runtime-contracts",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3399,6 +3403,7 @@ dependencies = [
  "eliot-process",
  "eliot-process-executor",
  "eliot-protocol",
+ "eliot-security-contracts",
  "eliot-user-broker-core",
  "eliot-windows-ipc",
  "serde",

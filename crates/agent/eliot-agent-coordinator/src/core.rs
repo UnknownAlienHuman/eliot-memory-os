@@ -533,11 +533,36 @@ fn offer_class_head(
         ));
         return;
     }
-    // Bounded scan for the oldest eligible head; the window is the class item
-    // ceiling. See the known-limitation note on `next_ready`: the window always
-    // starts at the oldest admitted item, so a window whose items are all
-    // permanently out of profile never advances.
-    for (_, attempt) in view.ready.iter().take(context.profile.max_items) {
+    // Bounded scan for the oldest eligible head, in ascending canonical enqueue
+    // order, so age still decides between two items this class could serve.
+    //
+    // The window (`max_items`) counts only the items a capacity dimension
+    // currently closes, because those are *temporarily* ineligible and may
+    // become serviceable when the class frees up. An item over the class
+    // deadline ceiling is not temporarily ineligible: its own `wall_time_ms`
+    // budget and the class ceiling are both fixed at admission, so under this
+    // profile revision it can never be served by this class. Letting such an
+    // item hold the window would make the window restart at the same
+    // permanently-infeasible items on every pull, so a class whose oldest
+    // `max_items` items are all over-ceiling would report
+    // `AllReadyItemsSkipped` forever and starve every eligible item queued
+    // behind them. It is therefore stepped over without consuming the window.
+    //
+    // Stepping over is not dropping and not re-queuing: the item stays admitted,
+    // keeps its canonical enqueue ordinal, is never removed by a pull, and is
+    // counted in `infeasible_items`. Its disposition belongs to admission, and
+    // only a new profile revision can make it serviceable again.
+    //
+    // Termination and cost: the walk is over `view.ready`, the per-class
+    // admitted list that `class_views` has already materialised for this pull,
+    // so each item is visited at most once. That list is finite and already
+    // bounded: `admit` and `reassign` refuse to push the coordinator past the
+    // positive, validated `CoordinatorConfig::max_admitted_attempts`, so this
+    // loop cannot outlast a bounded admitted set. The item ceiling is what
+    // bounds the items that could still be *served*, which is the part that
+    // decides this pull.
+    let mut window_used = 0usize;
+    for (_, attempt) in &view.ready {
         view.scanned += 1;
         let Some(block) = item_block(view, attempt, context.profile) else {
             view.head = Some(attempt);
@@ -546,9 +571,14 @@ fn offer_class_head(
         view.skipped += 1;
         if block.reason == ReadyItemSkipReason::ClassDeadlineCeiling {
             view.infeasible += 1;
+            continue;
         }
+        window_used += 1;
         if view.capacity_closure.is_none() && block.closure.is_some() {
             view.capacity_closure = Some(block);
+        }
+        if window_used >= context.profile.max_items {
+            break;
         }
     }
     view.skip_reason = Some(ClassSkipReason::AllReadyItemsSkipped);
@@ -1344,13 +1374,16 @@ impl AgentCoordinator {
     ///
     /// Known limitation, stated here so a reader of the code does not need the
     /// delivery report: the per-class partition is reachable only through the
-    /// profile-bound path [`Self::pull_next`], and `pull_next` has **no in-tree
-    /// caller** — the composition root that could supply a `SchedulingProfile` is
-    /// out of this crate's grant. So on every path that runs today, selection
-    /// applies the age order and the class-rank order but no per-class limit, and
-    /// `profile_revision` in the published outcome is `None`. A reader must not
-    /// conclude from this method that saturated low-priority work is prevented
-    /// from consuming another class's partition: nothing on this path does that.
+    /// profile-bound path [`Self::pull_next`], and in production this
+    /// coordinator's `attempts` map is **empty** — `AgentFabric` never calls
+    /// [`Self::admit`], because no production issuer of the provider-verified
+    /// [`ProviderAdmissionReceipt`] that `admit` requires exists in this tree.
+    /// So this method returns `None` on every production path today, no caller
+    /// invokes it, and `profile_revision` in any published outcome would be
+    /// `None`. A reader must not conclude from this method that saturated
+    /// low-priority work is prevented from consuming another class's
+    /// partition: nothing on this path does that. The full measurement is on
+    /// [`Self::pull_next`].
     pub fn next_ready(&mut self) -> Option<AttemptRecord> {
         let selected = self.select_ready(None, false).selected_attempt_id?;
         self.attempts.get(&selected).cloned()
@@ -1387,9 +1420,13 @@ impl AgentCoordinator {
     ///   [`FAIRNESS_QUANTUM`] per round of their own service, so the wait is
     ///   finite and is a whole number of those rounds.
     /// - **bounded scan**: the per-class scan is bounded by the class item
-    ///   ceiling and walks the items in ascending canonical enqueue ordinal, so
-    ///   a truncated window can only leave later items unserved, never displace
-    ///   an older one.
+    ///   ceiling, applied to the items a capacity dimension currently closes,
+    ///   and walks the items in ascending canonical enqueue ordinal, so a
+    ///   truncated window can only leave later items unserved, never displace
+    ///   an older one. An item over the class deadline ceiling is stepped over
+    ///   without consuming the window, because under a fixed profile revision
+    ///   it is permanently rather than temporarily ineligible; see
+    ///   [`offer_class_head`].
     /// - **bounded credit**: each class's credit for a pull — its virtual time
     ///   minus the winner's — lies in `0..=[FAIRNESS_QUANTUM]`, and the bound is
     ///   tight. The scheduler's *stored* virtual times are not bounded in value:
@@ -1401,27 +1438,40 @@ impl AgentCoordinator {
     ///   infeasible and gets no service promise from this selector. Disposing of
     ///   it is the admission owner's decision.
     ///
-    /// Known limitation, not papered over: the scan window always starts at the
-    /// oldest admitted item of its class. If every item inside the window is
-    /// permanently out of profile — the deadline-ceiling case above — then the
-    /// class reports `AllReadyItemsSkipped`, publishes no capacity deferral
-    /// (a deadline mismatch is not a capacity dimension), and the window never
-    /// advances, so both the blocked items and everything queued behind them in
-    /// that class make no progress on any pull. Nothing in this selector breaks
-    /// that: the disposition belongs to admission, which must refuse or stage an
-    /// item whose budget exceeds the class deadline ceiling, and `plan`/`admit`
-    /// take no profile today. The condition is reachable by profile choice
-    /// alone: any class whose `deadline_ms` is below the `wall_time_ms` budget of
-    /// its first `max_items` admitted items.
+    /// A permanently-infeasible item does not hold the class's scan window:
+    /// an item whose own `wall_time_ms` budget exceeds the class deadline
+    /// ceiling is reported infeasible and stepped over rather than blocking
+    /// every item queued behind it, so a class whose oldest items are all
+    /// over-ceiling still progresses. Disposing of such an item is the
+    /// admission owner's decision; this selector only declines to serve it and
+    /// promises nothing on its behalf.
     ///
     /// The pull selects; it does not start anything. A caller that receives a
     /// `selected_attempt_id` starts that attempt through the existing
     /// [`Self::start_attempt`], which remains the only state transition.
     ///
-    /// This entry point has no in-tree caller yet: the composition root that
-    /// would compile and supply a `SchedulingProfile` is outside this crate, so
-    /// the per-class partition it enforces is currently unexercised in
-    /// production. See the limitation note on [`Self::next_ready`].
+    /// Unreachable in production, and the reason is upstream of the profile.
+    /// Measured on `origin/main` @ `5d691922c`, the whole production gap is:
+    ///
+    /// - No caller outside this crate constructs a [`ProviderAdmissionReceipt`].
+    ///   Its `expires_at_unix_ms` doc records that "No production issuer exists
+    ///   in this tree yet, so every construction site is a test fixture", and
+    ///   `git grep` finds no `bins/` construction site. The receipt is
+    ///   provider-verified on intake, so a pull cannot be fed a synthesized
+    ///   one without forging provider evidence.
+    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) calls exactly three
+    ///   coordinator methods — `plan` (twice), `snapshot`, and a lease
+    ///   `authorizes` on an unrelated `SwarmCoordinatorLease`. It never calls
+    ///   [`Self::admit`], so this coordinator's `attempts` map is empty in
+    ///   production and every pull over it would select nothing even if a
+    ///   profile were supplied.
+    ///
+    /// So the per-class partition is unexercised in production, and the
+    /// blocking join is `AgentFabric` -> [`Self::admit`], not a missing profile.
+    /// Building that join needs the #1678 admission saga's owner-issued
+    /// receipt; supplying only a `SchedulingProfile` would produce a selector
+    /// that is correct and permanently empty. See also the note on
+    /// [`Self::next_ready`].
     ///
     /// # Errors
     ///

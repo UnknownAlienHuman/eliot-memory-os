@@ -43,16 +43,20 @@ use super::{
 
 /// Refuses a campaign-packet staging candidate that repeats retained work.
 ///
-/// I7.24 W3/A2: a materially repeated effect-capable call on unchanged
-/// inputs without a new expected delta is a loop/no-progress signal, not a
-/// fresh dispatch. Only campaign-packet pairs are compared; other lanes and
-/// unreconstructible pairs never match.
+/// I7.24 step 5: a materially repeated effect-capable call on unchanged
+/// inputs without new owner-observed evidence is a loop/no-progress signal,
+/// not a fresh dispatch. Only campaign-packet pairs are compared; other
+/// lanes and unreconstructible pairs never match. The class derives from the
+/// accepted `admission` the enqueue path already owns, and a reworded
+/// expected delta alone is not progress.
 fn refuse_campaign_staged_repeat(
+    admission: &LocalReadAdmission,
     index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
 ) -> Result<(), TransportError> {
-    let Some(current) = crate::tool_exposure::build_tool_call_request(envelope, tool) else {
+    let Some(current) = crate::tool_exposure::build_tool_call_request(envelope, tool, admission)
+    else {
         return Ok(());
     };
     let retained = index.values().flatten().filter_map(|candidate| {
@@ -73,7 +77,8 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
-        match check_local_read_admission(envelope, tool)? {
+        let admission = check_local_read_admission(envelope, tool)?;
+        match admission {
             LocalReadAdmission::CampaignPacket { .. } => {}
             LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {
                 return Err(TransportError::SessionFenced);
@@ -114,7 +119,7 @@ impl KernelComposition {
                 return Ok(());
             }
         }
-        refuse_campaign_staged_repeat(&index, envelope, tool)?;
+        refuse_campaign_staged_repeat(&admission, &index, envelope, tool)?;
         let queued = index
             .values()
             .flatten()
@@ -818,6 +823,15 @@ impl KernelComposition {
             .is_same_authority(&envelope.state_fence.authority_epoch)
             || session.module_generation.state_fence != envelope.state_fence
         {
+            return Err(TransportError::SessionFenced);
+        }
+        // #1824 (I10.21 A2): an unreconciled unknown-origin Material change
+        // (or a still-unverified host/filesystem hint) blocks governed
+        // finish-candidate acceptance until reconciled. Exact replays above
+        // stay readback and unrelated lanes are untouched: the monitor owns
+        // its ledger, this leg only queries its gate, and the refusal fails
+        // closed without crashing the route.
+        if super::change_monitor::governed_acceptance_blocked() {
             return Err(TransportError::SessionFenced);
         }
         let persisted = self

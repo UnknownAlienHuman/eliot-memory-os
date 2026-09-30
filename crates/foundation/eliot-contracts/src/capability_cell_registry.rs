@@ -57,7 +57,7 @@ pub const CAPABILITY_CELL_REGISTRY_VERSION: u32 = 1;
 ///
 /// Any registry bound to another pair key is stale and fails closed.
 pub const EXPECTED_NORMATIVE_PAIR_KEY: &str =
-    "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b";
+    "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1";
 /// Closed replacement-class vocabulary admitted by registry validation.
 ///
 /// The spellings follow the `CrateExtractionDecision` disposition set (`I2.23`)

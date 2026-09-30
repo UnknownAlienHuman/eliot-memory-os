@@ -92,6 +92,24 @@ const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydra
 /// `accepted:false` resolve value (`absent` or `conflict`). Any transport or
 /// store failure surfaces as a transport failure, never as absence.
 const AGENT_HOST_REQUEST_RESOLVE_OPERATION: &str = "agent_host_request_resolve";
+/// Closed kernel entry that previews one invocation dry run without staging
+/// or dispatch (issue #1939, I7.17).
+///
+/// Owned by `bins/eliot-kernel/src/host_request_route.rs`
+/// (`AGENT_HOST_REQUEST_PREVIEW_OPERATION`); the literal is repeated here
+/// because that constant is `pub(crate)` to that binary and this crate takes
+/// no new dependencies. The entry runs the existing invoke-read validator
+/// over the presented envelope plus canonical tool bytes and answers the
+/// exact preview with its source/currentness ceiling, or the typed
+/// unsupported value when the tool has no serving read lane. It never stages
+/// a row, issues a receipt, advances state, or runs provider work.
+const AGENT_HOST_REQUEST_PREVIEW_OPERATION: &str = "agent_host_request_preview";
+/// Owner preview source the kernel preview entry emits on every answer.
+///
+/// Repeated here because the kernel constant is `pub(crate)` to that binary;
+/// a preview reply carrying any other source fails closed as undecodable, so
+/// the caller keeps the local static fallback.
+const OWNER_DRY_RUN_PREVIEW_SOURCE: &str = "kernel-owner-preview.v1";
 /// Canonical prefix of the kernel-derived opaque operation handle.
 const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
 /// Filler capability carried only on handle-form resolve envelopes
@@ -1946,6 +1964,187 @@ fn host_request_invoke_read_frame(
     Ok(frame)
 }
 
+/// Owner-issued dry-run preview for one invocation (issue #1939, I7.17).
+///
+/// Decoded from the kernel preview entry with the same connection/digest/
+/// fence joins as the admitted reply: only an answer naming this exact
+/// envelope, capability, payload, connection, and fence is accepted. The
+/// owner never mints an operation identity here, so there is no handle
+/// field; `previewed` is true only when the owner validated a serving read
+/// lane (validation ran, never a simulation and never an effect).
+#[derive(Clone, Debug)]
+pub struct OwnerDryRunPreview {
+    /// Serving read lane the owner validated (`query`, `skill`,
+    /// `campaign-packet`, or `state`); `None` for unsupported tools.
+    pub lane: Option<String>,
+    /// True only when the owner validated a serving lane.
+    pub previewed: bool,
+}
+
+/// Derives the preview request label for one host correlation.
+///
+/// Readable `{correlation}:preview` while it fits the envelope text ceiling;
+/// a digest fallback beyond that, mirroring [`resolve_request_label`] so a
+/// long-but-submittable correlation never loses its preview path.
+/// Deterministic and unique per correlation, which is all the transport
+/// correlation needs.
+fn preview_request_label(base: &str) -> String {
+    let direct = format!("{base}:preview");
+    if direct.len() <= MAX_RESOLVE_LABEL_BYTES {
+        direct
+    } else {
+        format!("preview:{}", sha256_hex(base.as_bytes()))
+    }
+}
+
+/// Builds one lookup-only preview envelope over the current transport binding
+/// (issue #1939, I7.17).
+///
+/// Mirrors [`build_resolve_envelope`]: the kind is observation-only `Status`
+/// with no parent and no correlation projection (the only parentless `Status`
+/// shape the envelope contract admits), capability and payload digest name
+/// the exact tool bytes carried beside it, and the identity is fresh
+/// (`{correlation}:preview`) so no replay cache, resolve probe, or prior
+/// admission is consulted or recorded. Nothing here stages or receipts.
+fn build_preview_envelope(
+    request: &HostInvocationRequest,
+    facts: &TransportFacts,
+    session_id: &str,
+    payload_digest: &str,
+    now_ms: u64,
+) -> Result<HostRequestEnvelope, PortFailure> {
+    let label = preview_request_label(request.correlation_id.as_str());
+    let deadline = now_ms.saturating_add(DEFAULT_DEADLINE_PREFERENCE_MS);
+    if deadline == 0 {
+        return Err(request_failure());
+    }
+    let identity = HostRequestIdentity {
+        request_id: RequestId::new(&label).map_err(|_| request_failure())?,
+        correlation_projection: None,
+        idempotency_key: format!("{label}:idempotent"),
+        cancellation_id: format!("{label}:cancel"),
+        parent_operation_id: None,
+        deadline_unix_ms: deadline,
+        capability: request.tool.canonical_name().to_owned(),
+        session_id: Some(session_id.to_owned()),
+        task_id: None,
+        work_scope_id: None,
+        payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
+        payload_sha256: payload_digest.to_owned(),
+    };
+    finish_envelope(facts, HostRequestKind::Status, identity)
+}
+
+/// Builds one preview frame carrying the exact envelope plus the exact
+/// canonical tool bytes it previews.
+///
+/// Reuses the neutral frame identity of
+/// [`host_request_frame_for_envelope`]; only the payload gains the `tool`
+/// bytes the kernel linkage gate binds to the envelope digest before
+/// validating. The kernel answers the exact preview or the typed unsupported
+/// value; nothing is staged or receipted.
+fn host_request_preview_frame(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    let mut frame =
+        host_request_frame_for_envelope(AGENT_HOST_REQUEST_PREVIEW_OPERATION, envelope, facts)?;
+    let tool = serde_json::to_value(&request.tool).map_err(|_| request_failure())?;
+    let ProtocolPayload::Json(payload) = &mut frame.payload else {
+        return Err(request_failure());
+    };
+    payload["tool"] = tool;
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
+/// Decodes one kernel preview answer after joining it to the exact preview
+/// envelope, tool, connection, and fence.
+///
+/// Mirrors [`decode_admitted_reply`]: the frame must correlate to the sent
+/// envelope and the payload must carry `status: "known"`. The value must then
+/// name this exact envelope digest, capability, payload digest, connection,
+/// and fence, come from the owner preview source, and carry a closed
+/// disposition with its lane contract (`dry_run_preview` always names a
+/// serving lane; `dry_run_unsupported` never does). Anything else fails
+/// closed so the caller keeps the local static fallback.
+fn decode_preview_reply(
+    reply: &Frame,
+    envelope: &HostRequestEnvelope,
+    request: &HostInvocationRequest,
+    facts: &TransportFacts,
+) -> Option<OwnerDryRunPreview> {
+    reply.validate().ok()?;
+    if reply.kind != FrameKind::Response || reply.message_type != MessageType::Result {
+        return None;
+    }
+    if reply.connection_id != envelope.connection_id {
+        return None;
+    }
+    if reply.request_id.as_ref() != Some(&envelope.identity.request_id) {
+        return None;
+    }
+    if reply.request_identity.is_some() {
+        return None;
+    }
+    let ProtocolPayload::Json(payload) = &reply.payload else {
+        return None;
+    };
+    if canonical_json_bytes(payload).ok()?.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+        return None;
+    }
+    if payload.get("status")?.as_str()? != "known" {
+        return None;
+    }
+    let value = payload.get("value")?;
+    if value.get("accepted")?.as_bool() != Some(true) {
+        return None;
+    }
+    if value.get("envelope_sha256")?.as_str()? != envelope.envelope_sha256.as_str() {
+        return None;
+    }
+    if value.get("capability")?.as_str()? != request.tool.canonical_name() {
+        return None;
+    }
+    let expected_digest = canonical_payload_digest(&request.tool).ok()?;
+    if value.get("payload_sha256")?.as_str()? != expected_digest.as_str() {
+        return None;
+    }
+    if value.get("connection_id")?.as_str()? != facts.connection_id.as_str() {
+        return None;
+    }
+    let fence: StateFence = serde_json::from_value(value.get("state_fence")?.clone()).ok()?;
+    if fence != facts.state_fence {
+        return None;
+    }
+    if value.get("source")?.as_str()? != OWNER_DRY_RUN_PREVIEW_SOURCE {
+        return None;
+    }
+    match value.get("preview")?.as_str()? {
+        "dry_run_preview" => {
+            let lane = value.get("lane")?.as_str()?;
+            if !matches!(lane, "query" | "skill" | "campaign-packet" | "state") {
+                return None;
+            }
+            Some(OwnerDryRunPreview {
+                lane: Some(lane.to_owned()),
+                previewed: true,
+            })
+        }
+        "dry_run_unsupported" => {
+            if !value.get("lane")?.is_null() {
+                return None;
+            }
+            Some(OwnerDryRunPreview {
+                lane: None,
+                previewed: false,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Builds one rehydrate frame carrying the exact (envelope, admission-receipt)
 /// pair the kernel admitted.
 ///
@@ -3240,6 +3439,40 @@ impl KernelHostRequestClient {
             }
         })?;
         Ok(())
+    }
+
+    /// Asks the kernel preview entry to validate one invocation dry run
+    /// (issue #1939, I7.17).
+    ///
+    /// Observation-only: builds a fresh lookup-only `Status` envelope over
+    /// the current transport facts and presents the exact validated tool
+    /// bytes beside it. No replay cache is consulted or recorded, no resolve
+    /// probe runs, and the kernel stages nothing, so a preview can never
+    /// become an admission. Any transport, decode, or owner failure is the
+    /// typed error the caller maps to the local static fallback; only an
+    /// exactly joined owner answer returns.
+    pub fn preview_invocation(
+        &mut self,
+        request: &HostInvocationRequest,
+    ) -> Result<OwnerDryRunPreview, PortFailure> {
+        request
+            .validate()
+            .map_err(|error| plan_gap_bind(&error.to_string()))?;
+        if let Some(projection) = request.correlation_projection.as_ref() {
+            reject_kernel_operational_correlation(projection)?;
+        }
+        let now_ms = unix_ms()?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+        let payload_digest = canonical_payload_digest(&request.tool)?;
+        let envelope = build_preview_envelope(request, &facts, &session, &payload_digest, now_ms)?;
+        let frame = host_request_preview_frame(request, &envelope, &facts)?;
+        let reply = self.exchange(&frame)?;
+        decode_preview_reply(&reply, &envelope, request, &facts).ok_or_else(request_failure)
     }
 
     /// Sends one observation-only reconcile probe for an invocation whose

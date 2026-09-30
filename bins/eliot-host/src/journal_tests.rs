@@ -807,6 +807,10 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
     let bridge_path = path(&portable, "eliot-store-surreal.exe");
     let provider_path = path(&portable, "surreal.exe");
     let host_path = path(&portable, "eliot-host.exe");
+    let user_broker_path = path(&portable, "eliot-user-broker.exe");
+    let user_broker_bytes = b"approved-user-broker-fixture";
+    std::fs::write(&user_broker_path, user_broker_bytes)?;
+    let user_broker_digest = handle(format!("{:x}", Sha256::digest(user_broker_bytes)));
     let mut runtime_launch = RuntimeLaunchDescriptor {
         profile: InstallationProfile::PortableDev,
         portable_root: Some(portable_handle.clone()),
@@ -865,6 +869,10 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
             handle("c".repeat(64)),
             handle("--native-worker-artifact-sha256"),
             handle("d".repeat(64)),
+            handle("--user-broker-executable"),
+            user_broker_path.clone(),
+            handle("--user-broker-artifact-sha256"),
+            user_broker_digest.clone(),
             handle("--eliotd-descriptor"),
             path(&portable, "eliotd.json"),
             handle("--eliotd-descriptor-sha256"),
@@ -903,10 +911,12 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        user_broker_artifact_digest: user_broker_digest.clone(),
         wasm_host_artifact_digest: handle("f".repeat(64)),
         doctor_executable_path: path(&portable, "eliot-doctor.exe"),
         testd_executable_path: path(&portable, "eliot-testd.exe"),
         native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
+        user_broker_executable_path: user_broker_path.clone(),
         wasm_host_executable_path: path(&portable, "eliot-wasm-host.exe"),
         descriptor_digest: handle("0".repeat(64)),
     };
@@ -921,6 +931,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        user_broker_artifact_digest: user_broker_digest,
         wasm_host_artifact_digest: handle("f".repeat(64)),
         kernel_executable_path: path(&portable, "eliot-kernel.exe"),
         store_bridge_executable_path: bridge_path,
@@ -929,6 +940,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_executable_path: path(&portable, "eliot-doctor.exe"),
         testd_executable_path: path(&portable, "eliot-testd.exe"),
         native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
+        user_broker_executable_path: user_broker_path,
         wasm_host_executable_path: path(&portable, "eliot-wasm-host.exe"),
         config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure")],
@@ -3795,6 +3807,8 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
             user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
+            #[cfg(windows)]
+            backup_dispatch_queue: crate::HostBackupDispatchQueue::bounded(),
             store_recovery_startup_fence: StoreRecoveryStartupFence::Clear,
             active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind::None,
             owner_lease,

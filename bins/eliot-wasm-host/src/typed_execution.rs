@@ -13,6 +13,7 @@
 //! `eliot-wasm-runtime` crate keeps no Wasmtime dependency.
 
 use std::fmt;
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -20,15 +21,19 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eliot_wasm_runtime::component_contract::{ProofCeiling, TYPED_ABI_REVISION};
+use eliot_wasm_runtime::capsule::{ModuleContractKit, ModuleTestCapsule};
+use eliot_wasm_runtime::component_contract::{
+    ProofCeiling, TYPED_ABI_REVISION, TypedContractError,
+};
 use eliot_wasm_runtime::{
     CancellationPolicy, EngineTermination, EpochPolicy, InvocationLimits, MAX_EPOCH_DEADLINE_TICKS,
-    Sha256Digest,
+    Sha256Digest, TrapClass,
 };
 
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
 use crate::contour::CAPABILITY_INTRODUCTION_REQUIRED;
 use crate::typed_bindings::{TypedWorld, typed_wit_digest};
+use crate::wasmtime_provider::is_instance_limit_error;
 
 const ENGINE_VERSION: &str = "47.0.4";
 const PROVIDER_STACK_SIZE: u64 = 8 * 1024;
@@ -42,6 +47,9 @@ const MAX_TYPED_LIST_ITEMS: usize = 256;
 /// Memory-COUNT ceiling. `InvocationLimits` bounds memory bytes and instance
 /// count but carries no memory count, so the Host fixes it here.
 const MAX_TYPED_MEMORIES: usize = 1;
+/// Table-COUNT ceiling. `InvocationLimits` bounds table elements and instance
+/// count but carries no table count, so the Host fixes it here.
+const MAX_TYPED_TABLES: usize = 1;
 /// Approximate per-item lift cost used to convert a list into a byte bound.
 const TYPED_ITEM_LIFT_BYTES: u64 = 8;
 
@@ -173,7 +181,8 @@ impl TypedDomainAdmission {
 
 /// Bounded engine/run receipt for one typed call. No raw payload, path,
 /// secret, or backtrace. Observation timing is separate from the
-/// deterministic semantic digest.
+/// deterministic semantic digest: wall time, fuel, and peak resource
+/// measurements are recorded but excluded from [`semantic_digest`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedReceipt {
     /// Selected execution mode proof.
@@ -190,6 +199,10 @@ pub struct TypedReceipt {
     pub engine_version: String,
     /// Digest of the frozen WIT bytes.
     pub wit_digest: Sha256Digest,
+    /// Digest of the cache identity revalidated before compile: engine
+    /// version/config/target, artifact digest/length, ABI world/revision,
+    /// and admitted policy. Digests only: no raw payload, path, or secret.
+    pub cache_identity: Sha256Digest,
     /// Actual component imports observed (must be empty).
     pub actual_imports: Vec<String>,
     /// Actual component exports observed (exactly one interface).
@@ -236,6 +249,10 @@ pub struct TypedReceipt {
 pub enum TypedExecutionError {
     /// Default governed refusal without Kernel admission.
     GovernedAdmissionRequired,
+    /// Governed or capsule admission binding disagrees with the attempted
+    /// call (world, operation, artifact digest, kit/capsule binding). An
+    /// exact owned typed denial, distinct from the unadmitted default.
+    AdmissionMismatch(String),
     /// Unknown world selection.
     WorldUnknown(String),
     /// Component exports do not select exactly one registered world.
@@ -278,6 +295,7 @@ impl fmt::Display for TypedExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::GovernedAdmissionRequired => formatter.write_str("KERNEL_ADMISSION_REQUIRED"),
+            Self::AdmissionMismatch(reason) => write!(formatter, "ADMISSION_MISMATCH:{reason}"),
             Self::WorldUnknown(world) => write!(formatter, "WORLD_UNKNOWN:{world}"),
             Self::WorldSelection { reason } => write!(formatter, "WORLD_SELECTION:{reason}"),
             Self::ExportTypeMismatch(name) => write!(formatter, "EXPORT_TYPE_MISMATCH:{name}"),
@@ -304,7 +322,126 @@ impl From<PreflightError> for TypedExecutionError {
 
 /// Default governed refusal. No Kernel admission is bound in this host,
 /// so governed execution always fails closed before compile/instantiate.
+/// The refusal is enforced through [`check_governed_admission`]: the closed
+/// unadmitted record below is well-formed but carries no Kernel issuance, so
+/// the gate reaches its documented staleness denial and that typed denial
+/// propagates unchanged (`KERNEL_ADMISSION_REQUIRED`).
 pub fn execute_governed_refusal() -> Result<(), TypedExecutionError> {
+    let unadmitted = GovernedAdmission {
+        world: TypedWorld::ContextAdmission,
+        operation_id: "unadmitted-operation".to_owned(),
+        task_id: "unadmitted-task".to_owned(),
+        scope_id: "unadmitted-scope".to_owned(),
+        fence_epoch: "unadmitted-fence".to_owned(),
+        policy_id: "unadmitted-policy".to_owned(),
+        artifact_digest: Sha256Digest::of_bytes(b"unadmitted-governed-attempt"),
+        proof_ceiling: ProofCeiling::Observation,
+    };
+    check_governed_admission(
+        unadmitted.world,
+        Some(&unadmitted.artifact_digest),
+        None,
+        Some(&unadmitted),
+    )
+}
+
+/// Governed admission bindings the default path requires: exact world,
+/// operation/task/scope/fence/policy identity, artifact hash, and effect
+/// ceiling. This is the host-side record of the Kernel/module admission;
+/// it carries no trust flag and grants nothing by itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedAdmission {
+    /// World the admission was issued for.
+    pub world: TypedWorld,
+    /// Admitted operation id.
+    pub operation_id: String,
+    /// Admitted task id.
+    pub task_id: String,
+    /// Admitted scope id.
+    pub scope_id: String,
+    /// Admitted state fence epoch.
+    pub fence_epoch: String,
+    /// Admitted policy identity.
+    pub policy_id: String,
+    /// Admitted artifact digest the call must hash to.
+    pub artifact_digest: Sha256Digest,
+    /// Highest proof ceiling this admission may claim.
+    pub proof_ceiling: ProofCeiling,
+}
+
+impl GovernedAdmission {
+    /// Rejects an admission record that is itself unbounded or malformed,
+    /// before any component is acquired, compiled, or instantiated.
+    /// Locator-shaped identities (the `://` authority marker the artifact
+    /// path layer also rejects) are malformed here: an admitted identity is
+    /// a plain bounded local name, never a remote/registry/discovery source.
+    pub fn validate(&self) -> Result<(), TypedExecutionError> {
+        for value in [
+            self.operation_id.as_str(),
+            self.task_id.as_str(),
+            self.scope_id.as_str(),
+            self.fence_epoch.as_str(),
+            self.policy_id.as_str(),
+        ] {
+            if value.is_empty()
+                || value.len() > MAX_DESCRIPTOR_STRING_BYTES
+                || value.contains("://")
+                || value.chars().any(char::is_control)
+            {
+                return Err(TypedExecutionError::LimitDenied(
+                    "admission-field".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Default-governed admission gate. Denies before any artifact acquisition,
+/// compilation, or instantiation: this function takes no artifact bytes,
+/// performs no filesystem access, and builds no engine.
+///
+/// The artifact digest is the digest the caller bound under policy before the
+/// call, or `None` when no digest was bound: an explicit governed attempt
+/// carries no admission channel, so the gate denies before any acquisition
+/// could consult a digest.
+///
+/// Denial order: a caller-supplied artifact path on the governed lane is
+/// denied first with `KERNEL_ADMISSION_REQUIRED` (no arbitrary path/URL
+/// acquisition, no fallback to the experimental mode), before any admission
+/// record is consulted; absent admission yields `KERNEL_ADMISSION_REQUIRED`;
+/// a malformed record yields the owned `LIMIT_DENIED` denial (empty,
+/// over-long, control-character, or locator-shaped `://` identity); a
+/// world disagreement or a missing/mismatched artifact-digest binding yields
+/// the owned `ADMISSION_MISMATCH` denial. A well-formed record is still
+/// denied with `KERNEL_ADMISSION_REQUIRED`: this host binds no live Kernel
+/// admission channel to re-anchor freshness against, so staleness cannot be
+/// proven fresh (an old request not listed in a committed record is stale).
+pub fn check_governed_admission(
+    world: TypedWorld,
+    artifact_digest: Option<&Sha256Digest>,
+    artifact_source: Option<&Path>,
+    admission: Option<&GovernedAdmission>,
+) -> Result<(), TypedExecutionError> {
+    // P1.3 (#758): no arbitrary path/URL or fallback to experimental mode.
+    // The untrusted path is refused before any admission record is read,
+    // so a governed path attempt denies even alongside a presented record.
+    if artifact_source.is_some() {
+        return Err(TypedExecutionError::GovernedAdmissionRequired);
+    }
+    let admitted = admission.ok_or(TypedExecutionError::GovernedAdmissionRequired)?;
+    admitted.validate()?;
+    if admitted.world != world {
+        return Err(TypedExecutionError::AdmissionMismatch("world".to_owned()));
+    }
+    match artifact_digest {
+        Some(digest) if *digest == admitted.artifact_digest => {}
+        _ => {
+            return Err(TypedExecutionError::AdmissionMismatch(
+                "artifact-digest".to_owned(),
+            ));
+        }
+    }
     Err(TypedExecutionError::GovernedAdmissionRequired)
 }
 
@@ -431,22 +568,194 @@ fn validate_descriptor(
     Ok((Sha256Digest::of_bytes(&canonical), output_bytes))
 }
 
-fn semantic_digest(
+/// Digest-keyed cache identity for one typed compilation (items 22/P3.6).
+/// The identity binds engine version/config/target, artifact digest/length,
+/// ABI world/revision, and admitted policy — never a name, path, URL,
+/// generation, epoch, fence, proof, or authority value. The typed lane keeps
+/// no cross-invocation compiled cache: every call recompiles the same bounded
+/// buffer on a fresh engine, so this identity is the revalidation gate each
+/// compile passes and the value the receipt binds. A future cache entry would
+/// be valid exactly under this key; a key mismatch is denied, never bypassed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TypedCacheIdentity {
+    /// Digest of the exact immutable component bytes being compiled.
+    artifact: Sha256Digest,
+    /// Exact length of those bytes.
+    artifact_bytes: u64,
+    /// Digest of the typed engine configuration (version, target, fuel and
+    /// epoch mode, stack and count ceilings).
+    engine: Sha256Digest,
+    /// Digest of the frozen ABI binding (world, package, revision, WIT).
+    abi: Sha256Digest,
+    /// Digest of the admitted per-invocation limit/policy envelope.
+    policy: Sha256Digest,
+}
+
+impl TypedCacheIdentity {
+    /// Canonical digest of the whole identity, recorded in the receipt.
+    fn digest(&self) -> Sha256Digest {
+        let canonical = format!(
+            "758-typed-cache-identity|{}|{}|{}|{}|{}",
+            self.artifact.as_str(),
+            self.artifact_bytes,
+            self.engine.as_str(),
+            self.abi.as_str(),
+            self.policy.as_str(),
+        );
+        Sha256Digest::of_bytes(canonical.as_bytes())
+    }
+}
+
+/// Canonical digest of the exact typed engine settings for one invocation:
+/// the pinned engine version, the host compilation target, the component
+/// model, the fuel/epoch mode from the admitted cancellation policy, and the
+/// stack/count ceilings the fresh engine is built with. Mirrors the pool
+/// owner's descriptor-string mechanism for the typed lane.
+fn typed_engine_configuration_digest(limits: &InvocationLimits) -> Sha256Digest {
+    let descriptor = format!(
+        "typed-engine/v1;wasmtime={ENGINE_VERSION};target={os}/{arch};component_model=true;consume_fuel={consume};epoch_interruption=true;max_wasm_stack={PROVIDER_STACK_SIZE};memories={MAX_TYPED_MEMORIES};tables={MAX_TYPED_TABLES};memory_bytes={memory};table_elements={tables};instances={instances}",
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        consume = typed_fuel_budget(limits).is_some(),
+        memory = limits.max_memory_bytes,
+        tables = limits.max_table_elements,
+        instances = limits.max_instances,
+    );
+    Sha256Digest::of_bytes(descriptor.as_bytes())
+}
+
+/// Canonical digest of the admitted per-invocation limit/policy envelope.
+/// Every scalar ceiling plus the allow-listed artifact digests is bound, so
+/// a policy change is an identity change. Sorted iteration over the
+/// allow-list keeps the digest deterministic.
+fn typed_policy_digest(limits: &InvocationLimits) -> Sha256Digest {
+    let mut canonical = format!(
+        "typed-policy/v1;max_input_bytes={};max_output_bytes={};max_host_calls={};max_fuel={};max_memory_bytes={};max_table_elements={};max_instances={};max_stack_bytes={};wall_deadline_ms={};epoch_deadline_ticks={};epoch_cancellation={:?};artifact_max_reads={};artifact_max_bytes={}",
+        limits.max_input_bytes,
+        limits.max_output_bytes,
+        limits.max_host_calls,
+        limits.max_fuel,
+        limits.max_memory_bytes,
+        limits.max_table_elements,
+        limits.max_instances,
+        limits.max_stack_bytes,
+        limits.wall_deadline_ms,
+        limits.epoch.deadline_ticks,
+        limits.epoch.cancellation,
+        limits.artifact_access.max_reads,
+        limits.artifact_access.max_bytes,
+    );
+    for digest in &limits.artifact_access.allowed_digests {
+        canonical.push(';');
+        canonical.push_str(digest.as_str());
+    }
+    Sha256Digest::of_bytes(canonical.as_bytes())
+}
+
+/// Canonical digest of the frozen ABI binding for one world: world name,
+/// package identity, ABI revision, and the WIT digest the Host generated its
+/// bindings from.
+fn typed_abi_digest(world: TypedWorld) -> Sha256Digest {
+    let canonical = format!(
+        "typed-abi/v1;world={};package={};abi_revision={};wit={}",
+        world.world_name(),
+        crate::typed_bindings::TYPED_PACKAGE_ID,
+        TYPED_ABI_REVISION,
+        typed_wit_digest().as_str(),
+    );
+    Sha256Digest::of_bytes(canonical.as_bytes())
+}
+
+/// Builds the cache identity for one invocation from the preflighted digest
+/// and the admitted limits.
+fn typed_cache_identity(
     world: TypedWorld,
     artifact_digest: &Sha256Digest,
     artifact_bytes: u64,
-    output_digest: &Sha256Digest,
-    output_bytes: u64,
-    terminal: &str,
-) -> Sha256Digest {
-    let canonical = format!(
-        "758|{}|{}|{artifact_bytes}|{}|{output_bytes}|{terminal}|{}",
-        world.world_name(),
-        artifact_digest.as_str(),
-        output_digest.as_str(),
-        typed_wit_digest().as_str()
-    );
-    Sha256Digest::of_bytes(canonical.as_bytes())
+    limits: &InvocationLimits,
+) -> TypedCacheIdentity {
+    TypedCacheIdentity {
+        artifact: artifact_digest.clone(),
+        artifact_bytes,
+        engine: typed_engine_configuration_digest(limits),
+        abi: typed_abi_digest(world),
+        policy: typed_policy_digest(limits),
+    }
+}
+
+/// Revalidates the cache identity before compile (no bypass): the same
+/// bounded buffer is re-hashed independently of preflight — mirroring the
+/// pool owner's key-versus-bytes revalidation — and the fresh hash must be
+/// allow-listed by the admitted artifact policy. Both typed lanes call this
+/// after limit validation and before any engine is built; the capsule lane
+/// reaches it through its delegation to the domain lane. A buffer that does
+/// not hash to an allow-listed digest is denied with the owned typed
+/// `ADMISSION_MISMATCH`, never served from a stale entry.
+fn check_cache_identity(
+    world: TypedWorld,
+    artifact: &[u8],
+    limits: &InvocationLimits,
+) -> Result<TypedCacheIdentity, TypedExecutionError> {
+    let digest = Sha256Digest::of_bytes(artifact);
+    if !limits.artifact_access.allowed_digests.contains(&digest) {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "cache-artifact".to_owned(),
+        ));
+    }
+    let artifact_bytes = u64::try_from(artifact.len())
+        .map_err(|_| TypedExecutionError::LimitDenied("artifact-length".to_owned()))?;
+    Ok(typed_cache_identity(world, &digest, artifact_bytes, limits))
+}
+
+/// Deterministic semantic digest of one typed receipt: every fail-closed
+/// semantic field is bound, every execution observation is excluded.
+/// Excluded observations are `elapsed_ms` (wall clock), `fuel_consumed`,
+/// `peak_memory_bytes`, and `table_elements`. Raw payloads, paths, secrets,
+/// and backtraces are excluded by construction: the receipt carries only
+/// digests, measured sizes, and bounded identity codes, so there is nothing
+/// to redact. Two receipts for the same engine/config/target, artifact, ABI,
+/// policy, input, output, and terminal agree here even when their wall-clock
+/// observations differ.
+fn semantic_digest(receipt: &TypedReceipt) -> Sha256Digest {
+    fn push_field(canonical: &mut Vec<u8>, value: &[u8]) {
+        canonical.extend_from_slice(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        canonical.extend_from_slice(value);
+    }
+
+    let mut canonical = b"eliot-typed-semantic/v1\0".to_vec();
+    push_field(&mut canonical, receipt.proof.as_bytes());
+    push_field(&mut canonical, receipt.world.as_bytes());
+    push_field(&mut canonical, receipt.package_id.as_bytes());
+    push_field(&mut canonical, receipt.artifact_digest.as_str().as_bytes());
+    push_field(&mut canonical, &receipt.artifact_bytes.to_be_bytes());
+    push_field(&mut canonical, receipt.engine_version.as_bytes());
+    push_field(&mut canonical, receipt.wit_digest.as_str().as_bytes());
+    push_field(&mut canonical, receipt.cache_identity.as_str().as_bytes());
+    for import in &receipt.actual_imports {
+        push_field(&mut canonical, import.as_bytes());
+    }
+    for export in &receipt.actual_exports {
+        push_field(&mut canonical, export.as_bytes());
+    }
+    push_field(&mut canonical, receipt.input_digest.as_str().as_bytes());
+    push_field(&mut canonical, &receipt.input_bytes.to_be_bytes());
+    push_field(&mut canonical, receipt.output_digest.as_str().as_bytes());
+    push_field(&mut canonical, &receipt.output_bytes.to_be_bytes());
+    push_field(&mut canonical, &receipt.instances.to_be_bytes());
+    for identity in [
+        &receipt.operation_id,
+        &receipt.task_id,
+        &receipt.fence_epoch,
+        &receipt.policy_id,
+    ] {
+        match identity {
+            Some(value) => push_field(&mut canonical, value.as_bytes()),
+            None => push_field(&mut canonical, b"none"),
+        }
+    }
+    push_field(&mut canonical, receipt.stage.as_bytes());
+    push_field(&mut canonical, receipt.terminal.as_bytes());
+    Sha256Digest::of_bytes(&canonical)
 }
 
 /// Annotates a fail-closed cause with the stage the single call had actually
@@ -480,7 +789,9 @@ fn validate_descriptor_abi_digest(descriptor: &TypedDescriptor) -> Result<(), Ty
 /// before the host lowers it into guest memory and a result is bounded while
 /// its leaves are read. Nested records are bounded transitively by the store
 /// memory ceiling, which is the total host-allocation policy the pinned typed
-/// API offers for a not-yet-lifted result.
+/// API offers for a not-yet-lifted result. Accumulation itself is saturating:
+/// a hostile sequence of individually bounded leaves saturates into the typed
+/// `finish` denial instead of overflowing the counter.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TypedBound {
     bytes: u64,
@@ -492,8 +803,10 @@ impl TypedBound {
         if value.len() > MAX_TYPED_STRING_BYTES {
             return Err(TypedExecutionError::LimitDenied("typed-string".to_owned()));
         }
-        self.bytes += u64::try_from(value.len()).unwrap_or(u64::MAX);
-        self.items += 1;
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+        self.items = self.items.saturating_add(1);
         Ok(())
     }
 
@@ -585,10 +898,12 @@ pub fn execute_describe_experimental(
     // Same-buffer hash/compile: preflight once, compile the same slice.
     let preflight = preflight_bytes(artifact)?;
     validate_limits(limits, &preflight.digest)?;
+    // Cache identity revalidation before any engine is built: no bypass.
+    let cache_identity = check_cache_identity(world, artifact, limits)?;
 
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
-    config.consume_fuel(true);
+    config.consume_fuel(typed_fuel_budget(limits).is_some());
     config.epoch_interruption(true);
     config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
     let engine = wasmtime::Engine::new(&config)
@@ -612,7 +927,7 @@ pub fn execute_describe_experimental(
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let input_digest = Sha256Digest::of_bytes(&[]);
     let terminal = format!("{:?}", EngineTermination::Completed);
-    let receipt = TypedReceipt {
+    let mut receipt = TypedReceipt {
         proof: ExecutionMode::LocalExperimental.proof().to_owned(),
         world: world.world_name().to_owned(),
         package_id: crate::typed_bindings::TYPED_PACKAGE_ID.to_owned(),
@@ -620,6 +935,7 @@ pub fn execute_describe_experimental(
         artifact_bytes: preflight.byte_len,
         engine_version: ENGINE_VERSION.to_owned(),
         wit_digest: typed_wit_digest(),
+        cache_identity: cache_identity.digest(),
         actual_imports: imports,
         actual_exports: exports,
         input_digest,
@@ -637,15 +953,12 @@ pub fn execute_describe_experimental(
         stage: TypedStage::Cleanup.as_str().to_owned(),
         elapsed_ms,
         terminal: terminal.clone(),
-        semantic_digest: semantic_digest(
-            world,
-            &preflight.digest,
-            preflight.byte_len,
-            &output_digest,
-            output_bytes,
-            &terminal,
-        ),
+        // Replaced immediately below: `semantic_digest` reads the receipt's
+        // deterministic semantic fields and never this placeholder, the wall
+        // time, fuel, or peak measurements.
+        semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
+    receipt.semantic_digest = semantic_digest(&receipt);
     Ok((receipt, descriptor))
 }
 
@@ -860,7 +1173,14 @@ fn map_call_error(
         wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,
         wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,
         wasmtime::Trap::StackOverflow => EngineTermination::StackLimit,
-        _ => return TypedExecutionError::Engine(format!("{call}:guest-trap")),
+        // `unreachable` — the instruction a guest panic lowers to — and every
+        // other fault code are guest traps, never guest errors: the
+        // owner-typed `Trap(GuestTrap)` cause keeps them distinct from
+        // `TypedDomainResult::GuestError` and from fuel, deadline, stack, and
+        // resource terminations. The staged `Invoke` wrapper records the
+        // terminal stage without claiming success, and the single invocation
+        // is never retried on another world.
+        wasmtime::Trap::UnreachableCodeReached | _ => EngineTermination::Trap(TrapClass::GuestTrap),
     };
     TypedExecutionError::Engine(format!("{termination:?}"))
 }
@@ -871,6 +1191,12 @@ fn map_instantiate_error(
 ) -> TypedExecutionError {
     if let Some(hit) = limit_hit {
         return resource_limit_error(hit);
+    }
+    // Instance exhaustion surfaces as an instantiation error, never as a
+    // growth callback: reuse the provider owner's classifier so the typed
+    // lane reports the same typed `InstanceLimit` denial.
+    if is_instance_limit_error(error) {
+        return TypedExecutionError::Engine(format!("{:?}", EngineTermination::InstanceLimit));
     }
     let lowered = error.to_string().to_ascii_lowercase();
     if lowered.contains("import") {
@@ -889,6 +1215,13 @@ struct ObservedUsage {
     table_elements: Option<u32>,
 }
 
+/// Per-store resource state for one guarded typed invocation. Count bounds
+/// (`memories`, `tables`, `instances`) are forwarded to the configured
+/// [`wasmtime::StoreLimits`]; byte/element bounds are enforced in the growth
+/// callbacks below. The pinned Wasmtime 47 `ResourceLimiter` offers no
+/// resource/handle/module bound, so those classes are explicit unsupported
+/// policy here: no field claims to enforce them, and receipts must never
+/// claim they were bounded.
 struct StoreState {
     limits: wasmtime::StoreLimits,
     peak_memory_bytes: Option<u64>,
@@ -921,6 +1254,18 @@ impl StoreState {
     }
 }
 
+/// Fuel budget for one guarded invocation. `Some` only when the admitted
+/// cancellation policy meters fuel (`EpochAndFuel`): epoch-only execution
+/// leaves fuel disabled so the injected epoch/wall deadline alone decides
+/// termination. Compilation and host-side bounding (preflight, lift checks,
+/// receipts) never consume fuel either way.
+fn typed_fuel_budget(limits: &InvocationLimits) -> Option<u64> {
+    match limits.epoch.cancellation {
+        CancellationPolicy::EpochAndFuel => Some(limits.max_fuel),
+        CancellationPolicy::EpochInterruption => None,
+    }
+}
+
 fn new_store(
     engine: &wasmtime::Engine,
     limits: &InvocationLimits,
@@ -932,6 +1277,7 @@ fn new_store(
                 .memory_size(usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX))
                 .memories(MAX_TYPED_MEMORIES)
                 .table_elements(usize::try_from(limits.max_table_elements).unwrap_or(usize::MAX))
+                .tables(MAX_TYPED_TABLES)
                 .instances(usize::try_from(limits.max_instances).unwrap_or(usize::MAX))
                 .build(),
             peak_memory_bytes: None,
@@ -942,9 +1288,11 @@ fn new_store(
         },
     );
     store.limiter(|state| state);
-    store
-        .set_fuel(limits.max_fuel)
-        .map_err(|_| TypedExecutionError::LimitDenied("fuel".to_owned()))?;
+    if let Some(budget) = typed_fuel_budget(limits) {
+        store
+            .set_fuel(budget)
+            .map_err(|_| TypedExecutionError::LimitDenied("fuel".to_owned()))?;
+    }
     store.set_epoch_deadline(limits.epoch.deadline_ticks);
     Ok(store)
 }
@@ -1004,47 +1352,97 @@ impl wasmtime::ResourceLimiter for StoreState {
     fn instances(&self) -> usize {
         self.limits.instances()
     }
+
+    fn tables(&self) -> usize {
+        self.limits.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.limits.memories()
+    }
+}
+
+/// Epoch-driver lifetime guard for one guarded invocation (item 23).
+/// Each invocation builds a fresh engine, component, store, and driver:
+/// this module holds no `static`, so invocations share nothing and a failure
+/// cannot poison a later call. Stopping the driver and joining its thread
+/// happens in [`Drop`], so every exit path — success, staged failure, early
+/// return, or panic — tears the driver down before the per-invocation engine
+/// is dropped. The explicit `drop` in [`run_guarded`] keeps the original
+/// ordering (driver joined before fuel and resource measurements are read);
+/// the `Drop` impl is the backstop for exits that never reach it.
+struct EpochDriver {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl EpochDriver {
+    fn spawn(
+        engine: &wasmtime::Engine,
+        limits: &InvocationLimits,
+    ) -> Result<Self, TypedExecutionError> {
+        let wall_deadline = Instant::now() + Duration::from_millis(limits.wall_deadline_ms);
+        let stop = Arc::new(AtomicBool::new(false));
+        let engine_clone = engine.clone();
+        let stop_clone = Arc::clone(&stop);
+        let epoch_deadline = limits.epoch.deadline_ticks;
+        // Same interruption mechanism as the legacy provider: a bounded driver
+        // thread advances the epoch and forces the deadline once the wall
+        // clock expires. Guests observe only interruption, never time.
+        let handle = thread::Builder::new()
+            .name("eliot-typed-epoch".to_owned())
+            .spawn(move || {
+                while !stop_clone.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                    if Instant::now() >= wall_deadline {
+                        for _ in 0..epoch_deadline {
+                            engine_clone.increment_epoch();
+                        }
+                        break;
+                    }
+                    engine_clone.increment_epoch();
+                }
+            })
+            .map_err(|_| TypedExecutionError::Engine("epoch-driver-spawn".to_owned()))?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for EpochDriver {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Runs one descriptor closure with fuel, memory/table/instance limits,
 /// and epoch interruption driven by both a tick pump and the wall
 /// deadline. The wall deadline forces epoch ticks independent of remaining
 /// fuel, so the epoch deadline fires even when fuel is plentiful. No clock,
-/// randomness, or ambient capability reaches the guest.
+/// randomness, or ambient capability reaches the guest. There is no
+/// synchronous cancellation: dropping a caller future stops nothing; only
+/// fuel exhaustion or the epoch/wall deadline traps below stop the guest.
+/// A failed invocation retains nothing for the next one: the store, driver,
+/// and per-invocation engine state all drop here, and the staged error keeps
+/// the stage actually reached without retrying another world or invocation.
 fn run_guarded<T>(
     engine: &wasmtime::Engine,
     limits: &InvocationLimits,
     invoke: impl FnOnce(&mut wasmtime::Store<StoreState>) -> Result<T, TypedExecutionError>,
 ) -> Result<(T, ObservedUsage), TypedExecutionError> {
     let mut store = new_store(engine, limits)?;
-    let wall_deadline = Instant::now() + Duration::from_millis(limits.wall_deadline_ms);
-    let stop = Arc::new(AtomicBool::new(false));
-    let engine_clone = engine.clone();
-    let stop_clone = Arc::clone(&stop);
-    let epoch_deadline = limits.epoch.deadline_ticks;
-    // Same interruption mechanism as the legacy provider: a bounded driver
-    // thread advances the epoch and forces the deadline once the wall
-    // clock expires. Guests observe only interruption, never time.
-    let driver = thread::Builder::new()
-        .name("eliot-typed-epoch".to_owned())
-        .spawn(move || {
-            while !stop_clone.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(1));
-                if Instant::now() >= wall_deadline {
-                    for _ in 0..epoch_deadline {
-                        engine_clone.increment_epoch();
-                    }
-                    break;
-                }
-                engine_clone.increment_epoch();
-            }
-        })
-        .map_err(|_| TypedExecutionError::Engine("epoch-driver-spawn".to_owned()))?;
+    let driver = EpochDriver::spawn(engine, limits)?;
     let outcome = invoke(&mut store);
-    stop.store(true, Ordering::Release);
-    let _ = driver.join();
-    let remaining_fuel = store.get_fuel().unwrap_or(0);
-    let fuel_consumed = limits.max_fuel.saturating_sub(remaining_fuel);
+    drop(driver);
+    let fuel_consumed = match typed_fuel_budget(limits) {
+        Some(budget) => budget.saturating_sub(store.get_fuel().unwrap_or(0)),
+        None => 0,
+    };
     let limit_hit = store.data().limit_hit;
     let (peak_memory_bytes, table_elements) = store.data_mut().finish_measurements();
     match outcome {
@@ -1473,15 +1871,22 @@ impl TypedDomainResult {
 /// and the domain export is then called EXACTLY ONCE with the generated
 /// request type of the selected world. That single invocation is terminal:
 /// a staged failure or otherwise unknown outcome is returned as-is and never
-/// retried on another world or second invocation.
+/// retried on another world or second invocation. Bound #760 capsule
+/// provenance validates first, then delegates back unbound.
 pub fn execute_domain_experimental(
     world: TypedWorld,
     artifact: &[u8],
     limits: &InvocationLimits,
     request: &TypedDomainRequest,
     admitted: &TypedDomainAdmission,
+    provenance: Option<(&ModuleContractKit, &ModuleTestCapsule)>,
 ) -> Result<(TypedReceipt, TypedDomainResult), TypedExecutionError> {
     let start = Instant::now();
+    if let Some((kit, capsule)) = provenance {
+        return execute_capsule_domain_experimental(
+            kit, capsule, artifact, limits, request, admitted,
+        );
+    }
     admitted.validate()?;
     if request.world() != world {
         return Err(TypedExecutionError::WorldSelection {
@@ -1498,10 +1903,12 @@ pub fn execute_domain_experimental(
 
     let preflight = preflight_bytes(artifact)?;
     validate_limits(limits, &preflight.digest)?;
+    // Cache identity revalidation before any engine is built: no bypass.
+    let cache_identity = check_cache_identity(world, artifact, limits)?;
 
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
-    config.consume_fuel(true);
+    config.consume_fuel(typed_fuel_budget(limits).is_some());
     config.epoch_interruption(true);
     config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
     let engine = wasmtime::Engine::new(&config)
@@ -1529,7 +1936,7 @@ pub fn execute_domain_experimental(
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let terminal = result.terminal().to_owned();
-    let receipt = TypedReceipt {
+    let mut receipt = TypedReceipt {
         proof: ExecutionMode::LocalExperimental.proof().to_owned(),
         world: world.world_name().to_owned(),
         package_id: crate::typed_bindings::TYPED_PACKAGE_ID.to_owned(),
@@ -1537,6 +1944,7 @@ pub fn execute_domain_experimental(
         artifact_bytes: preflight.byte_len,
         engine_version: ENGINE_VERSION.to_owned(),
         wit_digest: typed_wit_digest(),
+        cache_identity: cache_identity.digest(),
         actual_imports: imports,
         actual_exports: exports,
         input_digest,
@@ -1554,16 +1962,146 @@ pub fn execute_domain_experimental(
         stage: TypedStage::Cleanup.as_str().to_owned(),
         elapsed_ms,
         terminal: terminal.clone(),
-        semantic_digest: semantic_digest(
-            world,
-            &preflight.digest,
-            preflight.byte_len,
-            &descriptor_digest,
-            output_bytes,
-            &terminal,
-        ),
+        // Replaced immediately below: `semantic_digest` reads the receipt's
+        // deterministic semantic fields and never this placeholder, the wall
+        // time, fuel, or peak measurements.
+        semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
+    receipt.semantic_digest = semantic_digest(&receipt);
     Ok((receipt, result))
+}
+
+/// Maps a #760 neutral kit/capsule validation failure to the exact owned
+/// typed denial. Neutral causes carry bounded field names only, so the
+/// `InvalidKit`/`InvalidCapsule` tag passes through; every other cause maps
+/// to the host denial with the same fail-closed meaning. Failures stay
+/// typed: there is no stringly catch-all.
+fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
+    match error {
+        TypedContractError::UnknownWorld(_) | TypedContractError::WorldMismatch { .. } => {
+            TypedExecutionError::WorldSelection {
+                reason: "capsule-world".to_owned(),
+            }
+        }
+        TypedContractError::LegacyRejected(_) => TypedExecutionError::LegacyMismatch,
+        TypedContractError::PackageMismatch { .. } => {
+            TypedExecutionError::AdmissionMismatch("package".to_owned())
+        }
+        TypedContractError::VersionMismatch { .. } => {
+            TypedExecutionError::AdmissionMismatch("abi-version".to_owned())
+        }
+        TypedContractError::AbiMismatch { .. } => {
+            TypedExecutionError::AdmissionMismatch("abi-revision".to_owned())
+        }
+        TypedContractError::DescriptorField(_) => {
+            TypedExecutionError::AdmissionMismatch("abi-descriptor".to_owned())
+        }
+        TypedContractError::ImportMismatch => {
+            TypedExecutionError::ForbiddenImport("capsule-import".to_owned())
+        }
+        TypedContractError::ExportMismatch => {
+            TypedExecutionError::MissingExport("capsule-export".to_owned())
+        }
+        TypedContractError::EngineMismatch => {
+            TypedExecutionError::AdmissionMismatch("engine-binding".to_owned())
+        }
+        TypedContractError::ArtifactMismatch | TypedContractError::InterfaceMismatch => {
+            TypedExecutionError::AdmissionMismatch("capsule-artifact".to_owned())
+        }
+        TypedContractError::LimitDenied | TypedContractError::EnvelopeTooLarge => {
+            TypedExecutionError::LimitDenied("capsule-bound".to_owned())
+        }
+        TypedContractError::ReportMismatch => {
+            TypedExecutionError::AdmissionMismatch("capsule-report".to_owned())
+        }
+        TypedContractError::EngineDenied => {
+            TypedExecutionError::Engine("capsule-engine-denied".to_owned())
+        }
+        TypedContractError::EngineUnavailable => {
+            TypedExecutionError::Engine("capsule-engine-unavailable".to_owned())
+        }
+        TypedContractError::EngineUnknown => {
+            TypedExecutionError::Engine("capsule-engine-unknown".to_owned())
+        }
+        TypedContractError::InvalidKit(detail) => TypedExecutionError::AdmissionMismatch(detail),
+        TypedContractError::InvalidCapsule(detail) => {
+            TypedExecutionError::AdmissionMismatch(detail)
+        }
+        TypedContractError::Serialization(_) => {
+            TypedExecutionError::AdmissionMismatch("kit-digest".to_owned())
+        }
+    }
+}
+
+/// Executes the #760 neutral operation capsule's domain operation through
+/// the real Wasmtime component engine on the local-experimental path.
+///
+/// The neutral [`ModuleContractKit`] and [`ModuleTestCapsule`] own the
+/// world/operation/artifact/input/output bindings: the kit is validated,
+/// the capsule is validated against the kit (exact world match, operation
+/// equal to the world's domain export, kit-digest rebinding, fixture and
+/// expected output inside the capsule's declared input/output bounds), the
+/// capsule world and operation are rebound to the host's own generated
+/// selection by canonical contract name (no cross-crate type bridge), and
+/// the same artifact buffer is hashed and required to equal the kit-bound
+/// digest and length. A governed kit is refused on this lane: the experimental receipt
+/// is `NON_GOVERNED_EXPERIMENTAL` and can never satisfy governed proof.
+///
+/// The single invocation itself runs through [`execute_domain_experimental`]
+/// with the caller's typed request and admitted envelope: the same bounded
+/// buffer is compiled, the exact component type is preflighted (including
+/// the generated export-signature typecheck) before instantiation, the
+/// descriptor and the domain export are each called exactly once under the
+/// existing fuel/epoch/deadline/resource limits and cancellation policy,
+/// and the typed terminal result (outcome or the guest's own typed error)
+/// is retained verbatim. The typed request arrives as generated WIT types;
+/// the capsule fixture bytes are bounds evidence only, never parsed into a
+/// request, and there is no legacy byte-runner fallback.
+pub fn execute_capsule_domain_experimental(
+    kit: &ModuleContractKit,
+    capsule: &ModuleTestCapsule,
+    artifact: &[u8],
+    limits: &InvocationLimits,
+    request: &TypedDomainRequest,
+    admitted: &TypedDomainAdmission,
+) -> Result<(TypedReceipt, TypedDomainResult), TypedExecutionError> {
+    kit.validate().map_err(map_contract_error)?;
+    capsule.validate(kit).map_err(map_contract_error)?;
+    if kit.governed {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "kit-governed".to_owned(),
+        ));
+    }
+    let world = request.world();
+    if capsule.world.world_name() != world.world_name() {
+        return Err(TypedExecutionError::AdmissionMismatch("world".to_owned()));
+    }
+    if capsule.operation.as_str() != world.domain_func() {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "operation".to_owned(),
+        ));
+    }
+    let preflight = preflight_bytes(artifact)?;
+    if kit.artifact_digest != preflight.digest {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "artifact-digest".to_owned(),
+        ));
+    }
+    if kit.artifact_len != preflight.byte_len {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "artifact-length".to_owned(),
+        ));
+    }
+    if capsule.max_input_bytes > limits.max_input_bytes {
+        return Err(TypedExecutionError::LimitDenied("capsule-input".to_owned()));
+    }
+    if capsule.max_output_bytes > limits.max_output_bytes {
+        return Err(TypedExecutionError::LimitDenied(
+            "capsule-output".to_owned(),
+        ));
+    }
+    // Delegation re-enters the direct lane: capsule provenance is consumed.
+    execute_domain_experimental(world, artifact, limits, request, admitted, None)
 }
 
 /// Digest of the admitted operation envelope plus the measured request bound.

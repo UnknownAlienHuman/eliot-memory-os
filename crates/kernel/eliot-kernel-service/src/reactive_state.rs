@@ -666,6 +666,7 @@ where
         }
     })?;
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: request.operation().clone(),
         state_fence: request.fence().clone(),
         scope_id: scope,

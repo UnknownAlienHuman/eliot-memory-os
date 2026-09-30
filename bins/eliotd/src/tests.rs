@@ -46,6 +46,7 @@ fn resolution_ticket() -> Result<AgentActivationResolutionTicket, Box<dyn std::e
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "connection-1".to_owned(),
+        workspace_selector: None,
         cancellation_id: "cancellation-1".to_owned(),
         state_fence: StateFence::new(test_epoch(1)?, ResourceGeneration::new(1)?),
         kernel_deadline_unix_ms: 100,

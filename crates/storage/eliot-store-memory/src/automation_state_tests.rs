@@ -191,6 +191,7 @@ fn transition_with(
         operation_manifest_set_digest(&eliot_store_api::generated_operation_manifests().unwrap())
             .unwrap();
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(format!("op-automation-{tag}")).expect("operation id"),
             idempotency_key: format!("idem-automation-{tag}"),
