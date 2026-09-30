@@ -914,7 +914,7 @@ pub fn parse_finish_submit_outcome(
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::local_read_claim`)
 /// answers the single-`operation`-key poll with `{"pair": {"envelope",
-/// "tool", "attempt"}}` or `{"pair": null}`. `None` is the empty-queue
+/// "tool", "attempt", "record", "durable_attempt"}}` or `{"pair": null}`. `None` is the empty-queue
 /// backoff signal, not an error — exactly like the activation ticket `None`
 /// case. The claimed envelope must already decode as admitted shape and the
 /// attempt must already decode as a bound capability (operation handle equal
@@ -1057,17 +1057,33 @@ pub enum ObserveDeferOutcome {
 ///
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_claim`)
-/// answers the single-`operation`-key poll with `{"pair": {"envelope",
-/// "tool", "attempt"}}` or `{"pair": null}`. `None` is the empty-queue
-/// backoff signal, not an error — exactly like the local-read claim. The
+/// answers the single-`operation`-key poll with a pair containing the
+/// `envelope`, `tool`, `attempt`, `record` and `durable_attempt` fields, or
+/// `{"pair": null}`. `None` is the empty-queue backoff signal, not an error —
+/// exactly like the local-read claim. The
 /// claimed envelope must already decode as admitted shape, name the
 /// `eliot.observe` capability, and bind the attempt; their closed linkage
 /// and fence binding are re-proved inside the observe flight before any
-/// submit or defer touches them. A pair without an attempt fails closed:
-/// absent authority is never invented.
+/// submit or defer touches them. The daemon also validates the exact durable
+/// ORS row, executable-input commitment and retained attempt; a partial pair
+/// fails closed instead of rebuilding missing authority.
+#[derive(Clone, Debug)]
+pub struct ObserveClaimedPair {
+    /// Original admitted host request envelope.
+    pub envelope: HostRequestEnvelope,
+    /// Exact decoded original ToolRequest value retained by Kernel.
+    pub tool: serde_json::Value,
+    /// Current Kernel-issued daemon claim capability.
+    pub attempt: LocalReadAttempt,
+    /// Exact durable ORS row read back by Kernel for this claim.
+    pub record: eliot_ors::HostRequestRecord,
+    /// Exact durable ORS attempt read back with the row.
+    pub durable_attempt: eliot_ors::HostRequestAttempt,
+}
+
 pub fn parse_observe_claimed_pair(
     value: &serde_json::Value,
-) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
+) -> Result<Option<ObserveClaimedPair>, String> {
     let pair = value
         .get("pair")
         .ok_or_else(|| "Kernel semantic_observe_claim answer omits the pair".to_owned())?;
@@ -1085,6 +1101,12 @@ pub fn parse_observe_claimed_pair(
                 .get("attempt")
                 .cloned()
                 .ok_or_else(|| "Kernel semantic_observe_claim pair omits the attempt".to_owned())?;
+            let record_value = pair.get("record").cloned().ok_or_else(|| {
+                "Kernel semantic_observe_claim pair omits the retained ORS record".to_owned()
+            })?;
+            let durable_attempt_value = pair.get("durable_attempt").cloned().ok_or_else(|| {
+                "Kernel semantic_observe_claim pair omits the retained ORS attempt".to_owned()
+            })?;
             let envelope: HostRequestEnvelope =
                 serde_json::from_value(envelope_value).map_err(|error| {
                     format!("Kernel semantic_observe_claim pair envelope does not decode: {error}")
@@ -1113,7 +1135,80 @@ pub fn parse_observe_claimed_pair(
                         .to_owned(),
                 );
             }
-            Ok(Some((envelope, tool, attempt)))
+            let record: eliot_ors::HostRequestRecord =
+                serde_json::from_value(record_value).map_err(|error| {
+                    format!("Kernel semantic_observe_claim ORS record does not decode: {error}")
+                })?;
+            record.validate().map_err(|error| {
+                format!("Kernel semantic_observe_claim ORS record is invalid: {error}")
+            })?;
+            let durable_attempt: eliot_ors::HostRequestAttempt =
+                serde_json::from_value(durable_attempt_value).map_err(|error| {
+                    format!("Kernel semantic_observe_claim ORS attempt does not decode: {error}")
+                })?;
+            let Some(executable_input) = record.executable_input.as_ref() else {
+                return Err(
+                    "Kernel semantic_observe_claim ORS record omits retained executable input"
+                        .to_owned(),
+                );
+            };
+            executable_input
+                .validate_for(&record)
+                .map_err(|error| format!("Kernel retained executable input is invalid: {error}"))?;
+            if record.operation_id.as_str() != attempt.operation_id
+                || record.request_digest != envelope.envelope_sha256
+                || record.payload_digest != envelope.identity.payload_sha256
+                || !matches!(
+                    record.state,
+                    eliot_ors::HostRequestState::Admitted | eliot_ors::HostRequestState::Routed
+                )
+                || record.result_digest.is_some()
+                || record.attempt.as_ref() != Some(&durable_attempt)
+                || durable_attempt.attempt_id.as_str() != attempt.attempt_id
+                || durable_attempt.generation != attempt.fencing_generation
+                || durable_attempt.input_commitment_sha256
+                    != executable_input.commitment_sha256
+                || executable_input.payload_sha256 != envelope.identity.payload_sha256
+                || executable_input.application_binding.state_fence != envelope.state_fence
+                || durable_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
+                || Some(attempt.session_id.as_str()) != envelope.identity.session_id.as_deref()
+                || attempt.authority_epoch != envelope.state_fence.authority_epoch
+                || Some(attempt.scope_id.as_str()) != envelope.identity.work_scope_id.as_deref()
+                || attempt.facet_method != OBSERVE_CAPABILITY
+            {
+                return Err(
+                    "Kernel semantic_observe_claim ORS row is not the exact admitted pair"
+                        .to_owned(),
+                );
+            }
+            let retained_request_identity = &executable_input.application_binding.request_identity;
+            let original_request_identity = serde_json::to_value(&envelope.identity)
+                .map_err(|error| format!("original observe identity cannot encode: {error}"))?;
+            if retained_request_identity != &original_request_identity {
+                return Err(
+                    "Kernel retained observe identity differs from the original envelope"
+                        .to_owned(),
+                );
+            }
+            let tool_bytes = canonical_json_bytes(&tool)
+                .map_err(|error| format!("original observe tool cannot canonicalize: {error}"))?;
+            let tool_length = u64::try_from(tool_bytes.len())
+                .map_err(|_| "original observe tool length exceeds the ORS contract".to_owned())?;
+            if tool_length != executable_input.payload_length
+                || sha256_hex(&tool_bytes) != executable_input.payload_sha256
+            {
+                return Err(
+                    "Kernel retained executable input does not bind the decoded original tool"
+                        .to_owned(),
+                );
+            }
+            Ok(Some(ObserveClaimedPair {
+                envelope,
+                tool,
+                attempt,
+                record,
+                durable_attempt,
+            }))
         }
         _ => Err(
             "Kernel semantic_observe_claim pair is neither an admitted pair nor null".to_owned(),
@@ -2480,10 +2575,7 @@ impl DaemonKernelClient {
     #[cfg(windows)]
     pub async fn claim_observe_pair_async(
         &self,
-    ) -> Result<
-        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
-        super::DaemonError,
-    > {
+    ) -> Result<Option<ObserveClaimedPair>, super::DaemonError> {
         let value = self
             .transact_async(
                 "semantic_observe_claim",
@@ -2492,10 +2584,10 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let pair = parse_observe_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
-        if let Some((envelope, _, attempt)) = pair.as_ref() {
+        if let Some(pair) = pair.as_ref() {
             let _ = crate::diagnostics::RequestReceipt::of(
-                envelope.identity.request_id.as_str(),
-                &attempt.operation_id,
+                pair.envelope.identity.request_id.as_str(),
+                &pair.attempt.operation_id,
             )
             .emit();
         }
