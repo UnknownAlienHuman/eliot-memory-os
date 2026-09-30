@@ -1,7 +1,8 @@
 //! Public identity for the installer-provisioned supervision signing authority.
 //!
-//! The contract contains only a DPAPI-NG ciphertext locator and public trust
-//! anchor. Signing key bytes never cross this boundary.
+//! The contract contains only profile-specific non-secret signing-key
+//! references and a public trust anchor. Signing key bytes never cross this
+//! boundary.
 
 use eliot_contracts::{ResourceGeneration, sha256_hex};
 use schemars::JsonSchema;
@@ -15,6 +16,16 @@ use crate::{
 
 /// Current Windows provider used for service-SID-bound key sealing.
 pub const WINDOWS_SERVICE_SID_DPAPI_NG_PROVIDER: &str = "windows-dpapi-ng-service-sid-v1";
+/// Current-user Windows Credential Manager provider for `UserMode` authority.
+pub const WINDOWS_CURRENT_USER_CREDENTIAL_MANAGER_PROVIDER: &str =
+    "windows-credential-manager-current-user-v1";
+/// Repository-local disposable provider for `PortableDev` authority.
+pub const PORTABLE_DEV_DISPOSABLE_KEY_PROVIDER: &str = "repository-local-disposable-v1";
+/// Reserved Credential Manager target namespace for `UserMode` supervision keys.
+pub const USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX: &str =
+    "eliot/supervision-authority/user-mode/v1/";
+/// Required repository-local contour for disposable `PortableDev` supervision keys.
+pub const PORTABLE_DEV_SUPERVISION_KEY_PREFIX: &str = ".eliot-dev/state/supervision/";
 /// Exact SCM service identity whose token admits Kernel key unsealing.
 pub const SUPERVISION_AUTHORITY_HOST_SERVICE: &str = "EliotHost";
 /// SCM `SERVICE_SID_TYPE_UNRESTRICTED` selected by the installer.
@@ -143,6 +154,201 @@ impl SupervisionSealedKeyReference {
     }
 }
 
+/// Read-back receipt binding a `UserMode` supervision key to its Windows user.
+///
+/// This records the account SID observed by the current-user Credential
+/// Manager provider. The installer/provider owns the OS read-back which makes
+/// the receipt truthful; this dependency-light contract checks its exact SID
+/// shape and binds it into the provision receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionOwnerSidReceipt {
+    /// Exact Windows account SID observed by the current-user provider.
+    pub owner_sid: String,
+}
+
+impl SupervisionOwnerSidReceipt {
+    /// Constructs and validates one exact Windows account SID receipt.
+    pub fn new(owner_sid: impl Into<String>) -> Result<Self, SupervisionLeaseError> {
+        let value = Self {
+            owner_sid: owner_sid.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validates that the receipt identifies a user account SID.
+    pub fn validate(&self) -> Result<(), SupervisionLeaseError> {
+        validate_user_sid(&self.owner_sid)
+    }
+}
+
+/// Typed non-secret `UserMode` reference to a current-user Credential Manager key.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeSupervisionKeyReference {
+    /// Exact provider discriminator; no provider fallback is permitted.
+    pub provider: String,
+    /// Unpredictable target in the reserved supervision-key namespace.
+    pub credential_target: String,
+    /// Current Windows account SID observed by the provider on read-back.
+    pub owner_sid_receipt: SupervisionOwnerSidReceipt,
+}
+
+impl UserModeSupervisionKeyReference {
+    /// Constructs and validates one current-user Credential Manager reference.
+    pub fn new(
+        credential_target: impl Into<String>,
+        owner_sid_receipt: SupervisionOwnerSidReceipt,
+    ) -> Result<Self, SupervisionLeaseError> {
+        let value = Self {
+            provider: WINDOWS_CURRENT_USER_CREDENTIAL_MANAGER_PROVIDER.to_owned(),
+            credential_target: credential_target.into(),
+            owner_sid_receipt,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validates provider, reserved target namespace and current-user receipt.
+    pub fn validate(&self) -> Result<(), SupervisionLeaseError> {
+        if self.provider != WINDOWS_CURRENT_USER_CREDENTIAL_MANAGER_PROVIDER {
+            return Err(invalid("unsupported UserMode supervision-key provider"));
+        }
+        validate_supervision_credential_target(&self.credential_target)?;
+        self.owner_sid_receipt.validate()
+    }
+}
+
+/// Typed non-secret reference to an explicitly disposable `PortableDev` key file.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDevSupervisionKeyReference {
+    /// Exact provider discriminator; it declares a disposable repository-local key.
+    pub provider: String,
+    /// Canonical path below the repository-local `.eliot-dev/state` contour.
+    pub relative_path: String,
+}
+
+impl PortableDevSupervisionKeyReference {
+    /// Constructs and validates one disposable repository-local key reference.
+    pub fn new(relative_path: impl Into<String>) -> Result<Self, SupervisionLeaseError> {
+        let value = Self {
+            provider: PORTABLE_DEV_DISPOSABLE_KEY_PROVIDER.to_owned(),
+            relative_path: relative_path.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validates the disposable provider and exact repository-local contour.
+    pub fn validate(&self) -> Result<(), SupervisionLeaseError> {
+        if self.provider != PORTABLE_DEV_DISPOSABLE_KEY_PROVIDER {
+            return Err(invalid("unsupported PortableDev supervision-key provider"));
+        }
+        validate_relative_key_path(&self.relative_path)?;
+        if !self
+            .relative_path
+            .starts_with(PORTABLE_DEV_SUPERVISION_KEY_PREFIX)
+            || self.relative_path.len() == PORTABLE_DEV_SUPERVISION_KEY_PREFIX.len()
+        {
+            return Err(invalid(
+                "PortableDev supervision key must remain below the repository-local disposable state contour",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Profile-specific, non-secret reference to the supervision signing authority.
+///
+/// The untagged wire representation keeps existing v2 `SystemService` references
+/// byte-shape compatible: their provider and service-SID fields still identify
+/// the existing struct. The other strict provider structs carry only fields
+/// owned by their own profile.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SupervisionAuthorityKeyReference {
+    /// Existing DPAPI-NG key sealed for the exact `EliotHost` service SID.
+    SystemService(SupervisionSealedKeyReference),
+    /// Current-user Credential Manager key bound to an owner-SID receipt.
+    UserMode(UserModeSupervisionKeyReference),
+    /// Disposable repository-local key for `PortableDev` only.
+    PortableDev(PortableDevSupervisionKeyReference),
+}
+
+impl SupervisionAuthorityKeyReference {
+    /// Validates one exact profile-specific provider reference.
+    pub fn validate(&self) -> Result<(), SupervisionLeaseError> {
+        match self {
+            Self::SystemService(reference) => reference.validate(),
+            Self::UserMode(reference) => reference.validate(),
+            Self::PortableDev(reference) => reference.validate(),
+        }
+    }
+
+    /// Wraps an already validated `SystemService` DPAPI-NG reference.
+    pub fn system_service(
+        reference: SupervisionSealedKeyReference,
+    ) -> Result<Self, SupervisionLeaseError> {
+        reference.validate()?;
+        Ok(Self::SystemService(reference))
+    }
+
+    /// Constructs one current-user `UserMode` Credential Manager reference.
+    pub fn user_mode(
+        credential_target: impl Into<String>,
+        owner_sid_receipt: SupervisionOwnerSidReceipt,
+    ) -> Result<Self, SupervisionLeaseError> {
+        Ok(Self::UserMode(UserModeSupervisionKeyReference::new(
+            credential_target,
+            owner_sid_receipt,
+        )?))
+    }
+
+    /// Constructs one disposable `PortableDev` repository-local key reference.
+    pub fn portable_dev(relative_path: impl Into<String>) -> Result<Self, SupervisionLeaseError> {
+        Ok(Self::PortableDev(PortableDevSupervisionKeyReference::new(
+            relative_path,
+        )?))
+    }
+
+    /// Returns the service-SID-bound reference only for `SystemService`.
+    pub fn as_system_service(&self) -> Option<&SupervisionSealedKeyReference> {
+        match self {
+            Self::SystemService(reference) => Some(reference),
+            Self::UserMode(_) | Self::PortableDev(_) => None,
+        }
+    }
+
+    /// Returns the exact provider discriminator for this reference variant.
+    pub fn provider(&self) -> &str {
+        match self {
+            Self::SystemService(reference) => &reference.provider,
+            Self::UserMode(reference) => &reference.provider,
+            Self::PortableDev(reference) => &reference.provider,
+        }
+    }
+}
+
+impl From<SupervisionSealedKeyReference> for SupervisionAuthorityKeyReference {
+    fn from(value: SupervisionSealedKeyReference) -> Self {
+        Self::SystemService(value)
+    }
+}
+
+impl From<UserModeSupervisionKeyReference> for SupervisionAuthorityKeyReference {
+    fn from(value: UserModeSupervisionKeyReference) -> Self {
+        Self::UserMode(value)
+    }
+}
+
+impl From<PortableDevSupervisionKeyReference> for SupervisionAuthorityKeyReference {
+    fn from(value: PortableDevSupervisionKeyReference) -> Self {
+        Self::PortableDev(value)
+    }
+}
+
 /// Public result of the installer-owned supervision authority effect.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,8 +365,8 @@ pub struct ProvisionedSupervisionAuthority {
     pub candidate_generation: String,
     /// Exact lifecycle generation bound to the key and lease.
     pub authority_generation: ResourceGeneration,
-    /// Non-secret, Kernel-root-relative sealed-key reference.
-    pub key_reference: SupervisionSealedKeyReference,
+    /// Non-secret, strictly validated profile-specific key reference.
+    pub key_reference: SupervisionAuthorityKeyReference,
     /// Installation-pinned public Ed25519 trust anchor.
     pub trust_anchor: SupervisionTrustAnchor,
     /// Digest of the canonical public Watchdog admission template.
@@ -171,6 +377,10 @@ pub struct ProvisionedSupervisionAuthority {
 
 impl ProvisionedSupervisionAuthority {
     /// Current strict contract revision.
+    ///
+    /// Existing v2 `SystemService` key-reference JSON remains readable and keeps
+    /// its original serialized receipt input shape; the two added provider
+    /// variants use their own strict, provider-discriminated object shapes.
     pub const CONTRACT_VERSION: u16 = 2;
 
     /// Constructs a complete provision result and computes its public receipt.
@@ -178,7 +388,7 @@ impl ProvisionedSupervisionAuthority {
         supervision_lease_scope_id: impl Into<String>,
         candidate_generation: impl Into<String>,
         authority_generation: ResourceGeneration,
-        key_reference: SupervisionSealedKeyReference,
+        key_reference: impl Into<SupervisionAuthorityKeyReference>,
         trust_anchor: SupervisionTrustAnchor,
     ) -> Result<Self, SupervisionLeaseError> {
         let mut value = Self {
@@ -188,7 +398,7 @@ impl ProvisionedSupervisionAuthority {
             wake_policy: canonical_wake_policy(),
             candidate_generation: candidate_generation.into(),
             authority_generation,
-            key_reference,
+            key_reference: key_reference.into(),
             trust_anchor,
             watchdog_admission_template_digest: String::new(),
             provision_receipt_digest: String::new(),
@@ -306,8 +516,49 @@ fn validate_relative_key_path(value: &str) -> Result<(), SupervisionLeaseError> 
         })
     {
         return Err(invalid(
-            "sealed key path must be canonical and relative to the Kernel root",
+            "supervision key path must be canonical and relative to its admitted profile root",
         ));
+    }
+    Ok(())
+}
+
+fn validate_supervision_credential_target(value: &str) -> Result<(), SupervisionLeaseError> {
+    let Some(token) = value.strip_prefix(USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX) else {
+        return Err(invalid(
+            "UserMode supervision key target is outside its reserved Credential Manager namespace",
+        ));
+    };
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "UserMode supervision key target must have one lowercase SHA-256 token",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_user_sid(value: &str) -> Result<(), SupervisionLeaseError> {
+    let Some(tail) = value
+        .strip_prefix("S-1-5-21-")
+        .or_else(|| value.strip_prefix("S-1-12-1-"))
+    else {
+        return Err(invalid(
+            "UserMode supervision authority requires a Windows account SID",
+        ));
+    };
+    let components = tail.split('-').collect::<Vec<_>>();
+    if components.len() != 4
+        || components.iter().any(|component| {
+            component.is_empty()
+                || (component.len() > 1 && component.starts_with('0'))
+                || !component.bytes().all(|byte| byte.is_ascii_digit())
+                || component.parse::<u32>().is_err()
+        })
+    {
+        return Err(invalid("UserMode owner SID receipt is malformed"));
     }
     Ok(())
 }
@@ -355,6 +606,18 @@ fn invalid(reason: impl Into<String>) -> SupervisionLeaseError {
 mod tests {
     use super::*;
 
+    fn service_key_reference_mut(
+        authority: &mut ProvisionedSupervisionAuthority,
+    ) -> &mut SupervisionSealedKeyReference {
+        match &mut authority.key_reference {
+            SupervisionAuthorityKeyReference::SystemService(reference) => reference,
+            SupervisionAuthorityKeyReference::UserMode(_)
+            | SupervisionAuthorityKeyReference::PortableDev(_) => {
+                panic!("expected a SystemService key reference")
+            }
+        }
+    }
+
     fn authority() -> ProvisionedSupervisionAuthority {
         let file = SupervisionSealedKeyFileIdentity {
             canonical_path_digest: "1".repeat(64),
@@ -400,9 +663,9 @@ mod tests {
             "supervision//key.bin",
         ] {
             let mut value = authority();
-            value.key_reference.relative_path = path.to_owned();
-            value.key_reference.provider_identity_digest = value
-                .key_reference
+            let reference = service_key_reference_mut(&mut value);
+            reference.relative_path = path.to_owned();
+            reference.provider_identity_digest = reference
                 .computed_identity_digest()
                 .unwrap_or_else(|error| panic!("identity: {error}"));
             value.provision_receipt_digest = value
@@ -415,9 +678,9 @@ mod tests {
     #[test]
     fn provisioned_authority_rejects_service_sid_and_provider_substitution() {
         let mut value = authority();
-        value.key_reference.host_service_sid = "S-1-5-19".to_owned();
-        value.key_reference.provider_identity_digest = value
-            .key_reference
+        let reference = service_key_reference_mut(&mut value);
+        reference.host_service_sid = "S-1-5-19".to_owned();
+        reference.provider_identity_digest = reference
             .computed_identity_digest()
             .unwrap_or_else(|error| panic!("identity: {error}"));
         value.provision_receipt_digest = value
@@ -426,9 +689,9 @@ mod tests {
         assert!(value.validate().is_err());
 
         let mut value = authority();
-        value.key_reference.provider = "windows-credential-manager".to_owned();
-        value.key_reference.provider_identity_digest = value
-            .key_reference
+        let reference = service_key_reference_mut(&mut value);
+        reference.provider = "windows-credential-manager".to_owned();
+        reference.provider_identity_digest = reference
             .computed_identity_digest()
             .unwrap_or_else(|error| panic!("identity: {error}"));
         value.provision_receipt_digest = value

@@ -35,7 +35,7 @@ const PRODUCT_DIR: &str = "Eliot";
 const USER_PROGRAMS_DIR: &str = "Programs";
 /// Repository-local immutable root for the `portable_dev` profile (I3.1 table).
 const PORTABLE_BINARIES_DIR: &str = "target\\eliot-dev";
-/// Repository-local state root prefix for the `portable_dev` profile (I3.1 table).
+/// Repository-local mutable root for the `portable_dev` profile (I3.1 table).
 const PORTABLE_STATE_DIR: &str = ".eliot-dev";
 /// User configuration root name, where I3.1 publishes a `config|cache` pair.
 const USER_CONFIG_DIR: &str = "config";
@@ -79,8 +79,8 @@ fn required_anchor(
 /// The I3.1 root set resolved for one explicitly selected profile.
 ///
 /// `user_cache` is the sibling root of `user_config` where I3.1 publishes the
-/// `config|cache` pair; for `system_service`, whose user root is a single
-/// `%LocalAppData%\Eliot`, both name that same root.
+/// `config|cache` pair for `user_mode` and `portable_dev`. `system_service`
+/// retains its single `%LocalAppData%\Eliot` user root in both role fields.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileGovernedRoots {
@@ -108,17 +108,19 @@ impl ProfileGovernedRoots {
     /// I3.1: "Mutable data is never stored beside immutable versioned binaries,
     /// except inside the explicitly disposable `portable_dev` profile." A target
     /// inside the profile's versioned immutable binaries root is therefore
-    /// refused for `system_service` and `user_mode`, and admitted only for the
-    /// disposable `portable_dev` profile. The comparison is lexical on
-    /// [`WindowsPathIdentity`], the same bounded identity this crate already uses
-    /// for root separation, so a traversal or alias cannot slip past it.
+    /// refused for `system_service` and `user_mode`. `portable_dev` admits it
+    /// only within its selected repository, including the disposable binary
+    /// and state contours. This comparison uses lexical
+    /// [`WindowsPathIdentity`] to reject traversal and paths outside the selected
+    /// roots. Callers that write to disk must also retain the full parent contour
+    /// to reject reparse aliases and path replacement.
     ///
     /// # Errors
     ///
     /// Returns [`InstallationError::InvalidField`] when the target is not a
     /// usable absolute path, and [`InstallationError::ProfileViolation`] when
     /// the target lies inside the versioned immutable binaries root of a profile
-    /// that does not permit it.
+    /// that does not permit it, or outside the selected `portable_dev` checkout.
     pub fn admits_write_target(&self, target: &str) -> Result<(), InstallationError> {
         let target = WindowsPathIdentity::parse_root(target, "write_target")?;
         let binaries =
@@ -128,6 +130,24 @@ impl ProfileGovernedRoots {
                 "write target lies inside the {} immutable binaries root; mutable data is never stored beside immutable versioned binaries",
                 self.profile_name()
             )));
+        }
+        if self.profile == InstallationProfile::PortableDev {
+            let state = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
+            if !state.ends_with(&[PORTABLE_STATE_DIR, "state"]) || state.components.len() <= 2 {
+                return Err(InstallationError::ProfileViolation(
+                    "portable_dev durable root does not identify a repository checkout".to_owned(),
+                ));
+            }
+            let repository = WindowsPathIdentity {
+                prefix: state.prefix.clone(),
+                components: state.components[..state.components.len() - 2].to_vec(),
+            };
+            if !repository.contains(&target) {
+                return Err(InstallationError::ProfileViolation(
+                    "portable_dev write target is outside its selected repository checkout"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -256,16 +276,17 @@ pub fn select_profile_roots(
                 ));
             };
             text(generation, "generation")?;
-            let state_root = joined_windows_path(&repository, PORTABLE_STATE_DIR);
-            let config_root = joined_windows_path(&state_root, USER_CONFIG_DIR);
-            let cache_root = joined_windows_path(&state_root, USER_CACHE_DIR);
+            let profile_root = joined_windows_path(&repository, PORTABLE_STATE_DIR);
+            let state_root = joined_windows_path(&profile_root, "state");
+            let config_root = joined_windows_path(&profile_root, USER_CONFIG_DIR);
+            let cache_root = joined_windows_path(&profile_root, USER_CACHE_DIR);
             ProfileGovernedRoots {
                 profile,
                 immutable_binaries: joined_windows_path(
                     &joined_windows_path(&repository, PORTABLE_BINARIES_DIR),
                     generation,
                 ),
-                durable_data: joined_windows_path(&state_root, "state"),
+                durable_data: state_root,
                 user_config: config_root,
                 user_cache: cache_root,
             }

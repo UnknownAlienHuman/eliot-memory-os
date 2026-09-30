@@ -27,19 +27,21 @@ use super::canary_removal::{
 use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES;
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
-    InstallationError, InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, InstallerEffectPlan, PackageArtifactDigest, SetupBinding,
-    SetupMilestone, SetupStatus, decode_installation_transaction_json_from_store, handle,
-    runtime_sha256_handle,
+    InstallationError, InstallationRoots, InstallationStage, InstallationStepOutcome,
+    InstallationTransaction, InstallationTransactionStore, InstallerEffectPlan,
+    PackageArtifactDigest, SetupBinding, SetupMilestone, SetupStatus, SystemServiceHostRootReceipt,
+    decode_installation_transaction_json_from_store, handle, runtime_sha256_handle,
     transaction_store_private::{self, TransactionVersion},
 };
+use crate::installation_registry::installation_registry_path_user_owned;
 use eliot_config::initial_snapshot::SignedInitialConfigSnapshot;
 use eliot_contracts::ContractVersion;
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier, DirectoryPublicationReceipt,
     FileIdentity, OwnedDirectoryPublication, PackageFileSpec, PackageManifest, PeCoffEvidence,
-    TrustedSourceBundle, WindowsAuthenticodeVerifier, canonical_windows_path,
+    ProtectedRootLease, RetainedDirectoryContour, TrustedSourceBundle, UserOwnedPathLease,
+    UserOwnedRootLease, WindowsAuthenticodeVerifier, canonical_windows_path,
     delete_owned_file_handle, file_identity_for_open_handle, open_no_follow_directory,
     open_no_follow_file, validate_package_relative_path, windows_paths_equal,
 };
@@ -129,7 +131,7 @@ pub(crate) fn retry_registry_open_on_already_open<T>(
     }
 }
 
-/// Opens (or creates) the registry writer file with bounded AlreadyOpen
+/// Opens (or creates) the registry writer file with bounded `AlreadyOpen`
 /// retry. This is the `open_at` (`Database::create`) primitive.
 pub(crate) fn open_registry_writer_create_with_retry(
     path: &Path,
@@ -143,7 +145,7 @@ pub(crate) fn open_registry_writer_create_with_retry(
     .map_err(|error| super::InstallationError::Platform(error.to_string()))
 }
 
-/// Opens the existing registry writer file with bounded AlreadyOpen retry.
+/// Opens the existing registry writer file with bounded `AlreadyOpen` retry.
 /// This is the `open_existing_at` (`Database::open`) primitive.
 pub(crate) fn open_registry_writer_with_retry(
     path: &Path,
@@ -157,7 +159,7 @@ pub(crate) fn open_registry_writer_with_retry(
     .map_err(|error| super::InstallationError::Platform(error.to_string()))
 }
 
-/// Opens the registry read-only file with bounded AlreadyOpen retry. This is
+/// Opens the registry read-only file with bounded `AlreadyOpen` retry. This is
 /// the `inspect_existing`/`inspect_existing_at` (`ReadOnlyDatabase::open`)
 /// primitive.
 pub(crate) fn open_registry_reader_with_retry(
@@ -286,6 +288,147 @@ impl super::RedbInstallationRegistry {
         file.verify_path_identity()
             .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
         read_existing_registry(&database).map(Some)
+    }
+
+    /// Inspects an existing `UserMode` or `PortableDev` registry through a
+    /// retained current-user no-follow Host-root lease. This read never
+    /// creates a registry file or database.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the read must retain the caller-provided current-user root lease"
+    )]
+    pub fn inspect_existing_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: super::InstallationProfile,
+    ) -> Result<Option<super::ApprovedGenerationRegistry>, super::InstallationError> {
+        if profile == super::InstallationProfile::SystemService {
+            return Err(super::InstallationError::ProfileViolation(
+                "SystemService registry reads require the protected Host-root lease".to_owned(),
+            ));
+        }
+        let path = installation_registry_path_user_owned(&host_root, profile)?;
+        host_root
+            .verify_stable_identity()
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => {
+                return Err(super::InstallationError::Platform(
+                    "UserMode registry path is not an existing regular file".to_owned(),
+                ));
+            }
+        }
+        let file = UserOwnedPathLease::open_existing(&host_root, &path)
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        if file.path() != path {
+            return Err(super::InstallationError::Platform(
+                "UserMode registry path is not the retained canonical Host child".to_owned(),
+            ));
+        }
+        file.verify_path_identity()
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        let database = open_registry_reader_with_retry(file.path())?;
+        file.verify_path_identity()
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        host_root
+            .verify_stable_identity()
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        read_existing_registry(&database).map(Some)
+    }
+
+    /// Reads one generation's retained `UserMode` or `PortableDev` root receipt
+    /// without creating any registry path. Missing registry or receipt bytes
+    /// are explicit migration/recovery outcomes, never path-derived success.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the inspection retains the caller-provided current-user root lease"
+    )]
+    pub fn inspect_profile_selection_receipt_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: super::InstallationProfile,
+        generation: &PlatformHandle,
+    ) -> Result<
+        eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+        super::InstallationError,
+    > {
+        let registry = Self::inspect_existing_user_owned_at(host_root, profile)?.ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
+                reason: "current-user installation registry is absent; retained profile identity cannot be rehydrated"
+                    .to_owned(),
+            }
+        })?;
+        registry
+            .profile_selection_receipt_for_generation(generation)
+            .cloned()
+    }
+
+    /// Reads the committed Phase-B activation fence for one exact generation
+    /// through the same bounded `UserOwned` registry snapshot used by Store and
+    /// Watchdog restart validation.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the inspection retains the caller-provided current-user root lease"
+    )]
+    pub fn inspect_committed_activation_fence_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: super::InstallationProfile,
+        generation: &PlatformHandle,
+    ) -> Result<super::ActivationCommitFence, super::InstallationError> {
+        let registry = Self::inspect_existing_user_owned_at(host_root, profile)?.ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
+                reason: "current-user installation registry is absent; committed activation fence cannot be rehydrated"
+                    .to_owned(),
+            }
+        })?;
+        let fence = registry.last_committed_activation_fence().ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
+                reason: "current-user registry has no committed activation fence".to_owned(),
+            }
+        })?;
+        if &fence.generation != generation {
+            return Err(super::InstallationError::IdentityConflict);
+        }
+        fence.validate()?;
+        Ok(fence.clone())
+    }
+
+    /// Reads the retained root selection and exact committed Phase-B fence for
+    /// one generation from one validated `UserOwned` registry snapshot.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the inspection retains the caller-provided current-user root lease"
+    )]
+    pub fn inspect_profile_selection_and_activation_fence_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: super::InstallationProfile,
+        generation: &PlatformHandle,
+    ) -> Result<
+        (
+            eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+            super::ActivationCommitFence,
+        ),
+        super::InstallationError,
+    > {
+        let registry = Self::inspect_existing_user_owned_at(host_root, profile)?.ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
+                reason: "current-user installation registry is absent; retained generation bindings cannot be rehydrated"
+                    .to_owned(),
+            }
+        })?;
+        let selection = registry
+            .profile_selection_receipt_for_generation(generation)?
+            .clone();
+        let fence = registry.last_committed_activation_fence().ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
+                reason: "current-user registry has no committed activation fence".to_owned(),
+            }
+        })?;
+        if &fence.generation != generation {
+            return Err(super::InstallationError::IdentityConflict);
+        }
+        fence.validate()?;
+        Ok((selection, fence.clone()))
     }
 
     /// Loads the registry, returning an empty value on first use.
@@ -519,6 +662,12 @@ pub struct SourceBundlePublicationJournal {
     pub parent_identity: FileIdentity,
     /// Candidate generation identity.
     pub generation: PlatformHandle,
+    /// Exact I3.1 root binding used to materialize this source bundle.
+    pub profile_governed_roots: InstallationRoots,
+    /// Canonical profile anchor path selected before source materialization.
+    pub selected_profile_anchor_path: PlatformHandle,
+    /// Original file-object identity selected for the profile anchor.
+    pub selected_profile_anchor_identity: FileIdentity,
     /// Canonical package manifest digest.
     pub manifest_digest: PlatformHandle,
     /// Complete twelve-role artifact evidence digest.
@@ -569,7 +718,7 @@ pub struct SourceBundlePublicationRole {
 }
 
 /// Current source-bundle publication journal wire version.
-pub const SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION: u32 = 3;
+pub const SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION: u32 = 5;
 
 /// Derive the stable operation key for one exact source-bundle publication.
 pub fn source_bundle_publication_operation_id(
@@ -638,6 +787,62 @@ enum PublicationJournalStoreFault {
 }
 
 impl RedbInstallationTransactionStore {
+    /// Captures the original current-user root identities in one exact
+    /// transaction store after all root/ACL and `StagePackage` prefix effects
+    /// have been durably applied. The existing transaction file is opened by
+    /// its exact caller-selected path; no file or parent is created.
+    pub fn record_profile_selection_receipt_at_exact_path(
+        path: impl AsRef<Path>,
+        transaction_id: &PlatformHandle,
+        receipt: eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        let mut store = Self::open_existing_exact_path(path)?;
+        let mut transaction =
+            store
+                .load(transaction_id)?
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                })?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.record_profile_selection_receipt(receipt)?;
+        if transaction.revision != expected.revision {
+            <Self as transaction_store_private::Sealed>::compare_and_save(
+                &mut store,
+                expected,
+                &transaction,
+            )?;
+        }
+        Ok(transaction)
+    }
+
+    /// Rehydrates a `SystemService` transaction from the exact immutable receipt
+    /// already retained by its installation registry. The current Host-root
+    /// lease is compared with that receipt before the transaction CAS.
+    pub fn bind_system_service_host_root_receipt_at_exact_path(
+        path: impl AsRef<Path>,
+        transaction_id: &PlatformHandle,
+        receipt: &SystemServiceHostRootReceipt,
+        root: &ProtectedRootLease,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        let mut store = Self::open_existing_exact_path(path)?;
+        let mut transaction =
+            store
+                .load(transaction_id)?
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                })?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.bind_system_service_host_root_receipt(receipt.clone(), root)?;
+        if transaction.revision != expected.revision {
+            <Self as transaction_store_private::Sealed>::compare_and_save(
+                &mut store,
+                expected,
+                &transaction,
+            )?;
+        }
+        Ok(transaction)
+    }
+
     /// Persist and read back a source-bundle publication intent in the exact
     /// caller-selected store before any native directory move occurs.
     pub fn begin_source_bundle_publication_at_exact_path(
@@ -672,7 +877,7 @@ impl RedbInstallationTransactionStore {
                 reason: "begin accepts only an Intent journal".to_owned(),
             });
         }
-        require_existing_parent(path)?;
+        let _parent_contour = retain_transaction_path_parent(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
                 let store = Self::open_existing_exact_path(path)?;
@@ -836,7 +1041,7 @@ impl RedbInstallationTransactionStore {
     #[cfg(test)]
     pub(crate) fn create_at_exact_path(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
         let path = path.as_ref();
-        require_existing_parent(path)?;
+        let _parent_contour = retain_transaction_path_parent(path)?;
         match fs::symlink_metadata(path) {
             Ok(_) => return Err(existing_path_error()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -899,12 +1104,18 @@ impl RedbInstallationTransactionStore {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
                 reason:
-                    "create_planned accepts only constructor-produced Planned/Pending v24 state"
+                    "create_planned accepts only constructor-produced Planned/Pending v25 state"
                         .to_owned(),
             });
         }
+        if transaction.profile_governed_roots.is_none() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "planned transaction cannot be persisted without its retained I3.1 profile-root binding"
+                    .to_owned(),
+            });
+        }
         let path = path.as_ref();
-        require_existing_parent(path)?;
+        let _parent_contour = retain_transaction_path_parent(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
                 let store = Self::open_existing_exact_path(path)?;
@@ -926,6 +1137,7 @@ impl RedbInstallationTransactionStore {
         }
 
         let mut publication = PendingTransactionStorePublication::reserve(path)?;
+        let published_path = publication.destination.clone();
         let temporary = publication.temporary().to_owned();
         let database = Database::create(&temporary)
             .map_err(|error| InstallationError::Platform(format!("temporary create: {error}")))?;
@@ -944,31 +1156,50 @@ impl RedbInstallationTransactionStore {
             .map_err(|error| InstallationError::Platform(format!("temporary sync: {error}")))?;
         publication.retain_written_temporary()?;
         publication
-            .publish(path, transaction)
+            .publish(transaction)
             .map_err(|error| match error {
                 InstallationError::Platform(reason) => {
                     InstallationError::Platform(format!("publish: {reason}"))
                 }
                 other => other,
             })?;
-        let reopened = Self::open_existing_exact_path(path).map_err(|error| match error {
-            InstallationError::Platform(reason) => {
-                InstallationError::Platform(format!("published reopen: {reason}"))
-            }
-            other => other,
-        })?;
+        let reopened =
+            Self::open_existing_exact_path(&published_path).map_err(|error| match error {
+                InstallationError::Platform(reason) => {
+                    InstallationError::Platform(format!("published reopen: {reason}"))
+                }
+                other => other,
+            })?;
         Ok(reopened)
     }
 
     /// Opens an existing regular database file without creating any path.
     pub fn open_existing_exact_path(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
         let path = path.as_ref();
-        require_existing_parent(path)?;
-        let metadata =
-            std::fs::symlink_metadata(path).map_err(|error| InstallationError::InvalidField {
+        #[cfg(windows)]
+        let parent = retain_transaction_path_parent(path)?;
+        #[cfg(not(windows))]
+        let _parent_contour = retain_transaction_path_parent(path)?;
+        #[cfg(windows)]
+        verify_transaction_parent(&parent)?;
+        #[cfg(windows)]
+        let exact_path = parent
+            .canonical_path()
+            .join(
+                path.file_name()
+                    .ok_or_else(|| InstallationError::InvalidField {
+                        field: "transaction_store.path".to_owned(),
+                        reason: "path must name a file".to_owned(),
+                    })?,
+            );
+        #[cfg(not(windows))]
+        let exact_path = path.to_path_buf();
+        let metadata = std::fs::symlink_metadata(&exact_path).map_err(|error| {
+            InstallationError::InvalidField {
                 field: "transaction_store.path".to_owned(),
                 reason: format!("existing regular file required: {error}"),
-            })?;
+            }
+        })?;
         if !metadata.is_file() {
             return Err(InstallationError::InvalidField {
                 field: "transaction_store.path".to_owned(),
@@ -976,15 +1207,8 @@ impl RedbInstallationTransactionStore {
             });
         }
         #[cfg(windows)]
-        let parent = retain_transaction_directory(path.parent().ok_or_else(|| {
-            InstallationError::InvalidField {
-                field: "transaction_store.path".to_owned(),
-                reason: "path must have a parent".to_owned(),
-            }
-        })?)?;
-        #[cfg(windows)]
         let (identity, file) =
-            open_no_follow_file(path).map_err(|error| InstallationError::InvalidField {
+            open_no_follow_file(&exact_path).map_err(|error| InstallationError::InvalidField {
                 field: "transaction_store.path".to_owned(),
                 reason: format!("existing regular non-reparse file required: {error}"),
             })?;
@@ -992,7 +1216,7 @@ impl RedbInstallationTransactionStore {
         let expected_identity = identity;
         #[cfg(windows)]
         verify_transaction_parent(&parent)?;
-        let database = ReadOnlyDatabase::open(path)
+        let database = ReadOnlyDatabase::open(&exact_path)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         drop(database);
         #[cfg(windows)]
@@ -1006,6 +1230,7 @@ impl RedbInstallationTransactionStore {
             if readback_identity != expected_identity {
                 return Err(InstallationError::IdentityConflict);
             }
+            verify_transaction_parent(&parent)?;
         }
         #[cfg(windows)]
         let file = RetainedTransactionFile {
@@ -1013,7 +1238,7 @@ impl RedbInstallationTransactionStore {
             file,
         };
         Ok(Self {
-            path: path.to_path_buf(),
+            path: exact_path,
             #[cfg(windows)]
             parent,
             #[cfg(windows)]
@@ -1795,6 +2020,7 @@ fn decode_initial_snapshot(bytes: &[u8]) -> Result<SignedInitialConfigSnapshot, 
 }
 
 struct PendingTransactionStorePublication {
+    destination: PathBuf,
     temporary: PathBuf,
     #[cfg(windows)]
     parent: RetainedTransactionDirectory,
@@ -1803,10 +2029,7 @@ struct PendingTransactionStorePublication {
 }
 
 #[cfg(windows)]
-struct RetainedTransactionDirectory {
-    identity: FileIdentity,
-    file: File,
-}
+type RetainedTransactionDirectory = RetainedDirectoryContour;
 
 #[cfg(windows)]
 struct RetainedTransactionFile {
@@ -1816,7 +2039,7 @@ struct RetainedTransactionFile {
 
 impl PendingTransactionStorePublication {
     fn reserve(destination: &Path) -> Result<Self, InstallationError> {
-        let directory = destination
+        let requested_directory = destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| InstallationError::InvalidField {
@@ -1824,13 +2047,18 @@ impl PendingTransactionStorePublication {
                 reason: "exact path must name a file".to_owned(),
             })?;
         #[cfg(windows)]
-        let parent = retain_transaction_directory(directory)?;
+        let parent = retain_transaction_directory(requested_directory)?;
+        #[cfg(windows)]
+        let directory = parent.canonical_path().to_path_buf();
+        #[cfg(not(windows))]
+        let directory = requested_directory.to_path_buf();
         let file_name = destination
             .file_name()
             .ok_or_else(|| InstallationError::InvalidField {
                 field: "transaction_store.path".to_owned(),
                 reason: "exact path must name a file".to_owned(),
             })?;
+        let destination = directory.join(file_name);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
@@ -1843,6 +2071,8 @@ impl PendingTransactionStorePublication {
                 std::process::id()
             ));
             let temporary = directory.join(temporary_name);
+            #[cfg(windows)]
+            verify_transaction_parent(&parent)?;
             #[cfg(windows)]
             let result = eliot_platform_windows::create_no_follow_file_for_delete(&temporary)
                 .map_err(|error| InstallationError::Platform(error.to_string()));
@@ -1863,7 +2093,10 @@ impl PendingTransactionStorePublication {
                 .map_err(|error| InstallationError::Platform(error.to_string()));
             match result {
                 Ok((identity, file)) => {
+                    #[cfg(windows)]
+                    verify_transaction_parent(&parent)?;
                     return Ok(Self {
+                        destination,
                         temporary: temporary.clone(),
                         #[cfg(windows)]
                         parent,
@@ -1901,11 +2134,7 @@ impl PendingTransactionStorePublication {
         Ok(())
     }
 
-    fn publish(
-        mut self,
-        destination: &Path,
-        transaction: &InstallationTransaction,
-    ) -> Result<(), InstallationError> {
+    fn publish(mut self, transaction: &InstallationTransaction) -> Result<(), InstallationError> {
         #[cfg(windows)]
         {
             verify_transaction_parent(&self.parent)?;
@@ -1917,14 +2146,17 @@ impl PendingTransactionStorePublication {
                     })?;
             verify_retained_transaction_file(retained)?;
         }
-        match fs::hard_link(&self.temporary, destination) {
+        match fs::hard_link(&self.temporary, &self.destination) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(existing_path_error());
             }
             Err(error) => return Err(InstallationError::Platform(error.to_string())),
         }
-        let directory = destination
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
+        let directory = self
+            .destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| InstallationError::InvalidField {
@@ -1936,6 +2168,8 @@ impl PendingTransactionStorePublication {
                 stage: InstallationStage::Planned,
             });
         }
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
         let expected_bytes = encode(transaction)?;
         #[cfg(windows)]
         let expected_identity = self
@@ -1946,7 +2180,7 @@ impl PendingTransactionStorePublication {
             })?
             .identity;
         verify_published_transaction(
-            destination,
+            &self.destination,
             &transaction.transaction_id,
             &expected_bytes,
             #[cfg(windows)]
@@ -1956,6 +2190,7 @@ impl PendingTransactionStorePublication {
         )?;
         #[cfg(windows)]
         {
+            verify_transaction_parent(&self.parent)?;
             let retained = self
                 .temporary_file
                 .take()
@@ -1967,6 +2202,7 @@ impl PendingTransactionStorePublication {
                     stage: InstallationStage::Planned,
                 });
             }
+            verify_transaction_parent(&self.parent)?;
         }
         sync_parent_directory(directory).map_err(|_| InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
@@ -1975,7 +2211,6 @@ impl PendingTransactionStorePublication {
 
     fn publish_publication_journal(
         mut self,
-        destination: &Path,
         journal: &SourceBundlePublicationJournal,
         fault: PublicationJournalStoreFault,
     ) -> Result<(), InstallationError> {
@@ -1992,14 +2227,17 @@ impl PendingTransactionStorePublication {
                     })?;
             verify_retained_transaction_file(retained)?;
         }
-        match fs::hard_link(&self.temporary, destination) {
+        match fs::hard_link(&self.temporary, &self.destination) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(existing_path_error());
             }
             Err(error) => return Err(InstallationError::Platform(error.to_string())),
         }
-        let directory = destination
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
+        let directory = self
+            .destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| InstallationError::InvalidField {
@@ -2010,6 +2248,8 @@ impl PendingTransactionStorePublication {
             stage: InstallationStage::Planned,
         })?;
         #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
+        #[cfg(windows)]
         let expected_identity = self
             .temporary_file
             .as_ref()
@@ -2019,6 +2259,7 @@ impl PendingTransactionStorePublication {
             .identity;
         #[cfg(windows)]
         {
+            verify_transaction_parent(&self.parent)?;
             let retained = self
                 .temporary_file
                 .take()
@@ -2030,18 +2271,23 @@ impl PendingTransactionStorePublication {
                     stage: InstallationStage::Planned,
                 });
             }
+            verify_transaction_parent(&self.parent)?;
         }
         sync_parent_directory(directory).map_err(|_| InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
         })?;
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
         verify_published_publication_journal(
-            destination,
+            &self.destination,
             journal,
             #[cfg(windows)]
             Some(expected_identity),
             #[cfg(not(windows))]
             None,
         )?;
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
         #[cfg(test)]
         if fault == PublicationJournalStoreFault::AfterFinalPublishBeforeResponse {
             return Err(injected_publication_store_fault(
@@ -2058,6 +2304,7 @@ fn begin_new_source_bundle_publication_store(
     fault: PublicationJournalStoreFault,
 ) -> Result<SourceBundlePublicationJournal, InstallationError> {
     let mut publication = PendingTransactionStorePublication::reserve(destination)?;
+    let published_path = publication.destination.clone();
     #[cfg(test)]
     if fault == PublicationJournalStoreFault::AfterTemporaryCreateBeforeInsert {
         return Err(injected_publication_store_fault(
@@ -2117,8 +2364,8 @@ fn begin_new_source_bundle_publication_store(
             "after journal commit before final publication",
         ));
     }
-    publication.publish_publication_journal(destination, journal, fault)?;
-    let store = RedbInstallationTransactionStore::open_existing_exact_path(destination)?;
+    publication.publish_publication_journal(journal, fault)?;
+    let store = RedbInstallationTransactionStore::open_existing_exact_path(&published_path)?;
     let recorded = store
         .load_source_bundle_publication(&journal.operation_id)?
         .ok_or(InstallationError::UnknownOutcome {
@@ -2217,29 +2464,40 @@ impl Drop for PendingTransactionStorePublication {
 fn retain_transaction_directory(
     path: &Path,
 ) -> Result<RetainedTransactionDirectory, InstallationError> {
-    let (identity, file) =
-        open_no_follow_directory(path).map_err(|error| InstallationError::InvalidField {
-            field: "transaction_store.path".to_owned(),
-            reason: format!("existing non-reparse parent directory required: {error}"),
-        })?;
-    Ok(RetainedTransactionDirectory { identity, file })
+    RetainedDirectoryContour::retain(path).map_err(|error| InstallationError::InvalidField {
+        field: "transaction_store.path".to_owned(),
+        reason: format!("existing reparse-safe parent contour required: {error}"),
+    })
 }
 
 #[cfg(windows)]
 fn verify_transaction_parent(
     parent: &RetainedTransactionDirectory,
 ) -> Result<(), InstallationError> {
-    let identity = file_identity_for_open_handle(&parent.file).map_err(|_| {
-        InstallationError::UnknownOutcome {
+    parent
+        .verify()
+        .map_err(|_| InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
-        }
-    })?;
-    if identity != parent.identity {
-        return Err(InstallationError::UnknownOutcome {
-            stage: InstallationStage::Planned,
-        });
-    }
-    Ok(())
+        })
+}
+
+#[cfg(windows)]
+fn retain_transaction_path_parent(
+    path: &Path,
+) -> Result<RetainedTransactionDirectory, InstallationError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| InstallationError::InvalidField {
+            field: "transaction_store.path".to_owned(),
+            reason: "exact path must name a file".to_owned(),
+        })?;
+    retain_transaction_directory(parent)
+}
+
+#[cfg(not(windows))]
+fn retain_transaction_path_parent(path: &Path) -> Result<(), InstallationError> {
+    require_existing_parent(path)
 }
 
 #[cfg(windows)]
@@ -2368,8 +2626,14 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
                 reason:
-                    "create_planned accepts only constructor-produced Planned/Pending v24 state"
+                    "create_planned accepts only constructor-produced Planned/Pending v25 state"
                         .to_owned(),
+            });
+        }
+        if transaction.profile_governed_roots.is_none() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "planned transaction cannot be persisted without its retained I3.1 profile-root binding"
+                    .to_owned(),
             });
         }
         require_publication_for_stage_package(self, transaction)?;
@@ -2591,11 +2855,28 @@ fn validate_publication_journal(
         || journal.parent_identity.file_index == 0
         || journal.source_identity.volume_serial_number == 0
         || journal.source_identity.file_index == 0
+        || journal.selected_profile_anchor_identity.volume_serial_number == 0
+        || journal.selected_profile_anchor_identity.file_index == 0
     {
         return Err(InstallationError::InvalidField {
             field: "publication.journal".to_owned(),
             reason: "invalid publication journal identity or path".to_owned(),
         });
+    }
+    journal
+        .profile_governed_roots
+        .validate(journal.profile_governed_roots.runtime_state_roots.profile)?;
+    if !windows_paths_equal(
+        Path::new(journal.selected_profile_anchor_path.as_str()),
+        Path::new(
+            journal
+                .profile_governed_roots
+                .runtime_state_roots
+                .profile_anchor_root
+                .as_str(),
+        ),
+    ) {
+        return Err(InstallationError::IdentityConflict);
     }
     for (value, field) in [
         (&journal.operation_id, "publication.operation_id"),
@@ -3057,6 +3338,9 @@ fn publication_journal_identity_matches(
         && left.temporary_name == right.temporary_name
         && left.parent_identity == right.parent_identity
         && left.generation == right.generation
+        && left.profile_governed_roots == right.profile_governed_roots
+        && left.selected_profile_anchor_path == right.selected_profile_anchor_path
+        && left.selected_profile_anchor_identity == right.selected_profile_anchor_identity
         && left.manifest_digest == right.manifest_digest
         && left.evidence_digest == right.evidence_digest
         && left.precommit_digest == right.precommit_digest
@@ -3229,17 +3513,20 @@ fn decode_publication_journal(
     let journal_wire = journal_value
         .and_then(|journal| journal.get("wire_version"))
         .and_then(serde_json::Value::as_u64);
-    let has_v3_restart_authority = journal_value.is_some_and(|journal| {
+    let has_v5_profile_anchor_identity = journal_value.is_some_and(|journal| {
         journal.get("temporary_path").is_some()
             && journal.get("temporary_name").is_some()
             && journal.get("parent_identity").is_some()
+            && journal.get("profile_governed_roots").is_some()
+            && journal.get("selected_profile_anchor_path").is_some()
+            && journal.get("selected_profile_anchor_identity").is_some()
     });
     if envelope_wire != Some(u64::from(SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION))
         || journal_wire != Some(u64::from(SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION))
-        || !has_v3_restart_authority
+        || !has_v5_profile_anchor_identity
     {
         return Err(InstallationError::MigrationRequired {
-            reason: "source publication journal predates the mandatory v3 temporary publication authority"
+            reason: "source publication journal predates the mandatory v5 retained profile-anchor identity"
                 .to_owned(),
         });
     }
@@ -3306,6 +3593,17 @@ pub fn require_published_source_bundle_journal(
         .ok_or_else(|| InstallationError::MigrationRequired {
             reason: "planned transaction requires a durable source publication journal".to_owned(),
         })?;
+    let retained_profile_anchor = transaction
+        .retained_profile_anchor()
+        .ok_or_else(|| InstallationError::MigrationRequired {
+            reason: "planned transaction has no retained profile-anchor identity".to_owned(),
+        })?;
+    retained_profile_anchor.validate()?;
+    if journal.selected_profile_anchor_path != retained_profile_anchor.canonical_path
+        || journal.selected_profile_anchor_identity != retained_profile_anchor.identity
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
     verify_published_source_bundle_journal_live(&journal)?;
     if journal.state != SourceBundlePublicationJournalState::Published
         || journal.destination_identity.is_none()
@@ -3313,6 +3611,7 @@ pub fn require_published_source_bundle_journal(
         || journal.output_bundle != output
         || journal.transaction_id != transaction.transaction_id
         || journal.generation != *generation
+        || transaction.profile_governed_roots.as_ref() != Some(&journal.profile_governed_roots)
         || journal.manifest_digest.as_str() != manifest.canonical_digest()
         || journal.evidence_digest
             != GenerationPackagePlanner::artifact_set_evidence_digest(manifest, expected)?
@@ -3357,6 +3656,7 @@ fn classify_missing_v7_table(read: &redb::ReadTransaction) -> Result<(), Install
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn require_existing_parent(path: &Path) -> Result<(), InstallationError> {
     if !path.is_absolute() {
         return Err(InstallationError::InvalidField {
@@ -3394,11 +3694,9 @@ fn encode(transaction: &InstallationTransaction) -> Result<Vec<u8>, Installation
     })
 }
 
-fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
-            reason: error.to_string(),
-        })?;
+fn prepare_transaction_envelope_for_current_wire(
+    value: &mut serde_json::Value,
+) -> Result<(), InstallationError> {
     let version =
         value
             .get("wire_version")
@@ -3411,13 +3709,65 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
             reason: "transaction envelope has an unsupported wire discriminator".to_owned(),
         }
     })?;
-    if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
+    if version == ContractVersion::new(29, 0, 0) || version == ContractVersion::new(30, 0, 0) {
+        let envelope = value
+            .as_object_mut()
+            .ok_or_else(|| InstallationError::CorruptRegistry {
+                reason: "transaction envelope is not an object".to_owned(),
+            })?;
+        let transaction =
+            envelope
+                .get_mut("transaction")
+                .ok_or_else(|| InstallationError::CorruptRegistry {
+                    reason: "transaction envelope payload is missing".to_owned(),
+                })?;
+        let transaction_version = transaction
+            .get("transaction_wire_version")
+            .cloned()
+            .and_then(|version| serde_json::from_value::<ContractVersion>(version).ok());
+        if transaction_version != Some(version) {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "v{} transaction envelope does not contain a matching transaction payload",
+                    version.major
+                ),
+            });
+        }
+        if version == ContractVersion::new(29, 0, 0)
+            && transaction.as_object().is_some_and(|transaction| {
+                transaction.contains_key("system_service_host_root_receipt")
+            })
+        {
+            return Err(InstallationError::CorruptRegistry {
+                reason: "v29 transaction envelope contains a field outside its declared wire shape"
+                    .to_owned(),
+            });
+        }
+        crate::transaction::prepare_transaction_json_for_current_wire(transaction)?;
+        envelope.insert(
+            "wire_version".to_owned(),
+            serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(|error| {
+                InstallationError::CorruptRegistry {
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+    } else if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
         return Err(InstallationError::MigrationRequired {
             reason: format!(
                 "transaction envelope wire {version} requires explicit migration to {INSTALLATION_TRANSACTION_WIRE_VERSION}"
             ),
         });
     }
+    Ok(())
+}
+
+fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    prepare_transaction_envelope_for_current_wire(&mut value)?;
     let envelope: DecodedTransactionEnvelope =
         serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
             reason: format!("transaction envelope is not the strict current shape: {error}"),
@@ -3455,6 +3805,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use crate::{InstallationProfile, RuntimeStateRoots};
 
     const LEGACY_TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
         TableDefinition::new("installation_transactions_v2");
@@ -3468,6 +3819,26 @@ mod tests {
             "eliot-installation-transaction-{name}-{}.redb",
             std::process::id()
         ))
+    }
+
+    fn publication_profile_binding() -> InstallationRoots {
+        let profile_root =
+            PlatformHandle::new(r"C:\eliot-publication-fixture").expect("fixture profile root");
+        let runtime_state_roots = RuntimeStateRoots::derived(
+            InstallationProfile::PortableDev,
+            profile_root.clone(),
+            profile_root,
+        )
+        .expect("fixture runtime roots");
+        InstallationRoots::new(
+            InstallationProfile::PortableDev,
+            r"C:\eliot-publication-fixture\target\eliot-dev\generation-fixture",
+            r"C:\eliot-publication-fixture\.eliot-dev\state",
+            r"C:\eliot-publication-fixture\.eliot-dev\config",
+            r"C:\eliot-publication-fixture\.eliot-dev\cache",
+            runtime_state_roots,
+        )
+        .expect("fixture I3.1 profile binding")
     }
 
     #[expect(
@@ -3575,6 +3946,11 @@ mod tests {
             .parent()
             .expect("output parent")
             .join(&temporary_name);
+        let profile_governed_roots = publication_profile_binding();
+        let selected_profile_anchor_path = profile_governed_roots
+            .runtime_state_roots
+            .profile_anchor_root
+            .clone();
         SourceBundlePublicationJournal {
             wire_version: SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
             operation_id: source_bundle_publication_operation_id(
@@ -3592,6 +3968,12 @@ mod tests {
                 file_index: 303,
             },
             generation,
+            profile_governed_roots,
+            selected_profile_anchor_path,
+            selected_profile_anchor_identity: FileIdentity {
+                volume_serial_number: 11,
+                file_index: 404,
+            },
             manifest_digest: PlatformHandle::new(manifest.canonical_digest())
                 .expect("manifest digest"),
             evidence_digest,
@@ -3710,6 +4092,11 @@ mod tests {
         let operation_id =
             source_bundle_publication_operation_id(&transaction_id, output_bundle, &generation)
                 .expect("operation");
+        let profile_governed_roots = publication_profile_binding();
+        let selected_profile_anchor_path = profile_governed_roots
+            .runtime_state_roots
+            .profile_anchor_root
+            .clone();
         let journal = SourceBundlePublicationJournal {
             wire_version: SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
             operation_id,
@@ -3719,6 +4106,12 @@ mod tests {
             temporary_name: publication.temporary_name().to_owned(),
             parent_identity: publication.parent_identity(),
             generation,
+            profile_governed_roots,
+            selected_profile_anchor_path,
+            selected_profile_anchor_identity: FileIdentity {
+                volume_serial_number: 11,
+                file_index: 404,
+            },
             manifest_digest: PlatformHandle::new(manifest.canonical_digest()).expect("manifest"),
             evidence_digest,
             precommit_digest,

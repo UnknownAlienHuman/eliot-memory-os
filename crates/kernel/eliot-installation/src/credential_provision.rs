@@ -1,4 +1,4 @@
-//! Secret-free durable contract for `LocalService` Store credential provisioning.
+//! Secret-free durable contract for profile-scoped Store credential provisioning.
 
 use eliot_contracts::ResourceGeneration;
 use eliot_ipc::TransportError;
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentBridgePhaseBBinding, AgentBridgePreparedBinding, AgentBridgeSourceMaterializationPlan,
-    InstallationError, handle, handles, sha256_handle, sha256_hex,
+    InstallationError, InstallationProfile, handle, handles, sha256_handle, sha256_hex,
 };
 
 /// Stable one-shot Host credential-control wire.
@@ -531,6 +531,85 @@ pub const HOST_CREDENTIAL_CONTROL_PIPE: &str = r"\\.\pipe\eliot-host-store-crede
 /// Exact Windows SID of the built-in `LocalService` principal.
 pub const LOCAL_SERVICE_SID: &str = "S-1-5-19";
 
+/// Derives the one profile-, installation-, and principal-scoped current-user credential
+/// control pipe name shared by the CLI client and current-user Host server.
+///
+/// The digest makes the endpoint bounded and prevents raw installation or SID
+/// text from becoming a pipe name. The pipe name grants no authority; Host
+/// still authenticates the connecting process and independently checks its
+/// selected transaction and current token.
+///
+/// # Errors
+/// Returns an installation error when the installation identity or current
+/// user SID is invalid, or the endpoint cannot be represented.
+pub fn current_user_credential_control_pipe(
+    profile: InstallationProfile,
+    installation_id: &PlatformHandle,
+    owner_sid: &PlatformHandle,
+) -> Result<String, InstallationError> {
+    let profile_label = match profile {
+        InstallationProfile::UserMode => "user-mode",
+        InstallationProfile::PortableDev => "portable-dev",
+        InstallationProfile::SystemService => {
+            return Err(InstallationError::ProfileViolation(
+                "current-user credential control does not admit SystemService".to_owned(),
+            ));
+        }
+    };
+    handle(
+        installation_id,
+        "current_user_credential_pipe.installation_id",
+    )?;
+    handle(owner_sid, "current_user_credential_pipe.owner_sid")?;
+    if !valid_current_user_sid(owner_sid.as_str()) {
+        return Err(InstallationError::ProfileViolation(
+            "current-user credential control requires a current-user SID".to_owned(),
+        ));
+    }
+    let digest = digest_json(
+        &(
+            "eliot.host.current-user-store-credential.v1",
+            profile_label,
+            installation_id.as_str(),
+            owner_sid.as_str(),
+        ),
+        "current_user_credential_pipe.binding_digest",
+    )?;
+    let endpoint = format!(
+        r"\\.\pipe\eliot-host-current-user-store-credential-v1-{profile_label}-{}",
+        &digest.as_str()[..32]
+    );
+    if endpoint.encode_utf16().count() > 240 {
+        return Err(InstallationError::InvalidField {
+            field: "current_user_credential_pipe".to_owned(),
+            reason: "derived endpoint exceeds the bounded pipe name".to_owned(),
+        });
+    }
+    Ok(endpoint)
+}
+
+pub(super) fn valid_current_user_sid(value: &str) -> bool {
+    let components = value.split('-').collect::<Vec<_>>();
+    let (Some("S"), Some("1"), Some(authority), subauthorities) = (
+        components.first().copied(),
+        components.get(1).copied(),
+        components.get(2).copied(),
+        components.get(3..).unwrap_or_default(),
+    ) else {
+        return false;
+    };
+    let is_user_authority = (authority == "5" && subauthorities.first() == Some(&"21"))
+        || (authority == "12" && subauthorities.first() == Some(&"1"));
+    is_user_authority
+        && subauthorities.len() >= 5
+        && components.iter().skip(1).all(|component| {
+            !component.is_empty()
+                && (component == &"0" || !component.starts_with('0'))
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+                && component.parse::<u32>().is_ok()
+        })
+}
+
 /// Validates the one canonical Credential Manager target admitted for Store.
 ///
 /// The target is an opaque `PlatformHandle` at the wire boundary, but its
@@ -702,6 +781,8 @@ pub enum StoreCredentialProvider {
 pub enum StoreCredentialScope {
     /// The built-in `LocalService` account (`S-1-5-19`).
     LocalService,
+    /// The exact interactive account selected for a `UserMode` installation.
+    CurrentUser,
 }
 
 /// Immutable Store credential effect payload retained by the installation plan.
@@ -710,8 +791,10 @@ pub enum StoreCredentialScope {
 pub struct StoreCredentialProvisionPlan {
     /// Exact protected Host state root containing the non-secret ownership marker.
     pub host_state_root: PlatformHandle,
-    /// Exact canonical `EliotHost` executable registered with SCM.
+    /// Exact approved `EliotHost` executable for the selected profile.
     pub expected_host_executable: PlatformHandle,
+    /// SHA-256 of the exact approved Host image, independently bound from its path.
+    pub expected_host_executable_sha256: PlatformHandle,
     /// Unpredictable Credential Manager target; never credential bytes.
     ///
     /// It must remain unavailable to other `LocalService` processes until the
@@ -757,6 +840,10 @@ impl StoreCredentialProvisionPlan {
                 reason: "must be an absolute canonical path".to_owned(),
             });
         }
+        sha256_handle(
+            &self.expected_host_executable_sha256,
+            "credential.expected_host_executable_sha256",
+        )?;
         handle(&self.target, "credential.target")?;
         if let Err(reason) = validate_store_credential_target(self.target.as_str()) {
             return Err(InstallationError::InvalidField {
@@ -799,10 +886,22 @@ impl StoreCredentialProvisionPlan {
             &self.expected_principal_sid,
             "credential.expected_principal_sid",
         )?;
-        if self.expected_principal_sid.as_str() != LOCAL_SERVICE_SID {
-            return Err(InstallationError::ProfileViolation(
-                "Store credential provisioning requires exact LocalService SID S-1-5-19".to_owned(),
-            ));
+        match self.scope {
+            StoreCredentialScope::LocalService
+                if self.expected_principal_sid.as_str() != LOCAL_SERVICE_SID =>
+            {
+                return Err(InstallationError::ProfileViolation(
+                    "LocalService Store credential requires exact SID S-1-5-19".to_owned(),
+                ));
+            }
+            StoreCredentialScope::CurrentUser
+                if !valid_current_user_sid(self.expected_principal_sid.as_str()) =>
+            {
+                return Err(InstallationError::ProfileViolation(
+                    "UserMode Store credential requires a current-user SID".to_owned(),
+                ));
+            }
+            StoreCredentialScope::LocalService | StoreCredentialScope::CurrentUser => {}
         }
         sha256_handle(&self.config_digest, "credential.config_digest")
     }
@@ -828,7 +927,7 @@ pub struct CredentialOwnershipMarkerIdentity {
 pub struct StoreCredentialAbsentSnapshot {
     /// Exact durable Host owner epoch serving the control endpoint.
     pub host_owner_epoch: PlatformHandle,
-    /// Exact live SCM Host PID/start/image identity digest.
+    /// Exact live Host PID/start/image identity digest.
     pub host_process_identity: PlatformHandle,
     /// Retained identity of the protected Host state root.
     pub host_state_root: CredentialOwnershipMarkerIdentity,
@@ -885,7 +984,7 @@ impl CredentialOwnershipMarkerIdentity {
     }
 }
 
-/// Durable lifecycle of one `LocalService` credential plus its ownership marker.
+/// Durable lifecycle of one scoped credential plus its ownership marker.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StoreCredentialLifecycle {
@@ -910,7 +1009,7 @@ impl StoreCredentialLifecycle {
     }
 }
 
-/// Secret-free receipt issued by the exact authenticated `LocalService` Host.
+/// Secret-free receipt issued by the exact authenticated profile Host.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialAccessReceipt {
@@ -926,13 +1025,13 @@ pub struct CredentialAccessReceipt {
     pub target: PlatformHandle,
     /// Exact provider.
     pub provider: StoreCredentialProvider,
-    /// Exact `LocalService` scope.
+    /// Exact profile principal scope.
     pub scope: StoreCredentialScope,
-    /// Exact `LocalService` SID observed by Host.
+    /// Exact scoped SID independently observed by Host.
     pub principal_sid: PlatformHandle,
     /// Durable Host owner epoch which served the one-shot request.
     pub host_owner_epoch: PlatformHandle,
-    /// Exact live SCM Host PID/start/image identity digest.
+    /// Exact live Host PID/start/image identity digest.
     pub host_process_identity: PlatformHandle,
     /// Exact create-new marker identity.
     pub marker: CredentialOwnershipMarkerIdentity,
@@ -958,15 +1057,22 @@ impl CredentialAccessReceipt {
                 "credential receipt provider is not Windows Credential Manager".to_owned(),
             ));
         }
-        if self.scope != StoreCredentialScope::LocalService {
-            return Err(InstallationError::ProfileViolation(
-                "credential receipt scope is not LocalService".to_owned(),
-            ));
-        }
-        if self.principal_sid.as_str() != LOCAL_SERVICE_SID {
-            return Err(InstallationError::ProfileViolation(
-                "credential receipt principal is not LocalService".to_owned(),
-            ));
+        match self.scope {
+            StoreCredentialScope::LocalService
+                if self.principal_sid.as_str() != LOCAL_SERVICE_SID =>
+            {
+                return Err(InstallationError::ProfileViolation(
+                    "LocalService credential receipt principal is not S-1-5-19".to_owned(),
+                ));
+            }
+            StoreCredentialScope::CurrentUser
+                if !valid_current_user_sid(self.principal_sid.as_str()) =>
+            {
+                return Err(InstallationError::ProfileViolation(
+                    "UserMode credential receipt principal is not a current-user SID".to_owned(),
+                ));
+            }
+            StoreCredentialScope::LocalService | StoreCredentialScope::CurrentUser => {}
         }
         handle(
             &self.host_owner_epoch,
@@ -1744,6 +1850,7 @@ mod tests {
                 scope: StoreCredentialScope::LocalService,
                 expected_principal_sid: handle(LOCAL_SERVICE_SID),
                 expected_host_executable: handle(r"C:\\eliot-host.exe"),
+                expected_host_executable_sha256: handle("d".repeat(64)),
                 host_state_root: handle(r"C:\\eliot-host"),
             },
             handle("c".repeat(64)),

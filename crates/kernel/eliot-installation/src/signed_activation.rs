@@ -599,6 +599,30 @@ impl RedbInstallationRegistry {
         {
             return Ok(false);
         }
+        let original_receipt_matches = match transaction.profile {
+            super::InstallationProfile::SystemService => {
+                let receipt = transaction
+                    .system_service_host_root_receipt()
+                    .ok_or_else(|| InstallationError::MigrationRequired {
+                        reason: "SystemService transaction has no original Host-root receipt for pending replay"
+                            .to_owned(),
+                    })?;
+                registry.system_service_host_root_receipt() == Some(receipt)
+            }
+            super::InstallationProfile::UserMode | super::InstallationProfile::PortableDev => {
+                let receipt = transaction.profile_selection_receipt().ok_or_else(|| {
+                    InstallationError::MigrationRequired {
+                        reason: "UserMode/PortableDev transaction has no original profile selection receipt for pending replay"
+                            .to_owned(),
+                    }
+                })?;
+                registry.profile_selection_receipt_for_generation(&pending.manifest.generation)?
+                    == receipt
+            }
+        };
+        if !original_receipt_matches {
+            return Ok(false);
+        }
         let approvals = transaction.service_registration_approvals()?;
         Ok(approvals.iter().all(|expected| {
             registry.service_registration_approval(&expected.generation, expected.role)

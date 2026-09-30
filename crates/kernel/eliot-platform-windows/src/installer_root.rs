@@ -118,74 +118,102 @@ impl WindowsInstallerRootExecutor {
         &self,
         request: &InstallerRootRequest,
     ) -> Result<(), InstallerRootError> {
-        if request.root.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        }) || request.installation_root.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        }) || request.profile_anchor.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        }) {
-            return Err(InstallerRootError::InvalidPath);
-        }
-        let expected_contour = match request.profile {
-            InstallerRootProfile::SystemService | InstallerRootProfile::UserMode => {
-                let profile_base = self.profile_base(request.profile)?;
-                if !windows_paths_equal(&request.profile_anchor, &profile_base) {
-                    return Err(InstallerRootError::InvalidPath);
-                }
-                let expected = profile_base.join("Eliot");
-                let installations = expected.join("installations");
-                let installation_parent = request.installation_root.parent();
-                let installation_key = request
-                    .installation_root
-                    .file_name()
-                    .and_then(|name| name.to_str());
-                if installation_parent
-                    .is_none_or(|parent| !windows_paths_equal(parent, &installations))
-                    || installation_key.is_none_or(|key| {
-                        key.len() != 64
-                            || !key
-                                .bytes()
-                                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-                    })
-                    || !windows_path_is_within(&request.root, &expected)
-                {
-                    return Err(InstallerRootError::InvalidPath);
-                }
-                let root_is_profile = windows_paths_equal(&request.root, &expected);
-                let root_is_installations = windows_paths_equal(&request.root, &installations);
-                let packages = expected.join("packages");
-                let root_is_packages = windows_paths_equal(&request.root, &packages);
-                if !root_is_profile
-                    && !root_is_installations
-                    && !root_is_packages
-                    && !windows_path_is_within(&request.root, &request.installation_root)
-                {
-                    return Err(InstallerRootError::InvalidPath);
-                }
-                expected
+        validate_path_components(request)?;
+        match request.profile {
+            InstallerRootProfile::SystemService => {
+                self.validate_system_service_profile_path(request)?;
+            }
+            InstallerRootProfile::UserMode => {
+                self.validate_user_mode_profile_path(request)?;
             }
             InstallerRootProfile::PortableDev => {
-                if !windows_path_is_within(&request.installation_root, &request.profile_anchor) {
-                    return Err(InstallerRootError::InvalidPath);
-                }
-                request.installation_root.clone()
+                self.validate_portable_dev_profile_path(request)?;
             }
-        };
-        if !windows_path_is_within(&request.root, &expected_contour) {
-            return Err(InstallerRootError::InvalidPath);
         }
         validate_existing_ancestors(&request.root)?;
         validate_existing_ancestors(&request.installation_root)
+    }
+
+    fn validate_system_service_profile_path(
+        &self,
+        request: &InstallerRootRequest,
+    ) -> Result<(), InstallerRootError> {
+        let profile_base = self.profile_base(request.profile)?;
+        if !windows_paths_equal(&request.profile_anchor, &profile_base) {
+            return Err(InstallerRootError::InvalidPath);
+        }
+        let profile_root = profile_base.join("Eliot");
+        let installations = profile_root.join("installations");
+        validate_installation_directory(&request.installation_root, &installations)?;
+        let packages = profile_root.join("packages");
+        if !windows_paths_equal(&request.root, &profile_root)
+            && !windows_paths_equal(&request.root, &installations)
+            && !windows_paths_equal(&request.root, &packages)
+            && !windows_path_is_within(&request.root, &request.installation_root)
+        {
+            return Err(InstallerRootError::InvalidPath);
+        }
+        Ok(())
+    }
+
+    fn validate_user_mode_profile_path(
+        &self,
+        request: &InstallerRootRequest,
+    ) -> Result<(), InstallerRootError> {
+        let profile_base = self.profile_base(request.profile)?;
+        if !windows_paths_equal(&request.profile_anchor, &profile_base) {
+            return Err(InstallerRootError::InvalidPath);
+        }
+        let profile_root = profile_base.join("Eliot");
+        let data_root = profile_root.join("data");
+        let installations = data_root.join("installations");
+        validate_installation_directory(&request.installation_root, &installations)?;
+        let packages = profile_root.join("packages");
+        let user_config = profile_root.join("config");
+        let user_cache = profile_root.join("cache");
+        let immutable_artifacts = profile_base.join("Programs").join("Eliot");
+        if !windows_paths_equal(&request.root, &profile_root)
+            && !windows_paths_equal(&request.root, &packages)
+            && !windows_paths_equal(&request.root, &data_root)
+            && !windows_paths_equal(&request.root, &installations)
+            && !windows_paths_equal(&request.root, &user_config)
+            && !windows_paths_equal(&request.root, &user_cache)
+            && !windows_path_is_within(&request.root, &request.installation_root)
+            && !windows_path_is_within(&request.root, &immutable_artifacts)
+        {
+            return Err(InstallerRootError::InvalidPath);
+        }
+        Ok(())
+    }
+
+    fn validate_portable_dev_profile_path(
+        &self,
+        request: &InstallerRootRequest,
+    ) -> Result<(), InstallerRootError> {
+        let repository = self.profile_base(request.profile)?;
+        if !windows_paths_equal(&request.profile_anchor, &repository)
+            || !windows_paths_equal(
+                &request.installation_root,
+                &repository.join(".eliot-dev").join("state"),
+            )
+        {
+            return Err(InstallerRootError::InvalidPath);
+        }
+        let profile_root = repository.join(".eliot-dev");
+        let user_config = profile_root.join("config");
+        let user_cache = profile_root.join("cache");
+        let build_root = repository.join("target");
+        let immutable_parent = repository.join("target").join("eliot-dev");
+        if !windows_paths_equal(&request.root, &profile_root)
+            && !windows_path_is_within(&request.root, &request.installation_root)
+            && !windows_paths_equal(&request.root, &user_config)
+            && !windows_paths_equal(&request.root, &user_cache)
+            && !windows_paths_equal(&request.root, &build_root)
+            && !windows_paths_equal(&request.root, &immutable_parent)
+        {
+            return Err(InstallerRootError::InvalidPath);
+        }
+        Ok(())
     }
 
     fn profile_base(&self, profile: InstallerRootProfile) -> Result<PathBuf, InstallerRootError> {
@@ -210,6 +238,43 @@ impl WindowsInstallerRootExecutor {
         }
         token_is_elevated()
     }
+}
+
+fn validate_path_components(request: &InstallerRootRequest) -> Result<(), InstallerRootError> {
+    let has_dot_component = |path: &std::path::Path| {
+        path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    };
+    if has_dot_component(&request.root)
+        || has_dot_component(&request.installation_root)
+        || has_dot_component(&request.profile_anchor)
+    {
+        return Err(InstallerRootError::InvalidPath);
+    }
+    Ok(())
+}
+
+fn validate_installation_directory(
+    installation_root: &std::path::Path,
+    installations: &std::path::Path,
+) -> Result<(), InstallerRootError> {
+    let installation_parent = installation_root.parent();
+    let installation_key = installation_root.file_name().and_then(|name| name.to_str());
+    if installation_parent.is_none_or(|parent| !windows_paths_equal(parent, installations))
+        || installation_key.is_none_or(|key| {
+            key.len() != 64
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+    {
+        return Err(InstallerRootError::InvalidPath);
+    }
+    Ok(())
 }
 
 /// Receipt-agnostic Windows filesystem primitive.

@@ -12,6 +12,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use eliot_platform_windows::profile_supervision::{
+    CurrentUserTaskReceipt, ProfileSelectionReceipt,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -20,12 +23,12 @@ use super::{
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt, HostPhaseBPreparedReceipt,
     HostPhaseBStaticTemplate, INSTALLATION_REGISTRY_WIRE_VERSION, InstallationActivationApproval,
     InstallationActivationApprovalBinding, InstallationActivationProjectionIntent,
-    InstallationError, InstallationProfile, InstallationTransaction,
+    CurrentUserTaskRunIntent, InstallationError, InstallationProfile, InstallationTransaction,
     InstallerServiceRegistrationApproval, InstallerServiceRole, PHASE_B_PENDING_MARKER,
     PHASE_B_PENDING_SCM_DIGEST, PlatformAgentBridgeSecurityConvergenceReceipt,
     PlatformAgentBridgeStagePrepared, PlatformAgentBridgeStagingReceipt, PlatformHandle,
     ProvisionedSupervisionAuthority, ResourceGeneration, RuntimeLaunchDescriptor, StateFence,
-    canonical_json_bytes, handle, sha256_handle, sha256_hex, text,
+    SystemServiceHostRootReceipt, canonical_json_bytes, handle, sha256_handle, sha256_hex, text,
 };
 
 #[cfg(test)]
@@ -122,6 +125,13 @@ pub struct ApprovedGeneration {
     pub active: bool,
     /// Whether this generation is the last-known-good activation.
     pub last_known_good: bool,
+    /// Original no-follow current-user selection of this generation's roots.
+    ///
+    /// This is present only for `UserMode` and `PortableDev`. A projected
+    /// generation without this receipt requires explicit migration/recovery
+    /// because its original file-object identity cannot be recovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_selection_receipt: Option<ProfileSelectionReceipt>,
 }
 
 /// Durable provider-neutral proof that an auxiliary Agent Bridge stage was
@@ -2556,7 +2566,371 @@ impl ApprovedGeneration {
     pub fn validate(&self) -> Result<(), InstallationError> {
         self.manifest.validate()?;
         self.approval.validate()?;
-        validate_approval_against_manifest(&self.approval, &self.manifest, "approved_generation")
+        validate_approval_against_manifest(&self.approval, &self.manifest, "approved_generation")?;
+        let profile_selection_receipt = match self.manifest.runtime_launch.profile {
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                Some(self.profile_selection_receipt.as_ref().ok_or_else(|| {
+                    InstallationError::MigrationRequired {
+                        reason: "projected UserMode/PortableDev generation has no unambiguous original profile selection receipt"
+                            .to_owned(),
+                    }
+                })?)
+            }
+            InstallationProfile::SystemService => self.profile_selection_receipt.as_ref(),
+        };
+        if let Some(receipt) = profile_selection_receipt {
+            self.manifest
+                .runtime_launch
+                .profile_governed_roots
+                .validate_profile_selection_receipt(&self.manifest.runtime_launch, receipt)?;
+        }
+        Ok(())
+    }
+}
+
+/// Exact retained registration and one-shot `RunEx` intent for a `UserMode`
+/// Host task. This is an intent projection only; it does not prove that Task
+/// Scheduler accepted `RunEx` or that the Host became ready.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeTaskRunIntentProjection {
+    /// Exact current-user Task Scheduler registration receipt, including the
+    /// original profile-selection receipt and operation IDs from its request.
+    pub task_receipt: CurrentUserTaskReceipt,
+    /// Exact one-shot `RunEx` request committed by the installation
+    /// transaction before calling Task Scheduler.
+    pub run_intent: CurrentUserTaskRunIntent,
+}
+
+impl UserModeTaskRunIntentProjection {
+    /// Returns the transaction ID retained by the original task request.
+    #[must_use]
+    pub fn transaction_id(&self) -> &str {
+        &self.task_receipt.request.transaction_id
+    }
+
+    /// Returns the effect ID retained by the original task request.
+    #[must_use]
+    pub fn effect_id(&self) -> &str {
+        &self.task_receipt.request.effect_id
+    }
+
+    /// Validates the exact task receipt and one-shot run-intent bindings.
+    ///
+    /// # Errors
+    /// Returns `IdentityConflict` or a typed invalid-field error when the
+    /// registration, request digest, original selection, or run intent differs.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "task receipt, original selection, and RunEx intent form one identity boundary"
+    )]
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        let receipt = &self.task_receipt;
+        let request = &receipt.request;
+        let selection = &receipt.selection;
+        let roots = &request.roots;
+        let transaction_id = PlatformHandle::new(request.transaction_id.as_str()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_mode_task_run.intent.transaction_id".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let effect_id = PlatformHandle::new(request.effect_id.as_str()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_mode_task_run.intent.effect_id".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        handle(&transaction_id, "user_mode_task_run.intent.transaction_id")?;
+        handle(&effect_id, "user_mode_task_run.intent.effect_id")?;
+        text(&receipt.task_name, "user_mode_task_run.task_receipt.task_name")?;
+        text(&receipt.sid, "user_mode_task_run.task_receipt.sid")?;
+        text(
+            &request.executable_sha256,
+            "user_mode_task_run.task_request.executable_sha256",
+        )?;
+        text(
+            &receipt.executable_sha256,
+            "user_mode_task_run.task_receipt.executable_sha256",
+        )?;
+        let executable_digest =
+            PlatformHandle::new(request.executable_sha256.as_str()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "user_mode_task_run.task_request.executable_sha256".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+        sha256_handle(
+            &executable_digest,
+            "user_mode_task_run.task_request.executable_sha256",
+        )?;
+        text(
+            &receipt.task_xml_sha256,
+            "user_mode_task_run.task_receipt.task_xml_sha256",
+        )?;
+        let request_digest = PlatformHandle::new(receipt.request_digest.as_str()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_mode_task_run.task_receipt.request_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let task_xml_digest = PlatformHandle::new(receipt.task_xml_sha256.as_str()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_mode_task_run.task_receipt.task_xml_sha256".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        sha256_handle(
+            &request_digest,
+            "user_mode_task_run.task_receipt.request_digest",
+        )?;
+        sha256_handle(
+            &task_xml_digest,
+            "user_mode_task_run.task_receipt.task_xml_sha256",
+        )?;
+        let recomputed_request_digest = request
+            .request_digest()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "user_mode_task_run.task_request".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if recomputed_request_digest != receipt.request_digest
+            || self.run_intent.request_digest != request_digest
+            || self.run_intent.task_name != receipt.task_name
+            || self.run_intent.sid != receipt.sid
+            || self.run_intent.session_id == 0
+            || self.run_intent.task_xml_sha256 != task_xml_digest
+            || receipt.sid != selection.owner_sid
+            || receipt.session_id != selection.session_id
+            || selection.profile != super::ProfileSelection::UserMode
+            || roots.profile != selection.profile
+            || roots.installation_id != selection.installation_id
+            || roots.installation_key != selection.installation_key
+            || roots.component != selection.component
+            || roots.version != selection.version
+            || roots.generation != selection.generation
+            || !eliot_platform_windows::windows_paths_equal(
+                &roots.authority_descriptor_path,
+                &selection.authority_descriptor_path,
+            )
+            || roots.authority_descriptor_sha256 != selection.authority_descriptor_sha256
+            || roots.authority_generation != selection.authority_generation
+            || !eliot_platform_windows::windows_paths_equal(
+                &request.executable,
+                &receipt.executable,
+            )
+            || request.executable_sha256 != receipt.executable_sha256
+            || !eliot_platform_windows::windows_paths_equal(
+                &request.working_directory,
+                &receipt.working_directory,
+            )
+            || request.bootstrap_arguments != receipt.arguments
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Inert process and kernel-readiness evidence copied from Host's validated
+/// authenticated readiness handshake. The launch markers bind the evidence
+/// to the exact staged `UserMode` operation; these fields do not represent a
+/// Task Scheduler engine PID.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeTaskRunHostReadinessEvidence {
+    /// Transaction ID parsed from the Host process's `RunEx` dynamic arguments.
+    pub launch_transaction_id: String,
+    /// Effect ID parsed from the Host process's `RunEx` dynamic arguments.
+    pub launch_effect_id: String,
+    /// PID of the Host process proven by the readiness handshake.
+    pub host_process_id: u32,
+    /// Host process start time in Windows 100-nanosecond units.
+    pub host_process_start_time_100ns: u64,
+    /// Executable path bound by the authenticated candidate handshake.
+    pub host_process_image_path: String,
+    /// Activation identity echoed by the authenticated readiness handshake.
+    pub activation_id: PlatformHandle,
+    /// Kernel activation operation identity echoed by the readiness receipt.
+    pub activation_operation_id: PlatformHandle,
+    /// Kernel process identity observed at readiness.
+    pub kernel_process_id: PlatformHandle,
+    /// Kernel Job Object identity observed at readiness.
+    pub kernel_job_object_id: PlatformHandle,
+    /// Process-observation evidence references, preserved in source order.
+    pub kernel_process_evidence_refs: Vec<PlatformHandle>,
+    /// Kernel-ready receipt evidence references, preserved in source order.
+    pub kernel_ready_evidence_refs: Vec<PlatformHandle>,
+}
+
+impl UserModeTaskRunHostReadinessEvidence {
+    fn validate(&self) -> Result<(), InstallationError> {
+        let transaction_id = PlatformHandle::new(self.launch_transaction_id.as_str()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_mode_task_run.host_ack.launch_transaction_id".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let effect_id = PlatformHandle::new(self.launch_effect_id.as_str()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_mode_task_run.host_ack.launch_effect_id".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        handle(
+            &transaction_id,
+            "user_mode_task_run.host_ack.launch_transaction_id",
+        )?;
+        handle(&effect_id, "user_mode_task_run.host_ack.launch_effect_id")?;
+        text(
+            &self.host_process_image_path,
+            "user_mode_task_run.host_ack.host_process_image_path",
+        )?;
+        if self.host_process_id == 0
+            || self.host_process_start_time_100ns == 0
+            || self.kernel_process_evidence_refs.is_empty()
+            || self.kernel_ready_evidence_refs.is_empty()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        for (value, field) in [
+            (&self.activation_id, "activation_id"),
+            (&self.activation_operation_id, "activation_operation_id"),
+            (&self.kernel_process_id, "kernel_process_id"),
+            (&self.kernel_job_object_id, "kernel_job_object_id"),
+        ] {
+            handle(value, &format!("user_mode_task_run.host_ack.{field}"))?;
+        }
+        for (values, field) in [
+            (
+                &self.kernel_process_evidence_refs,
+                "kernel_process_evidence_refs",
+            ),
+            (
+                &self.kernel_ready_evidence_refs,
+                "kernel_ready_evidence_refs",
+            ),
+        ] {
+            for value in values {
+                handle(value, &format!("user_mode_task_run.host_ack.{field}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact Host readiness acknowledgement for one staged `UserMode` task run.
+/// It proves readiness for the embedded transaction/effect identity and does
+/// not substitute for a Task Scheduler `RunEx` acceptance receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeTaskRunHostAck {
+    /// The complete intent to which this readiness evidence is bound.
+    pub intent: UserModeTaskRunIntentProjection,
+    /// Authenticated Host process and kernel readiness evidence.
+    pub evidence: UserModeTaskRunHostReadinessEvidence,
+}
+
+impl UserModeTaskRunHostAck {
+    /// Validates that Host's launch markers and image path bind to this exact
+    /// task-run intent. Registry acknowledgement additionally checks current
+    /// active-generation and Host-owner authority.
+    ///
+    /// # Errors
+    /// Returns `IdentityConflict` or a typed invalid-field error when the
+    /// acknowledgement does not bind to the embedded intent.
+    pub(crate) fn validate(&self) -> Result<(), InstallationError> {
+        self.intent.validate()?;
+        self.evidence.validate()?;
+        if self.evidence.launch_transaction_id != self.intent.transaction_id()
+            || self.evidence.launch_effect_id != self.intent.effect_id()
+            || !eliot_platform_windows::windows_paths_equal(
+                Path::new(&self.evidence.host_process_image_path),
+                &self.intent.task_receipt.executable,
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Durable state of the single current `UserMode` task-run projection.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserModeTaskRunRecordState {
+    /// The exact transaction/effect intent was staged before calling `RunEx`.
+    /// Task Scheduler acceptance and Host readiness remain unresolved.
+    IntentStaged,
+    /// Host acknowledged readiness for this exact dynamic launch identity.
+    HostReadinessAcknowledged,
+}
+
+/// The latest durable operation-bound `UserMode` task-run projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeTaskRunRecord {
+    state: UserModeTaskRunRecordState,
+    intent: UserModeTaskRunIntentProjection,
+    host_ack: Option<UserModeTaskRunHostAck>,
+}
+
+impl UserModeTaskRunRecord {
+    pub(crate) fn staged(intent: UserModeTaskRunIntentProjection) -> Self {
+        Self {
+            state: UserModeTaskRunRecordState::IntentStaged,
+            intent,
+            host_ack: None,
+        }
+    }
+
+    pub(crate) fn acknowledge(&mut self, ack: UserModeTaskRunHostAck) -> Result<(), InstallationError> {
+        ack.validate()?;
+        if ack.intent != self.intent {
+            return Err(InstallationError::IdentityConflict);
+        }
+        match self.host_ack.as_ref() {
+            Some(existing) if existing == &ack => Ok(()),
+            Some(_) => Err(InstallationError::IdentityConflict),
+            None => {
+                self.host_ack = Some(ack);
+                self.state = UserModeTaskRunRecordState::HostReadinessAcknowledged;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), InstallationError> {
+        self.intent.validate()?;
+        if let Some(ack) = self.host_ack.as_ref() {
+            ack.validate()?;
+            if ack.intent != self.intent
+                || self.state != UserModeTaskRunRecordState::HostReadinessAcknowledged
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        } else if self.state != UserModeTaskRunRecordState::IntentStaged {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Returns the explicit durable record state.
+    #[must_use]
+    pub const fn state(&self) -> UserModeTaskRunRecordState {
+        self.state
+    }
+
+    /// Returns the exact transaction-owned task and `RunEx` intent.
+    #[must_use]
+    pub const fn intent(&self) -> &UserModeTaskRunIntentProjection {
+        &self.intent
+    }
+
+    /// Returns Host's exact readiness acknowledgement, if one was committed.
+    #[must_use]
+    pub const fn host_ack(&self) -> Option<&UserModeTaskRunHostAck> {
+        self.host_ack.as_ref()
     }
 }
 
@@ -2613,6 +2987,11 @@ pub(crate) fn validate_approval_against_manifest(
 pub struct ApprovedGenerationRegistry {
     /// Mandatory durable wire discriminator.
     pub(crate) registry_wire_version: ContractVersion,
+    /// In-memory source-wire provenance for v17/v18 projection identity
+    /// checks. It is intentionally absent from the durable v19 wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) legacy_registry_identity_version: Option<(ContractVersion, u64)>,
     /// Monotonic CAS revision of this registry projection.
     pub(crate) revision: u64,
     /// Approved generations keyed by their exact generation identity.
@@ -2635,6 +3014,10 @@ pub struct ApprovedGenerationRegistry {
     /// pending activation.  A new stage supersedes this single terminal
     /// receipt.
     pub(crate) last_terminal_activation: Option<PendingActivationTerminal>,
+    /// Original `SystemService` Host-state root object identity for this
+    /// installation. It is shared by all generations and never reselected
+    /// from a path during registry reopen.
+    pub(crate) system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
     /// Operation-bound abort receipts retained across later staging. The
     /// one-slot terminal remains a fast idempotency view; this history is the
     /// crash-recovery owner for an earlier transaction.
@@ -2649,13 +3032,15 @@ pub struct ApprovedGenerationRegistry {
     /// `skip_serializing_if` is the wire-compatibility mechanism, not an
     /// optimization.  `registry_projection_identity` is a SHA-256 over the
     /// whole serialized registry and is compared against already-staged
-    /// activation intents, so a registry that has never cut over must keep
-    /// serializing byte-identically to the pre-#2737 shape.  Omitting the
-    /// member when it is absent is what preserves that identity; `default`
-    /// lets a pre-#2737 registry decode as `None` without bumping
-    /// `INSTALLATION_REGISTRY_WIRE_VERSION`.
+    /// activation intents, so older registry versions keep their exact
+    /// projection identity during decode. Omitting the member when it is
+    /// absent preserves the pre-#2737 shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) committed_cutover_activation: Option<CommittedCutoverActivation>,
+    /// Exact `UserMode` current-user task registration and one-shot `RunEx`
+    /// projection. This is mandatory on the v19 wire (explicit `null` when no
+    /// task run is projected).
+    pub(crate) user_mode_task_run_record: Option<UserModeTaskRunRecord>,
 }
 
 impl Default for ApprovedGenerationRegistry {
@@ -2667,7 +3052,23 @@ impl Default for ApprovedGenerationRegistry {
 pub(crate) fn registry_projection_identity(
     registry: &ApprovedGenerationRegistry,
 ) -> Result<PlatformHandle, InstallationError> {
-    let bytes = serde_json::to_vec(registry).map_err(|error| InstallationError::InvalidField {
+    let legacy_identity = registry
+        .legacy_registry_identity_version
+        .filter(|(_, source_revision)| *source_revision == registry.revision);
+    let bytes = match legacy_identity.map(|(version, _)| version.major) {
+        Some(17) if registry.system_service_host_root_receipt.is_none() => {
+            serde_json::to_vec(&LegacyRegistryProjectionIdentityV17::new(
+                registry,
+                ContractVersion::new(17, 0, 0),
+            ))
+        }
+        Some(18) => serde_json::to_vec(&LegacyRegistryProjectionIdentityV18::new(
+            registry,
+            ContractVersion::new(18, 0, 0),
+        )),
+        _ => serde_json::to_vec(registry),
+    }
+    .map_err(|error| InstallationError::InvalidField {
         field: "activation_projection.registry_identity".to_owned(),
         reason: error.to_string(),
     })?;
@@ -2675,6 +3076,146 @@ pub(crate) fn registry_projection_identity(
         field: "activation_projection.registry_identity".to_owned(),
         reason: error.to_string(),
     })
+}
+
+impl ApprovedGenerationRegistry {
+    pub(crate) fn matches_legacy_registry_identity_shape(
+        &self,
+        source: &serde_json::Value,
+    ) -> Result<bool, InstallationError> {
+        let Some((version, source_revision)) = self.legacy_registry_identity_version else {
+            return Ok(false);
+        };
+        if source_revision != self.revision {
+            return Ok(false);
+        }
+        let projected = match version.major {
+            17 if self.system_service_host_root_receipt.is_none() => {
+                serde_json::to_value(LegacyRegistryProjectionIdentityV17::new(self, version))
+            }
+            18 => serde_json::to_value(LegacyRegistryProjectionIdentityV18::new(self, version)),
+            _ => return Ok(false),
+        }
+        .map_err(|error| InstallationError::InvalidField {
+            field: "activation_projection.registry_identity".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let mut source = source.clone();
+        if version.major == 18
+            && let Some(object) = source.as_object_mut()
+        {
+            // Both members had explicit compatibility treatment in v18: the
+            // abort history defaulted to an empty collection, and the
+            // cutover receipt omitted the absent state.
+            object
+                .entry("aborted_activation_receipts")
+                .or_insert_with(|| serde_json::json!([]));
+            if object
+                .get("committed_cutover_activation")
+                .is_some_and(serde_json::Value::is_null)
+            {
+                object.remove("committed_cutover_activation");
+            }
+            if let Some(pending) = object
+                .get_mut("pending_activation")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for field in [
+                    "activation_intent_digest",
+                    "prior_active_generation",
+                    "phase_b_prepared_receipt",
+                ] {
+                    pending.entry(field).or_insert(serde_json::Value::Null);
+                }
+            }
+            if let Some(terminal) = object
+                .get_mut("last_terminal_activation")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                terminal
+                    .entry("abort_receipt")
+                    .or_insert(serde_json::Value::Null);
+            }
+        }
+        Ok(projected == source)
+    }
+}
+
+/// The v17 serialization shape used only when activation identity is checked
+/// against an in-memory registry decoded from v17. Re-emitting the exact prior
+/// field order keeps a transaction that pinned that U/P snapshot replayable
+/// after decode has normalized the durable model to v19.
+#[derive(Serialize)]
+struct LegacyRegistryProjectionIdentityV17<'a> {
+    registry_wire_version: ContractVersion,
+    revision: u64,
+    generations: &'a [ApprovedGeneration],
+    service_registration_approvals: &'a [InstallerServiceRegistrationApproval],
+    active_generation: &'a Option<PlatformHandle>,
+    last_known_good_generation: &'a Option<PlatformHandle>,
+    pending_activation: &'a Option<PendingActivation>,
+    last_terminal_activation: &'a Option<PendingActivationTerminal>,
+    aborted_activation_receipts: &'a [PendingActivationAbortReceipt],
+    active_phase_b_rebind: &'a Option<ActivePhaseBRebind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    committed_cutover_activation: Option<&'a CommittedCutoverActivation>,
+}
+
+impl<'a> LegacyRegistryProjectionIdentityV17<'a> {
+    fn new(registry: &'a ApprovedGenerationRegistry, version: ContractVersion) -> Self {
+        Self {
+            registry_wire_version: version,
+            revision: registry.revision,
+            generations: &registry.generations,
+            service_registration_approvals: &registry.service_registration_approvals,
+            active_generation: &registry.active_generation,
+            last_known_good_generation: &registry.last_known_good_generation,
+            pending_activation: &registry.pending_activation,
+            last_terminal_activation: &registry.last_terminal_activation,
+            aborted_activation_receipts: &registry.aborted_activation_receipts,
+            active_phase_b_rebind: &registry.active_phase_b_rebind,
+            committed_cutover_activation: registry.committed_cutover_activation.as_ref(),
+        }
+    }
+}
+
+/// The v18 serialization shape used to preserve the activation identity of a
+/// registry migrated in memory to v19. Its fields mirror the exact durable
+/// v18 projection and omit the v19 `UserMode` task-run member.
+#[derive(Serialize)]
+struct LegacyRegistryProjectionIdentityV18<'a> {
+    registry_wire_version: ContractVersion,
+    revision: u64,
+    generations: &'a [ApprovedGeneration],
+    service_registration_approvals: &'a [InstallerServiceRegistrationApproval],
+    active_generation: &'a Option<PlatformHandle>,
+    last_known_good_generation: &'a Option<PlatformHandle>,
+    pending_activation: &'a Option<PendingActivation>,
+    last_terminal_activation: &'a Option<PendingActivationTerminal>,
+    system_service_host_root_receipt: &'a Option<SystemServiceHostRootReceipt>,
+    aborted_activation_receipts: &'a [PendingActivationAbortReceipt],
+    active_phase_b_rebind: &'a Option<ActivePhaseBRebind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    committed_cutover_activation: Option<&'a CommittedCutoverActivation>,
+}
+
+impl<'a> LegacyRegistryProjectionIdentityV18<'a> {
+    fn new(registry: &'a ApprovedGenerationRegistry, version: ContractVersion) -> Self {
+        Self {
+            registry_wire_version: version,
+            revision: registry.revision,
+            generations: &registry.generations,
+            service_registration_approvals: &registry.service_registration_approvals,
+            active_generation: &registry.active_generation,
+            last_known_good_generation: &registry.last_known_good_generation,
+            pending_activation: &registry.pending_activation,
+            last_terminal_activation: &registry.last_terminal_activation,
+            system_service_host_root_receipt: &registry.system_service_host_root_receipt,
+            aborted_activation_receipts: &registry.aborted_activation_receipts,
+            active_phase_b_rebind: &registry.active_phase_b_rebind,
+            committed_cutover_activation: registry.committed_cutover_activation.as_ref(),
+        }
+    }
 }
 
 /// Operation-bound receipt for the cutover that performed the
@@ -2981,6 +3522,7 @@ impl ApprovedGenerationRegistry {
     pub const fn new() -> Self {
         Self {
             registry_wire_version: INSTALLATION_REGISTRY_WIRE_VERSION,
+            legacy_registry_identity_version: None,
             revision: 1,
             generations: Vec::new(),
             service_registration_approvals: Vec::new(),
@@ -2988,9 +3530,11 @@ impl ApprovedGenerationRegistry {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            system_service_host_root_receipt: None,
             aborted_activation_receipts: Vec::new(),
             active_phase_b_rebind: None,
             committed_cutover_activation: None,
+            user_mode_task_run_record: None,
         }
     }
 
@@ -3004,6 +3548,89 @@ impl ApprovedGenerationRegistry {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Returns the latest durable `UserMode` task-run projection, if present.
+    #[must_use]
+    pub const fn user_mode_task_run_record(&self) -> Option<&UserModeTaskRunRecord> {
+        self.user_mode_task_run_record.as_ref()
+    }
+
+    /// Validates an intent against the current active `UserMode` generation and
+    /// its exact original profile-selection receipt. Stage and ack call this
+    /// at their CAS boundary; ordinary registry validation permits an older
+    /// acknowledged record to remain as operation history after cutover.
+    pub(crate) fn validate_active_user_mode_task_run_intent(
+        &self,
+        intent: &UserModeTaskRunIntentProjection,
+    ) -> Result<&ApprovedGeneration, InstallationError> {
+        intent.validate()?;
+        let Some(active) = self.active() else {
+            return Err(InstallationError::IncompleteObservation(
+                "UserMode task run requires an active approved generation".to_owned(),
+            ));
+        };
+        let receipt = &intent.task_receipt;
+        let request = &receipt.request;
+        let selection = &receipt.selection;
+        let manifest = &active.manifest;
+        let runtime = &manifest.runtime_launch;
+        if runtime.profile != InstallationProfile::UserMode
+            || selection.generation != manifest.generation.as_str()
+            || request.roots.generation != manifest.generation.as_str()
+            || selection.installation_id != runtime.installation_epoch.installation.as_str()
+            || request.roots.installation_id != runtime.installation_epoch.installation.as_str()
+            || !eliot_platform_windows::windows_paths_equal(
+                &request.executable,
+                Path::new(manifest.host_executable_path.as_str()),
+            )
+            || !eliot_platform_windows::windows_paths_equal(
+                &request.executable,
+                Path::new(runtime.host_executable_path.as_str()),
+            )
+            || request.executable_sha256 != manifest.host_artifact_digest.as_str()
+            || request.executable_sha256 != runtime.host_artifact_digest.as_str()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let original_receipt = active.profile_selection_receipt.as_ref().ok_or_else(|| {
+            InstallationError::MigrationRequired {
+                reason: "active UserMode generation has no retained original profile-selection receipt"
+                    .to_owned(),
+            }
+        })?;
+        if original_receipt != selection {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(active)
+    }
+
+    /// Returns the original `SystemService` Host-state root identity retained by
+    /// this registry, when one has been bound.
+    #[must_use]
+    pub const fn system_service_host_root_receipt(&self) -> Option<&SystemServiceHostRootReceipt> {
+        self.system_service_host_root_receipt.as_ref()
+    }
+
+    /// Returns whether this registry has only the exact empty first-install
+    /// projection. This is used to admit a crash replay before its first
+    /// pending activation is projected; every other state requires its
+    /// persisted `SystemService` Host-root receipt.
+    #[must_use]
+    pub fn is_uninitialized_for_system_service_bootstrap(&self) -> bool {
+        self.registry_wire_version == INSTALLATION_REGISTRY_WIRE_VERSION
+            && self.revision == 1
+            && self.generations.is_empty()
+            && self.service_registration_approvals.is_empty()
+            && self.active_generation.is_none()
+            && self.last_known_good_generation.is_none()
+            && self.pending_activation.is_none()
+            && self.last_terminal_activation.is_none()
+            && self.system_service_host_root_receipt.is_none()
+            && self.aborted_activation_receipts.is_empty()
+            && self.active_phase_b_rebind.is_none()
+            && self.committed_cutover_activation.is_none()
+            && self.user_mode_task_run_record.is_none()
     }
 
     /// Returns the exact durable stage proof currently carried by Pending.
@@ -3080,6 +3707,7 @@ impl ApprovedGenerationRegistry {
             activation_fixture.approval.clone(),
             service_registration_approvals,
             activation_fixture.activation_intent_digest.clone(),
+            None,
         )
     }
 
@@ -3091,6 +3719,7 @@ impl ApprovedGenerationRegistry {
         approval: InstallationActivationApproval,
         service_registration_approvals: &[InstallerServiceRegistrationApproval],
         activation_intent_digest: PlatformHandle,
+        profile_selection_receipt: Option<ProfileSelectionReceipt>,
     ) -> Result<(), InstallationError> {
         self.validate()?;
         if self
@@ -3153,6 +3782,7 @@ impl ApprovedGenerationRegistry {
             approval: pending.approval.clone(),
             active: false,
             last_known_good: false,
+            profile_selection_receipt,
         });
         self.pending_activation = Some(pending);
         self.service_registration_approvals
@@ -3255,6 +3885,42 @@ impl ApprovedGenerationRegistry {
         activation_intent_digest: &PlatformHandle,
         approvals: &[InstallerServiceRegistrationApproval],
     ) -> Result<(), InstallationError> {
+        transaction.validate()?;
+        let profile_selection_receipt = match transaction.profile {
+            InstallationProfile::SystemService => None,
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let receipt = transaction
+                    .profile_selection_receipt()
+                    .cloned()
+                    .ok_or_else(|| InstallationError::MigrationRequired {
+                        reason: "transaction has no original profile selection receipt for registry staging"
+                            .to_owned(),
+                    })?;
+                Some(receipt)
+            }
+        };
+        let system_service_host_root_receipt = match transaction.profile {
+            InstallationProfile::SystemService => Some(
+                transaction
+                    .system_service_host_root_receipt()
+                    .cloned()
+                    .ok_or_else(|| InstallationError::MigrationRequired {
+                        reason: "SystemService transaction has no original Host-root receipt for registry staging"
+                            .to_owned(),
+                    })?,
+            ),
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => None,
+        };
+        if let Some(receipt) = system_service_host_root_receipt.as_ref() {
+            receipt.validate()?;
+            match self.system_service_host_root_receipt.as_ref() {
+                Some(existing) if existing != receipt => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Some(_) => {}
+                None => self.system_service_host_root_receipt = Some(receipt.clone()),
+            }
+        }
         if let Some(existing) = self.pending_activation.as_ref()
             && existing.transaction_id == transaction.transaction_id
             && existing.plan_digest == transaction.installer_plan_digest
@@ -3262,6 +3928,25 @@ impl ApprovedGenerationRegistry {
             && &existing.approval == approval
             && existing.activation_intent_digest.as_ref() == Some(activation_intent_digest)
         {
+            let generation_receipt = self
+                .generations
+                .iter()
+                .find(|generation| {
+                    generation.manifest.generation == transaction.candidate_manifest.generation
+                })
+                .and_then(|generation| generation.profile_selection_receipt.as_ref());
+            let system_service_receipt_matches = match transaction.profile {
+                InstallationProfile::SystemService => {
+                    self.system_service_host_root_receipt.as_ref()
+                        == system_service_host_root_receipt.as_ref()
+                }
+                InstallationProfile::UserMode | InstallationProfile::PortableDev => true,
+            };
+            if generation_receipt != profile_selection_receipt.as_ref()
+                || !system_service_receipt_matches
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
             for scm_approval in approvals {
                 if self.service_registration_approval(&scm_approval.generation, scm_approval.role)
                     != Some(scm_approval)
@@ -3276,6 +3961,7 @@ impl ApprovedGenerationRegistry {
             approval.clone(),
             approvals,
             activation_intent_digest.clone(),
+            profile_selection_receipt,
         )
     }
 
@@ -3936,6 +4622,35 @@ impl ApprovedGenerationRegistry {
         &self.generations
     }
 
+    /// Returns the exact original current-user root selection retained for a
+    /// generation. An absent generation or pre-receipt record is a typed
+    /// recovery condition; callers must not substitute a newly opened path.
+    pub fn profile_selection_receipt_for_generation(
+        &self,
+        generation: &PlatformHandle,
+    ) -> Result<&ProfileSelectionReceipt, InstallationError> {
+        self.validate()?;
+        let approved = self
+            .generations
+            .iter()
+            .find(|approved| approved.manifest.generation == *generation)
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: format!(
+                    "generation {} has no approved registry record for retained profile selection",
+                    generation.as_str()
+                ),
+            })?;
+        approved
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: format!(
+                    "generation {} predates retained profile root identities and requires explicit recovery",
+                    generation.as_str()
+                ),
+            })
+    }
+
     /// Returns the active generation identity, if committed by Host.
     #[must_use]
     pub const fn active_generation(&self) -> Option<&PlatformHandle> {
@@ -4518,6 +5233,72 @@ impl ApprovedGenerationRegistry {
                 reason: "must be non-zero".to_owned(),
             });
         }
+        let has_system_service_generation = self.generations.iter().any(|generation| {
+            generation.manifest.runtime_launch.profile == InstallationProfile::SystemService
+        });
+        let has_system_service_pending = self.pending_activation.as_ref().is_some_and(|pending| {
+            pending.manifest.runtime_launch.profile == InstallationProfile::SystemService
+        });
+        let has_system_service_abort_history =
+            self.aborted_activation_receipts.iter().any(|receipt| {
+                receipt.manifest.runtime_launch.profile == InstallationProfile::SystemService
+            });
+        let has_system_service_terminal_abort = self
+            .last_terminal_activation
+            .as_ref()
+            .and_then(|terminal| terminal.abort_receipt.as_ref())
+            .is_some_and(|receipt| {
+                receipt.manifest.runtime_launch.profile == InstallationProfile::SystemService
+            });
+        let has_system_service_projection = has_system_service_generation
+            || has_system_service_pending
+            || has_system_service_abort_history
+            || has_system_service_terminal_abort
+            || !self.service_registration_approvals.is_empty();
+        if has_system_service_projection && self.system_service_host_root_receipt.is_none() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "SystemService registry projection has no original Host-root object identity; explicit recovery is required"
+                    .to_owned(),
+            });
+        }
+        if let Some(receipt) = self.system_service_host_root_receipt.as_ref() {
+            receipt.validate()?;
+            let receipt_matches_manifest = |manifest: &CandidateManifest| {
+                manifest.runtime_launch.profile != InstallationProfile::SystemService
+                    || eliot_platform_windows::windows_paths_equal(
+                        std::path::Path::new(receipt.canonical_path()),
+                        std::path::Path::new(
+                            manifest
+                                .runtime_launch
+                                .runtime_state_roots
+                                .host_state_root
+                                .as_str(),
+                        ),
+                    )
+            };
+            for generation in &self.generations {
+                if !receipt_matches_manifest(&generation.manifest) {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            if let Some(pending) = self.pending_activation.as_ref()
+                && !receipt_matches_manifest(&pending.manifest)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if self
+                .aborted_activation_receipts
+                .iter()
+                .any(|abort| !receipt_matches_manifest(&abort.manifest))
+                || self
+                    .last_terminal_activation
+                    .as_ref()
+                    .and_then(|terminal| terminal.abort_receipt.as_ref())
+                    .is_some_and(|abort| !receipt_matches_manifest(&abort.manifest))
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
         let mut identities = BTreeSet::new();
         let mut service_identities = BTreeSet::new();
         let mut active_count = 0_usize;
@@ -4724,6 +5505,9 @@ impl ApprovedGenerationRegistry {
                     .validate_against_prior_binding(prior_binding)?;
             }
         }
+        if let Some(record) = self.user_mode_task_run_record.as_ref() {
+            record.validate()?;
+        }
         Ok(())
     }
 }
@@ -4884,11 +5668,6 @@ impl PendingActivation {
             return Err(InstallationError::IdentityConflict);
         }
         if let Some(intent) = &self.phase_b_intent {
-            if self.manifest.runtime_launch.profile != InstallationProfile::SystemService {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B intent requires the SystemService profile".to_owned(),
-                ));
-            }
             intent.validate()?;
             if intent.transaction_id != self.transaction_id
                 || intent.installation_plan_digest != self.plan_digest
@@ -4907,11 +5686,6 @@ impl PendingActivation {
             stage.validate_against_phase_b(intent, self)?;
         }
         if let Some(prepared) = &self.phase_b_prepared {
-            if self.manifest.runtime_launch.profile != InstallationProfile::SystemService {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B preparation requires the SystemService profile".to_owned(),
-                ));
-            }
             prepared.validate()?;
             if prepared.transaction_id != self.transaction_id
                 || prepared.manifest_digest != self.manifest_digest
@@ -4969,11 +5743,6 @@ impl PendingActivation {
             }
         }
         if let Some(receipt) = &self.phase_b_receipt {
-            if self.manifest.runtime_launch.profile != InstallationProfile::SystemService {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B receipt requires the SystemService profile".to_owned(),
-                ));
-            }
             receipt.validate()?;
             if receipt.transaction_id != self.transaction_id
                 || receipt.candidate_manifest_digest != self.manifest_digest
