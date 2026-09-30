@@ -384,6 +384,9 @@ pub struct TaskControllerClaimedInvocation {
     pub request_identity: RequestIdentity,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
+    /// Original Kernel native-worker claim ID, when the claim is running in a
+    /// native worker. Orientation requires this exact owner-issued value.
+    pub native_worker_claim_id: Option<String>,
 }
 
 /// Typed outcome of one `task_controller_result` submit.
@@ -564,6 +567,19 @@ pub fn parse_task_controller_claimed_pair(
     attempt
         .validate()
         .map_err(|error| format!("Kernel Task Controller attempt is invalid: {error}"))?;
+    let native_worker_claim_id = match pair.get("native_worker_claim_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value))
+            if !value.trim().is_empty() && !value.chars().any(char::is_control) =>
+        {
+            Some(value.clone())
+        }
+        Some(_) => {
+            return Err(
+                "Kernel Task Controller native worker claim ID is invalid".to_owned(),
+            );
+        }
+    };
 
     let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
     let tool_invocation = tool
@@ -603,6 +619,7 @@ pub fn parse_task_controller_claimed_pair(
         request_identity,
         operation_id,
         attempt,
+        native_worker_claim_id,
     }))
 }
 
