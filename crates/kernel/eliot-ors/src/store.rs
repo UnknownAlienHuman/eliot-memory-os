@@ -16563,27 +16563,19 @@ impl RedbRecoveryStore {
         Ok(outcome)
     }
 
-    /// Decides one owner-checked stage request against retained history
-    /// (issue #2730, item 2): live rows, retained replay commitments, and
-    /// the stream's compacted/retired boundary are consulted before
-    /// anything fresh is allocated, inside the authorized stream
-    /// incarnation the caller already bound. Performs no mutation itself.
-    ///
-    /// Where exact identity/content evidence remains, the existing
-    /// disposition returns with `fresh: false` — the live row's duplicate
-    /// outcome, or the retained commitment's duplicate outcome after
-    /// payload compaction. A frontier alone proves neither a particular
-    /// event ID nor its bytes: when the request names a position at or
-    /// below the retained compacted boundary with no exact evidence left,
-    /// the explicit retired/unverifiable recovery disposition returns with
-    /// `fresh: false`, without consulting the old position binding. Changed
-    /// content under a live or committed identity, a position admitted under
-    /// a different event above the boundary, or a torn position binding above
-    /// the boundary fails closed. Returns `Ok(None)` only for a genuinely new
-    /// identity at a free position above the boundary; the caller still runs
-    /// the pending-handoff compatibility check before any record/cursor
-    /// mutation.
-    fn check_bridge_retained_replay_in(
+    /// Answers one owner-checked stage request from the recent exact
+    /// replay window (issue #2885, item 3): the live row first, then the
+    /// retained replay commitment. The commitment window is bounded
+    /// ([`MAX_BRIDGE_EVENT_REPLAY_COMMITMENTS_PER_STREAM`] per owner
+    /// namespace, [`MAX_BRIDGE_EVENT_REPLAY_COMMITMENTS`] globally, oldest
+    /// evicted first), so it stays authoritative only for the recent
+    /// window; an identity whose commitment expired under bounded pressure
+    /// has no exact evidence here and falls through to the retained
+    /// compacted-boundary retired disposition in
+    /// [`Self::check_bridge_retained_replay_in`]. Performs no mutation
+    /// itself. Returns `Ok(None)` only when neither exact evidence source
+    /// covers this identity.
+    fn check_bridge_recent_replay_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
@@ -16611,6 +16603,44 @@ impl RedbRecoveryStore {
                 acked,
                 handoff.as_deref(),
             )));
+        }
+        Ok(None)
+    }
+
+    /// Decides one owner-checked stage request against retained history
+    /// (issue #2730, item 2): live rows, retained replay commitments, and
+    /// the stream's compacted/retired boundary are consulted before
+    /// anything fresh is allocated, inside the authorized stream
+    /// incarnation the caller already bound. Performs no mutation itself.
+    ///
+    /// The recent exact window answers first through
+    /// [`Self::check_bridge_recent_replay_in`], which keeps the bounded
+    /// live-row/commitment evidence authoritative with `fresh: false`.
+    /// Where exact identity/content evidence remains, the existing
+    /// disposition returns with `fresh: false` — the live row's duplicate
+    /// outcome, or the retained commitment's duplicate outcome after
+    /// payload compaction. A frontier alone proves neither a particular
+    /// event ID nor its bytes: when the request names a position at or
+    /// below the retained compacted boundary with no exact evidence left,
+    /// the explicit retired/unverifiable recovery disposition returns with
+    /// `fresh: false`, without consulting the old position binding. Changed
+    /// content under a live or committed identity, a position admitted under
+    /// a different event above the boundary, or a torn position binding above
+    /// the boundary fails closed. Returns `Ok(None)` only for a genuinely new
+    /// identity at a free position above the boundary; the caller still runs
+    /// the pending-handoff compatibility check before any record/cursor
+    /// mutation.
+    fn check_bridge_retained_replay_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        stage: &BridgeCheckedStage,
+        staging: &BridgeEventPrivacyStaging,
+        provenance: &BridgeEventIngestProvenance,
+    ) -> Result<Option<serde_json::Value>, OrsError> {
+        if let Some(outcome) =
+            Self::check_bridge_recent_replay_in(write, access, stage, staging, provenance)?
+        {
+            return Ok(Some(outcome));
         }
         let cursor = Self::load_bridge_cursor_row_in(write, &access.namespace)?;
         let (durable, acked, compacted) = cursor.as_ref().map_or((0, 0, 0), |row| {
