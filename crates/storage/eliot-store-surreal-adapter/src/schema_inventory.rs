@@ -576,6 +576,7 @@ pub(crate) static RESTORE_SCHEMA_DEPENDENCIES: [RestoreSchemaDependency; 4] = [
             schema::table::ERASURE_OUTCOME,
             schema::table::EXPERIENCE_BANK,
             schema::table::EXPERIENCE_FEEDBACK,
+            schema::table::INSTRUMENT_REGISTRY,
             schema::table::LEARNING_RECORD,
             schema::table::NOTIFICATION_RECORD,
             schema::table::ORDERING_HEAD,
