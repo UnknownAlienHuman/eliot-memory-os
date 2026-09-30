@@ -62,6 +62,7 @@ use eliot_store_api::{
     RequestMeta, ReservedWriteRequest, RevisionHeadExpectation, StateFence, StoreError,
     WriteReceipt,
 };
+use eliot_contracts::ResourceGeneration;
 use futures_util::future::join_all;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -124,7 +125,7 @@ pub struct ConcurrentEvidence {
     /// Current fence the generation executes under.
     pub state_fence: StateFence,
     /// Authenticated Kernel generation identity from the receiving boundary.
-    pub kernel_generation: String,
+    pub kernel_generation: ResourceGeneration,
 }
 
 impl ConcurrentEvidence {
@@ -145,12 +146,10 @@ impl ConcurrentEvidence {
             .validate()
             .map_err(StoreError::Foundation)
             .map_err(AdapterError::Store)?;
-        if self.kernel_generation.trim().is_empty()
-            || self.kernel_generation.chars().any(char::is_control)
-        {
+        if self.kernel_generation != self.state_fence.resource_generation {
             return Err(AdapterError::Store(StoreError::InvalidField {
                 field: "execution.kernel_generation",
-                reason: "authenticated Kernel generation identity is required",
+                reason: "authenticated Kernel generation must equal the full state fence generation",
             }));
         }
         Ok(())

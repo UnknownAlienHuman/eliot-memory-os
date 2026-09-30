@@ -9,10 +9,11 @@
 //! claim identity; it is not a second store or semantic write path.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use eliot_blob::BlobRootOwner;
-use eliot_contracts::StateFence;
+use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_installation::{
     InstallationProfile, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
     WindowsRuntimeRootLeaseProvider,
@@ -51,10 +52,9 @@ use eliot_store_api::{
     StoreFailureDisposition, StoreFailureIdentityContext, StoreGenesisRequest,
     StoreMutationDisposition, StoreRecoveryAction, StoreRetryDirective,
 };
-#[cfg(test)]
-use eliot_store_surreal_adapter::SchemaGeneration;
 use eliot_store_surreal_adapter::{
-    AdapterError, MigrationReceipt, SemanticReadiness, SurrealStoreAdapter,
+    AdapterError, ClientSetLimits, MigrationReceipt, SchemaGeneration, SemanticReadiness,
+    SurrealStoreAdapter,
 };
 #[cfg(test)]
 use secrecy::SecretString;
@@ -306,6 +306,8 @@ pub struct StoreComposition {
     schema_bootstrap_binding: StoreSchemaBootstrapBinding,
     schema_bootstrap_cache: tokio::sync::Mutex<Option<StoreSchemaBootstrapCache>>,
     connections: StoreConnectionManager,
+    writer_lanes: NonZeroUsize,
+    reserved_write_max_pending: Option<NonZeroUsize>,
     health_admission: HealthAdminAdmission,
     /// Exact materialization path of the selected Store launch config. It is
     /// the binding that locates the installation-visible I5.9 compatibility
@@ -381,9 +383,32 @@ impl StoreComposition {
         state_fence
             .validate()
             .map_err(|error| format!("invalid Store state fence: {error}"))?;
-        let store = SurrealStoreAdapter::new(
+        let write_limit = config
+            .store_transaction_limit
+            .unwrap_or_else(default_store_transaction_limit_usize);
+        let writer_lanes = NonZeroUsize::new(write_limit)
+            .ok_or_else(|| "configured Store writer lanes must be non-zero".to_owned())?;
+        let reserved_write_max_pending = match config.store_write_max_pending {
+            Some(max_pending) => Some(NonZeroUsize::new(max_pending).ok_or_else(|| {
+                "configured Store write max_pending must be non-zero".to_owned()
+            })?),
+            None => None,
+        };
+        let write_sessions = u8::try_from(write_limit).map_err(|_| {
+            "configured Store writer lanes exceed the bounded client-set profile".to_owned()
+        })?;
+        let client_limits = ClientSetLimits::new(
+            u8::try_from(DEFAULT_READ_CLIENTS).map_err(|_| {
+                "Store read client bound exceeds the bounded client-set profile".to_owned()
+            })?,
+            write_sessions,
+            1,
+        )
+        .map_err(|error| format!("invalid Store client-set profile: {error}"))?;
+        let store = SurrealStoreAdapter::new_with_limits(
             materialize_adapter_config(config, password, provider_bootstrap_password)?,
             provider_process_lease,
+            client_limits,
         )
         .map_err(|error| format!("compose canonical provider adapter: {error}"))?;
         // I5.9/I5.7 (issue #1933): fixed bounded read, write, and
@@ -392,9 +417,6 @@ impl StoreComposition {
         // and every per-class deadline follow the validated launch
         // timeouts. No connection is created per request, and no `expect`
         // remains on this path: both bounds fail closed on zero.
-        let write_limit = config
-            .store_transaction_limit
-            .unwrap_or_else(default_store_transaction_limit_usize);
         let connections = StoreConnectionManager::from_configured_limits(
             DEFAULT_READ_CLIENTS,
             write_limit,
@@ -409,6 +431,8 @@ impl StoreComposition {
             schema_bootstrap_binding,
             schema_bootstrap_cache: tokio::sync::Mutex::new(None),
             connections,
+            writer_lanes,
+            reserved_write_max_pending,
             health_admission: HealthAdminAdmission::bridge_default(),
             store_config_path: PathBuf::from(config.runtime_launch.store_config_path.as_str()),
             _runtime_root_leases: runtime_root_leases,
@@ -519,6 +543,62 @@ impl StoreComposition {
             self.mark_broken_and_recover(ClientClass::Health).await;
         }
         outcome
+    }
+
+    /// Installs reserved execution only from observed Store readiness and the
+    /// exact authenticated Kernel generation/full fence admitted by EBP.
+    /// `Ok(false)` leaves the legacy ordinary-write path in place when no
+    /// explicit pending bound or canonical-writer admission exists.
+    pub fn install_reserved_write_generation(
+        &self,
+        readiness: &ReadinessReceipt,
+        writer_compatibility: &CompatibilityVerdict,
+        kernel_generation: ResourceGeneration,
+        state_fence: StateFence,
+    ) -> Result<bool, String> {
+        let Some(max_pending) = self.reserved_write_max_pending else {
+            return Ok(false);
+        };
+        if !writer_compatibility.is_writer_admitted()
+            || !self.compatibility_verdict().is_writer_admitted()
+        {
+            return Ok(false);
+        }
+        if readiness.status != ReadinessStatus::Ready
+            || readiness.observed_generation.as_deref()
+                != Some(self.store.config().expected_schema_generation.as_str())
+        {
+            return Err(
+                "reserved execution requires an observed ready Store schema generation".to_owned(),
+            );
+        }
+        if state_fence != self.state_fence
+            || kernel_generation != state_fence.resource_generation
+        {
+            return Err(
+                "authenticated Kernel generation and complete fence do not match the Store composition"
+                    .to_owned(),
+            );
+        }
+        let observed_generation = SchemaGeneration::new(
+            readiness
+                .observed_generation
+                .as_deref()
+                .ok_or_else(|| {
+                    "ready Store receipt omitted its observed schema generation".to_owned()
+                })?,
+        )
+        .map_err(|error| format!("invalid observed Store schema generation: {error}"))?;
+        self.store
+            .install_concurrent_execution(
+                self.writer_lanes,
+                max_pending,
+                observed_generation,
+                kernel_generation,
+                state_fence,
+            )
+            .map_err(|error| format!("install reserved Store execution generation: {error}"))?;
+        Ok(true)
     }
 
     async fn readiness_inner(&self) -> Result<ReadinessReceipt, StoreError> {
@@ -1430,6 +1510,7 @@ pub struct StoreEbpSession {
     module_generation: eliot_protocol::ProtocolModuleGeneration,
     max_frame_bytes: usize,
     capabilities: BTreeSet<String>,
+    reserved_write_requested: bool,
     authenticated_peer: Option<AuthenticatedStorePeer>,
     session_principal_binding: String,
     replay: ReplayLedger,
@@ -1458,6 +1539,33 @@ impl StoreEbpSession {
     #[must_use]
     pub const fn max_frame_bytes(&self) -> usize {
         self.max_frame_bytes
+    }
+
+    /// Returns the exact generation and complete fence carried by the
+    /// authenticated Kernel hello.
+    pub fn authenticated_kernel_generation_and_fence(
+        &self,
+    ) -> Result<(ResourceGeneration, StateFence), String> {
+        validate_session_peer_binding(self)?;
+        let generation = self.module_generation.generation.clone();
+        if generation != self.state_fence.resource_generation {
+            return Err("authenticated Kernel generation does not match its full state fence".to_owned());
+        }
+        Ok((generation, self.state_fence.clone()))
+    }
+
+    /// Makes the reserved-write capability usable after composition has
+    /// installed its actual concurrent execution generation.
+    pub fn enable_reserved_write_capability(&mut self) {
+        if self.reserved_write_requested {
+            self.capabilities
+                .insert(eliot_store_api::CAPABILITY_RESERVED_WRITE.to_owned());
+        }
+    }
+
+    #[must_use]
+    pub const fn reserved_write_requested(&self) -> bool {
+        self.reserved_write_requested
     }
 }
 
@@ -1568,6 +1676,7 @@ fn admit_handshake_inner(
     }
     let capabilities: Vec<String> = CAPABILITIES
         .iter()
+        .filter(|capability| **capability != eliot_store_api::CAPABILITY_RESERVED_WRITE)
         .filter(|capability| hello.capabilities.iter().any(|value| value == **capability))
         .map(|capability| (*capability).to_owned())
         .collect();
@@ -1598,6 +1707,10 @@ fn admit_handshake_inner(
         max_frame_bytes: usize::try_from(hello.max_frame)
             .map_err(|_| "ClientHello max_frame does not fit usize".to_owned())?,
         capabilities: capabilities.into_iter().collect(),
+        reserved_write_requested: hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == eliot_store_api::CAPABILITY_RESERVED_WRITE),
         authenticated_peer,
         session_principal_binding: server_hello.session_principal_binding.clone(),
         replay: ReplayLedger::default(),
@@ -2305,6 +2418,7 @@ mod tests {
             connect_timeout_ms: 1_000,
             query_timeout_ms: 1_000,
             store_transaction_limit: None,
+            store_write_max_pending: None,
             schema_generation: "1.0.0".to_owned(),
             blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
             instance_id: "store-test".to_owned(),
