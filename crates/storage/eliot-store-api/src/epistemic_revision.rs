@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    NamedMutationOperation, NamedMutationRequest, PreparedTransition, RequestMeta, StoreError,
-    WriteReceipt, WriteReceiptStatus, canonical_json_bytes, sha256_hex,
-    validate_store_receipt_envelope,
+    CausalWriteReceipt, NamedMutationOperation, NamedMutationRequest, PreparedTransition,
+    RequestMeta, StoreError, WriteReceipt, WriteReceiptStatus, canonical_json_bytes, sha256_hex,
+    validate_store_receipt_envelope, validate_store_receipt_envelope_with_causal,
 };
 
 pub const EPISTEMIC_REVISION_SCHEMA: &str = "eliot.storage.epistemic-revision.v1";
@@ -199,6 +199,35 @@ impl EpistemicCommit {
             return Err(StoreError::InvalidReceipt);
         }
         validate_store_receipt_envelope(&self.context, &self.prepared, receipt)?;
+        self.readback_after_validation(receipt)
+    }
+
+    /// Validates a post-genesis receipt against the canonical owner's
+    /// independently reread causal projection before constructing the
+    /// admitted wire view.
+    pub fn readback_with_causal(
+        &self,
+        committed: &CausalWriteReceipt,
+    ) -> Result<EpistemicPositionReadback, StoreError> {
+        let reconstructed = Self::from_prepared(&self.context, &self.prepared)?
+            .ok_or(StoreError::InvalidReceipt)?;
+        if reconstructed != *self || committed.receipt.status != WriteReceiptStatus::Committed {
+            return Err(StoreError::InvalidReceipt);
+        }
+        committed.validate()?;
+        validate_store_receipt_envelope_with_causal(
+            &self.context,
+            &self.prepared,
+            &committed.receipt,
+            &committed.causal,
+        )?;
+        self.readback_after_validation(&committed.receipt)
+    }
+
+    fn readback_after_validation(
+        &self,
+        receipt: &WriteReceipt,
+    ) -> Result<EpistemicPositionReadback, StoreError> {
         let envelope = receipt.require_reconciliation_envelope()?;
         let candidate = &self.payload.candidate;
         let admission = AdmittedReceipt::new(AdmittedReceiptParams {

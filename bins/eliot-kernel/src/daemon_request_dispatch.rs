@@ -43,6 +43,8 @@ use eliot_kernel_service::{
     IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
     StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
 };
+#[cfg(windows)]
+use eliot_kernel_service::ProcessExecutionRequest;
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionError, ProcessExecutionView, ProcessLifecycle,
@@ -68,7 +70,8 @@ use eliot_store_api::{
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
     RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
+    StoreRecoveryRequest, StoreRecoverySnapshot, CausalWriteReceipt, WriteReceipt,
+    WriteReceiptStatus,
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::Deserialize;
@@ -88,6 +91,11 @@ pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evide
 /// through the single timing owner and always answers with its exact durable
 /// head so the producer converges after renewals on any path.
 pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
+/// Authenticated current-source process execution/readback route. The payload
+/// is the existing closed P-03 request and every leg remains bound to the
+/// daemon frame's original request identity and authenticated session.
+pub(crate) const EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION: &str =
+    "execute_current_source_process";
 /// Authenticated Governor publish operation carrying one live-derivation
 /// projection (issue #1935 AUD1, I7.16). The Governor-owned derivation
 /// publishes its exact revision, exact active fingerprint, and exact
@@ -623,6 +631,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         STORAGE_REPLACEMENT_ROLLBACK_OPERATION => STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
         MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
+        EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION => EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
         "store_recovery" => "store_recovery",
@@ -3332,6 +3341,22 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION => {
+                #[cfg(windows)]
+                {
+                    self.execute_current_source_process_operation(
+                        session,
+                        payload.clone(),
+                        request_identity,
+                    )
+                    .await
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (session, payload, request_identity);
+                    Err(TransportError::SessionFenced)
+                }
+            }
             "agent_activation_claim" => {
                 #[cfg(windows)]
                 {
@@ -4508,6 +4533,60 @@ impl KernelComposition {
         frame.request_id = Some(request_id);
         frame.validate()?;
         Ok(frame)
+    }
+
+    #[cfg(windows)]
+    async fn execute_current_source_process_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: ProcessExecutionRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        request
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = request
+            .operation_id()
+            .ok_or(TransportError::SessionFenced)?;
+        if identity.request.state_fence != session.module_generation.state_fence
+            || identity.request.metadata.task_id.is_none()
+            || identity.idempotency_key != operation_id.as_str()
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if let ProcessExecutionRequest::Start(admission) = &request {
+            if admission.recipient_module_id() != session.module_generation.module_id.as_str()
+                || identity.deadline_unix_ms != admission.deadline_unix_ms()
+                || !identity
+                    .request
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(admission.state_fence().authority_epoch())
+                || identity.request.state_fence.resource_generation.value()
+                    != admission.state_fence().generation().get()
+                || identity.request.metadata.request_id.as_str()
+                    != admission.intent().operation_id().as_str()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let (_, session_binding) = super::caller_binding(session)?;
+        let response = self
+            .execute_process_request(session, session_binding, request)
+            .await;
+        let response = serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": response,
+            "recovery": null,
+        }))
     }
 
     fn accepted_daemon_response() -> serde_json::Value {
@@ -8852,7 +8931,7 @@ impl KernelComposition {
         // by operation identity into either the canonical receipt or a durable
         // Recovery Problem whenever ORS does hold one.
         match gateway
-            .apply(
+            .apply_with_causal(
                 &operation.context,
                 operation.transition,
                 operation.expected_revision_heads,
@@ -8860,7 +8939,8 @@ impl KernelComposition {
             )
             .await
         {
-            Ok(receipt) => {
+            Ok(pair) => {
+                let receipt = &pair.receipt;
                 if !campaign_source_publications.is_empty() {
                     if receipt.status == WriteReceiptStatus::Committed {
                         if let Err(error) = self.p07_ors.commit_campaign_source_publications(
@@ -8889,7 +8969,7 @@ impl KernelComposition {
                     }
                 }
                 Ok(store_apply_response(
-                    &receipt,
+                    &pair,
                     verified_correction.as_ref(),
                     journal_issue,
                 ))
@@ -8917,8 +8997,8 @@ impl KernelComposition {
         verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
         journal_issue: Option<&str>,
     ) -> Result<Option<serde_json::Value>, TransportError> {
-        let Ok(Some(receipt)) = gateway
-            .receipt(
+        let Ok(Some(pair)) = gateway
+            .receipt_with_causal(
                 &operation.context.state_fence,
                 operation.transition.identity.operation_id.clone(),
             )
@@ -8926,6 +9006,7 @@ impl KernelComposition {
         else {
             return Ok(None);
         };
+        let receipt = &pair.receipt;
         if receipt.operation_id != operation.transition.identity.operation_id
             || receipt.idempotency_key != operation.transition.identity.idempotency_key
             || receipt.canonical_request_hash
@@ -8938,8 +9019,10 @@ impl KernelComposition {
         receipt
             .validate()
             .map_err(|_| TransportError::IdentityConflict)?;
+        pair.validate()
+            .map_err(|_| TransportError::IdentityConflict)?;
         Ok(Some(store_apply_response(
-            &receipt,
+            &pair,
             verified_correction,
             journal_issue,
         )))
@@ -12116,13 +12199,16 @@ fn persist_pre_stage_corrections(
     }
 }
 fn store_apply_response(
-    receipt: &WriteReceipt,
+    pair: &CausalWriteReceipt,
     verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
     journal_issue: Option<&str>,
 ) -> serde_json::Value {
     let mut response = serde_json::json!({
         "status": "known",
-        "value": { "kind": "write_receipt", "value": receipt },
+        "value": {
+            "kind": "causal_write_receipt",
+            "value": { "receipt": pair.receipt, "causal": pair.causal },
+        },
         "recovery": null,
     });
     // A local recovery/persistence failure is reported here without claiming

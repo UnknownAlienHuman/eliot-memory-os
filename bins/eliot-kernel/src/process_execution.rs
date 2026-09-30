@@ -27,7 +27,7 @@ use eliot_kernel_core::{
 };
 use eliot_kernel_service::{
     HostKernelCandidateBinding, KernelServiceError, ProcessExecutionRequest,
-    ProcessExecutionResponse,
+    ProcessExecutionResponse, ProcessStreamReadChunk, ProcessStreamReadRequest,
 };
 use eliot_ors::{
     EpochIdentity, EpochLineage, OpaqueLabel, ProcessEvidenceRecord,
@@ -2558,6 +2558,18 @@ impl ProcessExecutionGateway {
         }
     }
 
+    /// Reads one bounded chunk from the exact original, complete Kernel-owned
+    /// capture. The readback module rejects previews, durable-source claims
+    /// this gateway cannot resolve, and any capture that exceeded its
+    /// original retained capacity.
+    pub(crate) async fn read_stream_chunk(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: ProcessStreamReadRequest,
+    ) -> Result<ProcessStreamReadChunk, ProcessExecutionError> {
+        super::process_stream_readback::read_stream_chunk(self, owner, request).await
+    }
+
     fn authorize_operation(
         &self,
         owner: &ProcessOwnerBinding,
@@ -3332,6 +3344,10 @@ impl KernelComposition {
                 .reconcile(&owner, operation_id)
                 .await
                 .map(ProcessExecutionResponse::Reconciled),
+            ProcessExecutionRequest::ReadStream { request } => gateway
+                .read_stream_chunk(&owner, request)
+                .await
+                .map(ProcessExecutionResponse::StreamChunk),
         };
         result.unwrap_or_else(|error| {
             // F-LOG-KERNEL-3 (#901): subordinate observation only; the

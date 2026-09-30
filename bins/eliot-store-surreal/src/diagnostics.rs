@@ -704,11 +704,14 @@ impl BridgeIdentity {
     #[must_use]
     pub fn from_response(response: &Response) -> Self {
         match response {
-            Response::Transaction { receipt } | Response::Genesis { receipt } => {
+            Response::Transaction { receipt }
+            | Response::TransactionWithCausal { receipt, .. }
+            | Response::Genesis { receipt } => {
                 Self::from_receipt(receipt)
                     .with_manifest_digest(receipt.operation_manifest_digest.as_str())
             }
-            Response::Receipt { receipt } => receipt
+            Response::Receipt { receipt }
+            | Response::ReceiptWithCausal { receipt, .. } => receipt
                 .as_ref()
                 .map(|entry| {
                     Self::from_receipt(entry)
@@ -986,13 +989,16 @@ impl<'a> IntoIterator for &'a BoundedEventLog {
 #[must_use]
 pub fn classify_response(response: &Response) -> RequestOutcome {
     match response {
-        Response::Transaction { receipt } | Response::Genesis { receipt } => match receipt.status {
+        Response::Transaction { receipt }
+        | Response::TransactionWithCausal { receipt, .. }
+        | Response::Genesis { receipt } => match receipt.status {
             WriteReceiptStatus::Committed => RequestOutcome::Committed,
             WriteReceiptStatus::Rejected
             | WriteReceiptStatus::DeadLetter
             | WriteReceiptStatus::Cancelled => RequestOutcome::TerminalNonCommit,
         },
         Response::Receipt { .. }
+        | Response::ReceiptWithCausal { .. }
         | Response::Health { .. }
         | Response::Readiness { .. }
         | Response::Named { .. }
@@ -1180,7 +1186,9 @@ pub fn emit_dispatch_outcome(
     let mut event =
         BridgeDiagnosticEvent::new(boundary, operation, classify_response(response), identity);
     match response {
-        Response::Transaction { receipt } | Response::Genesis { receipt } => {
+        Response::Transaction { receipt }
+        | Response::TransactionWithCausal { receipt, .. }
+        | Response::Genesis { receipt } => {
             event.receipt_status = Some(receipt.status);
         }
         Response::Failure { failure } => {
@@ -1190,6 +1198,7 @@ pub fn emit_dispatch_outcome(
             event.failure_disposition = Some(failure.disposition);
         }
         Response::Receipt { .. }
+        | Response::ReceiptWithCausal { .. }
         | Response::Health { .. }
         | Response::Readiness { .. }
         | Response::Named { .. }

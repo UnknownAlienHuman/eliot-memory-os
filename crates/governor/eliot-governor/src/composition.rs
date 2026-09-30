@@ -107,7 +107,8 @@ use eliot_security_contracts::{PrivacyClass, RevocationReason};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
-    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, ProblemOwnerTransition,
+    CanonicalReadClient, CausalWriteReceipt, OrderingHeadExpectation, PreparedTransition,
+    ProblemOwnerTransition,
     RevisionHeadExpectation, ScopeRevisionView, StoreHealth, TaskContractAcceptanceSet,
     WriteReceipt,
 };
@@ -235,8 +236,39 @@ pub trait KernelTransitionPort: Send + Sync {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt>;
 
+    /// Applies one transition and preserves the Kernel/Store owner’s
+    /// independently projected causal binding. The default refuses before
+    /// dispatch; callers must never manufacture the binding from a receipt.
+    fn apply_prepared_with_causal<'a>(
+        &'a self,
+        _identity: &RequestIdentity,
+        _transition: PreparedTransition,
+        _expected_revision_heads: Vec<RevisionHeadExpectation>,
+        _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> KernelPortFuture<'a, CausalWriteReceipt> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "causal receipt readback is not admitted by this Kernel transition port".to_owned(),
+            ))
+        })
+    }
+
     /// Reconciles one operation by its exact canonical identity.
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>>;
+
+    /// Reconciles one operation with the canonical owner’s independently
+    /// reread causal projection. The default refuses instead of treating the
+    /// receipt envelope as its own expected causal authority.
+    fn receipt_with_causal(
+        &self,
+        _operation_id: OperationId,
+    ) -> KernelPortFuture<'_, Option<CausalWriteReceipt>> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "causal receipt readback is not admitted by this Kernel transition port".to_owned(),
+            ))
+        })
+    }
 
     /// Returns a bounded Kernel-owned health observation.
     fn health(&self) -> KernelPortFuture<'_, StoreHealth>;
@@ -3556,6 +3588,51 @@ impl CanonicalAdmissionOwner {
                 expected_ordering_heads,
             )
             .await?)
+    }
+
+    /// Sends a Canonical-produced transition through the owner path that
+    /// returns an independently reread causal projection with the receipt.
+    pub(crate) async fn commit_with_causal<P: KernelTransitionPort + ?Sized>(
+        &self,
+        port: &P,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+    ) -> Result<CausalWriteReceipt, CompositionError> {
+        identity
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        if envelope.request != identity.request.metadata {
+            return Err(CompositionError::Provider(
+                "admitted request binding does not match the Canonical envelope request".to_owned(),
+            ));
+        }
+        if envelope.idempotency_key != identity.idempotency_key {
+            return Err(CompositionError::Provider(
+                "admitted idempotency key does not match the Canonical envelope".to_owned(),
+            ));
+        }
+        let expected_revision_heads = envelope.expected_revision_heads.clone();
+        let expected_ordering_heads = envelope.expected_ordering_heads.clone();
+        let transition = self.prepare(&envelope)?;
+        if transition.identity.idempotency_key != identity.idempotency_key
+            || transition.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "immutable transition does not agree with the admitted request identity".to_owned(),
+            ));
+        }
+        let receipt = port
+            .apply_prepared_with_causal(
+                identity,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await?;
+        receipt
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        Ok(receipt)
     }
 
     /// Returns the active fence without exposing mutable canonical state.
@@ -8052,6 +8129,38 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.owners
             .canonical
             .commit(self.kernel.as_ref(), identity, envelope)
+            .await
+    }
+
+    /// Applies a Canonical-admitted transition and retains the independently
+    /// projected causal receipt returned by the canonical owner. This is the
+    /// required entrypoint for consumers that must validate post-genesis
+    /// receipts; it has the same readiness and fresh WorkScope guards as
+    /// [`Self::commit_canonical`].
+    pub async fn commit_canonical_with_causal(
+        &self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+    ) -> Result<CausalWriteReceipt, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        if envelope.task_id.is_some() {
+            let scope = require_fresh_matched_binding(
+                self.owners.work_scope.as_ref(),
+                &envelope.request.state_fence,
+                "canonical write work scope is not freshly matched",
+            )?;
+            if scope.binding.scope.scope_ref != envelope.scope_id.as_str() {
+                return Err(CompositionError::Recovery(
+                    "canonical write addresses a different WorkScope than the bound scope"
+                        .to_owned(),
+                ));
+            }
+        }
+        self.owners
+            .canonical
+            .commit_with_causal(self.kernel.as_ref(), identity, envelope)
             .await
     }
 

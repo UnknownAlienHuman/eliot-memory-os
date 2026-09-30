@@ -9,9 +9,14 @@
 #![forbid(unsafe_code)]
 
 use eliot_graph_api::{
-    GraphCoverage, GraphEdge, GraphFreshness, GraphNode, GraphQueryResult, GraphRevision,
+    CoordinateKind, GraphCoordinate, GraphCoverage, GraphEdge, GraphFreshness, GraphNode,
+    GraphQueryResult, GraphRevision,
 };
-use eliot_instrument_api::{EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
+use eliot_instrument_api::{EvidenceAxes, EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
+use eliot_lsp_bridge::{
+    Coverage as LspCoverage, DiagnosticSeverity, FailureDisposition, LspRawOutputKind,
+    NormalizedResult, RetainedLspObservationV1, SemanticOperation, adopt_retained_observation,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +24,9 @@ use thiserror::Error;
 
 pub const CONTRACT_NAME: &str = "eliot.code-cortex";
 pub const CONTRACT_VERSION: &str = "1.0.0";
+/// Stable normalized-evidence kind for a historically adopted LSP observation.
+pub const LSP_NORMALIZED_EVIDENCE_KIND: &str = "eliot.lsp.normalized-observation.v1";
+const MAX_RETAINED_LSP_OBSERVATIONS: usize = 32;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CodeCortexError {
@@ -145,6 +153,15 @@ pub struct SemanticIndex {
     revision: u64,
     graphs: BTreeMap<String, GraphQueryResult>,
     evidence: BTreeMap<String, NormalizedEvidence>,
+    retained_lsp: BTreeMap<String, RetainedLspProjection>,
+}
+
+#[derive(Clone, Debug)]
+struct RetainedLspProjection {
+    workspace_root: String,
+    source_handle: String,
+    raw_handles: Vec<String>,
+    result: NormalizedResult,
 }
 
 impl SemanticIndex {
@@ -203,6 +220,116 @@ impl SemanticIndex {
         Ok(revision)
     }
 
+    /// Validates and retains one original LSP envelope as historical evidence.
+    ///
+    /// Adoption revalidates the exact retained raw bytes and full normalized
+    /// result through the bridge's historical validator. That validator keeps
+    /// the observation stale because the current source and process owners are
+    /// not supplied here. The index retains the normalized result's actual
+    /// items and projects them as stale nodes during composition; it never
+    /// launches an analyzer or creates an observation receipt.
+    pub fn admit_retained_lsp_observation(
+        &mut self,
+        record: RetainedLspObservationV1,
+    ) -> Result<GraphRevision, CodeCortexError> {
+        if self.retained_lsp.len() >= MAX_RETAINED_LSP_OBSERVATIONS {
+            return Err(CodeCortexError::InvalidLimit);
+        }
+
+        let source_kind = match &record.operation {
+            SemanticOperation::Diagnostics | SemanticOperation::ProbeVersion => {
+                LspRawOutputKind::Stdout
+            }
+            SemanticOperation::Definitions { .. }
+            | SemanticOperation::References { .. }
+            | SemanticOperation::Symbols { .. }
+            | SemanticOperation::Rename { .. } => LspRawOutputKind::ScipSidecar,
+        };
+        let raw = record
+            .raw_outputs
+            .iter()
+            .find(|output| output.kind == source_kind)
+            .ok_or_else(|| {
+                CodeCortexError::InvalidEvidence(
+                    "retained LSP observation lacks the raw stream for its operation".to_owned(),
+                )
+            })?;
+        let raw_artifact_id = raw.evidence.artifact_id.clone();
+        let evidence_id = raw_artifact_id.to_string();
+        let raw_handles = record
+            .raw_outputs
+            .iter()
+            .map(|output| output.evidence.artifact_id.to_string())
+            .collect::<Vec<_>>();
+        let workspace_root = record.source_candidate.workspace_root.clone();
+        let normalizer = record.registry_identity.normalizer.clone();
+        let raw_metadata = record
+            .raw_outputs
+            .iter()
+            .map(|output| {
+                serde_json::json!({
+                    "kind": output.kind,
+                    "artifact_id": output.evidence.artifact_id.to_string(),
+                    "sha256": output.evidence.sha256,
+                    "source": output.evidence.source,
+                    "truncated": output.evidence.truncated,
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = adopt_retained_observation(record)
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        if !matches!(
+            &result.receipt().freshness,
+            eliot_lsp_bridge::Freshness::Stale { .. }
+        ) {
+            return Err(CodeCortexError::InvalidEvidence(
+                "historical LSP adoption did not preserve stale freshness".to_owned(),
+            ));
+        }
+        let coverage = match &result.receipt().coverage {
+            LspCoverage::ProbeOnly => EvidenceCoverage::NotApplicable,
+            _ if matches!(
+                &result.receipt().disposition,
+                FailureDisposition::Success
+            ) => {
+                EvidenceCoverage::CompleteForScope
+            }
+            _ => EvidenceCoverage::PartialForScope,
+        };
+        let value = serde_json::json!({
+            "receipt_kind": eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND,
+            "result": &result,
+            "raw_outputs": raw_metadata,
+        });
+        let evidence = NormalizedEvidence {
+            evidence_id: raw_artifact_id.clone(),
+            raw_artifact_id,
+            normalizer,
+            kind: LSP_NORMALIZED_EVIDENCE_KIND.to_owned(),
+            summary: "bridge-validated historical LSP observation; stale freshness retained"
+                .to_owned(),
+            value,
+            axes: EvidenceAxes::observed(),
+            freshness: EvidenceFreshness::Stale,
+            coverage,
+        };
+        evidence
+            .validate()
+            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        let key = format!("{}:{}", evidence_id, self.retained_lsp.len());
+        self.evidence.insert(key.clone(), evidence);
+        self.retained_lsp.insert(
+            key,
+            RetainedLspProjection {
+                workspace_root,
+                source_handle: evidence_id,
+                raw_handles,
+                result,
+            },
+        );
+        self.bump()
+    }
+
     pub fn snapshot(&self) -> IndexSnapshot {
         let revision = self
             .revision()
@@ -245,6 +372,24 @@ impl CodeCortexService {
         Ok(Self { index })
     }
 
+    /// Builds a service from caller-supplied original bridge observations.
+    ///
+    /// Each envelope is independently re-adopted from its retained bytes and
+    /// represented as stale evidence. This entrypoint does not accept an
+    /// already-normalized JSON value as proof of a bridge invocation.
+    pub fn with_retained_lsp_observations(
+        records: Vec<RetainedLspObservationV1>,
+    ) -> Result<Self, CodeCortexError> {
+        if records.len() > MAX_RETAINED_LSP_OBSERVATIONS {
+            return Err(CodeCortexError::InvalidLimit);
+        }
+        let mut index = SemanticIndex::new();
+        for record in records {
+            index.admit_retained_lsp_observation(record)?;
+        }
+        Ok(Self { index })
+    }
+
     pub fn index(&self) -> &SemanticIndex {
         &self.index
     }
@@ -258,7 +403,9 @@ impl CodeCortexService {
         request: &CompositionRequest,
     ) -> Result<CodeCortexReport, CodeCortexError> {
         request.validate()?;
-        compose_snapshot(request, &self.index.snapshot())
+        let mut report = compose_snapshot(request, &self.index.snapshot())?;
+        project_retained_lsp_observations(request, &self.index.retained_lsp, &mut report)?;
+        Ok(report)
     }
 }
 
@@ -372,6 +519,398 @@ pub fn compose_snapshot(
         coverage_gaps: gaps,
         expansion_handles,
     })
+}
+
+fn project_retained_lsp_observations(
+    request: &CompositionRequest,
+    observations: &BTreeMap<String, RetainedLspProjection>,
+    report: &mut CodeCortexReport,
+) -> Result<(), CodeCortexError> {
+    for (evidence_id, observation) in observations {
+        if observation.workspace_root != request.scope {
+            report.coverage_gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: format!(
+                    "retained LSP evidence {evidence_id} belongs to a different workspace scope"
+                ),
+                cheapest_probe: None,
+            });
+            continue;
+        }
+        for handle in &observation.raw_handles {
+            if !report.evidence_handles.contains(handle) {
+                report.evidence_handles.push(handle.clone());
+            }
+        }
+        report.coverage_gaps.push(CoverageGap {
+            scope: request.scope.clone(),
+            reason: format!(
+                "retained LSP evidence {evidence_id} is historical and stale; source and process-owner state were not revalidated"
+            ),
+            cheapest_probe: Some(
+                "obtain a current source-bound observation through the owning process path"
+                    .to_owned(),
+            ),
+        });
+
+        let mut node_limit_reached = false;
+        let mut relation_limit_reached = false;
+        match &observation.result {
+            NormalizedResult::Definitions { items, .. } => {
+                for item in items {
+                    let symbol = lsp_symbol_coordinate(&observation.workspace_root, &item.symbol);
+                    let location = lsp_span_coordinate(
+                        &observation.workspace_root,
+                        &item.path,
+                        Some(&item.symbol),
+                        item.line,
+                        item.column,
+                    );
+                    if !admit_lsp_node(
+                        request,
+                        report,
+                        symbol.clone(),
+                        "stale_lsp_symbol_observation",
+                        Some(item.symbol.clone()),
+                        &observation.source_handle,
+                    )? || !admit_lsp_node(
+                        request,
+                        report,
+                        location.clone(),
+                        "stale_lsp_definition_observation",
+                        Some(item.symbol.clone()),
+                        &observation.source_handle,
+                    )? {
+                        node_limit_reached = true;
+                        break;
+                    }
+                    if !admit_lsp_relation(
+                        request,
+                        report,
+                        symbol,
+                        location,
+                        "lsp_definition_observed",
+                        &observation.source_handle,
+                    ) {
+                        relation_limit_reached = true;
+                        break;
+                    }
+                }
+            }
+            NormalizedResult::References { items, .. } => {
+                for item in items {
+                    let symbol = lsp_symbol_coordinate(&observation.workspace_root, &item.symbol);
+                    let location = lsp_span_coordinate(
+                        &observation.workspace_root,
+                        &item.path,
+                        Some(&item.symbol),
+                        item.line,
+                        item.column,
+                    );
+                    if !admit_lsp_node(
+                        request,
+                        report,
+                        symbol.clone(),
+                        "stale_lsp_symbol_observation",
+                        Some(item.symbol.clone()),
+                        &observation.source_handle,
+                    )? || !admit_lsp_node(
+                        request,
+                        report,
+                        location.clone(),
+                        "stale_lsp_reference_observation",
+                        Some(item.symbol.clone()),
+                        &observation.source_handle,
+                    )? {
+                        node_limit_reached = true;
+                        break;
+                    }
+                    if !admit_lsp_relation(
+                        request,
+                        report,
+                        symbol,
+                        location,
+                        "lsp_reference_observed",
+                        &observation.source_handle,
+                    ) {
+                        relation_limit_reached = true;
+                        break;
+                    }
+                }
+            }
+            NormalizedResult::Symbols { items, receipt } => {
+                let path_scope = match &receipt.coverage {
+                    LspCoverage::SymbolSubset { path_scope } if !path_scope.is_empty() => {
+                        Some(path_scope.clone())
+                    }
+                    _ => None,
+                };
+                for item in items {
+                    let coordinate = GraphCoordinate {
+                        kind: CoordinateKind::Symbol,
+                        package: observation.workspace_root.clone(),
+                        path: path_scope.clone(),
+                        symbol: Some(item.symbol.clone()),
+                        line: None,
+                        column: None,
+                    };
+                    if !admit_lsp_node(
+                        request,
+                        report,
+                        coordinate,
+                        format!("stale_lsp_symbol_kind_{}", item.kind),
+                        item.display_name.clone(),
+                        &observation.source_handle,
+                    )? {
+                        node_limit_reached = true;
+                        break;
+                    }
+                }
+            }
+            NormalizedResult::Diagnostics { observations, .. } => {
+                for item in observations {
+                    let severity = match item.severity {
+                        DiagnosticSeverity::Error => "error",
+                        DiagnosticSeverity::Warning => "warning",
+                        DiagnosticSeverity::Information => "information",
+                        DiagnosticSeverity::Hint => "hint",
+                        DiagnosticSeverity::Unknown => "unknown",
+                    };
+                    if !admit_lsp_node(
+                        request,
+                        report,
+                        lsp_span_coordinate(
+                            &observation.workspace_root,
+                            &item.file,
+                            None,
+                            item.line,
+                            item.column,
+                        ),
+                        format!("stale_lsp_diagnostic_{severity}"),
+                        Some(item.code.clone()),
+                        &observation.source_handle,
+                    )? {
+                        node_limit_reached = true;
+                        break;
+                    }
+                }
+            }
+            NormalizedResult::Rename { candidate, .. } => {
+                if candidate.applied {
+                    return Err(CodeCortexError::InvalidEvidence(
+                        "bridge adoption returned an applied rename candidate".to_owned(),
+                    ));
+                }
+                let symbol = lsp_symbol_coordinate(&observation.workspace_root, &candidate.symbol);
+                if !admit_lsp_node(
+                    request,
+                    report,
+                    symbol.clone(),
+                    "stale_lsp_symbol_observation",
+                    Some(candidate.symbol.clone()),
+                    &observation.source_handle,
+                )? {
+                    node_limit_reached = true;
+                }
+                for edit in &candidate.edits {
+                    if node_limit_reached || relation_limit_reached {
+                        break;
+                    }
+                    let location = lsp_span_coordinate(
+                        &observation.workspace_root,
+                        &edit.path,
+                        Some(&candidate.symbol),
+                        edit.line,
+                        edit.column,
+                    );
+                    if !admit_lsp_node(
+                        request,
+                        report,
+                        location.clone(),
+                        "stale_lsp_unapplied_rename_candidate",
+                        Some(candidate.new_name.clone()),
+                        &observation.source_handle,
+                    )? {
+                        node_limit_reached = true;
+                        break;
+                    }
+                    if !admit_lsp_relation(
+                        request,
+                        report,
+                        symbol.clone(),
+                        location,
+                        "lsp_rename_candidate_observed",
+                        &observation.source_handle,
+                    ) {
+                        relation_limit_reached = true;
+                        break;
+                    }
+                }
+            }
+            NormalizedResult::Version { .. } => {}
+        }
+        if node_limit_reached {
+            report.coverage_gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: format!(
+                    "retained LSP evidence {evidence_id} was projected only up to the requested node limit"
+                ),
+                cheapest_probe: None,
+            });
+        }
+        if relation_limit_reached {
+            report.coverage_gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: format!(
+                    "retained LSP evidence {evidence_id} was projected only up to the requested relation limit"
+                ),
+                cheapest_probe: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn lsp_symbol_coordinate(workspace_root: &str, symbol: &str) -> GraphCoordinate {
+    GraphCoordinate {
+        kind: CoordinateKind::Symbol,
+        package: workspace_root.to_owned(),
+        path: None,
+        symbol: Some(symbol.to_owned()),
+        line: None,
+        column: None,
+    }
+}
+
+fn admit_lsp_node(
+    request: &CompositionRequest,
+    report: &mut CodeCortexReport,
+    coordinate: GraphCoordinate,
+    kind: impl Into<String>,
+    label: Option<String>,
+    evidence_id: &str,
+) -> Result<bool, CodeCortexError> {
+    add_lsp_node(
+        request,
+        report,
+        GraphNode {
+            coordinate,
+            kind: kind.into(),
+            label,
+        },
+        evidence_id,
+    )
+}
+
+fn admit_lsp_relation(
+    request: &CompositionRequest,
+    report: &mut CodeCortexReport,
+    from: GraphCoordinate,
+    to: GraphCoordinate,
+    kind: &str,
+    evidence_id: &str,
+) -> bool {
+    let from = from.to_string();
+    let to = to.to_string();
+    if let Some(existing) = report.relations.iter_mut().find(|relation| {
+        relation.from == from
+            && relation.to == to
+            && relation.kind == kind
+            && relation.authority == RelationAuthority::InstrumentObservation
+    }) {
+        if !existing.source_handles.iter().any(|handle| handle == evidence_id) {
+            existing.source_handles.push(evidence_id.to_owned());
+        }
+        return true;
+    }
+    if report.relations.len() >= request.max_relations {
+        return false;
+    }
+    if report.relations.iter().any(|relation| {
+        relation.from == from && relation.to == to && relation.kind == kind
+    }) {
+        report.conflicts.push(SemanticConflict {
+            subject: format!("{from}|{kind}|{to}"),
+            alternatives: vec![
+                "exact graph relation".to_owned(),
+                "historical LSP instrument observation".to_owned(),
+            ],
+            source_handles: vec![evidence_id.to_owned()],
+        });
+    }
+    report.relations.push(SemanticRelation {
+        from,
+        to,
+        kind: kind.to_owned(),
+        authority: RelationAuthority::InstrumentObservation,
+        freshness: RelationFreshness::Stale,
+        coverage: RelationCoverage::Partial,
+        source_handles: vec![evidence_id.to_owned()],
+        dependencies: Vec::new(),
+        conflicts: Vec::new(),
+    });
+    true
+}
+
+fn lsp_span_coordinate(
+    workspace_root: &str,
+    path: &str,
+    symbol: Option<&str>,
+    line_zero_based: u32,
+    column_zero_based: u32,
+) -> GraphCoordinate {
+    GraphCoordinate {
+        kind: CoordinateKind::Span,
+        package: workspace_root.to_owned(),
+        path: Some(path.to_owned()),
+        symbol: symbol.map(str::to_owned),
+        line: Some(line_zero_based.saturating_add(1)),
+        column: Some(column_zero_based.saturating_add(1)),
+    }
+}
+
+fn add_lsp_node(
+    request: &CompositionRequest,
+    report: &mut CodeCortexReport,
+    node: GraphNode,
+    evidence_id: &str,
+) -> Result<bool, CodeCortexError> {
+    node.validate()
+        .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+    if let Some(existing) = report
+        .nodes
+        .iter()
+        .find(|existing| existing.coordinate == node.coordinate)
+    {
+        if existing.kind != node.kind || existing.label != node.label {
+            report.conflicts.push(SemanticConflict {
+                subject: node.coordinate.to_string(),
+                alternatives: vec![
+                    format!("existing graph node: {}", existing.kind),
+                    format!("LSP observation node: {}", node.kind),
+                ],
+                source_handles: vec![evidence_id.to_owned()],
+            });
+        }
+        return Ok(true);
+    }
+    if report.nodes.len() >= request.max_nodes {
+        return Ok(false);
+    }
+    let handle = node.coordinate.to_string();
+    let source_handle = node
+        .coordinate
+        .path
+        .clone()
+        .unwrap_or_else(|| node.coordinate.package.clone());
+    let label = node.label.clone().unwrap_or_else(|| node.kind.clone());
+    report.entrypoints.push(SemanticAnchor {
+        handle,
+        label,
+        source_handle,
+    });
+    report.nodes.push(node);
+    Ok(true)
 }
 
 fn add_edge(

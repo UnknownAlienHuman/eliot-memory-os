@@ -6,10 +6,9 @@
 //! owned by `eliot-blob` and its canonical owner.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
+use std::time::UNIX_EPOCH;
 use eliot_platform::WorkScopePath;
 
 use crate::{FileIdentity, PortError, ProtectedPathError, WindowsPlatform};
@@ -21,7 +20,9 @@ pub enum BlobFileStoreError {
     ReparsePoint,
     NotFound,
     AlreadyExists,
+    PreconditionFailed,
     UnsupportedPlatform,
+    Platform(BlobFileStorePlatformFailure),
     Io(String),
     UnknownPublication,
 }
@@ -33,7 +34,11 @@ impl std::fmt::Display for BlobFileStoreError {
             Self::ReparsePoint => formatter.write_str("Blob path crosses a reparse point"),
             Self::NotFound => formatter.write_str("Blob file was not found"),
             Self::AlreadyExists => formatter.write_str("Blob destination already exists"),
+            Self::PreconditionFailed => {
+                formatter.write_str("Blob compare-and-replace precondition failed")
+            }
             Self::UnsupportedPlatform => formatter.write_str("Blob file store requires Windows"),
+            Self::Platform(source) => write!(formatter, "Blob platform operation failed: {source}"),
             Self::Io(reason) => write!(formatter, "Blob file operation failed: {reason}"),
             Self::UnknownPublication => {
                 formatter.write_str("Blob replacement committed with an unknown outcome")
@@ -43,6 +48,43 @@ impl std::fmt::Display for BlobFileStoreError {
 }
 
 impl std::error::Error for BlobFileStoreError {}
+
+/// Preserves native failure categories and status across the physical Blob
+/// boundary rather than reducing Windows errors to formatted text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobFileStorePlatformFailure {
+    Port(PortError),
+    Protected(ProtectedPathError),
+    Directory(crate::DirectoryPublicationError),
+    WindowsAdapter(crate::WindowsAdapterError),
+    Native {
+        operation: &'static str,
+        status: u32,
+    },
+    SystemIo {
+        kind: std::io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+}
+
+impl std::fmt::Display for BlobFileStorePlatformFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Port(error) => write!(formatter, "path contract: {error}"),
+            Self::Protected(error) => write!(formatter, "protected path: {error}"),
+            Self::Directory(error) => write!(formatter, "directory operation: {error}"),
+            Self::WindowsAdapter(error) => write!(formatter, "Windows adapter: {error}"),
+            Self::Native { operation, status } => {
+                write!(formatter, "{operation} failed with status 0x{status:08X}")
+            }
+            Self::SystemIo { kind, raw_os_error } => {
+                write!(formatter, "system I/O {kind:?} (OS status {raw_os_error:?})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlobFileStorePlatformFailure {}
 
 /// Pinned Windows root used for physical Blob files.
 ///
@@ -69,9 +111,11 @@ impl BlobFileStore {
     /// Pins one existing absolute, non-reparse Blob root.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, BlobFileStoreError> {
         let platform = WindowsPlatform::new(root).map_err(map_port)?;
-        let root_path = platform.root.as_path();
-        let (root_identity, _root_handle) =
-            crate::open_no_follow_directory(root_path).map_err(map_protected)?;
+        let root_handle = platform._root_pin.try_clone().map_err(map_io)?;
+        if !root_handle.metadata().map_err(map_io)?.is_dir() {
+            return Err(BlobFileStoreError::InvalidPath);
+        }
+        let root_identity = crate::file_identity_for_open_handle(&root_handle).map_err(map_protected)?;
         Ok(Self {
             platform,
             root_identity,
@@ -99,28 +143,51 @@ impl BlobFileStore {
     /// delete rights inside the pinned root. Success is based on the complete
     /// observed create/read/delete round trip, never on a configured boolean.
     pub fn prove_root_permissions(&self) -> Result<(), BlobFileStoreError> {
-        static NEXT_PROBE: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
-        let sequence = NEXT_PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| BlobFileStoreError::Io(error.to_string()))?
-            .as_nanos();
-        let name = format!(
-            ".eliot-blob-owner-probe-{}-{now}-{sequence}.tmp",
-            std::process::id()
-        );
-        let path = WorkScopePath::new(name).map_err(|_| BlobFileStoreError::InvalidPath)?;
-        let sample = b"eliot-blob-root-permission-proof-v1";
-        self.create_new_durable(&path, sample)?;
-        let observed = self.read_bounded(&path, sample.len() as u64)?;
-        if observed != sample {
-            let _ = self.remove_durable(&path);
-            return Err(BlobFileStoreError::Io(
-                "Blob root permission probe readback differed".to_owned(),
-            ));
+        #[cfg(windows)]
+        {
+            let parent = self.pinned_root_directory()?;
+            let (_name, mut probe) = create_unique_sibling(&parent)?;
+            let identity = crate::file_identity_for_open_handle(&probe).map_err(map_protected)?;
+            let sample = b"eliot-blob-root-permission-proof-v1";
+            let proof = (|| {
+                ensure_regular_single_link(&probe)?;
+                probe.write_all(sample).map_err(map_io)?;
+                probe.sync_all().map_err(map_io)?;
+                crate::directory_publication::sync_directory_handle(&parent)
+                    .map_err(map_directory)?;
+                probe.seek(SeekFrom::Start(0)).map_err(map_io)?;
+                let mut observed = Vec::with_capacity(sample.len());
+                (&mut probe)
+                    .take(sample.len() as u64 + 1)
+                    .read_to_end(&mut observed)
+                    .map_err(map_io)?;
+                if observed != sample
+                    || crate::file_identity_for_open_handle(&probe).map_err(map_protected)?
+                        != identity
+                {
+                    return Err(BlobFileStoreError::Io(
+                        "Blob root permission probe readback differed".to_owned(),
+                    ));
+                }
+                Ok(())
+            })();
+            let removed = crate::delete_owned_file_handle(probe, identity).map_err(map_protected);
+            match (proof, removed) {
+                (Ok(()), Ok(())) => crate::directory_publication::sync_directory_handle(&parent)
+                    .map_err(map_directory),
+                (Err(error), Ok(())) => {
+                    let _ = crate::directory_publication::sync_directory_handle(&parent);
+                    Err(error)
+                }
+                (_, Err(_)) => Err(BlobFileStoreError::Io(
+                    "Blob root permission probe could not safely remove its owned file".to_owned(),
+                )),
+            }
         }
-        self.remove_durable(&path)
+        #[cfg(not(windows))]
+        {
+            Err(BlobFileStoreError::UnsupportedPlatform)
+        }
     }
 
     /// Loads or durably creates the purpose-specific S-04 receipt issuer key.
@@ -151,9 +218,9 @@ impl BlobFileStore {
             Ok(ciphertext) => self.open_receipt_issuer_key(&ciphertext, owner_identity),
             Err(BlobFileStoreError::NotFound) => {
                 let mut key = [0_u8; 32];
-                crate::fill_system_random(&mut key).map_err(|_| {
-                    BlobFileStoreError::Io(
-                        "Windows system CSPRNG could not issue the Blob issuer key".to_owned(),
+                crate::fill_system_random(&mut key).map_err(|error| {
+                    BlobFileStoreError::Platform(
+                        BlobFileStorePlatformFailure::WindowsAdapter(error),
                     )
                 })?;
                 let mut cleartext = match self.receipt_issuer_key_frame(owner_identity, &key) {
@@ -166,9 +233,11 @@ impl BlobFileStore {
                 let protected = self
                     .platform
                     .protect_secret(&cleartext)
-                    .map_err(|_| BlobFileStoreError::Io(
-                        "DPAPI could not protect the Blob issuer key".to_owned(),
-                    ));
+                    .map_err(|error| {
+                        BlobFileStoreError::Platform(
+                            BlobFileStorePlatformFailure::WindowsAdapter(error),
+                        )
+                    });
                 cleartext.fill(0);
                 let protected = match protected {
                     Ok(protected) => protected,
@@ -209,9 +278,9 @@ impl BlobFileStore {
         let cleartext = self
             .platform
             .unprotect_secret(&protected)
-            .map_err(|_| BlobFileStoreError::Io(
-                "DPAPI could not open the Blob issuer key".to_owned(),
-            ))?;
+            .map_err(|error| {
+                BlobFileStoreError::Platform(BlobFileStorePlatformFailure::WindowsAdapter(error))
+            })?;
         let header = self.receipt_issuer_key_header(owner_identity)?;
         let expected_len = header
             .len()
@@ -263,6 +332,18 @@ impl BlobFileStore {
         path: &WorkScopePath,
         max_bytes: u64,
     ) -> Result<Vec<u8>, BlobFileStoreError> {
+        self.read_bounded_with_identity(path, max_bytes)
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// Reads bounded bytes and returns the identity of the exact no-follow
+    /// object held throughout the read. Callers that later mutate the path
+    /// must retain this identity as their compare-and-replace precondition.
+    pub fn read_bounded_with_identity(
+        &self,
+        path: &WorkScopePath,
+        max_bytes: u64,
+    ) -> Result<(Vec<u8>, FileIdentity), BlobFileStoreError> {
         if max_bytes == 0 {
             return Err(BlobFileStoreError::InvalidPath);
         }
@@ -299,7 +380,7 @@ impl BlobFileStore {
                     "bounded Blob read exceeded its exact object".to_owned(),
                 ));
             }
-            Ok(bytes)
+            Ok((bytes, identity))
         }
         #[cfg(not(windows))]
         {
@@ -355,6 +436,118 @@ impl BlobFileStore {
         match self.platform.publish_atomic(path, bytes).map_err(map_port)? {
             crate::PublicationOutcome::Published(_) => Ok(()),
             crate::PublicationOutcome::Unknown(_) => Err(BlobFileStoreError::UnknownPublication),
+        }
+    }
+
+    /// Replaces a regular file only when its identity and digest still match
+    /// the values observed by the caller. The original no-follow handle is
+    /// retained, denies concurrent writers, and remains live through the
+    /// handle-relative atomic rename and parent-directory flush.
+    pub fn replace_durable_if_matches(
+        &self,
+        path: &WorkScopePath,
+        expected_identity: FileIdentity,
+        expected_sha256: &str,
+        bytes: &[u8],
+    ) -> Result<(), BlobFileStoreError> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            };
+
+            if !valid_sha256(expected_sha256) {
+                return Err(BlobFileStoreError::InvalidPath);
+            }
+            let parent = self.pin_existing_parent(path)?;
+            let mut original = match open_file_relative(
+                &parent,
+                path_leaf(path)?,
+                FILE_GENERIC_READ | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
+            ) {
+                Ok(file) => file,
+                Err(BlobFileStoreError::NotFound) => {
+                    return Err(BlobFileStoreError::PreconditionFailed);
+                }
+                Err(error) => return Err(error),
+            };
+            ensure_regular_single_link(&original)?;
+            if crate::file_identity_for_open_handle(&original).map_err(map_protected)?
+                != expected_identity
+                || digest_open_file(&original)? != expected_sha256.to_ascii_lowercase()
+            {
+                return Err(BlobFileStoreError::PreconditionFailed);
+            }
+
+            let (_temporary_name, mut temporary) = create_unique_sibling(&parent)?;
+            let temporary_identity = crate::file_identity_for_open_handle(&temporary)
+                .map_err(map_protected)?;
+            let stage_result = (|| {
+                ensure_regular_single_link(&temporary)?;
+                temporary.write_all(bytes).map_err(map_io)?;
+                temporary.sync_all().map_err(map_io)?;
+                if crate::file_identity_for_open_handle(&temporary).map_err(map_protected)?
+                    != temporary_identity
+                {
+                    return Err(BlobFileStoreError::InvalidPath);
+                }
+                // Recheck the retained original immediately before the atomic
+                // name operation. Its open handle also prevents write opens.
+                if crate::file_identity_for_open_handle(&original).map_err(map_protected)?
+                    != expected_identity
+                    || digest_open_file(&original)? != expected_sha256.to_ascii_lowercase()
+                {
+                    return Err(BlobFileStoreError::PreconditionFailed);
+                }
+                Ok(())
+            })();
+
+            if let Err(error) = stage_result {
+                // Before the rename succeeds the temporary name is still ours;
+                // delete only the exact object created above. Once rename
+                // succeeds, subsequent failures are an unknown publication.
+                let cleanup = crate::delete_owned_file_handle(
+                    temporary,
+                    temporary_identity,
+                );
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(_) => Err(BlobFileStoreError::UnknownPublication),
+                };
+            }
+
+            // Treat every native rename failure as an unknown outcome. The
+            // held temporary handle might already name the published target,
+            // so cleanup by handle could otherwise delete committed data.
+            if native_replace_from_handle(&temporary, &parent, path_leaf(path)?).is_err() {
+                return Err(BlobFileStoreError::UnknownPublication);
+            }
+
+            if crate::directory_publication::sync_directory_handle(&parent).is_err() {
+                return Err(BlobFileStoreError::UnknownPublication);
+            }
+            let published = match open_file_relative(
+                &parent,
+                path_leaf(path)?,
+                FILE_GENERIC_READ,
+                FILE_SHARE_READ,
+            ) {
+                Ok(file) => file,
+                Err(_) => return Err(BlobFileStoreError::UnknownPublication),
+            };
+            if ensure_regular_single_link(&published).is_err()
+                || crate::file_identity_for_open_handle(&published)
+                    .map_or(true, |identity| identity != temporary_identity)
+            {
+                return Err(BlobFileStoreError::UnknownPublication);
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (path, expected_identity, expected_sha256, bytes);
+            Err(BlobFileStoreError::UnsupportedPlatform)
         }
     }
 
@@ -693,6 +886,13 @@ unsafe extern "system" {
         ea_buffer: *mut std::ffi::c_void,
         ea_length: u32,
     ) -> i32;
+    fn NtSetInformationFile(
+        file_handle: windows_sys::Win32::Foundation::HANDLE,
+        io_status_block: *mut BlobNativeIoStatusBlock,
+        file_information: *mut std::ffi::c_void,
+        length: u32,
+        file_information_class: i32,
+    ) -> i32;
 }
 
 #[cfg(windows)]
@@ -814,7 +1014,10 @@ fn nt_open_relative(
             BLOB_STATUS_OBJECT_NAME_NOT_FOUND | BLOB_STATUS_OBJECT_PATH_NOT_FOUND => {
                 BlobFileStoreError::NotFound
             }
-            _ => BlobFileStoreError::Io("handle-relative Blob file open failed".to_owned()),
+            _ => BlobFileStoreError::Platform(BlobFileStorePlatformFailure::Native {
+                operation: "NtCreateFile",
+                status: status as u32,
+            }),
         });
     }
     if raw.is_null() {
@@ -957,8 +1160,11 @@ fn walk_regular_files_handle(
             return Ok(());
         }
         if status < 0 {
-            return Err(BlobFileStoreError::Io(
-                "handle-relative Blob directory enumeration failed".to_owned(),
+            return Err(BlobFileStoreError::Platform(
+                BlobFileStorePlatformFailure::Native {
+                    operation: "NtQueryDirectoryFile",
+                    status: status as u32,
+                },
             ));
         }
         let available = usize::try_from(io_status.information)
@@ -1053,21 +1259,154 @@ fn native_rename_no_replace(
         .map_err(map_directory)
 }
 
+#[cfg(windows)]
+fn native_replace_from_handle(
+    source: &File,
+    destination_parent: &File,
+    leaf: &str,
+) -> Result<(), BlobFileStoreError> {
+    use std::os::windows::io::AsRawHandle;
+
+    validate_leaf(leaf)?;
+    let name = leaf.encode_utf16().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(BlobFileStoreError::InvalidPath)?;
+    let header_bytes = std::mem::size_of::<BlobNativeFileRenameInformation>()
+        .checked_sub(std::mem::size_of::<u16>())
+        .ok_or_else(|| BlobFileStoreError::Io("invalid native rename layout".to_owned()))?;
+    let total_bytes = header_bytes
+        .checked_add(name_bytes)
+        .ok_or_else(|| BlobFileStoreError::Io("native rename buffer overflow".to_owned()))?;
+    let word_count = total_bytes
+        .checked_add(std::mem::size_of::<usize>() - 1)
+        .ok_or_else(|| BlobFileStoreError::Io("native rename buffer overflow".to_owned()))?
+        / std::mem::size_of::<usize>();
+    let mut storage = vec![0_usize; word_count];
+    let information = storage.as_mut_ptr().cast::<BlobNativeFileRenameInformation>();
+    unsafe {
+        // SAFETY: the aligned storage has enough room for the native header
+        // and UTF-16 leaf; both handles remain live for the synchronous call.
+        (*information).replace_if_exists = 1;
+        (*information).padding = [0; 7];
+        (*information).root_directory = destination_parent.as_raw_handle().cast();
+        (*information).file_name_length =
+            u32::try_from(name_bytes).map_err(|_| BlobFileStoreError::InvalidPath)?;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (*information).file_name.as_mut_ptr(),
+            name.len(),
+        );
+    }
+    let mut io_status = BlobNativeIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let status = unsafe {
+        // SAFETY: `source` is our durable staged file, destination parent is
+        // pinned below the root, and the rename buffer is valid through call.
+        NtSetInformationFile(
+            source.as_raw_handle().cast(),
+            &raw mut io_status,
+            information.cast(),
+            u32::try_from(total_bytes)
+                .map_err(|_| BlobFileStoreError::InvalidPath)?,
+            10,
+        )
+    };
+    if status >= 0 {
+        Ok(())
+    } else {
+        Err(BlobFileStoreError::Platform(
+            BlobFileStorePlatformFailure::Native {
+                operation: "NtSetInformationFile(FileRenameInformation)",
+                status: status as u32,
+            },
+        ))
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct BlobNativeFileRenameInformation {
+    replace_if_exists: u8,
+    padding: [u8; 7],
+    root_directory: windows_sys::Win32::Foundation::HANDLE,
+    file_name_length: u32,
+    file_name: [u16; 1],
+}
+
+#[cfg(windows)]
+fn create_unique_sibling(parent: &File) -> Result<(String, File), BlobFileStoreError> {
+    for _ in 0..32 {
+        let mut random = [0_u8; 16];
+        crate::fill_system_random(&mut random).map_err(|error| {
+            BlobFileStoreError::Platform(BlobFileStorePlatformFailure::WindowsAdapter(error))
+        })?;
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let leaf = format!(".eliot-blob-cas-{suffix}.tmp");
+        match create_file_relative(parent, &leaf) {
+            Ok(file) => return Ok((leaf, file)),
+            Err(BlobFileStoreError::AlreadyExists) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(BlobFileStoreError::AlreadyExists)
+}
+
+#[cfg(windows)]
+fn digest_open_file(file: &mut File) -> Result<String, BlobFileStoreError> {
+    use sha2::{Digest, Sha256};
+
+    let identity_before = crate::file_identity_for_open_handle(file).map_err(map_protected)?;
+    let length_before = file.metadata().map_err(map_io)?.len();
+    file.seek(SeekFrom::Start(0)).map_err(map_io)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read_total = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).map_err(map_io)?;
+        if count == 0 {
+            break;
+        }
+        read_total = read_total
+            .checked_add(count as u64)
+            .ok_or(BlobFileStoreError::InvalidPath)?;
+        digest.update(&buffer[..count]);
+    }
+    if read_total != length_before
+        || file.metadata().map_err(map_io)?.len() != length_before
+        || crate::file_identity_for_open_handle(file).map_err(map_protected)? != identity_before
+    {
+        return Err(BlobFileStoreError::PreconditionFailed);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(windows)]
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn map_io(error: std::io::Error) -> BlobFileStoreError {
     match error.kind() {
         std::io::ErrorKind::NotFound => BlobFileStoreError::NotFound,
         std::io::ErrorKind::AlreadyExists => BlobFileStoreError::AlreadyExists,
-        std::io::ErrorKind::PermissionDenied => {
-            BlobFileStoreError::Io("permission denied".to_owned())
-        }
-        _ => BlobFileStoreError::Io(error.to_string()),
+        kind => BlobFileStoreError::Platform(BlobFileStorePlatformFailure::SystemIo {
+            kind,
+            raw_os_error: error.raw_os_error(),
+        }),
     }
 }
 
 fn map_port(error: PortError) -> BlobFileStoreError {
     match error {
         PortError::InvalidPath => BlobFileStoreError::InvalidPath,
-        _ => BlobFileStoreError::Io(error.to_string()),
+        _ => BlobFileStoreError::Platform(BlobFileStorePlatformFailure::Port(error)),
     }
 }
 
@@ -1076,7 +1415,7 @@ fn map_protected(error: ProtectedPathError) -> BlobFileStoreError {
         ProtectedPathError::InvalidPath => BlobFileStoreError::InvalidPath,
         ProtectedPathError::ReparsePoint => BlobFileStoreError::ReparsePoint,
         ProtectedPathError::UnsupportedPlatform => BlobFileStoreError::UnsupportedPlatform,
-        _ => BlobFileStoreError::Io("protected no-follow file operation failed".to_owned()),
+        error => BlobFileStoreError::Platform(BlobFileStorePlatformFailure::Protected(error)),
     }
 }
 
@@ -1089,6 +1428,6 @@ fn map_directory(error: crate::DirectoryPublicationError) -> BlobFileStoreError 
         crate::DirectoryPublicationError::UnsupportedPlatform => {
             BlobFileStoreError::UnsupportedPlatform
         }
-        _ => BlobFileStoreError::Io("handle-relative directory operation failed".to_owned()),
+        error => BlobFileStoreError::Platform(BlobFileStorePlatformFailure::Directory(error)),
     }
 }

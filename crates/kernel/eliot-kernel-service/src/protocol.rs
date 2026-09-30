@@ -8,7 +8,8 @@ use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError};
 use eliot_process::{
     CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
-    ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
+    ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
+    ProcessStreamKind,
 };
 pub use eliot_protocol::AGENT_BRIDGE_MODULE_ID;
 use eliot_protocol::{
@@ -2367,6 +2368,238 @@ pub fn semantic_store_config_hash_from_json(
     })
 }
 
+/// Largest retained original stream accepted by the bounded readback API.
+pub const PROCESS_STREAM_READBACK_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum bytes returned by one original stream readback call.
+pub const PROCESS_STREAM_READ_CHUNK_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Authenticated bounded read request for one exact original process receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStreamReadRequest {
+    start_receipt: ProcessStartReceipt,
+    stream: ProcessStreamKind,
+    offset: u64,
+    max_bytes: u64,
+}
+
+impl ProcessStreamReadRequest {
+    /// Builds a bounded read request tied to the exact original start receipt.
+    pub fn new(
+        start_receipt: ProcessStartReceipt,
+        stream: ProcessStreamKind,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<Self, KernelServiceError> {
+        let value = Self {
+            start_receipt,
+            stream,
+            offset,
+            max_bytes,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Revalidates a deserialized request before dispatch.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.start_receipt
+            .validate()
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        if self.offset > PROCESS_STREAM_READBACK_MAX_BYTES {
+            return Err(KernelServiceError::InvalidField {
+                field: "stream_read.offset",
+                reason: "must not exceed the bounded retained-stream ceiling",
+            });
+        }
+        if self.max_bytes == 0 || self.max_bytes > PROCESS_STREAM_READ_CHUNK_MAX_BYTES {
+            return Err(KernelServiceError::InvalidField {
+                field: "stream_read.max_bytes",
+                reason: "must be within the bounded non-empty chunk ceiling",
+            });
+        }
+        Ok(())
+    }
+
+    /// Exact authenticated original start receipt.
+    pub const fn start_receipt(&self) -> &ProcessStartReceipt {
+        &self.start_receipt
+    }
+
+    /// Physical output stream to read.
+    pub const fn stream(&self) -> ProcessStreamKind {
+        self.stream
+    }
+
+    /// Zero-based offset into the original stream bytes.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Maximum bytes to return for this chunk.
+    pub const fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+}
+
+/// Owner-generated bounded chunk of complete original captured stream bytes.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStreamReadChunk {
+    operation_id: OperationId,
+    binding: ProcessExecutionBinding,
+    stream: ProcessStreamKind,
+    start_receipt_sha256: String,
+    stream_evidence_sha256: String,
+    observed_sha256: String,
+    observed_bytes: u64,
+    stream_eof: bool,
+    offset: u64,
+    bytes: Vec<u8>,
+    chunk_sha256: String,
+    chunk_eof: bool,
+}
+
+impl ProcessStreamReadChunk {
+    /// Constructs one chunk from authenticated Kernel owner observations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_owner_readback(
+        operation_id: OperationId,
+        binding: ProcessExecutionBinding,
+        stream: ProcessStreamKind,
+        start_receipt_sha256: String,
+        stream_evidence_sha256: String,
+        observed_sha256: String,
+        observed_bytes: u64,
+        stream_eof: bool,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Self, KernelServiceError> {
+        let chunk_sha256 = sha256_hex(&bytes);
+        let chunk_eof = offset
+            .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                KernelServiceError::InvalidField {
+                    field: "stream_read.bytes",
+                    reason: "length is outside the protocol range",
+                }
+            })?)
+            == Some(observed_bytes);
+        let value = Self {
+            operation_id,
+            binding,
+            stream,
+            start_receipt_sha256,
+            stream_evidence_sha256,
+            observed_sha256,
+            observed_bytes,
+            stream_eof,
+            offset,
+            bytes,
+            chunk_sha256,
+            chunk_eof,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Revalidates the chunk shape after wire deserialization.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        let bytes_len = u64::try_from(self.bytes.len()).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "stream_read.bytes",
+                reason: "length is outside the protocol range",
+            }
+        })?;
+        let end = self
+            .offset
+            .checked_add(bytes_len)
+            .ok_or(KernelServiceError::InvalidField {
+                field: "stream_read.offset",
+                reason: "chunk end overflowed",
+            })?;
+        if &self.operation_id != self.binding.operation_id()
+            || self.start_receipt_sha256.len() != 64
+            || self.stream_evidence_sha256.len() != 64
+            || self.observed_sha256.len() != 64
+            || self.chunk_sha256 != sha256_hex(&self.bytes)
+            || !self.stream_eof
+            || self.observed_bytes > PROCESS_STREAM_READBACK_MAX_BYTES
+            || self.offset > self.observed_bytes
+            || end > self.observed_bytes
+            || bytes_len > PROCESS_STREAM_READ_CHUNK_MAX_BYTES
+            || self.chunk_eof != (end == self.observed_bytes)
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "stream_read.chunk",
+                reason: "must bind a complete bounded original stream chunk",
+            });
+        }
+        for (field, value) in [
+            ("start_receipt_sha256", self.start_receipt_sha256.as_str()),
+            ("stream_evidence_sha256", self.stream_evidence_sha256.as_str()),
+            ("observed_sha256", self.observed_sha256.as_str()),
+            ("chunk_sha256", self.chunk_sha256.as_str()),
+        ] {
+            if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(KernelServiceError::InvalidField {
+                    field,
+                    reason: "must be a SHA-256 hex digest",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Original operation identity.
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    /// Exact original authority/session/fence binding.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
+    }
+    /// Stream selected by the original evidence.
+    pub const fn stream(&self) -> ProcessStreamKind {
+        self.stream
+    }
+    /// Canonical digest of the exact retained start receipt.
+    pub fn start_receipt_sha256(&self) -> &str {
+        &self.start_receipt_sha256
+    }
+    /// Canonical digest of the exact original stream evidence.
+    pub fn stream_evidence_sha256(&self) -> &str {
+        &self.stream_evidence_sha256
+    }
+    /// Original observed stream digest.
+    pub fn observed_sha256(&self) -> &str {
+        &self.observed_sha256
+    }
+    /// Original observed stream byte count.
+    pub const fn observed_bytes(&self) -> u64 {
+        self.observed_bytes
+    }
+    /// Whether the original process drain observed stream EOF.
+    pub const fn stream_eof(&self) -> bool {
+        self.stream_eof
+    }
+    /// Zero-based chunk offset.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+    /// Exact bytes in this bounded chunk.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    /// SHA-256 digest of this chunk's bytes.
+    pub fn chunk_sha256(&self) -> &str {
+        &self.chunk_sha256
+    }
+    /// Whether this chunk reaches the original stream length.
+    pub const fn chunk_eof(&self) -> bool {
+        self.chunk_eof
+    }
+}
+
 /// Closed Kernel process-execution operation set for authenticated clients.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "operation", content = "payload")]
@@ -2389,6 +2622,11 @@ pub enum ProcessExecutionRequest {
         /// Exact operation identity to reconcile.
         operation_id: OperationId,
     },
+    /// Read one bounded chunk from a complete original captured stream.
+    ReadStream {
+        /// Receipt, stream and exact bounded offset request.
+        request: ProcessStreamReadRequest,
+    },
 }
 
 impl ProcessExecutionRequest {
@@ -2398,6 +2636,7 @@ impl ProcessExecutionRequest {
             Self::Start(request) => request
                 .validate()
                 .map_err(|error| KernelServiceError::Platform(error.to_string())),
+            Self::ReadStream { request } => request.validate(),
             Self::Inspect { operation_id }
             | Self::Cancel { operation_id }
             | Self::Reconcile { operation_id } => {
@@ -2416,6 +2655,7 @@ impl ProcessExecutionRequest {
     pub fn operation_id(&self) -> Option<&OperationId> {
         match self {
             Self::Start(request) => Some(request.intent().operation_id()),
+            Self::ReadStream { request } => Some(request.start_receipt().operation_id()),
             Self::Inspect { operation_id }
             | Self::Cancel { operation_id }
             | Self::Reconcile { operation_id } => Some(operation_id),
@@ -2442,6 +2682,8 @@ pub enum ProcessExecutionResponse {
     Cancelled(CancellationReceipt),
     /// Observation-only reconciliation evidence.
     Reconciled(ProcessEvidence),
+    /// Bounded bytes read from the exact original process capture owner.
+    StreamChunk(ProcessStreamReadChunk),
     /// Bounded provider-neutral rejection.
     Rejected(ProcessExecutionRejection),
 }

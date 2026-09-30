@@ -1,11 +1,10 @@
 //! C3 S-04 blob implementation over injected platform, codec, key, AEAD and
 //! canonical-live-set ports.
 //!
-//! This crate intentionally contains no direct filesystem or cryptographic
-//! implementation. The current P-01 filesystem surface cannot express
-//! durable create/replace/no-replace rename plus Windows reparse containment,
-//! so those exact obligations are represented by [`BlobPlatformPort`]. A
-//! composition lacking that adapter receives a typed `PLAN_GAP`.
+//! Filesystem and cryptographic effects are provided through typed ports. The
+//! production Windows physical adapter lives in `physical_ports` and delegates
+//! no-follow, durable filesystem operations to the platform-owned Blob file
+//! store. Tests continue to inject deterministic ports.
 //!
 //! # Ownership and concurrency
 //!
@@ -38,6 +37,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
+use eliot_contracts::StateFence;
 pub use eliot_blob_api::{
     BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
     BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
@@ -52,6 +52,7 @@ pub use backup_io::{
 };
 pub mod demand;
 pub mod key_ports;
+mod physical_ports;
 pub mod publication_owner;
 pub mod stream_sink;
 pub use demand::{
@@ -70,12 +71,13 @@ use eliot_blob_api::{
     SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path,
     verify_receipt,
 };
-use eliot_platform::WorkScopePath;
+use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_receipts::{
     ArtifactBinding, OperationId, ProofCeiling, Receipt, ReceiptCore, ReceiptDisposition,
-    ReceiptKind, contract_identity,
+    ReceiptKind, RequestBinding, contract_identity,
 };
 pub use key_ports::{DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION};
+pub use physical_ports::{WindowsBlobPlatform, ZstdBlobCompression};
 pub use publication_owner::{BlobArchivePublicationBinding, BlobArchivePublicationOwner};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -113,6 +115,9 @@ pub struct BlobRootOwner {
     owner_id: BlobId,
     process_id: u32,
     claim_id: String,
+    /// Store/Kernel lifecycle fence that admitted this physical root claim.
+    /// Reference/test owners may omit it; production service leases cannot.
+    lifecycle_fence: Option<StateFence>,
     /// Normalized configured-root key shared with the service claim path.
     /// [`owns_service_root`] is the only public comparison over it.
     registry_key: String,
@@ -303,6 +308,7 @@ impl fmt::Debug for BlobRootOwner {
             .field("owner_id", &self.owner_id)
             .field("process_id", &self.process_id)
             .field("claim_id", &self.claim_id)
+            .field("lifecycle_fence", &self.lifecycle_fence)
             .field("registry_key", &self.registry_key)
             .field("lease", &self.lease)
             .finish()
@@ -315,6 +321,7 @@ impl PartialEq for BlobRootOwner {
             && self.owner_id == other.owner_id
             && self.process_id == other.process_id
             && self.claim_id == other.claim_id
+            && self.lifecycle_fence == other.lifecycle_fence
     }
 }
 
@@ -329,6 +336,35 @@ impl BlobRootOwner {
         root_id: impl Into<String>,
         owner_id: impl Into<String>,
         process_id: u32,
+    ) -> Result<Self, BlobError> {
+        Self::claim_inner(root_id, owner_id, process_id, None)
+    }
+
+    /// Claims one root and binds it to the exact admitted Store/Kernel
+    /// lifecycle fence. Production compositions use this constructor so the
+    /// root generation is derived from its real launch owner, not a literal.
+    pub fn claim_with_lifecycle_fence(
+        root_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        process_id: u32,
+        lifecycle_fence: StateFence,
+    ) -> Result<Self, BlobError> {
+        lifecycle_fence
+            .validate()
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        Self::claim_inner(
+            root_id,
+            owner_id,
+            process_id,
+            Some(lifecycle_fence),
+        )
+    }
+
+    fn claim_inner(
+        root_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        process_id: u32,
+        lifecycle_fence: Option<StateFence>,
     ) -> Result<Self, BlobError> {
         let configured_root = root_id.into();
         if configured_root.trim().is_empty()
@@ -418,6 +454,7 @@ impl BlobRootOwner {
             owner_id,
             process_id,
             claim_id,
+            lifecycle_fence,
             registry_key,
             lease,
         })
@@ -452,6 +489,59 @@ impl BlobRootOwner {
     #[must_use]
     pub fn owns_service_root(&self, lease_root_id: &str) -> bool {
         ownership_key(lease_root_id) == self.registry_key
+    }
+
+    /// Issues a request-bound service lease from the original authenticated
+    /// Store/Kernel request binding and this retained OS root claim.
+    ///
+    /// The caller supplies the exact binding already admitted for the
+    /// operation. This owner copies its state fence and request identity; it
+    /// never accepts a root identity or generation from an untrusted Blob
+    /// payload. A missing/failed OS lease heartbeat or a malformed or
+    /// mismatched request refuses issuance.
+    pub fn lease_for_request(
+        &self,
+        request: &RequestBinding,
+    ) -> Result<BlobRootLease, BlobError> {
+        if self.heartbeat_failure().is_some() {
+            return Err(BlobError::OwnerConflict);
+        }
+        request
+            .metadata
+            .validate()
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        request
+            .state_fence
+            .validate()
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        if request.metadata.state_fence != request.state_fence {
+            return Err(BlobError::StaleFence);
+        }
+        if self.lifecycle_fence.as_ref() != Some(&request.state_fence) {
+            return Err(BlobError::StaleFence);
+        }
+        let root_generation = request.state_fence.resource_generation.value();
+        if root_generation == 0 {
+            return Err(BlobError::StaleFence);
+        }
+        let root_id = PlatformHandle::new(self.root_id.clone())
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let lease_id = BlobId::new(format!(
+            "request-{}",
+            request.metadata.request_id.as_str()
+        ))?;
+        let lease = BlobRootLease {
+            root_id,
+            owner_id: self.owner_id.clone(),
+            lease_id,
+            root_generation,
+            fence_binding: request.clone(),
+        };
+        lease.validate()?;
+        if !self.owns_service_root(lease.root_id.as_str()) {
+            return Err(BlobError::OwnerConflict);
+        }
+        Ok(lease)
     }
 
     /// Returns the last bounded heartbeat failure observed by the native lease

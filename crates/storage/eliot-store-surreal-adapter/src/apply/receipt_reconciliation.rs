@@ -143,9 +143,18 @@ pub(crate) async fn read_receipt(
     adapter: &SurrealStoreAdapter,
     operation_id: OperationId,
 ) -> Result<Option<WriteReceipt>, AdapterError> {
+    Ok(read_receipt_with_causal(adapter, operation_id)
+        .await?
+        .map(|(receipt, _)| receipt))
+}
+
+pub(crate) async fn read_receipt_with_causal(
+    adapter: &SurrealStoreAdapter,
+    operation_id: OperationId,
+) -> Result<Option<(WriteReceipt, eliot_store_api::CausalBinding)>, AdapterError> {
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
-    read_receipt_by_operation(db, &adapter.config, &operation_id).await
+    read_receipt_with_causal_by_operation(db, &adapter.config, &operation_id).await
 }
 
 pub(super) async fn read_receipt_by_operation(
@@ -153,6 +162,16 @@ pub(super) async fn read_receipt_by_operation(
     config: &SurrealAdapterConfig,
     operation_id: &OperationId,
 ) -> Result<Option<WriteReceipt>, AdapterError> {
+    Ok(read_receipt_with_causal_by_operation(db, config, operation_id)
+        .await?
+        .map(|(receipt, _)| receipt))
+}
+
+pub(super) async fn read_receipt_with_causal_by_operation(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation_id: &OperationId,
+) -> Result<Option<(WriteReceipt, eliot_store_api::CausalBinding)>, AdapterError> {
     let mut bindings = Map::new();
     bindings.insert("table".to_owned(), json!(schema::table::WRITE_RECEIPT));
     bindings.insert("key".to_owned(), json!(operation_id.to_string()));
@@ -172,8 +191,9 @@ pub(super) async fn read_receipt_by_operation(
         if receipt.require_reconciliation_envelope()?.core.causal != *causal.binding() {
             return Err(AdapterError::Store(StoreError::InvalidReceipt));
         }
+        return Ok(Some((receipt.clone(), causal.binding().clone())));
     }
-    Ok(receipt)
+    Ok(None)
 }
 
 /// Resolves durable idempotency state for one exact admitted transition

@@ -10,12 +10,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{
-    ArtifactId, ContractId, ResourceGeneration, SourceId, TaskId, TransactionSequence,
-};
+use eliot_contracts::{ArtifactId, ContractId, ResourceGeneration, SourceId, TaskId};
+use eliot_blob_api::{BlobLocator, BlobReadyReceipt};
 pub use eliot_contracts::{
-    ContractError, ContractVersion, ErrorCode, OperationId, PolicyRevision, RequestMetadata,
-    StateFence, canonical_json_bytes, sha256_hex,
+    ContractError, ContractVersion, ErrorCode, OperationId, PolicyRevision, ReceiptId,
+    RequestMetadata, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex,
 };
 pub use eliot_learning_contracts::{CampaignLearningStateView, LearningStateViewRecipe, OwnerId};
 pub use eliot_learning_contracts::{
@@ -25,11 +24,11 @@ pub use eliot_learning_contracts::{
 };
 use eliot_reactive_context_plan::RetrievalPlan;
 use eliot_receipts::{
-    ArtifactBinding, AuthorityBinding, CausalBinding, OperationBinding, ProofCeiling, ReceiptCore,
+    ArtifactBinding, AuthorityBinding, OperationBinding, ProofCeiling, ReceiptCore,
     ReceiptDisposition, ReceiptKind, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding,
     contract_identity as receipt_contract_identity,
 };
-pub use eliot_receipts::{EffectClass, ReceiptEnvelope};
+pub use eliot_receipts::{CausalBinding, EffectClass, ReceiptEnvelope};
 pub use eliot_security_contracts::{
     DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState, PurgeLedgerEntry,
     RevocationReason, SelectionChainHead, SelectionChainSeal, SelectionIntegrityReceipt,
@@ -4196,6 +4195,101 @@ pub struct NamedMutationRequest {
     pub parameters: BTreeMap<String, Value>,
 }
 
+/// Exact non-authoritative Blob pointer retained with one captured observation.
+///
+/// The locator and metadata identities are copied only from the original
+/// non-deserializable `BlobReadyReceipt` returned by the Blob owner. This
+/// compact pointer lets the canonical capture row locate the complete original
+/// immutable bytes; it is not itself a read capability or a Blob receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedBlobPayloadRefV1 {
+    /// Closed payload-reference schema version.
+    pub schema_version: u16,
+    /// Consumer-owned schema label for the exact Blob content.
+    pub receipt_kind: String,
+    /// Content identity and full residency/path generation.
+    pub locator: BlobLocator,
+    /// Exact metadata identity returned by the Blob owner.
+    pub metadata_sha256: String,
+    /// Receipt identity returned by the Blob owner when the bytes were staged.
+    pub ready_receipt_id: String,
+    /// Exact uncompressed bytes length authenticated by the Blob receipt.
+    pub plaintext_length: u64,
+    /// Exact uncompressed bytes SHA-256 authenticated by the Blob receipt.
+    pub plaintext_sha256: String,
+}
+
+impl CapturedBlobPayloadRefV1 {
+    /// Copies the payload locator from the non-deserializable receipt produced
+    /// by the Blob owner after durable staging.
+    pub fn from_ready_receipt(
+        receipt_kind: impl Into<String>,
+        ready: &BlobReadyReceipt,
+    ) -> Result<Self, StoreError> {
+        ready.validate().map_err(|_| StoreError::InvalidField {
+            field: "capture.payload_ref",
+            reason: "Blob ready receipt failed validation",
+        })?;
+        let value = Self {
+            schema_version: 1,
+            receipt_kind: receipt_kind.into(),
+            locator: ready.locator().clone(),
+            metadata_sha256: ready.metadata_sha256().to_owned(),
+            ready_receipt_id: ready.receipt().identity.receipt_id.to_string(),
+            plaintext_length: ready.plaintext_length(),
+            plaintext_sha256: ready.plaintext_sha256().to_owned(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Revalidates the closed pointer whenever it crosses a canonical-store
+    /// boundary. The actual Blob read still requires a fresh owner-issued
+    /// `BlobReadRequest` and the Blob owner's retained root lease.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        let invalid = || StoreError::InvalidField {
+            field: "capture.payload_ref",
+            reason: "payload reference is invalid",
+        };
+        if self.schema_version != 1
+            || self.receipt_kind.trim().is_empty()
+            || self.receipt_kind.chars().any(char::is_control)
+            || self.ready_receipt_id.trim().is_empty()
+            || self.ready_receipt_id.chars().any(char::is_control)
+            || self.plaintext_length == 0
+        {
+            return Err(invalid());
+        }
+        self.locator.validate().map_err(|_| invalid())?;
+        for digest in [&self.metadata_sha256, &self.plaintext_sha256] {
+            if digest.len() != 64
+                || digest
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Decodes the optional pointer on one already-authorized capture parameter
+/// map. This returns identity only; a consumer must fetch the bytes from the
+/// single Blob owner with a fresh operation-bound read request.
+pub fn decode_captured_blob_payload_ref(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<Option<CapturedBlobPayloadRefV1>, StoreError> {
+    let Some(value) = parameters.get("payload_ref") else {
+        return Ok(None);
+    };
+    let reference: CapturedBlobPayloadRefV1 = serde_json::from_value(value.clone())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    reference.validate()?;
+    Ok(Some(reference))
+}
+
 impl NamedMutationRequest {
     /// Validates the closed operation and canonical parameter map.
     pub fn validate(&self) -> Result<(), StoreError> {
@@ -5772,22 +5866,94 @@ impl WriteReceipt {
     }
 }
 
-/// Issues the one store-owned receipt envelope for a planned committed write.
-///
-/// The adapters call this after deriving the complete top-level receipt and
-/// before sending their atomic transaction.  The envelope binds the exact
-/// request metadata, prepared transition, derived plan fields and durable
-/// commit sequence.  No caller-provided envelope is accepted, and no clock or
-/// environment value is consulted while issuing it.
+/// A canonical write receipt paired with the owner-projected causal facts
+/// read independently from the same canonical Store history. This is a
+/// transport projection, not an authority token; consumers must validate it
+/// against their admitted request before relying on the receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CausalWriteReceipt {
+    pub receipt: WriteReceipt,
+    pub causal: CausalBinding,
+}
+
+impl CausalWriteReceipt {
+    /// Constructs the pair only when the owner projection agrees with the
+    /// committed sequence, receipt state fence, and immutable envelope.
+    pub fn new(receipt: WriteReceipt, causal: CausalBinding) -> Result<Self, StoreError> {
+        validate_causal_write_receipt(&receipt, &causal)?;
+        Ok(Self { receipt, causal })
+    }
+
+    /// Revalidates the complete pair at a consumer boundary.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_causal_write_receipt(&self.receipt, &self.causal)
+    }
+}
+
+/// Validates an owner-supplied causal projection without deriving it from
+/// the receipt envelope being checked.
+pub fn validate_causal_write_receipt(
+    receipt: &WriteReceipt,
+    causal: &CausalBinding,
+) -> Result<(), StoreError> {
+    receipt.validate()?;
+    let envelope = receipt.require_reconciliation_envelope()?;
+    if committed_receipt_sequence(receipt)? != causal.transaction_sequence.value()
+        || receipt.state_fence != causal.state_fence
+        || envelope.core.causal != *causal
+    {
+        return Err(StoreError::InvalidReceipt);
+    }
+    Ok(())
+}
+
+/// Genesis-only compatibility entrypoint for a single-transaction store.
+/// Later commits must use [`issue_store_receipt_envelope_with_causal`] with
+/// the causal projection read from their canonical transaction owner.
 pub fn issue_store_receipt_envelope(
     context: &RequestMeta,
     transition: &PreparedTransition,
     receipt: &WriteReceipt,
     commit_sequence: u64,
 ) -> Result<ReceiptEnvelope, StoreError> {
+    if commit_sequence != 1 {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let causal = CausalBinding {
+        state_fence: context.state_fence.clone(),
+        transaction_sequence: TransactionSequence::genesis(),
+        parent_receipt_id: None,
+        predecessor_receipt_ids: Vec::new(),
+    };
+    issue_store_receipt_envelope_with_causal(
+        context,
+        transition,
+        receipt,
+        commit_sequence,
+        &causal,
+    )
+}
+
+/// Issues a store-owned receipt envelope using causal facts independently
+/// read from the canonical transaction owner. The supplied binding must come
+/// from that owner; the envelope itself is never accepted as its own causal
+/// authority.
+pub fn issue_store_receipt_envelope_with_causal(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    receipt: &WriteReceipt,
+    commit_sequence: u64,
+    causal: &CausalBinding,
+) -> Result<ReceiptEnvelope, StoreError> {
     validate_receipt_inputs(context, transition, receipt, commit_sequence)?;
 
     let state_fence = context.state_fence.clone();
+    if causal.state_fence != state_fence
+        || causal.transaction_sequence.value() != commit_sequence
+    {
+        return Err(StoreError::InvalidReceipt);
+    }
     let task = receipt_task(context, transition, &state_fence)?;
     let session = receipt_session(context, &state_fence);
     let artifacts = receipt_artifacts(transition, receipt, commit_sequence)?;
@@ -5807,15 +5973,7 @@ pub fn issue_store_receipt_envelope(
         },
         task,
         session,
-        causal: CausalBinding {
-            state_fence: state_fence.clone(),
-            // Store commit order is bound by the plan artifact above.  The
-            // receipt causal chain remains a valid genesis chain because the
-            // current store plan has no authoritative predecessor receipt id.
-            transaction_sequence: TransactionSequence::genesis(),
-            parent_receipt_id: None,
-            predecessor_receipt_ids: Vec::new(),
-        },
+        causal: causal.clone(),
         request: RequestBinding {
             metadata: context.clone(),
             state_fence: state_fence.clone(),
@@ -5865,7 +6023,13 @@ pub fn issue_genesis_receipt_envelope(
     validate_genesis_receipt_shape(receipt)?;
     check_genesis_receipt_bindings(&transition, receipt)?;
     receipt.validate()?;
-    issue_store_receipt_envelope(context, &transition, receipt, commit_sequence)
+    let causal = CausalBinding {
+        state_fence: context.state_fence.clone(),
+        transaction_sequence: TransactionSequence::genesis(),
+        parent_receipt_id: None,
+        predecessor_receipt_ids: Vec::new(),
+    };
+    issue_store_receipt_envelope_with_causal(context, &transition, receipt, commit_sequence, &causal)
 }
 
 /// Validates a recovered genesis receipt against the canonical neutral
@@ -5879,7 +6043,13 @@ pub fn validate_genesis_receipt_envelope(
     validate_genesis_receipt_shape(receipt)?;
     check_genesis_receipt_bindings(&transition, receipt)?;
     receipt.validate()?;
-    validate_store_receipt_envelope(context, &transition, receipt)
+    let causal = CausalBinding {
+        state_fence: context.state_fence.clone(),
+        transaction_sequence: TransactionSequence::genesis(),
+        parent_receipt_id: None,
+        predecessor_receipt_ids: Vec::new(),
+    };
+    validate_store_receipt_envelope_with_causal(context, &transition, receipt, &causal)
 }
 
 /// Recomputes the expected issue-#18 receipt bindings for the genesis path
@@ -6077,21 +6247,40 @@ fn operation_kind(class: TransitionClass) -> &'static str {
     }
 }
 
-/// Rebuilds the store-owned envelope from a durable receipt and rejects any
-/// substitution, duplicate or payload/hash mismatch observed during replay.
-///
-/// The commit sequence is recovered only from the receipt's deterministic
-/// `committed_at` marker; malformed markers fail closed rather than falling
-/// back to a clock, environment or caller value.
+/// Genesis-only compatibility validator for a single-transaction store.
+/// Later commits must use [`validate_store_receipt_envelope_with_causal`] with
+/// a projection independently reread from the canonical owner.
 pub fn validate_store_receipt_envelope(
     context: &RequestMeta,
     transition: &PreparedTransition,
     receipt: &WriteReceipt,
 ) -> Result<(), StoreError> {
-    let commit_sequence = receipt_commit_sequence(receipt)?;
+    if committed_receipt_sequence(receipt)? != 1 {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let causal = CausalBinding {
+        state_fence: context.state_fence.clone(),
+        transaction_sequence: TransactionSequence::genesis(),
+        parent_receipt_id: None,
+        predecessor_receipt_ids: Vec::new(),
+    };
+    validate_store_receipt_envelope_with_causal(context, transition, receipt, &causal)
+}
+
+/// Rebuilds and validates an envelope using a causal projection independently
+/// reread from the canonical owner. In particular, this must not take
+/// `receipt.envelope.core.causal` as evidence for the expected value.
+pub fn validate_store_receipt_envelope_with_causal(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    receipt: &WriteReceipt,
+    causal: &CausalBinding,
+) -> Result<(), StoreError> {
+    let commit_sequence = committed_receipt_sequence(receipt)?;
     let mut candidate = receipt.clone();
     candidate.envelope = None;
-    let expected = issue_store_receipt_envelope(context, transition, &candidate, commit_sequence)?;
+    let expected =
+        issue_store_receipt_envelope_with_causal(context, transition, &candidate, commit_sequence, causal)?;
     match receipt.envelope.as_ref() {
         Some(actual) if actual == &expected => Ok(()),
         Some(_) => Err(StoreError::InvalidReceipt),
@@ -6099,7 +6288,9 @@ pub fn validate_store_receipt_envelope(
     }
 }
 
-fn receipt_commit_sequence(receipt: &WriteReceipt) -> Result<u64, StoreError> {
+/// Reads the canonical transaction number from a committed Store receipt.
+/// Malformed or missing markers fail closed.
+pub fn committed_receipt_sequence(receipt: &WriteReceipt) -> Result<u64, StoreError> {
     let value = receipt
         .committed_at
         .as_deref()
@@ -6505,6 +6696,21 @@ pub trait CanonicalStoreClient: Send + Sync {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError>;
 
+    /// Applies one prepared transition and returns the immutable receipt with
+    /// the canonical owner’s independently projected causal binding. Clients
+    /// without that readback path refuse before performing a write; this
+    /// method never falls back to `apply_prepared` and then guesses causal
+    /// facts from the receipt envelope.
+    async fn apply_prepared_with_causal(
+        &self,
+        _ctx: &RequestMeta,
+        _transition: PreparedTransition,
+        _expected_revision_heads: Vec<RevisionHeadExpectation>,
+        _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<CausalWriteReceipt, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
     /// Applies one sealed reserved-write request through the existing
     /// authenticated Store path (issue #991).
     ///
@@ -6548,6 +6754,16 @@ pub trait CanonicalStoreClient: Send + Sync {
 
     /// Resolves a final receipt by operation identity.
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError>;
+    /// Resolves a final receipt and its independently reread canonical causal
+    /// binding by operation identity. A client without an owner readback
+    /// refuses rather than deriving the expected binding from the returned
+    /// envelope.
+    async fn receipt_with_causal(
+        &self,
+        _operation_id: OperationId,
+    ) -> Result<Option<CausalWriteReceipt>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
     /// Reads revision heads by stable key.
     async fn revision_heads(&self, keys: Vec<RevisionKey>)
     -> Result<Vec<RevisionHead>, StoreError>;

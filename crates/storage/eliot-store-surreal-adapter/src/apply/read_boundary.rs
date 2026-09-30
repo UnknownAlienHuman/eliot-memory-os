@@ -1188,7 +1188,8 @@ fn evidence_pack_payload(
     // receipt by operation_index.
     let mut ordered: Vec<&EvidenceReceiptRow> = rows.iter().collect();
     ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
-    let mut indexed: Vec<(u64, &EvidenceRecordRow)> = Vec::new();
+    let mut indexed: Vec<(u64, &EvidenceRecordRow, Option<eliot_store_api::TaskBinding>)> =
+        Vec::new();
     let mut operation_base: u64 = 0;
     for row in ordered {
         let mut records: Vec<&EvidenceRecordRow> = row
@@ -1198,8 +1199,8 @@ fn evidence_pack_payload(
         records.sort_by_key(|record| record.operation_index);
         // Legacy receipts without recoverable captures remain absent. A
         // recoverable capture without its admitted identity fails closed.
-        let in_scope = if records.is_empty() {
-            false
+        let (in_scope, task_binding) = if records.is_empty() {
+            (false, None)
         } else {
             let receipt = row.receipt.as_ref().ok_or(StoreError::InvalidReceipt)?;
             receipt.validate()?;
@@ -1211,13 +1212,24 @@ fn evidence_pack_payload(
             }
             // The validated receipt retains its original write fence. Read
             // freshness does not erase observations admitted under older fences.
-            binding.scope_id.as_str() == scope_id.as_str()
+            if binding.scope_id.as_str() == scope_id.as_str() {
+                (
+                    true,
+                    receipt
+                        .require_reconciliation_envelope()?
+                        .core
+                        .task
+                        .clone(),
+                )
+            } else {
+                (false, None)
+            }
         };
         for record in records {
             validate_evidence_record(row, record)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
             if in_scope {
-                indexed.push((capture_index, record));
+                indexed.push((capture_index, record, task_binding.clone()));
             }
         }
         operation_base =
@@ -1226,19 +1238,24 @@ fn evidence_pack_payload(
     // Exact subject match only — never substring, never a default.
     let matched: Vec<(u64, &EvidenceRecordRow)> = indexed
         .into_iter()
-        .filter(|(_, record)| record.subject == subject)
+        .filter(|(_, record, _)| record.subject == subject)
         .collect();
     let matched_total = matched.len();
     let records: Vec<Value> = matched
         .into_iter()
         .take(limit)
-        .map(|(capture_index, record)| {
+        .map(|(capture_index, record, task_binding)| {
             json!({
                 "capture_index": capture_index,
                 "operation": named_mutation_operation_name(
                     eliot_store_api::NamedMutationOperation::CaptureObservation,
                 ),
                 "parameters": record.parameters,
+                // This task binding is projected from the original validated
+                // canonical write receipt. A later task-scoped consumer can
+                // refuse cross-task retained blobs without interpreting the
+                // capture subject as authority.
+                "task_binding": task_binding,
             })
         })
         .collect();
