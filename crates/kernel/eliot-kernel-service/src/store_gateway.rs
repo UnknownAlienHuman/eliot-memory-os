@@ -2378,6 +2378,62 @@ impl KernelStoreGateway {
         }
     }
 
+    /// Durably records that one wake-horizon publication MAY ALREADY have been
+    /// handed to the schedule owner, and does so BEFORE the transport await that
+    /// could commit it (issue #2970).
+    ///
+    /// `Admitted` alone cannot carry that meaning on this contour: it is the very
+    /// same durable state the horizon path leaves behind when no schedule owner
+    /// was reachable, so a restart cannot distinguish a horizon the owner never
+    /// received from one it already retained. This advance therefore walks the
+    /// outbox's own mechanical progression to `Routed`, the state
+    /// `classify_retained_obligation` already reads as "the owner may already
+    /// have acted". Nothing here is ever moved backward out of that contour.
+    ///
+    /// The write lands before the first await, so a process death inside the
+    /// await window reloads as reconciling work rather than re-issuable
+    /// `Retained` work, and the later attempt must answer "did this possibly
+    /// happen?" from the owner itself under the ORIGINAL owner operation
+    /// identity instead of publishing the slice again.
+    fn mark_wake_horizon_obligation_possible_effect(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<(), String> {
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so the wake \
+                 horizon publication cannot be recorded as a possible owner effect"
+                    .to_owned(),
+            ));
+        };
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        for target in [HostRequestState::Admitted, HostRequestState::Routed] {
+            match ors.advance_host_request(&operation_id, &obligation.request_digest, target, None)
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(unretained_obligation_reason(
+                        obligation,
+                        "the retained horizon obligation record disappeared before its possible \
+                         owner effect could be recorded"
+                            .to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(unretained_obligation_reason(
+                        obligation,
+                        format!(
+                            "the wake horizon publication could not be advanced to {target:?} \
+                             before the schedule owner handoff: {error}"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Prepares one retained wake cancellation for its single owner handoff,
     /// and reports the unresolved phases to return when it cannot.
     ///
@@ -4889,14 +4945,16 @@ impl KernelStoreGateway {
     /// returns the obligation's final disposition beside the horizon phase the
     /// schedule owner produced.
     ///
-    /// The retained record is admitted durably before the request leaves this
-    /// boundary, so a lost response arms the anti-blind-retry fence on the
-    /// original owner operation identity instead of leaving an untracked possible
-    /// effect. The exact owner answer becomes the durable record's retained body,
+    /// The retained record is advanced to the monotonic `Routed` state BEFORE the
+    /// request leaves this boundary, so that state answers "may the schedule
+    /// owner already have retained this slice?" durably and from durable state
+    /// alone. The exact owner answer becomes the durable record's retained body,
     /// so a replay of this same parent operation serves it instead of publishing
-    /// the slice a second time. An owner that was never reachable leaves the
-    /// record admitted, because nothing was published and the effect may still be
-    /// issued under the same retained identity.
+    /// the slice a second time. Once the record is `Routed` no reported answer
+    /// makes it re-issuable: an owner that answers `Unavailable`, a typed refusal,
+    /// and a lost response all leave an obligation that must be reconciled under
+    /// its original owner operation identity, because a later read of the
+    /// committed configuration is empty of the effect either way.
     async fn issue_wake_horizon<R>(
         &self,
         obligation: &UserAutomationRuntimeObligation,
@@ -4936,7 +4994,13 @@ impl KernelStoreGateway {
                 ),
             ));
         };
-        if let Err(reason) = self.mark_user_automation_obligation_admitted(obligation) {
+        // Issue #2970: the durable possible-effect state is persisted BEFORE the
+        // awaited owner call, not after it. `Admitted` on its own cannot say the
+        // owner was never handed this slice, so the record is advanced to
+        // `Routed` first: a process death inside the await window then reloads
+        // as reconciling under this original owner operation identity rather than
+        // as work a later attempt would publish a second time.
+        if let Err(reason) = self.mark_wake_horizon_obligation_possible_effect(obligation) {
             reconcile(&reason);
             return Ok((
                 settled,
@@ -4977,14 +5041,22 @@ impl KernelStoreGateway {
                     )?,
                 ))
             }
-            // No schedule owner was reachable, so nothing was published. The
-            // intent stays durably retained under its owner operation identity
-            // and the effect may still be issued under it.
+            // The record is already durably `Routed`, which says the owner MAY
+            // have retained this slice. An owner that answers `Unavailable`
+            // after that point therefore does not restore the "never handed
+            // over" proof the record used to carry, so the obligation is
+            // reported under its original identity as unresolved and is never
+            // re-published from this contour.
             Err(UserAutomationRuntimeError::Unavailable(reason)) => {
-                settled.disposition = UserAutomationRuntimeObligationDisposition::Retained;
+                let detail = unretained_horizon_outcome_reason(
+                    &publication.automation_revision,
+                    &obligation.owner_operation_id,
+                    &reason,
+                );
+                reconcile(&detail);
                 Ok((
                     settled,
-                    unreached(UnreachedHorizonKind::Unavailable, &reason),
+                    unreached(UnreachedHorizonKind::UnknownOutcome, &detail),
                 ))
             }
             // The owner may have retained the slice and the answer was lost, so
