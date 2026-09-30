@@ -2209,15 +2209,14 @@ impl CanonicalVerifierExecutionFact {
         let executed = self.job_state == "succeeded"
             && self.receipt.execution == ExecutionStatus::Succeeded
             && self.verification_run.execution == ExecutionStatus::Succeeded;
-        let execution_status = if self.invocation.profile
-            != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
-        {
-            VerifierExecutionStatus::Simulated
-        } else if !executed {
-            VerifierExecutionStatus::NotExecuted
-        } else {
-            VerifierExecutionStatus::Executed
-        };
+        let execution_status =
+            if self.invocation.profile != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+                VerifierExecutionStatus::Simulated
+            } else if !executed {
+                VerifierExecutionStatus::NotExecuted
+            } else {
+                VerifierExecutionStatus::Executed
+            };
         let outcome = match self.verification_run.outcome {
             VerificationOutcome::Pass => VerifierRunOutcome::Pass,
             VerificationOutcome::Fail => VerifierRunOutcome::Fail,
@@ -2240,8 +2239,7 @@ impl CanonicalVerifierExecutionFact {
                         | EvidenceFreshness::ExactCommit
                         | EvidenceFreshness::ExactQuiescedWorktree
                 ) && evidence.coverage == EvidenceCoverage::CompleteForScope
-            })
-        {
+            }) {
             VerifierRunScope::Exact
         } else {
             VerifierRunScope::Stale
@@ -3002,6 +3000,83 @@ impl AcceptanceDenominatorError {
 /// being checked cannot declare a contract obligation verifier-free. A
 /// verification-class item with no joined test fails closed here rather than
 /// reaching the gate uncovered.
+/// Joins one acceptance obligation's mapped test IDs against the run's own
+/// recorded events.
+///
+/// The join reads the events this fact rehydrates, so the evidence references,
+/// the observed count and the pass state are all derived from the SAME run that
+/// the coverage row will cite. An empty result is a real answer — an unmapped or
+/// unexecuted obligation — and never a synthesised pass.
+struct MappedTestJoin {
+    /// Every evidence and artifact reference the joined events carried.
+    evidence_refs: BTreeSet<String>,
+    /// How many events the mapped test IDs actually matched.
+    mapped_events: usize,
+    /// Whether every mapped test ID was observed at least once.
+    all_mapped_observed: bool,
+    /// Whether every observed event reported `PASS`.
+    all_pass: bool,
+}
+
+/// Collects the evidence one mapped test set produced inside this run.
+fn join_mapped_test_events<'a>(
+    fact: &CanonicalVerifierExecutionFact,
+    mapped: impl IntoIterator<Item = &'a String>,
+) -> MappedTestJoin {
+    let mut evidence_refs = BTreeSet::new();
+    let mut mapped_events = 0_usize;
+    let mut all_mapped_observed = true;
+    let mut all_pass = true;
+    for test_id in mapped {
+        let test_events = fact
+            .verification_run
+            .evidence
+            .iter()
+            .filter(|event| {
+                event
+                    .value
+                    .get("nextest_test_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(test_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if test_events.is_empty() {
+            all_mapped_observed = false;
+        }
+        for event in test_events {
+            mapped_events += 1;
+            evidence_refs.insert(event.evidence_id.to_string());
+            evidence_refs.insert(event.raw_artifact_id.to_string());
+            if let Some(handles) = event
+                .value
+                .get("raw_artifact_handles")
+                .and_then(serde_json::Value::as_array)
+            {
+                evidence_refs.extend(
+                    handles
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+            if event
+                .value
+                .get("nextest_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("PASS")
+            {
+                all_pass = false;
+            }
+        }
+    }
+    MappedTestJoin {
+        evidence_refs,
+        mapped_events,
+        all_mapped_observed,
+        all_pass,
+    }
+}
+
 pub(crate) fn acceptance_coverage_from_verifier_fact(
     contract: &ContractAcceptanceDenominator,
     plan: &CanonicalPlanBinding,
@@ -3048,52 +3123,12 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
                 "rehydrated contract acceptance item carries no required-evidence class",
             )
         })?;
-        let mut evidence_refs = BTreeSet::new();
-        let mut mapped_events = 0_usize;
-        let mut all_mapped_observed = true;
-        let mut all_pass = true;
-        for test_id in &mapped {
-            let test_events = fact
-                .verification_run
-                .evidence
-                .iter()
-                .filter(|event| {
-                    event
-                        .value
-                        .get("nextest_test_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(test_id.as_str())
-                })
-                .collect::<Vec<_>>();
-            if test_events.is_empty() {
-                all_mapped_observed = false;
-            }
-            for event in test_events {
-                mapped_events += 1;
-                evidence_refs.insert(event.evidence_id.to_string());
-                evidence_refs.insert(event.raw_artifact_id.to_string());
-                if let Some(handles) = event
-                    .value
-                    .get("raw_artifact_handles")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    evidence_refs.extend(
-                        handles
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned),
-                    );
-                }
-                if event
-                    .value
-                    .get("nextest_status")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("PASS")
-                {
-                    all_pass = false;
-                }
-            }
-        }
+        let MappedTestJoin {
+            mut evidence_refs,
+            mapped_events,
+            all_mapped_observed,
+            all_pass,
+        } = join_mapped_test_events(fact, &mapped);
         if mapped_events == 0 {
             // Keep the negative item disposition tied to the actual raw run
             // artifacts inspected; never mint a placeholder item receipt.
@@ -3109,10 +3144,7 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
         // test executed and every bound execution passed. Failed, stale,
         // not-executed, simulated, unmapped, and non-test obligations stay
         // uncovered here and fail closed in `derive_finish_decision`.
-        let satisfied = run_certifies
-            && !mapped.is_empty()
-            && all_mapped_observed
-            && all_pass;
+        let satisfied = run_certifies && !mapped.is_empty() && all_mapped_observed && all_pass;
         let verifier_run_refs = if mapped_events == 0 {
             Vec::new()
         } else {
