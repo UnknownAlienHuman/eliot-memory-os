@@ -15,10 +15,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod handoff_persistence;
 mod integration_candidate;
 mod peer_communication;
 mod swarm_plan_attachment;
 mod work_lease_issuance;
+
+pub use handoff_persistence::{
+    HandoffPersistenceError, capture_handoff_checkpoint, handoff_checkpoint_ref_text,
+    reconcile_handoff_capture,
+};
 
 pub use integration_candidate::{
     IntegrationCandidate, IntegrationCandidateDraft, IntegrationCandidateReceipt,
