@@ -15,7 +15,7 @@
         -> the finalizer independently re-verifies R(C)
         -> install/readback verifies the original source approval and separately bound release candidate
 
-    Three defects are corrected here.
+    Four defects are corrected here.
 
     1. No tracked file is ever the approval instance. The pre-image digest of
        `GovernorRetirementApprovalV1` covers historical source C and its tree; the later release candidate D is
@@ -38,6 +38,13 @@
        tracked tree of C with a fixed rule set. The owner pins the verifier
        identity and the closure rule-set version, and any unclassified tracked
        reference to the retiring surface blocks approval.
+    #
+    #    4. Exact replay/conflict semantics (I5.27) are enforced, not merely
+    #    named. The replay record carries the canonical request digest (owner
+    #    evidence excluded), identical to the approval's admitted hash, so an
+    #    exact replay returns the same receipt; reusing one
+    #    (idempotency_namespace, operation_id) key with a different request
+    #    hash is APPROVAL_IDENTITY_CONFLICT and performs no transition.
 
     The issuer. Current `main` has no production release-retirement approval
     issuer, and the release retirement role is a semantic owner decision that
@@ -251,7 +258,7 @@ function Read-GovernorApprovalField([object]$Object, [string]$Name) {
     return $property.Value
 }
 
-function Read-GovernorApprovalFieldEx([object]$Object, [string]$Name) {
+function Get-GovernorApprovalFieldEx([object]$Object, [string]$Name) {
     return Get-GovernorApprovalDomainSeparatedLine $Name (Read-GovernorApprovalField $Object $Name)
 }
 
@@ -1740,6 +1747,7 @@ function New-GovernorRetirementApproval(
     [string]$ProductRemovalDecision,
     [string]$ReopenCondition,
     [string]$RollbackCondition,
+    [string]$ExpectedFreezeClosureDigest = '',
     [string]$OutputPath) {
     # Owner-side issuance of the detached GovernorRetirementApprovalV1 artifact
     # R(C) (issue #2968 Required design B, two-time workflow step 4). The issuer
@@ -1795,6 +1803,9 @@ function New-GovernorRetirementApproval(
     if ([string]$closure.status -cne 'COMPLETE') {
         $blocking = @(@($closure.unclassified_path_families) + @($closure.unclassified_paths) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
         throw "retirement approval issuance refuses an incomplete independent closure: $([string]::Join(', ', $blocking))"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedFreezeClosureDigest) -and $ExpectedFreezeClosureDigest.Trim().ToLowerInvariant() -cne [string]$closure.digest_sha256) {
+        throw "retirement approval issuance refuses a candidate whose independent closure differs from the prior freeze record for C (frozen=$($ExpectedFreezeClosureDigest.Trim()) recomputed=$([string]$closure.digest_sha256)); freeze candidate C first with New-GovernorRetirementCandidateFreeze, then issue R(C)"
     }
     $candidateTree = Get-GovernorRetirementCandidateTree $Repo $SourceCommit
     $normativePair = Get-GovernorRetirementNormativePairRevision $Repo $SourceCommit
@@ -2210,19 +2221,41 @@ function New-GovernorRetirementApprovalReference([object]$Binding, [string]$Appr
     }
 }
 
-function New-GovernorRetirementReplayRecord([object]$Reference, [object]$ApprovalBody) {
+function New-GovernorRetirementReplayRecord([object]$Reference, [object]$ApprovalBody, [object]$ExistingReplayRecord = $null) {
     # Exact owner-decision replay under one operation (issue #2968 step 11).
     # The unchanged v1 request hash covers historical source C and its approved
     # denominator, dispositions, target identity, policy revisions and
     # rollback/reopen conditions. It excludes owner evidence as before. The
     # later release candidate D is separately recorded in the release binding;
     # moving D changes that binding without re-issuing or re-digesting R(C).
-    $canonical = Get-GovernorApprovalCanonicalPreimage $ApprovalBody
+    # Exact I5.27 semantics: the same (idempotency_namespace, operation_id)
+    # with the same request hash replays the same receipt; the same key with a
+    # different request hash is APPROVAL_IDENTITY_CONFLICT and performs no
+    # transition. R(C) immutability itself rides the existing
+    # Authenticode/RFC3161 finalizer chain over the digest-bound bundle files;
+    # no second signing, MAC, digest or nonce scheme is defined here.
+    $namespace = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ApprovalBody 'idempotency_namespace'))
+    $operation = [string]$Reference.operation_id
+    $requestHash = Get-GovernorApprovalRequestDigest $ApprovalBody
+    if ($null -ne $ExistingReplayRecord) {
+        $existingNamespace = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ExistingReplayRecord 'idempotency_namespace'))
+        $existingOperation = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ExistingReplayRecord 'operation_id'))
+        $existingHash = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ExistingReplayRecord 'canonical_request_hash')).ToLowerInvariant()
+        if ($existingNamespace -ceq $namespace -and $existingOperation -ceq $operation) {
+            if ($existingHash -cne $requestHash.ToLowerInvariant()) {
+                throw "APPROVAL_IDENTITY_CONFLICT (idempotency key $namespace/$operation is reused with a different canonical request hash; no transition is performed)"
+            }
+            if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ExistingReplayRecord 'release_candidate_commit')) -ceq [string]$Reference.candidate_commit -and
+                (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ExistingReplayRecord 'release_candidate_tree')) -ceq [string]$Reference.candidate_tree) {
+                return $ExistingReplayRecord
+            }
+        }
+    }
     [ordered]@{
-        operation_id = [string]$Reference.operation_id
-        idempotency_namespace = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ApprovalBody 'idempotency_namespace'))
+        operation_id = $operation
+        idempotency_namespace = $namespace
         idempotency_retention_hours = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ApprovalBody 'idempotency_retention_hours'))
-        canonical_request_hash = (Get-GovernorApprovalSha256 $canonical)
+        canonical_request_hash = $requestHash
         approved_owner_candidate_commit = [string]$Reference.owner_candidate_commit
         approved_owner_candidate_tree = [string]$Reference.owner_candidate_tree
         release_candidate_commit = [string]$Reference.candidate_commit
