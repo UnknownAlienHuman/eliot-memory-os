@@ -26,6 +26,7 @@ use eliot_store_api::{
     CampaignSourcePublisher, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
     CampaignSourceRevisionRead, NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeId,
 };
+use eliot_workscope::ObservedScopeResources;
 use serde::Deserialize;
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,7 +34,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     DaemonComposition, KernelContextReadClient,
     daemon_kernel_client::{DaemonKernelClient, TaskControllerClaimedInvocation},
-    task_binding_admission::ObservedScopeResources,
 };
 
 /// Task Controller input fully decoded and all required campaign reads
