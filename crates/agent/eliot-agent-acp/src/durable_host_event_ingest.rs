@@ -1838,12 +1838,14 @@ impl DurableHostEventJournal {
             sequence,
         };
         if let Some(existing) = self.records.get(&(stream_id.to_owned(), sequence)) {
-            if existing.transport_hash.as_str() == hash_hex
-                && existing.envelope_digest == envelope_digest
-                && existing.requested_route_digest.as_ref() == requested_route_digest.as_ref()
-                && existing.actual_route_digest.as_ref() == actual_route_digest.as_ref()
-                && existing.route_evidence == route_evidence
-            {
+            if Self::staged_replay_identical(
+                existing,
+                &hash_hex,
+                &envelope_digest,
+                requested_route_digest.as_ref(),
+                actual_route_digest.as_ref(),
+                route_evidence.as_ref(),
+            ) {
                 return Ok(StageOutcome { key, fresh: false });
             }
             self.record_best_effort_drop(
@@ -1856,6 +1858,66 @@ impl DurableHostEventJournal {
             );
             return Err(IngestError::ConflictingDuplicate);
         }
+        self.insert_staged_record(
+            stream_id,
+            sequence,
+            transport_hash,
+            stored,
+            envelope,
+            envelope_digest,
+            requested_route_digest,
+            actual_route_digest,
+            route_evidence,
+            predecessors,
+            warnings,
+            transformation_version,
+            key,
+        )
+    }
+
+    /// Exact-replay identity for one stored record (issue #2645 W4): an
+    /// identical redelivery under one cursor is idempotent, while changed
+    /// route metadata under the same event identity is not — the retained
+    /// versioned route-evidence relation compares alongside the existing
+    /// transport/envelope/column commitment, so drift conflicts instead of
+    /// restaging silently.
+    fn staged_replay_identical(
+        existing: &DurableHostEventRecord,
+        hash_hex: &str,
+        envelope_digest: &LowercaseSha256,
+        requested_route_digest: Option<&LowercaseSha256>,
+        actual_route_digest: Option<&LowercaseSha256>,
+        route_evidence: Option<&CommittedRouteEvidenceRelation>,
+    ) -> bool {
+        existing.transport_hash.as_str() == hash_hex
+            && existing.envelope_digest == *envelope_digest
+            && existing.requested_route_digest.as_ref() == requested_route_digest
+            && existing.actual_route_digest.as_ref() == actual_route_digest
+            && existing.route_evidence.as_ref() == route_evidence
+    }
+
+    /// Fresh-record insertion for the shared staging core: stale-sequence,
+    /// adapter-identity, and capacity gates, then the staged insert. Never
+    /// advances a cursor. Idempotent replays never reach here (they return
+    /// above without storing), so capacity failures here always mean
+    /// genuinely new bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_staged_record(
+        &mut self,
+        stream_id: &str,
+        sequence: u64,
+        transport_hash: LowercaseSha256,
+        stored: StoredPayload,
+        envelope: NormalizedHostEventEnvelope,
+        envelope_digest: LowercaseSha256,
+        requested_route_digest: Option<LowercaseSha256>,
+        actual_route_digest: Option<LowercaseSha256>,
+        route_evidence: Option<CommittedRouteEvidenceRelation>,
+        predecessors: Vec<EventId>,
+        warnings: Vec<String>,
+        transformation_version: &str,
+        key: EventKey,
+    ) -> Result<StageOutcome, IngestError> {
         let durable = self
             .progress
             .get(stream_id)
