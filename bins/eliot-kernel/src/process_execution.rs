@@ -1252,6 +1252,19 @@ pub(crate) trait ProcessStartPorts {
         request: Self::Request,
         outer_binding: Option<&HostKernelCandidateBinding>,
     ) -> Result<Self::Receipt, ProcessExecutionError>;
+    /// Executes one admitted child start with a retained live stdin writer.
+    /// Ports that do not own this Windows transport fail closed instead of
+    /// silently falling back to a one-shot or closed stdin stream.
+    async fn execute_with_live_stdin(
+        &self,
+        _owner: &ProcessOwnerBinding,
+        _request: Self::Request,
+        _outer_binding: Option<&HostKernelCandidateBinding>,
+    ) -> Result<Self::Receipt, ProcessExecutionError> {
+        Err(ProcessExecutionError::Unavailable(
+            "live stdin is unavailable for this process-start port".to_owned(),
+        ))
+    }
     fn persist_completed(
         &self,
         operation_id: &eliot_process::OperationId,
@@ -1796,9 +1809,36 @@ impl ProcessExecutionGateway {
         path_proof: ProcessPathProof,
         outer_binding: HostKernelCandidateBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_with_stdin_mode(owner, admission, path_proof, outer_binding, false)
+            .await
+    }
+
+    /// Starts one admitted native-worker process with a retained live stdin
+    /// stream. This does not enqueue or synthesize an Execute request; a later
+    /// sender must present the exact facet-derived frame and operation identity.
+    #[cfg(windows)]
+    pub(crate) async fn start_with_live_stdin(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: ProcessExecutionAdmissionRequest,
+        path_proof: ProcessPathProof,
+        outer_binding: HostKernelCandidateBinding,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_with_stdin_mode(owner, admission, path_proof, outer_binding, true)
+            .await
+    }
+
+    async fn start_with_stdin_mode(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: ProcessExecutionAdmissionRequest,
+        path_proof: ProcessPathProof,
+        outer_binding: HostKernelCandidateBinding,
+        live_stdin: bool,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         // F-LOG-KERNEL-3 (#901): admitted-launch boundary. Reservation,
         // replay, fence, and executor handoff stay inside
-        // `run_process_start`; exactly one terminal is emitted per failed
+        // `run_process_start_mode`; exactly one terminal is emitted per failed
         // start, and an `UnknownOutcome` (possible launch/response loss)
         // keeps its unknown code instead of a committed-start claim.
         observe_process("kernel.process.start_requested", "attempt");
@@ -1813,12 +1853,13 @@ impl ProcessExecutionGateway {
             return Err(error);
         }
         let effect_operation_id = admission.intent().operation_id().clone();
-        match Box::pin(run_process_start(
+        match Box::pin(run_process_start_mode(
             self,
             owner,
             admission,
             path_proof,
             Some(outer_binding),
+            live_stdin,
         ))
         .await
         {
@@ -1836,6 +1877,128 @@ impl ProcessExecutionGateway {
                 Err(error)
             }
         }
+    }
+
+    fn execute_admitted_process_request(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: ProcessRequest,
+        outer_binding: Option<&HostKernelCandidateBinding>,
+        live_stdin: bool,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        // CHILD-1 (#1918): register the descendant before the executor
+        // handoff. A poisoned or conflicting registry refuses the launch: an
+        // unregistered child must never start.
+        let operation_id = request.operation_id().clone();
+        let registration = RegisteredDescendant::new(
+            operation_id.clone(),
+            owner.module_id().to_owned(),
+            owner.authority_epoch().clone(),
+            owner.generation(),
+        )
+        .map_err(ProcessExecutionError::Contract)?;
+        self.descendants
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("descendant registry lock poisoned".to_owned())
+            })?
+            .register(registration)
+            .map_err(ProcessExecutionError::Contract)?;
+        // #1824 (I10.21): the retained pre-effect baseline must belong to the
+        // exact request about to be handed to the executor. A mismatch refuses
+        // the handoff and drops the registration like any other failed launch.
+        if let Err(error) = self.verify_governed_effect_request(owner, &request) {
+            if let Ok(mut registry) = self.descendants.lock() {
+                registry.remove(&operation_id);
+            }
+            return Err(error);
+        }
+        let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(OrsProcessStreamRecoverySink {
+            store: Arc::clone(&self.evidence_store),
+            owner: owner.clone(),
+            evidence: Arc::new(OrsProcessEvidenceSink {
+                store: Arc::clone(&self.evidence_store),
+                owner: owner.clone(),
+            }),
+        });
+        let started = self.execute_process_request_on_platform(
+            request,
+            sink,
+            outer_binding,
+            live_stdin,
+        );
+        match started {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                // A typed UnknownOutcome means the platform could not observe
+                // that its still-suspended child was terminated. Keep this
+                // operation's owner/epoch/generation registration available
+                // for reconciliation; only a proved pre-effect refusal may
+                // release the attempt registration here.
+                if !matches!(&error, ProcessExecutionError::UnknownOutcome)
+                    && let Ok(mut registry) = self.descendants.lock()
+                {
+                    registry.remove(&operation_id);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn execute_process_request_on_platform(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        outer_binding: Option<&HostKernelCandidateBinding>,
+        live_stdin: bool,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        #[cfg(windows)]
+        let started = match outer_binding {
+            Some(candidate) => {
+                let binding: Result<RecoverableJobBinding, ProcessExecutionError> =
+                    serde_json::to_value(&candidate.job_binding)
+                        .map_err(|_| {
+                            ProcessExecutionError::Unavailable(
+                                "Host Kernel Job binding cannot be encoded".to_owned(),
+                            )
+                        })
+                        .and_then(|value| {
+                            serde_json::from_value(value).map_err(|_| {
+                                ProcessExecutionError::Unavailable(
+                                    "Host Kernel Job binding is malformed".to_owned(),
+                                )
+                            })
+                        });
+                match binding {
+                    Ok(binding)
+                        if binding.job_identity().name() == candidate.job_object_id.as_str() =>
+                    {
+                        if live_stdin {
+                            self.executor
+                                .start_with_live_stdin(request, sink, binding)
+                        } else {
+                            self.executor
+                                .start_with_kernel_outer_job_binding(request, sink, binding)
+                        }
+                    }
+                    Ok(_) => Err(ProcessExecutionError::Contract(
+                        eliot_process::ContractError::DispatchBindingMismatch,
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            None => Err(ProcessExecutionError::Unavailable(
+                "current Host Kernel Job binding is required for Kernel child launch".to_owned(),
+            )),
+        };
+        #[cfg(not(windows))]
+        let started = {
+            let _ = (request, sink, outer_binding, live_stdin);
+            Err(ProcessExecutionError::Unavailable(
+                "Windows process launch is unavailable on this platform".to_owned(),
+            ))
+        };
+        started
     }
 
     /// Issues one Kernel-authenticated `ProcessRequest` for `TestD` durable
@@ -2211,16 +2374,27 @@ impl ProcessExecutionGateway {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "reservation, canonical projection, authority issue, executor handoff, and replay linearization are one ordered operation"
-)]
 pub(crate) async fn run_process_start<P: ProcessStartPorts>(
     ports: &P,
     owner: &ProcessOwnerBinding,
     admission: ProcessExecutionAdmissionRequest,
     path_proof: P::PathProof,
     outer_binding: Option<HostKernelCandidateBinding>,
+) -> Result<P::Receipt, ProcessExecutionError> {
+    run_process_start_mode(ports, owner, admission, path_proof, outer_binding, false).await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "reservation, canonical projection, authority issue, executor handoff, and replay linearization are one ordered operation"
+)]
+async fn run_process_start_mode<P: ProcessStartPorts>(
+    ports: &P,
+    owner: &ProcessOwnerBinding,
+    admission: ProcessExecutionAdmissionRequest,
+    path_proof: P::PathProof,
+    outer_binding: Option<HostKernelCandidateBinding>,
+    live_stdin: bool,
 ) -> Result<P::Receipt, ProcessExecutionError> {
     admission.validate()?;
     ports.validate_path(&admission, &path_proof)?;
@@ -2366,7 +2540,14 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             });
         }
     };
-    let receipt = match ports.execute(owner, request, outer_binding.as_ref()).await {
+    let started = if live_stdin {
+        ports
+            .execute_with_live_stdin(owner, request, outer_binding.as_ref())
+            .await
+    } else {
+        ports.execute(owner, request, outer_binding.as_ref()).await
+    };
+    let receipt = match started {
         Ok(receipt) => receipt,
         Err(error) => {
             drop(context_guard);
@@ -2581,98 +2762,16 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         request: Self::Request,
         outer_binding: Option<&HostKernelCandidateBinding>,
     ) -> Result<Self::Receipt, ProcessExecutionError> {
-        // CHILD-1 (#1918): register the descendant before the executor
-        // handoff. A poisoned or conflicting registry refuses the launch: an
-        // unregistered child must never start.
-        let operation_id = request.operation_id().clone();
-        let registration = RegisteredDescendant::new(
-            operation_id.clone(),
-            owner.module_id().to_owned(),
-            owner.authority_epoch().clone(),
-            owner.generation(),
-        )
-        .map_err(ProcessExecutionError::Contract)?;
-        self.descendants
-            .lock()
-            .map_err(|_| {
-                ProcessExecutionError::Unavailable("descendant registry lock poisoned".to_owned())
-            })?
-            .register(registration)
-            .map_err(ProcessExecutionError::Contract)?;
-        // #1824 (I10.21): the retained pre-effect baseline must belong to the
-        // exact request about to be handed to the executor. A mismatch refuses
-        // the handoff and drops the registration like any other failed launch.
-        if let Err(error) = self.verify_governed_effect_request(owner, &request) {
-            if let Ok(mut registry) = self.descendants.lock() {
-                registry.remove(&operation_id);
-            }
-            return Err(error);
-        }
-        let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(OrsProcessStreamRecoverySink {
-            store: Arc::clone(&self.evidence_store),
-            owner: owner.clone(),
-            evidence: Arc::new(OrsProcessEvidenceSink {
-                store: Arc::clone(&self.evidence_store),
-                owner: owner.clone(),
-            }),
-        });
-        #[cfg(windows)]
-        let started = match outer_binding {
-            Some(candidate) => {
-                let binding: Result<RecoverableJobBinding, ProcessExecutionError> =
-                    serde_json::to_value(&candidate.job_binding)
-                        .map_err(|_| {
-                            ProcessExecutionError::Unavailable(
-                                "Host Kernel Job binding cannot be encoded".to_owned(),
-                            )
-                        })
-                        .and_then(|value| {
-                            serde_json::from_value(value).map_err(|_| {
-                                ProcessExecutionError::Unavailable(
-                                    "Host Kernel Job binding is malformed".to_owned(),
-                                )
-                            })
-                        });
-                match binding {
-                    Ok(binding)
-                        if binding.job_identity().name() == candidate.job_object_id.as_str() =>
-                    {
-                        self.executor
-                            .start_with_kernel_outer_job_binding(request, sink, binding)
-                    }
-                    Ok(_) => Err(ProcessExecutionError::Contract(
-                        eliot_process::ContractError::DispatchBindingMismatch,
-                    )),
-                    Err(error) => Err(error),
-                }
-            }
-            None => Err(ProcessExecutionError::Unavailable(
-                "current Host Kernel Job binding is required for Kernel child launch".to_owned(),
-            )),
-        };
-        #[cfg(not(windows))]
-        let started = {
-            let _ = (request, sink, outer_binding);
-            Err(ProcessExecutionError::Unavailable(
-                "Windows process launch is unavailable on this platform".to_owned(),
-            ))
-        };
-        match started {
-            Ok(receipt) => Ok(receipt),
-            Err(error) => {
-                // A typed UnknownOutcome means the platform could not observe
-                // that its still-suspended child was terminated. Keep this
-                // operation's owner/epoch/generation registration available
-                // for reconciliation; only a proved pre-effect refusal may
-                // release the attempt registration here.
-                if !matches!(&error, ProcessExecutionError::UnknownOutcome)
-                    && let Ok(mut registry) = self.descendants.lock()
-                {
-                    registry.remove(&operation_id);
-                }
-                Err(error)
-            }
-        }
+        self.execute_admitted_process_request(owner, request, outer_binding, false)
+    }
+
+    async fn execute_with_live_stdin(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: Self::Request,
+        outer_binding: Option<&HostKernelCandidateBinding>,
+    ) -> Result<Self::Receipt, ProcessExecutionError> {
+        self.execute_admitted_process_request(owner, request, outer_binding, true)
     }
 
     fn persist_completed(
