@@ -34,6 +34,7 @@ use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_kernel_service::{
     KernelStoreGateway, MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS, MaintenanceTriggerClaimRequest,
     MaintenanceTriggerDeliveryError, MaintenanceTriggerDeliveryRow,
+    MaintenanceTriggerRedeliveryOutcome,
 };
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, DecisionReason, MaintenanceError,
@@ -1193,6 +1194,142 @@ pub fn collect_pending_maintenance_triggers(
     // page validation refuses an empty gapless page, so absence here is the
     // owner's witnessed incompleteness, never a certified-complete set.
     Ok(walk)
+}
+
+/// Reclaims one timed-out claim through owner-mediated redelivery (I14.22,
+/// issue #1694 W3).
+///
+/// This is the production front-door timeout-redelivery caller: it releases
+/// the timed-out claim through
+/// [`KernelStoreGateway::release_expired_maintenance_trigger_claim`] — a
+/// `Claimed` row returns to `Pending`, a `DecisionRecorded` row moves to
+/// `Reconciling` with its committed receipt preserved — then routes on the
+/// owner's post-release snapshot under the same trigger identity and
+/// revision. A row carrying a committed decision receipt returns
+/// [`MaintenanceTriggerRedeliveryOutcome::ReconcileByReceipt`]: the owner
+/// must acknowledge that exact receipt without another job, recommendation,
+/// or wake — never repeat the uncertain downstream effect — by claiming
+/// first through [`claim_maintenance_trigger_for_daemon`] and completing
+/// through [`acknowledge_recovered_maintenance_commit`]. A row with no
+/// committed receipt re-issues one fresh finite claim through
+/// [`claim_maintenance_trigger_for_daemon`] under the same identity and
+/// revision, so an exact retry reuses the live claim and a concurrent claim
+/// conflicts there instead of producing a competing accepted decision.
+///
+/// A timeout never mints a new trigger ID and never widens the lease: the
+/// presented identity must already carry a fresh finite deadline, checked
+/// before any ledger transition, so a stale deadline fails with the row left
+/// open under its existing disposition. Settled rows (`Acknowledged`,
+/// `Expired`, `Superseded`) carry no releasable claim, so the owner refuses
+/// the release and they reconcile through the stored outcome instead of a
+/// fresh claim.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerClaimError`]: a malformed request, the exact
+/// Kernel owner release/claim refusal, or a stale-claim refusal when the
+/// owner's receipt answers another trigger, revision, or scope.
+pub fn redeliver_maintenance_trigger_after_timeout(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    record: &MaintenanceTriggerRecord,
+    live_fence: &StateFence,
+    identity: &TriggerClaimIdentity,
+) -> Result<MaintenanceTriggerRedeliveryOutcome, MaintenanceTriggerClaimError> {
+    record
+        .validate()
+        .map_err(|source| claim_request_error(record, identity, source))?;
+    if identity.daemon_session.trim().is_empty() {
+        return Err(claim_request_error(
+            record,
+            identity,
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_claim.daemon_session",
+                reason: "claiming session must be named",
+            },
+        ));
+    }
+    if identity.delivery_id.trim().is_empty() {
+        return Err(claim_request_error(
+            record,
+            identity,
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_claim.delivery_id",
+                reason: "delivery identity must be named",
+            },
+        ));
+    }
+    // Redelivery always needs a fresh finite claim, never a new trigger ID:
+    // a stale deadline fails here, before any ledger transition, and the row
+    // stays open under its existing disposition.
+    if identity.claim_deadline_unix_ms <= identity.now_unix_ms
+        || identity.claim_deadline_unix_ms - identity.now_unix_ms
+            > MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS
+    {
+        return Err(claim_request_error(
+            record,
+            identity,
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_claim.claim_deadline_unix_ms",
+                reason: "redelivery must carry a fresh finite deadline within the claim lease bound",
+            },
+        ));
+    }
+    live_fence.validate().map_err(|source| {
+        claim_request_error(record, identity, ProtocolError::Foundation(source))
+    })?;
+    // Owner-mediated release under the same trigger identity: the owner
+    // refuses a still-live claim, an unknown trigger, and a settled row, so
+    // none of those can reach a fresh claim below.
+    let rows = gateway
+        .release_expired_maintenance_trigger_claim(
+            principal_ref,
+            &record.trigger_id,
+            identity.now_unix_ms,
+        )
+        .map_err(|source| claim_owner_error(record, identity, source))?;
+    let row = rows
+        .iter()
+        .find(|row| row.record.trigger_id == record.trigger_id)
+        .ok_or_else(|| {
+            claim_owner_error(
+                record,
+                identity,
+                MaintenanceTriggerDeliveryError::UnknownTrigger,
+            )
+        })?;
+    if let Some(receipt) = row.decision_receipt.as_ref() {
+        // A decision is already committed: return its exact receipt for
+        // acknowledgement. The receipt must validate and answer this exact
+        // retained trigger at this exact row revision; a substituted answer
+        // fails here rather than authorizing an ack under the wrong
+        // obligation, and never authorizes repeating the downstream effect.
+        receipt
+            .validate()
+            .map_err(MaintenanceTriggerDeliveryError::Protocol)
+            .map_err(|source| claim_owner_error(record, identity, source))?;
+        receipt
+            .matches_trigger(record)
+            .map_err(|source| claim_stale_error(record, identity, source))?;
+        if receipt.revision != row.revision {
+            return Err(claim_stale_error(
+                record,
+                identity,
+                ProtocolError::ReplayConflict,
+            ));
+        }
+        return Ok(
+            MaintenanceTriggerRedeliveryOutcome::ReconcileByReceipt(receipt.clone()),
+        );
+    }
+    // No committed decision: re-issue one fresh finite claim under the same
+    // identity and revision. The claim join re-checks the fence, the finite
+    // deadline, the revision echo, and the exact-retry/conflict rules, so
+    // concurrent claims and exact retries cannot produce competing accepted
+    // decisions.
+    let claim =
+        claim_maintenance_trigger_for_daemon(gateway, principal_ref, record, live_fence, identity)?;
+    Ok(MaintenanceTriggerRedeliveryOutcome::Reclaimed(claim))
 }
 
 /// Fail-closed refusals of the decision-commit route (I14.22, issue #1694 W4).
