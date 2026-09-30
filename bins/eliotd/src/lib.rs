@@ -63,6 +63,11 @@ pub mod cell_declaration_registry;
 /// Governor composition edge over `GovernorContextInputs`.
 pub mod context_reconstruction_route;
 mod controlboard_adapters;
+/// Issue #1720 A12: the fire-side cue activation drive. This composition root
+/// evaluates the Governor-reconstructed cue candidate with the R5
+/// `eliot-cue-activation` owner and attaches the deterministic summary to the
+/// reconstruction response.
+mod cue_activation_route;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
@@ -212,6 +217,9 @@ pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
     controlboard_notification_refresh_refusal_body, controlboard_result_body,
     is_controlboard_read_tool, serve_controlboard_view,
+};
+pub use cue_activation_route::{
+    CueActivationDisposition, CueActivationSkip, CueActivationSummary, evaluate_cue_activation,
 };
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
