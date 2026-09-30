@@ -168,7 +168,7 @@ async fn main() {
         Err(error) => exit_error("PRINCIPAL_FAILURE", &error),
     };
     #[cfg(windows)]
-    let _profile_root_leases =
+    let profile_root_leases =
         match startup_binding::retain_profile_root_binding(&options, &startup_binding) {
             Ok(leases) => leases,
             Err(error) => exit_error("PRINCIPAL_FAILURE", &error),
@@ -206,7 +206,7 @@ async fn main() {
     #[cfg(windows)]
     {
         let (profile, portable_dev_repository_root) = startup_binding
-            .supervision_profile_binding(_profile_root_leases.as_ref())
+            .supervision_profile_binding(profile_root_leases.as_ref())
             .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
         kernel_config = kernel_config
             .with_supervision_installation_profile(profile, portable_dev_repository_root);
@@ -325,7 +325,7 @@ async fn main() {
         Err(error) => observe_terminal_error(&error.to_string()),
     }
     #[cfg(windows)]
-    if let Some(leases) = &_profile_root_leases {
+    if let Some(leases) = &profile_root_leases {
         leases
             .verify_stable_identity()
             .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error.to_string()));
