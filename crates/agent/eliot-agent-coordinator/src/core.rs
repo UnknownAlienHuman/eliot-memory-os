@@ -34,7 +34,8 @@ use crate::model::{
     ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
     ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReadyItemSkipReason,
     ReadySelectionOutcome, ReassignmentId, ReassignmentReceipt, ResultSubmission,
-    RoleProfileManifest, RouteCandidateEvidence, SchedulingProfile, StaffingLaneCandidate,
+    RoleProfileManifest, RouteCandidateEvidence, SchedulingProfile, SelectionScopeCoverage,
+    StaffingLaneCandidate,
     StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeFinalReceipt,
     WipPartitionKey, WorkClass, WorkClassProfile, WorkClassSelectionReport, WorkerId,
     validate_text,
@@ -451,6 +452,39 @@ fn class_report(
         class_skip_reason: view.skip_reason,
         skipped_ready_items: view.skipped,
         infeasible_items: view.infeasible,
+    }
+}
+
+/// How much of the declared class scope this pull covered (issue #1683 W7).
+///
+/// The denominator is [`WorkClass::ALL`], read here and **not** from the
+/// `classes` list the same pull produced. That is the whole point: `classes` is
+/// built by iterating that same constant, so a coverage number taken from it
+/// would equal nine on every pull by construction and would certify nothing.
+/// Reading the policy's own closed vocabulary instead makes the record falsifiable
+/// — a caller can compare it against what it asked for rather than against what
+/// the loop happened to emit.
+///
+/// `profile` is `Some` only after the caller ran [`SchedulingProfile::validate`],
+/// which requires exactly one profile per member of `WorkClass::ALL`; so every
+/// profile-bound pull reports full coverage and the profile-free peek reports
+/// none. Both are stated rather than assumed: a profile-free peek still lists all
+/// nine classes in `classes`, and without this record a reader would have to
+/// re-derive from nine absent ceilings that no per-class limit applied.
+fn scope_coverage(profile: Option<&SchedulingProfile>) -> SelectionScopeCoverage {
+    let mut unlimited = Vec::new();
+    let mut limited = 0u32;
+    for work_class in WorkClass::ALL {
+        if profile.and_then(|set| set.class_profile(work_class)).is_some() {
+            limited = limited.saturating_add(1);
+        } else {
+            unlimited.push(work_class);
+        }
+    }
+    SelectionScopeCoverage {
+        expected_classes: u32::try_from(WorkClass::ALL.len()).unwrap_or(u32::MAX),
+        limited_classes: limited,
+        unlimited_classes: unlimited,
     }
 }
 
@@ -1653,6 +1687,13 @@ impl AgentCoordinator {
     /// start one item is not a durable `DEFERRED_CAPACITY` transition, so this
     /// method does not restate that vocabulary.
     ///
+    /// `last_selection.coverage` states how much of the declared nine-class
+    /// scope each pull covered, measured against `WorkClass::ALL` rather than
+    /// against the class list the pull iterated. On this profile-bound drive it
+    /// is total by construction, because `SchedulingProfile::validate` has
+    /// already refused any profile that does not cover all nine — so reading it
+    /// is how a caller confirms that, rather than assuming it.
+    ///
     /// Production residual, unchanged by this method and not worked around here:
     /// no issuer of the provider-verified [`ProviderAdmissionReceipt`] that
     /// [`Self::admit`] requires exists in this tree, so in production `attempts`
@@ -1794,6 +1835,7 @@ impl AgentCoordinator {
                 )
             })
             .collect();
+        let coverage = scope_coverage(profile);
         let claims = deliverable_claims(&self.attempts, &self.writer_holders);
         let oldest_ready_enqueue_sequence = views
             .iter()
@@ -1815,6 +1857,7 @@ impl AgentCoordinator {
             selected_enqueue_sequence,
             oldest_ready_enqueue_sequence,
             classes,
+            coverage,
             deliverable_claims: claims,
             deferrals,
         }

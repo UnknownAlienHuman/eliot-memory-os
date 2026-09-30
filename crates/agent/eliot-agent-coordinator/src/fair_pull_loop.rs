@@ -228,5 +228,12 @@ pub struct FairPullOutcome {
     /// The pull that ended this drive, in full. Its `deferrals` name the exact
     /// limiting dimension, observed value, limit and profile revision for every
     /// class that held ready work and was closed.
+    ///
+    /// Its `coverage` is the scope-coverage record measured against the closed
+    /// `WorkClass::ALL` vocabulary rather than against the class list this pull
+    /// iterated, so it stays falsifiable on a drive that selected nothing. Note
+    /// what it does and does not attest: it says which classes the profile
+    /// covered, never that a durable owner accepted anything. Nothing in this
+    /// outcome is derived from an owner answer.
     pub last_selection: ReadySelectionOutcome,
 }

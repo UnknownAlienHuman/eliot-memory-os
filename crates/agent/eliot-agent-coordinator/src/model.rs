@@ -1734,11 +1734,62 @@ pub struct DeliverableClaim {
     pub holder_state: CoordinatedAttemptState,
 }
 
+/// Scope coverage of one pull (issue #1683 W7).
+///
+/// Coverage here is measured against an **independently derived expected set**:
+/// the closed [`WorkClass::ALL`] vocabulary, which is the same denominator
+/// [`SchedulingProfile::validate`] holds every profile set to. It is
+/// deliberately not derived from [`ReadySelectionOutcome::classes`], which is
+/// the list this pull happened to iterate — a count taken from that list agrees
+/// with itself by construction and so proves nothing about whether the pull
+/// considered the whole scope.
+///
+/// What `limited_classes` counts, precisely: the expected classes for which a
+/// [`WorkClassProfile`] was in force. It is not a count of classes that offered
+/// work, and not a count of classes that were closed — a class holding no ready
+/// item and a class holding ready items it can serve are both *covered*
+/// whenever a profile is in force. The distinction matters because
+/// [`ReadySelectionOutcome::classes`] is populated on the profile-free
+/// [`AgentCoordinator::next_ready`](crate::AgentCoordinator::next_ready) peek
+/// too, and that record lists all nine classes while applying no per-class
+/// limit to any of them; before this record existed a reader could not tell that
+/// pull apart from a fully covered one without re-deriving it from the ceilings.
+///
+/// A caller checks completeness as
+/// `limited_classes + unlimited_classes.len() == expected_classes`. A shortfall
+/// in that sum means this pull did not cover the whole declared scope, which is
+/// a fact about the record and not an error this type reports.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectionScopeCoverage {
+    /// `WorkClass::ALL.len()`: the closed I14.1 scope this pull is measured
+    /// against, independent of what it iterated.
+    pub expected_classes: u32,
+    /// How many of `expected_classes` had a per-class profile in force.
+    pub limited_classes: u32,
+    /// The expected classes for which **no** per-class limit applied, in
+    /// scheduler rank order. Non-empty on the profile-free peek, where every
+    /// class is listed and none is limited; empty on every profile-bound pull,
+    /// because [`SchedulingProfile::validate`] refuses a profile that does not
+    /// cover all nine.
+    pub unlimited_classes: Vec<WorkClass>,
+}
+
 /// Exact outcome of one fair pull (issue #1683 W7).
 ///
 /// Diagnostics only: nothing here is an authority, and no field re-decides
 /// admission, ordering or capacity. It derives `Serialize` only because it is a
 /// published projection, never an input wire.
+///
+/// What this record does **not** claim, stated because it is the difference
+/// between an exact outcome and a flattering one: no field here is derived from
+/// a durable owner's answer. `capacity_identity`/`capacity_revision` are the
+/// coordinator's **own configured** view (`CoordinatorConfig`), not an
+/// observation the Kernel answered with, and `select_ready` reads only this
+/// coordinator's in-memory `attempts`, `enqueue_sequence`, `fair_virtual_time`
+/// and `writer_holders`. So a `selected_attempt_id` is "this selector chose
+/// this admitted item under the profile named here", never "the owner accepted
+/// it". See [`SelectionScopeCoverage`] for what this record does measure
+/// independently.
 ///
 /// What this record does **not** carry, stated so a reader does not infer it:
 /// I5.7's starvation diagnostics ask for oldest-ready *age*, per-scope *wait* and
@@ -1774,8 +1825,15 @@ pub struct ReadySelectionOutcome {
     /// Canonical enqueue ordinal of the oldest admitted item overall, under the
     /// same age rule.
     pub oldest_ready_enqueue_sequence: Option<u64>,
-    /// Exactly nine entries in scheduler rank order.
+    /// Exactly nine entries in scheduler rank order: one per member of the
+    /// closed [`WorkClass::ALL`] vocabulary, listed whether or not the class
+    /// held work and whether or not a per-class limit applied to it. It is the
+    /// iterated list, so it is **not** the coverage denominator — read
+    /// [`Self::coverage`] for that.
     pub classes: Vec<WorkClassSelectionReport>,
+    /// How much of the declared scope this pull actually covered, measured
+    /// against [`WorkClass::ALL`] rather than against `classes`.
+    pub coverage: SelectionScopeCoverage,
     pub deliverable_claims: Vec<DeliverableClaim>,
     /// One entry per class that held ready work and was closed, in scheduler
     /// rank order. Empty when a class offered work.
