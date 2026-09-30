@@ -32,29 +32,33 @@ const HOST_COMPOSITION_REQUESTER: &str = "host-composition";
 /// it, while a plain SCM demand-start has no approved transaction to name and
 /// stays the Host lifecycle opening its own control contour.
 ///
-/// Both drive the same capability requirement. I1.5 starts the Kernel and the
-/// independent Watchdog as sibling activation branches of the control contour,
-/// and the Host readiness fence refuses `ControlReady` without a proven Store
-/// branch, so a generation that is about to run that fence requires all three
-/// capabilities. A narrower observable-use class contributes its own set later,
-/// through the `ActivationTriggerClass` vocabulary.
+/// Each arm records the capability set of the admission it actually holds.
+/// The installer-pending arm records the admitted
+/// [`ActivationTriggerClass::ApprovedMaintenanceJob`] set — the authenticated
+/// request the pending transaction carries — not the bootstrap full contour,
+/// so a generation created for that request is never bound to a broader
+/// requirement no admitted request stated. The bare SCM arm has no admitted
+/// request to record, so it keeps the bootstrap control contour the Host
+/// readiness fence needs; narrower or broader observable-use classes that join
+/// later contribute their own [`ActivationTriggerClass::requested_capabilities`]
+/// set through the coalescing append path, which only ever unions admitted
+/// trigger sets into the durable record and never rewrites this creation
+/// ingress.
 fn activation_ingress(
     pending: Option<&eliot_installation::PendingActivation>,
 ) -> ActivationIngress {
-    let (trigger_class, requester) = match pending {
-        Some(pending) => (
-            ActivationTriggerClass::ApprovedMaintenanceJob.as_str(),
-            format!("pending-activation:{}", pending.transaction_id.as_str()),
-        ),
-        None => (
-            HOST_LIFECYCLE_TRIGGER_CLASS,
-            HOST_COMPOSITION_REQUESTER.to_owned(),
-        ),
-    };
-    ActivationIngress {
-        trigger_class,
-        requester,
-        capabilities: control_contour_capabilities(),
+    match pending {
+        Some(pending) => ActivationIngress {
+            trigger_class: ActivationTriggerClass::ApprovedMaintenanceJob.as_str(),
+            requester: format!("pending-activation:{}", pending.transaction_id.as_str()),
+            capabilities: ActivationTriggerClass::ApprovedMaintenanceJob
+                .requested_capabilities(),
+        },
+        None => ActivationIngress {
+            trigger_class: HOST_LIFECYCLE_TRIGGER_CLASS,
+            requester: HOST_COMPOSITION_REQUESTER.to_owned(),
+            capabilities: control_contour_capabilities(),
+        },
     }
 }
 
