@@ -17,6 +17,7 @@ eliot-instrument-api.workspace = true
 eliot-instrument-runner = { path = "../../instrument/eliot-instrument-runner", version = "0.1.0" }
 eliot-instrument-scip.workspace = true
 eliot-observability = { path = "../../instrument/eliot-observability", version = "0.1.0" }
+eliot-process-executor.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-types = { path = "../../eliot-types", version = "0.1.0" }
