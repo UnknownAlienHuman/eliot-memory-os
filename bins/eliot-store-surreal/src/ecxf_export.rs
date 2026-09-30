@@ -168,22 +168,19 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
             // sorted them. `prove_event_range_against_store` re-proves this
             // interval against those same events' validated ordinals.
             event_range: eliot_backup::EventRange {
-                first_sequence: capture
-                    .events
-                    .first()
-                    .map(|event| event.event_ordinal),
+                first_sequence: capture.events.first().map(|event| event.event_ordinal),
                 last_sequence: capture.events.last().map(|event| event.event_ordinal),
                 count: capture.events.len() as u64,
             },
             reachable_blob_residency_keys: Vec::new(),
             events: capture
                 .events
-                .into_iter()
+                .iter()
                 .map(canonical_event_record)
                 .collect::<Result<Vec<_>, _>>()?,
             projections: capture
                 .projections
-                .into_iter()
+                .iter()
                 .map(|record| projection_record(record, ECXF_PROJECTION_RECORD_TYPE))
                 .collect::<Result<Vec<_>, _>>()?,
             receipts: capture.receipts,
@@ -214,23 +211,23 @@ const ECXF_PROJECTION_RECORD_TYPE: &str = "projection-record";
 /// `CanonicalEvent` and runs that owner's `validate` again before any byte is
 /// written.
 fn canonical_event_record(
-    event: eliot_store_api::CanonicalEvent,
+    event: &eliot_store_api::CanonicalEvent,
 ) -> Result<CanonicalRecord, BackupError> {
     let record_id = event.event_id.to_string();
-    let payload =
-        serde_json::to_value(&event).map_err(|error| BackupError::Serialization(error.to_string()))?;
+    let payload = serde_json::to_value(event)
+        .map_err(|error| BackupError::Serialization(error.to_string()))?;
     CanonicalRecord::new(ECXF_EVENT_RECORD_TYPE, record_id, payload)
 }
 
 /// Projects one store-observed [`ProjectionPublicationRecord`] onto a canonical
 /// record, from the publication's own canonical bytes.
 fn projection_record(
-    record: eliot_store_api::ProjectionPublicationRecord,
+    record: &eliot_store_api::ProjectionPublicationRecord,
     record_type: &str,
 ) -> Result<CanonicalRecord, BackupError> {
     let record_id = record.publication_id.to_string();
-    let payload =
-        serde_json::to_value(&record).map_err(|error| BackupError::Serialization(error.to_string()))?;
+    let payload = serde_json::to_value(record)
+        .map_err(|error| BackupError::Serialization(error.to_string()))?;
     CanonicalRecord::new(record_type, record_id, payload)
 }
 
@@ -250,9 +247,7 @@ fn unobserved_member(capture: &EcxfSourceCapture) -> Option<&'static str> {
     match capture.missing_evidence.first() {
         Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => Some("scope_id"),
         Some(EcxfCaptureGap::SourcePurgeLedgerUnavailable) => Some("purge_ledger"),
-        Some(EcxfCaptureGap::BlobStoreEvidenceUnavailable) => {
-            Some("reachable_blob_residency_keys")
-        }
+        Some(EcxfCaptureGap::BlobStoreEvidenceUnavailable) => Some("reachable_blob_residency_keys"),
         Some(EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable) => {
             Some("architecture_source_digest")
         }
