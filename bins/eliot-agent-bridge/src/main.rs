@@ -4078,11 +4078,7 @@ mod tests {
             "client_capabilities":{"tasks":false},
             "tool":{"name":"eliot.query","arguments":{
                 "intent":{
-                    "mode":"verification",
-                    "time_scope":"session-window",
-                    "branch_environment_scope":"branch",
-                    "freshness_policy":"exact-fence",
-                    "required_assurance":"evidence-provenance"
+                    "mode":"verification"
                 },
                 "query":"subject:evidence-alpha",
                 "exact_resource_uri": null

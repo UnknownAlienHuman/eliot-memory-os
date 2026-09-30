@@ -72,11 +72,7 @@ fn tool_digest(tool: &Value) -> TestResult<String> {
 fn query_tool_with_mode(mode: &str) -> Value {
     json!({"name":"eliot.query","arguments":{
         "intent":{
-            "mode": mode,
-            "time_scope":"session-window",
-            "branch_environment_scope":"branch",
-            "freshness_policy":"exact-fence",
-            "required_assurance":"evidence-provenance"
+            "mode": mode
         },
         "query":"subject:evidence-alpha",
         "exact_resource_uri": null
