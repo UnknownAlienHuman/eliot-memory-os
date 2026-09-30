@@ -15,9 +15,9 @@ use eliot_contracts::sha256_hex;
 use eliot_receipts::{
     LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest,
     tool_exposure::{
-        AttemptEvidence, ExposureIdentities, ExposureReplaySignal, OwnerStageFact,
-        ToolExposureHistoryEntry, ToolExposureReceiptV2, detect_exposure_replay,
-        detect_repeat_without_progress_with_evidence, EXPOSURE_HISTORY_VERSION,
+        AttemptEvidence, EXPOSURE_HISTORY_VERSION, ExposureIdentities, ExposureReplaySignal,
+        OwnerStageFact, ToolExposureHistoryEntry, ToolExposureReceiptV2, detect_exposure_replay,
+        detect_repeat_without_progress_with_evidence,
     },
 };
 
