@@ -33,7 +33,9 @@ use eliot_wasm_runtime::{
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
 use crate::contour::CAPABILITY_INTRODUCTION_REQUIRED;
 use crate::typed_bindings::{TypedWorld, typed_wit_digest};
-use crate::wasmtime_provider::is_instance_limit_error;
+use crate::wasmtime_provider::{
+    WasmtimeBuildError, WasmtimeComponentEngine, is_instance_limit_error,
+};
 
 const ENGINE_VERSION: &str = "47.0.4";
 const PROVIDER_STACK_SIZE: u64 = 8 * 1024;
@@ -903,36 +905,72 @@ fn check_ceiling(
     Ok(())
 }
 
-/// Builds the typed lane's dispatch engine and compiles the exact bounded
-/// buffer on it (item 26 seam, #758).
+/// Builds the typed lane's dispatch provider for the exact bounded buffer
+/// (item 26 seam, #758): the buffer is compiled through the configured
+/// provider (`WasmtimeComponentEngine::new_for_admitted_limits`) instead of a
+/// locally-configured engine, and the caller dispatches via
+/// `provider.dispatch_leg(limits)` — the same leg the provider itself invokes
+/// under for the admitted cancellation policy. Both typed lanes (describe and
+/// domain) build through this one seam so the typed provider construction
+/// exists exactly once. `guest_exec` is untouched: the shared provider
+/// constructor is reused, never modified, here.
 ///
-/// Two-path status on current main: this locally-configured engine is the
-/// second engine path beside the single provider
-/// (`WasmtimeComponentEngine::new_for_admitted_limits`, used by the
-/// guest-exec child). Both typed lanes (describe and domain)
-/// build through this one seam so the typed configuration exists exactly
-/// once. Full dispatch migration onto the provider-built engine legs needs a
-/// provider-owned leg accessor in `wasmtime_provider.rs` (sibling scope: no
-/// such accessor exists on current main, and the provider file is not this
-/// slice's), so this seam keeps the exact current provider-equivalent
-/// settings (component model, fuel/epoch mode from the admitted policy,
-/// provider stack ceiling) without inventing a third configuration.
-/// `guest_exec` is untouched: the shared provider constructor is neither
-/// called nor modified here.
-fn build_typed_dispatch_component(
+/// The provider legs carry the exact typed settings the retired local seam
+/// enforced: component model on, epoch interruption on, fuel accounting only
+/// on the fuel leg (selected exactly when the admitted policy meters fuel),
+/// and the provider stack ceiling. The legs additionally use the
+/// provider-owned pooling allocator (a provider performance Default, not a
+/// typed ceiling); Store/resource ceilings stay lane-owned in [`new_store`].
+///
+/// Failure vocabulary is unchanged: engine construction failure is the typed
+/// `ENGINE:config:invalid`, compilation failure keeps the staged `Compile`
+/// mapping of [`map_compile_error`], and binding/digest variants unreachable
+/// through this constructor (every digest is recomputed from the presented
+/// bytes; no caller binding is taken) map to the closest owned typed denial.
+fn build_typed_dispatch_provider(
+    world: TypedWorld,
     limits: &InvocationLimits,
     artifact: &[u8],
-) -> Result<(wasmtime::Engine, wasmtime::component::Component), TypedExecutionError> {
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    config.consume_fuel(typed_fuel_budget(limits).is_some());
-    config.epoch_interruption(true);
-    config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))?;
-    let component = wasmtime::component::Component::new(&engine, artifact)
-        .map_err(|error| staged(TypedStage::Compile, map_compile_error(&error)))?;
-    Ok((engine, component))
+) -> Result<WasmtimeComponentEngine, TypedExecutionError> {
+    WasmtimeComponentEngine::new_for_admitted_limits(
+        artifact,
+        &typed_component_configuration(world),
+        limits,
+    )
+    .map_err(map_provider_build_error)
+}
+
+/// Component-configuration bytes bound into the typed dispatch provider
+/// build. Computed per world from the lane's own generated selection — lane,
+/// world, describe plus domain exports, closed imports — never pasted, never
+/// a name/path/URL, and never the legacy guest descriptor.
+fn typed_component_configuration(world: TypedWorld) -> Vec<u8> {
+    format!(
+        "component=typed-dispatch;world={};exports=describe+{};imports=closed",
+        world.world_name(),
+        world.domain_func(),
+    )
+    .into_bytes()
+}
+
+/// Maps a dispatch-provider build failure to the exact owned typed denial.
+/// Typed failures stay typed: there is no stringly catch-all.
+fn map_provider_build_error(error: WasmtimeBuildError) -> TypedExecutionError {
+    match error {
+        WasmtimeBuildError::Config(_) => TypedExecutionError::Engine("config:invalid".to_owned()),
+        WasmtimeBuildError::Compile(error) => {
+            staged(TypedStage::Compile, map_compile_error(&error))
+        }
+        WasmtimeBuildError::ArtifactDigestMismatch => {
+            TypedExecutionError::AdmissionMismatch("artifact-digest".to_owned())
+        }
+        WasmtimeBuildError::VersionMismatch
+        | WasmtimeBuildError::WitDigestMismatch
+        | WasmtimeBuildError::ConfigurationDigestMismatch
+        | WasmtimeBuildError::ComponentConfigurationDigestMismatch => {
+            TypedExecutionError::AdmissionMismatch("engine-binding".to_owned())
+        }
+    }
 }
 
 /// Executes the typed `describe` descriptor for one world through the real
@@ -961,15 +999,16 @@ pub fn execute_describe_experimental(
     // Cache identity revalidation before any engine is built: no bypass.
     let cache_identity = check_cache_identity(world, artifact, &preflight.digest, limits)?;
 
-    let (engine, component) = build_typed_dispatch_component(limits, artifact)?;
+    let provider = build_typed_dispatch_provider(world, limits, artifact)?;
+    let (engine, component) = provider.dispatch_leg(limits);
 
     // Inspect the exact component type before any instance is created or any
     // guest function is called. Generated bindings provide the expected WIT
     // function signatures; the Wasmtime ComponentFunc type checker compares
     // them against the compiled component metadata.
-    let (imports, exports) = preflight_component_type(world, &engine, &component)?;
+    let (imports, exports) = preflight_component_type(world, engine, component)?;
 
-    let (descriptor, usage) = dispatch_describe(world, &engine, &component, limits)?;
+    let (descriptor, usage) = dispatch_describe(world, engine, component, limits)?;
     let (output_digest, output_bytes) =
         validate_descriptor(world, &descriptor, limits.max_output_bytes)
             .map_err(|error| staged(TypedStage::Output, error))?;
@@ -1962,11 +2001,12 @@ pub fn execute_domain_experimental(
     // Cache identity revalidation before any engine is built: no bypass.
     let cache_identity = check_cache_identity(world, artifact, &preflight.digest, limits)?;
 
-    let (engine, component) = build_typed_dispatch_component(limits, artifact)?;
+    let provider = build_typed_dispatch_provider(world, limits, artifact)?;
+    let (engine, component) = provider.dispatch_leg(limits);
 
-    let (imports, exports) = preflight_component_type(world, &engine, &component)?;
+    let (imports, exports) = preflight_component_type(world, engine, component)?;
 
-    let (descriptor, result, usage) = dispatch_domain(world, &engine, &component, limits, request)?;
+    let (descriptor, result, usage) = dispatch_domain(world, engine, component, limits, request)?;
 
     let (descriptor_digest, descriptor_bytes) =
         validate_descriptor(world, &descriptor, limits.max_output_bytes)
