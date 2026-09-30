@@ -176,7 +176,7 @@ public sealed record UserAutomationScheduleProjection(
 /// and calendar, and the Operator does not own the expression language. It pins
 /// only what the supplied bytes decide — see
 /// <see cref="RequireOneSourceDigest"/> and
-/// <see cref="RequireFreshOwnerEvidenceForEdit"/> for exactly what is pinned
+/// <see cref="RequireV3SourceDigestConsistencyForEdit"/> for exactly what is pinned
 /// and what is not.
 /// </para>
 /// <para>
@@ -716,71 +716,47 @@ public static class UserAutomationScheduleMirror
     }
 
     /// <summary>
-    /// Refuses a fresh create/edit submission until an owner-issued normalization
-    /// result or explicit migration action is bound to the immutable revision.
+    /// Checks that the embedded V3 source digest changes exactly when its
+    /// canonical source inputs change. The Store owner still validates and issues
+    /// normalization evidence.
     /// </summary>
     /// <remarks>
-    /// The accepted owner operation schema validates caller-supplied V4
-    /// occurrence records, but exposes no callable normalization result,
-    /// migration action, or bound owner identity. Equality with a previous
-    /// revision and a caller-supplied source digest prove neither owner issuance
-    /// nor freshness. This gate belongs to fresh submission, not typed request
-    /// validation: retained requests must remain decodable for exact-identity
-    /// reconciliation. Reads and inspection remain available, and no immutable
-    /// revision is rewritten.
+    /// V3 binds schedule kind, expression, calendar, timezone, DST policies and
+    /// the inclusive interval. Pinned zone-table identity is build-constant. The
+    /// Operator compares these inputs to the occurrence-carried digest but cannot
+    /// recompute the canonical hash or prove normalization provenance.
     /// </remarks>
-    public static void RequireOwnerIssuedNormalizationForFreshSubmission(string action)
-    {
-        if (!string.Equals(action, "create", StringComparison.Ordinal)
-            && !string.Equals(action, "edit", StringComparison.Ordinal))
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(action),
-                "Only fresh create/edit schedule submissions require this owner-issued normalization gate.");
-        }
-
-        throw new InvalidOperationException(
-            $"UserAutomation {action} not sent: the current owner contract has no callable normalization result or explicit migration action bound to this immutable schedule revision. Preserve the existing revision; obtain an owner-issued result bound to a new immutable revision before submission.");
-    }
-
-    /// <summary>
-    /// Checks only the locally provable relation between source fields and
-    /// source digests for an edit. It cannot establish fresh owner evidence.
-    /// </summary>
-    /// <remarks>
-    /// The owner source digest is a hash of expression and calendar only. This
-    /// method rejects reusing the prior digest after either source field changes
-    /// and rejects changing the digest when both source fields stay the same.
-    /// A zone, DST policy, interval or occurrence change may validly retain the
-    /// same digest; whether that effect-relevant edit has fresh normalization
-    /// evidence cannot be decided here. Fresh submissions are guarded separately
-    /// because the Operator cannot recompute the source hash or prove provenance.
-    /// </remarks>
-    public static void RequireFreshOwnerEvidenceForEdit(
+    public static void RequireV3SourceDigestConsistencyForEdit(
         UserAutomationNormalizedSchedule previous,
         UserAutomationNormalizedSchedule next)
     {
         ArgumentNullException.ThrowIfNull(previous);
         ArgumentNullException.ThrowIfNull(next);
         var previousProjection = previous.ReadLocalProjection();
-        var nextProjection = next.ReadLocalProjection();
-        var sameSource = string.Equals(previous.Expression, next.Expression, StringComparison.Ordinal)
-            && string.Equals(previous.Calendar, next.Calendar, StringComparison.Ordinal);
+        var nextProjection = next.ReadLocalProjection(allowReceiptFreeDraft: true);
+        var sameDigestInputs = string.Equals(previous.Kind, next.Kind, StringComparison.Ordinal)
+            && string.Equals(previous.Expression, next.Expression, StringComparison.Ordinal)
+            && string.Equals(previous.Calendar, next.Calendar, StringComparison.Ordinal)
+            && string.Equals(previous.Timezone, next.Timezone, StringComparison.Ordinal)
+            && string.Equals(previous.DstFold, next.DstFold, StringComparison.Ordinal)
+            && string.Equals(previous.DstGap, next.DstGap, StringComparison.Ordinal)
+            && string.Equals(previous.StartAt, next.StartAt, StringComparison.Ordinal)
+            && string.Equals(previous.EndAt, next.EndAt, StringComparison.Ordinal);
         var sameDigest = string.Equals(
             previousProjection.SourceDigest, nextProjection.SourceDigest, StringComparison.Ordinal);
-        if (!sameSource && sameDigest)
+        if (!sameDigestInputs && sameDigest)
         {
             throw new UserAutomationScheduleContractException(
                 "Invalid",
                 OwnerText("Invalid", "schedule.next_occurrences.source_digest"),
-                "this edit changes its expression or calendar but reuses the previous source digest; obtain fresh owner normalization and submit a new immutable revision");
+                "this edit changes a V3 source field but reuses the previous source digest; obtain owner normalization for the new immutable revision");
         }
-        if (sameSource && !sameDigest)
+        if (sameDigestInputs && !sameDigest)
         {
             throw new UserAutomationScheduleContractException(
                 "Invalid",
                 OwnerText("Invalid", "schedule.occurrence_key.source_digest"),
-                "this edit keeps the same expression and calendar but changes their source digest; obtain the correct owner normalization for this source");
+                "this edit keeps the same V3 source fields but changes their source digest; obtain the correct owner normalization for this source");
         }
     }
 
@@ -983,7 +959,7 @@ public sealed record UserAutomationOutcome(
 public sealed record UserAutomationResultValidationContext
 {
     // A reviewed decoder change must explicitly acknowledge the Rust result schema.
-    private const string SupportedUserAutomationResultSchemaSha256 = "a33f0f2df3f54d99ac0af98f256bd4766f943552a46be06c98e5f74f4462dc5c";
+    private const string SupportedUserAutomationResultSchemaSha256 = "785065c0d1839a65d8ea7dad8dd0415450470dfee1fab655472a49d0cd0c3a3e";
 
     private UserAutomationResultValidationContext(
         string expectedOperationId,
@@ -1631,7 +1607,36 @@ public static class UserAutomationOutcomeClassifier
         && TryReadBoundedText(schedule, "start_at", OperatorScheduleContract.UTC_INSTANT_BYTES, out _)
         && HasOptionalBoundedText(schedule, "end_at", OperatorScheduleContract.UTC_INSTANT_BYTES)
         && HasBoundedStringArray(schedule, "next_occurrences", OperatorScheduleContract.MAX_OCCURRENCE_KEY_BYTES)
-        && HasBoundedArrayLength(schedule, "next_occurrences", OperatorScheduleContract.MAX_REFERENCES, requireNonEmpty: true);
+        && HasBoundedArrayLength(schedule, "next_occurrences", OperatorScheduleContract.MAX_REFERENCES, requireNonEmpty: true)
+        && HasBoundNormalizationReceipt(schedule);
+
+    /// <summary>
+    /// The Rust input schema permits an omitted receipt on Create/Edit drafts,
+    /// but a revision returned as stored owner state must carry one. This local
+    /// check verifies shape and schedule binding, not issuer provenance.
+    /// </summary>
+    private static bool HasBoundNormalizationReceipt(JsonElement schedule)
+    {
+        if (!TryGetObject(schedule, "normalization_receipt", out var normalizationReceipt)
+            || !HasExactProperties(
+                normalizationReceipt,
+                "receipt_id",
+                "normalizer_authority",
+                "source_digest",
+                "zone_database_revision",
+                "occurrences_digest")
+            || !TryReadScheduleProjection(schedule, out var projection)
+            || projection.NormalizationReceipt is not { } issuedReceipt)
+        {
+            return false;
+        }
+
+        return string.Equals(issuedReceipt.SourceDigest, projection.SourceDigest, StringComparison.Ordinal)
+            && string.Equals(
+                issuedReceipt.ZoneDatabaseRevision,
+                projection.PinnedZoneDatabaseRelease,
+                StringComparison.Ordinal);
+    }
 
     private static bool HasCurrentProviderPolicy(JsonElement policy)
     {

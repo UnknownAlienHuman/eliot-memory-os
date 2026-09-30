@@ -602,12 +602,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// Sends one closed UserAutomation operator operation through the existing
     /// authenticated Governor client. The UI never supplies identity, fence,
     /// schedule authority, provider credentials, or Store receipt fields.
-    ///
-    /// Create/edit revisions are parsed and validated for local inspection, then
-    /// refused at the fresh submission boundary because the owner contract exposes
-    /// no normalization result or migration action bound to the immutable
-    /// revision. The local projection is shown with the refusal and is never
-    /// treated as owner evidence. Read/inspect operations remain usable.
+    /// Create/edit inputs may omit the normalization receipt; the Store owner
+    /// compiles the schedule and issues that evidence before persistence.
     public async Task RunUserAutomationAsync()
     {
         // A create or edit needs a caller-supplied schedule revision. The
@@ -631,19 +627,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             operation = BuildUserAutomationOperation();
             scheduleProjection = operation switch
             {
-                UserAutomationCreateOperation create => create.Revision.Schedule.ReadLocalProjection(),
-                UserAutomationEditOperation edit => edit.Revision.Schedule.ReadLocalProjection(),
+                UserAutomationCreateOperation create => create.Revision.Schedule.ReadLocalProjection(allowReceiptFreeDraft: true),
+                UserAutomationEditOperation edit => edit.Revision.Schedule.ReadLocalProjection(allowReceiptFreeDraft: true),
                 _ => null
             };
             operation.Validate();
-            if (operation is UserAutomationCreateOperation)
-            {
-                UserAutomationScheduleMirror.RequireOwnerIssuedNormalizationForFreshSubmission("create");
-            }
-            else if (operation is UserAutomationEditOperation)
-            {
-                UserAutomationScheduleMirror.RequireOwnerIssuedNormalizationForFreshSubmission("edit");
-            }
         }
         catch (UserAutomationScheduleContractException refusal)
         {
