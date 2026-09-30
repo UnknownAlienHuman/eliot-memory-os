@@ -29,11 +29,31 @@ use crate::error::{
 /// `DreamJobInput`, hashed by the foundation contract owner.
 pub fn dream_job_input_contract_identity() -> Result<ContractIdentity, ContractViolation> {
     let shape = schemars::schema_for!(DreamJobInput);
+    dreamer_contract_identity(&shape, "DreamJobInput")
+}
+
+/// Returns the content-addressed identity for [`DreamJobAdmission`].
+///
+/// The serialized reference remains owned by the original publisher; this
+/// helper only derives the expected contract identity for validating that
+/// reference against the existing admission schema.
+pub fn dream_job_admission_contract_identity() -> Result<ContractIdentity, ContractViolation> {
+    let shape = schemars::schema_for!(DreamJobAdmission);
+    dreamer_contract_identity(&shape, "DreamJobAdmission")
+}
+
+/// Returns a content-addressed identity for another schema owned by this
+/// contract module. Used by sibling schema owners to avoid duplicating the
+/// contract name, version parsing, or identity construction.
+pub(crate) fn dreamer_contract_identity<S: Serialize + ?Sized>(
+    shape: &S,
+    type_name: &'static str,
+) -> Result<ContractIdentity, ContractViolation> {
     let version = parse_contract_version(crate::CONTRACT_VERSION)?;
-    contract_identity(crate::CONTRACT_NAME, version, &shape).map_err(|_| {
+    contract_identity(crate::CONTRACT_NAME, version, shape).map_err(|_| {
         ContractViolation::Malformed {
             field: "contract",
-            reason: "cannot derive DreamJobInput contract identity".to_owned(),
+            reason: std::format!("cannot derive {type_name} contract identity"),
         }
     })
 }

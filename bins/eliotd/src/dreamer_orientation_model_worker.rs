@@ -11,8 +11,8 @@ use eliot_agent_opencode::{
     RunRequestError, select_opencode_route,
 };
 use eliot_contracts::{
-    ContractVersion, RequestMetadata, StateFence, canonical_json_bytes, contract_identity,
-    sha256_hex,
+    ContractIdentity, ContractVersion, RequestMetadata, StateFence, canonical_json_bytes,
+    contract_identity, sha256_hex,
 };
 use eliot_coordination::{CoordinationOwner, WorkLeaseRequest};
 use eliot_dreamer_contracts::{
@@ -20,11 +20,12 @@ use eliot_dreamer_contracts::{
     PROVIDER_OUTPUT_SCHEMA_VERSION, RecipeInput, provider_output_schema_v2,
 };
 use eliot_protocol::dreamer_job::{
-    DurableJobError, OpaqueContentRef, ProviderStaffingRuntimeSourcePublication,
+    DurableJobError, DurableJobRuntimeOwnerExecutionInput, OpaqueContentRef,
 };
 use eliot_read::LocalReadPort;
 use eliot_receipts::WorkScopeBinding;
 use eliot_store_api::ScopeId;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use super::agent_fabric::{
@@ -50,12 +51,17 @@ pub struct DreamerOrientationModelWorkerInput<'a, R: LocalReadPort> {
     /// Original WorkScope from the durable submit, retained unchanged by the
     /// Task Controller runtime-owner input.
     pub work_scope: &'a WorkScopeBinding,
+    /// Exact typed runtime-owner input decoded from the original durable
+    /// submission/claim. New v2 invocations carry the admission, bundle and
+    /// staffing publications here as separate owner references and bytes.
+    pub runtime_owner_input: &'a DurableJobRuntimeOwnerExecutionInput,
+    /// Original immutable runtime-owner content reference from the durable
+    /// request/claimed response.
+    pub runtime_owner_input_ref: &'a OpaqueContentRef,
+    /// Exact original canonical bytes named by `runtime_owner_input_ref`.
+    pub runtime_owner_input_bytes: &'a [u8],
     pub catalogue: &'a ModelCatalogueSnapshot,
     pub policy: &'a HumanModelPreferencePolicy,
-    /// Original provider-runtime staffing profile publication. Missing is a
-    /// typed residual: provider/model selection alone does not supply recipe,
-    /// role, capacity, launch or provider identity.
-    pub provider_staffing_source: Option<&'a ProviderStaffingRuntimeSourcePublication>,
     pub now_unix_ms: u64,
     /// Exact recipe member from the original admitted output-schema role.
     pub output_schema_recipe: &'a RecipeInput,
@@ -99,6 +105,16 @@ pub enum DreamerOrientationModelWorkerError {
     Selection(#[from] ModelControlError),
     #[error("provider staffing source is absent from the original runtime input")]
     ProviderStaffingSourceMissing,
+    #[error("original v2 runtime-owner admission/bundle publications are absent or incomplete")]
+    RuntimeOwnerSourceMissing,
+    #[error("original runtime-owner publication does not bind the decoded job/admission/bundle")]
+    RuntimeOwnerSourceBindingMismatch,
+    #[error("original runtime-owner publication has the wrong typed contract identity")]
+    RuntimeOwnerSourceContractMismatch,
+    #[error("original runtime-owner content reference is invalid: {0}")]
+    RuntimeOwnerReference(DurableJobError),
+    #[error("original admission or bundle content reference is invalid: {0}")]
+    RuntimeOwnerSourceReference(DurableJobError),
     #[error("original provider admission is absent from the runtime owner input")]
     ProviderAdmissionMissing,
     #[error(transparent)]
@@ -151,6 +167,11 @@ pub async fn execute_admitted_orientation_model(
     route_admission: &OpenCodeRouteAdmission,
     input: DreamerOrientationModelWorkerInput<'_, impl LocalReadPort>,
 ) -> Result<DreamerOrientationModelAttempt, DreamerOrientationModelWorkerError> {
+    validate_runtime_owner_publication(
+        input.runtime_owner_input,
+        input.runtime_owner_input_ref,
+        input.runtime_owner_input_bytes,
+    )?;
     input.semantic_input_ref.validate("semantic_input")?;
     let byte_length = u64::try_from(input.semantic_input_bytes.len())
         .map_err(|_| DreamerOrientationModelWorkerError::SemanticReferenceMismatch)?;
@@ -168,6 +189,22 @@ pub async fn execute_admitted_orientation_model(
     job.validate()?;
     if canonical_json_bytes(&job)?.as_slice() != input.semantic_input_bytes {
         return Err(DreamerOrientationModelWorkerError::NonCanonicalSemanticInput);
+    }
+    let (original_admission, original_bundle, staffing_publication) =
+        decode_v2_runtime_owner_sources(input.runtime_owner_input)?;
+    if original_admission != *input.admission
+        || original_bundle != *input.bundle
+        || input.runtime_owner_input.task_id.as_str() != input.admission.task_id.as_str()
+        || input.runtime_owner_input.work_scope != *input.work_scope
+        || input.runtime_owner_input.state_fence != job.state_fence
+        || input.runtime_owner_input.output_contract != *input.output_contract_ref
+        || input.runtime_owner_input.semantic_source.expected_digest
+            != input.semantic_input_ref.sha256
+        || input.runtime_owner_input.semantic_source.expected_byte_length
+            != input.semantic_input_ref.byte_length
+        || !runtime_schema_binds_invocation(&input)
+    {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch);
     }
     input.admission.validate()?;
     input.bundle.validate()?;
@@ -192,9 +229,6 @@ pub async fn execute_admitted_orientation_model(
     }
     let prompt_bytes = admitted_model_route_context_bytes(&job, input.admission, input.bundle)?;
 
-    let staffing_publication = input
-        .provider_staffing_source
-        .ok_or(DreamerOrientationModelWorkerError::ProviderStaffingSourceMissing)?;
     let staffing_profile = DreamerProviderStaffingRuntimeProfile::from_publication(
         staffing_publication,
     )?;
@@ -320,6 +354,116 @@ pub async fn execute_admitted_orientation_model(
     )
     .await
     .map_err(Into::into)
+}
+
+fn decode_v2_runtime_owner_sources(
+    runtime: &DurableJobRuntimeOwnerExecutionInput,
+) -> Result<
+    (
+        DreamJobAdmission,
+        DreamInputBundle,
+        &eliot_protocol::dreamer_job::ProviderStaffingRuntimeSourcePublication,
+    ),
+    DreamerOrientationModelWorkerError,
+> {
+    runtime.validate()?;
+    if !runtime.has_v2_owner_publications() {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceMissing);
+    }
+    let admission_identity =
+        eliot_dreamer_contracts::job::dream_job_admission_contract_identity()?;
+    let bundle_identity = eliot_dreamer_contracts::bundle::dream_input_bundle_contract_identity()?;
+    let admission = decode_original_typed_publication(
+        runtime.job_admission_ref.as_ref(),
+        runtime.job_admission_bytes.as_deref(),
+        "job_admission",
+        &admission_identity,
+    )?;
+    let bundle = decode_original_typed_publication(
+        runtime.input_bundle_ref.as_ref(),
+        runtime.input_bundle_bytes.as_deref(),
+        "input_bundle",
+        &bundle_identity,
+    )?;
+    let staffing = runtime
+        .provider_staffing_source
+        .as_ref()
+        .ok_or(DreamerOrientationModelWorkerError::RuntimeOwnerSourceMissing)?;
+    Ok((admission, bundle, staffing))
+}
+
+fn validate_runtime_owner_publication(
+    runtime: &DurableJobRuntimeOwnerExecutionInput,
+    reference: &OpaqueContentRef,
+    bytes: &[u8],
+) -> Result<(), DreamerOrientationModelWorkerError> {
+    reference
+        .validate("runtime_owner_execution_input")
+        .and_then(|()| reference.validate_original_bytes(bytes))
+        .map_err(DreamerOrientationModelWorkerError::RuntimeOwnerReference)?;
+    if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity_v2()? {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceContractMismatch);
+    }
+    let canonical = canonical_json_bytes(runtime)
+        .map_err(|_| DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch)?;
+    if canonical.as_slice() != bytes {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch);
+    }
+    runtime
+        .validate()
+        .map_err(DreamerOrientationModelWorkerError::SemanticReference)
+}
+
+fn decode_original_typed_publication<T>(
+    reference: Option<&OpaqueContentRef>,
+    bytes: Option<&[u8]>,
+    field: &'static str,
+    expected_contract: &ContractIdentity,
+) -> Result<T, DreamerOrientationModelWorkerError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let (Some(reference), Some(bytes)) = (reference, bytes) else {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceMissing);
+    };
+    reference
+        .validate(field)
+        .and_then(|()| reference.validate_original_bytes(bytes))
+        .map_err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceReference)?;
+    if &reference.contract != expected_contract {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceContractMismatch);
+    }
+    let decoded: T = serde_json::from_slice(bytes)
+        .map_err(|_| DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch)?;
+    let canonical = canonical_json_bytes(&decoded)
+        .map_err(|_| DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch)?;
+    if canonical.as_slice() != bytes {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch);
+    }
+    Ok(decoded)
+}
+
+fn runtime_schema_binds_invocation<R: LocalReadPort>(
+    input: &DreamerOrientationModelWorkerInput<'_, R>,
+) -> bool {
+    let RecipeInput::OutputSchema {
+        schema_id,
+        schema_version,
+        schema_digest,
+    } = input.output_schema_recipe
+    else {
+        return false;
+    };
+    let runtime = input.runtime_owner_input;
+    runtime.output_schema_recipe.schema_id == *schema_id
+        && runtime.output_schema_recipe.schema_version == *schema_version
+        && runtime.output_schema_recipe.schema_digest == *schema_digest
+        && runtime.schema_source.source_handle == input.output_schema_source.source_handle
+        && runtime.schema_source.expected_digest == input.output_schema_source.expected_digest
+        && runtime.schema_source.expected_byte_length
+            == input.output_schema_source.expected_byte_length
+        && runtime.schema_source.privacy_class == input.output_schema_source.privacy_class
+        && runtime.schema_source.route_class == input.output_schema_source.route_class
 }
 
 async fn resolve_original_output_schema<R: LocalReadPort>(

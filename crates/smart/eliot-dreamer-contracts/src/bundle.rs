@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
+use eliot_contracts::ContractIdentity;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,16 @@ const MAX_HANDLE_CHARS: usize = 128;
 const MAX_MATERIALS: usize = 1024;
 /// Maximum omissions accepted in one bundle (G3 collection bound).
 const MAX_OMISSIONS: usize = 1024;
+
+/// Returns the content-addressed identity for [`DreamInputBundle`].
+///
+/// The reference remains issued by the original bundle owner; this helper
+/// derives only the expected identity from the existing schema so a consumer
+/// can validate that unchanged reference and its retained bytes.
+pub fn dream_input_bundle_contract_identity() -> Result<ContractIdentity, ContractViolation> {
+    let shape = schemars::schema_for!(DreamInputBundle);
+    crate::job::dreamer_contract_identity(&shape, "DreamInputBundle")
+}
 
 /// Rejects a digest that is not exactly 64 lowercase hex characters.
 fn check_digest(value: &str, field: &'static str) -> Result<(), ContractViolation> {
