@@ -71,8 +71,20 @@ var viewModel = new MainViewModel(client)
     ProjectId = "00000000-0000-0000-0000-000000000001",
     TaskId = "00000000-0000-0000-0000-000000000002"
 };
+var sampleUserAutomationFence = JsonSerializer.SerializeToElement(new
+{
+    authority_epoch = new
+    {
+        lineage_id = "00000000-0000-0000-0000-000000000003",
+        sequence = 1
+    },
+    resource_generation = 1,
+    task_revision = (ulong?)null,
+    policy_revision = (ulong?)null,
+    integration_revision = (ulong?)null
+});
 var userAutomationWire = JsonSerializer.Serialize(
-    UserAutomationOperatorRequest.Create(new UserAutomationListOperation(false)));
+    UserAutomationOperatorRequest.Create(new UserAutomationListOperation(false), sampleUserAutomationFence));
 True(!userAutomationWire.Contains("\"command\"", StringComparison.Ordinal), "UserAutomation has no generic command envelope");
 True(userAutomationWire.Contains("\"kind\":\"list\"", StringComparison.Ordinal), "closed UserAutomation operation kind");
 True(userAutomationWire.Contains("\"idempotency_key\"", StringComparison.Ordinal), "retry-stable UserAutomation identity");
@@ -550,6 +562,36 @@ sealed class FakeGovernorClient : IGovernorClient
         CancellationToken cancellationToken = default)
     {
         request.Validate();
+        if (request.Operation is UserAutomationGetContextOperation)
+        {
+            var contextFence = JsonSerializer.SerializeToElement(new
+            {
+                authority_epoch = new
+                {
+                    lineage_id = "00000000-0000-0000-0000-000000000003",
+                    sequence = 1
+                },
+                resource_generation = 1,
+                task_revision = (ulong?)null,
+                policy_revision = (ulong?)null,
+                integration_revision = (ulong?)null
+            });
+            return Task.FromResult(JsonSerializer.SerializeToElement(new
+            {
+                wire_id = OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
+                wire_version = OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION,
+                status = "known",
+                correlation = new
+                {
+                    operation_id = $"user-automation-operation:{request.IdempotencyKey}",
+                    idempotency_key = request.IdempotencyKey
+                },
+                state_fence = contextFence,
+                value = new { outcome = "context", state_fence = contextFence },
+                recovery = (object?)null
+            }));
+        }
+
         UserAutomationCount++;
         LastUserAutomation = request.Operation;
         return Task.FromResult(JsonSerializer.SerializeToElement(new

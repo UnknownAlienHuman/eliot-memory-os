@@ -7,9 +7,12 @@ using Eliot.Operator.Protocol.Generated;
 namespace Eliot.Operator.Protocol;
 
 /// Closed UserAutomation operation surface carried by the authenticated
-/// Governor command. It contains no principal, StateFence, Store receipt,
+/// Governor command. Except for the read-only context handshake, each request
+/// also carries the exact owner-issued StateFence witness against which the
+/// Kernel admits the operation. It contains no principal, Store receipt,
 /// scheduler, provider credential, or ambient settings.
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
+[JsonDerivedType(typeof(UserAutomationGetContextOperation), "get_context")]
 [JsonDerivedType(typeof(UserAutomationCreateOperation), "create")]
 [JsonDerivedType(typeof(UserAutomationListOperation), "list")]
 [JsonDerivedType(typeof(UserAutomationStatusOperation), "status")]
@@ -38,6 +41,16 @@ public abstract record UserAutomationOperation
     /// abstract declaration, all ten derived records, the polymorphic
     /// `UserAutomationOperation` contract and the outer request at once.
     public abstract bool IsEffect();
+}
+
+/// Read-only authenticated route handshake. This operation is never shown as
+/// a business action and its result supplies the StateFence for the next
+/// independently identified request.
+public sealed record UserAutomationGetContextOperation : UserAutomationOperation
+{
+    public override void Validate() { }
+
+    public override bool IsEffect() => false;
 }
 
 public sealed record UserAutomationCreateOperation(
@@ -175,12 +188,16 @@ public sealed record UserAutomationInspectLastFailureOperation(
 }
 
 /// Exact authenticated UserAutomation front-door payload. The named route
-/// adds the authenticated session, principal, request metadata, State Fence
-/// and issued operation identity; the surface supplies only the closed
-/// operation and one retry-stable idempotency key.
+/// adds the authenticated session, principal, request metadata and issued
+/// operation identity. The read-only get_context handshake omits
+/// expected_state_fence; every later request carries the unchanged fence that
+/// handshake returned.
 public sealed record UserAutomationOperatorRequest(
     [property: JsonPropertyName("operation")] UserAutomationOperation Operation,
-    [property: JsonPropertyName("idempotency_key")] string IdempotencyKey)
+    [property: JsonPropertyName("idempotency_key")] string IdempotencyKey,
+    [property: JsonPropertyName("expected_state_fence")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        JsonElement? ExpectedStateFence)
 {
     /// The retry-stable identity of one typed operation. It is derived from
     /// the exact canonical operation bytes, so a lost response, a transport
@@ -202,8 +219,45 @@ public sealed record UserAutomationOperatorRequest(
         return Convert.ToHexString(digest.AsSpan(0, 16)).ToLowerInvariant();
     }
 
-    public static UserAutomationOperatorRequest Create(UserAutomationOperation operation) =>
-        new(operation, DeriveIdempotencyKey(operation));
+    public static UserAutomationOperatorRequest Create(UserAutomationOperation operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        if (operation is not UserAutomationGetContextOperation)
+        {
+            throw new InvalidOperationException(
+                "a UserAutomation business request requires a fresh owner State Fence witness");
+        }
+
+        return CreateContext();
+    }
+
+    /// Mints the short-lived read-only handshake identity. It is deliberately
+    /// unique per call so a newly authenticated session cannot receive a
+    /// retained result from an earlier context read.
+    public static UserAutomationOperatorRequest CreateContext() =>
+        new(
+            new UserAutomationGetContextOperation(),
+            Guid.NewGuid().ToString("N"),
+            ExpectedStateFence: null);
+
+    /// Mints one business request from the same typed operation and exact
+    /// owner-issued fence. The fence is retained and replayed byte-for-byte;
+    /// it is never reacquired while reconciling this identity.
+    public static UserAutomationOperatorRequest Create(
+        UserAutomationOperation operation,
+        JsonElement expectedStateFence)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        if (operation is UserAutomationGetContextOperation)
+        {
+            throw new InvalidOperationException("get_context must not carry an expected State Fence");
+        }
+
+        return new UserAutomationOperatorRequest(
+            operation,
+            DeriveIdempotencyKey(operation),
+            expectedStateFence.Clone());
+    }
 
     public void Validate()
     {
@@ -233,6 +287,19 @@ public sealed record UserAutomationOperatorRequest(
         if (Operation is null) throw new InvalidOperationException("operation must be present.");
         Operation.Validate();
         OperatorIntentContract.RequireOperationId(IdempotencyKey);
+        if (Operation is UserAutomationGetContextOperation)
+        {
+            if (ExpectedStateFence is not null)
+            {
+                throw new InvalidOperationException("get_context must omit expected_state_fence");
+            }
+        }
+        else if (ExpectedStateFence is not { } expectedStateFence
+            || !UserAutomationOutcomeClassifier.IsClosedStateFence(expectedStateFence))
+        {
+            throw new InvalidOperationException(
+                "a UserAutomation business request requires one closed expected_state_fence");
+        }
     }
 }
 
@@ -258,10 +325,10 @@ public sealed record UserAutomationRetainedRequest(
     /// `IsEffect` property under the closed Web naming policy.
     public const string SupersededLocalClassifierMember = "isEffect";
 
-    /// The outer request is exactly these two members. It is stated here rather
-    /// than read back off the request type so the retained envelope is checked
-    /// against the wire contract, not against its own reader.
-    private static readonly string[] RequestMemberNames = ["operation", "idempotency_key"];
+    /// The outer business request is exactly these three members. It is stated
+    /// here rather than read back off the request type so the retained envelope
+    /// is checked against the wire contract, not against its own reader.
+    private static readonly string[] RequestMemberNames = ["operation", "idempotency_key", "expected_state_fence"];
 
     /// The one tolerated deviation, scoped to retained local recovery bytes.
     /// `OperatorJson.Reader` itself is untouched, so no unrelated surface

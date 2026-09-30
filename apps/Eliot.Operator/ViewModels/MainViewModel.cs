@@ -600,10 +600,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     }
 
     /// Sends one closed UserAutomation operator operation through the existing
-    /// authenticated Governor client. The UI never supplies identity, fence,
+    /// authenticated Governor client. A fresh owner context supplies the
+    /// request's expected State Fence; the UI never supplies principal,
     /// schedule authority, provider credentials, or Store receipt fields.
-    /// Create/edit inputs may omit the normalization receipt; the Store owner
-    /// compiles the schedule and issues that evidence before persistence.
+    /// Create/edit inputs may omit the normalization receipt; owner-issued
+    /// normalization evidence is required before a revision is accepted.
     public async Task RunUserAutomationAsync()
     {
         // A create or edit needs a caller-supplied schedule revision. The
@@ -667,23 +668,25 @@ public sealed class MainViewModel : INotifyPropertyChanged
         IsBusy = true;
         NotifyCounts();
         operation.Validate();
+        var cancellationToken = _requestCancellation?.Token ?? CancellationToken.None;
 
         if (!operation.IsEffect())
         {
             try
             {
-                var readRequest = UserAutomationOperatorRequest.Create(operation);
+                var expectedStateFence = await ReadFreshUserAutomationStateFenceAsync(cancellationToken);
+                var readRequest = UserAutomationOperatorRequest.Create(operation, expectedStateFence);
                 var read = await _client.UserAutomationAsync(
                     readRequest,
-                    _requestCancellation?.Token ?? CancellationToken.None);
+                    cancellationToken);
                 ShowUserAutomationResult(action, read, readRequest);
             }
             catch (Exception error)
             {
                 SetBanner(
                     "UserAutomation read failed",
-                    $"The UserAutomation read did not complete ({OperatorFaultReason.ForException(error)}); "
-                    + "a read has no owner effect, so it can be retried once the session is restored.",
+                    $"The UserAutomation context handshake or read did not complete ({OperatorFaultReason.ForException(error)}); "
+                    + "no write was requested, so it can be retried after the owner session is restored.",
                     OperatorBannerSeverity.Error);
             }
             finally
@@ -714,10 +717,26 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
+        JsonElement expectedWriteFence;
+        try
+        {
+            expectedWriteFence = await ReadFreshUserAutomationStateFenceAsync(cancellationToken);
+        }
+        catch (Exception error)
+        {
+            SetBanner(
+                "Command not sent — fresh owner context unavailable",
+                $"The UserAutomation operation was not sent because the authenticated context handshake did not produce a current State Fence ({OperatorFaultReason.ForException(error)}). Retry after the owner session is restored.",
+                OperatorBannerSeverity.Warning);
+            IsBusy = false;
+            NotifyCounts();
+            return;
+        }
+
         // One prepared request. The same object is journaled and transmitted,
-        // so the retained identity and the wire identity cannot diverge and
-        // the key is minted exactly once.
-        var request = UserAutomationOperatorRequest.Create(operation);
+        // including the exact owner-issued State Fence witness, so recovery
+        // resends the same request without reacquiring context.
+        var request = UserAutomationOperatorRequest.Create(operation, expectedWriteFence);
         request.Validate();
         var pending = new OperatorPendingOperation(
             request.IdempotencyKey,
@@ -742,6 +761,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         RefreshPendingState();
         await TransmitUserAutomationAsync(request, pending, action);
+    }
+
+    /// Reads the authenticated current State Fence on the existing
+    /// UserAutomation route. This response is an admission witness only; it is
+    /// never displayed as a business result or stored as an operation.
+    private async Task<JsonElement> ReadFreshUserAutomationStateFenceAsync(CancellationToken cancellationToken)
+    {
+        var contextRequest = UserAutomationOperatorRequest.CreateContext();
+        var contextAnswer = await _client.UserAutomationAsync(contextRequest, cancellationToken);
+        return UserAutomationOutcomeClassifier.ReadContextStateFence(contextAnswer, contextRequest);
     }
 
     /// Transmits one prepared typed UserAutomation request under the identity it

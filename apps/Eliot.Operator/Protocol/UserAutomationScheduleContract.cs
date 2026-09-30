@@ -906,16 +906,16 @@ public enum UserAutomationOutcomeClass
 
     /// <summary>
     /// The owner reports a current versioned transition bound to the submitted
-    /// operation. The Operator has no independent current-fence comparand, and
-    /// the schedule fields remain inspection data without normalization proof.
+    /// operation and the exact expected State Fence. The schedule fields remain
+    /// inspection data without owner-issued normalization proof.
     /// </summary>
     OwnerBoundTransitionScheduleUnverified,
 
-    /// <summary>The owner reports non-retention, but no independent current-fence comparison is available.</summary>
-    OwnerReportedNotRetainedFenceUnverified,
+    /// <summary>The owner reports non-retention under the expected State Fence.</summary>
+    OwnerReportedNotRetained,
 
-    /// <summary>The owner reports a commit with a ledger read owed, but the current fence is not independently compared.</summary>
-    OwnerReportedCommitFenceUnverifiedLedgerReadOwed,
+    /// <summary>The owner reports a commit under the expected State Fence with a ledger read owed.</summary>
+    OwnerReportedCommitLedgerReadOwed,
 
     /// <summary>
     /// The answer does not prove schedule normalization provenance. A decodable
@@ -966,13 +966,15 @@ public sealed record UserAutomationResultValidationContext
         string expectedIdempotencyKey,
         string expectedResultWireId,
         int supportedResultWireVersion,
-        string? transportCorrelationId)
+        string? transportCorrelationId,
+        JsonElement? expectedStateFence)
     {
         ExpectedOperationId = expectedOperationId;
         ExpectedIdempotencyKey = expectedIdempotencyKey;
         ExpectedResultWireId = expectedResultWireId;
         SupportedResultWireVersion = supportedResultWireVersion;
         TransportCorrelationId = transportCorrelationId;
+        ExpectedStateFence = expectedStateFence?.Clone();
     }
 
     public string ExpectedOperationId { get; }
@@ -990,6 +992,12 @@ public sealed record UserAutomationResultValidationContext
     /// is never substituted for the semantic operation identity.
     /// </summary>
     public string? TransportCorrelationId { get; }
+
+    /// <summary>
+    /// The independently acquired fence embedded in the exact request being
+    /// classified. It is absent only for the read-only get_context handshake.
+    /// </summary>
+    public JsonElement? ExpectedStateFence { get; }
 
     /// <summary>
     /// Creates validation context from the same request value that is sent or
@@ -1017,7 +1025,8 @@ public sealed record UserAutomationResultValidationContext
             request.IdempotencyKey,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION,
-            transportCorrelationId);
+            transportCorrelationId,
+            request.ExpectedStateFence);
     }
 
     /// <summary>Rejects a context that does not name the current closed wire contract.</summary>
@@ -1072,6 +1081,58 @@ public static class UserAutomationOutcomeClassifier
     private const int MaxRecoveryReasonChars = 1_024;
     // Bound summary text; the retained response remains available separately.
     private const int MaxDescribedOccurrences = 8;
+
+    /// <summary>
+    /// Reads the StateFence from the authenticated, versioned get_context
+    /// answer. The returned top-level fence is admitted only when the nested
+    /// context projection is identical and the operation correlation matches
+    /// this exact one-call handshake request.
+    /// </summary>
+    public static JsonElement ReadContextStateFence(
+        JsonElement answer,
+        UserAutomationOperatorRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        request.Validate();
+        if (request.Operation is not UserAutomationGetContextOperation)
+        {
+            throw new InvalidOperationException("a State Fence can only be read from a get_context request");
+        }
+
+        var context = UserAutomationResultValidationContext.FromRequest(request);
+        if (!context.IsValid()
+            || context.ExpectedStateFence is not null
+            || answer.ValueKind != JsonValueKind.Object
+            || !HasExactProperties(answer, OperatorScheduleContract.USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS)
+            || !TryReadBoundedText(answer, "wire_id", 128, out var wireId)
+            || !string.Equals(wireId, context.ExpectedResultWireId, StringComparison.Ordinal)
+            || !answer.TryGetProperty("wire_version", out var wireVersion)
+            || wireVersion.ValueKind != JsonValueKind.Number
+            || !wireVersion.TryGetInt32(out var version)
+            || version != context.SupportedResultWireVersion
+            || !TryReadBoundedText(answer, "status", 32, out var status)
+            || !string.Equals(status, "known", StringComparison.Ordinal)
+            || !TryGetObject(answer, "correlation", out var correlation)
+            || !HasExactProperties(correlation, OperatorScheduleContract.USER_AUTOMATION_RESULT_CORRELATION_MEMBERS)
+            || !MatchesResultCorrelation(correlation, context)
+            || !answer.TryGetProperty("recovery", out var recovery)
+            || recovery.ValueKind != JsonValueKind.Null
+            || !TryGetObject(answer, "state_fence", out var envelopeFence)
+            || !IsClosedStateFence(envelopeFence)
+            || !TryGetObject(answer, "value", out var value)
+            || !HasExactProperties(value, "outcome", "state_fence")
+            || !TryReadBoundedText(value, "outcome", 32, out var outcome)
+            || !string.Equals(outcome, "context", StringComparison.Ordinal)
+            || !TryGetObject(value, "state_fence", out var valueFence)
+            || !SameStateFence(envelopeFence, valueFence))
+        {
+            throw new InvalidOperationException(
+                "the authenticated get_context answer is missing the current wire version, request identity, or matching closed State Fence");
+        }
+
+        return envelopeFence.Clone();
+    }
+
     /// <summary>Decodes one owner answer for one typed operation identity.</summary>
     public static UserAutomationOutcome Read(
         string action,
@@ -1083,6 +1144,13 @@ public static class UserAutomationOutcomeClassifier
         if (!context.IsValid())
         {
             return UnverifiedOwnerAnswer(action, "the submitted result-validation context is unsupported");
+        }
+        if (context.ExpectedStateFence is not { } expectedStateFence
+            || !IsClosedStateFence(expectedStateFence))
+        {
+            return UnverifiedOwnerAnswer(
+                action,
+                "the request has no independently acquired closed State Fence witness");
         }
         if (answer.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
         {
@@ -1185,9 +1253,9 @@ public static class UserAutomationOutcomeClassifier
             && recovery.ValueKind == JsonValueKind.Null)
         {
             return new UserAutomationOutcome(
-                UserAutomationOutcomeClass.OwnerReportedNotRetainedFenceUnverified,
-                $"UserAutomation {action}: owner reports not retained; current fence unverified",
-                $"The owner reports that this operation was not retained: {notRetainedReason}. The Operator has no independent submitted/current State Fence comparand for this result, so this remains an owner-reported value and does not authorize a new submission.",
+                UserAutomationOutcomeClass.OwnerReportedNotRetained,
+                $"UserAutomation {action}: owner reports not retained under the expected State Fence",
+                $"The owner reports that this operation was not retained under the submitted State Fence: {notRetainedReason}. The result is bound to this operation identity and the expected State Fence, but remains owner-reported and does not authorize a new submission.",
                 RefusalKind: null,
                 RefusalText: null,
                 ScheduleProjection: null);
@@ -1205,9 +1273,9 @@ public static class UserAutomationOutcomeClassifier
             && TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var ledgerReadReason))
         {
             return new UserAutomationOutcome(
-                UserAutomationOutcomeClass.OwnerReportedCommitFenceUnverifiedLedgerReadOwed,
-                $"UserAutomation {action}: owner reports commit; current fence unverified and ledger read owed",
-                $"The owner reports a canonical commit ({settledReason}) and a separate ledger read remains owed ({ledgerReadReason}). The Operator has no independent submitted/current State Fence comparand for this result, so keep it under the same identity and reconcile before another submission.",
+                UserAutomationOutcomeClass.OwnerReportedCommitLedgerReadOwed,
+                $"UserAutomation {action}: owner reports commit under the expected State Fence; ledger read owed",
+                $"The owner reports a canonical commit under the submitted State Fence ({settledReason}) and a separate ledger read remains owed ({ledgerReadReason}). Keep it under the same identity and reconcile before another submission.",
                 RefusalKind: null,
                 RefusalText: null,
                 ScheduleProjection: null);
@@ -1274,8 +1342,7 @@ public static class UserAutomationOutcomeClassifier
             return new UserAutomationOutcome(
                 UserAutomationOutcomeClass.OwnerBoundTransitionScheduleUnverified,
                 $"UserAutomation {action} answered — schedule normalization unverified",
-                "The owner reports a known transition under its reported State Fence. "
-                + "The Operator has no independent submitted/current-fence comparand. "
+                "The owner returned a transition bound to this operation identity and the expected State Fence. "
                 + DescribeUnverifiedScheduleProjection(projection),
                 RefusalKind: null,
                 RefusalText: null,
@@ -1285,7 +1352,7 @@ public static class UserAutomationOutcomeClassifier
         return new UserAutomationOutcome(
             UserAutomationOutcomeClass.OwnerBoundTransitionScheduleUnverified,
             $"UserAutomation {action} answered — schedule not verified",
-            "The owner reports a known transition under its reported State Fence, but the Operator has no independent submitted/current-fence comparand. "
+            "The owner returned a transition bound to this operation identity and the expected State Fence, but the schedule is not verified. "
             + "This answer carries no decodable "
             + $"{OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} occurrence projection, "
             + "so the Operator does not report the schedule as normalized",
@@ -1400,7 +1467,9 @@ public static class UserAutomationOutcomeClassifier
         && TryGetObject(transition, "state_fence", out var stateFence)
         && IsClosedStateFence(stateFence)
         && TryGetObject(answer, "state_fence", out var envelopeFence)
-        && SameSerializedFence(stateFence, envelopeFence);
+        && context.ExpectedStateFence is { } expectedStateFence
+        && SameStateFence(stateFence, expectedStateFence)
+        && SameStateFence(stateFence, envelopeFence);
 
     private static bool HasCurrentResultEnvelope(
         JsonElement answer,
@@ -1417,7 +1486,10 @@ public static class UserAutomationOutcomeClassifier
             || !HasExactProperties(correlation, OperatorScheduleContract.USER_AUTOMATION_RESULT_CORRELATION_MEMBERS)
             || !MatchesResultCorrelation(correlation, context)
             || !TryGetObject(answer, "state_fence", out var stateFence)
-            || !IsClosedStateFence(stateFence))
+            || !IsClosedStateFence(stateFence)
+            || context.ExpectedStateFence is not { } expectedStateFence
+            || (!SameStateFence(stateFence, expectedStateFence)
+                && !IsStateFenceMismatchRefusalEnvelope(answer, context, stateFence)))
         {
             return false;
         }
@@ -1432,6 +1504,61 @@ public static class UserAutomationOutcomeClassifier
         && string.Equals(operationId, context.ExpectedOperationId, StringComparison.Ordinal)
         && TryReadBoundedText(correlation, "idempotency_key", MaxIdentityChars, out var idempotencyKey)
         && string.Equals(idempotencyKey, context.ExpectedIdempotencyKey, StringComparison.Ordinal);
+
+    /// <summary>
+    /// A stale-fence refusal reports the live request fence, which must differ
+    /// from the caller's expected fence. Admit that one mismatch only when the
+    /// unknown answer proves the exact pre-Store refusal contract; all other
+    /// known and unknown answers must echo the submitted fence.
+    /// </summary>
+    private static bool IsStateFenceMismatchRefusalEnvelope(
+        JsonElement answer,
+        UserAutomationResultValidationContext context,
+        JsonElement liveFence)
+    {
+        if (context.ExpectedStateFence is not { } expectedStateFence
+            || !IsClosedStateFence(liveFence)
+            || SameStateFence(liveFence, expectedStateFence)
+            || !TryReadBoundedText(answer, "status", 32, out var status)
+            || !string.Equals(status, "unknown", StringComparison.Ordinal)
+            || !TryGetObject(answer, "value", out var value)
+            || !HasExactProperties(
+                value,
+                "kind",
+                "schema_version",
+                "operation",
+                "state_fence",
+                "attempt_state",
+                "refusal")
+            || !TryReadBoundedText(value, "kind", 64, out var kind)
+            || !string.Equals(kind, "user_automation_refusal", StringComparison.Ordinal)
+            || !value.TryGetProperty("schema_version", out var schemaVersion)
+            || schemaVersion.ValueKind != JsonValueKind.Number
+            || !schemaVersion.TryGetInt32(out var version)
+            || version != 1
+            || !TryGetObject(value, "operation", out var operation)
+            || !MatchesOperationIdentity(operation, context, RequestIdMember)
+            || !TryGetObject(value, "state_fence", out var nestedFence)
+            || !SameStateFence(nestedFence, liveFence)
+            || !TryReadBoundedText(value, "attempt_state", 64, out var attemptState)
+            || !string.Equals(attemptState, "store_not_called", StringComparison.Ordinal)
+            || !TryGetObject(value, "refusal", out var refusal)
+            || !HasExactProperties(refusal, "code")
+            || !TryReadBoundedText(refusal, "code", 64, out var refusalCode)
+            || !string.Equals(refusalCode, "state_fence_mismatch", StringComparison.Ordinal)
+            || !TryGetObject(answer, "recovery", out var recovery)
+            || !HasExactProperties(recovery, "kind", "reason")
+            || !TryReadBoundedText(recovery, "kind", 64, out var recoveryKind)
+            || !string.Equals(recoveryKind, "unknown_outcome", StringComparison.Ordinal)
+            || !TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var recoveryReason)
+            || !string.Equals(recoveryReason, "state_fence_mismatch_store_not_called", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return TryGetObject(answer, "state_fence", out var envelopeFence)
+            && SameStateFence(envelopeFence, liveFence);
+    }
 
     private static bool HasCurrentTransitionShape(JsonElement transition) =>
         HasAllowedAndRequiredProperties(
@@ -2241,8 +2368,10 @@ public static class UserAutomationOutcomeClassifier
         return requiredNames.All(names.Contains);
     }
 
-    private static bool SameSerializedFence(JsonElement left, JsonElement right) =>
-        string.Equals(left.GetRawText(), right.GetRawText(), StringComparison.Ordinal);
+    private static bool SameStateFence(JsonElement left, JsonElement right) =>
+        IsClosedStateFence(left)
+        && IsClosedStateFence(right)
+        && JsonElement.DeepEquals(left, right);
 
     private static UserAutomationOutcome ReadAttemptRefusal(
         string action,
@@ -2269,8 +2398,11 @@ public static class UserAutomationOutcomeClassifier
             || !MatchesOperationIdentity(operation, context, RequestIdMember)
             || !TryGetObject(value, "state_fence", out var stateFence)
             || !IsClosedStateFence(stateFence)
+            || context.ExpectedStateFence is not { } expectedStateFence
             || !TryGetObject(answer, "state_fence", out var envelopeFence)
-            || !SameSerializedFence(stateFence, envelopeFence)
+            || !SameStateFence(stateFence, envelopeFence)
+            || (!SameStateFence(stateFence, expectedStateFence)
+                && !IsStateFenceMismatchRefusalEnvelope(answer, context, stateFence))
             || !TryReadBoundedText(value, "attempt_state", 64, out var attemptState)
             || !string.Equals(attemptState, "store_not_called", StringComparison.Ordinal)
             || !HasExactProperties(recovery, "kind", "reason")
@@ -2291,7 +2423,26 @@ public static class UserAutomationOutcomeClassifier
         }
 
         if (!TryReadBoundedText(refusal, "code", 64, out var code)
-            || !TryExplainRefusal(code, out var explanation))
+            || code.Length == 0)
+        {
+            return UnverifiedOwnerAnswer(action, "the typed refusal code is malformed; the operation outcome remains unknown");
+        }
+
+        if (string.Equals(code, "state_fence_mismatch", StringComparison.Ordinal))
+        {
+            if (!IsStateFenceMismatchRefusalEnvelope(answer, context, stateFence))
+            {
+                return UnverifiedOwnerAnswer(
+                    action,
+                    "the state_fence_mismatch refusal does not prove the exact stale-fence pre-Store contract");
+            }
+
+            return UnverifiedOwnerAnswer(
+                action,
+                "the owner rejected this attempt before Store because the submitted State Fence was stale; preserve this request and reconcile its same operation identity before any new submission");
+        }
+
+        if (!TryExplainRefusal(code, out var explanation))
         {
             return UnverifiedOwnerAnswer(action, "the typed refusal code is unsupported; the operation outcome remains unknown");
         }
@@ -2361,7 +2512,7 @@ public static class UserAutomationOutcomeClassifier
                 StringComparison.Ordinal);
     }
 
-    private static bool IsClosedStateFence(JsonElement stateFence)
+    internal static bool IsClosedStateFence(JsonElement stateFence)
     {
         if (!HasExactProperties(
                 stateFence,

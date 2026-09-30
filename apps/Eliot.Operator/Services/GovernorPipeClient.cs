@@ -195,7 +195,9 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         request.Validate();
         using var budget = new OperationBudget($"automation:{request.IdempotencyKey}", cancellationToken, _closing.Token);
         // Kernel/Host authenticates this route and supplies RequestMetadata,
-        // principal, State Fence and OperationIdentity. Reusing the generic
+        // principal and OperationIdentity. Business requests also carry the
+        // unchanged State Fence acquired by get_context, which Kernel compares
+        // with its live request context before Store work. Reusing the generic
         // task-scoped operator-command envelope would discard that contract.
         return await CallToolAsync<JsonElement>(
             UserAutomationContract.Route, request, $"automation:{request.IdempotencyKey}", budget).ConfigureAwait(false);
