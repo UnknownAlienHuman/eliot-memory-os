@@ -9,6 +9,9 @@ use std::time::Duration;
 use eliot_runtime::{
     ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
 };
+use eliot_watchdog_core::{
+    CountDelta, EvidenceRef, HealthObservationPair, MaintenanceDebtInput,
+};
 
 use crate::AdmittedIsolatedDestination;
 use crate::CompositionError;
@@ -154,6 +157,84 @@ fn publish_interval_coverage(publication: &IntervalCoveragePublication, interval
         channels = ?channels,
         "one supervision tick's per-channel I8.2 observation coverage published"
     );
+}
+
+/// Actual #1689 due-policy facts the A5 adapter projects into [`MaintenanceDebtInput`].
+///
+/// Every field is a read of the actual
+/// `crates/governor/eliot-maintenance/src/end_of_activity.rs::AssessmentSourceSnapshot`
+/// that carries the `due_policies` source (`MaintenanceDuePolicyReference`
+/// records), plus the owner-supplied overdue counts and due-policy evidence
+/// the `eliot_watchdog_core::evaluate_maintenance_debt` rule consumes. The
+/// watchdog owns no #1689 snapshot read — the caller that owns it copies the
+/// snapshot's public claims here — so this struct carries claims, never a
+/// second due policy: no thresholds, no due-date arithmetic, no drain
+/// decision.
+#[derive(Clone, Debug)]
+pub struct ActualDuePolicyFacts {
+    /// `snapshot.persistence_owner` of the actual due-policy source.
+    pub persistence_owner: String,
+    /// `snapshot.source_revision`, absent only when the owner could not provide one.
+    pub source_revision: Option<String>,
+    /// `snapshot.records.len()`: every due policy in the snapshot's declared scope.
+    pub due_policy_records: u64,
+    /// Whether `snapshot.coverage` is the owner's `Complete` state.
+    pub coverage_complete: bool,
+    /// Owner-supplied overdue count delta copied from the maintenance owner's projection.
+    pub overdue: CountDelta,
+    /// Owner-issued due-policy evidence handle, retained verbatim.
+    pub evidence: EvidenceRef,
+}
+
+/// Projects the actual #1689 due-policy snapshot facts into [`MaintenanceDebtInput`].
+///
+/// A5: a debt signal must agree with the #1689 due-policy inputs and never
+/// restate them. The rule consumes owner-supplied counts and retains the
+/// owner-issued due-policy evidence; this adapter is the single place where
+/// those supplied values are checked against the actual snapshot before they
+/// reach the rule. Each check fails closed: a mismatch yields no owner counts
+/// and no evidence, so `eliot_watchdog_core::evaluate_maintenance_debt`
+/// answers `OwnerEvidenceUnknown` and opens nothing, exactly as if the owner
+/// had stayed silent.
+///
+/// Agreement, read from the owner's own snapshot contract: the snapshot names
+/// its persistence owner; a `Complete` snapshot always carries a source
+/// revision and no gaps, so a blank owner, a missing or blank revision, or a
+/// non-`Complete` coverage means these are not the actual snapshot's facts.
+/// Overdue policies are a subset of the snapshot's due policies, so an
+/// overdue count above the snapshot's record count contradicts the snapshot.
+/// This adapter reads no store, computes no due state, and authorizes no
+/// effect.
+#[must_use]
+pub fn project_actual_due_policy_snapshot(
+    facts: &ActualDuePolicyFacts,
+    pair: HealthObservationPair,
+    deferred_problems: CountDelta,
+    stale_capabilities: CountDelta,
+) -> MaintenanceDebtInput {
+    let agrees = facts.coverage_complete
+        && !facts.persistence_owner.trim().is_empty()
+        && facts
+            .source_revision
+            .as_ref()
+            .is_some_and(|revision| !revision.trim().is_empty())
+        && !facts.evidence.evidence_id.trim().is_empty()
+        && facts.overdue.current <= facts.due_policy_records;
+    MaintenanceDebtInput {
+        pair,
+        due_policy_overdue: if agrees {
+            Some(facts.overdue)
+        } else {
+            None
+        },
+        due_policy_evidence: if agrees {
+            Some(facts.evidence.clone())
+        } else {
+            None
+        },
+        deferred_problems,
+        stale_capabilities,
+    }
 }
 
 /// Ends one supervision tick's coverage interval when the tick body is left.
