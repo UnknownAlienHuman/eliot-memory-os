@@ -30,10 +30,11 @@
 //!   authenticated identity rather than an absent value. An envelope that
 //!   genuinely carries no task identity is still refused with
 //!   [`ReconstructionPrerequisite::MissingTaskBinding`] before any read.
-//! - **Dependency heads** are the revision heads the daemon OBSERVED on the
-//!   authenticated campaign owner read under that same admitted fence; the
-//!   scope key is the store's own `scope:<scope_id>` head. They are never
-//!   synthesized.
+//! - **Dependency heads** are the revision head this daemon OBSERVED on the
+//!   store's own `GetRevisionHeads` read for that scope, taken under the same
+//!   retained Kernel fence. They are never synthesized, and no other response
+//!   on this route can supply them: the campaign-source lookup this route also
+//!   performs returns an empty head list.
 //! - **The five remaining selectors** are the owner-declared members of the
 //!   authenticated Task Controller `TaskPlan` recipe's slot denominator; the
 //!   exact per-member mapping is documented on
@@ -71,8 +72,8 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     CampaignSourceDocumentSchema, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRead, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
-    ReadConsistency, RevisionHead, RevisionKey, ScopeId,
+    CampaignSourceRevisionRead, CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS,
+    NamedReadOperation, NamedReadRequest, ReadConsistency, RevisionKey, ScopeId,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -250,8 +251,27 @@ pub async fn serve_context_reconstruction(
             tracing::warn!(error = %error, "eliotd.context_reconstruction.task_recipe");
             ReconstructionPrerequisite::TaskRecipeUnavailable
         })?;
-    let dependency_revisions =
-        observed_scope_head(&recipe.observed_heads, &scope, &envelope.state_fence)?;
+    // #2857: the dependency head is OBSERVED from the store's own revision-head
+    // read for this scope, not taken from the campaign-source lookup response.
+    //
+    // `GetCampaignSourceRevision` is a Kernel-served operation whose
+    // `NamedReadResponse` is built with an EMPTY `revision_heads` list
+    // (`bins/eliot-kernel/src/daemon_request_dispatch.rs::store_named_response`
+    // arm for that operation hardcodes `revision_heads: Vec::new()`), so the
+    // heads that came back with the recipe read were never observations at all.
+    // Reading them here meant `observed_scope_head` could only ever match zero
+    // heads and return `DependencyHeadUnavailable`, so no
+    // `ContextReconstructionRequest` was ever constructed and
+    // `reconstruct` stayed unreachable from any admitted request.
+    //
+    // The head's owner is `CanonicalReadClient::revision_heads`, the one
+    // catalogue-activated `GetRevisionHeads` read the sibling daemon legs
+    // (`experience_runtime::read_current_position`) already use for exactly
+    // this declared minimum. It travels the same authenticated `store_named`
+    // route under the same retained fence, and it is re-checked against that
+    // fence here. Nothing is synthesized: an absent, zero, duplicate or
+    // foreign-fence head is a typed refusal.
+    let dependency_revisions = observed_scope_head(&reads, &scope, &retained_fence).await?;
     let request = context_reconstruction_request(
         &scope,
         &dependency_revisions,
@@ -268,11 +288,9 @@ pub async fn serve_context_reconstruction(
     context_reconstruction_result_body(envelope, attempt, &scope, task_id, &seven)
 }
 
-/// The authenticated task recipe together with the revision heads the daemon
-/// observed on the very read that returned it.
+/// The authenticated task recipe, read under the admitted fence.
 struct AuthenticatedTaskRecipe {
     recipe: LearningStateViewRecipe,
-    observed_heads: Vec<RevisionHead>,
 }
 
 /// Derives the trusted scope of one admitted query pair: the envelope work
@@ -519,25 +537,35 @@ async fn read_authenticated_task_recipe(
     {
         return Err("task recipe task-plan requirement is not the task anchor".to_owned());
     }
-    Ok(AuthenticatedTaskRecipe {
-        recipe,
-        observed_heads: response.revision_heads,
-    })
+    Ok(AuthenticatedTaskRecipe { recipe })
 }
 
-/// Turns the revision heads this daemon OBSERVED on its authenticated owner
-/// read into the exact-fence dependency minimums for the reconstruction.
+/// Turns the revision head this daemon OBSERVED on its own store head read
+/// into the exact-fence dependency minimum for the reconstruction.
 ///
-/// The key is the store's own scope head key. A head that is absent, zero,
-/// duplicated or bound to another fence is refused; nothing is invented.
-fn observed_scope_head(
-    heads: &[RevisionHead],
+/// The key is the store's own scope head key, read through the one
+/// catalogue-activated `GetRevisionHeads` operation
+/// ([`CanonicalReadClient::revision_heads`]) over the same authenticated
+/// `store_named` transport the rest of this route uses. The store projects
+/// only the requested keys back, so a head that is absent, zero, or bound to
+/// another fence is refused; nothing is invented and no other source supplies
+/// a dependency revision.
+async fn observed_scope_head(
+    reads: &KernelContextReadClient,
     scope: &ScopeId,
     fence: &StateFence,
 ) -> Result<BTreeMap<RevisionKey, u64>, ReconstructionPrerequisite> {
     let key = RevisionKey::new(format!("scope:{}", scope.as_str()))
         .map_err(|_| ReconstructionPrerequisite::DependencyHeadUnavailable)?;
-    let mut matching = heads.iter().filter(|head| head.key == key);
+    let mut matching = reads
+        .revision_heads(vec![key.clone()])
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "eliotd.context_reconstruction.scope_head");
+            ReconstructionPrerequisite::DependencyHeadUnavailable
+        })?
+        .into_iter()
+        .filter(|head| head.key == key);
     let head = matching
         .next()
         .ok_or(ReconstructionPrerequisite::DependencyHeadUnavailable)?;
