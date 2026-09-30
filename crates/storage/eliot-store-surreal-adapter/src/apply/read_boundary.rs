@@ -350,17 +350,7 @@ async fn named_read_payload(
             )?)
         }
         NamedReadOperation::GetEvidencePack => {
-            let causal_binding =
-                read_evidence_pack_causal_binding(db, &adapter.config, state_fence).await?;
-            let rows = read_evidence_records(db, &adapter.config).await?;
-            let suppression = read_erasure_suppression(db, &adapter.config).await?;
-            let mut payload = evidence_pack_payload(query, state_fence, &rows, &suppression)
-                .map_err(AdapterError::Store)?;
-            let object = payload
-                .as_object_mut()
-                .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
-            object.insert("causal_binding".to_owned(), to_value(&causal_binding)?);
-            Ok(payload)
+            evidence_pack_read_payload(db, &adapter.config, query, state_fence).await
         }
         NamedReadOperation::GetTaskState => {
             let rows = read_authority_records(db, &adapter.config).await?;
@@ -421,6 +411,26 @@ async fn named_read_payload(
             operation: format!("{other:?}"),
         }),
     }
+}
+
+/// Reads the exact retained evidence projection and attaches the Store's
+/// current causal allocation readback under the same evidence-pack fence.
+async fn evidence_pack_read_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let causal_binding = read_evidence_pack_causal_binding(db, config, state_fence).await?;
+    let rows = read_evidence_records(db, config).await?;
+    let suppression = read_erasure_suppression(db, config).await?;
+    let mut payload = evidence_pack_payload(query, state_fence, &rows, &suppression)
+        .map_err(AdapterError::Store)?;
+    let object = payload
+        .as_object_mut()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    object.insert("causal_binding".to_owned(), to_value(&causal_binding)?);
+    Ok(payload)
 }
 
 /// Reads the actual canonical causal tip and next position for an evidence
