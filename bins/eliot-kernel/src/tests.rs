@@ -4202,7 +4202,16 @@ fn physical_supervision_signer_unseals_only_with_exact_eliot_host_service_sid_to
         eliot_runtime_contracts::SUPERVISION_AUTHORITY_HOST_SERVICE,
     )
     .expect("resolve exact EliotHost service SID");
-    assert_eq!(live_sid, authority.key_reference.host_service_sid);
+    assert_eq!(
+        live_sid,
+        authority
+            .key_reference
+            .as_system_service()
+            .expect(
+                "the SystemService profile authority must carry the service-SID-bound sealed key"
+            )
+            .host_service_sid
+    );
     let signer = ProtectedSupervisionLeaseSigner::new_for_profile(
         kernel_root,
         eliot_installation::InstallationProfile::SystemService,
