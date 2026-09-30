@@ -504,12 +504,12 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
     let policy = ordering_policy();
     must(ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &bundle,
-        draft: &draft,
-        rivals: &rivals,
-        affordances: &affordances,
-        limits: &limits,
-        policy: &policy,
+        bundle: bundle.clone(),
+        draft: draft.clone(),
+        rivals: rivals.clone(),
+        affordances: affordances.clone(),
+        limits: *limits,
+        policy: policy.clone(),
     }))
 }
 
@@ -1914,12 +1914,12 @@ fn malformed_plan_bindings_fail_closed() {
     assert!(
         ProbePlan::new(ProbePlanParams {
             plan_id: artifact("plan-1"),
-            bundle: &bundle,
-            draft: &bound_draft,
-            rivals: &rivals,
-            affordances: &wrong_scope,
-            limits: &bound_limits,
-            policy: &ordering_policy(),
+            bundle: bundle.clone(),
+            draft: bound_draft.clone(),
+            rivals: rivals.clone(),
+            affordances: wrong_scope.clone(),
+            limits: *bound_limits,
+            policy: ordering_policy(),
         })
         .is_err(),
         "scope disagreement must fail the planner closed"
@@ -1934,12 +1934,12 @@ fn malformed_plan_bindings_fail_closed() {
     assert!(
         ProbePlan::new(ProbePlanParams {
             plan_id: artifact("plan-1"),
-            bundle: &bundle,
-            draft: &drifted,
-            rivals: &rivals,
-            affordances: &affordances,
-            limits: &bound_limits,
-            policy: &ordering_policy(),
+            bundle: bundle.clone(),
+            draft: drifted.clone(),
+            rivals: rivals.clone(),
+            affordances: affordances.clone(),
+            limits: *bound_limits,
+            policy: ordering_policy(),
         })
         .is_err(),
         "fence disagreement must fail the planner closed"
@@ -1950,12 +1950,12 @@ fn malformed_plan_bindings_fail_closed() {
     assert!(
         ProbePlan::new(ProbePlanParams {
             plan_id: artifact("plan-1"),
-            bundle: &bundle,
-            draft: &bound_draft,
-            rivals: &rivals,
-            affordances: &affordances,
-            limits: &over,
-            policy: &ordering_policy(),
+            bundle: bundle.clone(),
+            draft: bound_draft.clone(),
+            rivals: rivals.clone(),
+            affordances: affordances.clone(),
+            limits: *over,
+            policy: ordering_policy(),
         })
         .is_err(),
         "an over-ceiling candidate bound must fail the planner closed"
@@ -2024,12 +2024,12 @@ fn plan_for_with(
     let limits = limits(candidates);
     must(ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &bundle,
-        draft: &draft,
-        rivals,
-        affordances: &affordances,
-        limits: &limits,
-        policy: &ordering_policy(),
+        bundle: bundle.clone(),
+        draft: draft.clone(),
+        rivals: rivals.clone(),
+        affordances: affordances.clone(),
+        limits: *limits,
+        policy: ordering_policy(),
     }))
 }
 
@@ -2620,12 +2620,12 @@ fn every_declared_budget_ceiling_fails_closed_one_over() {
         assert!(
             ProbePlan::new(ProbePlanParams {
                 plan_id: artifact("plan-budget"),
-                bundle: &bundle,
-                draft: &draft,
-                rivals: &rivals,
-                affordances: &affordances,
-                limits: &limits,
-                policy: &ordering_policy(),
+                bundle: bundle.clone(),
+                draft: draft.clone(),
+                rivals: rivals.clone(),
+                affordances: affordances.clone(),
+                limits: *limits,
+                policy: ordering_policy(),
             })
             .is_err(),
             "one-over {} must fail closed",
@@ -2637,12 +2637,12 @@ fn every_declared_budget_ceiling_fails_closed_one_over() {
     assert!(
         ProbePlan::new(ProbePlanParams {
             plan_id: artifact("plan-budget-stu"),
-            bundle: &bundle,
-            draft: &draft,
-            rivals: &rivals,
-            affordances: &affordances,
-            limits: &stu_limits,
-            policy: &ordering_policy(),
+            bundle: bundle.clone(),
+            draft: draft.clone(),
+            rivals: rivals.clone(),
+            affordances: affordances.clone(),
+            limits: *stu_limits,
+            policy: ordering_policy(),
         })
         .is_err()
     );

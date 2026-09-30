@@ -57,7 +57,7 @@ enum DescriptorClass {
 }
 
 /// Validates inputs, checks cross-bindings, and assembles the frozen plan.
-pub(crate) fn build_plan(params: ProbePlanParams<'_>) -> Result<ProbePlan, ContractViolation> {
+pub(crate) fn build_plan(params: ProbePlanParams) -> Result<ProbePlan, ContractViolation> {
     let ProbePlanParams {
         plan_id,
         bundle,
@@ -73,23 +73,23 @@ pub(crate) fn build_plan(params: ProbePlanParams<'_>) -> Result<ProbePlan, Contr
     affordances.validate()?;
     limits.validate()?;
     policy.validate()?;
-    let scope = bound_context(bundle, draft, rivals, affordances)?;
-    let mut groups = classify_descriptors(affordances, &scope, limits)?;
-    let mut probes = rank_plannables(&mut groups, policy)?;
+    let scope = bound_context(&bundle, &draft, &rivals, &affordances)?;
+    let mut groups = classify_descriptors(&affordances, &scope, &limits)?;
+    let mut probes = rank_plannables(&mut groups, &policy)?;
     let mut omissions = Vec::new();
     drain_gaps(&mut groups, &mut omissions)?;
-    admit_against_budget(&mut probes, &mut omissions, limits)?;
+    admit_against_budget(&mut probes, &mut omissions, &limits)?;
     sort_omissions(&mut omissions);
     let objective_dispositions = objective_dispositions(&groups, &probes, &omissions)?;
-    let relations = build_relations(&probes, policy);
+    let relations = build_relations(&probes, &policy);
     assemble(
         plan_id,
-        bundle,
-        draft,
-        rivals,
-        affordances,
+        &bundle,
+        &draft,
+        &rivals,
+        &affordances,
         &scope,
-        policy,
+        &policy,
         probes,
         omissions,
         objective_dispositions,

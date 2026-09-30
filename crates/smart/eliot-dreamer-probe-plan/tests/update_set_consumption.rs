@@ -297,12 +297,12 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
     let policy = ordering_policy();
     must(ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &bundle,
-        draft: &draft,
-        rivals: &rivals,
-        affordances: &affordances,
-        limits: &limits,
-        policy: &policy,
+        bundle: bundle.clone(),
+        draft: draft.clone(),
+        rivals: rivals.clone(),
+        affordances: affordances.clone(),
+        limits: *limits,
+        policy: policy.clone(),
     }))
 }
 

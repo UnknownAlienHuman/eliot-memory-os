@@ -657,9 +657,7 @@ pub(crate) fn run_conflict_stage(stage: Option<&ConflictStage>) -> Result<PulseS
     )
 }
 
-pub(crate) fn run_probe_stage(
-    params: Option<ProbePlanParams<'_>>,
-) -> Result<PulseStage, PulseError> {
+pub(crate) fn run_probe_stage(params: Option<ProbePlanParams>) -> Result<PulseStage, PulseError> {
     params.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Probes)),
         |inputs| {

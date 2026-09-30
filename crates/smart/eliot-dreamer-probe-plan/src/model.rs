@@ -643,22 +643,35 @@ pub(crate) fn omission_order_key(omission: &ProbeOmission) -> (u8, &str) {
 
 /// Constructor data for [`ProbePlan`]; `schema_version` and `digest` are
 /// assigned by [`ProbePlan::new`], which runs the bounded planner.
-#[derive(Clone, Debug)]
-pub struct ProbePlanParams<'a> {
+///
+/// Every bound record is owned rather than borrowed. The planner consumes this
+/// value destructively — [`ProbePlan::new`] destructures it and reads nothing
+/// afterwards — so the borrows constrained nothing while pinning the complete
+/// denominator to the caller's stack frame and leaving it undecodable from any
+/// wire. Each field is already a closed owner record, so the whole set now
+/// travels as one value.
+///
+/// Ownership is not a substitute for binding: [`ProbePlan::new`] re-validates
+/// every field and re-proves task, scope, fence, job, and manifest agreement
+/// before freezing the plan digest, so a decoded value carries no more
+/// authority than a locally constructed one.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbePlanParams {
     /// Plan-scoped stable identity supplied by the calling owner.
     pub plan_id: ArtifactId,
     /// Grounded input bundle the plan is bound to.
-    pub bundle: &'a DreamInputBundle,
+    pub bundle: DreamInputBundle,
     /// Validator-bound draft the plan is bound to.
-    pub draft: &'a ValidatedDreamDraft,
+    pub draft: ValidatedDreamDraft,
     /// Rival-model projection the plan discriminates.
-    pub rivals: &'a RivalModelSet,
+    pub rivals: RivalModelSet,
     /// Closed inquiry-affordance denominator the plan selects from.
-    pub affordances: &'a InquiryAffordanceSet,
+    pub affordances: InquiryAffordanceSet,
     /// Independent per-dimension budget limits bounding admission.
-    pub limits: &'a BudgetLimits,
+    pub limits: BudgetLimits,
     /// Explicit versioned lexicographic presentation policy.
-    pub policy: &'a ProbeOrderingPolicy,
+    pub policy: ProbeOrderingPolicy,
 }
 
 /// Bounded immutable discriminative probe plan with a frozen canonical digest.
@@ -712,7 +725,7 @@ impl ProbePlan {
     /// admits them against the candidate bound, and records every remainder
     /// as an explicit gap. Any bounds, binding, or digest failure fails
     /// closed; no fallback probe is ever synthesized.
-    pub fn new(params: ProbePlanParams<'_>) -> Result<Self, ContractViolation> {
+    pub fn new(params: ProbePlanParams) -> Result<Self, ContractViolation> {
         crate::plan::build_plan(params)
     }
 

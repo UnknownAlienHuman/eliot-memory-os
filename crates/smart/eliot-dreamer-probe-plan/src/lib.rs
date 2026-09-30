@@ -28,13 +28,11 @@ pub use model::{
 /// Canonical pure planning operation for A-17b.
 ///
 /// The parameter bundle makes the plan identity, exact budget limits, and
-/// versioned presentation policy explicit while keeping every input borrowed
-/// and immutable.  This function performs no I/O, reservation, execution, or
-/// evidence acquisition; it is the named operation for callers that do not
-/// need the constructor spelling.
-pub fn plan_discriminative_probes(
-    params: ProbePlanParams<'_>,
-) -> Result<ProbePlan, ContractViolation> {
+/// versioned presentation policy explicit while keeping every input immutable.
+/// This function performs no I/O, reservation, execution, or evidence
+/// acquisition; it is the named operation for callers that do not need the
+/// constructor spelling.
+pub fn plan_discriminative_probes(params: ProbePlanParams) -> Result<ProbePlan, ContractViolation> {
     ProbePlan::new(params)
 }
 

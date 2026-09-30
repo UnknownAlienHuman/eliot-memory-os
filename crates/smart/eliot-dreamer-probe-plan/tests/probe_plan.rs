@@ -423,12 +423,12 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
     let policy = ordering_policy();
     must(ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &bundle,
-        draft: &draft,
-        rivals: &rivals,
-        affordances: &affordances,
-        limits: &limits,
-        policy: &policy,
+        bundle: bundle.clone(),
+        draft: draft.clone(),
+        rivals: rivals.clone(),
+        affordances: affordances.clone(),
+        limits: *limits,
+        policy: policy.clone(),
     }))
 }
 
@@ -754,12 +754,12 @@ fn binding_mismatches_fail_the_planner_closed() {
     let wrong_scope = affordance_set_scoped("scope-2", vec![descriptor("aff-x", gap_target("c"))]);
     let scoped = ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &bundle,
-        draft: &bound_draft,
-        rivals: &rivals,
-        affordances: &wrong_scope,
-        limits: &limits,
-        policy: &ordering_policy(),
+        bundle: bundle.clone(),
+        draft: bound_draft.clone(),
+        rivals: rivals.clone(),
+        affordances: wrong_scope.clone(),
+        limits: *limits,
+        policy: ordering_policy(),
     });
     assert!(scoped.is_err());
 
@@ -768,12 +768,12 @@ fn binding_mismatches_fail_the_planner_closed() {
     let affordances = affordance_set(vec![descriptor("aff-x", gap_target("c"))]);
     let fenced = ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &bundle,
-        draft: &drifted,
-        rivals: &rivals,
-        affordances: &affordances,
-        limits: &limits,
-        policy: &ordering_policy(),
+        bundle: bundle.clone(),
+        draft: drifted.clone(),
+        rivals: rivals.clone(),
+        affordances: affordances.clone(),
+        limits: *limits,
+        policy: ordering_policy(),
     });
     assert!(fenced.is_err());
 
@@ -781,12 +781,12 @@ fn binding_mismatches_fail_the_planner_closed() {
     wrong_job_draft.receipt.job_id = "job-2".to_owned();
     let wrong_job = ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &bundle,
-        draft: &wrong_job_draft,
-        rivals: &rivals,
-        affordances: &affordances,
-        limits: &limits,
-        policy: &ordering_policy(),
+        bundle: bundle.clone(),
+        draft: wrong_job_draft.clone(),
+        rivals: rivals.clone(),
+        affordances: affordances.clone(),
+        limits: *limits,
+        policy: ordering_policy(),
     });
     assert!(wrong_job.is_err());
 
@@ -794,12 +794,12 @@ fn binding_mismatches_fail_the_planner_closed() {
     wrong_manifest_bundle.manifest_digest = digest("manifest-other");
     let wrong_manifest = ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &wrong_manifest_bundle,
-        draft: &bound_draft,
-        rivals: &rivals,
-        affordances: &affordances,
-        limits: &limits,
-        policy: &ordering_policy(),
+        bundle: wrong_manifest_bundle.clone(),
+        draft: bound_draft.clone(),
+        rivals: rivals.clone(),
+        affordances: affordances.clone(),
+        limits: *limits,
+        policy: ordering_policy(),
     });
     assert!(wrong_manifest.is_err());
 
@@ -807,12 +807,12 @@ fn binding_mismatches_fail_the_planner_closed() {
     over.candidates = Some(17);
     let budgeted = ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
-        bundle: &bundle,
-        draft: &bound_draft,
-        rivals: &rivals,
-        affordances: &affordances,
-        limits: &over,
-        policy: &ordering_policy(),
+        bundle: bundle.clone(),
+        draft: bound_draft.clone(),
+        rivals: rivals.clone(),
+        affordances: affordances.clone(),
+        limits: *over,
+        policy: ordering_policy(),
     });
     assert!(budgeted.is_err());
 }

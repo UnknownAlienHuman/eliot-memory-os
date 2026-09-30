@@ -113,7 +113,8 @@ pub type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextEr
 /// Versioned runtime-owned production carrier: everything one complete
 /// Orientation pulse must consume, with no optional mandatory member.
 ///
-/// Every reference borrows caller-owned admitted records; nothing is
+/// Every reference borrows caller-owned admitted records, except `probes`,
+/// which owns its bound records because its planner consumes them; nothing is
 /// JSON-round-tripped and no missing member is defaulted. The assembler
 /// declares the shared operation/task/scope/fence identity explicitly, and
 /// [`compose_production_result`] re-proves every member against it before any
@@ -153,7 +154,7 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     /// Conflict-analysis stage inputs.
     pub conflict: ConflictStage<'a>,
     /// Discriminative probe-plan parameters.
-    pub probes: ProbePlanParams<'a>,
+    pub probes: ProbePlanParams,
     /// Context-candidate stage inputs.
     pub candidates: CandidateStage<'a>,
     /// Declared shared operation identity.
@@ -174,12 +175,13 @@ pub(crate) struct ProductionOrientationInputs<'a> {
 /// stage members.
 ///
 /// This is the Owner channel, not a second contract and not a state machine: it
-/// carries the exact owner records by reference, adds no semantic recomputation,
-/// and performs no effect. Every member is a value the Governor already produced
-/// through its own owner entry, so the carrier below joins existing records
-/// rather than deriving canonical state in this binary. Nothing is defaulted:
-/// a member the Governor has not published leaves the channel incomplete, and
-/// the caller supplies the whole channel or none of it.
+/// carries the exact owner records, almost all by reference and `probes` by
+/// value because its planner consumes them; it adds no semantic recomputation
+/// and performs no effect. Every member is a value the Governor already
+/// produced through its own owner entry, so the carrier below joins existing
+/// records rather than deriving canonical state in this binary. Nothing is
+/// defaulted: a member the Governor has not published leaves the channel
+/// incomplete, and the caller supplies the whole channel or none of it.
 pub struct OrientationSupply<'a> {
     /// CC-004 canonical projection set emitted by the Governor's own producer.
     pub projections: &'a CanonicalProjectionSet,
@@ -230,7 +232,7 @@ pub struct OrientationSupply<'a> {
     /// Conflict-analysis policy.
     pub conflict_policy: &'a ConflictAnalysisPolicy,
     /// Discriminative probe-plan parameters over owner rival/affordance records.
-    pub probes: ProbePlanParams<'a>,
+    pub probes: ProbePlanParams,
     /// Candidate request envelope (context-candidate stage).
     pub candidate_request: &'a CandidateRequest,
     /// Context recipe fixing the candidate denominator.
