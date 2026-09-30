@@ -43,7 +43,6 @@ mod cold_start_surface;
 mod cold_start_trigger;
 mod composition;
 mod context_inputs;
-mod coordination_owner_commit;
 mod cue_composition;
 mod epistemic_composition;
 mod experience_commit;
