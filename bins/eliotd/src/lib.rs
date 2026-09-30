@@ -87,6 +87,14 @@ pub mod governed_source_readback;
 mod governor_authority_feed;
 mod governor_local_read;
 mod governor_observe_serve;
+/// Issue #1145: the live constructor and caller of the Governor improvement
+/// candidate route. `ImprovementRouteRequest` borrows seven Governor-owned
+/// records, so it had no constructor anywhere in the repository and
+/// `route_improvement_candidate` had no caller. This module assembles that
+/// request from the advisory improvement artifact, the `G-19` improvement
+/// admission policy and the admitted Kernel fence the daemon already holds on
+/// the same maintenance observation, and runs the route over it.
+pub mod improvement_candidate_dispatch;
 pub mod improvement_candidate_route;
 /// Issue #1867 W3: the deduplication-registry read-back. This module reads
 /// the candidate records `improvement_intake_dispatch` commits back through
@@ -264,6 +272,7 @@ pub use governor_observe_serve::{
     ObserveDeferral, ObserveOwnerRoute, ObserveSuboperation, decode_observe_suboperation,
     observe_suboperation_owner, serve_admitted_observe,
 };
+pub use improvement_candidate_dispatch::dispatch_improvement_candidate_route;
 pub use improvement_candidate_route::{
     ImprovementRouteRequest, assess_improvement_repeat, improvement_candidate_retry_permitted,
     improvement_operation_owners, improvement_route_owner, reconcile_improvement_unknown,

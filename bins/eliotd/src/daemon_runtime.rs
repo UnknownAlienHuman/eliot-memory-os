@@ -4553,6 +4553,47 @@ async fn run_improvement_intake(
             .emit();
         }
     }
+    // Phase 5: run the Governor improvement-candidate ROUTE over the same
+    // observation, the same `G-19` policy and the same admitted fence this pass
+    // already holds. This is the leg that makes
+    // `route_improvement_candidate` reachable at all: `ImprovementRouteRequest`
+    // borrows seven Governor-owned records, so until this call nothing in the
+    // repository constructed one.
+    //
+    // It is pure with respect to the Kernel — no exchange, no write — so it
+    // needs no guard and adds no fifth phase of durability. A typed
+    // `PipelineError` is a diagnostic under the same discipline as the three
+    // refusals above, never a loop failure: the Governor pipeline refusing this
+    // candidate is the advisory outcome I12.24:76 requires, because this daemon
+    // holds no independent executed evaluation and sets
+    // `ImprovementEvidenceExecution::NotExecuted` rather than claiming one.
+    // Nothing on this path promotes, activates, installs, completes, or issues
+    // authority.
+    let routed = eliotd::improvement_candidate_dispatch::dispatch_improvement_candidate_route(
+        &artifact, &policy, &fence,
+    );
+    match routed {
+        Ok(disposition) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.improvement_candidate_routed",
+                candidate_id = %artifact.candidate.candidate_id,
+                // The pipeline's own advisory-only terminal disposition, recorded
+                // verbatim. A `CanaryAdmitted` disposition here would still be a
+                // non-authorizing handoff the Kernel owner (#11) must
+                // independently authorize, never an activation.
+                disposition = ?disposition,
+            );
+        }
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-candidate-route",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
     Ok(())
 }
 
