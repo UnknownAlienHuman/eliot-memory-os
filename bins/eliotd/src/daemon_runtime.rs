@@ -46,7 +46,6 @@
 //! `eliotd::task_binding_admission`'s "Measured reachability" section.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -55,29 +54,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{
-    ClockReading, ProductId, RequestId, SessionId, SourceId, StateFence, TaskId,
-    canonical_json_bytes, sha256_hex,
-};
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
-    AgentActivationResultReconcile, HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope,
-    HostRequestResultBody, HostRequestResultClass, HostRequestResultLineage,
-    HostRequestResultSourceRevision, LocalReadAttempt, host_request_operation_id,
-};
-use eliot_read::{
-    CurrentStateView, NamedParameters, ReadApi, ReadOrderingBinding, ReadService, StateRequest,
+    AgentActivationResultReconcile, host_request_operation_id,
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
-use eliot_security_contracts::InfluenceState;
-use eliot_store_api::{
-    EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency, RevisionKey, ScopeId,
-    StoreHealth, StoreHealthStatus,
-};
+use eliot_store_api::{StoreHealth, StoreHealthStatus};
 use eliotd::diagnostics::RepeatedFailureGuard;
 use eliotd::startup_capability_bindings::{
     DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
@@ -96,9 +82,8 @@ use eliotd::{
     ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
     DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome, KernelContextReadClient,
     LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
-    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, StateSubmitOutcome,
-    TaskControllerSubmitOutcome, forward_admitted_local_read, serve_admitted_observe,
-    terminal_for_invalid_ticket,
+    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
+    forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -1597,10 +1582,6 @@ async fn run_loop(
     // Campaign packets have their own queue, claim, compile, and result
     // flight. They are never consumed by the query poller.
     let mut campaign_packet_flight = CampaignPacketFlight::Idle;
-    // State pairs have their own queue, claim, serve, and result flight
-    // (#2564 Slice 1). They are never consumed by the query poller and never
-    // served through the query-only `GetEvidencePack` twin.
-    let mut state_flight = StateFlight::Idle;
     // Task Controller claims ride the same bounded cadence. The owner path is
     // real and independent: one authenticated claim, one Governor transition,
     // and one fenced result submit per tick.
@@ -1710,7 +1691,6 @@ async fn run_loop(
                 // its own queue and attempt type. Both drain on their own
                 // bounded budgets after the shared flights settle.
                 drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
-                drain_state_on_shutdown(&mut state_flight).await?;
                 drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
                 drain_finish_on_shutdown(&mut finish_flight).await?;
                 return Ok(exit);
@@ -1734,9 +1714,6 @@ async fn run_loop(
                 // Campaign packets ride the same tick under their own gate and
                 // are never consumed by the query poller.
                 maybe_start_campaign_packet_poll(&kernel, &mut campaign_packet_flight);
-                // State pairs ride the same tick under their own gate and are
-                // never consumed by the query poller.
-                maybe_start_state_poll(&kernel, &composition, &mut state_flight);
                 // Task Controller uses a separate queue and attempt type;
                 // start it on the same cadence without sharing the local-read
                 // completion branch.
@@ -1810,9 +1787,6 @@ async fn run_loop(
                     campaign_packet_completion,
                     &mut campaign_packet_flight,
                 )?;
-            }
-            state_completion = next_state_completion(&mut state_flight) => {
-                settle_state_completion(state_completion, &mut state_flight)?;
             }
             task_controller_completion =
                 next_task_controller_completion(&mut task_controller_flight) => {
@@ -3951,537 +3925,7 @@ async fn drain_campaign_packet_on_shutdown(
     }
 }
 
-/// Settled outcome of one state poll step (#2564 Slice 1). The state flight
-/// owns a distinct queue/attempt/result lifecycle (`state_claim` /
-/// `state_result`) and never shares a completion with the query flight: a
-/// query, Skill or packet result can never complete a State claim.
-enum StatePollOutcome {
-    IdleBackoff,
-    Accepted,
-    Expired,
-    StaleAttempt,
-}
-
-enum StateCompletion {
-    Settled(Result<StatePollOutcome, String>),
-}
-
-struct StateFlightState {
-    future: Pin<Box<dyn std::future::Future<Output = StateCompletion>>>,
-}
-
-enum StateFlight {
-    Idle,
-    InFlight(StateFlightState),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StateTickDecision {
-    StartPoll,
-    SkipInFlight,
-}
-
-fn decide_state_tick(flight: &StateFlight) -> StateTickDecision {
-    match flight {
-        StateFlight::Idle => StateTickDecision::StartPoll,
-        StateFlight::InFlight(_) => StateTickDecision::SkipInFlight,
-    }
-}
-
-fn start_state_poll(
-    kernel: &Arc<DaemonKernelClient>,
-    composition: SharedComposition,
-) -> Pin<Box<dyn std::future::Future<Output = StateCompletion>>> {
-    let kernel_clone = Arc::clone(kernel);
-    Box::pin(async move {
-        StateCompletion::Settled(run_state_poll(&kernel_clone, composition).await)
-    })
-}
-
-fn maybe_start_state_poll(
-    kernel: &Arc<DaemonKernelClient>,
-    composition: &SharedComposition,
-    flight: &mut StateFlight,
-) {
-    if decide_state_tick(flight) == StateTickDecision::StartPoll {
-        *flight = StateFlight::InFlight(StateFlightState {
-            future: start_state_poll(kernel, Arc::clone(composition)),
-        });
-    }
-}
-
-async fn next_state_completion(flight: &mut StateFlight) -> StateCompletion {
-    match flight {
-        StateFlight::Idle => std::future::pending::<StateCompletion>().await,
-        StateFlight::InFlight(state) => (&mut state.future).await,
-    }
-}
-
-fn settle_state_completion(
-    completion: StateCompletion,
-    flight: &mut StateFlight,
-) -> Result<(), String> {
-    match completion {
-        StateCompletion::Settled(Ok(_)) => {
-            *flight = StateFlight::Idle;
-            Ok(())
-        }
-        StateCompletion::Settled(Err(error)) => Err(error),
-    }
-}
-
-/// Runs one state poll step: `state_claim` (pair plus fenced attempt
-/// capability, or null meaning backoff), then [`serve_state_pair`] for the
-/// admitted pair under that attempt, then `state_result` with the returned
-/// [`HostRequestResultBody`] (accepted, the expected expiry race, or the
-/// stale-attempt quarantine). Exact replays stay idempotent by Kernel
-/// contract. Any step failure fails the daemon closed — a claimed pair that
-/// cannot serve or submit is never silently discarded. A stale capability is
-/// never retried: the step settles and the next tick claims the current
-/// generation anew.
-async fn run_state_poll(
-    kernel: &Arc<DaemonKernelClient>,
-    composition: SharedComposition,
-) -> Result<StatePollOutcome, String> {
-    // #740: receipt span over the claim/serve/submit poll step. Pair
-    // presence and submit outcome are named; payload bytes never are.
-    let _span = tracing::info_span!("eliotd.state_poll").entered();
-    let pair = kernel
-        .claim_state_pair_async()
-        .await
-        .map_err(|error| format!("Kernel state pair claim: {error}"))?;
-    let Some((envelope, tool, attempt)) = pair else {
-        return Ok(StatePollOutcome::IdleBackoff);
-    };
-    let body = serve_state_pair(kernel, &composition, &envelope, &tool, &attempt)
-        .await
-        .map_err(|error| format!("daemon state serve: {error}"))?;
-    match submit_state_result_idempotent(kernel, &body).await? {
-        StateSubmitOutcome::Accepted => Ok(StatePollOutcome::Accepted),
-        StateSubmitOutcome::Expired => Ok(StatePollOutcome::Expired),
-        StateSubmitOutcome::StaleAttempt => Ok(StatePollOutcome::StaleAttempt),
-    }
-}
-
-/// Returns whether one claimed pair is the admitted `eliot.state` shape the
-/// state lane owns: the envelope capability and the tool name agree on
-/// `eliot.state`. A query, Skill or packet pair is never reinterpreted as
-/// state.
-fn is_state_pair(envelope: &HostRequestEnvelope, tool: &serde_json::Value) -> bool {
-    envelope.identity.capability == "eliot.state"
-        && tool
-            .as_object()
-            .and_then(|object| object.get("name"))
-            .and_then(serde_json::Value::as_str)
-            == Some("eliot.state")
-}
-
-/// Derives the trusted scope of one admitted state pair: the envelope work
-/// scope, else its session — never an MCP argument, exactly as the Kernel's
-/// `local_state_selectors_from_tool` derives it.
-fn trusted_state_scope(envelope: &HostRequestEnvelope) -> Result<ScopeId, String> {
-    let scope_text = envelope
-        .identity
-        .work_scope_id
-        .as_deref()
-        .filter(|scope| !scope.trim().is_empty())
-        .or_else(|| {
-            envelope
-                .identity
-                .session_id
-                .as_deref()
-                .filter(|scope| !scope.trim().is_empty())
-        })
-        .ok_or_else(|| "admitted state request binds no usable scope".to_owned())?;
-    ScopeId::new(scope_text.to_owned())
-        .map_err(|error| format!("admitted state scope: {error}"))
-}
-
-/// Parses the admitted `include` projection-field list with the Kernel's
-/// closed discipline (`local_state_selectors_from_tool`): absent or null is
-/// the default full projection; entries are unique non-blank control-free
-/// field names. Anything else fails the step before any read.
-fn state_include_fields(tool: &serde_json::Value) -> Result<Vec<String>, String> {
-    let arguments = tool
-        .as_object()
-        .and_then(|object| object.get("arguments"))
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| "admitted state arguments must be an object".to_owned())?;
-    match arguments.get("include") {
-        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(serde_json::Value::Array(items)) => {
-            let mut seen = BTreeSet::new();
-            let mut include = Vec::with_capacity(items.len());
-            for item in items {
-                let field = item
-                    .as_str()
-                    .filter(|field| {
-                        !field.trim().is_empty() && !field.chars().any(char::is_control)
-                    })
-                    .ok_or_else(|| {
-                        "admitted state include must list unique non-blank fields".to_owned()
-                    })?;
-                if !seen.insert(field) {
-                    return Err(
-                        "admitted state include must list unique non-blank fields".to_owned(),
-                    );
-                }
-                include.push(field.to_owned());
-            }
-            Ok(include)
-        }
-        Some(_) => Err("admitted state include must list unique non-blank fields".to_owned()),
-    }
-}
-
-/// Builds the read metadata bound to the admitted state envelope and the
-/// retained authenticated owner session.
-///
-/// The task binding stays optional: authenticated discovery with no selected
-/// task is served as the bounded selection/intake state, never refused for
-/// want of a task and never given an invented `TaskContract`. A present but
-/// blank or control-bearing task is read the same way the state serve on the
-/// sibling slice reads it — as absent — because the admitted envelope, not
-/// this poller, owns task admission.
-fn state_read_context(
-    envelope: &HostRequestEnvelope,
-    task_id: Option<&str>,
-    fence: &StateFence,
-) -> Result<eliot_contracts::RequestMetadata, String> {
-    let operation = host_request_operation_id(envelope);
-    let request_id = RequestId::new(format!("eliotd:state-preview:{operation}"))
-        .map_err(|error| format!("state request id: {error}"))?;
-    let session_id = envelope
-        .identity
-        .session_id
-        .as_deref()
-        .map(SessionId::new)
-        .transpose()
-        .map_err(|error| format!("admitted session identity: {error}"))?;
-    let task_id = task_id
-        .map(TaskId::new)
-        .transpose()
-        .map_err(|error| format!("admitted task identity: {error}"))?;
-    let context = eliot_contracts::RequestMetadata {
-        request_id,
-        session_id,
-        task_id,
-        product_id: ProductId::new(SERVICE_NAME).map_err(|error| error.to_string())?,
-        source_id: SourceId::new(SERVICE_NAME).map_err(|error| error.to_string())?,
-        state_fence: fence.clone(),
-        clock: ClockReading {
-            valid_time_ms: None,
-            known_time_ms: None,
-            transaction_sequence: None,
-            monotonic_ns: None,
-        },
-    };
-    context
-        .validate()
-        .map_err(|error| format!("state request metadata: {error}"))?;
-    Ok(context)
-}
-
-/// Serves one admitted `eliot.state` pair through the Governor state/query
-/// facade subset (#2564 Slice 1, A1 adjudication).
-///
-/// This lane invokes `ReadApi::state` over a fresh `KernelContextReadClient`
-/// — the existing Governor composition edge for bounded current-state reads
-/// — never the full seven-role `reconstruct_context_inputs` (whose closed
-/// request requires a non-blank evidence subject, task, projection and
-/// affordance selectors this lane must not invent) and never the query-only
-/// `GetEvidencePack` twin (state is never routed as query). The
-/// `DaemonComposition::reconstruction_composition` borrow pins readiness plus
-/// the exact admitted fence and scope; the guard drops before any owner read,
-/// so no composition lock crosses the reconstruction awaits. The reads are
-/// the owner-resolved selectors of the admitted operation: `GetRevisionHeads`
-/// with empty parameters, then the scope-bound `GetScopeRevisionView` and —
-/// only when the envelope binds a task — the task-bound `GetTaskState` under
-/// `ExactFence` over the observed dependency revisions. A task-bound preview
-/// without its task fact is a step failure, never a healthy empty preview;
-/// an empty list is never claimed `KnownEmpty` here — the owner reads speak
-/// for themselves through their bound views.
-async fn serve_state_pair(
-    kernel: &Arc<DaemonKernelClient>,
-    composition: &SharedComposition,
-    envelope: &HostRequestEnvelope,
-    tool: &serde_json::Value,
-    attempt: &LocalReadAttempt,
-) -> Result<HostRequestResultBody, String> {
-    if !is_state_pair(envelope, tool) {
-        return Err("request is not the admitted eliot.state shape".to_owned());
-    }
-    attempt
-        .validate()
-        .map_err(|error| format!("state attempt is not bound shape: {error}"))?;
-    let scope = trusted_state_scope(envelope)?;
-    if attempt.operation_id != host_request_operation_id(envelope)
-        || attempt.scope_id != scope.as_str()
-        || attempt.authority_epoch != envelope.state_fence.authority_epoch
-        || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
-        || attempt.facet_method != envelope.identity.capability
-    {
-        return Err("state attempt does not bind the admitted request".to_owned());
-    }
-    let retained_fence = kernel.kernel_fence();
-    if envelope.state_fence != retained_fence {
-        return Err("admitted State Fence differs from the retained Kernel fence".to_owned());
-    }
-    // The retained owner session must belong to this live client generation:
-    // a missing Kernel-authenticated session is a step failure, never a
-    // substituted principal. (The blank-principal sub-check stays with the
-    // lib serve edges that own `OwnerSessionFacts` field access.)
-    if kernel.owner_session_facts().is_none() {
-        return Err("no authenticated owner session is retained for this state preview".to_owned());
-    }
-    let include = state_include_fields(tool)?;
-    let reads = KernelContextReadClient::new(Arc::clone(kernel));
-    {
-        let guard = composition.lock().await;
-        let borrowed = guard
-            .reconstruction_composition(kernel, &reads, scope.clone())
-            .map_err(|error| format!("daemon state composition: {error}"))?;
-        if *borrowed.admitted_fence() != envelope.state_fence {
-            return Err("daemon state fence moved before serve".to_owned());
-        }
-    }
-    serve_state_views(kernel, envelope, attempt, &scope, include, &retained_fence).await
-}
-
-/// Reads the owner-backed state views for one pinned admitted pair and binds
-/// them into the digest-committed result body.
-///
-/// The `GetRevisionHeads` observation carries empty parameters; the
-/// scope/task reads carry exactly the admitted scope, the admitted task (when
-/// bound) and the catalogue's own bound. Every view must echo its operation
-/// and the admitted fence or the step fails closed: a previous generation is
-/// never served as current.
-async fn serve_state_views(
-    kernel: &Arc<DaemonKernelClient>,
-    envelope: &HostRequestEnvelope,
-    attempt: &LocalReadAttempt,
-    scope: &ScopeId,
-    include: Vec<String>,
-    fence: &StateFence,
-) -> Result<HostRequestResultBody, String> {
-    let task_id = envelope
-        .identity
-        .task_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control));
-    let ctx = state_read_context(envelope, task_id, fence)?;
-    let service = ReadService::new(KernelContextReadClient::new(Arc::clone(kernel)));
-    let heads = service
-        .state(
-            &ctx,
-            StateRequest {
-                operation: NamedReadOperation::GetRevisionHeads,
-                scope_id: None,
-                consistency: ReadConsistency::Eventual,
-                dependency_revisions: BTreeMap::new(),
-                ordering: ReadOrderingBinding::without_order_dependency(),
-                parameters: NamedParameters::new(),
-                provenance_handles: Vec::new(),
-            },
-        )
-        .await
-        .map_err(|error| format!("daemon state revision heads: {error}"))?;
-    if heads.operation != NamedReadOperation::GetRevisionHeads || heads.state_fence != *fence {
-        return Err("daemon state revision heads do not match the admitted fence".to_owned());
-    }
-    // Declared dependency minimums are exactly what the owner observed under
-    // the admitted fence: non-zero revisions carrying that fence. Anything
-    // older, zero or foreign never becomes a minimum.
-    let mut dependencies: BTreeMap<RevisionKey, u64> = BTreeMap::new();
-    for head in &heads.revision_heads {
-        if head.state_fence == *fence && head.revision != 0 {
-            dependencies.insert(head.key.clone(), head.revision);
-        }
-    }
-    let scope_view = service
-        .state(
-            &ctx,
-            StateRequest {
-                operation: NamedReadOperation::GetScopeRevisionView,
-                scope_id: Some(scope.clone()),
-                consistency: ReadConsistency::ExactFence,
-                dependency_revisions: dependencies.clone(),
-                ordering: ReadOrderingBinding::without_order_dependency(),
-                parameters: NamedParameters::new(),
-                provenance_handles: Vec::new(),
-            },
-        )
-        .await
-        .map_err(|error| format!("daemon state scope view: {error}"))?;
-    if scope_view.operation != NamedReadOperation::GetScopeRevisionView
-        || scope_view.state_fence != *fence
-    {
-        return Err("daemon state scope view does not match the admitted fence".to_owned());
-    }
-    // No selected task is authenticated discovery: the bounded scope views
-    // above are the preview. A bound task joins its exact task fact; without
-    // that fact the task-bound preview is refused, never served empty.
-    let task_view = match task_id {
-        None => None,
-        Some(task) => Some(
-            read_task_state_view(&service, &ctx, scope, task, &dependencies, fence).await?,
-        ),
-    };
-    let response = serde_json::json!({
-        "operation": "eliot.state",
-        "scope_id": scope.as_str(),
-        "task_id": task_id,
-        "include": include,
-        "revision_heads": heads.revision_heads.clone(),
-        "scope": scope_view,
-        "task_state": task_view,
-    });
-    state_result_body(envelope, attempt, &response, &heads, fence)
-}
-
-/// Reads the exact task fact for one task-bound admitted pair.
-///
-/// The selectors are the admitted scope, the admitted task and the
-/// catalogue's own bound — never a defaulted or substituted identity. The
-/// view must echo its operation and the admitted fence: a task-bound preview
-/// without its task fact is refused by the caller, never served empty.
-async fn read_task_state_view(
-    service: &ReadService<KernelContextReadClient>,
-    ctx: &eliot_contracts::RequestMetadata,
-    scope: &ScopeId,
-    task: &str,
-    dependencies: &BTreeMap<RevisionKey, u64>,
-    fence: &StateFence,
-) -> Result<CurrentStateView, String> {
-    let mut parameters = NamedParameters::new();
-    parameters
-        .insert(
-            "task_id".to_owned(),
-            serde_json::Value::String(task.to_owned()),
-        )
-        .map_err(|error| format!("daemon state task selector: {error}"))?;
-    parameters
-        .insert(
-            "max_records".to_owned(),
-            serde_json::Value::String(EVIDENCE_PACK_MAX_RECORDS.to_string()),
-        )
-        .map_err(|error| format!("daemon state task bound: {error}"))?;
-    let view = service
-        .state(
-            ctx,
-            StateRequest {
-                operation: NamedReadOperation::GetTaskState,
-                scope_id: Some(scope.clone()),
-                consistency: ReadConsistency::ExactFence,
-                dependency_revisions: dependencies.clone(),
-                ordering: ReadOrderingBinding::without_order_dependency(),
-                parameters,
-                provenance_handles: Vec::new(),
-            },
-        )
-        .await
-        .map_err(|error| format!("daemon state task view: {error}"))?;
-    if view.operation != NamedReadOperation::GetTaskState || view.state_fence != *fence {
-        return Err("daemon state task view does not match the admitted fence".to_owned());
-    }
-    Ok(view)
-}
-
-/// Projects the owner-backed state views into the host-request result body.
-///
-/// The response carries the exact bound views plus the identity they were
-/// read under. The lineage declares the read class with the observed source
-/// revisions and fence: a read of already-retained evidence with its actual
-/// revision and provenance, creating no new semantic record. `request_sha256`
-/// binds the actual expected admitted envelope, and the result digest covers
-/// the exact bounded response bytes.
-fn state_result_body(
-    envelope: &HostRequestEnvelope,
-    attempt: &LocalReadAttempt,
-    response: &serde_json::Value,
-    heads: &CurrentStateView,
-    fence: &StateFence,
-) -> Result<HostRequestResultBody, String> {
-    let bytes = canonical_json_bytes(response)
-        .map_err(|error| format!("state response bytes: {error}"))?;
-    let result_digest = sha256_hex(&bytes);
-    let source_revisions = heads
-        .revision_heads
-        .iter()
-        .map(|head| HostRequestResultSourceRevision {
-            key: head.key.as_str().to_owned(),
-            revision: head.revision,
-            state_fence: head.state_fence.clone(),
-        })
-        .collect::<Vec<_>>();
-    let body = HostRequestResultBody {
-        wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
-        wire_version: HostRequestResultBody::CONTRACT_VERSION,
-        operation_id: attempt.operation_id.clone(),
-        request_sha256: envelope.envelope_sha256.clone(),
-        result_digest: result_digest.clone(),
-        response: response.clone(),
-        attempt: Some(attempt.clone()),
-        lineage: Some(HostRequestResultLineage {
-            output_artifact_ref: None,
-            output_digest: result_digest,
-            producer_ref: None,
-            source_revisions: Some(source_revisions),
-            source_state_fence: Some(fence.clone()),
-            input_refs: None,
-            transformation_lineage: None,
-            closure_refs: None,
-            policy_fence: None,
-            origin_evidence_refs: None,
-            semantic_receipt_ref: None,
-            result_class: HostRequestResultClass::ExistingEvidenceRead,
-            proof_ceiling: None,
-            influence_state: InfluenceState::Unknown,
-            instruction_taint: None,
-        }),
-        evidence: None,
-    };
-    body.validate()
-        .map_err(|error| format!("state result body is not valid: {error}"))?;
-    Ok(body)
-}
-
-/// Submits one served state result body, retrying once with the byte-identical
-/// body when the first submit fails.
-///
-/// This is the state twin of the local-read lost-acknowledgement reconcile:
-/// the retained body is reused verbatim, never recomputed, and no local
-/// replay cache or timer is introduced. The retry is safe because the Kernel
-/// submit leg is exact-replay idempotent — an identical body under the same
-/// identity persists once and replays, never duplicates. Only transport
-/// failures retry: `Expired` and `StaleAttempt` are settled outcomes, so a
-/// quarantined capability is never resubmitted.
-async fn submit_state_result_idempotent(
-    kernel: &DaemonKernelClient,
-    body: &HostRequestResultBody,
-) -> Result<StateSubmitOutcome, String> {
-    match kernel.submit_state_result_async(body).await {
-        Ok(outcome) => Ok(outcome),
-        Err(first_error) => kernel
-            .submit_state_result_async(body)
-            .await
-            .map_err(|error| {
-                format!("Kernel state result submit: {first_error}; retry: {error}")
-            }),
-    }
-}
-
-async fn drain_state_on_shutdown(flight: &mut StateFlight) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, StateFlight::Idle);
-    let StateFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(StateCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
-    }
-}
-
+/// Outcome of one production Task Controller poll step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskControllerPollOutcome {
     /// No queued invocation; back off until the next tick.
