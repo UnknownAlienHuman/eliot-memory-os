@@ -19,10 +19,10 @@ use eliot_kernel_core::user_automation::{
     AutomationResourceCeiling, AutomationWorkClass, DeliveryChannel, ProviderFingerprint,
     ProviderFingerprintPolicy, UserAutomationConfigurationState, UserAutomationError,
     UserAutomationExecutionMode, UserAutomationExecutionProjection,
-    UserAutomationFailureProjection, UserAutomationInvocation,
-    UserAutomationPreflightContext, UserAutomationPreflightDecision,
-    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
-    UserAutomationTrigger, UserAutomationTriggerOrigin,
+    UserAutomationFailureProjection, UserAutomationInvocation, UserAutomationPreflightContext,
+    UserAutomationPreflightDecision, UserAutomationPreflightProjection,
+    UserAutomationPreflightReceipt, UserAutomationRevision, UserAutomationTrigger,
+    UserAutomationTriggerOrigin,
 };
 use eliot_protocol::RequestIdentity as ProtocolRequestIdentity;
 use eliot_protocol::dreamer_job::{
@@ -3313,9 +3313,9 @@ impl UserAutomationProviderRouteObservation {
     /// Validates the closed observation shape without granting any admission.
     pub fn validate(&self) -> Result<(), UserAutomationExecutionError> {
         match self {
-            Self::Observed { fingerprint } => {
-                fingerprint.validate().map_err(UserAutomationExecutionError::Contract)
-            }
+            Self::Observed { fingerprint } => fingerprint
+                .validate()
+                .map_err(UserAutomationExecutionError::Contract),
             Self::Unobserved { reason } => {
                 validate_text(reason, "provider_route_observation.reason")
             }

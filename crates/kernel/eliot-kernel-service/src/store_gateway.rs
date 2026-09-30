@@ -3237,9 +3237,9 @@ impl KernelStoreGateway {
         // that same owner instead of being left unattested. Delivery capability
         // is a named observation of the declared channels, not an inference from
         // an adapter result.
-        let agent_arm =
-            owner.current_configuration_state == UserAutomationConfigurationState::Active
-                && owner.revision.mode == UserAutomationExecutionMode::Agent;
+        let agent_arm = owner.current_configuration_state
+            == UserAutomationConfigurationState::Active
+            && owner.revision.mode == UserAutomationExecutionMode::Agent;
         let provider_route_observation = if agent_arm {
             Some(
                 Self::read_run_now_provider_route_observation(sealed, owner, invocation, runtime)
@@ -3417,9 +3417,11 @@ impl KernelStoreGateway {
             .admits(evidence.observed_provider_fingerprint.as_ref())
         {
             let owner_answer = provider_route_observation.map_or_else(
-                || "the composed runtime port exposes no provider-route observation for this \
+                || {
+                    "the composed runtime port exposes no provider-route observation for this \
                       occurrence"
-                    .to_owned(),
+                        .to_owned()
+                },
                 |observation| match observation {
                     UserAutomationProviderRouteObservation::Observed { .. } => {
                         "the provider-route observation owner issued an identity the revision's \
