@@ -267,10 +267,12 @@ impl OwnerProvenanceEvidence {
     /// This is a TYPED REFUSAL, not an empty default and not a stand-in. On
     /// this tree it is also the production answer, and the measured reasons are
     /// enumerated in the module docs: a `BackupArtifactHandle` needs an
-    /// `ArtifactId` that no backup-archive owner issues, `PublicationPort` has
-    /// no production implementation, `eliot-blob-api::backup_io` retains
-    /// per-member sealed blob envelopes rather than a backup archive, and
-    /// `BackupRole::Verifier` is bound to no owner channel.
+    /// `ArtifactId` that no backup-archive owner issues, the production
+    /// `PublicationPort` owner #959 added cannot be instantiated because no
+    /// production code constructs an `eliot_blob::BlobStoreService`, and
+    /// `eliot-blob-api::backup_io` retains per-member sealed blob envelopes
+    /// rather than a backup archive, and `BackupRole::Verifier` is bound to no
+    /// owner channel.
     ///
     /// What it means concretely: the presented archive is caller-presented
     /// inline bytes and nothing more. The route therefore records all three

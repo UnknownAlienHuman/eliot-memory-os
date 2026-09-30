@@ -221,12 +221,23 @@ pub enum CaptureState {
 /// restore call and mutates nothing.
 ///
 /// A [`StructurallyValidCandidate`] is never promoted to
-/// [`ProvenanceBoundCapture`] by this owner, because no retained-artifact owner
-/// exists in the repository today: there is no production
-/// `impl PublicationPort` (the only implementation is `MemPublisher` inside
-/// `bins/eliot-kernel/tests/backup_capture.rs`), and
-/// `KernelBackupCapture::capture` / `request_from_ports` have zero production
-/// callers. Nothing here may invent a capture receipt to cross that gap.
+/// [`ProvenanceBoundCapture`] by this owner, because the retained-artifact owner
+/// that issues a capture receipt exists but cannot be REACHED in production.
+/// #959 did land the one production `eliot_backup::PublicationPort`
+/// implementor, `eliot_blob::BlobArchivePublicationOwner`; what is missing is a
+/// way to bind it. It binds to an `eliot_blob::BlobStoreService`, and production
+/// constructs none: no production code calls its constructor, and three of the
+/// five ports it needs (`BlobPlatformPort`, `BlobCompressionPort`,
+/// `BlobLiveSetPort`) have only `#[cfg(test)]` implementations in this
+/// repository. This composition additionally holds just a
+/// `BlobStoreController`, which validates and probes a manifest and performs no
+/// blob I/O. So `KernelBackupCapture::capture` and `request_from_ports` still
+/// have zero production callers.
+///
+/// Nothing here may invent a capture receipt to cross that gap, and no second
+/// publication owner may be written beside the one #959 already owns: a second
+/// scheme in this composition root is exactly the hidden second owner A0.3
+/// forbids.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureEvidenceLevel {
     /// Bytes that decode and validate internally; carries no retained capture
@@ -385,8 +396,9 @@ pub enum ArchiveFenceProof {
     /// validated, with no retained-capture provenance behind it. Structural
     /// validity plus a relation is still an untrusted candidate (I5.13: "Backup
     /// existence is not recovery proof"), and this variant is the ONLY value a
-    /// `verify_only` answer can carry today, because no production
-    /// `impl PublicationPort` issues a capture receipt on that path.
+    /// `verify_only` answer can carry today, because `verify_only` publishes
+    /// nothing and reads no retained receipt, so no production publication owner
+    /// issues a capture receipt on that path.
     StructuralOnly,
     /// Bound to the owner-issued publication receipt identity that proves this
     /// installation produced the archive. Only this variant licenses the words
@@ -835,10 +847,12 @@ impl KernelBackupCapture {
         let archived_fence_relation =
             classify_archived_fence(&bundle.export_fence.state_fence, kernel_fence);
         // Nothing on this path authenticates the archive as produced by THIS
-        // installation: no retained-artifact owner issues a capture receipt here
-        // (there is no production `impl PublicationPort`), so a relation computed
-        // from caller-presented bytes is unproven structural evidence whatever
-        // the relation is. #2862 owns the producer that will change this.
+        // installation: `verify_only` publishes nothing and reads no retained
+        // receipt, and the production publication owner #959 added cannot be
+        // instantiated in production, so no owner issues a capture receipt here.
+        // A relation computed from caller-presented bytes is therefore unproven
+        // structural evidence whatever the relation is. #2862 owns the producer
+        // that will change this.
         let archived_fence_proof = ArchiveFenceProof::StructuralOnly;
         let archive_sha256 = bundle
             .bundle_sha256()
