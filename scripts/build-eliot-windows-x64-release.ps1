@@ -2785,7 +2785,10 @@ function Get-ExpectedSigningInventory(
     [bool]$IncludeGovernor,
     [bool]$IncludeAgentBridge,
     [string]$AgentBridgeSha256,
-    [int64]$AgentBridgeBytes
+    [int64]$AgentBridgeBytes,
+    [bool]$IncludeCodexPluginBridge,
+    [string]$CodexPluginBridgeSha256,
+    [int64]$CodexPluginBridgeBytes
 ) {
     $extensions = Get-SigningInventoryExtensionPolicy
     foreach ($digest in @($RuntimeReceiptSha256, $OperatorReceiptSha256)) {
@@ -2886,6 +2889,24 @@ function Get-ExpectedSigningInventory(
         }
     }
 
+    if ($IncludeCodexPluginBridge) {
+        # Issue #18 migrated Codex MCP edge: the staged plugin bin carries the
+        # current-owner bridge beside the retained governor copy. The copy is bound
+        # to the verified bridge source record like the governor plugin copy above.
+        if ([string]$CodexPluginBridgeSha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$CodexPluginBridgeBytes -le 0) {
+            throw 'Codex plugin bridge record is missing or non-canonical'
+        }
+        $codexPluginBridgePath = 'integrations/codex/plugins/eliot-governor/bin/eliot-agent-bridge.exe'
+        $codexPluginBridgeFullPath = Join-Path $BundlePath $codexPluginBridgePath.Replace('/', '\')
+        $codexPluginBridgeBundleFile = Get-Item -LiteralPath $codexPluginBridgeFullPath -ErrorAction Stop
+        $codexPluginBridgeBundleHash = (Get-FileHash -LiteralPath $codexPluginBridgeFullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if (-not (Test-PortableExecutableHeader $codexPluginBridgeFullPath) -or
+            $codexPluginBridgeBundleHash -cne [string]$CodexPluginBridgeSha256 -or [int64]$codexPluginBridgeBundleFile.Length -ne [int64]$CodexPluginBridgeBytes -or
+            -not $seen.Add($codexPluginBridgePath)) {
+            throw 'Codex plugin bridge copy differs from the verified bridge source record'
+        }
+        $entries += New-SigningInventoryEntry $codexPluginBridgePath 'codex-plugin-agent-bridge' 'plugin/eliot-governor' 'runtime/RUNTIME_ARTIFACTS.json' $RuntimeReceiptSha256 ([string]$CodexPluginBridgeSha256) ([int64]$CodexPluginBridgeBytes)
+    }
     $operatorSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($record in @($OperatorReceipt.artifacts.files)) {
         $relative = Assert-SafeRelativePath ([string]$record.path) 'Operator signing source record'
@@ -3128,7 +3149,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         }
         $entries += [ordered]@{
             path = 'integrations/codex/plugins/eliot-governor/'
-            selection = 'pinned source tree plus built governor binary'
+            selection = 'pinned source tree plus built governor and agent-bridge binaries (the staged plugin MCP manifest launches the agent-bridge copy)'
             owner = 'plugin/eliot-governor'
             install_destination = 'integrations/codex/plugins/eliot-governor/'
             generation = $SourceCommit
@@ -3344,6 +3365,7 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         'integrations/codex/plugins/eliot-governor/.mcp.json',
         'integrations/codex/plugins/eliot-governor/README.md',
         'integrations/codex/plugins/eliot-governor/bin/eliot-governor.exe',
+        'integrations/codex/plugins/eliot-governor/bin/eliot-agent-bridge.exe',
         'integrations/codex/plugins/eliot-governor/hooks/hooks.json',
         'integrations/codex/plugins/eliot-governor/skills/eliot-finish/SKILL.md',
         'integrations/codex/plugins/eliot-governor/skills/eliot-recover/SKILL.md',
@@ -3417,13 +3439,13 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         }
         $server = $serverProperties[0].Value
         if ([string]$server.type -ne 'stdio' -or
-            [string]$server.command -ne 'bin/eliot-governor.exe' -or
+            [string]$server.command -ne 'bin/eliot-agent-bridge.exe' -or
             [string]$server.cwd -ne '.' -or
             $server.enabled -ne $true -or
             $server.required -ne $false) {
-            throw 'release Codex MCP server transport is not the enabled fail-open local plugin binary'
+            throw 'release Codex MCP server transport is not the enabled current-owner bridge route'
         }
-        $expectedArgs = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
+        $expectedArgs = @('mcp', '--profile', 'codex_controller', '--transport', 'stdio', '--client-declaration', '${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json')
         $actualArgs = @($server.args)
         if ($actualArgs.Count -ne $expectedArgs.Count) {
             throw 'release Codex MCP server has the wrong argument count'
@@ -3437,6 +3459,21 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         $pluginGovernorHash = (Get-FileHash -LiteralPath (Join-Path $codexPluginRoot 'bin/eliot-governor.exe') -Algorithm SHA256).Hash
         if ($rootGovernorHash -ne $pluginGovernorHash) {
             throw 'release Codex plugin binary differs from the release Governor binary'
+        }
+        $codexPluginBridge = $release.codex_plugin_bridge
+        if (-not $codexPluginBridge -or
+            [string]$codexPluginBridge.path -cne 'integrations/codex/plugins/eliot-governor/bin/eliot-agent-bridge.exe' -or
+            [string]$codexPluginBridge.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [int64]$codexPluginBridge.bytes -le 0) {
+            throw 'RELEASE.json Codex plugin bridge binding is missing or non-canonical'
+        }
+        $codexPluginBridgeStagedPath = Join-Path $codexPluginRoot 'bin/eliot-agent-bridge.exe'
+        $codexPluginBridgeStagedFile = Get-Item -LiteralPath $codexPluginBridgeStagedPath -ErrorAction Stop
+        $codexPluginBridgeStagedHash = (Get-FileHash -LiteralPath $codexPluginBridgeStagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if (-not (Test-PortableExecutableHeader $codexPluginBridgeStagedPath) -or
+            $codexPluginBridgeStagedHash -cne [string]$codexPluginBridge.sha256 -or
+            [int64]$codexPluginBridgeStagedFile.Length -ne [int64]$codexPluginBridge.bytes) {
+            throw 'release Codex plugin bridge binary differs from the RELEASE.json current-owner record'
         }
     }
 
@@ -4022,9 +4059,14 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
     $agentBridgeSelected = $frontDoor -and [string]$frontDoor.selection -ceq 'agent-bridge'
     $expectedBridgeSha256 = if ($agentBridgeSelected) { [string]$frontDoor.bridge_sha256 } else { '' }
     $expectedBridgeBytes = if ($agentBridgeSelected) { [int64]$frontDoor.bridge_bytes } else { [int64]0 }
+    $codexPluginBridgeRecord = $release.codex_plugin_bridge
+    $codexPluginBridgeSelected = (-not $governorRetired)
+    $expectedCodexPluginBridgeSha256 = if ($codexPluginBridgeSelected -and $codexPluginBridgeRecord) { [string]$codexPluginBridgeRecord.sha256 } else { '' }
+    $expectedCodexPluginBridgeBytes = if ($codexPluginBridgeSelected -and $codexPluginBridgeRecord) { [int64]$codexPluginBridgeRecord.bytes } else { [int64]0 }
     $expectedSigningInventory = @(Get-ExpectedSigningInventory `
             $resolved $runtimeManifest $runtimeReceiptSha256 $operatorReceipt $operatorReceiptSha256 `
-            (-not $governorRetired) $agentBridgeSelected $expectedBridgeSha256 $expectedBridgeBytes)
+            (-not $governorRetired) $agentBridgeSelected $expectedBridgeSha256 $expectedBridgeBytes `
+            $codexPluginBridgeSelected $expectedCodexPluginBridgeSha256 $expectedCodexPluginBridgeBytes)
     Assert-SigningInventory $payloadManifest.signing_inventory $expectedSigningInventory
     Assert-ClosedCodeBearingPayload $resolved $expectedSigningInventory
 
@@ -4412,6 +4454,13 @@ try {
     $releaseBuilds = [System.Collections.Generic.List[object]]::new()
     if ($legacyGovernorPresent) {
         $releaseBuilds.Add([ordered]@{ purpose = 'governor'; package = 'eliot-app'; binary = 'eliot-governor' }) | Out-Null
+        if (-not $frontDoorBridgePlan.provisioned) {
+            # Issue #18 migrated Codex MCP edge: the staged plugin manifest launches
+            # bin/eliot-agent-bridge.exe, so the bridge is built for the plugin bin even
+            # when the Claude front door stays on legacy. When the front door provisions
+            # the bridge, that identical package/binary/profile build already produced it.
+            $releaseBuilds.Add([ordered]@{ purpose = 'codex-plugin-bridge'; package = 'eliot-agent-bridge'; binary = 'eliot-agent-bridge' }) | Out-Null
+        }
     }
     if ($frontDoorBridgePlan.provisioned) {
         $releaseBuilds.Add([ordered]@{ purpose = 'front-door-bridge'; package = 'eliot-agent-bridge'; binary = 'eliot-agent-bridge' }) | Out-Null
@@ -4512,6 +4561,30 @@ try {
     if ($frontDoorBridgeStaged) {
         $frontDoorBridgeLinkerVersion = Get-WindowsPeLinkerVersion $frontDoorBridge 'eliot-agent-bridge.exe'
         $peLinkerVersions = @(@($peLinkerVersions) + @($frontDoorBridgeLinkerVersion) | Sort-Object -Unique)
+    }
+    $codexPluginBridgeStaged = $null
+    $codexPluginBridgeSource = $null
+    if ($legacyGovernorPresent) {
+        # Issue #18 migrated Codex MCP edge: the staged plugin manifest launches
+        # bin/eliot-agent-bridge.exe (bins/eliot-agent-bridge, codex_controller contour),
+        # so the retained bundle verifies the bridge binary for the plugin bin beside the
+        # retained governor copy. When the front door provisions the bridge, that same
+        # cargo artifact is reused; otherwise the plugin-scoped build above produced it.
+        $codexPluginBridgeSource = if ($frontDoorBridgePlan.provisioned) { [string]$frontDoorBridgePlan.path } else { Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-agent-bridge.exe' }
+        if (-not (Test-Path -LiteralPath $codexPluginBridgeSource -PathType Leaf)) {
+            throw "release Codex plugin bridge executable is missing: $codexPluginBridgeSource"
+        }
+        $codexPluginBridgeFile = Get-Item -LiteralPath $codexPluginBridgeSource
+        Assert-NoSecretFile $codexPluginBridgeFile 'eliot-agent-bridge.exe'
+        [void](Assert-WindowsX64Pe $codexPluginBridgeFile.FullName 'eliot-agent-bridge.exe')
+        $codexPluginBridgeStaged = [ordered]@{
+            package = 'eliot-agent-bridge'
+            binary = 'eliot-agent-bridge'
+            path = 'integrations/codex/plugins/eliot-governor/bin/eliot-agent-bridge.exe'
+            sha256 = (Get-FileHash -LiteralPath $codexPluginBridgeFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            bytes = $codexPluginBridgeFile.Length
+        }
+        $peLinkerVersions = @(@($peLinkerVersions) + @((Get-WindowsPeLinkerVersion $codexPluginBridgeSource 'eliot-agent-bridge.exe')) | Sort-Object -Unique)
     }
     $stageToolchain.linker = [ordered]@{
         policy = 'msvc-link-via-rustc'
@@ -4745,6 +4818,11 @@ try {
         $codexPluginBin = Join-Path $codexPluginRoot 'bin'
         New-Item -ItemType Directory -Path $codexPluginBin -Force | Out-Null
         Copy-Item -LiteralPath $governor -Destination (Join-Path $codexPluginBin 'eliot-governor.exe')
+        # Issue #18 migrated Codex MCP edge: the staged plugin manifest launches the
+        # current-owner bridge, so the verified bridge binary ships beside the retained
+        # governor copy (kept for the unmigrated hook edge). Nothing launched by the
+        # shipped MCP manifest resolves to eliot-governor.exe anymore.
+        Copy-Item -LiteralPath $codexPluginBridgeSource -Destination (Join-Path $codexPluginBin 'eliot-agent-bridge.exe')
     }
     else {
         # Issue #2968 step 10: the retired bundle carries the immutable
@@ -4806,7 +4884,8 @@ try {
     $expectedBridgeBytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { [int64]0 }
     $signingInventory = @(Get-ExpectedSigningInventory `
             $bundle $runtimeManifest $runtimeReceiptSha256 $operatorReceipt $operatorReceiptSha256 `
-            $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes)
+            $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes `
+            ([bool]$codexPluginBridgeStaged) $(if ($codexPluginBridgeStaged) { [string]$codexPluginBridgeStaged.sha256 } else { '' }) $(if ($codexPluginBridgeStaged) { [int64]$codexPluginBridgeStaged.bytes } else { [int64]0 }))
     Assert-ClosedCodeBearingPayload $bundle $signingInventory
     $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $moduleBuildProvenance $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
@@ -4871,6 +4950,14 @@ try {
         operator_protocol_version = $verifiedOperator.protocol_version
         operator_protocol_hash = $verifiedOperator.protocol_hash
         codex_plugin_base_version = $codexPluginBaseVersion
+        codex_plugin_bridge = if ($legacyGovernorPresent) {
+            [ordered]@{
+                path = 'integrations/codex/plugins/eliot-governor/bin/eliot-agent-bridge.exe'
+                build = 'cargo --frozen -p eliot-agent-bridge --bin eliot-agent-bridge'
+                sha256 = [string]$codexPluginBridgeStaged.sha256
+                bytes = [int64]$codexPluginBridgeStaged.bytes
+            }
+        } else { $null }
         runtime_artifacts_manifest = 'runtime/RUNTIME_ARTIFACTS.json'
         runtime_artifact_catalog_path = $surrealCatalog.relative_path
         runtime_artifact_catalog_sha256 = $surrealCatalog.sha256

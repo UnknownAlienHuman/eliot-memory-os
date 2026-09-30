@@ -134,11 +134,11 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     $claudeMcp = Read-PinnedConsumerBytes $RepoRoot $SourceCommit 'integrations/claude/eliot/.mcp.json'
     $claudeMcpJson = Convert-ConsumerJson $claudeMcp.text 'integrations/claude/eliot/.mcp.json'
     $claudeServer = $claudeMcpJson.mcpServers.eliot
-    if ([string]$claudeServer.command -ne '${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe') {
+    if ([string]$claudeServer.command -ne '${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe') {
         throw 'Claude Code MCP server command drifted from the inventoried bytes: integrations/claude/eliot/.mcp.json'
     }
     $claudeArgs = @($claudeServer.args)
-    $claudeExpectedArgs = @('mcp', 'stdio', '--host', 'claude', '--instance', 'default')
+    $claudeExpectedArgs = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '${CLAUDE_PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json')
     if (($claudeArgs -join "`0") -cne ($claudeExpectedArgs -join "`0")) {
         throw 'Claude Code MCP server argv drifted from the inventoried bytes: integrations/claude/eliot/.mcp.json'
     }
@@ -201,11 +201,11 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     $desktop = Read-PinnedConsumerBytes $RepoRoot $SourceCommit 'integrations/claude/claude-desktop/mcpb/manifest.json'
     $desktopJson = Convert-ConsumerJson $desktop.text 'integrations/claude/claude-desktop/mcpb/manifest.json'
     $desktopConfig = $desktopJson.server.mcp_config
-    if ([string]$desktopConfig.command -ne '${__dirname}/server/eliot-governor.exe') {
+    if ([string]$desktopConfig.command -ne '${__dirname}/server/eliot-agent-bridge.exe' -or [string]$desktopJson.server.entry_point -ne 'server/eliot-agent-bridge.exe') {
         throw 'Claude Desktop MCP server command drifted from the inventoried bytes: integrations/claude/claude-desktop/mcpb/manifest.json'
     }
     $desktopArgs = @($desktopConfig.args)
-    $desktopExpectedArgs = @('mcp', 'stdio', '--host', 'claude-desktop', '--instance', 'default')
+    $desktopExpectedArgs = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '${__dirname}/server/agent-bridge/client-declaration-v2.json')
     if (($desktopArgs -join "`0") -cne ($desktopExpectedArgs -join "`0")) {
         throw 'Claude Desktop MCP server argv drifted from the inventoried bytes: integrations/claude/claude-desktop/mcpb/manifest.json'
     }
@@ -279,11 +279,11 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         throw 'staged Codex plugin must expose exactly one MCP server named eliot'
     }
     $codexServer = $codexServers[0].Value
-    if ([string]$codexServer.command -ne 'bin/eliot-governor.exe' -or [string]$codexServer.cwd -ne '.') {
+    if ([string]$codexServer.command -ne 'bin/eliot-agent-bridge.exe' -or [string]$codexServer.cwd -ne '.') {
         throw 'staged Codex MCP server command drifted from the inventoried bytes: integrations/codex/plugins/eliot-governor/.mcp.json'
     }
     $codexArgs = @($codexServer.args)
-    $codexExpectedArgs = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
+    $codexExpectedArgs = @('mcp', '--profile', 'codex_controller', '--transport', 'stdio', '--client-declaration', '${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json')
     if (($codexArgs -join "`0") -cne ($codexExpectedArgs -join "`0")) {
         throw 'staged Codex MCP server argv drifted from the inventoried bytes: integrations/codex/plugins/eliot-governor/.mcp.json'
     }
@@ -301,8 +301,8 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         args = @($codexArgs)
         configured_environment = Get-EnvMember $codexServer
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
-        behavior = 'Unconditionally return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio with no ambient operator flag; the codex_controller profile has no Bridge contour (behavior home is the eliot-mcp track per canon) and is never delegated. No legacy serving path remains.'
-        canonical_route = $null
+        behavior = 'Current-owner route (issue #18 migrated consumer edge): launches bin/eliot-agent-bridge.exe with the codex_controller bridge argv; the profile/scope gate ported from crates/eliot-app/src/mcp_stdio.rs is reached by that argv on the admitted SPINE_FUNCTIONAL contour through the Kernel front door. Installed behavior is owned by bins/eliot-agent-bridge (codex_controller MCP access edge).'
+        canonical_route = 'Codex agent-bridge declaration and Kernel canonical configuration route.'
     }
 
     $codexHooks = Read-StagedConsumerBytes $RepoRoot $SourceCommit $BundleRoot 'plugin/eliot-governor/hooks/hooks.json' 'integrations/codex/plugins/eliot-governor/hooks/hooks.json'
@@ -361,11 +361,12 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
 
     # Cutover-selection assertion (AUD2, unconditional disposition): the
     # cutover travels via in-binary delegation, so no retained launch config
-    # may name the Bridge binary directly and none may select the cutover
+    # may name the Bridge binary directly (issue #18 migrated current-owner MCP
+    # routes name it and are allowlisted by entrypoint above) and none may select the cutover
     # flag (it survives only as refusal evidence and never gates).
     foreach ($consumer in $consumers) {
         foreach ($field in @('command')) {
-            if ([string]$consumer.$field -match 'eliot-agent-bridge\.exe') {
+            if ([string]$consumer.$field -match 'eliot-agent-bridge\.exe' -and [string]$consumer.entrypoint -notmatch '^(Claude Code MCP stdio|Claude Desktop MCP stdio|Codex MCP stdio)') {
                 throw "no retained launch config may name the Bridge binary directly: $($consumer.entrypoint)"
             }
         }
@@ -486,6 +487,11 @@ function Invoke-InstalledEntrypointReadback {
     foreach ($behavior in $behaviors) {
         $name = [string]$behavior.entrypoint
         if ($Only.Count -ne 0 -and -not ($Only -contains $name)) {
+            continue
+        }
+        if ($name -match '^(Claude Code MCP stdio|Claude Desktop MCP stdio|Codex MCP stdio)') {
+            $record.detail = 'current-owner route (issue #18 migrated consumer edge): installed behavior is verified by the owning track (#11 Product Pulse), not by the legacy cutover-code readback; the staged launch binding above names bins/eliot-agent-bridge.'
+            $results += $record
             continue
         }
         $launch = $behavior.launch_configuration
