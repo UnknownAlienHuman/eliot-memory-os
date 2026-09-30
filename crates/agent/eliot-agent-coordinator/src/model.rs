@@ -1699,10 +1699,26 @@ pub struct WorkClassSelectionReport {
 /// a live writer.
 ///
 /// This is published state for the caller, not a gate: the one-writer property
-/// is enforced at the owning transitions (`admit` and `reassign`) on the
-/// Work/Action lease identity, so a second concurrent holder of one scope is
-/// rejected there. `plan` does **not** enforce it — it takes no scope holder
-/// decision and admits nothing — so a claim is never a statement about a plan.
+/// is enforced at the owning transitions (`admit` and `reassign`), which
+/// refuse a second concurrent holder of one scope, so a concurrent second
+/// holder is rejected there. `plan` does **not** enforce it — it takes no scope
+/// holder decision and admits nothing — so a claim is never a statement about
+/// a plan.
+///
+/// The partition this enforces is keyed by the `mutation_scope` string, so it
+/// is exact-equality exclusion over that string and not alias resolution: two
+/// spellings of one deliverable (a relative and an absolute path, a symlinked
+/// and a direct path, two cases of the same path) are two keys and therefore
+/// two holders. Issue #1683 W4 requires that "aliased/overlapping claims
+/// resolve through the established owner", and the established owner for
+/// deliverable identity is the canonical ordering scope, not a raw path string.
+/// Resolving the alias here would need a scope-canonicalisation identity this
+/// crate does not hold — its dependency closure contains no scope owner, and
+/// `eliot_workscope` is outside it — so the alias/overlap half of W4 is
+/// BLOCKED-BY on that owner rather than approximated with a second scheme
+/// here. What is enforced today is one writer per exact `mutation_scope`
+/// string, and this claim reports exactly that.
+///
 /// What this record answers is which attempt holds the deliverable, under which
 /// lease, and in what state, which is what tells a caller why the scope is not
 /// available. There is deliberately no count of waiting items: a second holder
