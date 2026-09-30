@@ -3293,13 +3293,17 @@ impl DaemonComposition {
     /// Readiness gates the construction exactly like
     /// [`Self::agent_fabric_descriptor`].
     ///
-    /// The ports returned here feed only the verifier-gated production path
-    /// [`Self::agent_fabric_new_verified_async`]: that sole production
-    /// consumer resolves the session halves over the live authenticated
-    /// session and verifies the binding through the Kernel
-    /// provider-admission verifier before any admitted capability is built,
-    /// so production ports never reach an effect without owner verification
-    /// (issue #1108 W1/W2).
+    /// The ports returned here feed only the verifier-gated production path:
+    /// the construct path through
+    /// [`Self::agent_fabric_new_verified_async`] (production caller
+    /// `solo_agent_driver::drive_solo_delegate_verified_async`) and the
+    /// restore path through
+    /// [`Self::agent_fabric_restore_verified_async`] (production caller
+    /// `solo_agent_driver::restore_solo_fabric_async`). Both consumers
+    /// resolve the session halves over the live authenticated session and
+    /// verify the binding through the Kernel provider-admission verifier
+    /// before any admitted capability is built, so production ports never
+    /// reach an effect without owner verification (issue #1108 W1/W2).
     ///
     /// # Errors
     ///
@@ -3392,6 +3396,10 @@ impl DaemonComposition {
     /// capability verified through the Kernel admission verifier (issue #1108
     /// W5/W2, production caller for A1).
     ///
+    /// Production caller is
+    /// `solo_agent_driver::drive_solo_delegate_verified_async`, reached from
+    /// the runtime queue poll via `solo_poll_queue_async`.
+    ///
     /// Sole production counterpart of the test-only
     /// `agent_fabric_new_verified`: readiness plus the exact live
     /// fence and the validated session binding gate the resolution, and
@@ -3443,6 +3451,10 @@ impl DaemonComposition {
 
     /// Restores the production fabric on freshly verified owner material in
     /// one call (issue #1108 A6/W2, verified restore for A8).
+    ///
+    /// Production caller is `solo_agent_driver::restore_solo_fabric_async`,
+    /// reached from the async fair-pull recovery poll
+    /// (`solo_fair_pull_recovery`).
     ///
     /// Sole production counterpart of the test-only
     /// `agent_fabric_restore_verified`: the session halves are
