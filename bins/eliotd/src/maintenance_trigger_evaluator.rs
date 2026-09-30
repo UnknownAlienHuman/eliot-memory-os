@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
@@ -44,9 +45,11 @@ use eliot_maintenance::{
     maintenance_observation_record,
 };
 use eliot_protocol::{
+    MAINTENANCE_TRIGGER_ACK_WIRE_ID, MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
-    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MaintenanceTriggerClaim,
-    MaintenanceTriggerDecisionReceipt, MaintenanceTriggerRecord, ProtocolError,
+    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MaintenanceTriggerAck, MaintenanceTriggerClaim,
+    MaintenanceTriggerDecisionReceipt, MaintenanceTriggerGapKind,
+    MaintenanceTriggerPendingSummary, MaintenanceTriggerRecord, ProtocolError,
 };
 use eliot_store_api::{StoreError, WriteReceiptStatus};
 use thiserror::Error;
@@ -904,6 +907,376 @@ impl DaemonComposition {
         };
         decision_receipt.validate()?;
         Ok(Some(decision_receipt))
+    }
+}
+
+/// Finite claim lease requested for one retained-trigger delivery attempt.
+///
+/// Five minutes: finite and well inside the Kernel ledger's own fifteen-minute
+/// claim bound, leaving the daemon room to resolve policy, evaluate, and
+/// commit one decision while letting a replacement generation reclaim the
+/// trigger promptly after daemon loss. Timeout permits owner-mediated
+/// redelivery under the same trigger identity, never a new trigger ID.
+const MAINTENANCE_TRIGGER_CLAIM_LEASE_MS: u64 = 5 * 60 * 1_000;
+
+/// Terminal outcome of driving one retained maintenance trigger to its next
+/// durable state (issue #1694 W3/W5/W7).
+///
+/// Every variant carries the stable trigger identity it settled; none carries
+/// a receipt, a claim, or payload content. `Acknowledged` closed the full
+/// claim→evaluate→commit→record→ack path under one finite claim.
+/// `AmbiguousMarked` left the row visibly reconciling after a lost commit-side
+/// response. `OpenForReconciliation` admitted no intent, so the row stays
+/// claimed for owner-mediated redelivery or timeout release.
+/// `ExpiredRecorded` terminally expired a past-window trigger with its
+/// identity and evidence preserved. Rows that already committed complete by
+/// their existing receipt inside the reclaim walk, with each validated echo
+/// checked before continuing; they carry no separate outcome because the
+/// ledger acknowledgement itself is the evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaintenanceTriggerDriveOutcome {
+    /// The decision committed and the exact receipt was acknowledged.
+    Acknowledged {
+        /// Stable trigger identity that completed delivery.
+        trigger_id: String,
+    },
+    /// A lost commit-side response left the row visibly reconciling.
+    AmbiguousMarked {
+        /// Stable trigger identity awaiting receipt reconciliation.
+        trigger_id: String,
+    },
+    /// No intent was admitted; the row stays open, never dropped.
+    OpenForReconciliation {
+        /// Stable trigger identity left open under its claim.
+        trigger_id: String,
+    },
+    /// Past-window eligibility terminally expired, evidence preserved.
+    ExpiredRecorded {
+        /// Stable trigger identity that received its terminal disposition.
+        trigger_id: String,
+    },
+}
+
+impl DaemonComposition {
+    /// Drives one retained trigger through claim, evaluation, commit, record,
+    /// and acknowledgement under a single finite claim (issue #1694 W3/W5).
+    ///
+    /// The claim binds the live admitted fence, this daemon's retained owner
+    /// session, the row revision, and a fresh delivery identity; the replayed
+    /// record is re-presented to the Governor-owned evaluator through
+    /// [`Self::commit_maintenance_trigger_decision`], whose bound receipt is
+    /// then recorded and acknowledged through the Kernel ledger. A past-window
+    /// record expires instead of executing. A lost record/ack-side response
+    /// after a bound receipt marks the row reconciling rather than repeating
+    /// the downstream effect; receipt absence with no bound receipt leaves
+    /// the row open for redelivery instead of reporting either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] keeping each owner's typed
+    /// refusal: not ready or unbound session, stale fence or claim, unknown
+    /// or conflicting trigger, evaluation denial, or a refused transport
+    /// exchange. Every refusal leaves the trigger retained; nothing is
+    /// dropped and no receipt is fabricated.
+    pub async fn drive_retained_maintenance_trigger(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        observation: MaintenanceObservation,
+        record: &MaintenanceTriggerRecord,
+    ) -> Result<MaintenanceTriggerDriveOutcome, MaintenanceDecisionCommitError> {
+        let owner_session = self.owner_session.as_ref().ok_or_else(|| {
+            MaintenanceDecisionCommitError::Daemon(DaemonError::Lifecycle(
+                "owner session is not bound; drop and re-run authenticated connect+start".to_owned(),
+            ))
+        })?;
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(MaintenanceDecisionCommitError::Admission(
+                CompositionError::NotReady,
+            ));
+        }
+        record.validate()?;
+        let live_fence = self.governor.kernel_snapshot().state_fence().clone();
+        let now = crate::unix_ms();
+        if record.validate_at(now).is_err() {
+            return self
+                .expire_retained_trigger(kernel, record, &live_fence, now)
+                .await;
+        }
+        let daemon_session = owner_session.session_binding().to_owned();
+        let delivery_id = format!(
+            "{}:delivery:{}:{now}",
+            crate::SERVICE_NAME,
+            record.trigger_id
+        );
+        let claim = kernel.claim_maintenance_trigger(
+            &live_fence,
+            &record.trigger_id,
+            &live_fence,
+            &daemon_session,
+            &delivery_id,
+            now.saturating_add(MAINTENANCE_TRIGGER_CLAIM_LEASE_MS),
+            &live_fence,
+            now,
+        )?;
+        claim.authorize_for(record, &live_fence, now)?;
+        let Some(receipt) = self
+            .commit_maintenance_trigger_decision(kernel, observation, record, &claim)
+            .await?
+        else {
+            return Ok(MaintenanceTriggerDriveOutcome::OpenForReconciliation {
+                trigger_id: record.trigger_id.clone(),
+            });
+        };
+        match self
+            .record_and_acknowledge(kernel, record, &claim, &receipt, &live_fence)
+            .await
+        {
+            Ok(()) => Ok(MaintenanceTriggerDriveOutcome::Acknowledged {
+                trigger_id: record.trigger_id.clone(),
+            }),
+            Err(_) => {
+                let _revision = kernel.mark_maintenance_trigger_ambiguous(
+                    &live_fence,
+                    &record.trigger_id,
+                    crate::unix_ms(),
+                )?;
+                Ok(MaintenanceTriggerDriveOutcome::AmbiguousMarked {
+                    trigger_id: record.trigger_id.clone(),
+                })
+            }
+        }
+    }
+
+    /// Reclaims the bounded retained-trigger set after an evaluator outage
+    /// (issue #1694 W3/W5/W7).
+    ///
+    /// Walks the Kernel ledger's bounded pages from the start cursor through
+    /// each stable continuation — a repeated continuation fails closed
+    /// instead of looping — replays every listed member, expires past-window
+    /// records with their evidence preserved, completes rows that already
+    /// committed by their existing receipt without re-evaluating, and returns
+    /// the still-eligible records for the owning trigger sites to drive with
+    /// their real observations. A member whose replay fails and whose receipt
+    /// recovery also fails stops the walk with the recovery error: the Kernel
+    /// cursor never advances on a failure, so the next run resumes honestly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] on the first refusal that
+    /// cannot be settled per-row. One damaged row never aborts silently: an
+    /// identity-mismatched replay is recorded as a visible `CorruptPayload`
+    /// gap and skipped, while an unrecoverable member fails the walk.
+    pub async fn reclaim_pending_maintenance_triggers(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+    ) -> Result<Vec<MaintenanceTriggerRecord>, MaintenanceDecisionCommitError> {
+        let owner_session = self.owner_session.as_ref().ok_or_else(|| {
+            MaintenanceDecisionCommitError::Daemon(DaemonError::Lifecycle(
+                "owner session is not bound; drop and re-run authenticated connect+start".to_owned(),
+            ))
+        })?;
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(MaintenanceDecisionCommitError::Admission(
+                CompositionError::NotReady,
+            ));
+        }
+        let live_fence = self.governor.kernel_snapshot().state_fence().clone();
+        let daemon_session = owner_session.session_binding().to_owned();
+        let mut eligible = Vec::new();
+        let mut continuation: Option<String> = None;
+        let mut seen_continuations = BTreeSet::new();
+        loop {
+            let now = crate::unix_ms();
+            let page = kernel.pending_maintenance_trigger_page(
+                &live_fence,
+                continuation.as_deref(),
+                now,
+            )?;
+            for member in &page.members {
+                let record =
+                    match kernel.replay_maintenance_trigger(&live_fence, &member.trigger_id) {
+                        Ok(record) => record,
+                        Err(_) => {
+                            self.reuse_committed_receipt(
+                                kernel,
+                                member,
+                                &daemon_session,
+                                &live_fence,
+                                now,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+                if record.trigger_id != member.trigger_id
+                    || record.operation_hash != member.operation_hash
+                {
+                    let _gap = kernel.record_maintenance_trigger_gap(
+                        &live_fence,
+                        &member.trigger_id,
+                        MaintenanceTriggerGapKind::CorruptPayload,
+                        "replayed record identity differs from its page member",
+                        crate::unix_ms(),
+                    )?;
+                    continue;
+                }
+                if record.validate_at(crate::unix_ms()).is_err() {
+                    self.expire_retained_trigger(kernel, &record, &live_fence, crate::unix_ms())
+                        .await?;
+                    continue;
+                }
+                eligible.push(record);
+            }
+            if !page.has_more {
+                break;
+            }
+            let next = page.continuation.clone().ok_or(
+                MaintenanceDecisionCommitError::Protocol(ProtocolError::InvalidField {
+                    field: "maintenance_trigger_page.continuation",
+                    reason: "a further page must carry its resume cursor",
+                }),
+            )?;
+            if !seen_continuations.insert(next.clone()) {
+                return Err(MaintenanceDecisionCommitError::Protocol(
+                    ProtocolError::InvalidField {
+                        field: "maintenance_trigger_page.continuation",
+                        reason: "pending page continuation did not advance",
+                    },
+                ));
+            }
+            continuation = Some(next);
+        }
+        Ok(eligible)
+    }
+
+    /// Records one bound decision receipt and acknowledges it under the live
+    /// claim, without another job, recommendation, or wake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] when the record or the ack
+    /// exchange is refused. The caller marks the row reconciling on this
+    /// path: the receipt is already bound, so the effect must not repeat.
+    async fn record_and_acknowledge(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        record: &MaintenanceTriggerRecord,
+        claim: &MaintenanceTriggerClaim,
+        receipt: &MaintenanceTriggerDecisionReceipt,
+        live_fence: &eliot_contracts::StateFence,
+    ) -> Result<(), MaintenanceDecisionCommitError> {
+        let recorded =
+            kernel.record_maintenance_trigger_decision(live_fence, &record.trigger_id, receipt)?;
+        let now = crate::unix_ms();
+        let ack = MaintenanceTriggerAck {
+            wire_id: MAINTENANCE_TRIGGER_ACK_WIRE_ID.to_owned(),
+            wire_version: MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,
+            trigger_id: record.trigger_id.clone(),
+            delivery_id: claim.delivery_id.clone(),
+            daemon_fence: claim.daemon_fence.clone(),
+            daemon_session: claim.daemon_session.clone(),
+            decision_receipt: recorded,
+        };
+        ack.validate_for_claim(claim, record, live_fence, now)?;
+        kernel.acknowledge_maintenance_trigger(live_fence, live_fence, &ack, now)?;
+        Ok(())
+    }
+
+    /// Completes one already-committed row by its existing receipt (issue
+    /// #1694 W5).
+    ///
+    /// Claims under a fresh delivery identity, checks the recovered receipt
+    /// against the listed page member (identity, operation hash, revision),
+    /// reuses it through an idempotent record, and acknowledges — never
+    /// re-evaluating and never repeating the downstream effect. Called when
+    /// a member's replay is refused because its decision already committed.
+    /// The full ack-against-claim-and-record proof runs on the Kernel owner,
+    /// which holds the retained record; this side validates the closed ack
+    /// shape before sending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] when the row holds no
+    /// committed receipt, the receipt answers a different member, or any
+    /// exchange is refused. Every failure leaves the row retained for the
+    /// next run.
+    async fn reuse_committed_receipt(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        member: &MaintenanceTriggerPendingSummary,
+        daemon_session: &str,
+        live_fence: &eliot_contracts::StateFence,
+        now: u64,
+    ) -> Result<(), MaintenanceDecisionCommitError> {
+        let receipt =
+            kernel.recover_maintenance_trigger_commit(live_fence, &member.trigger_id)?;
+        if receipt.operation_hash != member.operation_hash || receipt.revision != member.revision
+        {
+            return Err(MaintenanceDecisionCommitError::Protocol(
+                ProtocolError::ReplayConflict,
+            ));
+        }
+        let delivery_id = format!(
+            "{}:delivery:{}:{now}",
+            crate::SERVICE_NAME,
+            member.trigger_id
+        );
+        let claim = kernel.claim_maintenance_trigger(
+            live_fence,
+            &member.trigger_id,
+            live_fence,
+            daemon_session,
+            &delivery_id,
+            now.saturating_add(MAINTENANCE_TRIGGER_CLAIM_LEASE_MS),
+            live_fence,
+            now,
+        )?;
+        let recorded = kernel.record_maintenance_trigger_decision(
+            live_fence,
+            &member.trigger_id,
+            &receipt,
+        )?;
+        let ack = MaintenanceTriggerAck {
+            wire_id: MAINTENANCE_TRIGGER_ACK_WIRE_ID.to_owned(),
+            wire_version: MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,
+            trigger_id: member.trigger_id.clone(),
+            delivery_id: claim.delivery_id.clone(),
+            daemon_fence: claim.daemon_fence.clone(),
+            daemon_session: claim.daemon_session.clone(),
+            decision_receipt: recorded,
+        };
+        ack.validate()?;
+        kernel.acknowledge_maintenance_trigger(live_fence, live_fence, &ack, crate::unix_ms())?;
+        Ok(())
+    }
+
+    /// Records terminal expiry for one past-window retained trigger (issue
+    /// #1694 W7).
+    ///
+    /// Expired eligibility blocks stale execution but never deletes the row,
+    /// its record, or its evidence locators: the echoed disposition is
+    /// validated before reporting the outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] when the expiry exchange
+    /// is refused. The trigger stays retained for the next run.
+    async fn expire_retained_trigger(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        record: &MaintenanceTriggerRecord,
+        live_fence: &eliot_contracts::StateFence,
+        now: u64,
+    ) -> Result<MaintenanceTriggerDriveOutcome, MaintenanceDecisionCommitError> {
+        let _disposition = kernel.expire_maintenance_trigger(
+            live_fence,
+            &record.trigger_id,
+            "applicability window elapsed before redelivery",
+            now,
+        )?;
+        Ok(MaintenanceTriggerDriveOutcome::ExpiredRecorded {
+            trigger_id: record.trigger_id.clone(),
+        })
     }
 }
 

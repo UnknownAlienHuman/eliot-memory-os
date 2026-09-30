@@ -28,7 +28,12 @@ use eliot_governor::{
     KernelRecoveryPort,
 };
 use eliot_maintenance::MaintenanceJob;
-use eliot_protocol::RequestIdentity;
+use eliot_protocol::{
+    MaintenanceTriggerAck, MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt,
+    MaintenanceTriggerGap, MaintenanceTriggerGapKind, MaintenanceTriggerPage,
+    MaintenanceTriggerRecord, MaintenanceTriggerTerminalDisposition, MaintenanceTriggerTerminalKind,
+    RequestIdentity,
+};
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
     CONTRACT_VERSION, RecoveryRecord, RecoveryRecordKey, ScopeRevisionView, StoreGenesisRequest,
@@ -345,4 +350,411 @@ impl DaemonKernelClient {
         }
         Ok(snapshot)
     }
+
+    /// Issues one finite fenced claim for a retained maintenance trigger
+    /// (issue #1694 W3).
+    ///
+    /// The request mirrors the Kernel ledger's closed claim-issuance fields;
+    /// the Kernel dispatch serving [`MAINTENANCE_TRIGGER_CLAIM_OPERATION`]
+    /// binds the live session and issues the generation/session/revision
+    /// bound claim (STITCH: dispatch owner). The returned claim is validated
+    /// and must answer this trigger under this delivery identity: an exact
+    /// retry returns the live claim, a competing claim is refused by the
+    /// owner rather than returned here.
+    pub(crate) fn claim_maintenance_trigger(
+        &self,
+        state_fence: &StateFence,
+        trigger_id: &str,
+        daemon_fence: &StateFence,
+        daemon_session: &str,
+        delivery_id: &str,
+        claim_deadline_unix_ms: u64,
+        current_fence: &StateFence,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerClaim, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_claim").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger claim fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_CLAIM_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "trigger_id": trigger_id,
+                "daemon_fence": daemon_fence,
+                "daemon_session": daemon_session,
+                "delivery_id": delivery_id,
+                "claim_deadline_unix_ms": claim_deadline_unix_ms,
+                "current_fence": current_fence,
+                "now_unix_ms": now_unix_ms,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_CLAIM_OPERATION)?;
+        let claim: MaintenanceTriggerClaim = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        claim
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if claim.trigger_id != trigger_id || claim.delivery_id != delivery_id {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger claim answers a different trigger or delivery"
+                    .to_owned(),
+            ));
+        }
+        Ok(claim)
+    }
+
+    /// Reads one bounded pending-trigger page with stable continuation
+    /// (issue #1694 W3).
+    ///
+    /// A reconnect resumes from its cursor; an empty gapless page is refused
+    /// by validation rather than read as a certified-complete set.
+    pub(crate) fn pending_maintenance_trigger_page(
+        &self,
+        state_fence: &StateFence,
+        continuation: Option<&str>,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerPage, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_page").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger page fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_PAGE_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "continuation": continuation,
+                "now_unix_ms": now_unix_ms,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_PAGE_OPERATION)?;
+        let page: MaintenanceTriggerPage = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        page.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        Ok(page)
+    }
+
+    /// Replays one retained trigger after a pre-commit crash (issue #1694 W5).
+    ///
+    /// Returns the exact retained record; the caller re-presents it to the
+    /// evaluator under the same identity instead of minting a new trigger. A
+    /// committed row replays by receipt through
+    /// [`Self::recover_maintenance_trigger_commit`], never here.
+    pub(crate) fn replay_maintenance_trigger(
+        &self,
+        state_fence: &StateFence,
+        trigger_id: &str,
+    ) -> Result<MaintenanceTriggerRecord, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_replay").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger replay fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_REPLAY_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "trigger_id": trigger_id,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_REPLAY_OPERATION)?;
+        let record: MaintenanceTriggerRecord = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        record
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if record.trigger_id != trigger_id {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger replay answers a different trigger".to_owned(),
+            ));
+        }
+        Ok(record)
+    }
+
+    /// Reuses one committed decision receipt after a post-commit crash
+    /// (issue #1694 W5).
+    ///
+    /// The caller acknowledges this exact receipt without another job,
+    /// recommendation, or wake. Receipt absence is not proof of non-commit:
+    /// the owner reports the absence and the row stays open.
+    pub(crate) fn recover_maintenance_trigger_commit(
+        &self,
+        state_fence: &StateFence,
+        trigger_id: &str,
+    ) -> Result<MaintenanceTriggerDecisionReceipt, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_recover").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger recover fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_RECOVER_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "trigger_id": trigger_id,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_RECOVER_OPERATION)?;
+        let receipt: MaintenanceTriggerDecisionReceipt = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        receipt
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if receipt.trigger_id != trigger_id {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger recovery answers a different trigger".to_owned(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// Records one committed decision receipt into the Kernel delivery ledger
+    /// (issue #1694 W4/W5).
+    ///
+    /// The owner re-reads the exact canonical Store receipt, requires
+    /// `Committed` status, and re-proves the bound digest before recording;
+    /// the echoed receipt must equal the presented one byte for byte, which
+    /// makes a same-receipt retry an idempotent reuse rather than a competing
+    /// decision.
+    pub(crate) fn record_maintenance_trigger_decision(
+        &self,
+        state_fence: &StateFence,
+        trigger_id: &str,
+        receipt: &MaintenanceTriggerDecisionReceipt,
+    ) -> Result<MaintenanceTriggerDecisionReceipt, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_record").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger record fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        receipt
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_RECORD_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "trigger_id": trigger_id,
+                "receipt": receipt,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_RECORD_OPERATION)?;
+        let echoed: MaintenanceTriggerDecisionReceipt = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        echoed
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if echoed != *receipt {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger record echo differs from the presented receipt"
+                    .to_owned(),
+            ));
+        }
+        Ok(echoed)
+    }
+
+    /// Acknowledges one delivery against its exact committed decision receipt
+    /// (issue #1694 W5).
+    ///
+    /// The ack echoes the live claim exactly and embeds the committed receipt
+    /// byte for byte; the echoed ack must equal the presented one. A stale
+    /// consumer cannot ack after revocation: the owner refuses it rather
+    /// than returning a mismatched echo.
+    pub(crate) fn acknowledge_maintenance_trigger(
+        &self,
+        state_fence: &StateFence,
+        current_fence: &StateFence,
+        ack: &MaintenanceTriggerAck,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerAck, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_acknowledge").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger acknowledge fence does not match the admitted snapshot"
+                    .to_owned(),
+            ));
+        }
+        ack.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "current_fence": current_fence,
+                "ack": ack,
+                "now_unix_ms": now_unix_ms,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION)?;
+        let echoed: MaintenanceTriggerAck = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        echoed
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if echoed != *ack {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger ack echo differs from the presented ack".to_owned(),
+            ));
+        }
+        Ok(echoed)
+    }
+
+    /// Marks one lost or ambiguous commit as reconciling (issue #1694 W5).
+    ///
+    /// The owner keeps the trigger open with an `AmbiguousCommit` gap record;
+    /// receipt absence during an outage is not proof of non-commit. The reply
+    /// echoes the affected trigger identity and its post-transition revision
+    /// so the caller can prove which row moved.
+    pub(crate) fn mark_maintenance_trigger_ambiguous(
+        &self,
+        state_fence: &StateFence,
+        trigger_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<u64, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_ambiguous").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger ambiguous fence does not match the admitted snapshot"
+                    .to_owned(),
+            ));
+        }
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "trigger_id": trigger_id,
+                "now_unix_ms": now_unix_ms,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION)?;
+        let revision = value
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|revision| *revision != 0)
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel maintenance trigger ambiguous reply carries no post-transition revision"
+                        .to_owned(),
+                )
+            })?;
+        if value.get("trigger_id").and_then(serde_json::Value::as_str) != Some(trigger_id) {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger ambiguous reply answers a different trigger".to_owned(),
+            ));
+        }
+        Ok(revision)
+    }
+
+    /// Records one visible recovery gap for trigger damage (issue #1694 W7).
+    ///
+    /// Missing keys, corrupt payloads, inaccessible sources, and incomplete
+    /// enumeration produce this record — never a plaintext fallback and never
+    /// silent deletion. The echoed gap must name this trigger under the
+    /// presented kind.
+    pub(crate) fn record_maintenance_trigger_gap(
+        &self,
+        state_fence: &StateFence,
+        trigger_id: &str,
+        kind: MaintenanceTriggerGapKind,
+        detail: &str,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerGap, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_gap").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger gap fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_GAP_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "trigger_id": trigger_id,
+                "kind": kind,
+                "detail": detail,
+                "now_unix_ms": now_unix_ms,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_GAP_OPERATION)?;
+        let gap: MaintenanceTriggerGap = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        gap.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if gap.trigger_id.as_deref() != Some(trigger_id) || gap.kind != kind {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger gap answers a different trigger or kind".to_owned(),
+            ));
+        }
+        Ok(gap)
+    }
+
+    /// Records terminal expiry for a past-window trigger (issue #1694 W7).
+    ///
+    /// Expired eligibility blocks stale execution but never deletes the row,
+    /// its record, or its evidence locators. The echoed disposition must name
+    /// this trigger with the expiry class and no successor.
+    pub(crate) fn expire_maintenance_trigger(
+        &self,
+        state_fence: &StateFence,
+        trigger_id: &str,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerTerminalDisposition, KernelPortError> {
+        let _span = tracing::info_span!("eliotd.maintenance_trigger_expire").entered();
+        if *state_fence != self.snapshot.state_fence() {
+            return Err(KernelPortError::Contract(
+                "maintenance trigger expire fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self.request_blocking(
+            MAINTENANCE_TRIGGER_EXPIRE_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "trigger_id": trigger_id,
+                "reason": reason,
+                "now_unix_ms": now_unix_ms,
+            }),
+        )?;
+        let value = kind_value(&value, MAINTENANCE_TRIGGER_EXPIRE_OPERATION)?;
+        let disposition: MaintenanceTriggerTerminalDisposition = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        disposition
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if disposition.trigger_id != trigger_id
+            || disposition.kind != MaintenanceTriggerTerminalKind::Expired
+        {
+            return Err(KernelPortError::Contract(
+                "Kernel maintenance trigger expiry answers a different trigger or class".to_owned(),
+            ));
+        }
+        Ok(disposition)
+    }
+}
+
+/// Authenticated daemon-to-Kernel operation names for the retained
+/// maintenance-trigger delivery protocol (issue #1694).
+///
+/// The Kernel dispatch serving each name binds the live session, runs the
+/// matching Kernel delivery-gateway entry, and replies with
+/// `{ "kind": <name>, "value": <typed echo> }` through the existing typed
+/// application envelope. Names are fixed wire text shared with that
+/// dispatch (STITCH: dispatch owner implements the server half).
+pub(crate) const MAINTENANCE_TRIGGER_CLAIM_OPERATION: &str = "maintenance_trigger_claim";
+pub(crate) const MAINTENANCE_TRIGGER_PAGE_OPERATION: &str = "maintenance_trigger_pending_page";
+pub(crate) const MAINTENANCE_TRIGGER_REPLAY_OPERATION: &str = "maintenance_trigger_replay";
+pub(crate) const MAINTENANCE_TRIGGER_RECOVER_OPERATION: &str = "maintenance_trigger_recover_commit";
+pub(crate) const MAINTENANCE_TRIGGER_RECORD_OPERATION: &str = "maintenance_trigger_record_decision";
+pub(crate) const MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION: &str = "maintenance_trigger_acknowledge";
+pub(crate) const MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION: &str = "maintenance_trigger_mark_ambiguous";
+pub(crate) const MAINTENANCE_TRIGGER_GAP_OPERATION: &str = "maintenance_trigger_record_gap";
+pub(crate) const MAINTENANCE_TRIGGER_EXPIRE_OPERATION: &str = "maintenance_trigger_expire";
 }

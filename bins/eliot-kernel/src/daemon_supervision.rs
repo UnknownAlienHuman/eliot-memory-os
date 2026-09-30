@@ -7,6 +7,10 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
+use eliot_protocol::{
+    MAINTENANCE_TRIGGER_REVOCATION_WIRE_ID, MAINTENANCE_TRIGGER_REVOCATION_WIRE_VERSION,
+    MaintenanceTriggerRevocation, ProtocolError,
+};
 #[cfg(windows)]
 use eliot_kernel_service::KernelServiceState;
 use eliot_kernel_service::{KernelActivationReceipt, KernelServiceError};
@@ -287,6 +291,70 @@ pub(crate) const fn daemon_restart_refusal_reason(refusal: &DaemonRestartRefusal
         DaemonRestartRefusal::PolicyRejected => "restart_policy_rejected_by_contract",
         DaemonRestartRefusal::ClassWithholds(reason) => reason,
     }
+}
+
+// ============================================================================
+// Retained maintenance-trigger consumer authority on daemon loss (I14.22,
+// I14.24, issue #1694 W6).
+//
+// Pending trigger claims survive daemon loss; the Kernel owner revokes the
+// old consumer fence so a replacement generation can reclaim the same
+// triggers without competing with a stale consumer, then surfaces the
+// mirror-gated bounded pending set before reconciliation may complete.
+// Ordinary pending debt acquires no runtime lease here and blocks no
+// unrelated work. This module owns only the supervision half of that
+// decision — whether an observed loss ends consumer authority, and the exact
+// revoked identity — while enforcement stays with the Kernel delivery owner.
+// The runtime composition calls that submit the predicate's answer and the
+// built revocation through the gateway live with the daemon loss branch
+// (STITCH: `daemon_runtime` invokes both there and surfaces the replacement
+// pending set only after the required mirror recovery).
+
+/// Returns whether an observed daemon-generation loss ends its retained
+/// maintenance-trigger consumer authority.
+///
+/// A failed generation is gone: its claims must be retained and its consumer
+/// fence revoked so the replacement reclaims under the same identities. A
+/// recovery-fenced generation is fenced for recovery: nothing new may be
+/// admitted under its authority, including trigger delivery. Any other
+/// status is still a supervised generation whose authority stands.
+#[must_use]
+pub(crate) fn daemon_loss_revokes_trigger_consumer(state: &DaemonRuntimeState) -> bool {
+    state.recovery_fenced || matches!(state.status, DaemonRuntimeStatus::Failed(_))
+}
+
+/// Builds the exact consumer-authority revocation for one lost daemon
+/// generation/session.
+///
+/// The lost fence and session come from the supervision record of the
+/// generation being replaced, never from a request DTO; the revoking owner
+/// is the Kernel principal issuing the revocation. The closed revocation
+/// shape is validated before return, so a blank session, owner, or reason —
+/// or a zero revocation time — fails here instead of entering the ledger as
+/// a guessed revocation.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError`] when the revocation does not form a closed
+/// wire value.
+pub(crate) fn trigger_consumer_revocation_for_loss(
+    daemon_fence: &StateFence,
+    daemon_session: &str,
+    revoking_owner: &str,
+    reason: &str,
+    revoked_at_unix_ms: u64,
+) -> Result<MaintenanceTriggerRevocation, ProtocolError> {
+    let revocation = MaintenanceTriggerRevocation {
+        wire_id: MAINTENANCE_TRIGGER_REVOCATION_WIRE_ID.to_owned(),
+        wire_version: MAINTENANCE_TRIGGER_REVOCATION_WIRE_VERSION,
+        daemon_fence: daemon_fence.clone(),
+        daemon_session: daemon_session.to_owned(),
+        revoking_owner: revoking_owner.to_owned(),
+        reason: reason.to_owned(),
+        revoked_at_unix_ms,
+    };
+    revocation.validate()?;
+    Ok(revocation)
 }
 
 pub(crate) struct DaemonRuntimeState {

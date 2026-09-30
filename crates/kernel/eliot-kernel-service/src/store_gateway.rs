@@ -1710,6 +1710,37 @@ impl KernelStoreGateway {
             .map_err(MaintenanceTriggerDeliveryError::Service)
     }
 
+    /// Persists the ledger's durable snapshot to the composition-bound ORS
+    /// delivery table after one ledger transition (issue #1694).
+    ///
+    /// Guard-free by construction: callers compute their snapshot under the
+    /// service/ledger guards, drop them, then persist here, so no guard is
+    /// ever held across ORS IO. A persist failure fails the transition
+    /// closed: the in-memory ledger keeps the row and the next transition
+    /// re-persists the full snapshot, but the caller is told the durable
+    /// image is behind instead of being handed a success. Unresolved rows
+    /// are never expired or dropped here; removal stays with the ledger
+    /// owner's ack/terminal compaction path.
+    fn persist_maintenance_trigger_snapshot(
+        &self,
+        rows: &[MaintenanceTriggerDeliveryRow],
+    ) -> Result<(), MaintenanceTriggerDeliveryError> {
+        let ors = self.commit_ors.as_deref().ok_or_else(|| {
+            MaintenanceTriggerDeliveryError::StagingProof(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_delivery",
+                reason:
+                    "maintenance trigger delivery snapshot requires the composition-bound ORS"
+                        .to_owned(),
+            })
+        })?;
+        for row in rows {
+            let row_json = serde_json::to_string(row)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            ors.persist_maintenance_trigger_delivery_snapshot(&row.record.trigger_id, &row_json)?;
+        }
+        Ok(())
+    }
+
     /// Admits one retained maintenance trigger into the owned delivery ledger
     /// (issue #1694).
     ///
@@ -1745,13 +1776,17 @@ impl KernelStoreGateway {
             &record.payload.payload_hash,
         )
         .map_err(MaintenanceTriggerDeliveryError::StagingProof)?;
-        let service = self.lock_maintenance_service()?;
-        session
-            .service_context(&service)
-            .map_err(MaintenanceTriggerDeliveryError::Service)?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        let receipt = ledger.admit_intake(record)?;
-        Ok((receipt, ledger.durable_rows()))
+        let (receipt, rows) = {
+            let service = self.lock_maintenance_service()?;
+            session
+                .service_context(&service)
+                .map_err(MaintenanceTriggerDeliveryError::Service)?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            let receipt = ledger.admit_intake(record)?;
+            (receipt, ledger.durable_rows())
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok((receipt, rows))
     }
 
     /// Issues one finite fenced claim from the owned delivery ledger (issue
@@ -1770,10 +1805,15 @@ impl KernelStoreGateway {
         MaintenanceTriggerDeliveryError,
     > {
         let session = self.bind_maintenance_session(principal_ref)?;
-        let service = self.lock_maintenance_service()?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        let claim = handle_maintenance_trigger_claim(&service, &session, &mut ledger, request)?;
-        Ok((claim, ledger.durable_rows()))
+        let (claim, rows) = {
+            let service = self.lock_maintenance_service()?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            let claim =
+                handle_maintenance_trigger_claim(&service, &session, &mut ledger, request)?;
+            (claim, ledger.durable_rows())
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok((claim, rows))
     }
 
     /// Releases one expired claim back under the same trigger identity
@@ -1791,16 +1831,20 @@ impl KernelStoreGateway {
         now_unix_ms: u64,
     ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
         let session = self.bind_maintenance_session(principal_ref)?;
-        let service = self.lock_maintenance_service()?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        handle_maintenance_trigger_release_expired(
-            &service,
-            &session,
-            &mut ledger,
-            trigger_id,
-            now_unix_ms,
-        )?;
-        Ok(ledger.durable_rows())
+        let rows = {
+            let service = self.lock_maintenance_service()?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            handle_maintenance_trigger_release_expired(
+                &service,
+                &session,
+                &mut ledger,
+                trigger_id,
+                now_unix_ms,
+            )?;
+            ledger.durable_rows()
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok(rows)
     }
 
     /// Enumerates one bounded pending page from the owned delivery ledger
@@ -1888,25 +1932,35 @@ impl KernelStoreGateway {
                 },
             ));
         }
-        let service = self.lock_maintenance_service()?;
-        let context = session
-            .service_context(&service)
-            .map_err(MaintenanceTriggerDeliveryError::Service)?;
-        if !stored
-            .state_fence
-            .authority_epoch
-            .is_same_authority(&context.authority_epoch)
-            || stored.state_fence.resource_generation.value() != context.generation
-        {
-            return Err(MaintenanceTriggerDeliveryError::Service(
-                KernelServiceError::HandshakeMismatch {
-                    field: "maintenance_trigger.fence",
-                },
-            ));
-        }
-        let mut ledger = self.lock_maintenance_ledger()?;
-        handle_maintenance_trigger_decision(&service, &session, &mut ledger, trigger_id, receipt)?;
-        Ok(ledger.durable_rows())
+        let rows = {
+            let service = self.lock_maintenance_service()?;
+            let context = session
+                .service_context(&service)
+                .map_err(MaintenanceTriggerDeliveryError::Service)?;
+            if !stored
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&context.authority_epoch)
+                || stored.state_fence.resource_generation.value() != context.generation
+            {
+                return Err(MaintenanceTriggerDeliveryError::Service(
+                    KernelServiceError::HandshakeMismatch {
+                        field: "maintenance_trigger.fence",
+                    },
+                ));
+            }
+            let mut ledger = self.lock_maintenance_ledger()?;
+            handle_maintenance_trigger_decision(
+                &service,
+                &session,
+                &mut ledger,
+                trigger_id,
+                receipt,
+            )?;
+            ledger.durable_rows()
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok(rows)
     }
 
     /// Acknowledges one delivery against the exact committed decision
@@ -1923,17 +1977,21 @@ impl KernelStoreGateway {
         now_unix_ms: u64,
     ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
         let session = self.bind_maintenance_session(principal_ref)?;
-        let service = self.lock_maintenance_service()?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        handle_maintenance_trigger_ack(
-            &service,
-            &session,
-            &mut ledger,
-            ack,
-            current_fence,
-            now_unix_ms,
-        )?;
-        Ok(ledger.durable_rows())
+        let rows = {
+            let service = self.lock_maintenance_service()?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            handle_maintenance_trigger_ack(
+                &service,
+                &session,
+                &mut ledger,
+                ack,
+                current_fence,
+                now_unix_ms,
+            )?;
+            ledger.durable_rows()
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok(rows)
     }
 
     /// Replays one retained trigger after a pre-commit crash, without
@@ -1981,16 +2039,20 @@ impl KernelStoreGateway {
         now_unix_ms: u64,
     ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
         let session = self.bind_maintenance_session(principal_ref)?;
-        let service = self.lock_maintenance_service()?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        handle_maintenance_trigger_mark_ambiguous(
-            &service,
-            &session,
-            &mut ledger,
-            trigger_id,
-            now_unix_ms,
-        )?;
-        Ok(ledger.durable_rows())
+        let rows = {
+            let service = self.lock_maintenance_service()?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            handle_maintenance_trigger_mark_ambiguous(
+                &service,
+                &session,
+                &mut ledger,
+                trigger_id,
+                now_unix_ms,
+            )?;
+            ledger.durable_rows()
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok(rows)
     }
 
     /// Revokes one daemon generation/session's trigger-consumer authority
@@ -2006,10 +2068,14 @@ impl KernelStoreGateway {
         revocation: MaintenanceTriggerRevocation,
     ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
         let session = self.bind_maintenance_session(principal_ref)?;
-        let service = self.lock_maintenance_service()?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        handle_maintenance_trigger_revocation(&service, &session, &mut ledger, revocation)?;
-        Ok(ledger.durable_rows())
+        let rows = {
+            let service = self.lock_maintenance_service()?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            handle_maintenance_trigger_revocation(&service, &session, &mut ledger, revocation)?;
+            ledger.durable_rows()
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok(rows)
     }
 
     /// Surfaces the bounded pending set to a replacement generation (issue
@@ -2052,17 +2118,21 @@ impl KernelStoreGateway {
         now_unix_ms: u64,
     ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
         let session = self.bind_maintenance_session(principal_ref)?;
-        let service = self.lock_maintenance_service()?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        handle_maintenance_trigger_expiry(
-            &service,
-            &session,
-            &mut ledger,
-            trigger_id,
-            reason,
-            now_unix_ms,
-        )?;
-        Ok(ledger.durable_rows())
+        let rows = {
+            let service = self.lock_maintenance_service()?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            handle_maintenance_trigger_expiry(
+                &service,
+                &session,
+                &mut ledger,
+                trigger_id,
+                reason,
+                now_unix_ms,
+            )?;
+            ledger.durable_rows()
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok(rows)
     }
 
     /// Records supersession by an explicitly linked successor trigger
@@ -2080,18 +2150,22 @@ impl KernelStoreGateway {
         now_unix_ms: u64,
     ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
         let session = self.bind_maintenance_session(principal_ref)?;
-        let service = self.lock_maintenance_service()?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        handle_maintenance_trigger_supersession(
-            &service,
-            &session,
-            &mut ledger,
-            trigger_id,
-            successor_trigger_id,
-            reason,
-            now_unix_ms,
-        )?;
-        Ok(ledger.durable_rows())
+        let rows = {
+            let service = self.lock_maintenance_service()?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            handle_maintenance_trigger_supersession(
+                &service,
+                &session,
+                &mut ledger,
+                trigger_id,
+                successor_trigger_id,
+                reason,
+                now_unix_ms,
+            )?;
+            ledger.durable_rows()
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok(rows)
     }
 
     /// Records a visible recovery gap for unrepairable damage (issue #1694).
@@ -2109,18 +2183,22 @@ impl KernelStoreGateway {
         now_unix_ms: u64,
     ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
         let session = self.bind_maintenance_session(principal_ref)?;
-        let service = self.lock_maintenance_service()?;
-        let mut ledger = self.lock_maintenance_ledger()?;
-        handle_maintenance_trigger_gap(
-            &service,
-            &session,
-            &mut ledger,
-            trigger_id,
-            kind,
-            detail,
-            now_unix_ms,
-        )?;
-        Ok(ledger.durable_rows())
+        let rows = {
+            let service = self.lock_maintenance_service()?;
+            let mut ledger = self.lock_maintenance_ledger()?;
+            handle_maintenance_trigger_gap(
+                &service,
+                &session,
+                &mut ledger,
+                trigger_id,
+                kind,
+                detail,
+                now_unix_ms,
+            )?;
+            ledger.durable_rows()
+        };
+        self.persist_maintenance_trigger_snapshot(&rows)?;
+        Ok(rows)
     }
 
     /// Restores the owned delivery ledger from previously persisted durable
@@ -2131,9 +2209,10 @@ impl KernelStoreGateway {
     /// existing validators before entering the ledger — a damaged row fails
     /// the restore instead of entering as a guessed-complete entry. The
     /// rows source is the startup composition's read-back of the persisted
-    /// rows through the Store-lane rows backend (STITCH): this entry owns
-    /// the restore, not the read-back. The returned rows are the restored
-    /// durable snapshot.
+    /// rows through [`RedbRecoveryStore::read_maintenance_trigger_delivery_snapshots`]:
+    /// this entry owns the restore, not the read-back, and the startup call
+    /// itself stays with the composition owner (STITCH). The returned rows
+    /// are the restored durable snapshot.
     pub fn restore_maintenance_trigger_ledger(
         &self,
         rows: Vec<MaintenanceTriggerDeliveryRow>,

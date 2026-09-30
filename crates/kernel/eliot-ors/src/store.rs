@@ -232,6 +232,32 @@ const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_failure_retention_v1");
 const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_unknown_commit_recovery_v1");
+/// Durable maintenance-trigger delivery snapshots (issue #1694 W2/W7).
+///
+/// One row per admitted trigger identity holding the Kernel delivery ledger's
+/// exact row bytes verbatim. The bytes stay opaque here: ORS indexes the
+/// trigger identity only and never parses trigger semantics, policy, or
+/// payload meaning (I5.2). The Kernel delivery ledger is the one writer (via
+/// its gateway persist after every transition); the startup composition reads
+/// the rows back for the once-only ledger restore. Unresolved rows are never
+/// expired or compacted by this table: only the ledger owner removes a row,
+/// and only after exact acknowledgement or a terminal disposition with its
+/// downstream retention satisfied. This is one more table in the existing ORS
+/// table family, owned by the same `RedbRecoveryStore`; it is not a second
+/// trigger database.
+const MAINTENANCE_TRIGGER_DELIVERY: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_maintenance_trigger_delivery_v1");
+/// Upper bound on retained maintenance-trigger delivery snapshots.
+///
+/// Operator-scale bound: one row per admitted trigger identity. Breach fails
+/// with a typed refusal directing the owner to compact acknowledged/terminal
+/// rows first; unresolved rows are never dropped to make room.
+const MAX_MAINTENANCE_TRIGGER_DELIVERY_SNAPSHOTS: usize = 4096;
+/// Upper bound on one delivery snapshot's stored bytes.
+///
+/// Rows carry delivery metadata and receipts only; staged payload bytes live
+/// in the recovery inbox under their own envelope, never here.
+const MAX_MAINTENANCE_TRIGGER_DELIVERY_SNAPSHOT_BYTES: usize = 1_048_576;
 /// Durable scan disclosure rows (issue #2900): one row per
 /// `scan-disclosure:<installation>:<operation>` identity holding the exact
 /// canonical receipt bytes under their digest plus the owner-admitted write
@@ -12198,6 +12224,127 @@ impl RedbRecoveryStore {
             "acked_cursor": acked,
             "pruned": pruned,
         }))
+    }
+
+    /// Persists one Kernel maintenance-trigger delivery snapshot (issue #1694).
+    ///
+    /// Stores the ledger row bytes verbatim under the trigger identity with
+    /// replace semantics: persisting the same bytes twice is an idempotent
+    /// no-op, and persisting changed bytes replaces the row so the durable
+    /// image always mirrors the ledger's latest transition. The bytes are
+    /// validated as non-empty, bounded, well-formed JSON only — never parsed
+    /// as trigger semantics. A damaged or over-bound presentation fails here
+    /// instead of entering durable state as a guessed-complete entry.
+    /// Unresolved rows have no expiry path: only
+    /// [`Self::remove_maintenance_trigger_delivery_snapshot`] drops a row,
+    /// under the ledger owner's ack/terminal rule.
+    pub fn persist_maintenance_trigger_delivery_snapshot(
+        &self,
+        trigger_id: &str,
+        row_json: &str,
+    ) -> Result<(), OrsError> {
+        crate::model::validate_text(trigger_id, "maintenance_trigger_delivery.trigger_id")?;
+        if row_json.is_empty()
+            || row_json.len() > MAX_MAINTENANCE_TRIGGER_DELIVERY_SNAPSHOT_BYTES
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_delivery.row_json",
+                reason: "delivery snapshot must be non-empty bounded row bytes",
+            });
+        }
+        serde_json::from_str::<serde_json::Value>(row_json).map_err(|_| {
+            OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_delivery",
+                reason: "delivery snapshot bytes are not well-formed JSON".to_owned(),
+            }
+        })?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let snapshots = write
+                .open_table(MAINTENANCE_TRIGGER_DELIVERY)
+                .map_err(storage)?;
+            if snapshots.get(trigger_id).map_err(storage)?.is_none() {
+                let mut stored = 0_usize;
+                for entry in snapshots.iter().map_err(storage)? {
+                    entry.map_err(storage)?;
+                    stored += 1;
+                }
+                if stored >= MAX_MAINTENANCE_TRIGGER_DELIVERY_SNAPSHOTS {
+                    return Err(OrsError::InvalidField {
+                        field: "maintenance_trigger_delivery.snapshot_count",
+                        reason: "delivery snapshot capacity exceeded; compact acknowledged or terminal rows first",
+                    });
+                }
+            }
+            snapshots.insert(trigger_id, row_json).map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(())
+    }
+
+    /// Reads every retained maintenance-trigger delivery snapshot (issue #1694).
+    ///
+    /// Returns `(trigger identity, verbatim row bytes)` pairs in stable
+    /// trigger-identity order for the startup composition's once-only ledger
+    /// restore. Every row is revalidated; a damaged row fails the read
+    /// instead of restoring as a guessed-complete entry.
+    pub fn read_maintenance_trigger_delivery_snapshots(
+        &self,
+    ) -> Result<Vec<(String, String)>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let snapshots = read
+            .open_table(MAINTENANCE_TRIGGER_DELIVERY)
+            .map_err(storage)?;
+        let mut rows = Vec::new();
+        for entry in snapshots.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let trigger_id = key.value().to_owned();
+            let row_json = value.value().to_owned();
+            crate::model::validate_text(&trigger_id, "maintenance_trigger_delivery.trigger_id")?;
+            if row_json.is_empty()
+                || row_json.len() > MAX_MAINTENANCE_TRIGGER_DELIVERY_SNAPSHOT_BYTES
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "maintenance_trigger_delivery",
+                    reason: "retained delivery snapshot is not bounded row bytes".to_owned(),
+                });
+            }
+            serde_json::from_str::<serde_json::Value>(&row_json).map_err(|_| {
+                OrsError::IntegrityProblem {
+                    record_type: "maintenance_trigger_delivery",
+                    reason: "retained delivery snapshot bytes are not well-formed JSON".to_owned(),
+                }
+            })?;
+            rows.push((trigger_id, row_json));
+        }
+        Ok(rows)
+    }
+
+    /// Removes one retained maintenance-trigger delivery snapshot (issue #1694).
+    ///
+    /// The ledger owner calls this only after exact acknowledgement or a
+    /// terminal disposition with its downstream retention satisfied; this
+    /// substrate enforces no lifecycle itself. Removing an absent identity is
+    /// an idempotent `Ok(false)`, never an error, so compaction replays
+    /// safely after a crash between removal and its caller-side commit.
+    pub fn remove_maintenance_trigger_delivery_snapshot(
+        &self,
+        trigger_id: &str,
+    ) -> Result<bool, OrsError> {
+        crate::model::validate_text(trigger_id, "maintenance_trigger_delivery.trigger_id")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let removed = {
+            let mut snapshots = write
+                .open_table(MAINTENANCE_TRIGGER_DELIVERY)
+                .map_err(storage)?;
+            let existed = snapshots.get(trigger_id).map_err(storage)?.is_some();
+            if existed {
+                snapshots.remove(trigger_id).map_err(storage)?;
+            }
+            existed
+        };
+        write.commit().map_err(storage)?;
+        Ok(removed)
     }
 
     /// Records one forwarded coverage gap without touching any cursor.
