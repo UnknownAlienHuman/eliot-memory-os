@@ -2019,10 +2019,10 @@ fn admissible_sources(
 
 /// Requires the exact caller-supplied reason an observation is unavailable.
 fn unavailable_reason(slot_reason: Option<&String>) -> Result<&str, EvaluationContractError> {
-    match slot_reason.as_deref() {
+    match slot_reason {
         Some(reason) => {
             text(reason, "human_attention.assembly.unavailable_reason")?;
-            Ok(reason)
+            Ok(reason.as_str())
         }
         None => Err(EvaluationContractError::InvalidText {
             field: "human_attention.assembly.unavailable_reason",
