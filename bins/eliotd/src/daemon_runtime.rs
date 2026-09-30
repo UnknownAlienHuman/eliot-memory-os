@@ -4930,7 +4930,6 @@ async fn prepare_observation_capture(
         .map_err(|error| format!("selected Observe task id is invalid: {error}"))?;
     identity.request.metadata.session_id = Some(session_id);
     identity.request.metadata.task_id = task_id;
-    identity.request.metadata.work_scope_id = Some(capture_binding.authenticated_scope_ref.clone());
     identity.request.metadata.state_fence = semantic_fence.clone();
     identity.request.state_fence = semantic_fence.clone();
     identity

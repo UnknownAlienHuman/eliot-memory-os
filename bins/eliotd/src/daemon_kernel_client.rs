@@ -1199,6 +1199,7 @@ pub fn parse_observe_claimed_pair(
                 || attempt.authority_epoch != envelope.state_fence.authority_epoch
                 || Some(attempt.scope_id.as_str()) != envelope.identity.work_scope_id.as_deref()
                 || attempt.facet_method != OBSERVE_CAPABILITY
+                || envelope.state_fence != executable_input.application_binding.state_fence
             {
                 return Err(
                     "Kernel semantic_observe_claim ORS row is not the exact admitted pair"
@@ -1218,26 +1219,16 @@ pub fn parse_observe_claimed_pair(
                 || source_request_identity.idempotency_key != envelope.identity.idempotency_key
                 || source_request_identity.cancellation_id != envelope.identity.cancellation_id
                 || source_request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
-                || source_request_identity.request.state_fence
-                    != executable_input.application_binding.state_fence
-                || source_request_identity.request.metadata.state_fence
-                    != executable_input.application_binding.state_fence
-                || source_request_identity
-                    .request
-                    .metadata
-                    .session_id
-                    .as_ref()
-                    .map(eliot_contracts::SessionId::as_str)
-                    != envelope.identity.session_id.as_deref()
-                || source_request_identity
-                    .request
-                    .metadata
-                    .task_id
-                    .as_ref()
-                    .map(eliot_contracts::TaskId::as_str)
-                    != envelope.identity.task_id.as_deref()
-                || source_request_identity.request.metadata.work_scope_id.as_deref()
-                    != envelope.identity.work_scope_id.as_deref()
+                || !neutral_source_fence_matches_owner(
+                    &source_request_identity.request.state_fence,
+                    &executable_input.application_binding.state_fence,
+                )
+                || !neutral_source_fence_matches_owner(
+                    &source_request_identity.request.metadata.state_fence,
+                    &executable_input.application_binding.state_fence,
+                )
+                || source_request_identity.request.metadata.session_id.is_some()
+                || source_request_identity.request.metadata.task_id.is_some()
             {
                 return Err(
                     "Kernel original RequestIdentity differs from the admitted Host request"
@@ -1271,15 +1262,18 @@ pub fn parse_observe_claimed_pair(
     }
 }
 
-fn host_request_fence_matches_semantic(
-    transport: &eliot_contracts::StateFence,
+/// The Bridge Frame identity retains transport attribution and its neutral
+/// epoch/generation fence. The admitted Host row separately retains the full
+/// semantic owner fence; only the non-semantic fence coordinates may join.
+fn neutral_source_fence_matches_owner(
+    source: &eliot_contracts::StateFence,
     semantic: &eliot_contracts::StateFence,
 ) -> bool {
-    transport.authority_epoch.is_same_authority(&semantic.authority_epoch)
-        && transport.resource_generation == semantic.resource_generation
-        && transport.task_revision.is_none()
-        && transport.policy_revision.is_none()
-        && transport.integration_revision.is_none()
+    source.authority_epoch.is_same_authority(&semantic.authority_epoch)
+        && source.resource_generation == semantic.resource_generation
+        && source.task_revision.is_none()
+        && source.policy_revision.is_none()
+        && source.integration_revision.is_none()
 }
 
 /// Parses one unwrapped `semantic_observe_result` answer value into the
