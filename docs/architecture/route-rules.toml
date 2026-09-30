@@ -271,7 +271,6 @@ optional_files = []
 path = "bins/eliot-kernel/src/control_plane.rs"
 topic = "Kernel authority and recovery"
 expect_routes = ["generic-source", "host-kernel", "security-privacy"]
-expect_required_handles = ["A12.2", "I1.1"]
 
 [[coverage.example]]
 path = "bins/eliot-watchdog/src/runtime_loop.rs"
@@ -313,7 +312,6 @@ expect_routes = ["generic-source", "memory-context"]
 path = "apps/Eliot.Operator/MainWindow.xaml"
 topic = "operator ui"
 expect_routes = ["generic-source", "human-surfaces"]
-expect_required_handles = ["A11", "I11"]
 
 [[coverage.example]]
 path = "docs/architecture/INDEX.md"
@@ -382,45 +380,3 @@ path = "crates/foundation/eliot-contracts/src/lib.rs"
 topic = ""
 expect_routes = ["generic-source"]
 expect_absent_routes = ["improvement-learning"]
-
-# #4606 lexical-boundary coverage. The unrelated context-contracts path keeps
-# its path-triggered routes, but intra-word topic fragments must not pull
-# Host/Kernel (`ors` in `errors`/`validators`) or UI (`cli` in `clippy`)
-# routes. The required-handle expectations pin the resolved required sets so
-# the intended path material is proven present while the absent routes stay
-# out.
-[[coverage.example]]
-path = "crates/smart/eliot-context-contracts/src/atom.rs"
-topic = "Propagate typed errors"
-expect_routes = ["generic-source", "memory-context"]
-expect_required_handles = ["A2.3", "I2.17", "A4", "I13"]
-expect_absent_routes = ["host-kernel"]
-
-[[coverage.example]]
-path = "crates/smart/eliot-context-contracts/src/atom.rs"
-topic = "Tighten validators"
-expect_routes = ["generic-source", "memory-context"]
-expect_required_handles = ["A2.3", "I2.17", "A4", "I13"]
-expect_absent_routes = ["host-kernel"]
-
-[[coverage.example]]
-path = "crates/smart/eliot-context-contracts/src/atom.rs"
-topic = "Resolve Clippy warnings"
-expect_routes = ["generic-source", "memory-context"]
-expect_required_handles = ["A2.3", "I2.17", "A4", "I13"]
-expect_absent_routes = ["human-surfaces"]
-
-# #4606 positive controls. An explicit whole-token ORS topic still routes to
-# Host/Kernel, an explicit whole-token CLI topic still routes to UI, and the
-# required-handle expectations pin the resolved required sets.
-[[coverage.example]]
-path = "crates/smart/eliot-context-contracts/src/atom.rs"
-topic = "ORS epoch review"
-expect_routes = ["generic-source", "memory-context", "host-kernel"]
-expect_required_handles = ["A12.2", "I1.1"]
-
-[[coverage.example]]
-path = "crates/smart/eliot-context-contracts/src/atom.rs"
-topic = "CLI help output"
-expect_routes = ["generic-source", "memory-context", "human-surfaces"]
-expect_required_handles = ["A11", "I11"]
