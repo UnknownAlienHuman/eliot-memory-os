@@ -5853,6 +5853,37 @@ fn admit_over_restored_registry(
 /// admitting one result cannot produce another decision to publish. The
 /// publication here is bounded by the same 30s transport deadline the other two
 /// sites use, and the composition lock is not held across it.
+///
+/// # An owner's decision reaches no row, and this poll is not where that is fixed
+///
+/// I12.24:65's "decision owner selects reject / investigate / work item /
+/// experiment" is not observable in this pass, and that is stated here rather
+/// than left to be discovered. This poll is already complete for the shape a
+/// decision WOULD take: phase 2 reads the whole committed `candidate` scope
+/// exhaustively and `improvement_dedup_read::classify_row` re-proves each
+/// row's `owner_decision` — its `brief_id`, its `candidate_id`, and its owner
+/// against the authority owner's own `PrincipalRef` constructor. So a decision
+/// recorded in the SAME committed artifact shape would be seen by this pass
+/// with no additional read, and it needs no new record kind or document shape.
+///
+/// What is absent is the ROW, not the observation. No route writes one: the
+/// Kernel operator route answers an authenticated
+/// `UserAutomationOperation::DecideImprovementBrief` with the typed,
+/// non-reconciling refusal `KernelComposition::improvement_brief_decision_refusal`
+/// rather than a transport fence, and this daemon owns no ingress that could
+/// carry the selection here. So the `owner_decision` in every row this pass
+/// reads is the one the intake assembly recorded for ITSELF
+/// (`assemble_improvement_artifact` calls `record_brief_decision` with
+/// `OwnerDecisionKind::Investigate` and this daemon's own service name as the
+/// owner), and never a selection by an owner.
+///
+/// The three artifacts that would carry one — a Kernel queue the daemon can
+/// claim, the poll leg that claims it, and the improvement owner's commit of a
+/// caller-supplied `OwnerDecision` through `commit_improvement_artifact` — are
+/// named with their exact locations in `improvement_intake_dispatch`'s "The
+/// exact missing route, named" section. They are not in this function and are
+/// not simulated here: this poll admits and commits only what its own
+/// observation produced.
 async fn run_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
