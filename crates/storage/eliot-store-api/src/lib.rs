@@ -10,12 +10,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{
-    ArtifactId, ContractId, ResourceGeneration, SourceId, TaskId, TransactionSequence,
-};
+use eliot_contracts::{ArtifactId, ContractId, SourceId, TaskId, TransactionSequence};
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, PolicyRevision, RequestMetadata,
-    StateFence, canonical_json_bytes, sha256_hex,
+    ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
 pub use eliot_learning_contracts::{CampaignLearningStateView, LearningStateViewRecipe, OwnerId};
 pub use eliot_learning_contracts::{
