@@ -829,7 +829,7 @@ impl KernelComposition {
                 presented_generation: Some(body.attempt.fencing_generation),
             });
         }
-        let (envelope, state) = self.finish_queued_pair(body)?;
+        let (envelope, state, tool) = self.finish_queued_pair(body)?;
         if let Some(observation) = finish_stale_attempt(body, &state, session, &envelope) {
             return Ok(LocalReadSubmitDisposition::StaleAttempt(observation));
         }
@@ -842,11 +842,25 @@ impl KernelComposition {
         }
         // #1824 (I10.21 A2): an unreconciled unknown-origin Material change
         // (or a still-unverified host/filesystem hint) blocks governed
-        // finish-candidate acceptance until reconciled. Exact replays above
-        // stay readback and unrelated lanes are untouched: the monitor owns
-        // its ledger, this leg only queries its gate, and the refusal fails
-        // closed without crashing the route.
-        if super::change_monitor::governed_acceptance_blocked() {
+        // finish-candidate acceptance until reconciled. The block is scoped
+        // per tracked resource the candidate names: a candidate touching a
+        // blocked resource waits for explicit reconciliation of that
+        // resource, while unrelated resources are unaffected. A candidate
+        // that carries no resource keeps the global gate as fallback. Exact
+        // replays above stay readback and unrelated lanes are untouched: the
+        // monitor owns its ledger, this leg only queries its gate, and the
+        // refusal fails closed without crashing the route.
+        let candidate_blocked = {
+            let resources = finish_candidate_resources(tool.as_ref());
+            if resources.is_empty() {
+                super::change_monitor::governed_acceptance_blocked()
+            } else {
+                resources.iter().any(|resource| {
+                    super::change_monitor::governed_acceptance_blocked_for(resource.as_str())
+                })
+            }
+        };
+        if candidate_blocked {
             return Err(TransportError::SessionFenced);
         }
         let persisted = self
@@ -875,16 +889,26 @@ impl KernelComposition {
     }
 
     /// Loads the exact live finish queue record for a submitted result. An
-    /// absent queue entry is [`TransportError::UnknownRequest`].
+    /// absent queue entry is [`TransportError::UnknownRequest`]. The exact
+    /// admitted strict finish draft travels with the record so the submit
+    /// leg can scope the `ChangeMonitor` acceptance gate to the resources
+    /// the candidate names.
     fn finish_queued_pair(
         &self,
         body: &FinishResultBody,
-    ) -> Result<(HostRequestEnvelope, LocalReadAttemptState), TransportError> {
+    ) -> Result<
+        (
+            HostRequestEnvelope,
+            LocalReadAttemptState,
+            Option<serde_json::Value>,
+        ),
+        TransportError,
+    > {
         let index = self
             .host_request_connection_index
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        let (envelope, state) = index
+        let (envelope, state, tool) = index
             .values()
             .flatten()
             .find(|candidate| {
@@ -896,11 +920,12 @@ impl KernelComposition {
                 (
                     candidate.finish_envelope.clone(),
                     candidate.finish_attempt.clone(),
+                    candidate.finish_tool.clone(),
                 )
             })
             .ok_or(TransportError::UnknownRequest)?;
         let envelope = envelope.ok_or(TransportError::UnknownRequest)?;
-        Ok((envelope, state))
+        Ok((envelope, state, tool))
     }
 
     fn retire_finish_pair_under_transition(&self, operation_id: &str, request_digest: &str) {
@@ -1169,6 +1194,30 @@ pub(super) fn check_finish_admission(
     tool: &serde_json::Value,
 ) -> Result<(), TransportError> {
     finish_admission(envelope, tool)
+}
+
+/// Returns the tracked resources one admitted `eliot.finish` candidate
+/// names: the `artifact_refs` of its exact digest-bound strict draft. The
+/// draft travelled the queue with the candidate, so these are the resources
+/// the candidate touches in the ledger's own identity. Anything unexpected
+/// (absent tool, unexpected shape) yields no resource, so the submit leg
+/// keeps the global acceptance gate as fallback.
+///
+/// Issue #1824 (I10.21 A2): per-resource scope for the finish-acceptance
+/// leg; this only reads the admitted draft, never the monitor ledger.
+fn finish_candidate_resources(tool: Option<&serde_json::Value>) -> Vec<String> {
+    tool.and_then(|draft| draft.as_object())
+        .and_then(|draft| draft.get("arguments"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|arguments| arguments.get("artifact_refs"))
+        .and_then(serde_json::Value::as_array)
+        .map(|refs| {
+            refs.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Joins a presented finish result against its live queue record.
