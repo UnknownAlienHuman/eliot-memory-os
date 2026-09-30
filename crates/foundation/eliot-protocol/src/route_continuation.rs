@@ -229,7 +229,52 @@ impl HandoffCausalLink {
     /// A `COMPLETE` link must carry both source cursors and a replay cursor
     /// or rehydration bundle digest; every other completeness level admits
     /// partial information.
+    ///
+    /// The attempt-identity rule applied here is the strict new-attempt
+    /// shape: equal source and target attempts are refused. Callers that
+    /// know the declared continuity mode use
+    /// [`Self::validate_for_continuity`], which admits an equal attempt
+    /// only for [`ContinuityKind::NativeResume`] (I7.15).
     pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.validate_shape()?;
+        if self.source_attempt_id == self.target_attempt_id {
+            return Err(ProtocolError::InvalidField {
+                field: "handoff_causal_link.target_attempt_id",
+                reason: "target attempt must differ from the source attempt",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the link under its declared continuity mode (I7.15).
+    ///
+    /// Shape and completeness checks are unchanged from [`Self::validate`];
+    /// only the attempt-identity rule is mode-derived through
+    /// [`ContinuityKind::creates_new_attempt_identity`]: every mode except
+    /// [`ContinuityKind::NativeResume`] creates a new ELIOT attempt, so an
+    /// equal source/target attempt is refused exactly as in
+    /// [`Self::validate`]. A `NativeResume` link may name the same attempt
+    /// it continues; the compatible session and route, the fresh authority
+    /// epoch, and the fingerprinted continuation state are then enforced by
+    /// the owning admission validator, never by this shape check.
+    pub fn validate_for_continuity(
+        &self,
+        continuity: ContinuityKind,
+    ) -> Result<(), ProtocolError> {
+        self.validate_shape()?;
+        if self.source_attempt_id == self.target_attempt_id
+            && continuity.creates_new_attempt_identity()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "handoff_causal_link.target_attempt_id",
+                reason: "target attempt must differ from the source attempt",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates every link field except the attempt-identity rule.
+    fn validate_shape(&self) -> Result<(), ProtocolError> {
         text(
             &self.source_attempt_id,
             "handoff_causal_link.source_attempt_id",
@@ -243,12 +288,6 @@ impl HandoffCausalLink {
             &self.target_attempt_id,
             "handoff_causal_link.target_attempt_id",
         )?;
-        if self.source_attempt_id == self.target_attempt_id {
-            return Err(ProtocolError::InvalidField {
-                field: "handoff_causal_link.target_attempt_id",
-                reason: "target attempt must differ from the source attempt",
-            });
-        }
         self.source_state_fence.validate()?;
         if !self
             .source_authority_epoch

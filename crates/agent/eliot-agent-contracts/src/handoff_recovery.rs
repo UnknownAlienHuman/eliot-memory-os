@@ -1124,7 +1124,8 @@ fn advance_floor(
 
 /// Runs the recovery-handoff owners in order (I12.17, I7.15).
 ///
-/// The run gates destructive compaction on durable readback, consumes the
+/// The run gates destructive compaction on durable readback, refuses a resume
+/// whose own retained checkpoint lacks that readback, consumes the
 /// complete retained payload, admits the resume under fresh authority,
 /// dispatches the continuity branch, reconciles every in-flight operation
 /// without duplicating launch or tools, derives the rebuild request when a
@@ -1145,6 +1146,9 @@ pub fn recover_handoff(
         .registry
         .require_compaction_permit(inputs.capture_checkpoint_id)?;
     let retained = inputs.evidence.retained()?;
+    inputs
+        .registry
+        .require_compaction_permit(&retained.checkpoint.checkpoint_id)?;
     advance_floor(intent, HandoffResumeStatus::CompactionObserved)?;
     advance_floor(intent, HandoffResumeStatus::RevalidationPending)?;
     let admission = HandoffResumeGate::admit(inputs.evidence, inputs.observations, intent)?;
