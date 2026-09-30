@@ -37,6 +37,7 @@ use eliot_mod_research::{
     AcquisitionCoverageDegradation, BridgeIdentity, CancellationOutcome, EvidenceObservation,
     Obligation, RESEARCH_SOURCE_UNAVAILABLE, RawProviderEvidence, ResearchDispatchAuthority,
     SubmissionRecord, acquisition_coverage_degradation, compose_admitted, project_admitted_inquiry,
+    resolve_admitted_cell,
 };
 
 /// Stable code prefixed to the bounded report of follow-up obligations the
@@ -547,6 +548,14 @@ fn admit(
     // before any port, authority, or executor is constructed.
     admission
         .bind_admitted_dispatch(dispatch, client_receipt)
+        .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))?;
+    // The Module/Capability Registry reference the record seals is bound to the
+    // generated #13 cell record before any port, authority, or executor exists.
+    // A Kernel that admitted a module id this package does not declare, or a
+    // declared cell whose proof surface is stale, is refused here rather than
+    // after a provider process was started: there is no executor contact for a
+    // cell this process cannot name.
+    resolve_admitted_cell(&admission)
         .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))?;
     Ok(admission)
 }

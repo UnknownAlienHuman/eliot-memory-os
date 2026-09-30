@@ -59,6 +59,7 @@ import re
 import subprocess
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -90,11 +91,10 @@ WORKER_CONTRACT_RELATIVE = (
 )
 WORKER_BUNDLE_MANIFEST_RELATIVE = "bins/eliot-native-worker/Cargo.toml"
 WORKER_CAPSULE_ROOT = "docs/code-navigation/capsules/native-worker-core"
-WORKER_CAPSULES = {
-    "contract_kit": f"{WORKER_CAPSULE_ROOT}/contract_kit.json",
-    "context_capsule": f"{WORKER_CAPSULE_ROOT}/context_capsule.json",
-    "test_capsule": f"{WORKER_CAPSULE_ROOT}/test_capsule.json",
-}
+# The three artifacts that make up the mandatory I2.20 triad. Every declared
+# cell projects exactly these three, keyed by the same names the registry record
+# and the `EffectiveMicroModuleManifest` use.
+ARTIFACT_KINDS = ("contract_kit", "context_capsule", "test_capsule")
 WORKER_REGISTRY_RELATIVE = "bins/eliot-kernel/src/composition_bootstrap.rs"
 REGISTRY_SOURCE_RELATIVE = (
     "crates/foundation/eliot-contracts/src/capability_cell_registry.rs"
@@ -109,6 +109,107 @@ WORKER_REGISTRY_END = "// END GENERATED native-worker capability-cell registry"
 WORKER_CELL_ID_MARKER = "NATIVE_WORKER_CAPABILITY_CELL_ID"
 WORKER_PACKAGE_MARKER = "NATIVE_WORKER_CAPABILITY_SOURCE_PACKAGE"
 WORKER_REGISTRY_MARKER = "NATIVE_WORKER_CAPABILITY_CELL_REGISTRY_JSON"
+
+# The research-provider cell (#24) declares itself in the process module that
+# hosts it and is projected into that same process, so the provider validates its
+# own sealed `CapabilityCellId` against a generated record before any executor
+# contact. See `bins/eliot-mod-research/capability-cell.contract.toml`.
+RESEARCH_MANIFEST_RELATIVE = "bins/eliot-mod-research/Cargo.toml"
+RESEARCH_CONTRACT_RELATIVE = "bins/eliot-mod-research/capability-cell.contract.toml"
+RESEARCH_BUNDLE_MANIFEST_RELATIVE = "bins/eliot-mod-research/Cargo.toml"
+RESEARCH_CAPSULE_ROOT = "docs/code-navigation/capsules/mod-research-provider"
+RESEARCH_REGISTRY_RELATIVE = "bins/eliot-mod-research/src/capability_cell.rs"
+RESEARCH_REGISTRY_BEGIN = (
+    "// BEGIN GENERATED research-provider capability-cell registry "
+    "(scripts/gen_capability_cell_registry.py; do not hand-edit)"
+)
+RESEARCH_REGISTRY_END = "// END GENERATED research-provider capability-cell registry"
+RESEARCH_CELL_ID_MARKER = "RESEARCH_PROVIDER_CAPABILITY_CELL_ID"
+RESEARCH_PACKAGE_MARKER = "RESEARCH_PROVIDER_CAPABILITY_SOURCE_PACKAGE"
+RESEARCH_REGISTRY_MARKER = "RESEARCH_PROVIDER_CAPABILITY_CELL_REGISTRY_JSON"
+
+# Source-tree inputs every cell binds in addition to its own per-cell inputs.
+# The full workspace lockfile remains deliberate because the typed source
+# identity names its SHA-256 as Cargo lock provenance; any lockfile change,
+# including an unrelated dependency update, requires regeneration.
+SHARED_TREE_INPUTS = (
+    "Cargo.toml",
+    "Cargo.lock",
+    NORMATIVE_PAIR_RELATIVE,
+    REGISTRY_SOURCE_RELATIVE,
+    "scripts/gen_capability_cell_registry.py",
+    "crates/foundation/eliot-contracts/src/facet_manifest.rs",
+)
+
+
+@dataclass(frozen=True)
+class CellSource:
+    """One declared capability cell: where it is declared and where it lands.
+
+    The record is a per-cell projection of one package manifest plus its
+    adjacent contract, exactly as before; the table below only names which
+    package, contract, capsule root, hosting manifest, generated sink, and
+    constant prefix each declared cell uses, so a second cell is a declaration
+    rather than a second code path.
+    """
+
+    key: str
+    manifest: str
+    contract: str
+    bundle_manifest: str
+    capsule_root: str
+    registry: str
+    begin_marker: str
+    end_marker: str
+    cell_id_marker: str
+    package_marker: str
+    registry_marker: str
+    # Dependency keys the hosting manifest must declare for this cell's source
+    # package. A cell whose source crate *is* its host (a process module) has no
+    # such edge, so this is per-cell data and not a hardcoded constant.
+    required_bundle_dependencies: tuple[str, ...]
+    # Extra package/contract/build inputs bound by this cell's tree digest.
+    tree_inputs: tuple[str, ...]
+
+
+CELL_SOURCES = (
+    CellSource(
+        key="native-worker",
+        manifest=WORKER_MANIFEST_RELATIVE,
+        contract=WORKER_CONTRACT_RELATIVE,
+        bundle_manifest=WORKER_BUNDLE_MANIFEST_RELATIVE,
+        capsule_root=WORKER_CAPSULE_ROOT,
+        registry=WORKER_REGISTRY_RELATIVE,
+        begin_marker=WORKER_REGISTRY_BEGIN,
+        end_marker=WORKER_REGISTRY_END,
+        cell_id_marker=WORKER_CELL_ID_MARKER,
+        package_marker=WORKER_PACKAGE_MARKER,
+        registry_marker=WORKER_REGISTRY_MARKER,
+        required_bundle_dependencies=("eliot-native-worker-core",),
+        tree_inputs=(
+            "crates/modules/eliot-native-worker-core/build.rs",
+            "crates/modules/eliot-native-worker-core/src/generated/native_worker_facets_v1.rs.in",
+            "crates/modules/eliot-native-worker-core/src/generated/native_worker_facets_v1.rs",
+        ),
+    ),
+    CellSource(
+        key="research-provider",
+        manifest=RESEARCH_MANIFEST_RELATIVE,
+        contract=RESEARCH_CONTRACT_RELATIVE,
+        bundle_manifest=RESEARCH_BUNDLE_MANIFEST_RELATIVE,
+        capsule_root=RESEARCH_CAPSULE_ROOT,
+        registry=RESEARCH_REGISTRY_RELATIVE,
+        begin_marker=RESEARCH_REGISTRY_BEGIN,
+        end_marker=RESEARCH_REGISTRY_END,
+        cell_id_marker=RESEARCH_CELL_ID_MARKER,
+        package_marker=RESEARCH_PACKAGE_MARKER,
+        registry_marker=RESEARCH_REGISTRY_MARKER,
+        # The process module is both the source crate and the hosting bundle, so
+        # there is no separate host dependency to require.
+        required_bundle_dependencies=(),
+        tree_inputs=(),
+    ),
+)
 
 
 def rust_raw_string(value: str) -> str:
@@ -384,34 +485,40 @@ def _worker_toolchain() -> str:
     return "; ".join(lines)
 
 
-def _source_tree_digest(root: Path, capsule_payloads: dict[str, dict[str, object]]) -> str:
+def _selected_paths(selected: dict[str, object]) -> set[str]:
+    """Return every source/test path the context capsule selected."""
+    found: set[str] = set()
+    for collection in ("selected_source", "selected_tests"):
+        for entry in selected.get(collection, []):
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                found.add(entry["path"])
+    return found
+
+
+def _source_tree_digest(
+    root: Path,
+    cell_source: CellSource,
+    capsule_payloads: dict[str, dict[str, object]],
+) -> str:
     """Bind package/cell evidence inputs, not unrelated Kernel composition code.
 
-    A change outside this list does not stale the generated worker registry.
+    A change outside this list does not stale that cell's generated registry.
     The full workspace lockfile remains deliberate because the typed source
     identity names its SHA-256 as Cargo lock provenance; any lockfile change,
     including an unrelated dependency update, requires regeneration.
     """
     paths = {
-        "Cargo.toml",
-        "Cargo.lock",
-        WORKER_MANIFEST_RELATIVE,
-        WORKER_CONTRACT_RELATIVE,
-        WORKER_BUNDLE_MANIFEST_RELATIVE,
-        NORMATIVE_PAIR_RELATIVE,
-        REGISTRY_SOURCE_RELATIVE,
-        "scripts/gen_capability_cell_registry.py",
-        "crates/foundation/eliot-contracts/src/facet_manifest.rs",
-        "crates/modules/eliot-native-worker-core/build.rs",
-        "crates/modules/eliot-native-worker-core/src/generated/native_worker_facets_v1.rs.in",
-        "crates/modules/eliot-native-worker-core/src/generated/native_worker_facets_v1.rs",
-        *WORKER_CAPSULES.values(),
+        *SHARED_TREE_INPUTS,
+        cell_source.manifest,
+        cell_source.contract,
+        cell_source.bundle_manifest,
+        *cell_source.tree_inputs,
     }
     context = capsule_payloads["context_capsule"]
     selected = _table(
         context.get("selected_source_and_tests"),
         "selected_source_and_tests",
-        WORKER_CAPSULES["context_capsule"],
+        f"{cell_source.capsule_root}/context_capsule.json",
     )
     for collection in ("selected_source", "selected_tests"):
         entries = selected.get(collection, [])
@@ -419,7 +526,20 @@ def _source_tree_digest(root: Path, capsule_payloads: dict[str, dict[str, object
             raise RegistryError("CAPSULE_SOURCE_SHAPE", collection)
         for entry in entries:
             item = _table(entry, "source entry", collection)
-            paths.add(_safe_relative_path(item.get("path"), f"{collection}.path"))
+            relative = _safe_relative_path(item.get("path"), f"{collection}.path")
+            # A cell's own generated sink is output, never input. For a cell
+            # projected into one of its own source files the generated block
+            # would otherwise be an input to the digest it is written into, and
+            # no fixed point would exist.
+            if relative != cell_source.registry:
+                paths.add(relative)
+    # The capsule artifacts hash the same selected source, so for a cell whose
+    # sink is one of those files they couple the same cycle and are excluded for
+    # the same reason. They are still read, digested, and cross-checked against
+    # the manifest, the contract, and the declared cell id on every run above, so
+    # a capsule that stops agreeing still fails the generator closed.
+    if cell_source.registry not in _selected_paths(selected):
+        paths |= {f"{cell_source.capsule_root}/{name}.json" for name in ARTIFACT_KINDS}
 
     hashes: list[dict[str, str]] = []
     for relative in sorted(paths):
@@ -430,22 +550,24 @@ def _source_tree_digest(root: Path, capsule_payloads: dict[str, dict[str, object
     return sha256_hex(canonical_json(hashes))
 
 
-def load_worker_registry(root: Path) -> tuple[str, dict[str, object], str, str]:
-    """Build the native-worker registry from package, contract, capsule, and source inputs."""
-    source = parse_toml(root, WORKER_MANIFEST_RELATIVE)
-    package = _table(source.get("package"), "package", WORKER_MANIFEST_RELATIVE)
+def load_cell_registry(
+    root: Path, cell_source: CellSource
+) -> tuple[str, dict[str, object], str, str]:
+    """Build one cell's registry from package, contract, capsule, and source inputs."""
+    source = parse_toml(root, cell_source.manifest)
+    package = _table(source.get("package"), "package", cell_source.manifest)
     metadata = _table(
-        _table(package.get("metadata"), "metadata", WORKER_MANIFEST_RELATIVE).get(
+        _table(package.get("metadata"), "metadata", cell_source.manifest).get(
             "eliot"
         ),
         "package.metadata.eliot",
-        WORKER_MANIFEST_RELATIVE,
+        cell_source.manifest,
     )
-    contract = parse_toml(root, WORKER_CONTRACT_RELATIVE)
-    bundle = parse_toml(root, WORKER_BUNDLE_MANIFEST_RELATIVE)
-    bundle_package = _table(bundle.get("package"), "package", WORKER_BUNDLE_MANIFEST_RELATIVE)
+    contract = parse_toml(root, cell_source.contract)
+    bundle = parse_toml(root, cell_source.bundle_manifest)
+    bundle_package = _table(bundle.get("package"), "package", cell_source.bundle_manifest)
     bundle_dependencies = _table(
-        bundle.get("dependencies"), "dependencies", WORKER_BUNDLE_MANIFEST_RELATIVE
+        bundle.get("dependencies"), "dependencies", cell_source.bundle_manifest
     )
 
     cell = contract.get("cell")
@@ -454,18 +576,31 @@ def load_worker_registry(root: Path) -> tuple[str, dict[str, object], str, str]:
     _require_equal(metadata.get("lifecycle_owner"), contract.get("lifecycle_owner"), "lifecycle_owner")
     _require_equal(metadata.get("source_layer"), contract.get("source_layer"), "source_layer")
     _require_equal(package.get("name"), source_package, "source package name")
-    _require_equal(contract.get("source_manifest"), WORKER_MANIFEST_RELATIVE, "source manifest")
-    _require_equal(contract.get("worker_bundle_manifest"), WORKER_BUNDLE_MANIFEST_RELATIVE, "worker bundle manifest")
+    _require_equal(contract.get("source_manifest"), cell_source.manifest, "source manifest")
+    _require_equal(contract.get("worker_bundle_manifest"), cell_source.bundle_manifest, "worker bundle manifest")
     _require_equal(bundle_package.get("name"), contract.get("worker_bundle_package"), "worker bundle package")
-    if "eliot-native-worker-core" not in bundle_dependencies:
-        raise RegistryError(
-            "WORKER_BUNDLE_DEPENDENCY_MISSING",
-            f"{WORKER_BUNDLE_MANIFEST_RELATIVE} does not depend on {source_package}",
-        )
+    for dependency in cell_source.required_bundle_dependencies:
+        if dependency not in bundle_dependencies:
+            raise RegistryError(
+                "WORKER_BUNDLE_DEPENDENCY_MISSING",
+                f"{cell_source.bundle_manifest} does not depend on {dependency}",
+            )
+    if not cell_source.required_bundle_dependencies:
+        # A cell whose source package *is* its own hosting process module has no
+        # dependency edge to require; the honest check is that the manifest named
+        # as the bundle really is that package, not a second one. The package-name
+        # equality above already proved exactly that, so there is nothing further
+        # to invent here.
+        if cell_source.bundle_manifest != cell_source.manifest:
+            raise RegistryError(
+                "WORKER_BUNDLE_DEPENDENCY_MISSING",
+                f"{cell_source.key} declares no hosting dependency but its bundle manifest "
+                f"{cell_source.bundle_manifest} is not its own source manifest",
+            )
 
     proof_entrypoint = metadata.get("proof_entrypoint")
     if not isinstance(proof_entrypoint, str) or not proof_entrypoint.strip():
-        raise RegistryError("PROOF_ENTRYPOINT_MISSING", WORKER_MANIFEST_RELATIVE)
+        raise RegistryError("PROOF_ENTRYPOINT_MISSING", cell_source.manifest)
     _require_equal(
         contract.get("proof_entrypoint_source"),
         "package.metadata.eliot.proof_entrypoint",
@@ -477,9 +612,11 @@ def load_worker_registry(root: Path) -> tuple[str, dict[str, object], str, str]:
         "conservative proof ceiling",
     )
 
+    capsule_relatives = {
+        name: f"{cell_source.capsule_root}/{name}.json" for name in ARTIFACT_KINDS
+    }
     capsules = {
-        name: parse_capsule(root, relative)
-        for name, relative in WORKER_CAPSULES.items()
+        name: parse_capsule(root, relative) for name, relative in capsule_relatives.items()
     }
     kit = capsules["contract_kit"]
     context = capsules["context_capsule"]
@@ -489,18 +626,18 @@ def load_worker_registry(root: Path) -> tuple[str, dict[str, object], str, str]:
     _require_equal(test.get("artifact_kind"), "ModuleTestCapsule", "test-capsule kind")
     for name, capsule in capsules.items():
         _require_equal(capsule.get("cell_id"), cell, f"{name} cell id")
-    kit_identity = _table(kit.get("crate_or_cell_identity"), "crate_or_cell_identity", WORKER_CAPSULES["contract_kit"])
+    kit_identity = _table(kit.get("crate_or_cell_identity"), "crate_or_cell_identity", capsule_relatives["contract_kit"])
     _require_equal(kit_identity.get("functional_capability_cell"), cell, "contract-kit cell")
     _require_equal(kit_identity.get("source_package"), source_package, "contract-kit package")
-    context_package = _table(context.get("primary_source_package"), "primary_source_package", WORKER_CAPSULES["context_capsule"])
+    context_package = _table(context.get("primary_source_package"), "primary_source_package", capsule_relatives["context_capsule"])
     _require_equal(context_package.get("package"), source_package, "context-capsule package")
-    test_proof = _table(test.get("independent_proof_entrypoint"), "independent_proof_entrypoint", WORKER_CAPSULES["test_capsule"])
+    test_proof = _table(test.get("independent_proof_entrypoint"), "independent_proof_entrypoint", capsule_relatives["test_capsule"])
     _require_equal(test_proof.get("package"), source_package, "test-capsule package")
-    test_entrypoint = _table(test_proof.get("entrypoint"), "entrypoint", WORKER_CAPSULES["test_capsule"])
+    test_entrypoint = _table(test_proof.get("entrypoint"), "entrypoint", capsule_relatives["test_capsule"])
     _require_equal(test_entrypoint.get("value"), proof_entrypoint, "test-capsule proof entrypoint")
     _require_equal(context.get("bound_contract_digest"), kit.get("artifact_digest"), "context contract digest")
     _require_equal(test.get("bound_contract_digest"), kit.get("artifact_digest"), "test contract digest")
-    test_ceiling = _table(test.get("proof_level_ceiling"), "proof_level_ceiling", WORKER_CAPSULES["test_capsule"])
+    test_ceiling = _table(test.get("proof_level_ceiling"), "proof_level_ceiling", capsule_relatives["test_capsule"])
     _require_equal(test_ceiling.get("state"), "UNDECLARED", "test-capsule proof ceiling status")
 
     pair = parse_toml(root, NORMATIVE_PAIR_RELATIVE)
@@ -523,22 +660,22 @@ def load_worker_registry(root: Path) -> tuple[str, dict[str, object], str, str]:
     if any(component > 65535 for component in revision):
         raise RegistryError("CONTRACT_REVISION_INVALID", revision_text)
 
-    manifest = _table(contract.get("manifest"), "manifest", WORKER_CONTRACT_RELATIVE)
+    manifest = _table(contract.get("manifest"), "manifest", cell_source.contract)
     manifest_owner = manifest.get("owner")
     capsule_presence: dict[str, object] = {}
-    for field in ("contract_kit", "context_capsule", "test_capsule"):
-        expected_path = WORKER_CAPSULES[field]
+    for field in ARTIFACT_KINDS:
+        expected_path = capsule_relatives[field]
         _require_equal(manifest.get(field), expected_path, f"manifest {field} path")
         capsule_presence[field] = {"present": True, "owner": manifest_owner}
 
     contract_digest = sha256_hex(canonical_json(contract))
-    tree_digest = _source_tree_digest(root, capsules)
+    tree_digest = _source_tree_digest(root, cell_source, capsules)
     lock_digest = sha256_hex(read_bytes(root, "Cargo.lock").replace(b"\r\n", b"\n"))
     toolchain = _worker_toolchain()
     state = contract.get("owned_state")
     state_owner = contract.get("state_owner")
     if not isinstance(state, str) or not state.strip() or not isinstance(state_owner, str):
-        raise RegistryError("STATE_OWNERSHIP_MISSING", WORKER_CONTRACT_RELATIVE)
+        raise RegistryError("STATE_OWNERSHIP_MISSING", cell_source.contract)
 
     record: dict[str, object] = {
         "cell": cell,
@@ -550,7 +687,7 @@ def load_worker_registry(root: Path) -> tuple[str, dict[str, object], str, str]:
         "stateless": contract.get("stateless"),
         "state_owners": [{"state": state, "owner": state_owner}],
         "contract_digest": contract_digest,
-        "contract_digest_source": f"{WORKER_CONTRACT_RELATIVE}#contract-surface",
+        "contract_digest_source": f"{cell_source.contract}#contract-surface",
         "runtime_bundle": contract.get("runtime_bundle"),
         "execution_contour": contract.get("execution_contour"),
         "allowed_effect_classes": contract.get("allowed_effect_classes"),
@@ -589,31 +726,33 @@ def load_worker_registry(root: Path) -> tuple[str, dict[str, object], str, str]:
     )
 
 
-def replace_worker_registry_block(source: str, generated: str) -> str:
-    begin = source.find(WORKER_REGISTRY_BEGIN)
-    end = source.find(WORKER_REGISTRY_END)
+def replace_registry_block(
+    cell_source: CellSource, source: str, generated: str
+) -> str:
+    begin = source.find(cell_source.begin_marker)
+    end = source.find(cell_source.end_marker)
     if begin < 0 or end < 0 or end < begin:
         raise RegistryError(
-            "WORKER_REGISTRY_MARKERS_MISSING", WORKER_REGISTRY_RELATIVE
+            "WORKER_REGISTRY_MARKERS_MISSING", cell_source.registry
         )
-    end += len(WORKER_REGISTRY_END)
+    end += len(cell_source.end_marker)
     return source[:begin] + generated + source[end:]
 
 
-def emit_worker_registry(root: Path) -> tuple[str, str]:
-    source = read_text(root, WORKER_REGISTRY_RELATIVE)
-    registry_json, _record, cell, package = load_worker_registry(root)
+def emit_cell_registry(root: Path, cell_source: CellSource) -> tuple[str, str]:
+    source = read_text(root, cell_source.registry)
+    registry_json, _record, cell, package = load_cell_registry(root, cell_source)
     newline = "\r\n" if "\r\n" in source else "\n"
     generated = newline.join(
         (
-            WORKER_REGISTRY_BEGIN,
-            f'const {WORKER_CELL_ID_MARKER}: &str = {json.dumps(cell)};',
-            f'const {WORKER_PACKAGE_MARKER}: &str = {json.dumps(package)};',
-            f'const {WORKER_REGISTRY_MARKER}: &str = {rust_raw_string(registry_json)};',
-            WORKER_REGISTRY_END,
+            cell_source.begin_marker,
+            f'const {cell_source.cell_id_marker}: &str = {json.dumps(cell)};',
+            f'const {cell_source.package_marker}: &str = {json.dumps(package)};',
+            f'const {cell_source.registry_marker}: &str = {rust_raw_string(registry_json)};',
+            cell_source.end_marker,
         )
     )
-    return source, replace_worker_registry_block(source, generated)
+    return source, replace_registry_block(cell_source, source, generated)
 
 
 def emit(root: Path) -> tuple[str, str]:
@@ -643,15 +782,26 @@ def main(argv: list[str]) -> int:
     root = args.root.resolve()
     try:
         committed, regenerated = emit(root)
-        bootstrap_committed, bootstrap_regenerated = emit_worker_registry(root)
+        # Every declared cell is projected into its own generated sink and gated
+        # in the same pass, so a second cell can never be committed while the
+        # first one is stale.
+        cell_blocks = [
+            (cell_source, *emit_cell_registry(root, cell_source))
+            for cell_source in CELL_SOURCES
+        ]
     except RegistryError as error:
         print(f"CAPABILITY_CELL_REGISTRY_{error.reason}: {error}", file=sys.stderr)
         return 2
-    if regenerated == committed and bootstrap_regenerated == bootstrap_committed:
+    stale = regenerated != committed or any(
+        cell_committed != cell_regenerated
+        for _cell_source, cell_committed, cell_regenerated in cell_blocks
+    )
+    sinks = " ".join(cell_source.registry for cell_source, _c, _r in cell_blocks)
+    if not stale:
         print(
             "CAPABILITY_CELL_REGISTRY_GENERATE: IN_SYNC "
             f"source={MANIFEST_RELATIVE} contract={CONTRACT_RELATIVE} "
-            f"worker_registry={WORKER_REGISTRY_RELATIVE}"
+            f"registries={sinks}"
         )
         return 0
     if args.check:
@@ -663,14 +813,13 @@ def main(argv: list[str]) -> int:
         return 1
     if regenerated != committed:
         (root / CONTRACT_RELATIVE).write_bytes(regenerated.encode("utf-8"))
-    if bootstrap_regenerated != bootstrap_committed:
-        (root / WORKER_REGISTRY_RELATIVE).write_bytes(
-            bootstrap_regenerated.encode("utf-8")
-        )
+    for cell_source, cell_committed, cell_regenerated in cell_blocks:
+        if cell_regenerated != cell_committed:
+            (root / cell_source.registry).write_bytes(cell_regenerated.encode("utf-8"))
     print(
         "CAPABILITY_CELL_REGISTRY_GENERATE: WROTE "
         f"source={MANIFEST_RELATIVE} contract={CONTRACT_RELATIVE} "
-        f"worker_registry={WORKER_REGISTRY_RELATIVE}"
+        f"registries={sinks}"
     )
     return 0
 

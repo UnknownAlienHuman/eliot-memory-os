@@ -1,0 +1,192 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "mod-research-provider",
+  "product_objective": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_objective",
+    "value": null
+  },
+  "functional_capability_cell_refs": [
+    "mod-research-provider"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/mod-research-provider",
+  "primary_source_package": {
+    "package": "eliot-mod-research",
+    "root_path": "bins/eliot-mod-research",
+    "manifest_path": "bins/eliot-mod-research/Cargo.toml",
+    "module_manifest": null,
+    "description": "Kernel-gated ELIOT Researcher provider process; fails closed when the Kernel front door is unreachable or a reply does not verify"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 123597,
+    "test_stu": 0,
+    "selected_file_count": 10,
+    "inline_cfg_test_modules": 6,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "bins/eliot-mod-research/src/admission.rs",
+        "bytes": 34213,
+        "sha256": "a5ab700934864a5ebde48c1003d9e3c8d01e692065f6dc6aef73aef617e1ca3b",
+        "stu": 11405,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliot-mod-research/src/capability_cell.rs",
+        "bytes": 9326,
+        "sha256": "7de5e6bd561092c5ad3a111fe34463b8b6259c260fefa9ef165ed7fd1d7b057e",
+        "stu": 3109,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliot-mod-research/src/dispatch_authority.rs",
+        "bytes": 23767,
+        "sha256": "627e4c08ac92e94b40771a3eaf16b1e03efd9ec1837da6d363a2870cbfe16f91",
+        "stu": 7923,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliot-mod-research/src/dispatched_material.rs",
+        "bytes": 10837,
+        "sha256": "578e332174e71971c71f90aa7371e78e213a11f88b6817194c8eb2e1812376d0",
+        "stu": 3613,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliot-mod-research/src/evidence.rs",
+        "bytes": 36369,
+        "sha256": "a45c53a9569507fe5b900c99177fa406eb95fad1acd61641adb263b2674da9c2",
+        "stu": 12123,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliot-mod-research/src/execution.rs",
+        "bytes": 62222,
+        "sha256": "26fce8a39b5ff39e042f6e58ee2dcdf522f25d7c53a82d12d7676b26eb5592db",
+        "stu": 20741,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliot-mod-research/src/kernel_client.rs",
+        "bytes": 31592,
+        "sha256": "c22a689eb6a531f62d7e3d2620db2439a3f7dee35bab7e6cdef7f50ccbb048bc",
+        "stu": 10531,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliot-mod-research/src/lib.rs",
+        "bytes": 97257,
+        "sha256": "ff4966671e89f0f2fb38cac858f7c0e4d79deab569500c9b01734909ed762227",
+        "stu": 32419,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliot-mod-research/src/main.rs",
+        "bytes": 36156,
+        "sha256": "1512d742fd51df4e9984984cb224078a5d7fa6968db99a84ae48e2ee05cb5440",
+        "stu": 12052,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliot-mod-research/src/protocol.rs",
+        "bytes": 29051,
+        "sha256": "3b2f053a2db343dd0294d46f1bb50e35c0f65457d6fbdb6ca1286fdd7ae50872",
+        "stu": 9684,
+        "inline_cfg_test": true
+      }
+    ],
+    "selected_tests": [],
+    "source_selection_digest": "c4d6ace6d7798c8a303f313d4175eb045265a2de54ae3c889a699d75a6b27054"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-ipc",
+    "eliot-kernel-service",
+    "eliot-platform",
+    "eliot-platform-windows",
+    "eliot-process",
+    "eliot-process-executor",
+    "eliot-protocol",
+    "eliot-receipts",
+    "eliot-research-exchange",
+    "eliot-research-exchange-api",
+    "eliot-researcher",
+    "serde",
+    "serde_json",
+    "sha2",
+    "thiserror",
+    "tokio"
+  ],
+  "one_hop_consumers": [],
+  "architecture_implementation_refs": [
+    {
+      "block": "research-acquisition",
+      "title": "Research acquisition",
+      "responsibility": "Governed external-corpus acquisition, research exchange contracts, provider process, and evidence handoff.",
+      "documentation_handles": [
+        "I21.1"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "fb418f6a9b83f836cf02da3b6c45afdcd4a858efb6bd01280fe361aceabd0e7c",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "bins/eliot-mod-research/Cargo.toml",
+        "sha256": "941c7da644b791d7715c82d05abee434d1bb23908c84b0538a49ac6e08595d28"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 10,
+        "sha256": "c4d6ace6d7798c8a303f313d4175eb045265a2de54ae3c889a699d75a6b27054"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "5e1cc922f638965cd1ea7885c96dabf7ff7acd4c98234eaf7383a19afe66e705",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "5e1cc922f638965c"
+  }
+}
