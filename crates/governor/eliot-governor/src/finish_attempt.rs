@@ -266,9 +266,9 @@ impl PreparedKernelExchange {
             }
             Err(error) => return Err(error.into()),
         };
-        outcome
-            .validate()
-            .map_err(|error| FinishAttemptError::Kernel(KernelPortError::Contract(error.to_string())))?;
+        outcome.validate().map_err(|error| {
+            FinishAttemptError::Kernel(KernelPortError::Contract(error.to_string()))
+        })?;
         match &outcome {
             eliot_store_api::PreparedWriteOutcome::Staged(submission) => {
                 if submission.operation_id != self.operation_id

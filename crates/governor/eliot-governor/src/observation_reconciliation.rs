@@ -1140,7 +1140,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
         let original_content: ObservationContentWire =
             serde_json::from_value(input.original_content.clone()).map_err(|error| {
                 owner_refused(format!("MCP ObservationContent shape is invalid: {error}"))
-        })?;
+            })?;
         validate_observation_content(&original_content)?;
         validate_observation_write_source(input, &original_content)?;
         let observed_delta = String::from_utf8(
