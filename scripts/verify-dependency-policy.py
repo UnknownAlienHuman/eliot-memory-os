@@ -30,6 +30,7 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 
 
@@ -3533,6 +3534,8 @@ def _validate_patched_candidate(
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate status must describe project-local artifact provisioning"))
     if candidate.get("provisioning") != "project_local_provisioner":
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate must use the project-local provisioner"))
+    if candidate.get("installation_approval") != "not-issued":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate installation_approval is not 'not-issued': the 3.1.4 baseline versus 3.2.0 candidate approval distinction is explicit and the candidate is never installed without a separately issued approval"))
     if candidate.get("name") != surreal.get("name"):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate name must match the external executable"))
     if candidate.get("architecture") != "windows-x64" or candidate.get("pe_machine") != "8664":
@@ -4901,6 +4904,36 @@ def run_cargo_deny(
     configured_checks = scanner_info.get("checks")
     if not _has_exact_scanner_checks(configured_checks):
         scanner_config_errors.append("[scanner].checks must contain advisories, bans, licenses and sources exactly once")
+    provenance_source = scanner_info.get("release_source")
+    provenance_asset = scanner_info.get("release_asset")
+    if not isinstance(provenance_source, str) or not provenance_source.strip():
+        scanner_config_errors.append("[scanner].release_source must declare the exact scanner release provenance")
+    if not isinstance(provenance_asset, str) or not provenance_asset.strip():
+        scanner_config_errors.append("[scanner].release_asset must declare the exact scanner release asset")
+    else:
+        parsed_asset = urlparse(provenance_asset)
+        if parsed_asset.scheme != "https" or not parsed_asset.netloc:
+            scanner_config_errors.append("[scanner].release_asset must be an absolute https URL")
+        else:
+            if not isinstance(provenance_source, str) or (parsed_asset.scheme + "://" + parsed_asset.netloc + "/" not in provenance_source.rstrip("/") + "/"):
+                scanner_config_errors.append("[scanner].release_asset is not published by the declared [scanner].release_source")
+            if expected_version and expected_version not in parsed_asset.path:
+                scanner_config_errors.append("[scanner].release_asset does not carry the pinned [scanner].version")
+    if not _HEX64.fullmatch(str(scanner_info.get("release_asset_sha256", "")).lower()):
+        scanner_config_errors.append("[scanner].release_asset_sha256 must be a 64-character hexadecimal digest")
+    archive_member = scanner_info.get("archive_member")
+    if not isinstance(archive_member, str) or not archive_member.strip() or archive_member.startswith("/") or ".." in Path(archive_member).parts:
+        scanner_config_errors.append("[scanner].archive_member must be a relative in-archive path")
+    artifact_path_value = scanner_info.get("artifact_path")
+    if not isinstance(artifact_path_value, str) or not artifact_path_value.strip():
+        scanner_config_errors.append("[scanner].artifact_path must declare the project-local scanner materialization path")
+    else:
+        normalized_artifact = artifact_path_value.replace("\\", "/")
+        artifact_relative = PurePosixPath(normalized_artifact)
+        if artifact_relative.is_absolute() or ".." in artifact_relative.parts or not normalized_artifact.startswith(".eliot/dependency-policy/cargo-deny/"):
+            scanner_config_errors.append("[scanner].artifact_path must stay under the project-local scanner evidence root")
+        elif artifact_relative.name not in {executable_name, f"{executable_name}.exe"}:
+            scanner_config_errors.append("[scanner].artifact_path must name the declared scanner executable")
 
     option_args, option_evidence, config_errors = _rust_policy_options(root, rust_policy)
     execution.update(option_evidence)
