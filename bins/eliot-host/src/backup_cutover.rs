@@ -796,8 +796,11 @@ pub enum CutoverResidual {
     /// read, and the bounded recheck did not re-prove the pair. There is no
     /// cross-store atomic read guarantee, so a positive claim built from the
     /// torn pair would be an impossible state, not a fact. Refusals are still
-    /// reported — only the effect- and history-bearing dispositions require a
-    /// coherent pair. A failed journal READ is a different thing and is
+    /// reported — but a coherent pair is required before the mapper may settle
+    /// on the effect- and history-bearing dispositions, before it may attribute
+    /// a target pointer to this operation, and before it may answer the
+    /// unqualified pre-effect `Requested`. A torn pair answers movement in all
+    /// three cases. A failed journal READ is a different thing and is
     /// propagated as an error, never reported as movement.
     ConcurrentOwnerMovement,
     /// No owner can state which Host epoch carried this cutover's exact
@@ -4213,8 +4216,11 @@ fn retire_prior_generation(
 /// today. The variant stays in the closed result vocabulary because the issue
 /// requires the vocabulary to be preserved and versioned rather than silently
 /// narrowed, but it is currently unreachable, and nothing may cite it as a
-/// reachable outcome. When no owner observation establishes anything, the honest
-/// answer is `Requested` — qualification unavailable, not "validated".
+/// reachable outcome. When no owner observation establishes anything AND the
+/// journal/registry pair was read as one moment, the honest answer is
+/// `Requested` — qualification unavailable, not "validated". A torn pair
+/// answers `Unknown` with `ConcurrentOwnerMovement` instead, because the
+/// missing observation may simply have landed after the sampled read.
 ///
 /// (Do not confuse this variant with `ValidatedCutover`, which does exist and is
 /// used on the execute path: that is a sealed pre-effect validation value the
@@ -4243,9 +4249,12 @@ fn retire_prior_generation(
 /// progress.
 ///
 /// `coherence` gates the effect- and history-bearing dispositions
-/// (`Reconciled`, `RetirementPending`, `Prepared`) and the one attribution
+/// (`Reconciled`, `RetirementPending`, `Prepared`), the attribution
 /// absence a torn read cannot honestly assert (a target pointer with no durable
-/// intent at all). A refusal backed by a durable record of THIS operation is
+/// intent at all), and the unqualified pre-effect answer `Requested` — a missing
+/// observation is not an absence the read actually made, so a torn pair names
+/// movement rather than reporting one. A refusal backed by a durable record of
+/// THIS operation is
 /// still reported when the pair was torn, because such a refusal never claims an
 /// effect; a positive claim is not, because the journal and the registry have no
 /// shared transaction and a torn pair can combine into a state that never

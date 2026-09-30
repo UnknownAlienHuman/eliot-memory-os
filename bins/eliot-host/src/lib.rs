@@ -6881,8 +6881,9 @@ impl HostComposition {
     /// [`crate::backup_cutover::CutoverOutcome::residual`] names whatever
     /// uncertainty the owners left behind. No caller assertion is accepted: this
     /// port takes no `validated` flag, so the pure mapper cannot certify
-    /// qualification from a caller's word, and an unqualified read answers
-    /// `Requested`. The optional `retirement_receipt`
+    /// qualification from a caller's word, and a COHERENT unqualified read
+    /// answers `Requested` while a torn journal/registry pair answers
+    /// `Unknown` with `ConcurrentOwnerMovement`. The optional `retirement_receipt`
     /// is a lookup HINT, never the proof: it is believed only when it names the
     /// transaction identity the journal owner computed for the record it
     /// resolved, so an unrelated genuine `AppendReceipt` cannot produce
