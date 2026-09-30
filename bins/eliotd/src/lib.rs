@@ -1138,6 +1138,13 @@ impl DaemonComposition {
             eliot_workscope::RequestedEffect::CanonicalWrite,
         )
         .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
+        // Issue #1746 (W4/A5): the live Governor kernel-snapshot fence is read
+        // once for this gate. The activation applicability recheck and the
+        // effect-gate revalidation below both run against it, never against
+        // the caller-presented readiness fence (I4.2.1: "`MATCHED` is required
+        // again after any generation change that can alter the real target of
+        // the task").
+        let live_fence = self.governor.kernel_snapshot().state_fence();
         let admission = if crate::task_binding_admission::envelope_is_task_relative(&envelope) {
             // Issue #1746 (W4/A2): a task-relative write is admitted only
             // against the live Governor-resolved activation, never on the
@@ -1171,6 +1178,7 @@ impl DaemonComposition {
                 &envelope,
                 readiness.receipt,
                 readiness.fence,
+                &live_fence,
                 activation.as_ref(),
             )?
         } else {
@@ -1226,7 +1234,6 @@ impl DaemonComposition {
         // through untouched.
         if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) = &admission
         {
-            let live_fence = self.governor.kernel_snapshot().state_fence();
             crate::task_binding_admission::revalidate_task_bound_for_effect(
                 &binding.evidence,
                 Some(binding.admitted_task_ref.as_str()),
