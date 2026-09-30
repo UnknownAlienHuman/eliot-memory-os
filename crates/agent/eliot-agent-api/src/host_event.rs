@@ -37,7 +37,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::route_receipts::{COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION, CommittedRouteEvidenceRelation};
+use crate::route_receipts::{
+    COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION, CommittedRouteEvidenceRelation,
+};
 use crate::{
     CancelReason, CancellationState, ContractError, EventCursor, EventId, ExecutionUnit,
     ProviderExecutionBinding, ProviderObservationLineage, UsageReceipt,
@@ -1466,10 +1468,9 @@ impl CommittedHostEventIntake {
     ) -> Option<CommittedRouteBindingDisposition> {
         match (lineage, route_evidence) {
             (ProviderObservationLineage::SessionObservation(_), _) => None,
-            (
-                ProviderObservationLineage::ExecutionUnitObservation(_),
-                Some(relation),
-            ) if relation.schema_version == COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION => {
+            (ProviderObservationLineage::ExecutionUnitObservation(_), Some(relation))
+                if relation.schema_version == COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION =>
+            {
                 Some(CommittedRouteBindingDisposition::Verified)
             }
             (ProviderObservationLineage::ExecutionUnitObservation(_), _) => {
@@ -1552,10 +1553,9 @@ impl CommittedHostEventIntake {
                 }
                 Ok(())
             }
-            (
-                ProviderObservationLineage::ExecutionUnitObservation(_),
-                Some(relation),
-            ) if relation.schema_version == COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION => {
+            (ProviderObservationLineage::ExecutionUnitObservation(_), Some(relation))
+                if relation.schema_version == COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION =>
+            {
                 if self.route_binding_disposition
                     != Some(CommittedRouteBindingDisposition::Verified)
                 {
