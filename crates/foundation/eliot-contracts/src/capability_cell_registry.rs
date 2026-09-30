@@ -779,15 +779,32 @@ pub enum CapabilityCellProofError {
         presented: String,
     },
     /// The declared record carries no independently invokable proof entrypoint.
+    ///
+    /// This is the presence arm of the entrypoint comparison, and it still names
+    /// what the caller was looking for: a refusal that reported only "absent"
+    /// would discard the very value whose absence is the finding.
     MissingProofEntrypoint {
         /// Cell identity whose record has no proof entrypoint.
         cell: String,
+        /// Proof entrypoint the caller declared and the record failed to carry.
+        expected: String,
     },
     /// The declared record's current-support claim is stale or suspended, or it
     /// names an invalidation reason, so its proof surface is not current.
+    ///
+    /// Carries the observed support claim, the claim the caller declared, and
+    /// the invalidation reasons, so the refusal says which comparison failed and
+    /// on what evidence rather than only that the surface is not current.
     StaleProofSurface {
         /// Cell identity whose record support claim is not current.
         cell: String,
+        /// Support claim the record carries.
+        declared: SupportStatus,
+        /// Support claim the caller declared.
+        expected: SupportStatus,
+        /// Invalidation reasons the record names; empty when the support claim
+        /// itself is stale or suspended.
+        invalidation: Vec<String>,
     },
     /// The declared record's proof entrypoint is not the one the caller
     /// independently declared. Presence is not a proof surface: any non-empty
@@ -846,13 +863,19 @@ impl fmt::Display for CapabilityCellProofError {
                 formatter,
                 "capability cell '{cell}' record names source crate '{declared}', not '{presented}'"
             ),
-            Self::MissingProofEntrypoint { cell } => write!(
+            Self::MissingProofEntrypoint { cell, expected } => write!(
                 formatter,
-                "capability cell '{cell}' declares no independently invokable proof entrypoint"
+                "capability cell '{cell}' declares no independently invokable proof entrypoint; the declared entrypoint is '{expected}'"
             ),
-            Self::StaleProofSurface { cell } => write!(
+            Self::StaleProofSurface {
+                cell,
+                declared,
+                expected,
+                invalidation,
+            } => write!(
                 formatter,
-                "capability cell '{cell}' proof surface is not currently supported"
+                "capability cell '{cell}' proof surface is not currently supported (support={declared:?} declared={expected:?} invalidation=[{}])",
+                invalidation.join(",")
             ),
             Self::ProofEntrypointMismatch {
                 cell,
@@ -1304,7 +1327,10 @@ impl CapabilityCellRegistry {
         // reported as missing, and one that names a different entrypoint is
         // reported as a mismatch rather than accepted as "some proof surface".
         let proof_entrypoint = record.proof_entrypoint.clone().ok_or_else(|| {
-            CapabilityCellProofError::MissingProofEntrypoint { cell: cell.clone() }
+            CapabilityCellProofError::MissingProofEntrypoint {
+                cell: cell.clone(),
+                expected: expected.proof_entrypoint().as_str().to_owned(),
+            }
         })?;
         if proof_entrypoint != *expected.proof_entrypoint() {
             return Err(CapabilityCellProofError::ProofEntrypointMismatch {
@@ -1318,7 +1344,17 @@ impl CapabilityCellRegistry {
             SupportStatus::Stale | SupportStatus::Suspended
         ) || !record.freshness.invalidation.is_empty()
         {
-            return Err(CapabilityCellProofError::StaleProofSurface { cell });
+            return Err(CapabilityCellProofError::StaleProofSurface {
+                cell,
+                declared: record.freshness.current_support,
+                expected: expected.current_support(),
+                invalidation: record
+                    .freshness
+                    .invalidation
+                    .iter()
+                    .map(|reason| reason.as_str().to_owned())
+                    .collect(),
+            });
         }
         if record.freshness.current_support != expected.current_support() {
             return Err(CapabilityCellProofError::SupportMismatch {

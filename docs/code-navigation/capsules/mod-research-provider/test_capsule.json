@@ -96,7 +96,7 @@
     "test_stu": 0,
     "nonzero": true
   },
-  "bound_contract_digest": "33b01cb89b4123ac60b6eb227bbf51bf05dc121eea0cc4af194a21a0b40a7630",
+  "bound_contract_digest": "b8e5e3eebfdde065821e9d344f2708e150ece5e7a0d065a8269614254e181d76",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
@@ -122,15 +122,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 10,
-        "sha256": "5a0a3d3678da48b1a9354863919b3a3d0fb2e2cfc38a70f2a24a3fb4c5a75a52"
+        "sha256": "c962200d5bf22521ea593a31d53b8bfa1a314dd9c73feba0982fb52cc4d3a5a5"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "65c20bb7fff6a33e12e5f0ab772fb89978e119cf584e748b3fb181b19c7d39a9",
+  "artifact_digest": "1aa809f2f41a9c4be90fc3392e2edcf3c24775bab294f83d303755136423f636",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "65c20bb7fff6a33e"
+    "value": "1aa809f2f41a9c4b"
   }
 }

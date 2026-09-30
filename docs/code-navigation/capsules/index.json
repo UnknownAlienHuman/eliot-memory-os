@@ -5694,20 +5694,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/contract_kit.json",
-          "artifact_digest": "42ce1d4480700bddecfec6b255c60d9510e435715318818214915a25e1bc6076",
-          "contract_revision": "42ce1d4480700bdd"
+          "artifact_digest": "63763c3945b56c7af8253f490719845481a81a5f57bcfa0a716924822d539f0b",
+          "contract_revision": "63763c3945b56c7a"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/context_capsule.json",
-          "artifact_digest": "b6aa09cfb6d60736448d7d52e7fd3697dce36f2bf8e8716bdc8787c83459ff75",
-          "contract_revision": "b6aa09cfb6d60736"
+          "artifact_digest": "43127094fd22ab4ba6da5947aee4449d1493e991b174b4ae7816fda8a637572c",
+          "contract_revision": "43127094fd22ab4b"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/test_capsule.json",
-          "artifact_digest": "57756a56d86837065d870ad4266d58966c188998afca56a0a49760513c8094ac",
-          "contract_revision": "57756a56d8683706"
+          "artifact_digest": "7e193d6936acb5b307f5416041a0444f745d93bd9f551fae82a7fe50ec080a35",
+          "contract_revision": "7e193d6936acb5b3"
         }
       }
     },
@@ -5733,20 +5733,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/contract_kit.json",
-          "artifact_digest": "fe2ce1a6e722b969277798f3e1e5e1da0629e1b0344d549e81e27c446f43628a",
-          "contract_revision": "fe2ce1a6e722b969"
+          "artifact_digest": "573403350c190a5d97fe3e2e01a82d6a17d85e5f868f62de1f708c01f6887d89",
+          "contract_revision": "573403350c190a5d"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/context_capsule.json",
-          "artifact_digest": "65a4e186f764c53035a431c8b1c8c4fd132215e48a839557ab94ec11383f3d36",
-          "contract_revision": "65a4e186f764c530"
+          "artifact_digest": "f0836642a730ec802d091e8205be10f524ddcb755c35647fe52b1b7f44fc98cc",
+          "contract_revision": "f0836642a730ec80"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/test_capsule.json",
-          "artifact_digest": "6f325106990ce45e50b7e86374d3df550be52d71a6b0c8d18cba5bfb71a512de",
-          "contract_revision": "6f325106990ce45e"
+          "artifact_digest": "3a3be97f9c54f88f7d7f5f6aed004fc77b4ba819b49017ea17a0c30df943039a",
+          "contract_revision": "3a3be97f9c54f88f"
         }
       }
     },
@@ -5772,20 +5772,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/contract_kit.json",
-          "artifact_digest": "52d7846cfb6f6ba2505aea6fe072e64031e791b7febde64fbb8dcfe93d1e5aa7",
-          "contract_revision": "52d7846cfb6f6ba2"
+          "artifact_digest": "4e13ee9e16928cc7aac18f2f580419756ccce5ac1a32a666f6bf497aef6b5d41",
+          "contract_revision": "4e13ee9e16928cc7"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/context_capsule.json",
-          "artifact_digest": "8b050cdb55d2632904e2193ece0dac0ef70269e80ae073dfab419e8322ecdea1",
-          "contract_revision": "8b050cdb55d26329"
+          "artifact_digest": "5b591035d02b8e6c6db25d4ac6065789bbe5388a6de292211bf42416503e7f1b",
+          "contract_revision": "5b591035d02b8e6c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/test_capsule.json",
-          "artifact_digest": "b636dcec98faed859208951639b2a4a42bfe7cf86b25f1e3b606041d8a57ab80",
-          "contract_revision": "b636dcec98faed85"
+          "artifact_digest": "3518ff7e1ad8fc003577f2e08d01609a9033161a8507ccde93f4c20b5d39b708",
+          "contract_revision": "3518ff7e1ad8fc00"
         }
       }
     },
@@ -5811,20 +5811,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/contract_kit.json",
-          "artifact_digest": "b74558e325750d9917dbdb220ce34cf6882ff164b176c305816ccfc47c77843d",
-          "contract_revision": "b74558e325750d99"
+          "artifact_digest": "dccd166e4de33d44c8b62e19380b9cfe64df52c115d8fd2b56ba44b721ded828",
+          "contract_revision": "dccd166e4de33d44"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/context_capsule.json",
-          "artifact_digest": "cc203ebfb198cfd1da7a7d7de3c157bba12ab106c44f63abb7bb39a02a23acf9",
-          "contract_revision": "cc203ebfb198cfd1"
+          "artifact_digest": "61cf9018790c17cf9ea2a0488281c910da2e5dc6f88399bc0be441c7af58a114",
+          "contract_revision": "61cf9018790c17cf"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/test_capsule.json",
-          "artifact_digest": "e4f4a7603e8b74fe90d51962cd11e1e44ff4a1dab0f31c35aec369701bbcdbe4",
-          "contract_revision": "e4f4a7603e8b74fe"
+          "artifact_digest": "85b4d7cd6421744c03e3dc2790dda530bf03b7ab51a780be8475e41ceb0f59d2",
+          "contract_revision": "85b4d7cd6421744c"
         }
       }
     },
@@ -5850,20 +5850,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/contract_kit.json",
-          "artifact_digest": "deb16132ce9afb1a4be0a60f42585f960b1f17a2adfcd48d1157dd8d098d3ba4",
-          "contract_revision": "deb16132ce9afb1a"
+          "artifact_digest": "50ad63c2150b2cf2766fd9d2b997068f605ab55e6e8cdeb2fea3b592411e801e",
+          "contract_revision": "50ad63c2150b2cf2"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/context_capsule.json",
-          "artifact_digest": "a9cf33ffe704f4ab98841eaeb112d31088795a515d7fa40d28cad5ed7d3992eb",
-          "contract_revision": "a9cf33ffe704f4ab"
+          "artifact_digest": "2c2720ed8f152d3a11bf1c3d6cfd5ee304d040d29d3c55645c7253d868264021",
+          "contract_revision": "2c2720ed8f152d3a"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/test_capsule.json",
-          "artifact_digest": "fd303de10d13ed7ea1aec3d47309b5a1461feff22695bc15706640392c63c26e",
-          "contract_revision": "fd303de10d13ed7e"
+          "artifact_digest": "03ea9494a8472ed6a19720e447a7bf68e0afb80cf991474a3fa03d210f77951f",
+          "contract_revision": "03ea9494a8472ed6"
         }
       }
     },
@@ -5889,20 +5889,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/contract_kit.json",
-          "artifact_digest": "b5a733449b7792376849b054d3bf66ba2c3c54e6973bcbf08f01bdc57c6d91ad",
-          "contract_revision": "b5a733449b779237"
+          "artifact_digest": "c195431ea32c6ad461d85be3e57b6e29e4b6a2ce64fbf529ebb9f1e9dd518f8e",
+          "contract_revision": "c195431ea32c6ad4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/context_capsule.json",
-          "artifact_digest": "08e146c3d4151d2a1a2589bea917e33f62803dc2a90c3bda8531d27899fd0f72",
-          "contract_revision": "08e146c3d4151d2a"
+          "artifact_digest": "b8c0ac5abc672b97027f35adfd8dff107bb4238a97d15c9baea46fe5f25be454",
+          "contract_revision": "b8c0ac5abc672b97"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/test_capsule.json",
-          "artifact_digest": "7036f1d6fc11b41873e21dd36d58a2341fb28923389ad9da37ac98e6c956be7c",
-          "contract_revision": "7036f1d6fc11b418"
+          "artifact_digest": "98532ea7186ae490a779d7a6ad68ee417ff9f7521581be6bf9c9e208a33f9a6f",
+          "contract_revision": "98532ea7186ae490"
         }
       }
     },
@@ -5928,20 +5928,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/contract_kit.json",
-          "artifact_digest": "1ead3b6c5cfed0d2d66dcde13b9ed49f068208382a6a490c021be9194d810fb0",
-          "contract_revision": "1ead3b6c5cfed0d2"
+          "artifact_digest": "33963958f6594d535a2bf407b105894322de9e69b31ac54e7e4139a4fcfddbf1",
+          "contract_revision": "33963958f6594d53"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/context_capsule.json",
-          "artifact_digest": "14955ecaefa3efbe263547be587c03c02a18b94f74ae25da0c73e5b7cbf56b98",
-          "contract_revision": "14955ecaefa3efbe"
+          "artifact_digest": "45f8396835f5943fa93d192980f03f8dabe0cb8bfe49d8b24d9e654d3ddb8d07",
+          "contract_revision": "45f8396835f5943f"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/test_capsule.json",
-          "artifact_digest": "3378094d44ad2534a52727bf20974753445e1b33e4b6fd28c1f0519d58092e59",
-          "contract_revision": "3378094d44ad2534"
+          "artifact_digest": "6b3dc0c1923fa068e3836ecf91387ab6896185d87069d86aa562bfded9d3720f",
+          "contract_revision": "6b3dc0c1923fa068"
         }
       }
     },
@@ -5967,20 +5967,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/contract_kit.json",
-          "artifact_digest": "2c0c4cba75e17b09000fd4a1733197bcc2825719dc23ae5f24506347b216f110",
-          "contract_revision": "2c0c4cba75e17b09"
+          "artifact_digest": "8125c9288d955e763c6aaa912be38c67b964044cb1d80165a2316aa516875bc1",
+          "contract_revision": "8125c9288d955e76"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/context_capsule.json",
-          "artifact_digest": "946e9a5685478582c412b2c19e727a225714b033289de29ef1ae63949c8bc197",
-          "contract_revision": "946e9a5685478582"
+          "artifact_digest": "77af459a2c479a4537c22fcb75498c2d06968a8a4d4213a9a0fce5a36dda7aea",
+          "contract_revision": "77af459a2c479a45"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/test_capsule.json",
-          "artifact_digest": "80e49fd7549f960f170c614965937692fd10d40da78e8bcce1d7408d2d8bb262",
-          "contract_revision": "80e49fd7549f960f"
+          "artifact_digest": "4c4e891018d2fc712df6299ca39570f8c2a4b4f2059cddcc29c21b16c984abd9",
+          "contract_revision": "4c4e891018d2fc71"
         }
       }
     },
@@ -6045,20 +6045,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/contract_kit.json",
-          "artifact_digest": "898566a72b1cd52d147b39bbbd875f8ba99e40b6ad20a6d1a31d849477cf6d8b",
-          "contract_revision": "898566a72b1cd52d"
+          "artifact_digest": "f74d71f9f1d24fb1455b2094f4fd4e5ce47fdeb821468ec7554bcfcd4ebbeb45",
+          "contract_revision": "f74d71f9f1d24fb1"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/context_capsule.json",
-          "artifact_digest": "7691e4b9de157ef56919940157cd942a7e664603b8acaabe736bc07a7e8a929a",
-          "contract_revision": "7691e4b9de157ef5"
+          "artifact_digest": "918cd55c6560ed80f2976bb59cbbc5468aa672e9c17bc4a27162980de3f8449c",
+          "contract_revision": "918cd55c6560ed80"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/test_capsule.json",
-          "artifact_digest": "b591c989b8ab03ff3e440d96b08d28edcfa5e5cf3ec3d6457fde2f22485d5045",
-          "contract_revision": "b591c989b8ab03ff"
+          "artifact_digest": "acadc9ec4acfba9a2e532cc10c3064b6227ae47669e6c543e456643cbd96ec15",
+          "contract_revision": "acadc9ec4acfba9a"
         }
       }
     },
@@ -6240,20 +6240,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/contract_kit.json",
-          "artifact_digest": "0858b1fd31b2c524efdded911eab920e772b2a03893285b27c9b832f6f129a0a",
-          "contract_revision": "0858b1fd31b2c524"
+          "artifact_digest": "a762c0d24c97e271a0ef895321a6aea866c6a34eaeffee2ce814afe6dc89f99a",
+          "contract_revision": "a762c0d24c97e271"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/context_capsule.json",
-          "artifact_digest": "d3b371bd3d922a064e9fba216cf13f12f186b8d862b85983f83f5553c668fc32",
-          "contract_revision": "d3b371bd3d922a06"
+          "artifact_digest": "2f80b7411f7f039e887cd4edc5f91249d68ae3f6bc2fdc963b3b3f14065ea371",
+          "contract_revision": "2f80b7411f7f039e"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/test_capsule.json",
-          "artifact_digest": "c6d0aa9a6173e3fa5bacffccb38e4b287cee4511505f9290a2e92e0fb4d79076",
-          "contract_revision": "c6d0aa9a6173e3fa"
+          "artifact_digest": "4d7a17455acb53dceb124012f8e218725d24e9d709388e5575e6bd95114b92f5",
+          "contract_revision": "4d7a17455acb53dc"
         }
       }
     },
@@ -6318,20 +6318,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/contract_kit.json",
-          "artifact_digest": "6b86e8f703e54166751624a83c6119b2951236b1546080f1348ce8340fa9b7eb",
-          "contract_revision": "6b86e8f703e54166"
+          "artifact_digest": "c45454d9cf6fd5008903feb8f6745622da8b0802108fca80cf3542dfc236f692",
+          "contract_revision": "c45454d9cf6fd500"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/context_capsule.json",
-          "artifact_digest": "a7f1497337cf9258872f11b5aca5245890dc8740b3e678e410ea5e2186fd612a",
-          "contract_revision": "a7f1497337cf9258"
+          "artifact_digest": "ac019e8960095a62edcc75968a24c6263ab1c2bb97516d91c3313ed11010a761",
+          "contract_revision": "ac019e8960095a62"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/test_capsule.json",
-          "artifact_digest": "3f1918712ce4cfb6945aeebd96c52cd4d0bde3523fbb08dfdd824cf19b60402f",
-          "contract_revision": "3f1918712ce4cfb6"
+          "artifact_digest": "b31c90ce0f552a8eb05bae11b742649dbefab2e59feaf36579d0031d49cc3026",
+          "contract_revision": "b31c90ce0f552a8e"
         }
       }
     },
@@ -6357,20 +6357,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/contract_kit.json",
-          "artifact_digest": "79577569bda1b22c28289c9b612410fe288d16404c09c965852d322af8d90541",
-          "contract_revision": "79577569bda1b22c"
+          "artifact_digest": "915e38c9d541cab493237bec6a81a4378981ed85e8f8ae984dbea736f8091a72",
+          "contract_revision": "915e38c9d541cab4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/context_capsule.json",
-          "artifact_digest": "494dd7a762757363a693a23f05f50540a9156118a377cfa6823933b94c92ae98",
-          "contract_revision": "494dd7a762757363"
+          "artifact_digest": "f9ad8b1ce364e348a194c8bd7a55b77138a2759f9298e4e169750466dc09475f",
+          "contract_revision": "f9ad8b1ce364e348"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/test_capsule.json",
-          "artifact_digest": "16b19e8f25cf083af53cdba8996ffcb597b825633f0427c64b1b7799f5335729",
-          "contract_revision": "16b19e8f25cf083a"
+          "artifact_digest": "3c9d811cf26210382ddda9b0bd4f7cf500cd63a5588489c2e040b30f623a28f1",
+          "contract_revision": "3c9d811cf2621038"
         }
       }
     },
@@ -6396,20 +6396,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/contract_kit.json",
-          "artifact_digest": "93bde88d6be89769d7922d67d6d869117438de3becc5ca409be9d17cb42b4556",
-          "contract_revision": "93bde88d6be89769"
+          "artifact_digest": "7ddb9b996e2886150f23789e64935c126c49c06b7bf37b91dddaba1e63cd3a88",
+          "contract_revision": "7ddb9b996e288615"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/context_capsule.json",
-          "artifact_digest": "bc5b7e5cef55dc8198d3fff4b0e0b140802cb3c0cd9ff57fcbc5015bb04fc353",
-          "contract_revision": "bc5b7e5cef55dc81"
+          "artifact_digest": "46b50e71840310ee9de310e725d39fa1c7c06ef6311d21f647458146fff1a97f",
+          "contract_revision": "46b50e71840310ee"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/test_capsule.json",
-          "artifact_digest": "1cbec77f6db8912f04c4effde298dd397f87b9c29a4a5141a00a5b2380d28256",
-          "contract_revision": "1cbec77f6db8912f"
+          "artifact_digest": "1df80851db18d187476ba68d92b92b32e368e840ab00acdb1bc43686e625aa80",
+          "contract_revision": "1df80851db18d187"
         }
       }
     },
@@ -6435,20 +6435,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/contract_kit.json",
-          "artifact_digest": "aa6a86455a24b03972f52b4723f0f115c701423db76a322c13883eb79ef86ea9",
-          "contract_revision": "aa6a86455a24b039"
+          "artifact_digest": "2f2db78e1194b851b3ee04e013698136f064eb17c25102f3fb26fb47050e8798",
+          "contract_revision": "2f2db78e1194b851"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/context_capsule.json",
-          "artifact_digest": "2ba15c693196d571fd8c25e541c30b70915c82172225c5e452e69b6149fb8a6d",
-          "contract_revision": "2ba15c693196d571"
+          "artifact_digest": "1969aa6797e718e1bfdd8d7f2d69dbf71d0ff5da9ab34acbf5fcb37d583750bf",
+          "contract_revision": "1969aa6797e718e1"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/test_capsule.json",
-          "artifact_digest": "f77d91e28d7de2c146983e53c1f6277c7384a2627ca775b58d9be47e1b360e31",
-          "contract_revision": "f77d91e28d7de2c1"
+          "artifact_digest": "6652baddd3ceb558111f30ec4ab3ab02d6b01dc2c82caf36ae5c11ad36e880cd",
+          "contract_revision": "6652baddd3ceb558"
         }
       }
     },
@@ -6474,20 +6474,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/contract_kit.json",
-          "artifact_digest": "1f4249352649b067f8e041efad798f6986b8b2682197c2b8ec28c24f64e2537c",
-          "contract_revision": "1f4249352649b067"
+          "artifact_digest": "cf8a714405f473d1dd142b23c06ffe0839bb0def486a8b386c447af7d307be6a",
+          "contract_revision": "cf8a714405f473d1"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/context_capsule.json",
-          "artifact_digest": "53bdb118fac65fa2794f71719f57fac9cbcf576815cf2c09e56ba56c22a950d2",
-          "contract_revision": "53bdb118fac65fa2"
+          "artifact_digest": "19306ba2141c744928aba457f325569d03d9190c9b151e545ab2953a05d15270",
+          "contract_revision": "19306ba2141c7449"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/test_capsule.json",
-          "artifact_digest": "0897c1718c1d0f5f7d650f104d7aef3444a8c02459ad248a22df526e265caf98",
-          "contract_revision": "0897c1718c1d0f5f"
+          "artifact_digest": "879e00327909629d12086bde67abfe095cdc5f94deab4d289a1000708ce2b023",
+          "contract_revision": "879e00327909629d"
         }
       }
     },
@@ -6513,20 +6513,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/contract_kit.json",
-          "artifact_digest": "0097f5fa50de5abf06aaf863eda02681ce9bb4fd8d5659ca74c7f592f6334f3e",
-          "contract_revision": "0097f5fa50de5abf"
+          "artifact_digest": "f23cebd229c2770f9386607d3be2a3cf239b18b9a2b790a8cd03dff8e48bdbaa",
+          "contract_revision": "f23cebd229c2770f"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/context_capsule.json",
-          "artifact_digest": "201345ecacd2e9202c64fe7dc881987343a013e630e8ab972ed8014cdc90c7b9",
-          "contract_revision": "201345ecacd2e920"
+          "artifact_digest": "4a0d969da1479762373cc9bbfec7cb4f96664c64786bdbb9038610475e6d2bda",
+          "contract_revision": "4a0d969da1479762"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/test_capsule.json",
-          "artifact_digest": "78af860fd63f86725b8cb0ef96157f22bf9117619a7f537fcb40e071316d9a4e",
-          "contract_revision": "78af860fd63f8672"
+          "artifact_digest": "6fb084dc81851587984d6c265e09410a8a3fd70e1fbd67fb5e2eb77953bdbbe0",
+          "contract_revision": "6fb084dc81851587"
         }
       }
     },
@@ -6552,20 +6552,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/contract_kit.json",
-          "artifact_digest": "35cd32d26040ce83cbffedcce022a5ad4d9629017bef39603d7e3dfb0f615233",
-          "contract_revision": "35cd32d26040ce83"
+          "artifact_digest": "e1366403cdc03684724eb6becc33cfdbebe343467f77ff4046151f73b2d72261",
+          "contract_revision": "e1366403cdc03684"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/context_capsule.json",
-          "artifact_digest": "c34c7384efbea3ea0e913e85a03a4d5c6c4079c4537ff8f37f1cf5f2311880b3",
-          "contract_revision": "c34c7384efbea3ea"
+          "artifact_digest": "ecfa0a2b965cefc002510f4d04bea3c5733204877005ab8ee04e04ce64736043",
+          "contract_revision": "ecfa0a2b965cefc0"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/test_capsule.json",
-          "artifact_digest": "4f93a9e5f09219d979e9251b3b52e1534f155cb2167684560c2a14a02dbb1aeb",
-          "contract_revision": "4f93a9e5f09219d9"
+          "artifact_digest": "b9e5bfd6c7cf8f5e098fa3266648da8c5f341c81e1b51c32bd858b49dd4aae36",
+          "contract_revision": "b9e5bfd6c7cf8f5e"
         }
       }
     },
@@ -6591,20 +6591,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/contract_kit.json",
-          "artifact_digest": "b2b80115c6905025971f8154824d2ff2a8497079605a815a7e3d8d3b0a458fa0",
-          "contract_revision": "b2b80115c6905025"
+          "artifact_digest": "d61a317101c9dbb192bc69eae4214f181923e6cd6f05069074497d5935cc801e",
+          "contract_revision": "d61a317101c9dbb1"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/context_capsule.json",
-          "artifact_digest": "874f620ed664cfd30894ddb8bc502665ddf625db8def349b04a96bc7f85fac98",
-          "contract_revision": "874f620ed664cfd3"
+          "artifact_digest": "7b84b81379b26b4f0a3eb52c2f821ef6833a4f3ebf3372e7806b6543f003e398",
+          "contract_revision": "7b84b81379b26b4f"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/test_capsule.json",
-          "artifact_digest": "28fec7aca02221478b408fae40459e357136b78619707795e8e3d797a3261c3a",
-          "contract_revision": "28fec7aca0222147"
+          "artifact_digest": "68c16a57a013feb59749c0329d17582d8d9d995796eae7897f61b72880c3adcd",
+          "contract_revision": "68c16a57a013feb5"
         }
       }
     },
@@ -6903,20 +6903,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/installation/contract_kit.json",
-          "artifact_digest": "b4279d1471caeb862b47e179c94dec6d0f133771822bf372661dd4a3d7c6a56d",
-          "contract_revision": "b4279d1471caeb86"
+          "artifact_digest": "eb5a864ce3e68e6df3ee712774552e7ab3c56271c9d38f365ba7897dcbadd834",
+          "contract_revision": "eb5a864ce3e68e6d"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/installation/context_capsule.json",
-          "artifact_digest": "b95ccedba9fcb8d4a0c9bf4d5a40e46f1de05e37f276532832c1e448e6566f98",
-          "contract_revision": "b95ccedba9fcb8d4"
+          "artifact_digest": "5821414e754b21513769892984315001f57031f0f6ebace0a07e25d2b4f46005",
+          "contract_revision": "5821414e754b2151"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/installation/test_capsule.json",
-          "artifact_digest": "240a4b1c8bb9f6746cb727871aac4d467056baea21263c905c7b78b7b353f415",
-          "contract_revision": "240a4b1c8bb9f674"
+          "artifact_digest": "ed363c8673fc823bbeb898d337056099ccb7b0d6a723a7d185473086e5c1879a",
+          "contract_revision": "ed363c8673fc823b"
         }
       }
     },
@@ -6981,20 +6981,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-service/contract_kit.json",
-          "artifact_digest": "d9ab306ab1af5ff8a03869e40c1705e1d00e9cbcc039370504c2a08884094b70",
-          "contract_revision": "d9ab306ab1af5ff8"
+          "artifact_digest": "cb40a77234f9593803bf4ae0eb0f5cdd3ea569c1b1747cb3c3383f77bde3796a",
+          "contract_revision": "cb40a77234f95938"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/context_capsule.json",
-          "artifact_digest": "d12f8e1f19bee6c52cae7ccec9733095f19e77c14ab35c2de7f4b13a611f3710",
-          "contract_revision": "d12f8e1f19bee6c5"
+          "artifact_digest": "429bbcdbeb20d93974a7b0b6738ce92492f798ec26ca8329ccb5001ad776bf16",
+          "contract_revision": "429bbcdbeb20d939"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/test_capsule.json",
-          "artifact_digest": "70205d93593fda8050e55b5fbdb768a652795a7c4a8f27fb5e7ef4154585f2a7",
-          "contract_revision": "70205d93593fda80"
+          "artifact_digest": "382101fe4c87865866f3e630167b87196e761b5608749bd6aed0119fe5d1c1cd",
+          "contract_revision": "382101fe4c878658"
         }
       }
     },
@@ -7020,20 +7020,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/maintenance/contract_kit.json",
-          "artifact_digest": "3e1bb8848bcdcbcc5376e8bbdaf9b96c3312ac5c3b6cdfaa1cd520d15fc8bb19",
-          "contract_revision": "3e1bb8848bcdcbcc"
+          "artifact_digest": "d24dcb1475b96dcdb7c6e88c8288d97da97c1c0602181c9f8e77ebe3010d89d6",
+          "contract_revision": "d24dcb1475b96dcd"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/maintenance/context_capsule.json",
-          "artifact_digest": "bd248ad3075e10fbc49dc46a1d677486459fcbadea6fd546bb049df84903338b",
-          "contract_revision": "bd248ad3075e10fb"
+          "artifact_digest": "a4250e5eb6ad25bfb0f14ca29fec9851c3a32ace371a3f54f40b9802291fa21f",
+          "contract_revision": "a4250e5eb6ad25bf"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/maintenance/test_capsule.json",
-          "artifact_digest": "4d57815b40c932dbfe98a77ae6fb4fcd8b21fc808aab99ddfb71d2de22f99236",
-          "contract_revision": "4d57815b40c932db"
+          "artifact_digest": "1f4014d807e4225dfffc23170f9e11790197b143ad3e2b7f8b1409286fbac286",
+          "contract_revision": "1f4014d807e4225d"
         }
       }
     },
@@ -7176,20 +7176,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/mod-research-provider/contract_kit.json",
-          "artifact_digest": "33b01cb89b4123ac60b6eb227bbf51bf05dc121eea0cc4af194a21a0b40a7630",
-          "contract_revision": "33b01cb89b4123ac"
+          "artifact_digest": "b8e5e3eebfdde065821e9d344f2708e150ece5e7a0d065a8269614254e181d76",
+          "contract_revision": "b8e5e3eebfdde065"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/context_capsule.json",
-          "artifact_digest": "5943f2477c864c6d88bc0216862eba222060949722094bb75b27d7638d60fe8e",
-          "contract_revision": "5943f2477c864c6d"
+          "artifact_digest": "77547162dcce422a00e5e865f18e9e1d560180f5d63c60bf8168cd8aadab7010",
+          "contract_revision": "77547162dcce422a"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/test_capsule.json",
-          "artifact_digest": "65c20bb7fff6a33e12e5f0ab772fb89978e119cf584e748b3fb181b19c7d39a9",
-          "contract_revision": "65c20bb7fff6a33e"
+          "artifact_digest": "1aa809f2f41a9c4be90fc3392e2edcf3c24775bab294f83d303755136423f636",
+          "contract_revision": "1aa809f2f41a9c4b"
         }
       }
     },
@@ -7293,20 +7293,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/operational-recovery-state/contract_kit.json",
-          "artifact_digest": "4f78346b423d1bf03ae1c8fb451193ea9d549eda183624e865d1993961b50029",
-          "contract_revision": "4f78346b423d1bf0"
+          "artifact_digest": "311afca5a45741eeafea99da53ed5ca804c3b7a748e31a33d3ea98f8b2829a96",
+          "contract_revision": "311afca5a45741ee"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
-          "artifact_digest": "cb36735de280848afac56d236a1329a1e44920cf0f68ffa34b38c7d1b098cdc2",
-          "contract_revision": "cb36735de280848a"
+          "artifact_digest": "b8b5cdc1987cd4ade8a7444723da96d3edb0da33540700ca5e2dbea5d21ad998",
+          "contract_revision": "b8b5cdc1987cd4ad"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
-          "artifact_digest": "4b5bcd175a091759bae7ba9bb4f4694762c257a4114fe178349c9b28659398a2",
-          "contract_revision": "4b5bcd175a091759"
+          "artifact_digest": "892461440ae9ae53f6a240a0b959527fab1e1f503f1d2cfa4eac52570eb37776",
+          "contract_revision": "892461440ae9ae53"
         }
       }
     },
@@ -7566,20 +7566,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.measurement/contract_kit.json",
-          "artifact_digest": "51fd1a51f8251994f262934abd509ed5ded058dfeca9edd429ddf23baee850ee",
-          "contract_revision": "51fd1a51f8251994"
+          "artifact_digest": "41147b0329bea2337554fed2cad264eba9ffb95f7892b968d69acefe8119c670",
+          "contract_revision": "41147b0329bea233"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.measurement/context_capsule.json",
-          "artifact_digest": "13f05720d220ac13f7db32730c92084bad84a3d2308e835e17781ddd90b3db1d",
-          "contract_revision": "13f05720d220ac13"
+          "artifact_digest": "e802853e7ac84bae34fe7f02606f8353b9585ec7bc5465162efe5fa11de9fd16",
+          "contract_revision": "e802853e7ac84bae"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.measurement/test_capsule.json",
-          "artifact_digest": "bbafcab4e3d63624ead1f681f0f24ca8c30615bdc86d630b7ee357654f378d28",
-          "contract_revision": "bbafcab4e3d63624"
+          "artifact_digest": "96b64dcf250ddce935f7e8c35d32c5dd90b95ab71aad66e674dd6b4f3de54116",
+          "contract_revision": "96b64dcf250ddce9"
         }
       }
     },
@@ -10786,20 +10786,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/contract_kit.json",
-          "artifact_digest": "42ce1d4480700bddecfec6b255c60d9510e435715318818214915a25e1bc6076",
-          "contract_revision": "42ce1d4480700bdd"
+          "artifact_digest": "63763c3945b56c7af8253f490719845481a81a5f57bcfa0a716924822d539f0b",
+          "contract_revision": "63763c3945b56c7a"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/context_capsule.json",
-          "artifact_digest": "b6aa09cfb6d60736448d7d52e7fd3697dce36f2bf8e8716bdc8787c83459ff75",
-          "contract_revision": "b6aa09cfb6d60736"
+          "artifact_digest": "43127094fd22ab4ba6da5947aee4449d1493e991b174b4ae7816fda8a637572c",
+          "contract_revision": "43127094fd22ab4b"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/test_capsule.json",
-          "artifact_digest": "57756a56d86837065d870ad4266d58966c188998afca56a0a49760513c8094ac",
-          "contract_revision": "57756a56d8683706"
+          "artifact_digest": "7e193d6936acb5b307f5416041a0444f745d93bd9f551fae82a7fe50ec080a35",
+          "contract_revision": "7e193d6936acb5b3"
         }
       },
       "implementation_support": {
@@ -10850,20 +10850,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/contract_kit.json",
-          "artifact_digest": "fe2ce1a6e722b969277798f3e1e5e1da0629e1b0344d549e81e27c446f43628a",
-          "contract_revision": "fe2ce1a6e722b969"
+          "artifact_digest": "573403350c190a5d97fe3e2e01a82d6a17d85e5f868f62de1f708c01f6887d89",
+          "contract_revision": "573403350c190a5d"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/context_capsule.json",
-          "artifact_digest": "65a4e186f764c53035a431c8b1c8c4fd132215e48a839557ab94ec11383f3d36",
-          "contract_revision": "65a4e186f764c530"
+          "artifact_digest": "f0836642a730ec802d091e8205be10f524ddcb755c35647fe52b1b7f44fc98cc",
+          "contract_revision": "f0836642a730ec80"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/test_capsule.json",
-          "artifact_digest": "6f325106990ce45e50b7e86374d3df550be52d71a6b0c8d18cba5bfb71a512de",
-          "contract_revision": "6f325106990ce45e"
+          "artifact_digest": "3a3be97f9c54f88f7d7f5f6aed004fc77b4ba819b49017ea17a0c30df943039a",
+          "contract_revision": "3a3be97f9c54f88f"
         }
       },
       "implementation_support": {
@@ -10914,20 +10914,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/contract_kit.json",
-          "artifact_digest": "52d7846cfb6f6ba2505aea6fe072e64031e791b7febde64fbb8dcfe93d1e5aa7",
-          "contract_revision": "52d7846cfb6f6ba2"
+          "artifact_digest": "4e13ee9e16928cc7aac18f2f580419756ccce5ac1a32a666f6bf497aef6b5d41",
+          "contract_revision": "4e13ee9e16928cc7"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/context_capsule.json",
-          "artifact_digest": "8b050cdb55d2632904e2193ece0dac0ef70269e80ae073dfab419e8322ecdea1",
-          "contract_revision": "8b050cdb55d26329"
+          "artifact_digest": "5b591035d02b8e6c6db25d4ac6065789bbe5388a6de292211bf42416503e7f1b",
+          "contract_revision": "5b591035d02b8e6c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/test_capsule.json",
-          "artifact_digest": "b636dcec98faed859208951639b2a4a42bfe7cf86b25f1e3b606041d8a57ab80",
-          "contract_revision": "b636dcec98faed85"
+          "artifact_digest": "3518ff7e1ad8fc003577f2e08d01609a9033161a8507ccde93f4c20b5d39b708",
+          "contract_revision": "3518ff7e1ad8fc00"
         }
       },
       "implementation_support": {
@@ -10978,20 +10978,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/contract_kit.json",
-          "artifact_digest": "b74558e325750d9917dbdb220ce34cf6882ff164b176c305816ccfc47c77843d",
-          "contract_revision": "b74558e325750d99"
+          "artifact_digest": "dccd166e4de33d44c8b62e19380b9cfe64df52c115d8fd2b56ba44b721ded828",
+          "contract_revision": "dccd166e4de33d44"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/context_capsule.json",
-          "artifact_digest": "cc203ebfb198cfd1da7a7d7de3c157bba12ab106c44f63abb7bb39a02a23acf9",
-          "contract_revision": "cc203ebfb198cfd1"
+          "artifact_digest": "61cf9018790c17cf9ea2a0488281c910da2e5dc6f88399bc0be441c7af58a114",
+          "contract_revision": "61cf9018790c17cf"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/test_capsule.json",
-          "artifact_digest": "e4f4a7603e8b74fe90d51962cd11e1e44ff4a1dab0f31c35aec369701bbcdbe4",
-          "contract_revision": "e4f4a7603e8b74fe"
+          "artifact_digest": "85b4d7cd6421744c03e3dc2790dda530bf03b7ab51a780be8475e41ceb0f59d2",
+          "contract_revision": "85b4d7cd6421744c"
         }
       },
       "implementation_support": {
@@ -11042,20 +11042,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/contract_kit.json",
-          "artifact_digest": "deb16132ce9afb1a4be0a60f42585f960b1f17a2adfcd48d1157dd8d098d3ba4",
-          "contract_revision": "deb16132ce9afb1a"
+          "artifact_digest": "50ad63c2150b2cf2766fd9d2b997068f605ab55e6e8cdeb2fea3b592411e801e",
+          "contract_revision": "50ad63c2150b2cf2"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/context_capsule.json",
-          "artifact_digest": "a9cf33ffe704f4ab98841eaeb112d31088795a515d7fa40d28cad5ed7d3992eb",
-          "contract_revision": "a9cf33ffe704f4ab"
+          "artifact_digest": "2c2720ed8f152d3a11bf1c3d6cfd5ee304d040d29d3c55645c7253d868264021",
+          "contract_revision": "2c2720ed8f152d3a"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/test_capsule.json",
-          "artifact_digest": "fd303de10d13ed7ea1aec3d47309b5a1461feff22695bc15706640392c63c26e",
-          "contract_revision": "fd303de10d13ed7e"
+          "artifact_digest": "03ea9494a8472ed6a19720e447a7bf68e0afb80cf991474a3fa03d210f77951f",
+          "contract_revision": "03ea9494a8472ed6"
         }
       },
       "implementation_support": {
@@ -11106,20 +11106,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/contract_kit.json",
-          "artifact_digest": "b5a733449b7792376849b054d3bf66ba2c3c54e6973bcbf08f01bdc57c6d91ad",
-          "contract_revision": "b5a733449b779237"
+          "artifact_digest": "c195431ea32c6ad461d85be3e57b6e29e4b6a2ce64fbf529ebb9f1e9dd518f8e",
+          "contract_revision": "c195431ea32c6ad4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/context_capsule.json",
-          "artifact_digest": "08e146c3d4151d2a1a2589bea917e33f62803dc2a90c3bda8531d27899fd0f72",
-          "contract_revision": "08e146c3d4151d2a"
+          "artifact_digest": "b8c0ac5abc672b97027f35adfd8dff107bb4238a97d15c9baea46fe5f25be454",
+          "contract_revision": "b8c0ac5abc672b97"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/test_capsule.json",
-          "artifact_digest": "7036f1d6fc11b41873e21dd36d58a2341fb28923389ad9da37ac98e6c956be7c",
-          "contract_revision": "7036f1d6fc11b418"
+          "artifact_digest": "98532ea7186ae490a779d7a6ad68ee417ff9f7521581be6bf9c9e208a33f9a6f",
+          "contract_revision": "98532ea7186ae490"
         }
       },
       "implementation_support": {
@@ -11170,20 +11170,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/contract_kit.json",
-          "artifact_digest": "1ead3b6c5cfed0d2d66dcde13b9ed49f068208382a6a490c021be9194d810fb0",
-          "contract_revision": "1ead3b6c5cfed0d2"
+          "artifact_digest": "33963958f6594d535a2bf407b105894322de9e69b31ac54e7e4139a4fcfddbf1",
+          "contract_revision": "33963958f6594d53"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/context_capsule.json",
-          "artifact_digest": "14955ecaefa3efbe263547be587c03c02a18b94f74ae25da0c73e5b7cbf56b98",
-          "contract_revision": "14955ecaefa3efbe"
+          "artifact_digest": "45f8396835f5943fa93d192980f03f8dabe0cb8bfe49d8b24d9e654d3ddb8d07",
+          "contract_revision": "45f8396835f5943f"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/test_capsule.json",
-          "artifact_digest": "3378094d44ad2534a52727bf20974753445e1b33e4b6fd28c1f0519d58092e59",
-          "contract_revision": "3378094d44ad2534"
+          "artifact_digest": "6b3dc0c1923fa068e3836ecf91387ab6896185d87069d86aa562bfded9d3720f",
+          "contract_revision": "6b3dc0c1923fa068"
         }
       },
       "implementation_support": {
@@ -11234,20 +11234,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/contract_kit.json",
-          "artifact_digest": "2c0c4cba75e17b09000fd4a1733197bcc2825719dc23ae5f24506347b216f110",
-          "contract_revision": "2c0c4cba75e17b09"
+          "artifact_digest": "8125c9288d955e763c6aaa912be38c67b964044cb1d80165a2316aa516875bc1",
+          "contract_revision": "8125c9288d955e76"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/context_capsule.json",
-          "artifact_digest": "946e9a5685478582c412b2c19e727a225714b033289de29ef1ae63949c8bc197",
-          "contract_revision": "946e9a5685478582"
+          "artifact_digest": "77af459a2c479a4537c22fcb75498c2d06968a8a4d4213a9a0fce5a36dda7aea",
+          "contract_revision": "77af459a2c479a45"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/test_capsule.json",
-          "artifact_digest": "80e49fd7549f960f170c614965937692fd10d40da78e8bcce1d7408d2d8bb262",
-          "contract_revision": "80e49fd7549f960f"
+          "artifact_digest": "4c4e891018d2fc712df6299ca39570f8c2a4b4f2059cddcc29c21b16c984abd9",
+          "contract_revision": "4c4e891018d2fc71"
         }
       },
       "implementation_support": {
@@ -11362,20 +11362,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/contract_kit.json",
-          "artifact_digest": "898566a72b1cd52d147b39bbbd875f8ba99e40b6ad20a6d1a31d849477cf6d8b",
-          "contract_revision": "898566a72b1cd52d"
+          "artifact_digest": "f74d71f9f1d24fb1455b2094f4fd4e5ce47fdeb821468ec7554bcfcd4ebbeb45",
+          "contract_revision": "f74d71f9f1d24fb1"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/context_capsule.json",
-          "artifact_digest": "7691e4b9de157ef56919940157cd942a7e664603b8acaabe736bc07a7e8a929a",
-          "contract_revision": "7691e4b9de157ef5"
+          "artifact_digest": "918cd55c6560ed80f2976bb59cbbc5468aa672e9c17bc4a27162980de3f8449c",
+          "contract_revision": "918cd55c6560ed80"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/test_capsule.json",
-          "artifact_digest": "b591c989b8ab03ff3e440d96b08d28edcfa5e5cf3ec3d6457fde2f22485d5045",
-          "contract_revision": "b591c989b8ab03ff"
+          "artifact_digest": "acadc9ec4acfba9a2e532cc10c3064b6227ae47669e6c543e456643cbd96ec15",
+          "contract_revision": "acadc9ec4acfba9a"
         }
       },
       "implementation_support": {
@@ -11682,20 +11682,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/contract_kit.json",
-          "artifact_digest": "0858b1fd31b2c524efdded911eab920e772b2a03893285b27c9b832f6f129a0a",
-          "contract_revision": "0858b1fd31b2c524"
+          "artifact_digest": "a762c0d24c97e271a0ef895321a6aea866c6a34eaeffee2ce814afe6dc89f99a",
+          "contract_revision": "a762c0d24c97e271"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/context_capsule.json",
-          "artifact_digest": "d3b371bd3d922a064e9fba216cf13f12f186b8d862b85983f83f5553c668fc32",
-          "contract_revision": "d3b371bd3d922a06"
+          "artifact_digest": "2f80b7411f7f039e887cd4edc5f91249d68ae3f6bc2fdc963b3b3f14065ea371",
+          "contract_revision": "2f80b7411f7f039e"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/test_capsule.json",
-          "artifact_digest": "c6d0aa9a6173e3fa5bacffccb38e4b287cee4511505f9290a2e92e0fb4d79076",
-          "contract_revision": "c6d0aa9a6173e3fa"
+          "artifact_digest": "4d7a17455acb53dceb124012f8e218725d24e9d709388e5575e6bd95114b92f5",
+          "contract_revision": "4d7a17455acb53dc"
         }
       },
       "implementation_support": {
@@ -11815,20 +11815,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/contract_kit.json",
-          "artifact_digest": "6b86e8f703e54166751624a83c6119b2951236b1546080f1348ce8340fa9b7eb",
-          "contract_revision": "6b86e8f703e54166"
+          "artifact_digest": "c45454d9cf6fd5008903feb8f6745622da8b0802108fca80cf3542dfc236f692",
+          "contract_revision": "c45454d9cf6fd500"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/context_capsule.json",
-          "artifact_digest": "a7f1497337cf9258872f11b5aca5245890dc8740b3e678e410ea5e2186fd612a",
-          "contract_revision": "a7f1497337cf9258"
+          "artifact_digest": "ac019e8960095a62edcc75968a24c6263ab1c2bb97516d91c3313ed11010a761",
+          "contract_revision": "ac019e8960095a62"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/test_capsule.json",
-          "artifact_digest": "3f1918712ce4cfb6945aeebd96c52cd4d0bde3523fbb08dfdd824cf19b60402f",
-          "contract_revision": "3f1918712ce4cfb6"
+          "artifact_digest": "b31c90ce0f552a8eb05bae11b742649dbefab2e59feaf36579d0031d49cc3026",
+          "contract_revision": "b31c90ce0f552a8e"
         }
       },
       "implementation_support": {
@@ -11879,20 +11879,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/contract_kit.json",
-          "artifact_digest": "79577569bda1b22c28289c9b612410fe288d16404c09c965852d322af8d90541",
-          "contract_revision": "79577569bda1b22c"
+          "artifact_digest": "915e38c9d541cab493237bec6a81a4378981ed85e8f8ae984dbea736f8091a72",
+          "contract_revision": "915e38c9d541cab4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/context_capsule.json",
-          "artifact_digest": "494dd7a762757363a693a23f05f50540a9156118a377cfa6823933b94c92ae98",
-          "contract_revision": "494dd7a762757363"
+          "artifact_digest": "f9ad8b1ce364e348a194c8bd7a55b77138a2759f9298e4e169750466dc09475f",
+          "contract_revision": "f9ad8b1ce364e348"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/test_capsule.json",
-          "artifact_digest": "16b19e8f25cf083af53cdba8996ffcb597b825633f0427c64b1b7799f5335729",
-          "contract_revision": "16b19e8f25cf083a"
+          "artifact_digest": "3c9d811cf26210382ddda9b0bd4f7cf500cd63a5588489c2e040b30f623a28f1",
+          "contract_revision": "3c9d811cf2621038"
         }
       },
       "implementation_support": {
@@ -11943,20 +11943,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/contract_kit.json",
-          "artifact_digest": "93bde88d6be89769d7922d67d6d869117438de3becc5ca409be9d17cb42b4556",
-          "contract_revision": "93bde88d6be89769"
+          "artifact_digest": "7ddb9b996e2886150f23789e64935c126c49c06b7bf37b91dddaba1e63cd3a88",
+          "contract_revision": "7ddb9b996e288615"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/context_capsule.json",
-          "artifact_digest": "bc5b7e5cef55dc8198d3fff4b0e0b140802cb3c0cd9ff57fcbc5015bb04fc353",
-          "contract_revision": "bc5b7e5cef55dc81"
+          "artifact_digest": "46b50e71840310ee9de310e725d39fa1c7c06ef6311d21f647458146fff1a97f",
+          "contract_revision": "46b50e71840310ee"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/test_capsule.json",
-          "artifact_digest": "1cbec77f6db8912f04c4effde298dd397f87b9c29a4a5141a00a5b2380d28256",
-          "contract_revision": "1cbec77f6db8912f"
+          "artifact_digest": "1df80851db18d187476ba68d92b92b32e368e840ab00acdb1bc43686e625aa80",
+          "contract_revision": "1df80851db18d187"
         }
       },
       "implementation_support": {
@@ -12007,20 +12007,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/contract_kit.json",
-          "artifact_digest": "aa6a86455a24b03972f52b4723f0f115c701423db76a322c13883eb79ef86ea9",
-          "contract_revision": "aa6a86455a24b039"
+          "artifact_digest": "2f2db78e1194b851b3ee04e013698136f064eb17c25102f3fb26fb47050e8798",
+          "contract_revision": "2f2db78e1194b851"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/context_capsule.json",
-          "artifact_digest": "2ba15c693196d571fd8c25e541c30b70915c82172225c5e452e69b6149fb8a6d",
-          "contract_revision": "2ba15c693196d571"
+          "artifact_digest": "1969aa6797e718e1bfdd8d7f2d69dbf71d0ff5da9ab34acbf5fcb37d583750bf",
+          "contract_revision": "1969aa6797e718e1"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/test_capsule.json",
-          "artifact_digest": "f77d91e28d7de2c146983e53c1f6277c7384a2627ca775b58d9be47e1b360e31",
-          "contract_revision": "f77d91e28d7de2c1"
+          "artifact_digest": "6652baddd3ceb558111f30ec4ab3ab02d6b01dc2c82caf36ae5c11ad36e880cd",
+          "contract_revision": "6652baddd3ceb558"
         }
       },
       "implementation_support": {
@@ -12071,20 +12071,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/contract_kit.json",
-          "artifact_digest": "1f4249352649b067f8e041efad798f6986b8b2682197c2b8ec28c24f64e2537c",
-          "contract_revision": "1f4249352649b067"
+          "artifact_digest": "cf8a714405f473d1dd142b23c06ffe0839bb0def486a8b386c447af7d307be6a",
+          "contract_revision": "cf8a714405f473d1"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/context_capsule.json",
-          "artifact_digest": "53bdb118fac65fa2794f71719f57fac9cbcf576815cf2c09e56ba56c22a950d2",
-          "contract_revision": "53bdb118fac65fa2"
+          "artifact_digest": "19306ba2141c744928aba457f325569d03d9190c9b151e545ab2953a05d15270",
+          "contract_revision": "19306ba2141c7449"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/test_capsule.json",
-          "artifact_digest": "0897c1718c1d0f5f7d650f104d7aef3444a8c02459ad248a22df526e265caf98",
-          "contract_revision": "0897c1718c1d0f5f"
+          "artifact_digest": "879e00327909629d12086bde67abfe095cdc5f94deab4d289a1000708ce2b023",
+          "contract_revision": "879e00327909629d"
         }
       },
       "implementation_support": {
@@ -12135,20 +12135,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/contract_kit.json",
-          "artifact_digest": "0097f5fa50de5abf06aaf863eda02681ce9bb4fd8d5659ca74c7f592f6334f3e",
-          "contract_revision": "0097f5fa50de5abf"
+          "artifact_digest": "f23cebd229c2770f9386607d3be2a3cf239b18b9a2b790a8cd03dff8e48bdbaa",
+          "contract_revision": "f23cebd229c2770f"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/context_capsule.json",
-          "artifact_digest": "201345ecacd2e9202c64fe7dc881987343a013e630e8ab972ed8014cdc90c7b9",
-          "contract_revision": "201345ecacd2e920"
+          "artifact_digest": "4a0d969da1479762373cc9bbfec7cb4f96664c64786bdbb9038610475e6d2bda",
+          "contract_revision": "4a0d969da1479762"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/test_capsule.json",
-          "artifact_digest": "78af860fd63f86725b8cb0ef96157f22bf9117619a7f537fcb40e071316d9a4e",
-          "contract_revision": "78af860fd63f8672"
+          "artifact_digest": "6fb084dc81851587984d6c265e09410a8a3fd70e1fbd67fb5e2eb77953bdbbe0",
+          "contract_revision": "6fb084dc81851587"
         }
       },
       "implementation_support": {
@@ -12199,20 +12199,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/contract_kit.json",
-          "artifact_digest": "35cd32d26040ce83cbffedcce022a5ad4d9629017bef39603d7e3dfb0f615233",
-          "contract_revision": "35cd32d26040ce83"
+          "artifact_digest": "e1366403cdc03684724eb6becc33cfdbebe343467f77ff4046151f73b2d72261",
+          "contract_revision": "e1366403cdc03684"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/context_capsule.json",
-          "artifact_digest": "c34c7384efbea3ea0e913e85a03a4d5c6c4079c4537ff8f37f1cf5f2311880b3",
-          "contract_revision": "c34c7384efbea3ea"
+          "artifact_digest": "ecfa0a2b965cefc002510f4d04bea3c5733204877005ab8ee04e04ce64736043",
+          "contract_revision": "ecfa0a2b965cefc0"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/test_capsule.json",
-          "artifact_digest": "4f93a9e5f09219d979e9251b3b52e1534f155cb2167684560c2a14a02dbb1aeb",
-          "contract_revision": "4f93a9e5f09219d9"
+          "artifact_digest": "b9e5bfd6c7cf8f5e098fa3266648da8c5f341c81e1b51c32bd858b49dd4aae36",
+          "contract_revision": "b9e5bfd6c7cf8f5e"
         }
       },
       "implementation_support": {
@@ -12263,20 +12263,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/contract_kit.json",
-          "artifact_digest": "b2b80115c6905025971f8154824d2ff2a8497079605a815a7e3d8d3b0a458fa0",
-          "contract_revision": "b2b80115c6905025"
+          "artifact_digest": "d61a317101c9dbb192bc69eae4214f181923e6cd6f05069074497d5935cc801e",
+          "contract_revision": "d61a317101c9dbb1"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/context_capsule.json",
-          "artifact_digest": "874f620ed664cfd30894ddb8bc502665ddf625db8def349b04a96bc7f85fac98",
-          "contract_revision": "874f620ed664cfd3"
+          "artifact_digest": "7b84b81379b26b4f0a3eb52c2f821ef6833a4f3ebf3372e7806b6543f003e398",
+          "contract_revision": "7b84b81379b26b4f"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/test_capsule.json",
-          "artifact_digest": "28fec7aca02221478b408fae40459e357136b78619707795e8e3d797a3261c3a",
-          "contract_revision": "28fec7aca0222147"
+          "artifact_digest": "68c16a57a013feb59749c0329d17582d8d9d995796eae7897f61b72880c3adcd",
+          "contract_revision": "68c16a57a013feb5"
         }
       },
       "implementation_support": {
@@ -12844,20 +12844,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/installation/contract_kit.json",
-          "artifact_digest": "b4279d1471caeb862b47e179c94dec6d0f133771822bf372661dd4a3d7c6a56d",
-          "contract_revision": "b4279d1471caeb86"
+          "artifact_digest": "eb5a864ce3e68e6df3ee712774552e7ab3c56271c9d38f365ba7897dcbadd834",
+          "contract_revision": "eb5a864ce3e68e6d"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/installation/context_capsule.json",
-          "artifact_digest": "b95ccedba9fcb8d4a0c9bf4d5a40e46f1de05e37f276532832c1e448e6566f98",
-          "contract_revision": "b95ccedba9fcb8d4"
+          "artifact_digest": "5821414e754b21513769892984315001f57031f0f6ebace0a07e25d2b4f46005",
+          "contract_revision": "5821414e754b2151"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/installation/test_capsule.json",
-          "artifact_digest": "240a4b1c8bb9f6746cb727871aac4d467056baea21263c905c7b78b7b353f415",
-          "contract_revision": "240a4b1c8bb9f674"
+          "artifact_digest": "ed363c8673fc823bbeb898d337056099ccb7b0d6a723a7d185473086e5c1879a",
+          "contract_revision": "ed363c8673fc823b"
         }
       },
       "implementation_support": {
@@ -12972,20 +12972,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-service/contract_kit.json",
-          "artifact_digest": "d9ab306ab1af5ff8a03869e40c1705e1d00e9cbcc039370504c2a08884094b70",
-          "contract_revision": "d9ab306ab1af5ff8"
+          "artifact_digest": "cb40a77234f9593803bf4ae0eb0f5cdd3ea569c1b1747cb3c3383f77bde3796a",
+          "contract_revision": "cb40a77234f95938"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/context_capsule.json",
-          "artifact_digest": "d12f8e1f19bee6c52cae7ccec9733095f19e77c14ab35c2de7f4b13a611f3710",
-          "contract_revision": "d12f8e1f19bee6c5"
+          "artifact_digest": "429bbcdbeb20d93974a7b0b6738ce92492f798ec26ca8329ccb5001ad776bf16",
+          "contract_revision": "429bbcdbeb20d939"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/test_capsule.json",
-          "artifact_digest": "70205d93593fda8050e55b5fbdb768a652795a7c4a8f27fb5e7ef4154585f2a7",
-          "contract_revision": "70205d93593fda80"
+          "artifact_digest": "382101fe4c87865866f3e630167b87196e761b5608749bd6aed0119fe5d1c1cd",
+          "contract_revision": "382101fe4c878658"
         }
       },
       "implementation_support": {
@@ -13036,20 +13036,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/maintenance/contract_kit.json",
-          "artifact_digest": "3e1bb8848bcdcbcc5376e8bbdaf9b96c3312ac5c3b6cdfaa1cd520d15fc8bb19",
-          "contract_revision": "3e1bb8848bcdcbcc"
+          "artifact_digest": "d24dcb1475b96dcdb7c6e88c8288d97da97c1c0602181c9f8e77ebe3010d89d6",
+          "contract_revision": "d24dcb1475b96dcd"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/maintenance/context_capsule.json",
-          "artifact_digest": "bd248ad3075e10fbc49dc46a1d677486459fcbadea6fd546bb049df84903338b",
-          "contract_revision": "bd248ad3075e10fb"
+          "artifact_digest": "a4250e5eb6ad25bfb0f14ca29fec9851c3a32ace371a3f54f40b9802291fa21f",
+          "contract_revision": "a4250e5eb6ad25bf"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/maintenance/test_capsule.json",
-          "artifact_digest": "4d57815b40c932dbfe98a77ae6fb4fcd8b21fc808aab99ddfb71d2de22f99236",
-          "contract_revision": "4d57815b40c932db"
+          "artifact_digest": "1f4014d807e4225dfffc23170f9e11790197b143ad3e2b7f8b1409286fbac286",
+          "contract_revision": "1f4014d807e4225d"
         }
       },
       "implementation_support": {
@@ -13307,20 +13307,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/mod-research-provider/contract_kit.json",
-          "artifact_digest": "33b01cb89b4123ac60b6eb227bbf51bf05dc121eea0cc4af194a21a0b40a7630",
-          "contract_revision": "33b01cb89b4123ac"
+          "artifact_digest": "b8e5e3eebfdde065821e9d344f2708e150ece5e7a0d065a8269614254e181d76",
+          "contract_revision": "b8e5e3eebfdde065"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/context_capsule.json",
-          "artifact_digest": "5943f2477c864c6d88bc0216862eba222060949722094bb75b27d7638d60fe8e",
-          "contract_revision": "5943f2477c864c6d"
+          "artifact_digest": "77547162dcce422a00e5e865f18e9e1d560180f5d63c60bf8168cd8aadab7010",
+          "contract_revision": "77547162dcce422a"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/test_capsule.json",
-          "artifact_digest": "65c20bb7fff6a33e12e5f0ab772fb89978e119cf584e748b3fb181b19c7d39a9",
-          "contract_revision": "65c20bb7fff6a33e"
+          "artifact_digest": "1aa809f2f41a9c4be90fc3392e2edcf3c24775bab294f83d303755136423f636",
+          "contract_revision": "1aa809f2f41a9c4b"
         }
       },
       "implementation_support": {
@@ -13499,20 +13499,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/operational-recovery-state/contract_kit.json",
-          "artifact_digest": "4f78346b423d1bf03ae1c8fb451193ea9d549eda183624e865d1993961b50029",
-          "contract_revision": "4f78346b423d1bf0"
+          "artifact_digest": "311afca5a45741eeafea99da53ed5ca804c3b7a748e31a33d3ea98f8b2829a96",
+          "contract_revision": "311afca5a45741ee"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
-          "artifact_digest": "cb36735de280848afac56d236a1329a1e44920cf0f68ffa34b38c7d1b098cdc2",
-          "contract_revision": "cb36735de280848a"
+          "artifact_digest": "b8b5cdc1987cd4ade8a7444723da96d3edb0da33540700ca5e2dbea5d21ad998",
+          "contract_revision": "b8b5cdc1987cd4ad"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
-          "artifact_digest": "4b5bcd175a091759bae7ba9bb4f4694762c257a4114fe178349c9b28659398a2",
-          "contract_revision": "4b5bcd175a091759"
+          "artifact_digest": "892461440ae9ae53f6a240a0b959527fab1e1f503f1d2cfa4eac52570eb37776",
+          "contract_revision": "892461440ae9ae53"
         }
       },
       "implementation_support": {
@@ -14110,20 +14110,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.measurement/contract_kit.json",
-          "artifact_digest": "51fd1a51f8251994f262934abd509ed5ded058dfeca9edd429ddf23baee850ee",
-          "contract_revision": "51fd1a51f8251994"
+          "artifact_digest": "41147b0329bea2337554fed2cad264eba9ffb95f7892b968d69acefe8119c670",
+          "contract_revision": "41147b0329bea233"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.measurement/context_capsule.json",
-          "artifact_digest": "13f05720d220ac13f7db32730c92084bad84a3d2308e835e17781ddd90b3db1d",
-          "contract_revision": "13f05720d220ac13"
+          "artifact_digest": "e802853e7ac84bae34fe7f02606f8353b9585ec7bc5465162efe5fa11de9fd16",
+          "contract_revision": "e802853e7ac84bae"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.measurement/test_capsule.json",
-          "artifact_digest": "bbafcab4e3d63624ead1f681f0f24ca8c30615bdc86d630b7ee357654f378d28",
-          "contract_revision": "bbafcab4e3d63624"
+          "artifact_digest": "96b64dcf250ddce935f7e8c35d32c5dd90b95ab71aad66e674dd6b4f3de54116",
+          "contract_revision": "96b64dcf250ddce9"
         }
       },
       "implementation_support": {
@@ -18311,5 +18311,5 @@
       }
     }
   ],
-  "registry_digest": "caf6d5de9888a180157eea5bcc5a1c39144442300625140e9d48d0eb78c9299e"
+  "registry_digest": "59c6f444f96a541024fdf7a2be80b2cd556159ff5e67618d754c962b8fdf9511"
 }
