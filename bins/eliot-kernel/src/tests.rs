@@ -1905,16 +1905,26 @@ fn test_eliotd_live_receipt(
 #[cfg(windows)]
 #[test]
 fn eliotd_receipt_replay_and_renewal_require_exact_operation_lineage() {
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
     let first = test_eliotd_live_receipt(1, &"b".repeat(64), "daemon-ready-1");
     assert_eq!(
-        classify_eliotd_live_receipt_transition(&first, &first, false, None, None)
-            .expect("exact response-loss replay"),
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context, &first, &first, false, None, None,
+        )
+        .expect("exact response-loss replay"),
         EliotdLiveReceiptDisposition::ExactReplay
     );
     let foreign_request = test_eliotd_live_receipt(1, &"b".repeat(64), "daemon-ready-foreign");
     assert!(
-        classify_eliotd_live_receipt_transition(&first, &foreign_request, false, None, None,)
-            .is_err()
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &foreign_request,
+            false,
+            None,
+            None,
+        )
+        .is_err()
     );
 
     let renewed = test_eliotd_live_receipt(2, &"c".repeat(64), "daemon-ready-1");
@@ -1927,15 +1937,29 @@ fn eliotd_receipt_replay_and_renewal_require_exact_operation_lineage() {
         previous_receipt_sha256: Some(first.supervision.receipt_sha256.clone()),
     };
     assert_eq!(
-        classify_eliotd_live_receipt_transition(&first, &renewed, true, None, Some(&successor),)
-            .expect("exact ORS renewal predecessor"),
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &renewed,
+            true,
+            None,
+            Some(&successor),
+        )
+        .expect("exact ORS renewal predecessor"),
         EliotdLiveReceiptDisposition::ReplaceRenewalPredecessor
     );
     let mut substituted = successor;
     substituted.previous_receipt_sha256 = Some("d".repeat(64));
     assert!(
-        classify_eliotd_live_receipt_transition(&first, &renewed, true, None, Some(&substituted),)
-            .is_err()
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &renewed,
+            true,
+            None,
+            Some(&substituted),
+        )
+        .is_err()
     );
 }
 
@@ -2347,7 +2371,11 @@ async fn authenticated_handshake_fences_ready_without_production_supervision_dep
     let wait_receipt = receipt.clone();
     let waiter = tokio::spawn(async move {
         wait_kernel
-            .await_daemon_ready(&wait_receipt, Duration::from_millis(50))
+            .await_daemon_ready(
+                &wait_receipt,
+                Duration::from_millis(50),
+                &tracing::Span::none(),
+            )
             .await
     });
     tokio::task::yield_now().await;
@@ -3132,7 +3160,10 @@ async fn daemon_readiness_requires_fresh_running_executor_receipt() {
         state.receipt = Some(receipt.clone());
     }
 
-    let inspection = gateway.inspect_exact_running_receipt(&receipt).await;
+    let context = ProcessExecutionGateway::operation_context_for(&owner, receipt.operation_id());
+    let inspection = gateway
+        .inspect_exact_running_receipt_in_context(&receipt, &context)
+        .await;
     assert!(
         inspection.is_ok(),
         "gateway exact inspection must accept the live receipt: {inspection:?}"
@@ -3603,7 +3634,15 @@ fn process_owner_survives_reconnect_but_rejects_cross_owner() {
         .expect("owner");
     let reconnected = ProcessOwnerBinding::new("testd", "a".repeat(64), test_epoch(3), generation)
         .expect("owner");
-    assert!(authorize_process_owner(&owner, &reconnected).is_ok());
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    assert!(
+        crate::process_execution::authorize_process_owner_in_context(
+            &owner,
+            &reconnected,
+            &context,
+        )
+        .is_ok()
+    );
 
     let wrong_module =
         ProcessOwnerBinding::new("native", "a".repeat(64), test_epoch(3), generation)
@@ -3619,7 +3658,12 @@ fn process_owner_survives_reconnect_but_rejects_cross_owner() {
     )
     .expect("owner");
     for candidate in [wrong_module, wrong_principal, wrong_generation] {
-        assert!(authorize_process_owner(&owner, &candidate).is_err());
+        assert!(
+            crate::process_execution::authorize_process_owner_in_context(
+                &owner, &candidate, &context,
+            )
+            .is_err()
+        );
     }
 }
 
@@ -4243,7 +4287,11 @@ fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
     let first_session = ProcessSessionBinding::new("connection-a", 1).expect("session");
     let restarted_session = ProcessSessionBinding::new("connection-b", 2).expect("session");
     assert_ne!(first_session, restarted_session);
-    assert!(authorize_process_owner(&first, &restarted).is_ok());
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    assert!(
+        crate::process_execution::authorize_process_owner_in_context(&first, &restarted, &context,)
+            .is_ok()
+    );
 
     for (sid, module, authority, candidate_generation) in [
         ("S-1-5-19", "testd", test_epoch(3), generation),
@@ -4259,7 +4307,12 @@ fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
         let digest = stable_owner_principal_digest(sid, module, &authority, candidate_generation);
         let candidate = ProcessOwnerBinding::new(module, digest, authority, candidate_generation)
             .expect("owner");
-        assert!(authorize_process_owner(&first, &candidate).is_err());
+        assert!(
+            crate::process_execution::authorize_process_owner_in_context(
+                &first, &candidate, &context,
+            )
+            .is_err()
+        );
     }
 }
 
@@ -6019,6 +6072,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
         &mut progress,
         &SUPERVISION_LEASE_RENEWAL_POLICY,
         DUE_MS,
+        &tracing::Span::none(),
     )
     .expect("healthy progress renews");
     assert_eq!(decision.outcome, DaemonSupervisionRenewalOutcome::Renewed);
@@ -6029,7 +6083,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
     assert_eq!(progress.boot_id.as_deref(), Some("boot-88-w2"));
     let recorded = test_observation("obs-88-w2-1");
     let recorded_sha256 = recorded.digest().expect("recorded observation digest");
-    progress.record_renewed(&recorded, recorded_sha256.clone(), 8, DUE_MS);
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    progress.record_renewed_in_context(&context, &recorded, recorded_sha256.clone(), 8, DUE_MS);
     assert!(progress.accepted_cursors.contains(&DaemonChannelCursor {
         channel: DaemonProgressChannel::Claim,
         cursor: 8,
@@ -6075,6 +6130,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
         &mut replay_progress,
         &SUPERVISION_LEASE_RENEWAL_POLICY,
         DUE_MS,
+        &tracing::Span::none(),
     )
     .expect("exact replay echoes the recorded successor");
     assert_eq!(replay.outcome, DaemonSupervisionRenewalOutcome::ExactReplay);
@@ -6090,6 +6146,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut conflict_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
+            &tracing::Span::none(),
         ),
         Err(SupervisionProgressRenewalError::Heartbeat(
             DaemonSupervisionHeartbeatError::IdentityConflict { .. }
@@ -6114,6 +6171,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut degraded_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
+            &tracing::Span::none(),
         );
         if attempt < 2 {
             let blocked_decision = blocked.expect("degraded progress is reported, not renewed");
@@ -6150,6 +6208,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut degraded_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
+            &tracing::Span::none(),
         ),
         Err(SupervisionProgressRenewalError::Heartbeat(
             DaemonSupervisionHeartbeatError::SupervisionLeaseExpired
