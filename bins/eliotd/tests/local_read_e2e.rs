@@ -358,7 +358,7 @@ fn claimed_pair_submits_the_exact_bound_body() -> TestResult {
         operation_id: operation_id.clone(),
         attempt_id: format!("{operation_id}:attempt:e2e-boot:3:1"),
         fencing_generation: 1,
-        session_id: "kernel-session-1".to_owned(),
+        session_id: Some("kernel-session-1".to_owned()),
         authority_epoch: fence.authority_epoch.clone(),
         scope_id: "kernel-session-1".to_owned(),
         facet_method: "eliot.query".to_owned(),

@@ -865,7 +865,7 @@ pub fn parse_finish_claimed_pair(
         || tool_name != Some("eliot.finish")
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
-        || attempt.session_id != envelope.identity.session_id.as_deref().unwrap_or_default()
+        || attempt.session_id.as_deref() != envelope.identity.session_id.as_deref()
         || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
         || attempt.authority_epoch != envelope.state_fence.authority_epoch
     {
@@ -1050,6 +1050,10 @@ pub enum ObserveDeferOutcome {
     /// The presented attempt is not the current fencing generation. The
     /// waiter never observes the stale deferral; the poller idles.
     StaleAttempt,
+    /// The protected Observe pair was already published to the daemon. A
+    /// later no-op/defer request is reconciled as Unknown, never as a safe
+    /// no-effect deferral or an invitation to reschedule.
+    ReconciliationRequired,
 }
 
 /// Parses one unwrapped `semantic_observe_claim` answer value into the
@@ -1065,7 +1069,8 @@ pub enum ObserveDeferOutcome {
 /// `eliot.observe` capability, and bind the attempt; their closed linkage
 /// and fence binding are re-proved inside the observe flight before any
 /// submit or defer touches them. The daemon also validates the exact durable
-/// ORS row, executable-input commitment and retained attempt; a partial pair
+/// ORS row, executable-input commitment and retained `Claimed`
+/// attempt; a partial pair
 /// fails closed instead of rebuilding missing authority.
 #[derive(Clone, Debug)]
 pub struct ObserveClaimedPair {
@@ -1074,6 +1079,14 @@ pub struct ObserveClaimedPair {
     /// Original Governor request identity retained from the admitted Host
     /// Request Frame, distinct from the flat HostRequestIdentity above.
     pub source_request_identity: RequestIdentity,
+    /// Exact original peer admission receipt retained by the ORS executable
+    /// row, never reconstructed from the current daemon connection.
+    pub peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    /// Exact activation ticket retained beside the peer receipt in ORS.
+    pub source_activation_ticket: eliot_protocol::AgentActivationResolutionTicket,
+    /// Exact immutable activation result that admitted the retained policy
+    /// projection for this Host origin.
+    pub source_activation_result: eliot_protocol::AgentActivationResolutionResult,
     /// Exact decoded original ToolRequest value retained by Kernel.
     pub tool: serde_json::Value,
     /// Current Kernel-issued daemon claim capability.
@@ -1158,6 +1171,34 @@ pub fn parse_observe_claimed_pair(
             executable_input
                 .validate_for(&record)
                 .map_err(|error| format!("Kernel retained executable input is invalid: {error}"))?;
+            let observation_origin = executable_input
+                .application_binding
+                .observation_policy_binding
+                .get("origin")
+                .and_then(|origin| origin.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "retained observation owner origin is missing".to_owned())?;
+            let attempt_matches_owner = match observation_origin {
+                "HOST_PEER" => {
+                    attempt.wire_version
+                        == eliot_protocol::LOCAL_READ_ATTEMPT_HOST_ORIGIN_CONTRACT_VERSION
+                        && attempt.session_id.is_none()
+                        && record.scope_ref.as_ref().map(|scope| scope.as_str())
+                            == Some(attempt.scope_id.as_str())
+                }
+                "APPLICATION_SESSION" => {
+                    attempt.wire_version == LocalReadAttempt::CONTRACT_VERSION
+                        && attempt.session_id.as_deref()
+                            == executable_input
+                                .application_binding
+                                .session_ref
+                                .as_ref()
+                                .map(|session| session.as_str())
+                        && record.scope_ref.as_ref().map(|scope| scope.as_str())
+                            == Some(attempt.scope_id.as_str())
+                }
+                _ => false,
+            };
             let source_request_identity: RequestIdentity = serde_json::from_value(
                 executable_input
                     .application_binding
@@ -1176,13 +1217,43 @@ pub fn parse_observe_claimed_pair(
             {
                 return Err("Kernel original RequestIdentity differs from the retained ORS source".to_owned());
             }
+            let peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt =
+                serde_json::from_value(
+                    executable_input
+                        .application_binding
+                        .host_peer_admission_receipt
+                        .clone(),
+                )
+                .map_err(|error| format!("retained Host peer receipt does not decode: {error}"))?;
+            peer_admission_receipt
+                .validate()
+                .map_err(|error| format!("retained Host peer receipt is invalid: {error}"))?;
+            let source_activation_ticket: eliot_protocol::AgentActivationResolutionTicket =
+                serde_json::from_value(
+                    executable_input
+                        .application_binding
+                        .source_activation_ticket
+                        .clone(),
+                )
+                .map_err(|error| format!("retained source activation ticket does not decode: {error}"))?;
+            source_activation_ticket
+                .validate()
+                .map_err(|error| format!("retained source activation ticket is invalid: {error}"))?;
+            let source_activation_result: eliot_protocol::AgentActivationResolutionResult =
+                serde_json::from_value(
+                    executable_input
+                        .application_binding
+                        .source_activation_result
+                        .clone(),
+                )
+                .map_err(|error| format!("retained source activation result does not decode: {error}"))?;
+            source_activation_result
+                .validate_against(&source_activation_ticket)
+                .map_err(|error| format!("retained source activation result is invalid: {error}"))?;
             if record.operation_id.as_str() != attempt.operation_id
                 || record.request_digest != envelope.envelope_sha256
                 || record.payload_digest != envelope.identity.payload_sha256
-                || !matches!(
-                    &record.state,
-                    eliot_ors::HostRequestState::Admitted | eliot_ors::HostRequestState::Routed
-                )
+                || record.state != eliot_ors::HostRequestState::Submitted
                 || record.result_digest.is_some()
                 || record.attempt.as_ref() != Some(&durable_attempt)
                 || durable_attempt.attempt_id.as_str() != attempt.attempt_id
@@ -1190,16 +1261,34 @@ pub fn parse_observe_claimed_pair(
                 || durable_attempt.input_commitment_sha256.as_deref()
                     != Some(executable_input.commitment_sha256.as_str())
                 || executable_input.payload_sha256 != envelope.identity.payload_sha256
+                || !attempt_matches_owner
                 || !host_request_fence_matches_semantic(
                     &envelope.state_fence,
                     &executable_input.application_binding.state_fence,
                 )
                 || durable_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
-                || Some(attempt.session_id.as_str()) != envelope.identity.session_id.as_deref()
                 || attempt.authority_epoch != envelope.state_fence.authority_epoch
-                || Some(attempt.scope_id.as_str()) != envelope.identity.work_scope_id.as_deref()
                 || attempt.facet_method != OBSERVE_CAPABILITY
                 || envelope.state_fence != executable_input.application_binding.state_fence
+                || envelope.connection_id != peer_admission_receipt.connection_id
+                || envelope.peer_admission_receipt_sha256
+                    != peer_admission_receipt.receipt_sha256
+                || executable_input.peer_admission_receipt_sha256
+                    != peer_admission_receipt.receipt_sha256
+                || source_activation_ticket.peer_admission_receipt.as_ref()
+                    != Some(&peer_admission_receipt)
+                || source_activation_ticket.peer_admission_receipt_sha256
+                    != peer_admission_receipt.receipt_sha256
+                || source_activation_ticket.connection_id != envelope.connection_id
+                || source_activation_ticket.state_fence != envelope.state_fence
+                || source_activation_result.ticket_id != source_activation_ticket.ticket_id
+                || source_activation_result.ticket_state_fence != source_activation_ticket.state_fence
+                || !envelope.activation_binding.as_ref().is_some_and(|binding| {
+                    binding.ticket_id == source_activation_ticket.ticket_id
+                        && binding.ticket_sha256 == source_activation_ticket.ticket_sha256
+                        && binding.resolution_result_sha256
+                            == source_activation_result.result_sha256
+                })
             {
                 return Err(
                     "Kernel semantic_observe_claim ORS row is not the exact admitted pair"
@@ -1250,6 +1339,9 @@ pub fn parse_observe_claimed_pair(
             Ok(Some(ObserveClaimedPair {
                 envelope,
                 source_request_identity,
+                peer_admission_receipt,
+                source_activation_ticket,
+                source_activation_result,
                 tool,
                 attempt,
                 record,
@@ -1333,6 +1425,9 @@ pub fn parse_observe_defer_outcome(
     value: &serde_json::Value,
 ) -> Result<ObserveDeferOutcome, String> {
     let _span = tracing::info_span!("eliotd.observe_defer").entered();
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("unknown") {
+        return Ok(ObserveDeferOutcome::ReconciliationRequired);
+    }
     let accepted = value
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
@@ -1374,7 +1469,7 @@ pub fn parse_observe_defer_outcome(
         return Ok(ObserveDeferOutcome::StaleAttempt);
     }
     Err(
-        "Kernel semantic_observe_deferred answer is neither deferred, settled, expired, nor stale"
+        "Kernel semantic_observe_deferred answer is neither deferred, settled, expired, stale, nor unknown"
             .to_owned(),
     )
 }
@@ -3454,7 +3549,7 @@ mod tests {
             operation_id: operation_id.clone(),
             attempt_id: format!("{operation_id}:attempt:test-boot:7:{generation}"),
             fencing_generation: generation,
-            session_id: "kernel-session-1".to_owned(),
+            session_id: Some("kernel-session-1".to_owned()),
             authority_epoch: envelope.state_fence.authority_epoch.clone(),
             scope_id: "kernel-session-1".to_owned(),
             facet_method: "eliot.query".to_owned(),
