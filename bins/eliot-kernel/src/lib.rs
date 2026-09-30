@@ -4599,9 +4599,7 @@ impl KernelComposition {
                 "intentional publication before drain linearization" => {
                     Some("intentional publication before drain linearization")
                 }
-                "phase evidence cannot be rewritten" => {
-                    Some("phase evidence cannot be rewritten")
-                }
+                "phase evidence cannot be rewritten" => Some("phase evidence cannot be rewritten"),
                 "drain cancelled by pre-linearization wake" => {
                     Some("drain cancelled by pre-linearization wake")
                 }
@@ -4611,9 +4609,7 @@ impl KernelComposition {
                 "drain decision carries a foreign generation" => {
                     Some("drain decision carries a foreign generation")
                 }
-                "drain decision generation is empty" => {
-                    Some("drain decision generation is empty")
-                }
+                "drain decision generation is empty" => Some("drain decision generation is empty"),
                 "drain decision carries unreconciled pending snapshot" => {
                     Some("drain decision carries unreconciled pending snapshot")
                 }
@@ -4911,9 +4907,9 @@ impl KernelComposition {
         if coordinator.cancelled_by_wake() {
             return Err(DrainHalt::new("drain-cancelled-by-wake"));
         }
-        coordinator.commit_drain(decision.clone()).map_err(|reason| {
-            refusal_halt(reason, coordinator.pending_receipts())
-        })?;
+        coordinator
+            .commit_drain(decision.clone())
+            .map_err(|reason| refusal_halt(reason, coordinator.pending_receipts()))?;
         // Issue #1837 / I14.23 W1: durable audit evidence for the drain commit,
         // read back from the coordinator *after* the linearization is durable
         // so the record carries the boundary that was actually persisted rather
