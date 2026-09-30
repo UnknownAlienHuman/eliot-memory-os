@@ -3878,6 +3878,491 @@ impl RecoveryInboxReceipt {
     }
 }
 
+/// Maximum canonical maintenance-trigger lifecycle record size.
+///
+/// Lifecycle records are owner-produced protocol evidence. ORS retains their
+/// exact bytes and checks only the bounded shape and digest; it does not parse
+/// them into a second protocol model.
+pub const MAX_MAINTENANCE_TRIGGER_CANONICAL_BYTES: u64 = MAX_INLINE_RECOVERY_BYTES;
+
+/// Exact owner-produced canonical bytes retained as opaque lifecycle evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceTriggerCanonicalRecord {
+    /// Stable identity of this evidence record, opaque to ORS.
+    pub record_identity: String,
+    /// Exact canonical bytes supplied by the authenticated owner.
+    pub canonical_bytes: Vec<u8>,
+    /// Lowercase SHA-256 of `canonical_bytes`.
+    pub canonical_sha256: String,
+}
+
+impl MaintenanceTriggerCanonicalRecord {
+    /// Validates the opaque identity, bounded bytes, and exact digest.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.record_identity, "maintenance_trigger_record_identity")?;
+        if self.canonical_bytes.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_canonical_bytes",
+                reason: "must not be empty",
+            });
+        }
+        let length =
+            u64::try_from(self.canonical_bytes.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        if length > MAX_MAINTENANCE_TRIGGER_CANONICAL_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        validate_digest(
+            &self.canonical_sha256,
+            "maintenance_trigger_canonical_sha256",
+        )?;
+        if sha256_hex(&self.canonical_bytes) != self.canonical_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Fencing identity and finite lease for one maintenance-trigger delivery
+/// claim. ORS compares these opaque bindings exactly; it does not infer a
+/// daemon session or authorize the claim from these fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceTriggerClaimBinding {
+    /// Retained trigger revision being delivered.
+    pub retained_revision: u64,
+    /// Stable owner-issued delivery identity.
+    pub delivery_id: String,
+    /// Authenticated daemon session identity.
+    pub daemon_session: String,
+    /// SHA-256 of the exact State Fence bound to the claim.
+    pub state_fence_sha256: String,
+    /// Authority epoch observed by the State Fence.
+    pub authority_epoch: u64,
+    /// Resource generation observed by the State Fence.
+    pub resource_generation: u64,
+    /// Finite claim lease deadline in Unix milliseconds.
+    pub claim_deadline_ms: u64,
+}
+
+impl MaintenanceTriggerClaimBinding {
+    /// Validates all required identity, fence, and finite-deadline fields.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.retained_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_claim_retained_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        validate_text(&self.delivery_id, "maintenance_trigger_delivery_id")?;
+        validate_text(&self.daemon_session, "maintenance_trigger_daemon_session")?;
+        validate_digest(
+            &self.state_fence_sha256,
+            "maintenance_trigger_state_fence_sha256",
+        )?;
+        if self.authority_epoch == 0 || self.resource_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_claim_fence",
+                reason: "authority epoch and resource generation must be greater than zero",
+            });
+        }
+        if self.claim_deadline_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_claim_deadline_ms",
+                reason: "must be a finite, non-zero Unix millisecond timestamp",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Closed ORS lifecycle disposition for one retained maintenance trigger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceTriggerLifecyclePhase {
+    /// Retained and available for a fenced delivery claim.
+    Pending,
+    /// Bound to one current daemon delivery claim.
+    Claimed,
+    /// The committed decision and downstream intent are durably recorded.
+    DecisionRecorded,
+    /// The exact decision receipt has been acknowledged by its owner.
+    Acknowledged,
+    /// The downstream outcome is uncertain and must be reconciled by identity.
+    Reconciling,
+    /// Explicitly expired with a retained terminal disposition.
+    Expired,
+    /// Explicitly superseded with a retained terminal disposition.
+    Superseded,
+}
+
+/// Owner-issued evidence and retention horizon for downstream effects.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceTriggerDownstreamRetentionProof {
+    /// Exact owner-issued proof/reference, retained without interpretation.
+    pub proof: MaintenanceTriggerCanonicalRecord,
+    /// Earliest Unix-millisecond time at which downstream data may be pruned.
+    pub retained_until_ms: u64,
+}
+
+impl MaintenanceTriggerDownstreamRetentionProof {
+    pub fn validate(&self) -> Result<(), OrsError> {
+        self.proof.validate()?;
+        if self.retained_until_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_downstream_retained_until_ms",
+                reason: "must be a finite, non-zero Unix millisecond timestamp",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Durable lifecycle row for one retained maintenance trigger.
+///
+/// `intake_sequence` is assigned by ORS in the same transaction that stages
+/// the intake row and never changes; it is the stable ordering key for bounded
+/// pages. `retained_revision` identifies the trigger revision and remains
+/// stable through lifecycle changes. `state_revision` is the ORS-owned CAS
+/// revision and advances on every persisted transition. The canonical records
+/// remain opaque; ORS validates only their identity, byte bound, and digest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceTriggerLifecycleRecord {
+    /// ORS storage contract version for this row.
+    pub contract_version: u16,
+    /// Monotonic ORS-assigned sequence for stable bounded enumeration.
+    pub intake_sequence: u64,
+    /// Stable revision of the retained trigger itself.
+    pub retained_revision: u64,
+    /// Monotonic ORS-owned revision used for compare-and-swap updates.
+    pub state_revision: u64,
+    /// Canonical source-event identity shared with the intake row.
+    pub source_event_identity: String,
+    /// Stable trigger identity shared with the intake row.
+    pub trigger_id: String,
+    /// Current closed lifecycle disposition.
+    pub phase: MaintenanceTriggerLifecyclePhase,
+    /// Most recently retained claim binding, if a claim has been issued.
+    pub claim: Option<MaintenanceTriggerClaimBinding>,
+    /// Exact canonical bytes of the current claim record.
+    pub claim_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Exact canonical committed decision receipt, if one exists.
+    pub decision_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Exact canonical downstream intent retained before acknowledgement.
+    pub downstream_intent_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Explicitly marks a decision and intent recovered from an exact
+    /// committed Store owner/receipt lookup under the current fence.
+    /// Ordinary and legacy rows default to false. ORS treats the value as
+    /// opaque provenance and requires both retained records when it is true.
+    #[serde(default)]
+    pub recovered_from_store: bool,
+    /// Exact claim record that owned the effect when the intent was first retained.
+    /// `None` on a legacy row with an intent means its effect origin is unproven.
+    #[serde(default)]
+    pub downstream_intent_origin_claim_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Exact canonical acknowledgement record, if acknowledged.
+    pub acknowledgement_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Exact canonical revocation record retained across return to Pending.
+    pub revocation_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Exact canonical expiry or supersession disposition.
+    pub terminal_record: Option<MaintenanceTriggerCanonicalRecord>,
+    /// Time this trigger revision first became durable.
+    pub retained_at_ms: u64,
+    /// Time of this lifecycle row's latest durable transition.
+    pub updated_at_ms: u64,
+    /// Applicability/expiry boundary supplied by the owner, when present.
+    pub expires_at_ms: Option<u64>,
+    /// Owner proof and downstream retention deadline required before pruning.
+    pub downstream_retention: Option<MaintenanceTriggerDownstreamRetentionProof>,
+    /// Time the payload was compacted after terminal/ack and retention proof.
+    pub payload_compacted_at_ms: Option<u64>,
+}
+
+impl MaintenanceTriggerLifecycleRecord {
+    /// Validates identities, exact opaque-record hashes, timestamps, and
+    /// phase-specific record combinations without interpreting protocol data.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        self.validate_identity_and_timestamps()?;
+        self.validate_claim_and_terminal_records()?;
+        self.validate_downstream_intent_origin()?;
+        self.validate_recovered_from_store()?;
+        self.validate_phase_record_combination()?;
+        self.validate_retention_and_compaction()?;
+        Ok(())
+    }
+
+    fn validate_identity_and_timestamps(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        if self.intake_sequence == 0 || self.retained_revision == 0 || self.state_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_lifecycle_revision",
+                reason: "intake sequence and revisions must be greater than zero",
+            });
+        }
+        validate_digest(
+            &self.source_event_identity,
+            "maintenance_trigger_source_event_identity",
+        )?;
+        validate_text(&self.trigger_id, "maintenance_trigger_id")?;
+        if self.retained_at_ms == 0 || self.updated_at_ms < self.retained_at_ms {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_lifecycle_timestamps",
+                reason: "retained time must be non-zero and update time cannot precede it",
+            });
+        }
+        if self
+            .expires_at_ms
+            .is_some_and(|deadline| deadline == 0 || deadline < self.retained_at_ms)
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_expires_at_ms",
+                reason: "expiry must be a finite timestamp no earlier than retention",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_claim_and_terminal_records(&self) -> Result<(), OrsError> {
+        let claim_pair = self.claim.is_some() == self.claim_record.is_some();
+        if !claim_pair {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_claim",
+                reason: "claim binding and canonical claim record must be present together",
+            });
+        }
+        if let Some(claim) = &self.claim {
+            claim.validate()?;
+            if claim.retained_revision != self.retained_revision {
+                return Err(OrsError::InvalidField {
+                    field: "maintenance_trigger_claim_retained_revision",
+                    reason: "must match the retained trigger revision",
+                });
+            }
+        }
+        for record in [
+            self.claim_record.as_ref(),
+            self.decision_record.as_ref(),
+            self.downstream_intent_record.as_ref(),
+            self.downstream_intent_origin_claim_record.as_ref(),
+            self.acknowledgement_record.as_ref(),
+            self.revocation_record.as_ref(),
+            self.terminal_record.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            record.validate()?;
+        }
+
+        if self.revocation_record.is_some() && self.claim.is_none() {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_revocation_record",
+                reason: "a retained revocation must bind a prior claim",
+            });
+        }
+        if self.acknowledgement_record.is_some()
+            && self.phase != MaintenanceTriggerLifecyclePhase::Acknowledged
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_acknowledgement_record",
+                reason: "an acknowledgement record is present only when acknowledged",
+            });
+        }
+        if self.terminal_record.is_some()
+            != matches!(
+                self.phase,
+                MaintenanceTriggerLifecyclePhase::Expired
+                    | MaintenanceTriggerLifecyclePhase::Superseded
+            )
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_terminal_record",
+                reason: "expiry and supersession require a terminal record, and other phases forbid it",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_downstream_intent_origin(&self) -> Result<(), OrsError> {
+        if self.downstream_intent_origin_claim_record.is_some()
+            && (self.claim.is_none() || self.downstream_intent_record.is_none())
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_downstream_intent_origin_claim_record",
+                reason: "effect origin requires a retained claim and downstream intent",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_recovered_from_store(&self) -> Result<(), OrsError> {
+        if self.recovered_from_store
+            && (self.decision_record.is_none()
+                || self.downstream_intent_record.is_none()
+                || self.claim_record.is_none()
+                || self.downstream_intent_origin_claim_record.is_none()
+                || self.downstream_intent_origin_claim_record.as_ref()
+                    != self.claim_record.as_ref())
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_recovered_from_store",
+                reason: "recovered provenance requires the exact decision/intent and matching retained claim origin",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_phase_record_combination(&self) -> Result<(), OrsError> {
+        let has_claim = self.claim.is_some();
+        let has_decision = self.decision_record.is_some();
+        let has_intent = self.downstream_intent_record.is_some();
+        let has_ack = self.acknowledgement_record.is_some();
+        if (has_decision || has_intent || has_ack) && !has_claim {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_lifecycle_claim",
+                reason: "decision, downstream intent, and acknowledgement require a retained claim",
+            });
+        }
+        let phase_valid = match self.phase {
+            MaintenanceTriggerLifecyclePhase::Pending => !has_decision && !has_intent && !has_ack,
+            MaintenanceTriggerLifecyclePhase::Claimed => {
+                has_claim && !has_decision && !has_intent && !has_ack
+            }
+            MaintenanceTriggerLifecyclePhase::DecisionRecorded => {
+                has_claim && has_decision && has_intent && !has_ack
+            }
+            MaintenanceTriggerLifecyclePhase::Acknowledged => {
+                has_claim && has_decision && has_intent && has_ack
+            }
+            MaintenanceTriggerLifecyclePhase::Reconciling => has_claim && has_intent && !has_ack,
+            MaintenanceTriggerLifecyclePhase::Expired
+            | MaintenanceTriggerLifecyclePhase::Superseded => !has_ack,
+        };
+        if !phase_valid || (has_decision && !has_intent) {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_trigger_lifecycle_phase",
+                reason: "lifecycle phase does not match its retained records",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_retention_and_compaction(&self) -> Result<(), OrsError> {
+        if let Some(retention) = &self.downstream_retention {
+            retention.validate()?;
+            if retention.retained_until_ms < self.retained_at_ms
+                || self.downstream_intent_record.is_none()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "maintenance_trigger_downstream_retention",
+                    reason: "retention requires a downstream intent and cannot predate the trigger",
+                });
+            }
+            if !matches!(
+                self.phase,
+                MaintenanceTriggerLifecyclePhase::Acknowledged
+                    | MaintenanceTriggerLifecyclePhase::Expired
+                    | MaintenanceTriggerLifecyclePhase::Superseded
+            ) {
+                return Err(OrsError::InvalidField {
+                    field: "maintenance_trigger_downstream_retention",
+                    reason: "downstream retention proof is allowed only after acknowledgement or terminal disposition",
+                });
+            }
+        }
+        if let Some(compacted_at_ms) = self.payload_compacted_at_ms {
+            let Some(retention) = &self.downstream_retention else {
+                return Err(OrsError::InvalidField {
+                    field: "maintenance_trigger_payload_compacted_at_ms",
+                    reason: "compaction requires downstream retention proof",
+                });
+            };
+            if compacted_at_ms == 0
+                || compacted_at_ms < retention.retained_until_ms
+                || compacted_at_ms > self.updated_at_ms
+            {
+                return Err(OrsError::InvalidField {
+                    field: "maintenance_trigger_payload_compacted_at_ms",
+                    reason: "compaction must follow downstream retention and not postdate the lifecycle update",
+                });
+            }
+            if !matches!(
+                self.phase,
+                MaintenanceTriggerLifecyclePhase::Acknowledged
+                    | MaintenanceTriggerLifecyclePhase::Expired
+                    | MaintenanceTriggerLifecyclePhase::Superseded
+            ) {
+                return Err(OrsError::InvalidField {
+                    field: "maintenance_trigger_payload_compacted_at_ms",
+                    reason: "payload compaction requires acknowledgement or terminal disposition",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Closed crash-recovery directive for one retained maintenance trigger.
+///
+/// ORS owns this phase-to-action table so every recovery caller replays,
+/// reuses, or holds the same retained handoff instead of re-implementing
+/// lifecycle matching. The authenticated Kernel recovery owner (STITCH caller)
+/// invokes [`classify_maintenance_trigger_handoff`] after a crash or an
+/// ambiguous commit response and follows exactly one directive (issue #1694,
+/// W5): replay the same retained trigger, reuse the recorded decision receipt
+/// without re-executing effects, keep an uncertain handoff reconciling, or
+/// leave a settled trigger untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceTriggerHandoffDirective {
+    /// Crash before decision commit: replay the same retained trigger under
+    /// its existing identity and revision. Never a new trigger identity.
+    ReplayRetainedTrigger,
+    /// Commit before ack: acknowledge from the recorded decision receipt and
+    /// retained downstream intent without another job, recommendation, or wake.
+    ReuseDecisionReceipt,
+    /// Lost or ambiguous commit response: the handoff stays
+    /// pending/reconciling. Receipt absence during an outage is not proof of
+    /// non-commit, so no effect may be repeated blindly.
+    RemainReconciling,
+    /// Acknowledged or terminally disposed: no replay and no further effect.
+    Settled,
+}
+
+/// Classifies one validated lifecycle row into its crash-recovery directive.
+///
+/// Validates the row first, so a corrupt or phase-inconsistent lifecycle
+/// record fails with a typed [`OrsError`] instead of yielding a recovery
+/// action. Materially new policy or source evidence may create an explicitly
+/// linked new evaluation revision through the owner path; this classifier
+/// never overwrites the old result and never authorizes repeating an
+/// uncertain downstream effect.
+pub fn classify_maintenance_trigger_handoff(
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<MaintenanceTriggerHandoffDirective, OrsError> {
+    lifecycle.validate()?;
+    Ok(match lifecycle.phase {
+        MaintenanceTriggerLifecyclePhase::Pending | MaintenanceTriggerLifecyclePhase::Claimed => {
+            MaintenanceTriggerHandoffDirective::ReplayRetainedTrigger
+        }
+        MaintenanceTriggerLifecyclePhase::DecisionRecorded => {
+            MaintenanceTriggerHandoffDirective::ReuseDecisionReceipt
+        }
+        MaintenanceTriggerLifecyclePhase::Reconciling => {
+            MaintenanceTriggerHandoffDirective::RemainReconciling
+        }
+        MaintenanceTriggerLifecyclePhase::Acknowledged
+        | MaintenanceTriggerLifecyclePhase::Expired
+        | MaintenanceTriggerLifecyclePhase::Superseded => {
+            MaintenanceTriggerHandoffDirective::Settled
+        }
+    })
+}
+
 /// Durable cause for one staged opaque operation that cannot be decoded or
 /// trusted (issue #1925, I5.2/I5.6).
 ///

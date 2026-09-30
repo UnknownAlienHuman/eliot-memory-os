@@ -32328,6 +32328,48 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         self.report_recovery_problem(problem)
     }
 
+    fn record_maintenance_trigger_retention(
+        &self,
+        trigger_id: &str,
+        expected_state_revision: u64,
+        proof: MaintenanceTriggerDownstreamRetentionProof,
+        now_ms: u64,
+    ) -> Result<MaintenanceTriggerLifecycleRecord, OrsError> {
+        validate_text(trigger_id, "maintenance_trigger_id")?;
+        proof.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut lifecycle = load_maintenance_trigger_lifecycle_for_update(&write, trigger_id)?;
+        // Exact replay returns the retained row without advancing the
+        // revision; a changed proof under the same trigger conflicts instead
+        // of overwriting retained downstream evidence.
+        if let Some(retained) = lifecycle.downstream_retention.as_ref() {
+            if retained == &proof {
+                return commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle);
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+        // Retention evidence is admissible only after the trigger reached a
+        // disposition that ends delivery: exact acknowledgement or an explicit
+        // terminal expiry/supersession. The row validation additionally
+        // requires a retained downstream intent beside the proof, so a bare
+        // acknowledgement without recorded effects cannot authorize pruning.
+        if expected_state_revision != lifecycle.state_revision
+            || !matches!(
+                lifecycle.phase,
+                MaintenanceTriggerLifecyclePhase::Acknowledged
+                    | MaintenanceTriggerLifecyclePhase::Expired
+                    | MaintenanceTriggerLifecyclePhase::Superseded
+            )
+            || lifecycle.downstream_intent_record.is_none()
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        lifecycle.downstream_retention = Some(proof);
+        advance_maintenance_trigger_lifecycle(&mut lifecycle, now_ms)?;
+        persist_maintenance_trigger_lifecycle(&write, &lifecycle)?;
+        commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle)
+    }
+
     fn report_recovery_problem(
         &self,
         problem: RecoveryProblem,
