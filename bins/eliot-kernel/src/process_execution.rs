@@ -43,7 +43,8 @@ use eliot_platform_windows::{
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation,
     KernelDispatchKey, OperationId, OriginChallenge, OriginChallengeRequest, OriginControlGrant,
-    OriginControlOperation, OriginControlPresentation, PermitIssuance, ProcessEvidence,
+    OriginControlOperation, OriginControlPresentation, OriginGrantEffectOutcome, PermitIssuance,
+    ProcessEvidence,
     ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
     ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
     ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SessionId,
@@ -1486,6 +1487,39 @@ impl ProcessExecutionGateway {
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
     }
 
+    /// Reads the durable one-shot effect outcome for a decided origin grant.
+    ///
+    /// The grant-funded kill boundary calls this with the grant's one-shot
+    /// nonce before dispatching the effect, so a grant that already funded
+    /// an observed effect is never executed twice.
+    fn origin_grant_effect_state(
+        &self,
+        request_nonce: &str,
+    ) -> Result<OriginGrantEffectOutcome, ProcessExecutionError> {
+        self.controller
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
+            })?
+            .origin_grant_effect_state(request_nonce, &self.snapshot_binding)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+    }
+
+    /// Durably records the observed effect of a decided origin grant.
+    ///
+    /// Called after the executor observes the kill receipt. A failed record
+    /// fails the call: a failed snapshot can never report a clean success.
+    fn record_origin_grant_effect(&self, request_nonce: &str) -> Result<(), ProcessExecutionError> {
+        self.controller
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
+            })?
+            .record_origin_grant_effect(request_nonce, &self.snapshot_binding)
+            .map(|_| ())
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+    }
+
     #[cfg(windows)]
     pub(crate) fn attach_canonical_store(
         &self,
@@ -2006,15 +2040,58 @@ impl ProcessExecutionGateway {
             super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
             return Err(error);
         }
+        // Issue #1775 W6: one-shot effect journal. The durable journal keeps
+        // the consumed one-shot plus its possible-effect state, so a grant
+        // that already funded an observed effect answers
+        // reconciliation-required instead of executing twice, and an
+        // unproven effect never mints a fresh nonce. The unreadable-journal
+        // case fails closed before the effect, never around it.
+        if let Some(granted) = grant {
+            match self.origin_grant_effect_state(granted.request_nonce()) {
+                Ok(OriginGrantEffectOutcome::Effected) => {
+                    observe_process("kernel.process.cancel_replayed", "unknown");
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
+                Ok(OriginGrantEffectOutcome::Unknown) => {}
+                Err(error) => {
+                    observe_process("kernel.process.cancel_rejected", "fenced");
+                    super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
+                        &error,
+                    ));
+                    return Err(error);
+                }
+            }
+        }
         match self.executor.cancel(operation_id.clone()).await {
             Ok(receipt) => {
+                // The receipt is observed: journal the proven effect before
+                // reporting success. A failed journal cannot report a clean
+                // success; the receipt stays re-derivable through reconcile.
+                if let Some(granted) = grant {
+                    if let Err(error) = self.record_origin_grant_effect(granted.request_nonce()) {
+                        observe_process("kernel.process.cancel_unrecorded", "unknown");
+                        super::kernel_diagnostics::observe_terminal_error(
+                            process_terminal_code(&error),
+                        );
+                        return Err(error);
+                    }
+                }
                 observe_process("kernel.process.cancel_acknowledged", "success");
                 Ok(receipt)
             }
-            Err(error) => {
+            Err(_) => {
+                // Issue #1775 W5: a failed or hung owned child leaves the
+                // effect unproven. The consumed one-shot stays `Unknown` in
+                // the durable journal, and the caller gets the exact
+                // missing-capability report — reconcile the original
+                // target/operation through the retained owner binding and
+                // handles — never a downgrade to name/PID control and never
+                // a blind re-execution.
                 observe_process("kernel.process.cancel_failed", "unknown");
-                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
-                Err(error)
+                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
+                    &ProcessExecutionError::UnknownOutcome,
+                ));
+                Err(ProcessExecutionError::UnknownOutcome)
             }
         }
     }

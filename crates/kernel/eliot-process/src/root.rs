@@ -25,7 +25,7 @@ mod origin_challenge;
 pub use origin_challenge::{
     ORIGIN_CHALLENGE_SCHEMA_VERSION, OriginChallenge, OriginChallengeAuthority,
     OriginChallengeReplayEntry, OriginChallengeReplaySnapshot, OriginChallengeRequest,
-    OriginControlGrant, OriginControlOperation, OriginControlPresentation,
+    OriginControlGrant, OriginControlOperation, OriginControlPresentation, OriginGrantEffectOutcome,
 };
 
 mod stream_sink;
