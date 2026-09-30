@@ -1129,8 +1129,8 @@ pub fn parse_observe_claimed_pair(
                         .to_owned(),
                 );
             }
-            let record: eliot_ors::HostRequestRecord =
-                serde_json::from_value(record_value).map_err(|error| {
+            let record: eliot_ors::HostRequestRecord = serde_json::from_value(record_value)
+                .map_err(|error| {
                     format!("Kernel semantic_observe_claim ORS record does not decode: {error}")
                 })?;
             record.validate().map_err(|error| {
@@ -1160,8 +1160,7 @@ pub fn parse_observe_claimed_pair(
                 || record.attempt.as_ref() != Some(&durable_attempt)
                 || durable_attempt.attempt_id.as_str() != attempt.attempt_id
                 || durable_attempt.generation != attempt.fencing_generation
-                || durable_attempt.input_commitment_sha256
-                    != executable_input.commitment_sha256
+                || durable_attempt.input_commitment_sha256 != executable_input.commitment_sha256
                 || executable_input.payload_sha256 != envelope.identity.payload_sha256
                 || executable_input.application_binding.state_fence != envelope.state_fence
                 || durable_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed

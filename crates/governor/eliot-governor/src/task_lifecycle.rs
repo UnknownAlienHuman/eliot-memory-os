@@ -413,16 +413,9 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         // The Kernel admission scope is the independently admitted WorkScope
         // carried by the selection, not the Governor's global ordering scope.
         // Keep ordering scopes unchanged; they are a separate store concern.
-        envelope.scope_id = ScopeId::new(
-            input
-                .selection
-                .work_scope()
-                .binding
-                .scope
-                .scope_ref
-                .clone(),
-        )
-        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+        envelope.scope_id =
+            ScopeId::new(input.selection.work_scope().binding.scope.scope_ref.clone())
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
         envelope
             .validate()
             .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))?;
