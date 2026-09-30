@@ -2861,7 +2861,9 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
 
     /// Adopts only after same-owner reconciliation and fresh source
     /// revalidation at the adoption boundary. When current source readback is
-    /// unavailable, `None` returns a Stale observation.
+    /// unavailable, `None` returns a stale observation. Matching endpoint
+    /// captures also remain stale: the analyzer reads a mutable workspace,
+    /// so equality cannot exclude a source edit and reversal during indexing.
     pub async fn adopt_received_result_with_source_artifact_proof(
         &self,
         record: RetainedLspObservationV1,
@@ -2982,7 +2984,9 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             && process_complete
             && source_binding_matches_current(binding, current)
         {
-            projection.currentness = Freshness::Current;
+            projection.currentness = Freshness::Stale {
+                reason: "matching endpoint source captures do not prove that the mutable analyzer workspace remained unchanged during indexing".to_owned(),
+            };
         }
         Ok(projection)
     }
@@ -4168,7 +4172,14 @@ fn validate_instrument_binding(
         || intent.executable_sha256() != resolved.content_digest.as_str()
         || intent.argv() != command.arguments.as_slice()
         || intent.working_directory() != command.working_directory.as_str()
-        || intent.resource_limits() != &spec.limits
+        || spec
+            .limits
+            .timeout_ms
+            .is_some_and(|ceiling| intent.resource_limits().wall_timeout_ms() > ceiling)
+        || spec.limits.max_output_bytes.is_some_and(|ceiling| {
+            intent.resource_limits().stdout_bytes() > ceiling
+                || intent.resource_limits().stderr_bytes() > ceiling
+        })
         || resolved.arguments.as_slice() != intent.argv()
         || invocation.arguments.as_slice() != spec.argument_template.as_slice()
         || path_file_name(&spec.executable) != resolved.executable_file_name()

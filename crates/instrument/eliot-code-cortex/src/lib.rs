@@ -268,8 +268,7 @@ impl SemanticIndex {
             .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
         if projection.observation() != &result {
             return Err(CodeCortexError::InvalidEvidence(
-                "LSP adoption projection changed the bridge-validated normalized result"
-                    .to_owned(),
+                "LSP adoption projection changed the bridge-validated normalized result".to_owned(),
             ));
         }
         self.admit_lsp_observation(
@@ -326,10 +325,7 @@ impl SemanticIndex {
                 })
             })
             .collect::<Vec<_>>();
-        if !matches!(
-            &result.receipt().freshness,
-            LspFreshness::Stale { .. }
-        ) {
+        if !matches!(&result.receipt().freshness, LspFreshness::Stale { .. }) {
             return Err(CodeCortexError::InvalidEvidence(
                 "LSP adoption did not preserve the original stale observation receipt".to_owned(),
             ));
@@ -647,16 +643,12 @@ fn project_retained_lsp_observations(
                 .push(observation.process_operation_id.clone());
         }
         let receipt = observation.result.receipt();
-        let workspace_complete = matches!(
-            &receipt.coverage,
-            LspCoverage::Workspace { .. }
-        ) && matches!(&receipt.disposition, FailureDisposition::Success);
+        let workspace_complete = matches!(&receipt.coverage, LspCoverage::Workspace { .. })
+            && matches!(&receipt.disposition, FailureDisposition::Success);
         if let LspFreshness::Stale { reason } = &observation.currentness {
             report.coverage_gaps.push(CoverageGap {
                 scope: request.scope.clone(),
-                reason: format!(
-                    "LSP evidence {evidence_id} is stale at owner adoption: {reason}"
-                ),
+                reason: format!("LSP evidence {evidence_id} is stale at owner adoption: {reason}"),
                 cheapest_probe: Some(
                     "obtain a current source-bound observation through the owning process path"
                         .to_owned(),
@@ -963,7 +955,10 @@ fn admit_lsp_relation(
             && relation.kind == kind
             && relation.authority == RelationAuthority::InstrumentObservation
             && relation.freshness == freshness
-            && relation.source_handles.iter().any(|handle| handle == evidence_id)
+            && relation
+                .source_handles
+                .iter()
+                .any(|handle| handle == evidence_id)
     }) {
         return true;
     }
@@ -1034,8 +1029,7 @@ fn add_lsp_node(
         let incoming_is_current = node.kind.starts_with("current_lsp_");
         let existing_is_stale = existing.kind.starts_with("stale_lsp_");
         let incoming_is_stale = node.kind.starts_with("stale_lsp_");
-        if (existing_is_stale && incoming_is_current)
-            || (existing_is_current && incoming_is_stale)
+        if (existing_is_stale && incoming_is_current) || (existing_is_current && incoming_is_stale)
         {
             if report.nodes.len() >= request.max_nodes {
                 return Ok(false);
@@ -1080,9 +1074,11 @@ fn add_lsp_anchor(
     coordinate_handle: &str,
     evidence_id: &str,
 ) {
-    if report.entrypoints.iter().any(|anchor| {
-        anchor.handle == coordinate_handle && anchor.source_handle == evidence_id
-    }) {
+    if report
+        .entrypoints
+        .iter()
+        .any(|anchor| anchor.handle == coordinate_handle && anchor.source_handle == evidence_id)
+    {
         return;
     }
     report.entrypoints.push(SemanticAnchor {
