@@ -41,6 +41,10 @@ use eliot_kernel_service::{
     IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
     StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
 };
+#[cfg(windows)]
+use eliot_kernel_service::MaintenanceTriggerDeliveryError;
+#[cfg(windows)]
+use eliot_protocol::{MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, ProtocolError};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
@@ -277,6 +281,26 @@ pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str = "daemon_storage_re
 /// [`STORAGE_REPLACEMENT_OPERATION`].
 pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
     "daemon_storage_replacement_rollback";
+
+/// Authenticated daemon operation that admits one ORS-staged maintenance
+/// trigger before acknowledging intake (issue #1694 W2).
+///
+/// Persist before ack: the arm admits the ORS-staged input through the
+/// existing gateway owner entry
+/// (`KernelStoreGateway::admit_maintenance_trigger`) BEFORE issuing any
+/// intake acknowledgement. The complete opaque input must already be staged
+/// through the ORS owner; exact identity/hash replay returns the same
+/// staging obligation, changed content conflicts, and any capacity, key,
+/// integrity, or durable-write failure is answered with the exact bounded
+/// failure — never an acknowledgement — so the producer keeps its retry
+/// identity and its cursor must not advance. No new owner, database, or
+/// poller; no Governor types in ORS.
+///
+/// It carries the same front-door caveat as
+/// [`STORAGE_REPLACEMENT_RESUME_OPERATION`]: it is recognized here and
+/// unreachable from the front door until
+/// `frame_dispatch::is_daemon_operation` lists it.
+pub(crate) const MAINTENANCE_TRIGGER_INTAKE_OPERATION: &str = "maintenance_trigger_intake";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -582,6 +606,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         STORAGE_REPLACEMENT_OPERATION => STORAGE_REPLACEMENT_OPERATION,
         STORAGE_REPLACEMENT_RESUME_OPERATION => STORAGE_REPLACEMENT_RESUME_OPERATION,
         STORAGE_REPLACEMENT_ROLLBACK_OPERATION => STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
+        MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -2528,6 +2553,247 @@ impl KernelComposition {
     }
 }
 
+/// Exact request payload for [`MAINTENANCE_TRIGGER_INTAKE_OPERATION`].
+///
+/// The caller presents the complete retained trigger record plus the exact
+/// admitted session fence. The record carries the ORS envelope reference and
+/// payload hash; the intake operation proves staging through the ORS owner
+/// before any intake acknowledgement is issued. The caller never supplies
+/// authority, a receipt, or a delivery identity: those are owner-issued on
+/// admission, never asserted.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerIntakeRequest {
+    /// Version of the authenticated intake request.
+    version: u8,
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Complete retained trigger record to stage-admit.
+    record: MaintenanceTriggerRecord,
+}
+
+/// Closed intake failure for one maintenance-trigger intake (issue #1694 W2).
+///
+/// Every variant preserves its exact source error and projects one stable
+/// intake code, so an ORS/staging fault, a protocol or changed-content
+/// conflict, a fenced generation, and a live-authority refusal stay
+/// distinguishable and never collapse into an acknowledgement. Any failure
+/// admits nothing and acknowledges nothing: the producer keeps its retry
+/// identity and its cursor must not advance.
+#[cfg(windows)]
+enum MaintenanceTriggerIntakeFailure {
+    /// The ORS owner could not prove the staged opaque input: capacity, key,
+    /// integrity, or durable-write failure.
+    OrsStaging(eliot_ors::OrsError),
+    /// The presented record failed protocol validation, or changed content
+    /// under the same identity conflicted with staged bytes (`ReplayConflict`).
+    Protocol(ProtocolError),
+    /// The live generation is fenced for this intake.
+    FencedGeneration,
+    /// Live Kernel authority refused session or admission; fails closed.
+    LiveAuthority(KernelServiceError),
+    /// The Kernel owner could not reach its service or ledger state.
+    OwnerUnavailable(String),
+    /// The canonical Store refused the backing read.
+    Store(StoreError),
+    /// A ledger-level refusal owned by another transition (claim/ack paths).
+    /// Intake admission never produces one; it is preserved exactly and
+    /// fails closed here rather than becoming an acknowledgement.
+    UnexpectedLedgerRefusal(MaintenanceTriggerDeliveryError),
+}
+
+#[cfg(windows)]
+impl From<MaintenanceTriggerDeliveryError> for MaintenanceTriggerIntakeFailure {
+    /// Classifies one owner-side admission outcome into the closed intake
+    /// failure.
+    ///
+    /// Exact source errors are preserved in their variant; only the stable
+    /// code reads the classification. The five ledger-level refusals owned
+    /// by the claim/ack transitions can never be produced by intake
+    /// admission and fail closed as ledger refusals, never as
+    /// acknowledgements. STITCH (issue #1694): when the gateway half lands
+    /// `MaintenanceTriggerDeliveryError::LedgerAuthority` plus its
+    /// `from_ledger_admission_error` mapper in
+    /// `crates/kernel/eliot-kernel-service/src/store_gateway.rs`, this match
+    /// intentionally breaks until that variant is classified here — no
+    /// wildcard arm may absorb it.
+    fn from(error: MaintenanceTriggerDeliveryError) -> Self {
+        match error {
+            MaintenanceTriggerDeliveryError::StagingProof(error) => Self::OrsStaging(error),
+            MaintenanceTriggerDeliveryError::Protocol(error) => Self::Protocol(error),
+            MaintenanceTriggerDeliveryError::Service(KernelServiceError::GenerationFenced) => {
+                Self::FencedGeneration
+            }
+            MaintenanceTriggerDeliveryError::Service(error) => Self::LiveAuthority(error),
+            MaintenanceTriggerDeliveryError::OwnerUnavailable(reason) => {
+                Self::OwnerUnavailable(reason)
+            }
+            MaintenanceTriggerDeliveryError::Store(error) => Self::Store(error),
+            MaintenanceTriggerDeliveryError::UnknownTrigger
+            | MaintenanceTriggerDeliveryError::ClaimConflict
+            | MaintenanceTriggerDeliveryError::RevokedConsumer
+            | MaintenanceTriggerDeliveryError::ExpiredEligibility
+            | MaintenanceTriggerDeliveryError::MirrorRecoveryRequired => {
+                Self::UnexpectedLedgerRefusal(error)
+            }
+        }
+    }
+}
+
+/// Maps one intake failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; the `String` payloads and the source errors'
+/// own fields are never logged. Changed-content conflicts stay
+/// distinguishable from other protocol rejections, and a fenced generation
+/// stays distinguishable from a live-authority refusal, so none of them
+/// collapses into an effect-free success. The match stays exhaustive with no
+/// wildcard: a new failure variant breaks here loudly.
+#[cfg(windows)]
+fn maintenance_trigger_intake_terminal_code(
+    failure: &MaintenanceTriggerIntakeFailure,
+) -> &'static str {
+    match failure {
+        MaintenanceTriggerIntakeFailure::OrsStaging(_) => "INTAKE_STAGING_UNAVAILABLE",
+        MaintenanceTriggerIntakeFailure::Protocol(error) => {
+            if *error == ProtocolError::ReplayConflict {
+                "INTAKE_REPLAY_CONFLICT"
+            } else {
+                "INTAKE_PROTOCOL_REJECTED"
+            }
+        }
+        MaintenanceTriggerIntakeFailure::FencedGeneration => "INTAKE_GENERATION_FENCED",
+        MaintenanceTriggerIntakeFailure::LiveAuthority(_) => "INTAKE_LIVE_AUTHORITY_REFUSED",
+        MaintenanceTriggerIntakeFailure::OwnerUnavailable(_) => "INTAKE_OWNER_UNAVAILABLE",
+        MaintenanceTriggerIntakeFailure::Store(_) => "INTAKE_STORE_REFUSED",
+        MaintenanceTriggerIntakeFailure::UnexpectedLedgerRefusal(_) => "INTAKE_LEDGER_REFUSED",
+    }
+}
+
+/// Closed outcome of one admitted maintenance-trigger intake.
+///
+/// `terminal_code` is the ONE stable diagnostic code for a refused intake
+/// and is `None` only when the gateway owner actually admitted the staged
+/// input and issued its receipt. A receipt is present only when the owner
+/// constructed one after proving ORS staging, so "requested", "refused",
+/// and "admitted" never collapse into one answer.
+#[cfg(windows)]
+#[derive(Serialize)]
+struct MaintenanceTriggerIntakeAnswer {
+    /// Version of the authenticated intake answer.
+    version: u8,
+    /// Terminal diagnostic code of the refused intake, `None` when admitted.
+    terminal_code: Option<&'static str>,
+    /// The owner's intake receipt, present only when admitted.
+    receipt: Option<MaintenanceTriggerIntakeReceipt>,
+}
+
+/// The admitted-reply envelope, identical to every other arm on this channel.
+#[cfg(windows)]
+fn maintenance_trigger_intake_response(
+    answer: &MaintenanceTriggerIntakeAnswer,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": answer,
+        "recovery": null,
+    })
+}
+
+/// The outcome of an intake the owner refused before it could admit.
+///
+/// Every position field is empty on purpose: an intake that never reached
+/// admission staged nothing new, holds no obligation, and owns no receipt.
+/// Reporting the refusal code alone is the honest shape — a refused intake
+/// is not an admitted trigger that made no progress, and the producer keeps
+/// its retry identity.
+#[cfg(windows)]
+fn maintenance_trigger_intake_refusal_answer(
+    terminal_code: &'static str,
+) -> MaintenanceTriggerIntakeAnswer {
+    MaintenanceTriggerIntakeAnswer {
+        version: 1,
+        terminal_code: Some(terminal_code),
+        receipt: None,
+    }
+}
+
+#[cfg(windows)]
+impl KernelComposition {
+    /// Admits one ORS-staged maintenance trigger before acknowledging intake.
+    ///
+    /// The operation selector only picks this entry. The closed request
+    /// carries the complete retained trigger record and the exact admitted
+    /// session fence; the principal comes from the authenticated session
+    /// module binding, never from the request DTO. A malformed request or a
+    /// fence that is not the exact admitted session fence is fenced at the
+    /// transport, before the gateway is touched.
+    ///
+    /// Admission itself is the existing gateway owner entry
+    /// (`KernelStoreGateway::admit_maintenance_trigger`), which proves
+    /// ORS staging first and validates the record with the existing wire
+    /// validators: the complete opaque input must already be staged, exact
+    /// identity/hash replay returns the same staging receipt, and changed
+    /// content conflicts. Any failure is answered with the intake's own
+    /// stable refusal code and never with an acknowledgement, so the
+    /// producer keeps its retry identity and its cursor must not advance.
+    fn maintenance_trigger_intake_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerIntakeRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_intake_fence(
+            session,
+            request.version,
+            &request.state_fence,
+        )?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway.admit_maintenance_trigger(
+            session.module_generation.module_id.as_str(),
+            request.record,
+        ) {
+            Ok((receipt, _)) => Ok(maintenance_trigger_intake_response(
+                &MaintenanceTriggerIntakeAnswer {
+                    version: 1,
+                    terminal_code: None,
+                    receipt: Some(receipt),
+                },
+            )),
+            Err(error) => Ok(maintenance_trigger_intake_response(
+                &maintenance_trigger_intake_refusal_answer(
+                    maintenance_trigger_intake_terminal_code(
+                        &MaintenanceTriggerIntakeFailure::from(error),
+                    ),
+                ),
+            )),
+        }
+    }
+
+    /// The one admission gate every maintenance-trigger intake request passes.
+    ///
+    /// The same three checks the storage-replacement ingress applies: the
+    /// request's own State Fence must be well formed, the version must be
+    /// the one this arm speaks, and the presented fence must be the
+    /// **exact** admitted session fence. A request failing any of them is
+    /// fenced at the transport, before the gateway is touched.
+    fn validate_maintenance_trigger_intake_fence(
+        session: &Session,
+        version: u8,
+        state_fence: &StateFence,
+    ) -> Result<(), TransportError> {
+        state_fence
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if version != 1 || state_fence != &session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+}
+
 impl KernelComposition {
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
@@ -2844,6 +3110,15 @@ impl KernelComposition {
             }
             STORAGE_REPLACEMENT_ROLLBACK_OPERATION => {
                 self.storage_replacement_rollback_operation(session, payload.clone())
+            }
+            // Issue #1694 W2: the persist-before-ack maintenance-trigger
+            // intake. The arm admits the ORS-staged record through the
+            // existing gateway owner entry before issuing any intake
+            // acknowledgement; every route scope, receipt, and delivery
+            // identity on the reply is owner-issued, never from the payload.
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_INTAKE_OPERATION => {
+                self.maintenance_trigger_intake_operation(session, payload.clone())
             }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
