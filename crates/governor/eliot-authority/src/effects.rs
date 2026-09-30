@@ -559,12 +559,7 @@ impl EffectAuthorizer {
             // instead of renewing authority, and the replay consumes no use
             // budget. (I6.10: a stale lease is historical evidence, never a
             // new effect.)
-            lease.still_current(
-                &existing.proposal,
-                current_work_scope,
-                current_session,
-                now,
-            )?;
+            lease.still_current(&existing.proposal, current_work_scope, current_session, now)?;
             return Ok(existing.clone());
         }
         lease.authorize(&proposed, current_work_scope, current_session, now)?;
