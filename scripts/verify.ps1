@@ -413,22 +413,33 @@ if ($selectedGates.Count -eq 0) {
     exit 1
 }
 
-# Versioned profile admission (issue #1914 W2/W4, I18.21:3). This script stays
-# the ONE ordered gate-definition owner: the table above is still the only place
-# a gate command is written down, and nothing below selects or reorders a gate.
-# What this seam adds is the one thing the table cannot express: the profile
-# ADMISSION decision, which the shared Rust resolver owns.
+# Versioned profile admission (issue #1914 W2/W4, I18.21:3, I18.21:14). This
+# script stays the ONE ordered gate-definition owner: the table above is still
+# the only place a gate command is written down, and nothing below selects or
+# reorders a gate. What this seam adds is the one thing the table cannot
+# express: the profile ADMISSION decision, which the shared Rust resolver owns.
 #
 # The resolver named here is `eliot-profile-resolver`, the production entry of
 # `eliot-instrument-runner`. It resolves the closed profile ALIAS below through
-# `resolve_verification_route` — the same function the CI step calls with the
-# same alias — and issues the shared `VerificationProfileReceipt`. So "local
-# profile revision == CI profile revision" has a computed value on both sides
-# rather than being asserted in prose, and a refusal here (an unadmitted alias,
-# a missing executable identity, or an absent provenance receipt) stops the run
-# before a single gate executes rather than after.
+# `resolve_verification_route` — the same function, the same alias, and the same
+# binary that CI resolves, because CI enters this same script — and issues the
+# shared `VerificationProfileReceipt`. So "local profile revision == CI profile
+# revision" has a computed value on both sides rather than being asserted in
+# prose, and a refusal here (an unadmitted alias, a missing executable identity,
+# or an absent provenance receipt) stops the run before a single gate executes
+# rather than after.
 #
-# The three PowerShell profiles map onto the two admitted verification routes:
+# Reaching the resolver is this script's own responsibility. I18.21:14 says the
+# minimal bootstrap build is the only unavoidable pre-run exception, so the
+# admission below PERFORMS that build itself — exactly one crate, exactly one
+# binary, into a target root it names — and then executes the built file by
+# absolute path. No caller has to put the resolver on PATH, no PATH entry has to
+# survive between steps, and there is no branch that proceeds without the
+# resolver: if the bootstrap build fails or issues no receipt, the run is
+# refused. That is the difference between a governed entrypoint and a gate that
+# only consults a resolver somebody remembered to install.
+#
+# The three PowerShell profiles map onto the admitted verification route:
 # Quick and Review are package-scoped source verification, MergeCompile is
 # package-scoped compile-only verification. The mapping is declared here, once,
 # as data — not as a command list — and the resolver refuses any alias outside
@@ -439,42 +450,89 @@ $verificationRouteAliases = @{
     'MergeCompile' = 'package-verification'
 }
 $verificationRouteAlias = $verificationRouteAliases[$Profile]
+if ([string]::IsNullOrWhiteSpace($verificationRouteAlias)) {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: PowerShell profile '$Profile' names no admitted verification route alias.")
+    exit 1
+}
 $profileResolver = 'eliot-profile-resolver'
 $profileResolverSource = 'crates/instrument/eliot-instrument-runner/src/bin/eliot-profile-resolver.rs'
-$profileReceiptPath = Join-Path $repoRoot (Join-Path '.eliot' ('verification-profile-{0}.json' -f [Guid]::NewGuid().ToString('N')))
+$profileResolverPackage = 'eliot-instrument-runner'
+$eliotStateRoot = Join-Path $repoRoot '.eliot'
+# The receipt is run-local working state, so the directory that holds it is
+# created on demand and removed again below when this run created it. A
+# checkout that already has `.eliot` keeps it untouched.
+$eliotStateRootCreated = $false
+if (-not (Test-Path -LiteralPath $eliotStateRoot -PathType Container)) {
+    New-Item -ItemType Directory -Path $eliotStateRoot -Force | Out-Null
+    $eliotStateRootCreated = $true
+}
+$profileReceiptPath = Join-Path $eliotStateRoot ('verification-profile-{0}.json' -f [Guid]::NewGuid().ToString('N'))
 
-# Admit the profile through the shared resolver. A missing or unbuildable
-# resolver is a fail-closed outcome: without it this run has no versioned
-# profile revision to report, and reporting one it did not resolve would be
-# exactly the hidden-command-list divergence I18.21:11 forbids.
-$resolverCommand = Get-Command $profileResolver -CommandType Application -ErrorAction SilentlyContinue
-if ($null -eq $resolverCommand) {
-    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the shared profile resolver '$profileResolver' ($profileResolverSource) is not on PATH; build the ELIOT verifier/runner bootstrap first (I18.21:14).")
+# Minimal bootstrap build (I18.21:14). The target root is the one cargo is
+# already configured to use, so the resolver's own build output is the file it
+# runs and the cache root is the real cargo home rather than a stand-in.
+$resolverTargetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) { Join-Path $repoRoot 'target' } else { $env:CARGO_TARGET_DIR }
+$resolverCacheRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_HOME)) { Join-Path $env:USERPROFILE '.cargo' } else { $env:CARGO_HOME }
+foreach ($resolverRoot in @(@{ Name = 'target'; Value = $resolverTargetRoot }, @{ Name = 'cache'; Value = $resolverCacheRoot })) {
+    if ([string]::IsNullOrWhiteSpace($resolverRoot.Value) -or -not [IO.Path]::IsPathFullyQualified($resolverRoot.Value)) {
+        [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the resolver's $($resolverRoot.Name) root '$($resolverRoot.Value)' is not an absolute path, so no admitted layout can be bound to it.")
+        exit 1
+    }
+}
+if (-not (Test-Path -LiteralPath $resolverCacheRoot -PathType Container)) {
+    New-Item -ItemType Directory -Path $resolverCacheRoot -Force | Out-Null
+}
+$bootstrapExit = 0
+try {
+    $bootstrapOutput = @(& cargo build --locked --target-dir $resolverTargetRoot -p $profileResolverPackage --bin $profileResolver 2>&1)
+    $bootstrapExit = $LASTEXITCODE
+    foreach ($bootstrapLine in $bootstrapOutput) { Write-Host "VERIFY_PROFILE_BOOTSTRAP: $bootstrapLine" }
+} catch {
+    $bootstrapExit = -1
+    Write-Host "VERIFY_PROFILE_BOOTSTRAP: raised $($_.Exception.Message)"
+}
+if ($bootstrapExit -ne 0) {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the minimal bootstrap build of $profileResolverPackage/$profileResolver ($profileResolverSource) failed (exit $bootstrapExit); this run has no versioned profile revision to report and no gate ran under one.")
     exit 1
 }
-$resolverTargetRoot = Join-Path $repoRoot '.eliot'
-if (-not (Test-Path -LiteralPath $resolverTargetRoot -PathType Container)) {
-    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the resolver needs an existing target root at '$resolverTargetRoot' for its admitted layout.")
+$resolverExecutable = ''
+foreach ($resolverCandidate in @("$profileResolver.exe", $profileResolver)) {
+    $resolverCandidatePath = Join-Path (Join-Path $resolverTargetRoot 'debug') $resolverCandidate
+    if (Test-Path -LiteralPath $resolverCandidatePath -PathType Leaf) {
+        $resolverExecutable = $resolverCandidatePath
+        break
+    }
+}
+if ([string]::IsNullOrWhiteSpace($resolverExecutable)) {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the bootstrap build reported success but no $profileResolver executable exists under '$resolverTargetRoot\debug'.")
     exit 1
 }
-$resolverArgs = @(
-    '--alias', $verificationRouteAlias,
-    '--source-root', $repoRoot,
-    '--target-root', $resolverTargetRoot,
-    '--cache-root', (Join-Path $repoRoot '.cargo'),
-    '--declared-environment', "eliot-verify-profile-$Profile",
-    '--receipt-out', $profileReceiptPath
-)
-$resolverOutput = @(& $resolverCommand.Source @resolverArgs 2>&1)
-$resolverExit = $LASTEXITCODE
-foreach ($resolverLine in $resolverOutput) { Write-Host "VERIFY_PROFILE_RESOLVER: $resolverLine" }
+Write-Host "VERIFY_PROFILE_RESOLVER_EXECUTABLE: $resolverExecutable"
+
+# Admit the profile through the shared resolver. A nonzero exit reports the
+# admitted route's own normalized outcome, not an admission failure, so it is
+# recorded rather than treated as a refusal: the receipt is the admission
+# evidence, and a run that could not admit the route issues none.
+$resolverExit = 0
+try {
+    $resolverArgs = @(
+        '--alias', $verificationRouteAlias,
+        '--source-root', $repoRoot,
+        '--target-root', $resolverTargetRoot,
+        '--cache-root', $resolverCacheRoot,
+        '--declared-environment', "eliot-verify-profile-$Profile",
+        '--receipt-out', $profileReceiptPath
+    )
+    $resolverOutput = @(& $resolverExecutable @resolverArgs 2>&1)
+    $resolverExit = $LASTEXITCODE
+    foreach ($resolverLine in $resolverOutput) { Write-Host "VERIFY_PROFILE_RESOLVER: $resolverLine" }
+} catch {
+    $resolverExit = -1
+    Write-Host "VERIFY_PROFILE_RESOLVER: raised $($_.Exception.Message)"
+}
 Write-Host "VERIFY_PROFILE_ALIAS: $verificationRouteAlias exit=$resolverExit"
-if ($resolverExit -ne 0) {
-    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the shared resolver refused alias '$verificationRouteAlias' for profile '$Profile' (exit $resolverExit); no gate ran under an unadmitted profile revision.")
-    exit 1
-}
 if (-not (Test-Path -LiteralPath $profileReceiptPath -PathType Leaf)) {
-    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the shared resolver issued no VerificationProfileReceipt at '$profileReceiptPath'; a missing receipt is incomplete evidence, never a pass.")
+    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the shared resolver issued no VerificationProfileReceipt at '$profileReceiptPath' (exit $resolverExit); a missing receipt is incomplete evidence, never a pass, and no gate ran under an unadmitted profile revision.")
     exit 1
 }
 $profileReceipt = $null
@@ -492,6 +550,13 @@ $expectedRoute = if ($verificationRouteAlias -eq 'bundle-verification') { 'bundl
 if ($profileReceipt.profile -ne $expectedRoute) {
     [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: alias '$verificationRouteAlias' issued a receipt for route '$($profileReceipt.profile)', not '$expectedRoute'.")
     exit 1
+}
+# A receipt the shared owner issued is trusted as admission evidence; nothing
+# here recomputes or second-guesses it. The resolver's own exit already
+# reported the route's normalized outcome, and the receipt carries that same
+# outcome, so the two can never disagree about whether the run passed.
+if ($profileReceipt.outcome -ne 'PASS' -and $resolverExit -eq 0) {
+    Write-Host "VERIFY_PROFILE_OUTCOME_DISAGREEMENT: receipt outcome '$($profileReceipt.outcome)' with resolver exit 0; the shared receipt governs and no gate is treated as admitted-pass."
 }
 Write-Host "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) outcome=$($profileReceipt.outcome)"
 foreach ($identity in @($profileReceipt.tool_identities)) {
@@ -692,6 +757,35 @@ try {
     }
 }
 
+# The issued receipt is summarized below from the parsed value, so the
+# GUID-named file and, when this run had to create it, the `.eliot` directory
+# are working state, not artifacts: both are removed here, exactly like the
+# dependency-policy receipt, BEFORE the summary reports their cleanup state. A
+# cleanup failure is a harness failure rather than a silent leftover.
+$profileReceiptCleanupState = 'removed'
+try {
+    if (Test-Path -LiteralPath $profileReceiptPath -PathType Leaf) {
+        Remove-Item -LiteralPath $profileReceiptPath -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $profileReceiptPath) {
+        throw "profile receipt path is not a file: $profileReceiptPath"
+    }
+    if ($eliotStateRootCreated) {
+        Remove-Item -LiteralPath $eliotStateRoot -Force -Recurse -ErrorAction Stop
+    }
+    if ($eliotStateRootCreated -and (Test-Path -LiteralPath $eliotStateRoot)) {
+        throw "run-created state root still exists: $eliotStateRoot"
+    }
+} catch {
+    $profileReceiptCleanupState = 'fail'
+    $harnessState = 'harness-error'
+    if ([string]::IsNullOrWhiteSpace($harnessError)) {
+        $harnessError = 'verification-profile receipt cleanup failed'
+    } else {
+        $harnessError += '; verification-profile receipt cleanup failed'
+    }
+}
+
 $passedCount = @($results | Where-Object { $_.State -eq 'pass' }).Count
 $failedCount = @($results | Where-Object { $_.State -ne 'pass' -and $_.State -ne 'not-run' }).Count
 $notRunCount = @($results | Where-Object { $_.State -eq 'not-run' }).Count
@@ -715,8 +809,10 @@ $summaryLines = @(
     "VERIFY_FAILURE_POLICY: $(if ($Profile -eq 'MergeCompile') { 'collect independent results; unmet prerequisites not-run; any nonpass fails' } else { 'fail-fast' })",
     'VERIFY_CACHE: workflow-owned only; this script implements no gate cache, so a cache hit cannot skip a gate or supply a pass receipt',
     "VERIFY_PROFILE_ALIAS: $verificationRouteAlias",
-    "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) profile_digest=$($profileReceipt.profile_digest) dag_digest=$($profileReceipt.dag_digest) outcome=$($profileReceipt.outcome)",
-    "VERIFY_PROFILE_RECEIPT: shared owner crates/instrument/eliot-instrument-runner/src/bin/eliot-profile-resolver.rs issued this run's VerificationProfileReceipt through resolve_verification_route/build_verification_profile_receipt; the same alias is invoked by the local Justfile and by ci.yml, so this revision is the one CI resolves",
+    "VERIFY_PROFILE_RESOLVER: $profileResolver built at $resolverExecutable and invoked with alias $verificationRouteAlias (exit $resolverExit); the shared receipt, not a PATH lookup, is the admission evidence",
+    "VERIFY_PROFILE_RECEIPT_CLEANUP: $profileReceiptCleanupState",
+    "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) profile_digest=$($profileReceipt.profile_digest) dag_digest=$($profileReceipt.profile_digest) outcome=$($profileReceipt.outcome)",
+    "VERIFY_PROFILE_RECEIPT: shared owner crates/instrument/eliot-instrument-runner/src/bin/eliot-profile-resolver.rs issued this run's VerificationProfileReceipt through resolve_verification_route/build_verification_profile_receipt; this script performs the minimal bootstrap build (I18.21:14) and then invokes it, and ci.yml enters this same script, so the revision resolved here is the revision CI resolves",
     "VERIFY_PROFILE_ENVIRONMENT: $((@($profileReceipt.environment_dependencies) | ForEach-Object { "$($_.name)=$($_.expected_class)/$($_.observed_class)" }) -join ', ')",
     "VERIFY_PROFILE_PROOF_CEILING: $($profileReceipt.proof_ceiling)",
     "VERIFY_PROOF_CEILING: $proofCeiling",
@@ -740,24 +836,6 @@ try {
     }
 } catch {
     Write-Host "VERIFY_SUMMARY_MIRROR_UNAVAILABLE: $($_.Exception.Message)"
-}
-
-# The issued receipt is summarized above; the GUID-named file is working state,
-# not an artifact, so it is removed here exactly like the dependency-policy
-# receipt. A cleanup failure is reported and fails the run rather than leaving
-# undeclared working state behind.
-$profileReceiptCleanupState = 'removed'
-try {
-    if (Test-Path -LiteralPath $profileReceiptPath -PathType Leaf) {
-        Remove-Item -LiteralPath $profileReceiptPath -Force -ErrorAction Stop
-    }
-    if (Test-Path -LiteralPath $profileReceiptPath) {
-        throw "profile receipt path is not a file: $profileReceiptPath"
-    }
-} catch {
-    $profileReceiptCleanupState = 'fail'
-    Write-Host "VERIFY_PROFILE_RECEIPT_CLEANUP: fail $($_.Exception.Message)"
-    $overall = 'FAIL'
 }
 
 if ($overall -eq 'PASS') {
