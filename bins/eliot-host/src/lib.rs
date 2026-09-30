@@ -6681,10 +6681,33 @@ impl HostComposition {
             // path at all.
             //
             // No destination is created, so a refusal here still means no effect.
-            BackupDispatchTarget::Prepare => Err(BackupDispatchRefusal::new(
-                operation,
-                "preparation is admitted up to its destination parent, which the installation root contract now declares outside the source; what is still absent is an owner-issued caller credential, and how a prepared destination may be named across this seam is a frozen #954 interface decision",
-            )),
+            //
+            // #958 A2: the destination allocation itself is now admitted by the
+            // INSTALLATION AUTHORITY, on the production path, before this arm
+            // can answer anything. `admit_owner_isolated_destination` runs
+            // `eliot_installation::admit_prepared_isolated_destination`, which
+            // derives the destination root from the owner-declared isolated
+            // restore area and the owner-issued destination installation
+            // identity, proves the area through a retained protected-root lease,
+            // refuses a client-supplied arbitrary path and an active/source
+            // installation, and binds source, archive, class, operation, current
+            // purge revision, target schema and proposed restoration
+            // requirements from owner-issued records only. A refusal from it is
+            // pre-effect and names the installation authority's own reason; it
+            // replaces the generic message for exactly those refusals and leaves
+            // the rest of the arm unchanged.
+            BackupDispatchTarget::Prepare => match self.admit_owner_isolated_destination(request) {
+                Err(reason) => Err(BackupDispatchRefusal::new(operation, reason)),
+                // The installation authority admitted and durably retained a
+                // new distinct isolated destination for this operation, and the
+                // downstream refusal below still stands unchanged: admitting a
+                // destination does not name it across the frozen #954 seam, and
+                // the owner-issued caller credential is still absent.
+                Ok(()) => Err(BackupDispatchRefusal::new(
+                    operation,
+                    "the installation authority admitted a new distinct isolated destination and retained it, but preparation is still refused up to its caller credential: what is still absent is an owner-issued caller credential, and how a prepared destination may be named across this seam is a frozen #954 interface decision",
+                )),
+            },
             // Named owner refusal, also PRE-EFFECT: it refuses before
             // `backup_dispatch_cutover` is entered. A cutover needs a separately
             // admitted `CutoverRequest` body that the closed `#954` envelope does
@@ -6706,6 +6729,197 @@ impl HostComposition {
             host_terminal.disarm();
         }
         outcome
+    }
+
+    /// Admits one isolated destination installation through the INSTALLATION
+    /// AUTHORITY, before any effect (#958, A2).
+    ///
+    /// This is the production caller of
+    /// [`eliot_installation::admit_prepared_isolated_destination`], reached from
+    /// `main.rs::process_backup_dispatch_requests` on the live registered backup
+    /// owner loop through
+    /// [`Self::process_backup_dispatch_requests`] ->
+    /// [`Self::dispatch_backup_owner_operation`]'s
+    /// [`BackupDispatchTarget::Prepare`] arm. It runs before that arm can answer
+    /// anything, so a refused destination creates no directory, writes no journal
+    /// intent and returns no receipt.
+    ///
+    /// Every input is an owner record:
+    ///
+    /// - the owner-issued authenticated `#954` request identity carried on the
+    ///   admitted `BackupRuntimeControlRequest`'s own `PrepareIsolatedRestore`
+    ///   body, from which the installation authority issues the
+    ///   `PreparedDestinationFacts` (source, archive, class, operation, target
+    ///   schema and destination installation identity) and the
+    ///   `ProposedRestorationRequirements`;
+    /// - this composition's registry-committed owner evidence
+    ///   ([`crate::backup_preparation::OwnerEvidence::inspect`]), which supplies
+    ///   the source runtime roots, the approved target manifest and that
+    ///   manifest's owner-issued activation approval, and the current
+    ///   purge-ledger revision read from the ORS purge-ledger owner;
+    /// - a retained no-follow `ProtectedRootLease` over the owner-declared
+    ///   isolated restore area, which the installation authority resolves and
+    ///   re-verifies.
+    ///
+    /// On success the admitted record is written into the installation registry
+    /// through the authority's own compare-and-swap, so the destination becomes a
+    /// real PREPARED, UNACTIVATED installation this authority retains -- and the
+    /// downstream refusal for the missing owner-issued caller credential is left
+    /// exactly as it was, because admitting a destination does not name it across
+    /// the frozen `#954` seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static reason string per failure class; no owner error text, path
+    /// or record body is echoed. The typed failure itself is the installation
+    /// authority's [`eliot_installation::IsolatedDestinationError`], which is
+    /// matched variant-by-variant here rather than collapsed into one message.
+    #[cfg(windows)]
+    fn admit_owner_isolated_destination(
+        &self,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    ) -> Result<(), String> {
+        use eliot_host_service::runtime_control::BackupOperationBody;
+        use eliot_installation::{
+            IsolatedDestinationAdmissionInput, PreparedDestinationFacts,
+            ProposedRestorationRequirements,
+        };
+        use eliot_platform_windows::ProtectedRootLease;
+        let max_restore_bytes =
+            u64::try_from(eliot_protocol::backup::MAX_BACKUP_PAYLOAD_BYTES).unwrap_or(u64::MAX);
+        let BackupOperationBody::PrepareIsolatedRestore(ref body) = request.body else {
+            return Err(
+                "the admitted backup request body is not an isolated-restore preparation"
+                    .to_owned(),
+            );
+        };
+        let facts = PreparedDestinationFacts::issue_for_admitted_identity(&body.identity)
+            .map_err(Self::isolated_destination_reason)?;
+        let evidence = crate::backup_preparation::OwnerEvidence::inspect(&self.registry_host_root)
+            .map_err(|_| {
+                "the source installation owner evidence could not be inspected, so no isolated \
+                 destination can be admitted"
+                    .to_owned()
+            })?;
+        let purge_revision = evidence
+            .owner_purge_ledger_revision()
+            .map_err(|_| "no current owner-issued purge-ledger revision is available".to_owned())?;
+        let roots = evidence.runtime_roots();
+        let area = roots
+            .isolated_restore_root()
+            .map_err(|_| "this installation profile declares no isolated restore area".to_owned())?;
+        let area_lease = ProtectedRootLease::open_existing(std::path::Path::new(area.as_str()))
+            .map_err(|_| {
+                "the owner-declared isolated restore area could not be proved through its \
+                 protected-root lease"
+                    .to_owned()
+            })?;
+        let requirements =
+            ProposedRestorationRequirements::issue_for_facts(&facts, max_restore_bytes)
+                .map_err(Self::isolated_destination_reason)?;
+        let known = evidence.known_installations();
+        let approved = evidence.approved();
+        let active_generation = approved.manifest.generation.clone();
+        let allocation = eliot_installation::admit_prepared_isolated_destination(
+            &IsolatedDestinationAdmissionInput {
+                facts: &facts,
+                max_restore_bytes,
+                source_roots: roots,
+                source_active_generation: &active_generation,
+                isolated_area_lease: &area_lease,
+                approved_target_manifest: &approved.manifest,
+                approved_target_approval: &approved.approval,
+                restoration_requirements: &requirements,
+                current_purge_ledger_revision: purge_revision,
+                known_installations: &known,
+            },
+        )
+        .map_err(Self::isolated_destination_reason)?;
+
+        // The admission is durable: this authority retains a PREPARED, UNACTIVATED
+        // destination installation for the operation, with the registry CAS
+        // revision fence and the live exclusive Host owner capability the
+        // authority requires of every mutation of its own projection.
+        let store = self.open_registry_store().map_err(|_| {
+            "the installation registry could not be opened to admit the isolated destination"
+                .to_owned()
+        })?;
+        let capability = self.owner_lease.activation_capability();
+        store
+            .record_prepared_isolated_destination(
+                &capability,
+                evidence.revision(),
+                &allocation.admission,
+            )
+            .map(|_| ())
+            .map_err(|_| {
+                "the installation authority refused to retain the admitted isolated destination"
+                    .to_owned()
+            })
+    }
+
+    /// Renders one installation-authority refusal as its own static reason.
+    ///
+    /// The match is variant-by-variant rather than `to_string()`, so an owner
+    /// error body never reaches a dispatch answer and a new refusal class is a
+    /// compile error rather than a silently merged message.
+    #[cfg(windows)]
+    fn isolated_destination_reason(
+        error: eliot_installation::IsolatedDestinationError,
+    ) -> String {
+        use eliot_installation::{IsolatedDestinationError, IsolatedDestinationRefusal};
+        match error {
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ArbitraryDestination) => {
+                "the admitted destination identity is not an owner installation key, so no \
+                 isolated destination root can be derived for it"
+                    .to_owned()
+            }
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::SourceInstallationDestination,
+            ) => "the admitted destination is the source installation and is never a restore \
+                    destination"
+                .to_owned(),
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::DestinationOverlapsSource) => {
+                "the admitted destination root is not isolated from the source installation root"
+                    .to_owned()
+            }
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ExistingInstallation) => {
+                "the admitted destination is an installation this authority already holds, so it \
+                 is not a new distinct isolated installation"
+                    .to_owned()
+            }
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::UnapprovedTarget) => {
+                "the approved target build or profile could not be proved before allocation"
+                    .to_owned()
+            }
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ClassNotRestorable) => {
+                "the declared archive class is not an installation-backup class and cannot name an \
+                 isolated restore destination"
+                    .to_owned()
+            }
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::BoundRecordConflict {
+                field,
+            }) => format!(
+                "an owner-issued bound record ({field}) does not match the destination under \
+                 admission"
+            ),
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::IsolatedAreaUnproved) => {
+                "the owner-declared isolated restore area is not resolvable through its \
+                 protected-root lease"
+                    .to_owned()
+            }
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::DestinationNotAbsent) => {
+                "the derived destination leaf already exists and is not owned by this operation"
+                    .to_owned()
+            }
+            IsolatedDestinationError::BoundRecord(_) => {
+                "an owner-issued backup record bound to this operation did not validate".to_owned()
+            }
+            IsolatedDestinationError::Installation(_) => {
+                "the installation authority could not produce the isolated destination allocation"
+                    .to_owned()
+            }
+        }
     }
 
     /// Reconciles one admitted backup operation against the preparation this
