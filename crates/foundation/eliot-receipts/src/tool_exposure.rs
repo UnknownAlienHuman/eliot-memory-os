@@ -1344,6 +1344,82 @@ fn require_stage_unrecorded(
 }
 
 impl ToolExposureHistoryEntry {
+    /// Records the registration fact from the definition/facet owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference (the `canonical-name@profile-version` evidence staged
+    /// by the semantic-registry owner). No neighbouring stage is read or
+    /// inferred, and an already recorded registration is never overwritten —
+    /// a changed owner verdict persists as a successor revision through the
+    /// existing observation/receipt path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_registered(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.registered, "history.registered")?;
+        self.registered = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the advertisement fact from the publish-seam owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference (the surface-decision reference that rendered the
+    /// advertised surface). Advertisement never implies eligibility, and an
+    /// already recorded advertisement is never overwritten — a changed owner
+    /// verdict persists as a successor revision through the existing
+    /// observation/receipt path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_advertised(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.advertised_to_route, "history.advertised_to_route")?;
+        self.advertised_to_route = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the eligibility fact from the scope/policy/grant owners.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference (the Governor/Kernel grant verdict bound to the
+    /// surface decision). Eligibility is never inferred from advertisement or
+    /// selection, and an already recorded eligibility is never overwritten —
+    /// a changed owner verdict persists as a successor revision through the
+    /// existing observation/receipt path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_eligible(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(
+            &self.eligible_under_scope_policy_and_grant,
+            "history.eligible_under_scope_policy_and_grant",
+        )?;
+        self.eligible_under_scope_policy_and_grant =
+            OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Records the planner/model selection fact from the selection owner.
     ///
     /// Only this stage is set, from the supplied owner observation and its
