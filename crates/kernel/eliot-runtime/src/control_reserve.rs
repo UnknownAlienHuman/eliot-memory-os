@@ -89,8 +89,7 @@ pub const RUNTIME_RUNNABLE_BOTTLENECK: CapacityBottleneck =
     CapacityBottleneck::KernelRunnableControlSlots;
 
 /// The exact CPU-task-slot bottleneck enforced by [`RuntimeReserve`].
-pub const RUNTIME_CPU_TASK_BOTTLENECK: CapacityBottleneck =
-    CapacityBottleneck::CpuControlTaskSlots;
+pub const RUNTIME_CPU_TASK_BOTTLENECK: CapacityBottleneck = CapacityBottleneck::CpuControlTaskSlots;
 
 /// Maximum length of an owner, operation or reference string, in bytes.
 const MAX_REF_LEN: usize = 1_024;
@@ -140,7 +139,10 @@ impl fmt::Display for RuntimeReserveError {
                 write!(formatter, "{field} is invalid: {reason}")
             }
             Self::Contract(reason) => {
-                write!(formatter, "runtime contract rejected runtime reserve row: {reason}")
+                write!(
+                    formatter,
+                    "runtime contract rejected runtime reserve row: {reason}"
+                )
             }
             Self::NormalCapacityExhausted {
                 bottleneck,
@@ -335,9 +337,7 @@ impl Drop for RuntimePermit {
 /// Returns whether a value is usable as an owner, operation or reference
 /// identity: non-blank, without control characters, bounded in length.
 fn valid_reference(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= MAX_REF_LEN
-        && !value.chars().any(char::is_control)
+    !value.trim().is_empty() && value.len() <= MAX_REF_LEN && !value.chars().any(char::is_control)
 }
 
 fn validate_reference(value: &str, field: &'static str) -> Result<(), RuntimeReserveError> {
@@ -401,7 +401,10 @@ impl RuntimeReserve {
         owner_generation_ref: &str,
         authority_epoch_ref: &str,
     ) -> Result<Self, RuntimeReserveError> {
-        positive_capacity(normal_runnable_slots, "runtime_reserve.normal_runnable_slots")?;
+        positive_capacity(
+            normal_runnable_slots,
+            "runtime_reserve.normal_runnable_slots",
+        )?;
         positive_capacity(
             protected_runnable_slots,
             "runtime_reserve.protected_runnable_slots",
@@ -414,14 +417,8 @@ impl RuntimeReserve {
             protected_cpu_task_slots,
             "runtime_reserve.protected_cpu_task_slots",
         )?;
-        validate_reference(
-            owner_generation_ref,
-            "runtime_reserve.owner_generation_ref",
-        )?;
-        validate_reference(
-            authority_epoch_ref,
-            "runtime_reserve.authority_epoch_ref",
-        )?;
+        validate_reference(owner_generation_ref, "runtime_reserve.owner_generation_ref")?;
+        validate_reference(authority_epoch_ref, "runtime_reserve.authority_epoch_ref")?;
         Ok(Self {
             inner: Arc::new(RuntimeReserveInner {
                 runnable_normal_capacity: normal_runnable_slots,
@@ -462,8 +459,12 @@ impl RuntimeReserve {
             .map_err(|error| RuntimeReserveError::InvalidField {
                 field: "runtime_reserve.config",
                 reason: match error {
-                    super::ConfigError::ZeroCapacity => "owner configuration carries a zero capacity",
-                    super::ConfigError::ZeroDuration => "owner configuration carries a zero duration",
+                    super::ConfigError::ZeroCapacity => {
+                        "owner configuration carries a zero capacity"
+                    }
+                    super::ConfigError::ZeroDuration => {
+                        "owner configuration carries a zero duration"
+                    }
                 },
             })?;
         let capacity = |value: usize, field: &'static str| {
@@ -473,7 +474,10 @@ impl RuntimeReserve {
             })
         };
         Self::partitioned(
-            capacity(config.mailbox_capacity, "runtime_reserve.normal_runnable_slots")?,
+            capacity(
+                config.mailbox_capacity,
+                "runtime_reserve.normal_runnable_slots",
+            )?,
             capacity(
                 config.control_reserve,
                 "runtime_reserve.protected_runnable_slots",
@@ -523,13 +527,11 @@ impl RuntimeReserve {
     /// Returns the currently available protected runnable slots.
     #[must_use]
     pub fn available_protected_runnable_slots(&self) -> u64 {
-        self.inner
-            .runnable_protected_capacity
-            .saturating_sub(
-                self.inner
-                    .runnable_protected_in_flight
-                    .load(Ordering::Acquire),
-            )
+        self.inner.runnable_protected_capacity.saturating_sub(
+            self.inner
+                .runnable_protected_in_flight
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Returns the currently available normal CPU task slots.
@@ -751,10 +753,7 @@ impl RuntimeReserve {
         evidence_ref: &str,
         invalidation_ref: &str,
     ) -> Result<BottleneckCapacityProfile, RuntimeReserveError> {
-        validate_reference(
-            proof_profile_ref,
-            "runtime_evidence.proof_profile_ref",
-        )?;
+        validate_reference(proof_profile_ref, "runtime_evidence.proof_profile_ref")?;
         validate_reference(evidence_ref, "runtime_evidence.evidence_ref")?;
         validate_reference(invalidation_ref, "runtime_evidence.invalidation_ref")?;
         let bottleneck = dimension.bottleneck();
