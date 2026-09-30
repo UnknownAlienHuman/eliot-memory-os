@@ -12,22 +12,22 @@
 //!
 //! | Responsibility | Actual runtime owner | Status |
 //! |---|---|---|
-//! | Construct/admit `ModelRouteRequest` | none in-repo: no producer exists outside the contract owner and its tests | named implementation work |
-//! | Execute the admitted provider route, return `ModelRouteOutcome` | none: provider text lives outside the dreamer binary | named implementation work |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | none in-binary: no Governor orientation-supply channel exists | named implementation work |
-//! | Acquire each mandatory stage's owner input/receipt | none in-binary: records must arrive owner-built via the future carrier supply | named implementation work |
-//! | Invoke the pure composer | [`compose_production_result`] below (this module) | compiled, UNREACHABLE: no production call site can supply its carrier |
-//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | blocked leg reachable; complete/partial legs are not |
+//! | Construct/admit `ModelRouteRequest` | `model_stage::model_route_request` over the admitted pair | wired |
+//! | Execute the admitted provider route, return `ModelRouteOutcome` | `model_stage::model_route_outcome` over the measured local call | wired |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | wired |
+//! | Acquire each mandatory stage's owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | wired |
+//! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
+//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
 //!
 //! A missing adapter is implementation work, never substituted with local
-//! data: the v1 hypothesis pair derived in dispatch cannot impersonate the
-//! CC-002 outcome, empty projections are never synthesized, and no stage runs
-//! from a caller-built lookalike. Smart stays pure: model calls, canonical
-//! reads, retries, leases, policy/authority decisions, and persistence execute
-//! in runtime/Governor adapters before composition; the composer receives
-//! immutable admitted records and performs no external effects. Owner inputs
-//! are acquired without holding any Dreamer composition mutex, and the
-//! synchronous composer runs only on frozen records.
+//! data: the v1 hypothesis pair derived in dispatch is reported only as the
+//! measured local route execution it actually is, empty projections are never
+//! synthesized, and no stage runs from a caller-built lookalike. Smart stays
+//! pure: model calls, canonical reads, retries, leases, policy/authority
+//! decisions, and persistence execute in runtime/Governor adapters before
+//! composition; the composer receives immutable admitted records and performs no
+//! external effects. Owner inputs are acquired without holding any Dreamer
+//! composition mutex, and the synchronous composer runs only on frozen records.
 //!
 //! Overall result rule: `Complete` requires every denominator member executed
 //! under one coherent identity closure with both boundaries admitted and the
@@ -39,12 +39,25 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_context_contracts::{CanonicalProjectionSet, ContextError, SerializedContextMeasurement};
+use eliot_context_assembly::AssemblyPolicy;
+use eliot_context_candidates::{
+    AttentionInput, CandidatePolicy, CandidateRequest, CueInput, EpistemicInput, EvidenceInput,
+    MemberMeasurement,
+};
+use eliot_context_contracts::{
+    AdmittedContextSet, CanonicalProjectionSet, ContextError, ContextRecipe, QualityScorecard,
+    SerializedContextMeasurement,
+};
 use eliot_contracts::StateFence;
+use eliot_cue_activation::ActivationProfile;
+use eliot_cue_contracts::{ActivationRequest, CueSnapshotBuildCandidate};
 use eliot_dreamer_claim_grounding::GroundingRequest;
+use eliot_dreamer_classification::ClassificationPolicy;
+use eliot_dreamer_conflict_analysis::{ConflictAnalysisPolicy, ConflictSupplements};
 use eliot_dreamer_contracts::{
-    DreamInputBundle, JobClass, ModelRouteDisposition, ModelRouteOutcome, ModelRouteRequest,
-    ValidatedCandidate, bundle_digest_of,
+    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft, JobClass,
+    ModelRouteDisposition, ModelRouteOutcome, ModelRouteRequest, ValidatedCandidate,
+    ValidatedCurationItem, ValidatedDreamDraft, ValidatedGroundingCandidate, bundle_digest_of,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CurrentEpistemicPositionHandle, OrientationDisposition,
@@ -52,7 +65,9 @@ use eliot_dreamer_orientation::{
     projection::{OrientationPacketCandidate, build_projection},
 };
 use eliot_dreamer_probe_plan::ProbePlanParams;
+use eliot_dreamer_rival_model::RivalPolicy;
 use eliot_epistemic::PositionRequest;
+use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
 
 use crate::pulse::{
     CEILING_BLOCKED, CEILING_CANDIDATE_ONLY, CONFLICT_OUTPUT_QUALIFIED, CandidateStage,
@@ -70,9 +85,6 @@ use crate::{
 
 /// Exact schema version accepted by [`ProductionOrientationInputs`].
 pub(crate) const PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION: u32 = 1;
-/// Blocked reason when the CC-002 outcome is absent.
-pub(crate) const CC002_MISSING: &str =
-    "production orientation requires an admitted model-route outcome";
 /// Blocked reason when the CC-004 projection set is absent.
 pub(crate) const CC004_MISSING: &str = "production orientation requires a canonical projection set";
 /// Blocked reason naming the absent Governor supply channel.
@@ -87,9 +99,7 @@ pub(crate) const MODEL_OUTCOME_TIMEOUT: &str = "admitted model-route outcome tim
 pub(crate) const CONFLICT_UNQUALIFIED: &str = "conflict output unqualified until #2869/#2870";
 /// Fallback commitment when canonical serialization fails.
 const DIGEST_UNAVAILABLE: &str = "digest unavailable";
-/// Missing-owner identity for the CC-002 runtime owner.
-const OWNER_MODEL_ROUTE: &str = "model-route runtime owner";
-/// Missing-owner identity for the CC-004 projection owner.
+/// Missing-owner identity for the CC-004 projection owner and the stage owners.
 const OWNER_PROJECTIONS: &str = "governor canonical projection owner";
 
 /// Immutable route-measurement function supplied with the understanding record.
@@ -97,7 +107,7 @@ const OWNER_PROJECTIONS: &str = "governor canonical projection owner";
 /// A plain `fn` item keeps the carrier non-generic: the Governor channel
 /// supplies the measurement with the admitted set, and the composer invokes it
 /// at most once through the understanding owner entry.
-type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
+pub type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
 
 /// Versioned runtime-owned production carrier: everything one complete
 /// Orientation pulse must consume, with no optional mandatory member.
@@ -159,48 +169,181 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub cancelled: bool,
 }
 
+/// Governor-supplied records for the CC-004 projections and the nine mandatory
+/// stage members.
+///
+/// This is the Owner channel, not a second contract and not a state machine: it
+/// carries the exact owner records by reference, adds no semantic recomputation,
+/// and performs no effect. Every member is a value the Governor already produced
+/// through its own owner entry, so the carrier below joins existing records
+/// rather than deriving canonical state in this binary. Nothing is defaulted:
+/// a member the Governor has not published leaves the channel incomplete, and
+/// the caller supplies the whole channel or none of it.
+pub struct OrientationSupply<'a> {
+    /// CC-004 canonical projection set emitted by the Governor's own producer.
+    pub projections: &'a CanonicalProjectionSet,
+    /// Governor-issued Current Epistemic Position handles for the packet.
+    pub cep_handles: &'a [CurrentEpistemicPositionHandle],
+    /// Owner classification input (classification stage).
+    pub classification_input: &'a ClassificationInput,
+    /// Governor acceptance context the classification selector runs under.
+    pub classification_context: &'a CurationAcceptanceCtx<'a>,
+    /// Execution policy the classification input digest binds.
+    pub classification_policy: &'a ClassificationPolicy,
+    /// Immutable cue-snapshot build candidate (cue-activation stage).
+    pub cue_candidate: &'a CueSnapshotBuildCandidate,
+    /// Bounded cue-activation request.
+    pub cue_request: &'a ActivationRequest,
+    /// Versioned numerical activation profile.
+    pub cue_profile: &'a ActivationProfile,
+    /// Epistemic resolver request over admitted records.
+    pub epistemic: &'a PositionRequest,
+    /// Exact admitted context set to project (understanding stage).
+    pub admitted_context_set: &'a AdmittedContextSet,
+    /// Recipe the admitted set must satisfy (understanding stage).
+    pub recipe: &'a ContextRecipe,
+    /// Quality scorecard bound to the admitted binding (understanding stage).
+    pub quality: &'a QualityScorecard,
+    /// Caller-owned immutable assembly parameters (understanding stage).
+    pub assembly_policy: &'a AssemblyPolicy,
+    /// Route measurement invoked once over the canonical payload bytes.
+    pub measure: MeasureFn,
+    /// Owner grounding request (claim-grounding stage).
+    pub grounding: &'a GroundingRequest,
+    /// Validated grounding candidate carrying the rival declarations.
+    pub validated_draft: &'a ValidatedGroundingCandidate,
+    /// Admitted current position the rivals bind against.
+    pub current_position: &'a AdmittedPosition,
+    /// Rival-structuring policy.
+    pub rival_policy: &'a RivalPolicy,
+    /// Validated curation item under conflict analysis.
+    pub curation_item: &'a ValidatedCurationItem,
+    /// Validator-bound draft under conflict analysis.
+    pub validated_dream_draft: &'a ValidatedDreamDraft,
+    /// Claim-grounded draft under conflict analysis.
+    pub grounded: &'a GroundedDreamDraft,
+    /// Admitted conflict set under analysis.
+    pub conflict_set: &'a ConflictSet,
+    /// Expected receipts and supplement bounds for conflict analysis.
+    pub supplements: &'a ConflictSupplements,
+    /// Conflict-analysis policy.
+    pub conflict_policy: &'a ConflictAnalysisPolicy,
+    /// Discriminative probe-plan parameters over owner rival/affordance records.
+    pub probes: ProbePlanParams<'a>,
+    /// Candidate request envelope (context-candidate stage).
+    pub candidate_request: &'a CandidateRequest,
+    /// Context recipe fixing the candidate denominator.
+    pub candidate_recipe: &'a ContextRecipe,
+    /// Supplied measurements keyed by derived member identity.
+    pub measurements: &'a [MemberMeasurement],
+    /// Explicit attention/conflict projection (read, never produced here).
+    pub attention_and_conflicts: Option<&'a AttentionInput>,
+    /// Explicit epistemic projection (read, never produced here).
+    pub epistemic_position: Option<&'a EpistemicInput>,
+    /// Explicit cue-activation projection (read, never produced here).
+    pub cue_activation_result: Option<&'a CueInput>,
+    /// Explicit evidence projection (read, never produced here).
+    pub evidence: Option<&'a EvidenceInput>,
+    /// Context-candidate policy.
+    pub candidate_policy: &'a CandidatePolicy,
+}
+
 /// Resolves the production carrier from admitted dispatch artifacts.
 ///
-/// The Governor orientation-supply channel does not exist in-binary, so no
-/// CC-002 outcome, CC-004 set, or stage-owner record can be acquired here and
-/// this always returns the typed blocked result naming the missing adapters.
-/// The `Ok` arm stays compiled-live: when the channel lands, assembly fills
-/// the carrier from admitted artifacts plus the Governor supply and the same
-/// composer below produces complete/partial results with no dispatch change.
+/// The CC-002 request/outcome are produced by this binary's own model stage from
+/// admitted material and proved against the admitted bundle, so that boundary
+/// is present on every admitted Orientation job. The CC-004 projection set and
+/// the nine mandatory stage-owner records are Governor-published values supplied
+/// through [`OrientationSupply`]; without that channel the carrier cannot be
+/// filled honestly and this returns the typed blocked result naming the missing
+/// owner supply. With a supplied channel the same composer below produces
+/// complete/partial results with no dispatch change.
 ///
-/// MEASURED UNREACHABLE (A1/W1, #40): this body is a single unconditional
-/// `Err`, so no execution can reach
-/// `Ok(inputs) => compose_production_result(...)` at
-/// `dispatch_stage.rs::dispatch_orientation` — the entire complete/partial
-/// composition, including [`build_projection`](eliot_dreamer_orientation::projection::build_projection),
-/// is statically dead in production. Measured on the current base by
-/// enumerating every construction of [`ProductionOrientationInputs`] in the
-/// tree: there are ZERO. Not one struct literal, in this module or anywhere
-/// else in the workspace, and the file carries no test module, so no fixture
-/// reaches the composer either. The only references to the type are this
-/// module's own signatures and helpers plus one doc link in
-/// `pulse.rs`. The `Ok` arm is therefore genuinely required by the signature
-/// and is deliberately not deleted: removing it would delete the only seam the
-/// Governor supply channel can be wired into, and the current typed blocked
-/// behaviour is correct per I9.2. The missing piece is an owner that mints the
-/// mandatory CC-002/CC-004 records, not a dispatch edit. A future owner must add
-/// the real `Ok` construction here; it must NOT be satisfied by synthesising
-/// an outcome, projecting an empty set, or attaching a blocking read, all of
-/// which are self-issued authority.
+/// No member is synthesized here: absent Governor records are a refusal, never
+/// a default, an empty set, or a locally built lookalike, all of which would be
+/// self-issued authority.
 pub(crate) fn resolve_production_inputs<'a>(
     admission: &'a KernelJobAdmission,
     admitted_job: &'a AdmittedOrientationJob,
     candidate: &'a ValidatedCandidate,
     bundle: &'a DreamInputBundle,
     policy: &'a OrientationPolicy,
+    model_request: &'a ModelRouteRequest,
+    model_outcome: &'a ModelRouteOutcome,
+    supply: Option<&'a OrientationSupply<'a>>,
 ) -> Result<ProductionOrientationInputs<'a>, Box<OrientationPulseResult>> {
-    Err(Box::new(missing_prerequisites_blocked(
-        admission,
+    let Some(supply) = supply else {
+        return Err(Box::new(supply_missing_blocked(
+            admission,
+            admitted_job,
+            candidate,
+            bundle,
+            policy,
+            model_request,
+            model_outcome,
+        )));
+    };
+    Ok(ProductionOrientationInputs {
+        schema_version: PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION,
         admitted_job,
-        candidate,
         bundle,
+        validated_candidate: candidate,
         policy,
-    )))
+        model_request,
+        model_outcome,
+        projections: supply.projections,
+        cep_handles: supply.cep_handles,
+        classification: ClassificationStage {
+            input: supply.classification_input,
+            context: supply.classification_context,
+            policy: supply.classification_policy,
+        },
+        cue_activation: CueActivationStage {
+            candidate: supply.cue_candidate,
+            request: supply.cue_request,
+            profile: supply.cue_profile,
+        },
+        epistemic: supply.epistemic,
+        understanding: UnderstandingStage {
+            admitted: supply.admitted_context_set,
+            recipe: supply.recipe,
+            quality: supply.quality.clone(),
+            policy: supply.assembly_policy,
+            measure: supply.measure,
+        },
+        grounding: supply.grounding,
+        rivals: RivalStage {
+            bundle,
+            validated_draft: supply.validated_draft,
+            current_position: supply.current_position,
+            policy: supply.rival_policy,
+        },
+        conflict: ConflictStage {
+            item: supply.curation_item,
+            draft: supply.validated_dream_draft,
+            grounded: supply.grounded,
+            conflict_set: supply.conflict_set,
+            supplements: supply.supplements,
+            policy: supply.conflict_policy,
+        },
+        probes: supply.probes,
+        candidates: CandidateStage {
+            request: supply.candidate_request,
+            recipe: supply.candidate_recipe,
+            measurements: supply.measurements,
+            attention_and_conflicts: supply.attention_and_conflicts,
+            epistemic_position: supply.epistemic_position,
+            cue_activation_result: supply.cue_activation_result,
+            evidence: supply.evidence,
+            policy: supply.candidate_policy,
+        },
+        operation_id: admitted_job.job.operation_id.clone(),
+        task_id: admitted_job.job.task_id.clone(),
+        scope_id: admitted_job.job.scope_id.clone(),
+        state_fence: admission.state_fence.clone(),
+        deadline_unix_ms: admission.deadline_unix_ms,
+        cancelled: false,
+    })
 }
 
 /// Composes one typed production pulse from the versioned carrier.
@@ -675,20 +818,23 @@ fn blocked_result(parts: BlockedParts) -> OrientationPulseResult {
     }
 }
 
-/// Builds the blocked result for absent prerequisites: no boundary values,
-/// no stage records, no packet.
-fn missing_prerequisites_blocked(
+/// Builds the blocked result for the absent Governor supply channel: the
+/// CC-002 boundary is present and committed, the CC-004 boundary and every
+/// stage-owner record are absent, and no packet projects.
+fn supply_missing_blocked(
     admission: &KernelJobAdmission,
     admitted_job: &AdmittedOrientationJob,
     candidate: &ValidatedCandidate,
     bundle: &DreamInputBundle,
     policy: &OrientationPolicy,
+    model_request: &ModelRouteRequest,
+    model_outcome: &ModelRouteOutcome,
 ) -> OrientationPulseResult {
     let stages = PulseStageId::ORDER
         .iter()
         .map(|id| blocked_stage_record(*id, id.missing_reason()))
         .collect();
-    let mut missing_owners = vec![OWNER_MODEL_ROUTE.to_owned(), OWNER_PROJECTIONS.to_owned()];
+    let mut missing_owners = vec![OWNER_PROJECTIONS.to_owned()];
     missing_owners.extend(
         PulseStageId::ORDER
             .iter()
@@ -712,10 +858,10 @@ fn missing_prerequisites_blocked(
         },
         model_outcome: OrientationBoundaryRecord {
             boundary: "cc002_model_route".to_owned(),
-            present: false,
-            commitment: None,
-            disposition: None,
-            reason: Some(CC002_MISSING.to_owned()),
+            present: true,
+            commitment: output_digest(model_request),
+            disposition: Some(model_outcome.disposition.as_str().to_owned()),
+            reason: None,
         },
         projections: OrientationBoundaryRecord {
             boundary: "cc004_canonical_projections".to_owned(),
@@ -725,11 +871,7 @@ fn missing_prerequisites_blocked(
             reason: Some(CC004_MISSING.to_owned()),
         },
         stages,
-        omissions: vec![
-            CC002_MISSING.to_owned(),
-            CC004_MISSING.to_owned(),
-            ORIENTATION_SUPPLY_MISSING.to_owned(),
-        ],
+        omissions: vec![CC004_MISSING.to_owned(), ORIENTATION_SUPPLY_MISSING.to_owned()],
         missing_owners,
     })
 }

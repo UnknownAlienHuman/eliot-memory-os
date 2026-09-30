@@ -182,6 +182,7 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
         None,
         JobClass::Orientation,
         Some(&validated),
+        None,
     );
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("orientation dispatch must project, got {result:?}");
@@ -260,6 +261,7 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
         Some(binding),
         None,
         JobClass::Curation,
+        None,
         None,
     );
     assert!(
@@ -481,7 +483,15 @@ fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
     assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
     // Dispatch level: the same missing carrier refuses with the same reason.
-    let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Curation, None);
+    let refused = dispatch_admitted(
+        &admission,
+        &job,
+        None,
+        None,
+        JobClass::Curation,
+        None,
+        None,
+    );
     let Err(error) = refused else {
         panic!("carrier-less dispatch must refuse at the carrier check");
     };
@@ -660,6 +670,7 @@ fn submit_curation_with_source_runs_a31_then_fails_closed_at_transport() {
         admission.clone(),
         Box::new(ClosedTestTransport),
         Some(&source),
+        None,
     )
     .expect("test port must construct");
     let refused =
@@ -702,6 +713,7 @@ fn submit_curation_with_source_runs_a31_then_fails_closed_at_transport() {
         empty_admission.clone(),
         Box::new(ClosedTestTransport),
         Some(&empty_source),
+        None,
     )
     .expect("empty-handles test port must construct");
     let refused = <AuthenticatedKernelJobPort as KernelJobPort>::submit(
@@ -743,6 +755,7 @@ fn submit_curation_without_source_refuses_carrier_before_transport() {
         admission.clone(),
         Box::new(ClosedTestTransport),
         None,
+        None,
     )
     .expect("test port must construct");
     let refused =
@@ -772,6 +785,7 @@ fn submit_refused_class_refuses_before_transport() {
         material,
         admission.clone(),
         Box::new(ClosedTestTransport),
+        None,
         None,
     )
     .expect("test port must construct");
@@ -803,6 +817,7 @@ fn submit_orientation_stops_at_controller_gate() {
         material,
         admission.clone(),
         Box::new(ClosedTestTransport),
+        None,
         None,
     )
     .expect("test port must construct");
@@ -1014,6 +1029,7 @@ fn submit_curation_with_source_succeeds_with_curation_result_view() {
         admission.clone(),
         Box::new(SuccessClaimTransport::for_scope(&material.scope_id)),
         Some(&source),
+        None,
     )
     .expect("test port must construct");
     let view = <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job)
