@@ -151,6 +151,15 @@ impl RestartPolicyV1 {
         for dependency in &self.dependencies {
             text(&dependency.dependency_id, "dependency_id")?;
             if dependency.dependency_id == self.subject_id {
+                // I14.10 / I6.4: the hard-dependency graph defines startup,
+                // drain and restart order and must stay acyclic. A cycle can
+                // only be closed ACROSS children, so the multi-child walk is
+                // not this value's to make: it belongs to the catalog that owns
+                // every entry and already refuses it
+                // (`reject_required_dependency_cycle`, required edges only, at
+                // catalog validation). What this contract proves locally is the
+                // only cycle a single declaration can contain by itself: an edge
+                // back to its own subject.
                 return Err(invalid("dependency_id", "self dependency is invalid"));
             }
             if !dependency_ids.insert(&dependency.dependency_id) {
@@ -497,6 +506,22 @@ impl RestartOperationIdentity {
 pub struct RestartDecisionRecord {
     /// Content the operation identity is derived from.
     pub operation: RestartOperationIdentity,
+    /// The admitted policy revision this decision was taken under, bound to
+    /// the generation and state fence the decision acts on.
+    ///
+    /// I14.10 binds the restart policy to the generation it governs: the
+    /// generation a restart decision acts on and the policy revision that
+    /// decided it are one admitted pair, so a decision cannot be read under a
+    /// policy revision the admitted generation was never admitted with. This is
+    /// the exact value [`RestartPolicyV1::bind`] produces, and it carries the
+    /// policy digest the operation identity is derived from.
+    ///
+    /// The record is the owner's DURABLE operational state, so this binding is
+    /// what makes the record policy-bound rather than merely policy-adjacent: a
+    /// reloaded record whose binding names another generation, fence or policy
+    /// digest is refused before it is read at all, rather than being re-read
+    /// under whichever policy happens to be declared now.
+    pub policy_admission: RestartPolicyAdmissionBinding,
     /// Derived operation identity; recomputed and compared on validation.
     pub restart_operation_id: String,
     /// Manifest revision the policy was read from.
@@ -526,18 +551,39 @@ impl RestartDecisionRecord {
         policy.validate()?;
         self.operation.validate()?;
         state_fence.validate().map_err(RuntimeContractError::from)?;
+        // The admitted binding is validated with its own `validate_for`, which
+        // recomputes the digest from the ORIGINAL policy value and compares the
+        // recorded one. It is not recomputed here and not treated as a matching
+        // shape: a binding that names a different generation, fence, or policy
+        // revision is refused before the record is read at all.
+        self.policy_admission
+            .validate_for(policy, admitted_generation, state_fence)?;
+        // I14.10 / I8.12: the operational record is decided under one exact
+        // admitted policy. The record carries the digest of THAT original policy
+        // value in its operation identity, so it is compared against the digest
+        // the admitted binding already proved for this policy. Without this the
+        // admitted revision would not actually bound the decision identity.
         if self.operation.subject_id != policy.subject_id
             || self.operation.original_state_fence != *state_fence
             || self.operation.original_generation != *admitted_generation
+            || self.operation.policy_digest != self.policy_admission.policy_digest
             || self.source_manifest_revision != policy.source_manifest_revision
             || self.source_profile_revision != policy.source_profile_revision
         {
             return Err(invalid(
                 "restart_decision_record",
-                "child, generation, state fence, or source revision does not match the policy",
+                "child, generation, state fence, policy digest, or source revision does not match \
+                 the admitted policy",
             )
             .into());
         }
+        // I14.10 (rest_for_one selection): the recorded dependent set is proved
+        // against the admitted declaration, not accepted as a named list. A
+        // dependent the policy never declared, or one it declared as an
+        // optional/advisory edge, cannot enter a recovery; and the independent
+        // `one_for_one` strategy may select nobody at all, so an independent
+        // sibling is never joined by a peer failure.
+        validate_selected_dependents(policy, &self.operation.selected_dependents)?;
         if self.restart_operation_id != self.operation.derive()? {
             return Err(invalid(
                 "restart_operation_id",
@@ -917,6 +963,50 @@ impl RestartIntensityLedger {
         self.attempts = attempts;
         Ok(dropped)
     }
+}
+
+/// Proves the operational record's selected dependent set against the admitted
+/// declaration, so a recovery set cannot be asserted after the fact (I14.10).
+///
+/// `one_for_one` is the default independent-child strategy: it may select no
+/// dependent at all, so a peer failure never joins an independent sibling. Any
+/// other strategy may select only children the policy DECLARES as `Required`
+/// edges. An undeclared child, and a declared `Optional` or `Advisory` edge,
+/// are refused: an optional or advisory dependency's absence degrades that
+/// dependency's own capability, and must not become a liveness edge that drags
+/// a healthy child into another child's recovery.
+fn validate_selected_dependents(
+    policy: &RestartPolicyV1,
+    selected: &[String],
+) -> Result<(), RuntimeContractError> {
+    if policy.group_strategy == RestartGroupStrategy::OneForOne {
+        if !selected.is_empty() {
+            return Err(invalid(
+                "selected_dependents",
+                "one_for_one is the independent-child strategy and selects no dependent",
+            ));
+        }
+        return Ok(());
+    }
+    for dependent in selected {
+        let Some(edge) = policy
+            .dependencies
+            .iter()
+            .find(|edge| &edge.dependency_id == dependent)
+        else {
+            return Err(invalid(
+                "selected_dependents",
+                "a selected dependent is not a declared dependency of the admitted policy",
+            ));
+        };
+        if edge.kind != RestartDependencyKind::Required {
+            return Err(invalid(
+                "selected_dependents",
+                "only a declared required dependency may join a selected recovery",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn unique_texts(values: &[String], field: &'static str) -> Result<(), RuntimeContractError> {

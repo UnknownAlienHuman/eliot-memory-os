@@ -28,7 +28,7 @@ use eliot_platform_windows::{
 };
 use eliot_runtime_contracts::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
-    RuntimeLiveStoreIdentity,
+    RestartPolicyV1, RuntimeLiveStoreIdentity,
 };
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
 use serde::Serialize;
@@ -125,6 +125,18 @@ pub struct CanarySourceBundleMaterializeInput {
     /// any input whose two statements of it differ, so the restatement can
     /// never become a second, unvalidated staging root.
     pub staging_root: PlatformHandle,
+    /// The one versioned restart policy the operator's approved
+    /// config/fault profile declares for the supervised `eliotd` child
+    /// (I14.10, I8.12), or `None` when that profile declares none.
+    ///
+    /// This is a pass-through carrier only. Every restart number, window,
+    /// backoff, jitter, cooldown and quarantine threshold it contains is read
+    /// from the approved profile by the caller; this materializer declares no
+    /// number of its own and never synthesises one. `None` stays `None` all the
+    /// way onto the descriptor and into its digest: an absent declaration is
+    /// the fail-closed disposition that withholds automatic restart for the
+    /// child, and it is never widened into a default or an unlimited budget.
+    pub eliotd_restart_policy: Option<RestartPolicyV1>,
 }
 
 /// One receipt fact for a published source role.
@@ -927,6 +939,15 @@ fn build_typed_bundle_with_selection(
         launch_nonce: eliotd_launch_nonce.clone(),
         authority_epoch,
         generation: authority_generation,
+        // The operator's approved profile declaration is published onto the
+        // Host-approved, digest-bound descriptor that already admits this
+        // launch, so the Kernel supervises the child under the declaration the
+        // operator approved instead of one chosen locally. `None` is preserved
+        // exactly: `with_computed_digest` and `serde` skip the field when it is
+        // absent, so an undeclared child leaves the wire bytes and the
+        // descriptor digest unchanged and the Kernel withholds automatic
+        // restart for it.
+        restart_policy: input.eliotd_restart_policy.clone(),
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()
@@ -2154,6 +2175,7 @@ mod tests {
             },
             transaction_id: handle("transaction:test"),
             staging_root,
+            eliotd_restart_policy: None,
         }
     }
 
