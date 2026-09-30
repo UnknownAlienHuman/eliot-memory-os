@@ -944,8 +944,25 @@ pub enum CoordinatorError {
     UnknownWorkClass(String),
     #[error("route evidence is missing or stale")]
     RouteEvidence,
-    #[error("budget is wider than the admitted budget")]
-    BudgetExceeded,
+    /// A budget is wider than the budget that admits it (issue #1683 A8).
+    ///
+    /// `field` names the exact dimension the comparison refused. It is carried
+    /// through from the comparing owner's own `ChildBudgetExceeded { field }`
+    /// rather than re-derived here, because `eliot_agent_api` owns the
+    /// `BudgetEnvelope` dimension vocabulary: this names the dimension the
+    /// owner compared instead of leaving a caller to infer it. A caller reading
+    /// this variant therefore learns which *envelope* field was too wide — and
+    /// nothing beyond that. In particular it does not also report
+    /// `eliot_swarm`'s independent per-dimension account, which is a different
+    /// budget over different values and names its own dimension in its own
+    /// refusal; see the `swarm_error` mapping in
+    /// `swarm_definition_admission.rs`.
+    ///
+    /// This refusal changes no task: it is produced by a pure comparison over
+    /// the caller's own envelopes and returns before any attempt, priority,
+    /// deadline or class is written.
+    #[error("budget is wider than the admitted budget at {field}")]
+    BudgetExceeded { field: &'static str },
     #[error("one mutating holder already owns scope {0}")]
     MutatingWriterConflict(String),
     #[error(
