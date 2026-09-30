@@ -43,7 +43,7 @@ use crate::admitted_material::{admission_of, validation_input_for};
 use crate::controller::verify_admitted_binding;
 use crate::curation_screen_stage::{ScreenDecision, resolve_screen_inputs};
 use crate::dispatch_stage::{
-    CURATION_CARRIER_REFUSAL, CurationExecutionCarrier,
+    CURATION_CARRIER_REFUSAL, CurationExecutionCarrier, OwnerCarriers, PipelineOrientationRecords,
     curation_test_support::{
         CountingRoutingHandler, CurationTestHarness, test_batch_for, test_port_bindings,
     },
@@ -121,12 +121,14 @@ fn job_with_handles(job_id: &str, job_class: JobClass) -> DreamJobInput {
 }
 
 /// Threads screen, model, grounding, and v2 validation for one admitted job,
-/// returning the validated candidate. Every stage genuinely invokes its
-/// owner; any refusal fails the proof.
+/// returning the validated candidate together with the admitted grounding
+/// request this same chain committed, so the Orientation dispatch site joins
+/// this pipeline's own records rather than a rebuilt lookalike. Every stage
+/// genuinely invokes its owner; any refusal fails the proof.
 fn validate_through_model(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
-) -> ValidatedGroundingCandidate {
+) -> (GroundingRequest, ValidatedGroundingCandidate) {
     verify_admitted_binding(admission, job).expect("e2e binding must verify");
     match resolve_screen_inputs(admission, job).expect("e2e screen must resolve") {
         ScreenDecision::PassThrough(_) => {}
@@ -152,12 +154,16 @@ fn validate_through_model(
         run_admitted_model(model_inputs).expect("e2e model must prove");
     let request: GroundingRequest =
         resolve_grounding_inputs(admission, job, draft).expect("e2e grounding must resolve");
+    // The grounding owner takes the request by value, so the committed request
+    // is cloned ahead of the owner call and returned with the receipt, exactly
+    // as the production chain retains it.
     let grounded: GroundedDreamDraft =
-        ground_admitted_draft(request).expect("e2e grounding must prove");
+        ground_admitted_draft(request.clone()).expect("e2e grounding must prove");
     let _inputs = resolve_validation_inputs(admission, job).expect("e2e validation must map");
     let carrier: GroundingValidationInput =
         validation_input_for(admission, job, grounded, Some(0)).expect("e2e carrier must build");
-    validate_admitted_draft(&carrier).expect("e2e validation must accept")
+    let validated = validate_admitted_draft(&carrier).expect("e2e validation must accept");
+    (request, validated)
 }
 
 /// Orientation passes the full owned pipeline: genuine owner calls at every
@@ -167,7 +173,7 @@ fn validate_through_model(
 fn orientation_pipeline_threads_screen_to_packet_receipt() {
     let admission = admitted_admission("job-e2e-orientation");
     let job = job_with_handles("job-e2e-orientation", JobClass::Orientation);
-    let validated = validate_through_model(&admission, &job);
+    let (request, validated) = validate_through_model(&admission, &job);
     assert!(
         !validated
             .output_digest()
@@ -178,11 +184,15 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
     let result = dispatch_admitted(
         &admission,
         &job,
-        None,
-        None,
+        OwnerCarriers {
+            curation: None,
+            screen: None,
+            curation_protection: None,
+            orientation: None,
+        },
         JobClass::Orientation,
         Some(&validated),
-        None,
+        Some(PipelineOrientationRecords::new(&request, &validated)),
     );
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("orientation dispatch must project, got {result:?}");
@@ -258,8 +268,12 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
     let refused = dispatch_admitted(
         &admission,
         &job,
-        Some(binding),
-        None,
+        OwnerCarriers {
+            curation: None,
+            screen: Some(binding),
+            curation_protection: None,
+            orientation: None,
+        },
         JobClass::Curation,
         None,
         None,
@@ -483,7 +497,19 @@ fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
     assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
     // Dispatch level: the same missing carrier refuses with the same reason.
-    let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Curation, None, None);
+    let refused = dispatch_admitted(
+        &admission,
+        &job,
+        OwnerCarriers {
+            curation: None,
+            screen: None,
+            curation_protection: None,
+            orientation: None,
+        },
+        JobClass::Curation,
+        None,
+        None,
+    );
     let Err(error) = refused else {
         panic!("carrier-less dispatch must refuse at the carrier check");
     };
