@@ -225,11 +225,10 @@ fn operator_session_token(
         issued_at_unix_ms,
         expires_at_unix_ms,
     };
-    let bytes = canonical_json_bytes(&preimage)
-        .map_err(|_| KernelServiceError::InvalidField {
-            field: "operator_session.preimage",
-            reason: "canonical token preimage could not be encoded",
-        })?;
+    let bytes = canonical_json_bytes(&preimage).map_err(|_| KernelServiceError::InvalidField {
+        field: "operator_session.preimage",
+        reason: "canonical token preimage could not be encoded",
+    })?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -253,7 +252,10 @@ fn validate_operator_session_inputs(
         });
     }
     if !inputs.client_process_id.is_empty()
-        && !inputs.client_process_id.bytes().all(|byte| byte.is_ascii_digit())
+        && !inputs
+            .client_process_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
     {
         return Err(KernelServiceError::InvalidField {
             field: "operator_session.client_process_id",
