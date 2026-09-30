@@ -9,7 +9,8 @@
 
 pub use eliot_build_test_graph::{
     BUILD_ROOT_DIRECTORY, BuildFingerprint, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV,
-    CandidateIdentity, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
+    CandidateIdentity, FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV, GovernedWorkEnvelope,
+    LaneIdentity, RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes,
