@@ -75,13 +75,13 @@ use eliot_contracts::{
 };
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
-    ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, InstrumentRegistry,
-    InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ISOLATED_PROCESS_CLASS, PlannedStage,
+    ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
+    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, PlannedStage,
     ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
     StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
     VerificationRouteRequest, WorkScope, admitted_profile_for_alias,
     profile::{
-        PROFILE_ALIASES, bundle_verification_profile, builtin_specs, compiler_profile,
+        PROFILE_ALIASES, builtin_specs, bundle_verification_profile, compiler_profile,
         package_verification_profile, test_profile,
     },
     resolve_verification_route,
@@ -172,9 +172,15 @@ enum CliError {
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // One sentence for both variants on purpose: a caller reading stderr
+        // learns the run was REFUSED, and the `detail` after the colon says
+        // whether that was a malformed invocation or a typed contract refusal.
+        // The variant is still distinct to `From`/matching callers, which is
+        // where the two need to be told apart.
         match self {
-            Self::Usage(detail) => write!(f, "profile resolution refused: {detail}"),
-            Self::Contract(detail) => write!(f, "profile resolution refused: {detail}"),
+            Self::Usage(detail) | Self::Contract(detail) => {
+                write!(f, "profile resolution refused: {detail}")
+            }
         }
     }
 }
@@ -263,7 +269,7 @@ fn run() -> i32 {
             return EXIT_REFUSED;
         }
     };
-    let receipt = match resolve_route(request) {
+    let receipt = match resolve_route(&request) {
         Ok(receipt) => receipt,
         Err(error) => {
             eprintln!("{error}");
@@ -290,7 +296,7 @@ fn run() -> i32 {
 }
 
 /// Resolves one aliased route end to end and issues its shared receipt.
-fn resolve_route(request: Request) -> Result<VerificationProfileReceipt, CliError> {
+fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliError> {
     let layout = TargetLayout::new(
         admitted_root(&request.source_root)?,
         admitted_root(&request.target_root)?,
@@ -580,7 +586,7 @@ fn read_request() -> Result<Request, CliError> {
     let mut declared_environments = Vec::new();
     let mut receipt_out = None;
     while let Some(option) = args.next() {
-        let value = |option: &str| {
+        let mut value = |option: &str| {
             args.next()
                 .ok_or_else(|| CliError::Usage(format!("{option} requires a value")))
         };
@@ -589,7 +595,9 @@ fn read_request() -> Result<Request, CliError> {
             "--source-root" => source_root = Some(PathBuf::from(value("--source-root")?)),
             "--target-root" => target_root = Some(PathBuf::from(value("--target-root")?)),
             "--cache-root" => cache_root = Some(PathBuf::from(value("--cache-root")?)),
-            "--declared-environment" => declared_environments.push(value("--declared-environment")?),
+            "--declared-environment" => {
+                declared_environments.push(value("--declared-environment")?);
+            }
             "--receipt-out" => receipt_out = Some(PathBuf::from(value("--receipt-out")?)),
             other => return Err(CliError::Usage(format!("unknown option '{other}'"))),
         }
@@ -602,9 +610,12 @@ fn read_request() -> Result<Request, CliError> {
     })?;
     Ok(Request {
         alias,
-        source_root: source_root.ok_or_else(|| CliError::Usage("--source-root is required".to_owned()))?,
-        target_root: target_root.ok_or_else(|| CliError::Usage("--target-root is required".to_owned()))?,
-        cache_root: cache_root.ok_or_else(|| CliError::Usage("--cache-root is required".to_owned()))?,
+        source_root: source_root
+            .ok_or_else(|| CliError::Usage("--source-root is required".to_owned()))?,
+        target_root: target_root
+            .ok_or_else(|| CliError::Usage("--target-root is required".to_owned()))?,
+        cache_root: cache_root
+            .ok_or_else(|| CliError::Usage("--cache-root is required".to_owned()))?,
         declared_environments,
         receipt_out,
     })
@@ -637,14 +648,39 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 /// The canonical one-shot authority epoch of this resolution process.
+///
+/// `EpochLineageId` is a closed contract: `new` accepts exactly a 36-character
+/// canonical lowercase hyphenated UUID and refuses anything else, so the lineage
+/// is DERIVED into that shape rather than assembled from readable text. A
+/// `"{name}-{pid}-{nanos}"` string is a readable label, not a lineage, and is
+/// refused on every run — so the identity is minted in the spelling the contract
+/// actually validates instead of one that reads nicely and never works.
+///
+/// `EPOCH_LINEAGE` names what this process is, and `SessionId` below carries it
+/// where a human-readable product identity belongs; the epoch itself is a
+/// derived UUID because that is the only shape its owner accepts.
+///
+/// Uniqueness is what the one-shot fence needs: the epoch never leaves this
+/// process and the run revokes nothing, so per-process key bytes plus the
+/// process id and clock reading are sufficient and no durability is implied.
 fn process_epoch() -> Result<EpochId, CliError> {
-    let lineage = EpochLineageId::new(format!(
-        "{EPOCH_LINEAGE}-{}-{}",
-        std::process::id(),
-        system_nanos()
-    ))?;
-    let sequence =
-        NonZeroU64::new(1).ok_or_else(|| CliError::Contract("epoch sequence is not one".to_owned()))?;
+    let mut material = fresh_key_bytes();
+    // Fold this process's own identity into the material so two resolutions
+    // that happened to draw the same bytes are still distinct. Each source is
+    // zero-extended into its own 8-byte lane, so the copy lengths match the
+    // destination exactly rather than panicking at runtime.
+    material[..8].copy_from_slice(&u64::from(std::process::id()).to_le_bytes());
+    material[8..16].copy_from_slice(&system_nanos().to_le_bytes());
+    let mut lineage = String::with_capacity(36);
+    for (index, byte) in material.iter().take(16).enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            lineage.push('-');
+        }
+        lineage.push_str(&format!("{byte:02x}"));
+    }
+    let lineage = EpochLineageId::new(lineage)?;
+    let sequence = NonZeroU64::new(1)
+        .ok_or_else(|| CliError::Contract("epoch sequence is not one".to_owned()))?;
     Ok(EpochId::new(lineage, sequence)?)
 }
 
@@ -661,13 +697,20 @@ fn now_unix_ms() -> u64 {
 fn system_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Builds one clock observation from an observed millisecond reading.
+///
+/// The `ClockReading` field is a signed millisecond count, so a reading beyond
+/// `i64::MAX` cannot be represented and is clamped to the maximum rather than
+/// wrapping into a negative instant. `cast_unsigned` states the intended
+/// conversion: the ceiling is a positive constant, so the sign is not lost here.
 fn observation_clock(now: u64) -> ClockReading {
-    let ceiling = u64::try_from(i64::MAX).unwrap_or(i64::MAX);
-    let now = i64::try_from(now.min(ceiling)).unwrap_or(i64::MAX);
+    let ceiling = i64::MAX;
+    let now = i64::try_from(now.min(ceiling.cast_unsigned())).unwrap_or(i64::MAX);
     ClockReading {
         valid_time_ms: Some(now),
         known_time_ms: Some(now),
@@ -748,6 +791,14 @@ impl DispatchCell {
         lease: ActionLeaseRef,
         nonce: String,
     ) -> Result<ProcessRequest, CliError> {
+        // The heads are cloned out BEFORE the issuance consumes them, and the
+        // validation context is built from that clone. This is the same value
+        // the permit was issued with, not a second source: the authority builds
+        // the permit from this exact `PermitIssuance` and re-proves the two
+        // against each other at consume time. `DispatchPermit` exposes no reader
+        // for its heads (that is deliberate — it is dispatch authority material),
+        // so the run context is pinned from the issuance the authority consumed.
+        let pinned_heads = heads.clone();
         let issuance = PermitIssuance::new(
             lease,
             fence.clone(),
@@ -770,7 +821,7 @@ impl DispatchCell {
             observation_clock(issued_at_unix_ms),
             fence,
             context_epoch,
-            permit.expected_revision_heads.clone(),
+            pinned_heads,
             VALIDATION_REVISION,
         )?;
         *self
@@ -894,7 +945,10 @@ struct StageRoute {
 /// instead of producing a request for whatever stage happens to come next.
 struct StagePort {
     /// One sealed, permit-bound request per admitted stage identity.
-    sealed: BTreeMap<String, ProcessRequest>,
+    ///
+    /// Behind a mutex because `bind` takes `&self` (the port is shared) and
+    /// because removing the slot is what enforces one seal per stage.
+    sealed: std::sync::Mutex<BTreeMap<String, ProcessRequest>>,
     /// Evidence sink every stage launch retains through.
     sink: Arc<RetainedEvidenceSink>,
 }
@@ -930,7 +984,7 @@ impl StagePort {
             sealed.insert(operation, request);
         }
         Ok(Self {
-            sealed,
+            sealed: std::sync::Mutex::new(sealed),
             sink: Arc::new(RetainedEvidenceSink::default()),
         })
     }
@@ -1044,14 +1098,17 @@ impl InstrumentRequestPort for StagePort {
     /// stage it is for rather than consuming requests in plan order: a bind for
     /// a stage this run never sealed finds nothing and is refused.
     ///
-    /// The request is cloned out and the sealed slot left in place, so a second
-    /// bind for the same stage would hand over the same permit twice. The P-07
-    /// dispatch fence rejects that at consume time — the nonce is one-shot — so
-    /// the duplicate never reaches a second child.
+    /// The sealed slot is TAKEN, not copied. `ProcessRequest` deliberately does
+    /// not implement `Clone`: it holds the one-shot P-07 dispatch permit, so a
+    /// second bind for the same stage must fail here rather than hand the same
+    /// permit to a second child. Consuming the slot is what makes a
+    /// one-seal-per-stage run structural instead of a convention the caller has
+    /// to remember.
     fn bind(&self, invocation: &InstrumentInvocation) -> Result<ProcessRequest, RunnerError> {
         self.sealed
-            .get(invocation.request.request_id.as_str())
-            .cloned()
+            .lock()
+            .map_err(|_| RunnerError::Binding("sealed stage map poisoned".to_owned()))?
+            .remove(invocation.request.request_id.as_str())
             .ok_or_else(|| {
                 RunnerError::Binding(format!(
                     "no sealed request for invocation '{}'",
