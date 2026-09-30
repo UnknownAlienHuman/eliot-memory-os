@@ -33,7 +33,7 @@ use std::num::NonZeroU32;
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_kernel_service::{
     KernelStoreGateway, MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS, MaintenanceTriggerClaimRequest,
-    MaintenanceTriggerDeliveryError,
+    MaintenanceTriggerDeliveryError, MaintenanceTriggerDeliveryRow,
 };
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, DecisionReason, MaintenanceError,
@@ -46,11 +46,13 @@ use eliot_ors::{
     OperationalRecoveryStore, OrsError, stage_maintenance_trigger_intake,
 };
 use eliot_protocol::{
-    MAINTENANCE_TRIGGER_WIRE_ID, MAINTENANCE_TRIGGER_WIRE_VERSION, MaintenanceTriggerClaim,
-    MaintenanceTriggerContentRef, MaintenanceTriggerGap, MaintenanceTriggerIntakeReceipt,
+    MAINTENANCE_TRIGGER_ACK_WIRE_ID, MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,
+    MAINTENANCE_TRIGGER_WIRE_ID, MAINTENANCE_TRIGGER_WIRE_VERSION, MaintenanceTriggerAck,
+    MaintenanceTriggerClaim, MaintenanceTriggerContentRef, MaintenanceTriggerDecisionReceipt,
+    MaintenanceTriggerGap, MaintenanceTriggerGapKind, MaintenanceTriggerIntakeReceipt,
     MaintenanceTriggerPayloadRef, MaintenanceTriggerPendingSummary, MaintenanceTriggerPosition,
-    MaintenanceTriggerRecord, MaintenanceTriggerRouteGrant, MaintenanceTriggerRoutingClass,
-    MaintenanceTriggerSourceEvent, ProtocolError,
+    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, MaintenanceTriggerRouteGrant,
+    MaintenanceTriggerRoutingClass, MaintenanceTriggerSourceEvent, ProtocolError,
 };
 use thiserror::Error;
 
@@ -1173,4 +1175,659 @@ pub fn collect_pending_maintenance_triggers(
     // page validation refuses an empty gapless page, so absence here is the
     // owner's witnessed incompleteness, never a certified-complete set.
     Ok(walk)
+}
+
+/// Fail-closed refusals of the crash-recovery handoff route (I14.22, issue
+/// #1694 W5).
+///
+/// Every variant keeps the stable trigger identity (plus the delivery identity
+/// on the ack path) and the exact Kernel owner refusal: a replay/read refusal
+/// stays a [`MaintenanceTriggerDeliveryError`], and a locally unvalidatable
+/// recovered shape stays a [`ProtocolError`]. No failure mints a new trigger
+/// ID, synthesizes a receipt, or authorizes repeating an uncertain downstream
+/// effect.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerRecoveryError {
+    /// Crash replay through the Kernel owner failed: no retained record
+    /// could be re-presented under this identity.
+    #[error("maintenance trigger crash replay refused for trigger {trigger_id}: {source}")]
+    Replay {
+        /// Stable trigger identity being recovered.
+        trigger_id: String,
+        /// Exact owner refusal; nothing was re-presented.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+    /// The owner returned a decision receipt that does not validate, so it
+    /// must not be acknowledged.
+    #[error("maintenance trigger recovered receipt refused for trigger {trigger_id}: {source}")]
+    Receipt {
+        /// Stable trigger identity being recovered.
+        trigger_id: String,
+        /// Exact shape refusal; the receipt was not reused.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+    /// Marking a lost or ambiguous commit as reconciling failed.
+    #[error("maintenance trigger ambiguous-commit mark refused for trigger {trigger_id}: {source}")]
+    Ambiguous {
+        /// Stable trigger identity staying open.
+        trigger_id: String,
+        /// Exact owner refusal; the row keeps its existing disposition.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+    /// The locally built ack echoes a shape the wire contract refuses, so it
+    /// never reached the owner.
+    #[error("maintenance trigger recovered ack malformed for trigger {trigger_id}: {source}")]
+    AckShape {
+        /// Stable trigger identity being acknowledged.
+        trigger_id: String,
+        /// Delivery identity of the claim being acknowledged.
+        delivery_id: String,
+        /// Exact shape refusal; nothing was acknowledged.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+    /// The Kernel owner refused the recovered acknowledgement.
+    #[error("maintenance trigger recovered ack refused for trigger {trigger_id}: {source}")]
+    Ack {
+        /// Stable trigger identity being acknowledged.
+        trigger_id: String,
+        /// Delivery identity of the claim being acknowledged.
+        delivery_id: String,
+        /// Exact owner refusal; delivery stays unacknowledged.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+}
+
+impl MaintenanceTriggerRecoveryError {
+    /// Returns the stable trigger identity being recovered.
+    #[must_use]
+    pub fn trigger_id(&self) -> &str {
+        match self {
+            Self::Replay { trigger_id, .. }
+            | Self::Receipt { trigger_id, .. }
+            | Self::Ambiguous { trigger_id, .. }
+            | Self::AckShape { trigger_id, .. }
+            | Self::Ack { trigger_id, .. } => trigger_id,
+        }
+    }
+
+    /// Returns the delivery identity being acknowledged, when the failure is
+    /// on the ack path.
+    #[must_use]
+    pub fn delivery_id(&self) -> Option<&str> {
+        match self {
+            Self::AckShape { delivery_id, .. } | Self::Ack { delivery_id, .. } => Some(delivery_id),
+            Self::Replay { .. } | Self::Receipt { .. } | Self::Ambiguous { .. } => None,
+        }
+    }
+}
+
+/// Where one interrupted trigger must resume after a crash (I14.22, issue
+/// #1694 W5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaintenanceTriggerRecoveryOutcome {
+    /// Crash before decision commit: re-present this exact retained record to
+    /// the evaluator under the same identity. Never mint a new trigger, and
+    /// never treat receipt absence during an outage as proof of non-commit.
+    ReplayRecord {
+        /// The exact retained record, byte-identical to the admitted one.
+        record: MaintenanceTriggerRecord,
+    },
+    /// Commit before ack: acknowledge this exact owner-looked-up receipt
+    /// without another job, recommendation, or wake. The receipt is the
+    /// Kernel owner's read-back, never a locally synthesized value.
+    AcknowledgeReceipt {
+        /// The committed decision receipt to acknowledge.
+        receipt: MaintenanceTriggerDecisionReceipt,
+    },
+}
+
+/// Routes one interrupted trigger to its crash-recovery handoff (I14.22,
+/// issue #1694 W5).
+///
+/// This is the production front-door recovery router: it reads the owner's
+/// committed state first through
+/// [`KernelStoreGateway::recover_maintenance_trigger_commit`], and only when
+/// no committed receipt answers does it fall back to
+/// [`KernelStoreGateway::replay_maintenance_trigger_after_crash`]. A committed
+/// receipt therefore reuses the bound durable decision — idempotent accepted
+/// results, not exactly one physical evaluation call — while a pre-commit
+/// crash replays the same retained trigger for a fresh evaluation under the
+/// same identity.
+///
+/// A lost or ambiguous commit response is not routed here: it stays
+/// pending/reconciling through
+/// [`mark_maintenance_trigger_commit_ambiguous_after_loss`], and receipt
+/// absence during an outage is never reported as proof of non-commit.
+/// Materially new policy or source evidence never overwrites the old result:
+/// it arrives as an explicitly linked new trigger through
+/// [`admit_maintenance_trigger_intake`] and links via
+/// [`supersede_maintenance_trigger_with_successor`].
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerRecoveryError`]: an unvalidatable recovered
+/// receipt, or an owner refusal to replay under this identity (which also
+/// covers the owner being unreachable — both reads fail closed then).
+pub fn recover_maintenance_trigger_handoff(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    trigger_id: &str,
+) -> Result<MaintenanceTriggerRecoveryOutcome, MaintenanceTriggerRecoveryError> {
+    if trigger_id.trim().is_empty() {
+        return Err(MaintenanceTriggerRecoveryError::Replay {
+            trigger_id: trigger_id.to_owned(),
+            source: Box::new(MaintenanceTriggerDeliveryError::Protocol(
+                ProtocolError::InvalidField {
+                    field: "maintenance_trigger.trigger_id",
+                    reason: "trigger identity must be named",
+                },
+            )),
+        });
+    }
+    match gateway.recover_maintenance_trigger_commit(principal_ref, trigger_id) {
+        Ok(receipt) => {
+            receipt
+                .validate()
+                .map_err(|source| MaintenanceTriggerRecoveryError::Receipt {
+                    trigger_id: trigger_id.to_owned(),
+                    source: Box::new(source),
+                })?;
+            Ok(MaintenanceTriggerRecoveryOutcome::AcknowledgeReceipt { receipt })
+        }
+        Err(_) => {
+            // No committed receipt answers this identity (open row, unknown
+            // trigger, or owner refusal): the crash happened before decision
+            // commit, so replay the same retained trigger. An owner outage
+            // fails this read too, and that refusal is the returned error.
+            let record = gateway
+                .replay_maintenance_trigger_after_crash(principal_ref, trigger_id)
+                .map_err(|source| MaintenanceTriggerRecoveryError::Replay {
+                    trigger_id: trigger_id.to_owned(),
+                    source: Box::new(source),
+                })?;
+            Ok(MaintenanceTriggerRecoveryOutcome::ReplayRecord { record })
+        }
+    }
+}
+
+/// Acknowledges one recovered commit with its exact decision receipt (I14.22,
+/// issue #1694 W5).
+///
+/// This is the commit-before-ack completion caller: it echoes the live claim
+/// exactly (trigger, delivery identity, fence, session) and embeds the
+/// owner-looked-up receipt content byte for byte through
+/// [`KernelStoreGateway::acknowledge_maintenance_trigger`]. No job is
+/// admitted, no recommendation is suggested, and no wake is scheduled here —
+/// the receipt already binds those durable intents.
+///
+/// The claim must be live under the current generation: claim first through
+/// [`claim_maintenance_trigger_for_daemon`], and after a revocation reclaim
+/// under the replacement identity. A `DecisionRecorded`/`Reconciling` row
+/// whose live claim lapsed re-submits this same receipt through
+/// [`KernelStoreGateway::record_maintenance_trigger_decision`] first — the
+/// owner reuses the identical receipt idempotently — so the live claim binds
+/// the committed row before this ack. Expired eligibility blocks the ack at
+/// the owner; record terminal expiry through
+/// [`expire_inapplicable_maintenance_trigger`] instead. An ack refusal on an
+/// already-settled row reconciles through the recorded outcome, never through
+/// a fresh claim.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerRecoveryError`]: a locally malformed ack, or
+/// the exact Kernel owner ack refusal (stale consumer, lapsed claim, receipt
+/// mismatch, expired eligibility).
+pub fn acknowledge_recovered_maintenance_commit(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    claim: &MaintenanceTriggerClaim,
+    decision_receipt: &MaintenanceTriggerDecisionReceipt,
+    current_fence: &StateFence,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerRecoveryError> {
+    let ack = MaintenanceTriggerAck {
+        wire_id: MAINTENANCE_TRIGGER_ACK_WIRE_ID.to_owned(),
+        wire_version: MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,
+        trigger_id: claim.trigger_id.clone(),
+        delivery_id: claim.delivery_id.clone(),
+        daemon_fence: claim.daemon_fence.clone(),
+        daemon_session: claim.daemon_session.clone(),
+        decision_receipt: decision_receipt.clone(),
+    };
+    ack.validate()
+        .map_err(|source| MaintenanceTriggerRecoveryError::AckShape {
+            trigger_id: claim.trigger_id.clone(),
+            delivery_id: claim.delivery_id.clone(),
+            source: Box::new(source),
+        })?;
+    gateway
+        .acknowledge_maintenance_trigger(principal_ref, &ack, current_fence, now_unix_ms)
+        .map_err(|source| MaintenanceTriggerRecoveryError::Ack {
+            trigger_id: claim.trigger_id.clone(),
+            delivery_id: claim.delivery_id.clone(),
+            source: Box::new(source),
+        })?;
+    Ok(())
+}
+
+/// Holds one lost or ambiguous commit response open for reconciliation
+/// (I14.22, issue #1694 W5).
+///
+/// This is the production front-door ambiguous-commit caller for a commit
+/// whose response was lost: it marks the trigger reconciling through
+/// [`KernelStoreGateway::mark_maintenance_trigger_commit_ambiguous`], which
+/// keeps the row open and attaches a visible `AmbiguousCommit` gap record.
+/// The trigger must then be reconciled by receipt lookup through
+/// [`recover_maintenance_trigger_handoff`] before any further effect — it is
+/// never blindly re-executed and its external effects are never rerun on a
+/// guess.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerRecoveryError::Ambiguous`] for the exact
+/// Kernel owner refusal.
+pub fn mark_maintenance_trigger_commit_ambiguous_after_loss(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    trigger_id: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerRecoveryError> {
+    gateway
+        .mark_maintenance_trigger_commit_ambiguous(principal_ref, trigger_id, now_unix_ms)
+        .map_err(|source| MaintenanceTriggerRecoveryError::Ambiguous {
+            trigger_id: trigger_id.to_owned(),
+            source: Box::new(source),
+        })?;
+    Ok(())
+}
+
+/// Fail-closed refusals of the replacement-startup route (I14.22/I14.24,
+/// issue #1694 W6).
+///
+/// Every variant keeps the exact Kernel owner refusal: a ledger-restore
+/// refusal, a consumer-revocation refusal, or a mirror-gated pending-set
+/// refusal stays a [`MaintenanceTriggerDeliveryError`]. A replacement never
+/// claims reconciliation complete before the required mirror recovery, and
+/// ordinary pending debt never acquires a runtime lease here.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerStartupError {
+    /// The owned delivery ledger refused the once-only startup restore.
+    #[error("maintenance trigger ledger restore refused: {source}")]
+    Restore {
+        /// Exact owner refusal; no claim has been served.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+    /// The Kernel owner refused the lost-consumer revocation.
+    #[error("maintenance trigger consumer revocation refused: {source}")]
+    Revoke {
+        /// Exact owner refusal; old consumer authority is unchanged.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+    /// The mirror-gated replacement pending set could not be surfaced,
+    /// including the owner refusing before mirror recovery completes.
+    #[error("maintenance trigger replacement pending set refused: {source}")]
+    Surface {
+        /// Exact owner refusal; reconciliation is not complete.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+}
+
+/// Restores the owned delivery ledger once at startup (I14.22, issue #1694
+/// W6).
+///
+/// This is the production front-door restore caller: it hands the previously
+/// persisted durable rows to
+/// [`KernelStoreGateway::restore_maintenance_trigger_ledger`] before any
+/// claim is served. The rows source is the startup composition's read-back of
+/// the persisted rows through the Store-lane rows backend — this caller owns
+/// neither the read-back nor the persistence, only the handoff. The owner
+/// refuses when it already holds rows and revalidates every row, so a damaged
+/// row fails the restore instead of entering as a guessed-complete entry.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerStartupError::Restore`] for the exact owner
+/// refusal.
+pub fn restore_maintenance_trigger_ledger_at_startup(
+    gateway: &KernelStoreGateway,
+    rows: Vec<MaintenanceTriggerDeliveryRow>,
+) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerStartupError> {
+    gateway
+        .restore_maintenance_trigger_ledger(rows)
+        .map_err(|source| MaintenanceTriggerStartupError::Restore {
+            source: Box::new(source),
+        })
+}
+
+/// Revokes one lost daemon generation's trigger-consumer authority (I14.24,
+/// issue #1694 W6).
+///
+/// This is the production front-door revocation caller: it revokes the old
+/// consumer fence/session through
+/// [`KernelStoreGateway::revoke_maintenance_trigger_consumer`], which is the
+/// existing Kernel owner. Pending claims are retained under the same identity
+/// and revision for the replacement generation; committed rows move to
+/// `Reconciling` with their receipts preserved; every later old-generation
+/// claim or ack fails. The revocation value itself names the lost fence and
+/// session observed by the startup composition.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerStartupError::Revoke`] for the exact owner
+/// refusal.
+pub fn revoke_lost_daemon_consumer_for_replacement(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    revocation: MaintenanceTriggerRevocation,
+) -> Result<(), MaintenanceTriggerStartupError> {
+    revocation
+        .validate()
+        .map_err(MaintenanceTriggerDeliveryError::Protocol)
+        .map_err(|source| MaintenanceTriggerStartupError::Revoke {
+            source: Box::new(source),
+        })?;
+    gateway
+        .revoke_maintenance_trigger_consumer(principal_ref, revocation)
+        .map_err(|source| MaintenanceTriggerStartupError::Revoke {
+            source: Box::new(source),
+        })?;
+    Ok(())
+}
+
+/// Surfaces the bounded pending set to a replacement generation (I14.22,
+/// issue #1694 W6).
+///
+/// This is the production front-door replacement-enumeration caller: it walks
+/// [`KernelStoreGateway::maintenance_trigger_replacement_pending_set`] in
+/// bounded pages with stable continuation, exactly like
+/// [`collect_pending_maintenance_triggers`] but through the mirror-gated
+/// owner entry. Replacement authentication plus the required mirror recovery
+/// must already be complete — `mirror_recovered == false` is refused by the
+/// owner with `MirrorRecoveryRequired`, so maintenance reconciliation can
+/// never be claimed complete before the mirrors are rebuilt. A reconnect
+/// resumes from its held cursor and never resets progress to a guessed
+/// complete-empty set: only owner-issued cursors advance the walk, every page
+/// is validated, and the walk stops after `max_pages` pages with the resume
+/// cursor held. Ordinary pending debt acquires no runtime lease and blocks no
+/// unrelated safe work; safety/recovery triggers stay visible to their
+/// registered Host/Kernel/Watchdog/Doctor route through the owner-issued
+/// grant they already carry, and duplicated delivery authorizes no duplicated
+/// containment.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerStartupError::Surface`] for a Kernel owner
+/// page refusal (including missing mirror recovery) or a page that answers
+/// outside the page contract.
+pub fn surface_replacement_pending_set(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    continuation: Option<&str>,
+    mirror_recovered: bool,
+    now_unix_ms: u64,
+    max_pages: NonZeroU32,
+) -> Result<PendingTriggerWalk, MaintenanceTriggerStartupError> {
+    let mut walk = PendingTriggerWalk {
+        members: Vec::new(),
+        gaps: Vec::new(),
+        continuation: continuation.map(str::to_owned),
+        pages_walked: 0,
+    };
+    while walk.pages_walked < max_pages.get() {
+        let page = gateway
+            .maintenance_trigger_replacement_pending_set(
+                principal_ref,
+                walk.continuation.as_deref(),
+                mirror_recovered,
+                now_unix_ms,
+            )
+            .map_err(|source| MaintenanceTriggerStartupError::Surface {
+                source: Box::new(source),
+            })?;
+        page.validate()
+            .map_err(MaintenanceTriggerDeliveryError::Protocol)
+            .map_err(|source| MaintenanceTriggerStartupError::Surface {
+                source: Box::new(source),
+            })?;
+        walk.members.extend(page.members);
+        walk.gaps.extend(page.gaps);
+        walk.pages_walked += 1;
+        if page.has_more {
+            // Validated above: a further page always carries its cursor.
+            walk.continuation = page.continuation;
+        } else {
+            walk.continuation = None;
+            break;
+        }
+    }
+    Ok(walk)
+}
+
+/// Recovers one replacement daemon generation in revoke-then-surface order
+/// (I14.24, issue #1694 W6).
+///
+/// This is the production front-door replacement-startup wiring: it revokes
+/// the lost generation's consumer authority first, then surfaces the bounded
+/// pending set, matching the I14.24 `eliotd`-crash row ("Kernel revokes
+/// daemon epoch … compatible daemon generation; rebuild hot mirrors").
+/// Revocation before surfacing is load-bearing — the replacement reclaims the
+/// same trigger identities only after the old consumer can no longer answer.
+/// Ordinary pending debt keeps no runtime alive here.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerStartupError`]: a revocation refusal, or a
+/// mirror-gated pending-set refusal.
+pub fn recover_replacement_generation(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    revocation: MaintenanceTriggerRevocation,
+    continuation: Option<&str>,
+    mirror_recovered: bool,
+    now_unix_ms: u64,
+    max_pages: NonZeroU32,
+) -> Result<PendingTriggerWalk, MaintenanceTriggerStartupError> {
+    revoke_lost_daemon_consumer_for_replacement(gateway, principal_ref, revocation)?;
+    surface_replacement_pending_set(
+        gateway,
+        principal_ref,
+        continuation,
+        mirror_recovered,
+        now_unix_ms,
+        max_pages,
+    )
+}
+
+/// Fail-closed refusals of the expiry/damage/retention route (I14.22/I5.2,
+/// issue #1694 W7).
+///
+/// Every variant keeps the stable trigger identity and the exact Kernel owner
+/// refusal, except a damage kind owned by another transition, which stays a
+/// [`ProtocolError`] before any owner call. Expired eligibility blocks stale
+/// execution but never deletes the row, its record, or its evidence locators;
+/// damage produces a visible recovery/gap record, never a plaintext fallback
+/// and never silent deletion.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerRetentionError {
+    /// Terminal expiry was refused by the Kernel owner.
+    #[error("maintenance trigger expiry refused for trigger {trigger_id}: {source}")]
+    Expiry {
+        /// Stable trigger identity past its applicability window.
+        trigger_id: String,
+        /// Exact owner refusal; the row keeps its existing disposition.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+    /// Supersession by an explicitly linked successor was refused.
+    #[error("maintenance trigger supersession refused for trigger {trigger_id}: {source}")]
+    Supersession {
+        /// Stable trigger identity being superseded.
+        trigger_id: String,
+        /// Exact owner refusal; the old result is unchanged.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+    /// The damage kind belongs to another owning transition, so it never
+    /// reached the gap owner.
+    #[error("maintenance trigger gap kind refused for trigger {trigger_id}: {source}")]
+    GapKind {
+        /// Stable trigger identity carrying the damage.
+        trigger_id: String,
+        /// Exact kind refusal; nothing was recorded.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+    /// The visible recovery/gap record was refused by the Kernel owner.
+    #[error("maintenance trigger gap record refused for trigger {trigger_id}: {source}")]
+    Gap {
+        /// Stable trigger identity carrying the damage.
+        trigger_id: String,
+        /// Exact owner refusal; nothing was recorded.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+}
+
+impl MaintenanceTriggerRetentionError {
+    /// Returns the stable trigger identity this retention refusal names.
+    #[must_use]
+    pub fn trigger_id(&self) -> &str {
+        match self {
+            Self::Expiry { trigger_id, .. }
+            | Self::Supersession { trigger_id, .. }
+            | Self::GapKind { trigger_id, .. }
+            | Self::Gap { trigger_id, .. } => trigger_id,
+        }
+    }
+}
+
+/// Records terminal expiry for one past-window trigger (I14.22, issue #1694
+/// W7).
+///
+/// This is the production front-door expiry caller: it records the terminal
+/// `Expired` disposition through
+/// [`KernelStoreGateway::expire_maintenance_trigger`]. Expired eligibility
+/// blocks stale execution — claims and acks against the row fail at the owner
+/// afterwards — but the row, its record, and its evidence locators are
+/// preserved under the retention policy; nothing unresolved is deleted. Call
+/// this only when `now_unix_ms` is past the record's
+/// `applicable_until_unix_ms`: the owner refuses a still-applicable trigger,
+/// and an unknown identity stays unknown.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerRetentionError::Expiry`] for the exact owner
+/// refusal.
+pub fn expire_inapplicable_maintenance_trigger(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    trigger_id: &str,
+    reason: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerRetentionError> {
+    gateway
+        .expire_maintenance_trigger(principal_ref, trigger_id, reason, now_unix_ms)
+        .map_err(|source| MaintenanceTriggerRetentionError::Expiry {
+            trigger_id: trigger_id.to_owned(),
+            source: Box::new(source),
+        })?;
+    Ok(())
+}
+
+/// Records supersession by one explicitly linked successor trigger (I14.22,
+/// issue #1694 W7).
+///
+/// This is the production front-door supersession caller: it links the
+/// successor through
+/// [`KernelStoreGateway::supersede_maintenance_trigger`]. The old result is
+/// never overwritten — the successor is named on the terminal disposition and
+/// both rows stay readable with their records and receipts. The successor
+/// must already be admitted through [`admit_maintenance_trigger_intake`];
+/// materially new policy or source evidence therefore arrives as a new
+/// trigger first and links here, instead of rerunning the old row's external
+/// effects blindly.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerRetentionError::Supersession`] for the exact
+/// owner refusal, including an unadmitted successor identity.
+pub fn supersede_maintenance_trigger_with_successor(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    trigger_id: &str,
+    successor_trigger_id: &str,
+    reason: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerRetentionError> {
+    gateway
+        .supersede_maintenance_trigger(
+            principal_ref,
+            trigger_id,
+            successor_trigger_id,
+            reason,
+            now_unix_ms,
+        )
+        .map_err(|source| MaintenanceTriggerRetentionError::Supersession {
+            trigger_id: trigger_id.to_owned(),
+            source: Box::new(source),
+        })?;
+    Ok(())
+}
+
+/// Records a visible recovery/gap record for unrepairable damage (I14.22/I5.2,
+/// issue #1694 W7).
+///
+/// This is the production front-door damage caller: it records the gap
+/// through [`KernelStoreGateway::record_maintenance_trigger_gap`]. Missing
+/// keys, corrupt payloads, and inaccessible sources produce this record —
+/// never a plaintext fallback, never a bare `no_action`, and never silent
+/// deletion, per the I5.2 opaque-payload rules. Only those three kinds travel
+/// this caller: `AmbiguousCommit` belongs to the W5 ambiguous-commit
+/// transition ([`mark_maintenance_trigger_commit_ambiguous_after_loss`]) and
+/// `IncompleteEnumeration` belongs to the page-owning transitions, and the
+/// owner refuses both here, so this caller refuses them before any write.
+/// Compaction stays with the ledger owner and happens only after exact
+/// ack or terminal disposition plus required downstream retention — this
+/// caller compacts nothing and deletes nothing — and per-disposition counts
+/// stay on the existing role-filtered recovery surface.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerRetentionError`]: a kind owned by another
+/// transition, or the exact owner gap-record refusal.
+pub fn record_maintenance_trigger_damage(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    trigger_id: &str,
+    kind: MaintenanceTriggerGapKind,
+    detail: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerRetentionError> {
+    if matches!(
+        kind,
+        MaintenanceTriggerGapKind::AmbiguousCommit | MaintenanceTriggerGapKind::IncompleteEnumeration
+    ) {
+        return Err(MaintenanceTriggerRetentionError::GapKind {
+            trigger_id: trigger_id.to_owned(),
+            source: Box::new(ProtocolError::InvalidField {
+                field: "maintenance_trigger_gap.kind",
+                reason: "enumeration and commit gaps are recorded by their owning transitions",
+            }),
+        });
+    }
+    gateway
+        .record_maintenance_trigger_gap(principal_ref, trigger_id, kind, detail, now_unix_ms)
+        .map_err(|source| MaintenanceTriggerRetentionError::Gap {
+            trigger_id: trigger_id.to_owned(),
+            source: Box::new(source),
+        })?;
+    Ok(())
 }
