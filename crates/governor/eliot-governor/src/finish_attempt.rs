@@ -22,8 +22,7 @@ use eliot_finish::{
     FinishError, FinishService, TaskLifecycleState,
 };
 use eliot_observation::{
-    CandidateDisposition, ObservationAdmissionResult, ObservationJournal,
-    ObservationPlanBinding,
+    CandidateDisposition, ObservationAdmissionResult, ObservationJournal, ObservationPlanBinding,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{

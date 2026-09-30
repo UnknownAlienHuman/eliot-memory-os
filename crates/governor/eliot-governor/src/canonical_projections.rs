@@ -448,9 +448,7 @@ fn project_continuity(
     }))
 }
 
-fn project_safety(
-    task_id: &TaskId,
-) -> Result<GovernorSafetyProjection, GovernorProjectionError> {
+fn project_safety(task_id: &TaskId) -> Result<GovernorSafetyProjection, GovernorProjectionError> {
     // Rejection diagnostics remain in the retained ObservationJournal, but a
     // rejection carries no exact task-selection evidence to bind it to this
     // requested task. Do not promote cold, ambiguous, or otherwise unbound
