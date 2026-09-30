@@ -18361,8 +18361,9 @@ impl RedbRecoveryStore {
                 if key.value() != Self::bridge_position_key(&namespace, sequence) {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "bridge_event_position",
-                        reason: "position key does not match its canonical owner and sequence binding"
-                            .to_owned(),
+                        reason:
+                            "position key does not match its canonical owner and sequence binding"
+                                .to_owned(),
                     });
                 }
                 if !stream_owners.contains_key(&namespace) {
