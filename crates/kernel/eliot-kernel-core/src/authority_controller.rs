@@ -263,6 +263,15 @@ impl ProcessDispatchAuthorityController {
 
     /// Consumes one Kernel-owned process-origin presentation and durably
     /// records its one-shot nonce before returning the grant proof.
+    ///
+    /// One-shot replay discipline (issue #1775 W6/A-crash): the consumed
+    /// nonce is journaled through P-06 before the grant is returned, so an
+    /// exact replay — in this process or after a crash-restart recovery —
+    /// can never mint a second grant for the same challenge. The replay
+    /// keeps the existing dependency-unavailable shape but carries a
+    /// reconciliation directive naming the decided challenge: the caller
+    /// reconciles by challenge id and never mints a fresh nonce to repeat
+    /// an unknown effect.
     pub fn decide_origin_control(
         &mut self,
         presentation: &OriginControlPresentation,
@@ -275,7 +284,16 @@ impl ProcessDispatchAuthorityController {
         let grant = self
             .origin_authority
             .decide(presentation, &active_epoch, now_unix_ms)
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+            .map_err(|error| {
+                if matches!(error, eliot_process::ContractError::DispatchPermitConsumed) {
+                    KernelError::DependencyUnavailable(format!(
+                        "origin challenge {challenge_id} already decided: reconcile by challenge id, never mint a fresh nonce to repeat its effect",
+                        challenge_id = presentation.challenge().challenge_id()
+                    ))
+                } else {
+                    KernelError::DependencyUnavailable(error.to_string())
+                }
+            })?;
         self.persist_snapshot(binding)?;
         Ok(grant)
     }
