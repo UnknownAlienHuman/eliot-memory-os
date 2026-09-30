@@ -94,8 +94,8 @@
 //! not refused. The census names the store's tables by referencing `store.rs`'s
 //! own constants, so a renamed table cannot drift from its entry, and it compares
 //! that list with the tables redb reports for the file being read, under the same
-//! transaction as the pages. Counted at the time of writing: 73 distinct declared
-//! tables, 45 backing a dispositioned row family and 28 carrying an explicit
+//! transaction as the pages. Counted at the time of writing: 74 distinct declared
+//! tables, 45 backing a dispositioned row family and 29 carrying an explicit
 //! source-bound nonrestorable/forensic exclusion with the reason written next to
 //! it; 43 dispositioned families, each bound to at least one table, so none is
 //! excused from having one. A table with no disposition is refused with
@@ -917,7 +917,6 @@ struct DispositionedTable {
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
 /// time of writing: 74 distinct declared tables, of which 46 back a dispositioned
 /// row family and 28 are explicit source-bound exclusions.
-=======
 /// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
 ///

@@ -117,17 +117,22 @@
 //!   store, so the incumbent is served by nobody while the `I5.11` stage-10
 //!   window is open, and only another committed cutover can serve it again.
 //! - **Before** any cutover is committed, the durable owner still names one
-//!   generation, and it is not the descriptor's. The composition root
-//!   establishes that owner once, through
+//!   generation. The composition root establishes that owner once, through
 //!   [`establish_canonical_store_route_owner`], before any Store gateway
 //!   exists, so the initial state of every installation means "only the
 //!   recorded initial generation" rather than "anything goes". That is what
 //!   closes the configuration and restart legs of the negative in the
-//!   pre-first-commit window: an operator who installs and activates an
-//!   approved package generation carrying a NEW store bridge still reaches a
-//!   gateway whose generation the durable owner does not name, and it is
-//!   refused canonical reads and writes by the same gate that refuses a
-//!   cut-over incumbent.
+//!   pre-first-commit window: once the row exists, an operator who installs and
+//!   activates an approved package generation carrying a NEW store bridge still
+//!   reaches a gateway whose generation the durable owner does not name, and it
+//!   is refused canonical reads and writes by the same gate that refuses a
+//!   cut-over incumbent. Be precise about the one step in front of that: the
+//!   writer is only reached when the durable owner answers `None`, so on an
+//!   installation whose ORS predates this record the first composition writes
+//!   whatever generation the Host descriptor then names. There is no earlier
+//!   durable evidence to migrate that answer from, and the writer is
+//!   write-once, so from the second composition onward the recorded name is the
+//!   only one that can serve.
 //!
 //! **Not** established by this module, and stated here so no reader mistakes
 //! this file for a safety net it is not:

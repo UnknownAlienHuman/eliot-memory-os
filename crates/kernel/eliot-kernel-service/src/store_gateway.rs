@@ -7286,9 +7286,13 @@ impl KernelStoreGateway {
     /// restart and cannot be a composition-local flag. `None` therefore means
     /// neither a committed cutover nor an established owner exists for this
     /// scope, which is the state of a database this build has not composed yet;
-    /// a composition with no ORS handle keeps the generation its own route was
-    /// pinned to, which is the behaviour that existed before this gate and is
-    /// reachable only where no owner could exist to contradict it.
+    /// a gateway built without the composition-retained ORS handle also answers
+    /// `None`, because it holds no handle to read either owner with. That is the
+    /// behaviour that existed before this gate, and it is reachable only from a
+    /// gateway no production composition builds: both production construction
+    /// sites — `KernelComposition`'s initial canonical-store connect
+    /// (`canonical_store_runtime.rs`) and `KernelComposition::rebind_store`
+    /// (`lib.rs`) — pass the retained ORS handle.
     fn active_store_generation(&self) -> Result<Option<ResourceGeneration>, StoreError> {
         let Some(commit_ors) = self.commit_ors.as_deref() else {
             return Ok(None);
