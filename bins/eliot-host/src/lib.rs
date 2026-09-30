@@ -6474,10 +6474,43 @@ impl HostComposition {
             // derives (host/kernel/store/watchdog) lives under the installation
             // root, which IS the preparation source, and
             // `admit_staging_parent` refuses any staging parent nested under
-            // the source. The missing owner is the installation root contract,
-            // which must derive a destination parent outside the source
-            // installation root. No destination is created, so a refusal here
-            // still means no effect.
+            // the source.
+            //
+            // This arm is the one place the whole preparation contour is
+            // reachable, and it is missing exactly ONE of the thirteen
+            // `PresentedPreparationRequest` fields. Nine of the other twelve
+            // are readable from the admitted envelope (`request_id`, `nonce`,
+            // `identity.class`, `identity.fence`, `identity.source_installation`)
+            // or from owner evidence `prepare_backup_destination` already
+            // inspects (the approved-generation handle, approved profile,
+            // artifact digest set, and committed-fence authority generation),
+            // and the remaining three need no value at all, because the type
+            // admits the "no claim" position for `owner_lease_ref`,
+            // `purge_ledger_revision` and `audit_fence_note`.
+            //
+            // The one that is missing is `staging_parent`, and it has TWO
+            // independent owners that each decline it, which is why this is a
+            // named refusal and not a wiring gap:
+            //
+            //  * `crates/foundation/eliot-protocol/src/backup.rs`
+            //    (`BackupIsolatedRestorePrepare`) — frozen #954. The admitted
+            //    body carries no path, and neither does `BackupRuntimeControlRequest`
+            //    nor the accepted owner-method table, by design:
+            //    `BackupOwnerOutcome` says a produced destination "travels as a
+            //    bounded immutable handle, never as a path, a URL, or an inline
+            //    body". Widening the body is a digest-bound change to a frozen
+            //    interface this issue does not own.
+            //  * `crates/kernel/eliot-installation/src/runtime_root_contract.rs`
+            //    — the installation root contract. The one owner-declared root
+            //    outside `installation_root` is `expected_staging_root()`
+            //    (`<profile_root>\packages`), which is `pub(super)`, has zero
+            //    `eliot-host` call sites, and is the installer's package staging
+            //    root rather than I5.13's isolated restore root. The key that
+            //    names a new installation root is a caller-supplied installer CLI
+            //    argument, so deriving the destination from it is precisely the
+            //    client-supplied arbitrary path A2 rejects.
+            //
+            // No destination is created, so a refusal here still means no effect.
             BackupDispatchTarget::Prepare => Err(BackupDispatchRefusal::new(
                 operation,
                 "no owner-issued isolated-restore staging parent exists in retained Host state: every derived runtime root is the preparation source, and a staging parent nested under the source is refused",

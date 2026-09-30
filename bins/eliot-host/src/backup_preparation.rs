@@ -86,14 +86,71 @@
 //! 2. `prepare_isolated_destination` must take that authority, and
 //!    `bins/eliot-host/tests/backup_preparation.rs` must move with it.
 //! 3. `HostComposition::dispatch_backup_owner_operation`'s
-//!    `BackupDispatchTarget::Prepare` arm (`lib.rs`) still returns a permanent
-//!    pre-effect refusal, and it cannot be lifted by this module alone: the
-//!    admitted `#954` body `BackupIsolatedRestorePrepare`
-//!    (`crates/foundation/eliot-protocol/src/backup.rs`) carries no
-//!    `staging_parent`, `class`, `target_build`, `target_profile`,
-//!    `build_digests`, `operation_id`, `authority_generation` or `state_fence`,
-//!    so no [`PresentedPreparationRequest`] can be built from an admitted
-//!    envelope without inventing every one of those values.
+//!    `BackupDispatchTarget::Prepare` arm (`lib.rs`) is LIVE and reachable
+//!    (`HostBackupDispatchOwner::dispatch_backup_operation` →
+//!    `HostBackupDispatchQueue::submit` → that method) but returns a
+//!    pre-effect refusal, and it cannot be lifted from `lib.rs` alone.
+//!
+//!    The arm needs a [`PresentedPreparationRequest`]. Its thirteen fields
+//!    divide cleanly, and the division was measured field by field against the
+//!    admitted envelope rather than asserted:
+//!
+//!    * TWELVE are readable, from the envelope or from owner evidence this
+//!      module already inspects, so none of them is a reason to refuse:
+//!      `operation_id` is the admitted authenticated `request_id` the sibling
+//!      `Reconcile` arm already uses as the operation identity
+//!      (`BackupRuntimeControlRequest::request_id`); `authority_nonce` is its
+//!      `nonce`; `class` and the state fence are carried by
+//!      `BackupRequestIdentity` (`crates/foundation/eliot-protocol/src/backup.rs`);
+//!      `source_installation_id` is the identity's own source installation,
+//!      which [`BackupCallerAuth::authenticate_for_owner`] proves against this
+//!      composition's owner-issued launch installation; `target_build`,
+//!      `target_profile` and `build_digests` are the owner-issued
+//!      [`ApprovedBuildBinding::generation_handle`],
+//!      [`ApprovedBuildBinding::approved_profile`] and
+//!      [`ApprovedBuildBinding::artifact_digests`] read by
+//!      `DelegatedPreparation::prepare` itself;
+//!      and `approved_generation` is [`OwnerEvidence::authority_generation`],
+//!      taken from the committed `ActivationCommitFence`. The last three —
+//!      `owner_lease_ref`, `purge_ledger_revision` and `audit_fence_note` —
+//!      need no value: this type's own contract admits the "no claim" position
+//!      for each, and supplies the owner-issued side from
+//!      [`OwnerEvidence::owner_lease_ref`],
+//!      [`OwnerEvidence::owner_purge_ledger_revision`] and
+//!      [`OwnerEvidence::owner_audit_note`] when one is presented.
+//!    * ONE is not: [`PresentedPreparationRequest::staging_parent`] is a
+//!      filesystem `PathBuf`, and the admitted `#954` body
+//!      `BackupIsolatedRestorePrepare` carries no path of any kind — nor does
+//!      `BackupRuntimeControlRequest`, nor the accepted owner-method table
+//!      (`git grep -c path -- crates/kernel/eliot-host-control-endpoint/src/backup.rs`
+//!      is zero). That is deliberate, not an omission: `BackupOwnerOutcome`
+//!      states a produced destination "travels as a bounded immutable handle,
+//!      never as a path, a URL, or an inline body", so widening the body is a
+//!      digest-bound change to a `#954`-frozen interface owned by
+//!      `crates/foundation/eliot-protocol`, not this issue's to make.
+//!
+//!    The same field is also unowned on the filesystem side, so neither
+//!    reading of it is available today:
+//!
+//!    * Every root `RuntimeStateRoots` publishes is
+//!      `installation_root/<suffix>` for the seven `ROOT_SUFFIXES`
+//!      (`crates/kernel/eliot-installation/src/runtime_root_contract.rs`),
+//!      and `installation_root` IS the preparation source, so
+//!      `admit_staging_parent` refuses every one of them.
+//!    * The one owner-declared root outside `installation_root` is
+//!      `RuntimeStateRoots::expected_staging_root()` — `<profile_root>\packages`
+//!      — which is `pub(super)`, has zero `bins/eliot-host` call sites, and is
+//!      the installer's PACKAGE staging root, not I5.13's isolated restore root
+//!      ("restore to isolated root;").
+//!    * The key that names a new installation root is a caller-supplied CLI
+//!      argument of the installer (`bins/eliot/src/main.rs`), not an
+//!      owner-issued allocation, so deriving a destination root from it is
+//!      precisely the "client-supplied arbitrary path" A2 rejects.
+//!
+//!    So the refusal is conditional on one absent retained value, but that
+//!    value has no owner to issue it: it is a missing owner, not a wiring gap.
+//!    A13.7 "Restore occurs in an isolated area" and I5.13 "restore to isolated
+//!    root" both require that area to exist, and neither says who owns it.
 //!
 //! Writing an owner allocation seam in `crates/kernel/eliot-installation` while
 //! none of these can call it would add a public function with no caller, which
