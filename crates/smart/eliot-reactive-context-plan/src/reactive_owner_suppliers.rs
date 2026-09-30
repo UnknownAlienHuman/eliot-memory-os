@@ -40,6 +40,11 @@ pub struct PlanningViewSupply {
     /// Admitted canonical bytes travelling with the closure (re-proved,
     /// never trusted).
     pub admitted_canonical_bytes: Vec<u8>,
+    /// Route identity the packet is now served on, as this owner re-read it.
+    /// This is the observing owner's own declaration, never read back out of
+    /// the retained measurement: that would compare the card's route against a
+    /// copy of itself and could never fire.
+    pub route_id: String,
     /// Verifier contract revision in force per graded dimension, as this
     /// owner re-read it. Empty means this owner declares no verifier
     /// identity, which the measurement owner reports as absent rather than
@@ -221,6 +226,7 @@ impl ReactiveOwnerSupply {
                     view_supply.admitted,
                     view_supply.canonical_bytes,
                     view_supply.admitted_canonical_bytes,
+                    &view_supply.route_id,
                     &view_supply.verifier_rule_revisions,
                 )
                 .map_err(|error| OwnerAssembleError::Refused {

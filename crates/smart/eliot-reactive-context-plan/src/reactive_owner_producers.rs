@@ -53,9 +53,9 @@ use super::input::{ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTarget
 /// is refused here with its exact dimensions named, before any planner input
 /// is released.
 ///
-/// `verifier_rule_revisions` is the observing owner's own recorded verifier
-/// identity per dimension. It is supplied by the caller that re-read the
-/// verifier contracts; nothing is synthesised here, and an empty list means
+/// `route_id` and `verifier_rule_revisions` are the observing owner's own
+/// recorded identities, supplied by whoever re-read the route and the verifier
+/// contracts. Nothing is synthesised here, and an empty verifier list means
 /// this owner declares no verifier identity, which the measurement owner
 /// reports as absent rather than guessing at one.
 ///
@@ -71,6 +71,7 @@ pub fn produce_planning_view(
     admitted: AdmittedContextSet,
     canonical_bytes: Vec<u8>,
     admitted_canonical_bytes: Vec<u8>,
+    route_id: &str,
     verifier_rule_revisions: &[(QualityDimension, ArtifactId)],
 ) -> Result<ContextPlanningView, ReactiveInputError> {
     let view = ContextPlanningView::new(
@@ -80,7 +81,7 @@ pub fn produce_planning_view(
         canonical_bytes,
         admitted_canonical_bytes,
     )?;
-    view.revalidate_against_admitted(&admitted, verifier_rule_revisions)?;
+    view.revalidate_against_admitted(&admitted, route_id, verifier_rule_revisions)?;
     Ok(view)
 }
 

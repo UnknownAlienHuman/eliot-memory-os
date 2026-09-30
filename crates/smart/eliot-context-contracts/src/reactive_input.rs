@@ -519,7 +519,7 @@ impl ContextPlanningView {
     }
 
     /// Re-observe this retained closure against a freshly admitted context set
-    /// and return the delivery readiness that survives the re-observation.
+    /// and return the recorded grades the re-observation invalidated.
     ///
     /// This is the one site that holds both sides of the grade-invalidation
     /// comparison: `self` is the retained view, carrying the recorded card and
@@ -527,7 +527,8 @@ impl ContextPlanningView {
     /// set for the same task. A route, governing-instruction, source, task or
     /// verifier dependency that moved between the two is exactly what the
     /// recorded grade was taken under and no longer holds, so the retained card
-    /// is re-evaluated before the readiness read rather than after it.
+    /// is re-evaluated and the readiness read is taken over the re-observed
+    /// card.
     ///
     /// The re-observation is decided by
     /// [`SerializedContextMeasurement::reevaluate_against`], the measurement
@@ -537,47 +538,52 @@ impl ContextPlanningView {
     /// re-observation that agrees on every reason returns `Ok(None)` and the
     /// retained card is left exactly as it was.
     ///
-    /// `verifier_rule_revisions` is the verifier identity the observing owner
-    /// resolved for the dimensions it declares. It is the caller's own recorded
-    /// declaration — no revision, digest or counter is synthesised here — and an
-    /// empty list simply means that owner declares no verifier identity, which
-    /// the measurement owner reports as absent rather than guessing at one.
+    /// `route_id` and `verifier_rule_revisions` are the observing owner's own
+    /// recorded identities, supplied by whoever re-read the route and the
+    /// verifier contracts. They are NOT taken from the retained measurement:
+    /// reading the route back out of the retained record would compare the
+    /// card's route against a copy of itself and could never fire, which is the
+    /// same self-comparison this rule deliberately refuses elsewhere. Neither
+    /// value is synthesised here, and an empty verifier list means that owner
+    /// declares no verifier identity, which the measurement owner reports as
+    /// absent rather than guessing at one.
     ///
-    /// The returned readiness is the same typed refusal a plain
-    /// [`ContextPlanningView::validate`] produces, so an invalidated grade
-    /// blocks the dependent action with its exact dimensions named instead of
-    /// being reported as a current pass.
+    /// Returns the exact results that were marked, or `None` when the
+    /// re-observation agrees with the card on every reason.
     ///
     /// # Errors
     ///
     /// Returns [`ReactiveInputError::Context`] when the retained closure, the
     /// supplied admitted set, or the re-observation fails its owner validation,
     /// and [`ReactiveInputError::QualityRefused`] when the re-observed card no
-    /// longer carries a current pass for the required dimensions. The retained
-    /// view is never mutated: the re-evaluation runs against a clone, so a
-    /// refused or failing re-observation leaves the retained record intact.
+    /// longer carries a current pass for the dimensions the dependent action
+    /// requires. The retained view is never mutated: the re-evaluation runs
+    /// against a clone, so a refused or failing re-observation leaves the
+    /// retained record intact.
     pub fn revalidate_against_admitted(
         &self,
         admitted: &AdmittedContextSet,
+        route_id: &str,
         verifier_rule_revisions: &[(QualityDimension, eliot_contracts::ArtifactId)],
     ) -> Result<Option<Vec<QualityDimensionResult>>, ReactiveInputError> {
         // The retained closure and the freshly supplied admitted set are both
         // validated by their own owners first, so a re-evaluation never compares
         // two records that have not passed their own validation.
         self.validate()?;
-        admitted
-            .validate()
-            .map_err(ReactiveInputError::Context)?;
+        admitted.validate()?;
         // The current side of the comparison is a measurement carrying the values
-        // this re-observation observes. Every one of them is read from a record:
-        // the route the packet is now served on, the recipe revision the
-        // admitted set was admitted under, the source snapshots it read, and the
-        // task revision on the admitted set's own binding. The retained
-        // measurement's own byte, capacity and serializer fields are carried over
-        // unchanged rather than recomputed, because this re-observation concerns
-        // the recorded owner dependencies and not the rendered bytes.
+        // this re-observation observes. Each one is read from a record that
+        // differs from the graded one: the route the packet is now served on is
+        // this caller's declaration, the governing policy revision and the
+        // source snapshots are the freshly admitted set's, the task revision is
+        // the admitted set's own binding, and the verifier identity is the
+        // observing owner's. The retained measurement's byte, capacity and
+        // serializer fields are carried over unchanged rather than recomputed,
+        // because this re-observation concerns the recorded owner dependencies
+        // and not the rendered bytes, which `ContextPlanningView::validate`
+        // already binds to the view's own canonical digest.
         let observed = SerializedContextMeasurement {
-            route_id: self.view.measurement.route_id.clone(),
+            route_id: route_id.to_owned(),
             recipe_digest: admitted.economy.recipe_digest.clone(),
             sources: admitted
                 .records
@@ -593,9 +599,9 @@ impl ContextPlanningView {
             SerializedContextMeasurement::reevaluate_against(&observed, &mut reobserved)?;
         // The blocking read. A grade the re-observation invalidated is not a
         // current pass, so it blocks here exactly as a failed dimension does,
-        // and the exact dimensions are named instead of a generic error. The
-        // retained card is the one being read, so the readiness reported is the
-        // readiness of the packet as it now stands.
+        // and the exact dimensions are named instead of a generic error. This
+        // is the consumer that makes the producer live: the `invalidation`
+        // handle written above is what turns `is_current_pass` false below.
         reobserved
             .suitability(QualityOperation::DependentAction, &[])
             .map_err(|refusal| ReactiveInputError::QualityRefused {
