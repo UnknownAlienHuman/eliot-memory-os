@@ -1055,15 +1055,13 @@ fn task_controller_stale_attempt(
                 .as_deref()
                 .ok_or(TransportError::SessionFenced)
                 .ok()?
-        || body.attempt.session_id.as_deref()
-            != Some(
-                envelope
-                    .identity
-                    .session_id
-                    .as_deref()
-                    .ok_or(TransportError::SessionFenced)
-                    .ok()?,
-            )
+        || body.attempt.session_id.as_str()
+            != envelope
+                .identity
+                .session_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)
+                .ok()?
         || body.attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
         || body.attempt.state_fence != envelope.state_fence
         || !body
