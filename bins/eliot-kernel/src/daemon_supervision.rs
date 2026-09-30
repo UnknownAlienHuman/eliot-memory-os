@@ -264,14 +264,9 @@ pub(crate) fn daemon_class_withholds_replacement(
         return Some(DaemonRestartRefusal::PolicyNotAdmitted);
     };
     let (identity, failure) = daemon_restart_evidence(previous_status, view);
-    let decision = match decide_automatic_restart(
-        policy,
-        daemon_owner_restart_lifecycle(owner_state),
-        identity,
-        failure,
-    ) {
-        Ok(decision) => decision,
-        Err(_) => return Some(DaemonRestartRefusal::PolicyRejected),
+    let lifecycle = daemon_owner_restart_lifecycle(owner_state);
+    let Ok(decision) = decide_automatic_restart(policy, lifecycle, identity, failure) else {
+        return Some(DaemonRestartRefusal::PolicyRejected);
     };
     if decision == AutomaticRestartDecision::Eligible {
         return None;
