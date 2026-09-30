@@ -17,12 +17,12 @@ use eliot_ors::{
     OperationalRecordInput, OperationalRecoveryStore, StateFenceSnapshot,
 };
 use eliot_process::{
-    DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority, DispatchValidationContext,
-    KernelDispatchKey, OriginChallenge, OriginChallengeAuthority, OriginChallengeReplayEntry,
-    OriginChallengeRequest, OriginControlGrant, OriginControlPresentation,
-    OriginGrantEffectOutcome, PermitIssuance, ProcessExecutionAdmissionRequest, ProcessIntent,
-    ProcessOwnerBinding, ProcessRequest, ProcessStartReceipt, RecoveryCapability,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    CancellationReceipt, DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority,
+    DispatchValidationContext, KernelDispatchKey, OriginChallenge, OriginChallengeAuthority,
+    OriginChallengeReplayEntry, OriginChallengeRequest, OriginControlGrant,
+    OriginControlPresentation, OriginGrantEffectOutcome, PermitIssuance,
+    ProcessExecutionAdmissionRequest, ProcessIntent, ProcessOwnerBinding, ProcessRequest,
+    ProcessStartReceipt, RecoveryCapability, SuspendedProcessIdentity, ValidatedDispatch,
 };
 
 pub use crate::authority_snapshot::{
@@ -257,7 +257,7 @@ impl ProcessDispatchAuthorityController {
         let challenge = self
             .origin_authority
             .issue(request, issued_at_unix_ms, expires_at_unix_ms)
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+            .map_err(KernelError::ProcessContract)?;
         self.persist_snapshot(binding)?;
         Ok(challenge)
     }
@@ -292,7 +292,7 @@ impl ProcessDispatchAuthorityController {
                         challenge_id = presentation.challenge().challenge_id()
                     ))
                 } else {
-                    KernelError::DependencyUnavailable(error.to_string())
+                    KernelError::ProcessContract(error)
                 }
             })?;
         self.persist_snapshot(binding)?;
@@ -303,23 +303,25 @@ impl ProcessDispatchAuthorityController {
     /// funded, through the same durable ORS journal as issuance and
     /// consumption (issue #1775 W6).
     ///
-    /// The effect boundary calls this with the consumed one-shot nonce after
-    /// it observes the effect receipt. The journal then keeps the consumed
-    /// authority plus its proven effect through crash or lost response, so
-    /// reconciliation reads [`Self::origin_grant_effect_state`] instead of
-    /// minting a fresh nonce to repeat an unknown effect. A persistence
-    /// failure fences the controller through the shared [`Self::persist_snapshot`]
-    /// path, exactly like a failed issuance or consumption persist.
+    /// The effect boundary calls this with the consumed one-shot nonce and
+    /// the exact kill receipt the executor observed. The journal then keeps
+    /// the consumed authority plus its proven effect through crash or lost
+    /// response, so reconciliation replays the preserved original through
+    /// [`Self::origin_grant_effect_receipt`] instead of minting a fresh
+    /// nonce to repeat an unknown effect. A persistence failure fences the
+    /// controller through the shared [`Self::persist_snapshot`] path,
+    /// exactly like a failed issuance or consumption persist.
     pub fn record_origin_grant_effect(
         &mut self,
         request_nonce: &str,
+        receipt: &CancellationReceipt,
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<OriginGrantEffectOutcome> {
         self.ensure_operational(binding)?;
         let outcome = self
             .origin_authority
-            .record_grant_effect(request_nonce)
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+            .record_grant_effect(request_nonce, receipt)
+            .map_err(KernelError::ProcessContract)?;
         self.persist_snapshot(binding)?;
         Ok(outcome)
     }
@@ -338,7 +340,25 @@ impl ProcessDispatchAuthorityController {
         self.ensure_binding(binding)?;
         self.origin_authority
             .grant_effect_outcome(request_nonce)
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))
+            .map_err(KernelError::ProcessContract)
+    }
+
+    /// Returns the preserved original kill receipt for one `Effected` entry
+    /// without touching authority state (issue #1775 A-crash).
+    ///
+    /// The exact-replay half of [`Self::record_origin_grant_effect`]: a
+    /// proven effect replays this preserved original instead of re-executing
+    /// or reading live executor evidence. `Unknown` and never-decided nonces
+    /// fail with the existing typed nonce failures.
+    pub fn origin_grant_effect_receipt(
+        &self,
+        request_nonce: &str,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<CancellationReceipt> {
+        self.ensure_binding(binding)?;
+        self.origin_authority
+            .grant_effect_receipt(request_nonce)
+            .map_err(KernelError::ProcessContract)
     }
 
     /// Reads the original admitted target/operation for one decided origin
@@ -358,7 +378,7 @@ impl ProcessDispatchAuthorityController {
         self.ensure_binding(binding)?;
         self.origin_authority
             .grant_reconciliation_source(request_nonce)
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))
+            .map_err(KernelError::ProcessContract)
     }
 
     /// Issues one permit and durably journals its replay state.
@@ -476,9 +496,7 @@ impl ProcessDispatchAuthorityController {
         request: &OriginChallengeRequest,
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<()> {
-        request
-            .validate()
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+        request.validate().map_err(KernelError::ProcessContract)?;
         binding
             .state_fence()
             .validate_against_epoch(&request.state_fence().authority_epoch)

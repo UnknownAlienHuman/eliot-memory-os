@@ -37,7 +37,7 @@
 
 use eliot_contracts::{StateFence, sha256_hex};
 pub use eliot_process::{
-    Generation, OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest,
+    Generation, OperationId, OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest,
     OriginControlGrant, OriginControlOperation, OriginControlPresentation, PhysicalProcessBinding,
 };
 use serde::{Deserialize, Serialize};
@@ -422,11 +422,12 @@ pub fn gate_process_control(
 ///
 /// The daemon-side consumer invoked by central Governor code. Binds the
 /// validated Governor observation to the exact OS physical identity
-/// ([`PhysicalProcessBinding`]: pid plus process start identity plus image)
-/// and the admitted installation identity under the evidence fence, for one
-/// control operation class. Checks completeness only: the operation must be
-/// forwardable, the evidence well-formed, and the physical identity,
-/// installation, fence generation, and nonce well-shaped. Issuance, match,
+/// ([`PhysicalProcessBinding`]: pid plus process start identity plus image),
+/// the admitted installation identity, and the exact operation the control
+/// will act on under the evidence fence, for one control operation class.
+/// Checks completeness only: the operation must be forwardable, the
+/// evidence well-formed, and the physical identity, installation, fence
+/// generation, operation identity, and nonce well-shaped. Issuance, match,
 /// currency, revocation, and the live epoch are NOT checked here; they are
 /// evaluated exclusively by the Kernel-owned
 /// [`OriginChallengeAuthority::issue`] and [`OriginChallengeAuthority::decide`].
@@ -441,6 +442,7 @@ pub fn request_origin_control(
     installation_id: &str,
     operation: ProcessControlOperation,
     request_nonce: &str,
+    operation_id: OperationId,
 ) -> Result<OriginChallengeRequest, ProcessOriginError> {
     if !operation.is_forwardable() {
         return Err(ProcessOriginError::ObserveOnly);
@@ -455,6 +457,7 @@ pub fn request_origin_control(
         evidence.state_fence.clone(),
         OriginControlOperation::try_from(operation)?,
         request_nonce.to_owned(),
+        operation_id,
     )
     .map_err(ProcessOriginError::from)
 }
@@ -577,6 +580,7 @@ mod tests {
             "installation-7",
             ProcessControlOperation::Kill,
             "nonce-0001",
+            OperationId::new("operation-0001").expect("operation"),
         )
         .expect("complete evidence packages");
         assert_eq!(request.origin_digest(), observed.origin_digest);
@@ -591,6 +595,7 @@ mod tests {
                 "installation-7",
                 ProcessControlOperation::ReadStatus,
                 "nonce-0002",
+                OperationId::new("operation-0002").expect("operation"),
             ),
             Err(ProcessOriginError::ObserveOnly)
         ));
@@ -601,6 +606,7 @@ mod tests {
                 "installation-7",
                 ProcessControlOperation::ProbeObserve,
                 "nonce-0003",
+                OperationId::new("operation-0003").expect("operation"),
             ),
             Err(ProcessOriginError::ObserveOnly)
         ));
@@ -614,6 +620,7 @@ mod tests {
                 "installation-7",
                 ProcessControlOperation::Kill,
                 "nonce-0004",
+                OperationId::new("operation-0004").expect("operation"),
             ),
             Err(ProcessOriginError::Contract(_))
         ));
@@ -624,6 +631,7 @@ mod tests {
                 "",
                 ProcessControlOperation::Kill,
                 "nonce-0005",
+                OperationId::new("operation-0005").expect("operation"),
             ),
             Err(ProcessOriginError::Contract(_))
         ));
@@ -640,6 +648,7 @@ mod tests {
             "installation-7",
             ProcessControlOperation::Adopt,
             "nonce-0010",
+            OperationId::new("operation-0010").expect("operation"),
         )
         .expect("complete evidence packages");
         let challenge = authority
@@ -665,6 +674,7 @@ mod tests {
             "installation-7",
             ProcessControlOperation::Kill,
             "nonce-0020",
+            OperationId::new("operation-0020").expect("operation"),
         )
         .expect("complete evidence packages");
         let challenge = authority
@@ -678,6 +688,7 @@ mod tests {
             "installation-7",
             ProcessControlOperation::Adopt,
             "nonce-0021",
+            OperationId::new("operation-0021").expect("operation"),
         )
         .expect("adopt packages separately");
         let _ = adopt;
@@ -689,6 +700,7 @@ mod tests {
             fence.clone(),
             OriginControlOperation::Adopt,
             "nonce-0020",
+            OperationId::new("operation-0022").expect("operation"),
         );
         // Same nonce shape but different class cannot reseal the kill mint.
         assert!(mismatched.is_ok());
@@ -712,6 +724,7 @@ mod tests {
             "installation-7",
             ProcessControlOperation::Mutate,
             "nonce-0030",
+            OperationId::new("operation-0030").expect("operation"),
         )
         .expect("complete evidence packages");
         let challenge = other
@@ -741,6 +754,7 @@ mod tests {
                 "installation-7",
                 ProcessControlOperation::ReadStatus,
                 "nonce-0040",
+                OperationId::new("operation-0040").expect("operation"),
             ),
             Err(ProcessOriginError::ObserveOnly)
         ));
@@ -751,6 +765,7 @@ mod tests {
                 "installation-7",
                 ProcessControlOperation::ProbeObserve,
                 "nonce-0041",
+                OperationId::new("operation-0041").expect("operation"),
             ),
             Err(ProcessOriginError::ObserveOnly)
         ));

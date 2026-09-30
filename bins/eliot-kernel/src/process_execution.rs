@@ -1459,6 +1459,14 @@ impl ProcessExecutionGateway {
                 eliot_process::ContractError::ExpiredDispatchPermit,
             ));
         }
+        // The installation in the request is caller packaging until it is
+        // proven against the Kernel-retained composition identity here, so
+        // a foreign installation fails before any challenge is minted.
+        if request.installation_id() != live_origin_installation_id()? {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::IdentityMismatch,
+            ));
+        }
         self.controller
             .lock()
             .map_err(|_| {
@@ -1470,20 +1478,63 @@ impl ProcessExecutionGateway {
                 expires_at_unix_ms,
                 &self.snapshot_binding,
             )
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+            .map_err(origin_contract_error)
     }
 
     pub(crate) fn decide_origin_control(
         &self,
         presentation: &OriginControlPresentation,
     ) -> Result<OriginControlGrant, ProcessExecutionError> {
+        // Same anchor as issuance: the decided installation must still be
+        // the Kernel-retained one, not merely the value the caller packaged.
+        if presentation.request().installation_id() != live_origin_installation_id()? {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::IdentityMismatch,
+            ));
+        }
         self.controller
             .lock()
             .map_err(|_| {
                 ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
             })?
             .decide_origin_control(presentation, super::unix_ms(), &self.snapshot_binding)
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+            .map_err(origin_contract_error)
+    }
+
+    /// Reads the Kernel-retained installation identity for origin control.
+    ///
+    /// The anchor is the existing set-once dispatch contour cell
+    /// `compose_dispatch_contour` fills from the authenticated Host startup
+    /// binding — the same identity `require_setup_admission` and the restore
+    /// journal already compare against — never a request, config, or fixture
+    /// value. An uncomposed Kernel has no installation identity at all and
+    /// refuses; it is never defaulted to a placeholder.
+    fn live_origin_installation_id() -> Result<&'static str, ProcessExecutionError> {
+        let installation = super::dispatch_contour()
+            .map(|contour| contour.installation_id())
+            .unwrap_or("");
+        if installation.trim().is_empty() {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::IdentityMismatch,
+            ));
+        }
+        Ok(installation)
+    }
+
+    /// Preserves typed P-03 contract failures across the controller seam.
+    ///
+    /// The authority journal speaks in matchable `ContractError`s — consumed
+    /// vs. unknown nonces, binding mismatches, unproven effects — and this
+    /// boundary must keep them matchable instead of flattening them into
+    /// `Unavailable` strings. Only non-contract Kernel failures (fenced
+    /// authority, persistence loss, lock poisoning) stay `Unavailable`.
+    fn origin_contract_error(error: eliot_kernel_core::KernelError) -> ProcessExecutionError {
+        match error {
+            eliot_kernel_core::KernelError::ProcessContract(contract) => {
+                ProcessExecutionError::Contract(contract)
+            }
+            error => ProcessExecutionError::Unavailable(error.to_string()),
+        }
     }
 
     /// Reads the durable one-shot effect outcome for a decided origin grant.
@@ -1501,22 +1552,44 @@ impl ProcessExecutionGateway {
                 ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
             })?
             .origin_grant_effect_state(request_nonce, &self.snapshot_binding)
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+            .map_err(origin_contract_error)
     }
 
     /// Durably records the observed effect of a decided origin grant.
     ///
-    /// Called after the executor observes the kill receipt. A failed record
-    /// fails the call: a failed snapshot can never report a clean success.
-    fn record_origin_grant_effect(&self, request_nonce: &str) -> Result<(), ProcessExecutionError> {
+    /// Called with the exact kill receipt after the executor observes it. A
+    /// failed record fails the call: a failed snapshot can never report a
+    /// clean success.
+    fn record_origin_grant_effect(
+        &self,
+        request_nonce: &str,
+        receipt: &eliot_process::CancellationReceipt,
+    ) -> Result<(), ProcessExecutionError> {
         self.controller
             .lock()
             .map_err(|_| {
                 ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
             })?
-            .record_origin_grant_effect(request_nonce, &self.snapshot_binding)
+            .record_origin_grant_effect(request_nonce, receipt, &self.snapshot_binding)
             .map(|_| ())
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+            .map_err(origin_contract_error)
+    }
+
+    /// Replays the preserved original kill receipt for a proven grant effect.
+    ///
+    /// Exact-result replay: the caller gets the original receipt the effect
+    /// boundary observed, never a re-execution and never live evidence.
+    fn origin_grant_effect_receipt(
+        &self,
+        request_nonce: &str,
+    ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
+        self.controller
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
+            })?
+            .origin_grant_effect_receipt(request_nonce, &self.snapshot_binding)
+            .map_err(origin_contract_error)
     }
 
     /// Reconciles one grant-funded effect after crash or lost response
@@ -1524,20 +1597,24 @@ impl ProcessExecutionGateway {
     ///
     /// The reconciliation query path: the presented owner is authorized
     /// against the retained operation record first — a changed connection
-    /// owner fails here before any read — then the original admitted
+    /// owner fails here before any journal read — then the original admitted
     /// target/operation for the consumed one-shot nonce is read through the
-    /// durable authority journal. A grant decided for another operation class
-    /// cannot reconcile this operation. An unproven (`Unknown`) effect
-    /// returns reconciliation-required instead of re-executing or minting a
-    /// fresh nonce; a separately admitted new proof for a proven remaining
-    /// action goes through the normal decide path. A proven (`Effected`)
-    /// effect takes the exact-replay path for the original operation.
+    /// durable authority journal. The presented operation must equal the
+    /// operation the grant was decided for, the journaled installation must
+    /// still be the live Kernel installation, and a grant decided for
+    /// another operation class cannot reconcile this operation. An unproven
+    /// (`Unknown`) effect returns reconciliation-required instead of
+    /// re-executing or minting a fresh nonce; a separately admitted new
+    /// proof for a proven remaining action goes through the normal decide
+    /// path. A proven (`Effected`) effect replays the preserved original
+    /// kill receipt for the original operation — never a re-execution and
+    /// never live executor evidence.
     pub(crate) async fn reconcile_origin_grant_effect(
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
         request_nonce: &str,
-    ) -> Result<eliot_process::ProcessEvidence, ProcessExecutionError> {
+    ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
         observe_process("kernel.process.grant_reconcile_requested", "attempt");
         if let Err(error) = self.authorize_operation(owner, &operation_id) {
             observe_process("kernel.process.grant_reconcile_rejected", "fenced");
@@ -1551,7 +1628,19 @@ impl ProcessExecutionGateway {
                 ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
             })?
             .origin_grant_reconciliation_source(request_nonce, &self.snapshot_binding)
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+            .map_err(origin_contract_error)?;
+        if source.operation_id() != &operation_id {
+            observe_process("kernel.process.grant_reconcile_rejected", "fenced");
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ));
+        }
+        if source.installation_id() != live_origin_installation_id()? {
+            observe_process("kernel.process.grant_reconcile_rejected", "fenced");
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::IdentityMismatch,
+            ));
+        }
         if source.operation() != OriginControlOperation::Kill {
             observe_process("kernel.process.grant_reconcile_rejected", "fenced");
             return Err(ProcessExecutionError::Contract(
@@ -1565,7 +1654,9 @@ impl ProcessExecutionGateway {
             ));
             return Err(ProcessExecutionError::UnknownOutcome);
         }
-        self.reconcile(owner, operation_id).await
+        let receipt = self.origin_grant_effect_receipt(request_nonce)?;
+        observe_process("kernel.process.grant_reconcile_replayed", "success");
+        Ok(receipt)
     }
 
     #[cfg(windows)]
@@ -2090,15 +2181,27 @@ impl ProcessExecutionGateway {
         }
         // Issue #1775 W6: one-shot effect journal. The durable journal keeps
         // the consumed one-shot plus its possible-effect state, so a grant
-        // that already funded an observed effect answers
-        // reconciliation-required instead of executing twice, and an
-        // unproven effect never mints a fresh nonce. The unreadable-journal
-        // case fails closed before the effect, never around it.
+        // that already funded an observed effect replays the preserved
+        // original receipt instead of executing twice, and an unproven
+        // effect never mints a fresh nonce. The unreadable-journal case
+        // fails closed before the effect, never around it. The presented
+        // operation must equal the operation the grant was decided for
+        // before any journal read or effect.
         if let Some(granted) = grant {
+            if let Err(error) = granted
+                .binds_operation(&operation_id)
+                .map_err(ProcessExecutionError::Contract)
+            {
+                observe_process("kernel.process.cancel_rejected", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                return Err(error);
+            }
             match self.origin_grant_effect_state(granted.request_nonce()) {
                 Ok(OriginGrantEffectOutcome::Effected) => {
                     observe_process("kernel.process.cancel_replayed", "unknown");
-                    return Err(ProcessExecutionError::UnknownOutcome);
+                    let receipt = self.origin_grant_effect_receipt(granted.request_nonce())?;
+                    observe_process("kernel.process.cancel_acknowledged", "success");
+                    return Ok(receipt);
                 }
                 Ok(OriginGrantEffectOutcome::Unknown) => {}
                 Err(error) => {
@@ -2112,11 +2215,14 @@ impl ProcessExecutionGateway {
         }
         match self.executor.cancel(operation_id.clone()).await {
             Ok(receipt) => {
-                // The receipt is observed: journal the proven effect before
-                // reporting success. A failed journal cannot report a clean
-                // success; the receipt stays re-derivable through reconcile.
+                // The receipt is observed: journal the proven effect with
+                // its preserved original before reporting success. A failed
+                // journal cannot report a clean success; the receipt stays
+                // re-derivable through reconcile.
                 if let Some(granted) = grant {
-                    if let Err(error) = self.record_origin_grant_effect(granted.request_nonce()) {
+                    if let Err(error) =
+                        self.record_origin_grant_effect(granted.request_nonce(), &receipt)
+                    {
                         observe_process("kernel.process.cancel_unrecorded", "unknown");
                         super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
                             &error,
@@ -2311,7 +2417,10 @@ impl ProcessExecutionGateway {
     /// challenge window has expired, or whose admitted fence no longer
     /// matches the live epoch lineage and sequence, fails before the
     /// privileged effect even when it still names the right operation and
-    /// target.
+    /// target. The installation the grant binds is rechecked against the
+    /// same Kernel-retained composition identity issuance and decide proved,
+    /// so a grant minted under a foreign installation fails here even when
+    /// every other leg still looks live.
     fn authorize_effect_with_grant(
         &self,
         owner: &ProcessOwnerBinding,
@@ -2347,7 +2456,13 @@ impl ProcessExecutionGateway {
                 live_epoch.epoch,
                 super::unix_ms(),
             )
-            .map_err(ProcessExecutionError::Contract)
+            .map_err(ProcessExecutionError::Contract)?;
+        if grant.installation_id() != live_origin_installation_id()? {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::IdentityMismatch,
+            ));
+        }
+        Ok(())
     }
 }
 
