@@ -40,10 +40,10 @@ use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier, DirectoryPublicationReceipt,
     FileIdentity, OwnedDirectoryPublication, PackageFileSpec, PackageManifest, PeCoffEvidence,
-    TrustedSourceBundle, UserOwnedPathLease, UserOwnedRootLease, WindowsAuthenticodeVerifier,
-    canonical_windows_path, delete_owned_file_handle, file_identity_for_open_handle,
-    open_no_follow_directory, open_no_follow_file, validate_package_relative_path,
-    windows_paths_equal,
+    RetainedDirectoryContour, TrustedSourceBundle, UserOwnedPathLease, UserOwnedRootLease,
+    WindowsAuthenticodeVerifier, canonical_windows_path, delete_owned_file_handle,
+    file_identity_for_open_handle, open_no_follow_directory, open_no_follow_file,
+    validate_package_relative_path, windows_paths_equal,
 };
 
 const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
@@ -849,7 +849,7 @@ impl RedbInstallationTransactionStore {
                 reason: "begin accepts only an Intent journal".to_owned(),
             });
         }
-        require_existing_parent(path)?;
+        let _parent_contour = retain_transaction_path_parent(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
                 let store = Self::open_existing_exact_path(path)?;
@@ -1013,7 +1013,7 @@ impl RedbInstallationTransactionStore {
     #[cfg(test)]
     pub(crate) fn create_at_exact_path(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
         let path = path.as_ref();
-        require_existing_parent(path)?;
+        let _parent_contour = retain_transaction_path_parent(path)?;
         match fs::symlink_metadata(path) {
             Ok(_) => return Err(existing_path_error()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1087,7 +1087,7 @@ impl RedbInstallationTransactionStore {
             });
         }
         let path = path.as_ref();
-        require_existing_parent(path)?;
+        let _parent_contour = retain_transaction_path_parent(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
                 let store = Self::open_existing_exact_path(path)?;
@@ -1109,6 +1109,7 @@ impl RedbInstallationTransactionStore {
         }
 
         let mut publication = PendingTransactionStorePublication::reserve(path)?;
+        let published_path = publication.destination.clone();
         let temporary = publication.temporary().to_owned();
         let database = Database::create(&temporary)
             .map_err(|error| InstallationError::Platform(format!("temporary create: {error}")))?;
@@ -1127,31 +1128,50 @@ impl RedbInstallationTransactionStore {
             .map_err(|error| InstallationError::Platform(format!("temporary sync: {error}")))?;
         publication.retain_written_temporary()?;
         publication
-            .publish(path, transaction)
+            .publish(transaction)
             .map_err(|error| match error {
                 InstallationError::Platform(reason) => {
                     InstallationError::Platform(format!("publish: {reason}"))
                 }
                 other => other,
             })?;
-        let reopened = Self::open_existing_exact_path(path).map_err(|error| match error {
-            InstallationError::Platform(reason) => {
-                InstallationError::Platform(format!("published reopen: {reason}"))
-            }
-            other => other,
-        })?;
+        let reopened =
+            Self::open_existing_exact_path(&published_path).map_err(|error| match error {
+                InstallationError::Platform(reason) => {
+                    InstallationError::Platform(format!("published reopen: {reason}"))
+                }
+                other => other,
+            })?;
         Ok(reopened)
     }
 
     /// Opens an existing regular database file without creating any path.
     pub fn open_existing_exact_path(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
         let path = path.as_ref();
-        require_existing_parent(path)?;
-        let metadata =
-            std::fs::symlink_metadata(path).map_err(|error| InstallationError::InvalidField {
+        #[cfg(windows)]
+        let parent = retain_transaction_path_parent(path)?;
+        #[cfg(not(windows))]
+        let _parent_contour = retain_transaction_path_parent(path)?;
+        #[cfg(windows)]
+        verify_transaction_parent(&parent)?;
+        #[cfg(windows)]
+        let exact_path = parent
+            .canonical_path()
+            .join(
+                path.file_name()
+                    .ok_or_else(|| InstallationError::InvalidField {
+                        field: "transaction_store.path".to_owned(),
+                        reason: "path must name a file".to_owned(),
+                    })?,
+            );
+        #[cfg(not(windows))]
+        let exact_path = path.to_path_buf();
+        let metadata = std::fs::symlink_metadata(&exact_path).map_err(|error| {
+            InstallationError::InvalidField {
                 field: "transaction_store.path".to_owned(),
                 reason: format!("existing regular file required: {error}"),
-            })?;
+            }
+        })?;
         if !metadata.is_file() {
             return Err(InstallationError::InvalidField {
                 field: "transaction_store.path".to_owned(),
@@ -1159,15 +1179,8 @@ impl RedbInstallationTransactionStore {
             });
         }
         #[cfg(windows)]
-        let parent = retain_transaction_directory(path.parent().ok_or_else(|| {
-            InstallationError::InvalidField {
-                field: "transaction_store.path".to_owned(),
-                reason: "path must have a parent".to_owned(),
-            }
-        })?)?;
-        #[cfg(windows)]
         let (identity, file) =
-            open_no_follow_file(path).map_err(|error| InstallationError::InvalidField {
+            open_no_follow_file(&exact_path).map_err(|error| InstallationError::InvalidField {
                 field: "transaction_store.path".to_owned(),
                 reason: format!("existing regular non-reparse file required: {error}"),
             })?;
@@ -1175,7 +1188,7 @@ impl RedbInstallationTransactionStore {
         let expected_identity = identity;
         #[cfg(windows)]
         verify_transaction_parent(&parent)?;
-        let database = ReadOnlyDatabase::open(path)
+        let database = ReadOnlyDatabase::open(&exact_path)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         drop(database);
         #[cfg(windows)]
@@ -1189,6 +1202,7 @@ impl RedbInstallationTransactionStore {
             if readback_identity != expected_identity {
                 return Err(InstallationError::IdentityConflict);
             }
+            verify_transaction_parent(&parent)?;
         }
         #[cfg(windows)]
         let file = RetainedTransactionFile {
@@ -1196,7 +1210,7 @@ impl RedbInstallationTransactionStore {
             file,
         };
         Ok(Self {
-            path: path.to_path_buf(),
+            path: exact_path,
             #[cfg(windows)]
             parent,
             #[cfg(windows)]
@@ -1978,6 +1992,7 @@ fn decode_initial_snapshot(bytes: &[u8]) -> Result<SignedInitialConfigSnapshot, 
 }
 
 struct PendingTransactionStorePublication {
+    destination: PathBuf,
     temporary: PathBuf,
     #[cfg(windows)]
     parent: RetainedTransactionDirectory,
@@ -1986,10 +2001,7 @@ struct PendingTransactionStorePublication {
 }
 
 #[cfg(windows)]
-struct RetainedTransactionDirectory {
-    identity: FileIdentity,
-    file: File,
-}
+type RetainedTransactionDirectory = RetainedDirectoryContour;
 
 #[cfg(windows)]
 struct RetainedTransactionFile {
@@ -1999,7 +2011,7 @@ struct RetainedTransactionFile {
 
 impl PendingTransactionStorePublication {
     fn reserve(destination: &Path) -> Result<Self, InstallationError> {
-        let directory = destination
+        let requested_directory = destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| InstallationError::InvalidField {
@@ -2007,13 +2019,18 @@ impl PendingTransactionStorePublication {
                 reason: "exact path must name a file".to_owned(),
             })?;
         #[cfg(windows)]
-        let parent = retain_transaction_directory(directory)?;
+        let parent = retain_transaction_directory(requested_directory)?;
+        #[cfg(windows)]
+        let directory = parent.canonical_path().to_path_buf();
+        #[cfg(not(windows))]
+        let directory = requested_directory.to_path_buf();
         let file_name = destination
             .file_name()
             .ok_or_else(|| InstallationError::InvalidField {
                 field: "transaction_store.path".to_owned(),
                 reason: "exact path must name a file".to_owned(),
             })?;
+        let destination = directory.join(file_name);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
@@ -2026,6 +2043,8 @@ impl PendingTransactionStorePublication {
                 std::process::id()
             ));
             let temporary = directory.join(temporary_name);
+            #[cfg(windows)]
+            verify_transaction_parent(&parent)?;
             #[cfg(windows)]
             let result = eliot_platform_windows::create_no_follow_file_for_delete(&temporary)
                 .map_err(|error| InstallationError::Platform(error.to_string()));
@@ -2046,7 +2065,10 @@ impl PendingTransactionStorePublication {
                 .map_err(|error| InstallationError::Platform(error.to_string()));
             match result {
                 Ok((identity, file)) => {
+                    #[cfg(windows)]
+                    verify_transaction_parent(&parent)?;
                     return Ok(Self {
+                        destination,
                         temporary: temporary.clone(),
                         #[cfg(windows)]
                         parent,
@@ -2084,11 +2106,7 @@ impl PendingTransactionStorePublication {
         Ok(())
     }
 
-    fn publish(
-        mut self,
-        destination: &Path,
-        transaction: &InstallationTransaction,
-    ) -> Result<(), InstallationError> {
+    fn publish(mut self, transaction: &InstallationTransaction) -> Result<(), InstallationError> {
         #[cfg(windows)]
         {
             verify_transaction_parent(&self.parent)?;
@@ -2100,14 +2118,17 @@ impl PendingTransactionStorePublication {
                     })?;
             verify_retained_transaction_file(retained)?;
         }
-        match fs::hard_link(&self.temporary, destination) {
+        match fs::hard_link(&self.temporary, &self.destination) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(existing_path_error());
             }
             Err(error) => return Err(InstallationError::Platform(error.to_string())),
         }
-        let directory = destination
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
+        let directory = self
+            .destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| InstallationError::InvalidField {
@@ -2119,6 +2140,8 @@ impl PendingTransactionStorePublication {
                 stage: InstallationStage::Planned,
             });
         }
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
         let expected_bytes = encode(transaction)?;
         #[cfg(windows)]
         let expected_identity = self
@@ -2129,7 +2152,7 @@ impl PendingTransactionStorePublication {
             })?
             .identity;
         verify_published_transaction(
-            destination,
+            &self.destination,
             &transaction.transaction_id,
             &expected_bytes,
             #[cfg(windows)]
@@ -2139,6 +2162,7 @@ impl PendingTransactionStorePublication {
         )?;
         #[cfg(windows)]
         {
+            verify_transaction_parent(&self.parent)?;
             let retained = self
                 .temporary_file
                 .take()
@@ -2150,6 +2174,7 @@ impl PendingTransactionStorePublication {
                     stage: InstallationStage::Planned,
                 });
             }
+            verify_transaction_parent(&self.parent)?;
         }
         sync_parent_directory(directory).map_err(|_| InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
@@ -2158,7 +2183,6 @@ impl PendingTransactionStorePublication {
 
     fn publish_publication_journal(
         mut self,
-        destination: &Path,
         journal: &SourceBundlePublicationJournal,
         fault: PublicationJournalStoreFault,
     ) -> Result<(), InstallationError> {
@@ -2175,14 +2199,17 @@ impl PendingTransactionStorePublication {
                     })?;
             verify_retained_transaction_file(retained)?;
         }
-        match fs::hard_link(&self.temporary, destination) {
+        match fs::hard_link(&self.temporary, &self.destination) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(existing_path_error());
             }
             Err(error) => return Err(InstallationError::Platform(error.to_string())),
         }
-        let directory = destination
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
+        let directory = self
+            .destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| InstallationError::InvalidField {
@@ -2193,6 +2220,8 @@ impl PendingTransactionStorePublication {
             stage: InstallationStage::Planned,
         })?;
         #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
+        #[cfg(windows)]
         let expected_identity = self
             .temporary_file
             .as_ref()
@@ -2202,6 +2231,7 @@ impl PendingTransactionStorePublication {
             .identity;
         #[cfg(windows)]
         {
+            verify_transaction_parent(&self.parent)?;
             let retained = self
                 .temporary_file
                 .take()
@@ -2213,18 +2243,23 @@ impl PendingTransactionStorePublication {
                     stage: InstallationStage::Planned,
                 });
             }
+            verify_transaction_parent(&self.parent)?;
         }
         sync_parent_directory(directory).map_err(|_| InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
         })?;
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
         verify_published_publication_journal(
-            destination,
+            &self.destination,
             journal,
             #[cfg(windows)]
             Some(expected_identity),
             #[cfg(not(windows))]
             None,
         )?;
+        #[cfg(windows)]
+        verify_transaction_parent(&self.parent)?;
         #[cfg(test)]
         if fault == PublicationJournalStoreFault::AfterFinalPublishBeforeResponse {
             return Err(injected_publication_store_fault(
@@ -2241,6 +2276,7 @@ fn begin_new_source_bundle_publication_store(
     fault: PublicationJournalStoreFault,
 ) -> Result<SourceBundlePublicationJournal, InstallationError> {
     let mut publication = PendingTransactionStorePublication::reserve(destination)?;
+    let published_path = publication.destination.clone();
     #[cfg(test)]
     if fault == PublicationJournalStoreFault::AfterTemporaryCreateBeforeInsert {
         return Err(injected_publication_store_fault(
@@ -2300,8 +2336,8 @@ fn begin_new_source_bundle_publication_store(
             "after journal commit before final publication",
         ));
     }
-    publication.publish_publication_journal(destination, journal, fault)?;
-    let store = RedbInstallationTransactionStore::open_existing_exact_path(destination)?;
+    publication.publish_publication_journal(journal, fault)?;
+    let store = RedbInstallationTransactionStore::open_existing_exact_path(&published_path)?;
     let recorded = store
         .load_source_bundle_publication(&journal.operation_id)?
         .ok_or(InstallationError::UnknownOutcome {
@@ -2400,29 +2436,40 @@ impl Drop for PendingTransactionStorePublication {
 fn retain_transaction_directory(
     path: &Path,
 ) -> Result<RetainedTransactionDirectory, InstallationError> {
-    let (identity, file) =
-        open_no_follow_directory(path).map_err(|error| InstallationError::InvalidField {
-            field: "transaction_store.path".to_owned(),
-            reason: format!("existing non-reparse parent directory required: {error}"),
-        })?;
-    Ok(RetainedTransactionDirectory { identity, file })
+    RetainedDirectoryContour::retain(path).map_err(|error| InstallationError::InvalidField {
+        field: "transaction_store.path".to_owned(),
+        reason: format!("existing reparse-safe parent contour required: {error}"),
+    })
 }
 
 #[cfg(windows)]
 fn verify_transaction_parent(
     parent: &RetainedTransactionDirectory,
 ) -> Result<(), InstallationError> {
-    let identity = file_identity_for_open_handle(&parent.file).map_err(|_| {
-        InstallationError::UnknownOutcome {
+    parent
+        .verify()
+        .map_err(|_| InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
-        }
-    })?;
-    if identity != parent.identity {
-        return Err(InstallationError::UnknownOutcome {
-            stage: InstallationStage::Planned,
-        });
-    }
-    Ok(())
+        })
+}
+
+#[cfg(windows)]
+fn retain_transaction_path_parent(
+    path: &Path,
+) -> Result<RetainedTransactionDirectory, InstallationError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| InstallationError::InvalidField {
+            field: "transaction_store.path".to_owned(),
+            reason: "exact path must name a file".to_owned(),
+        })?;
+    retain_transaction_directory(parent)
+}
+
+#[cfg(not(windows))]
+fn retain_transaction_path_parent(path: &Path) -> Result<(), InstallationError> {
+    require_existing_parent(path)
 }
 
 #[cfg(windows)]
@@ -3581,6 +3628,7 @@ fn classify_missing_v7_table(read: &redb::ReadTransaction) -> Result<(), Install
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn require_existing_parent(path: &Path) -> Result<(), InstallationError> {
     if !path.is_absolute() {
         return Err(InstallationError::InvalidField {
