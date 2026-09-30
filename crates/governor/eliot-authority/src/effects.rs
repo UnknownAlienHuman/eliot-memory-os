@@ -527,6 +527,11 @@ impl EffectAuthorizer {
     /// revoked root — including the effect just admitted — is marked
     /// contestable/reopened via [`Self::contest_dependent_effects`], while
     /// historical admission records stay immutable.
+    ///
+    /// A replayed request under an already-stored idempotency key returns the
+    /// original decision only when it names the full stored material identity
+    /// and the presented lease is still current for that exact effect:
+    /// historical replay never renews expired or revoked authority.
     #[allow(clippy::too_many_arguments)]
     pub fn authorize_with_revoked_roots(
         &mut self,
@@ -544,18 +549,17 @@ impl EffectAuthorizer {
             .authorized_by_idempotency
             .get(&proposed.operation.idempotency_key)
         {
-            if !same_logical_effect(&existing.proposal, &proposed) {
+            if !same_logical_effect(existing, &proposed, &executor_boundary, &lease.lease_id) {
                 return Err(AuthorityError::IdentityConflict);
             }
-            // The stored executor and lease are distinct material from the
-            // proposal fields: replaying the same logical request under a
-            // different executor or a different lease is a substituted
-            // identity, not the same decision.
-            if existing.executor_boundary != executor_boundary
-                || existing.lease_id != lease.lease_id
-            {
-                return Err(AuthorityError::IdentityConflict);
-            }
+            // Historical replay stays separate from permission to execute
+            // now: the stored decision is returned only while the presented
+            // lease is still current for this exact effect. An expired,
+            // revoked, fence/epoch-drifted, or substituted lease refuses here
+            // instead of renewing authority, and the replay consumes no use
+            // budget. (I6.10: a stale lease is historical evidence, never a
+            // new effect.)
+            lease.still_current(&existing.proposal, current_work_scope, current_session, now)?;
             return Ok(existing.clone());
         }
         lease.authorize(&proposed, current_work_scope, current_session, now)?;
@@ -804,14 +808,30 @@ fn dependent_revoked_roots(
     matched
 }
 
-fn same_logical_effect(left: &ProposedEffect, right: &ProposedEffect) -> bool {
-    left.action_id == right.action_id
-        && left.canonical_payload_sha256 == right.canonical_payload_sha256
-        && left.operation_name == right.operation_name
-        && left.resource_ref == right.resource_ref
-        && left.operation.operation_kind == right.operation.operation_kind
-        && left.operation.effect == right.operation.effect
-        && left.operation.state_fence == right.operation.state_fence
+/// True only when the presented request is the same logical effect the stored
+/// authorization admitted: the full material identity — the complete
+/// operation binding (operation, request, and idempotency identities
+/// included), the exact executor boundary, and the authorizing lease — over
+/// the same action payload digest, operation name, and resource.
+///
+/// Selected proposal fields alone are never enough: the stored executor and
+/// lease are distinct material from the proposal, so replaying the same
+/// proposal under a different executor or lease — or with a substituted
+/// operation/request identity under a reused idempotency key — is an
+/// identity conflict, never the same decision. (I6.6, I6.8.)
+fn same_logical_effect(
+    existing: &AuthorizedEffect,
+    proposed: &ProposedEffect,
+    executor_boundary: &str,
+    lease_id: &LeaseId,
+) -> bool {
+    existing.proposal.action_id == proposed.action_id
+        && existing.proposal.canonical_payload_sha256 == proposed.canonical_payload_sha256
+        && existing.proposal.operation_name == proposed.operation_name
+        && existing.proposal.resource_ref == proposed.resource_ref
+        && existing.proposal.operation == proposed.operation
+        && existing.executor_boundary.as_str() == executor_boundary
+        && existing.lease_id == *lease_id
 }
 
 /// Effect outcome. Unknown outcome is explicitly non-terminal until reconciled.
