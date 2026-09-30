@@ -1368,7 +1368,14 @@ fn check_response_binding(
 
 fn plan_gap_from_response(response: &McpResponse) -> Result<Option<PortFailure>, PortFailure> {
     match response.kind {
-        ResponseKind::Candidate | ResponseKind::Projection => Ok(None),
+        // Issue #1739 W6: an owner-authored failure is not a plan gap. Only
+        // the bridge front produces `OwnerRejected`, and its content carries
+        // no gap fields to reconstruct a `PortFailure` from without
+        // fabricating the Kernel failure envelope, so the exact bytes are
+        // served as-is instead of converted.
+        ResponseKind::Candidate | ResponseKind::Projection | ResponseKind::OwnerRejected => {
+            Ok(None)
+        }
         ResponseKind::PlanGap => {
             let (capability, reason) = plan_gap_fields(response)?;
             Ok(Some(PortFailure::PlanGap {
