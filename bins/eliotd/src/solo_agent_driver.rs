@@ -1344,7 +1344,13 @@ async fn drive_solo_delegate_verified_async(
     now_unix_ms: u64,
 ) -> Result<SoloDriveOutcome, DaemonError> {
     let material = intake.claimed.material();
-    drive_admitted_material_async(composition, kernel, intake, material, now_unix_ms).await
+    // The admitted-material future below is heap-pinned so the queue-poll
+    // future that awaits this wrapper stays small: the intake would
+    // otherwise be counted in both frames across the seam await.
+    Box::pin(drive_admitted_material_async(
+        composition, kernel, intake, material, now_unix_ms,
+    ))
+    .await
 }
 
 /// Drives one intake on its consumed binding through the verified async seam
