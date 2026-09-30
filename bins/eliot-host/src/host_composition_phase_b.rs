@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(windows)]
+use super::launch_descriptor_validation::verify_user_broker_artifact;
+
+#[cfg(windows)]
 use super::phase_b_materialization::{
     prepare_agent_bridge_materialization, publish_agent_bridge_pair,
     rehydrate_agent_bridge_binding, rehydrate_agent_bridge_binding_from_pending,
@@ -341,6 +344,7 @@ impl HostComposition {
         } else {
             None
         };
+        verify_user_broker_artifact(manifest, portable_root.as_ref())?;
         let profile = launch_template.profile;
         let authority_path = approved_phase_b_destination_locator(
             Path::new(launch_template.authority_descriptor_path.as_str()),
@@ -1359,6 +1363,10 @@ impl HostComposition {
         if prepared.manifest_digest != manifest_digest
             || prepared.launch.generation != manifest.generation
             || prepared.launch.store_config_path != manifest.config_path
+            || prepared.launch.user_broker_executable_path
+                != manifest.runtime_launch.user_broker_executable_path
+            || prepared.launch.user_broker_artifact_digest
+                != manifest.runtime_launch.user_broker_artifact_digest
         {
             return Err(HostError::RecoveryRequired(
                 "Phase-B prepared record is not bound to the exact candidate manifest".to_owned(),
@@ -1400,6 +1408,7 @@ impl HostComposition {
         } else {
             None
         };
+        verify_user_broker_artifact(manifest, portable_root.as_ref())?;
         let readback = |path: &Path,
                         expected: &PlatformHandle,
                         label: &str|
