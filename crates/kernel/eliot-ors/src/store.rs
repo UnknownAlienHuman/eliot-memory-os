@@ -4081,6 +4081,18 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         operation_id: &crate::OperationIdentity,
     ) -> Result<Option<RecoveryPayloadEnvelope>, OrsError>;
+    /// Loads the exact original reservation through the durable operation
+    /// index. Unsupported stores fail closed instead of scanning or rebuilding
+    /// reservation identity.
+    fn load_write_reservation_by_operation(
+        &self,
+        _operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<ReservationRecord>, OrsError> {
+        Err(OrsError::InvalidField {
+            field: "write_reservation_operation_readback",
+            reason: "the store does not expose the exact operation reservation owner",
+        })
+    }
     /// Durably stages one complete opaque operation and reserves every
     /// declared Ordering Scope in one atomic ORS transaction, then proves the
     /// staging before returning `ACCEPTED_PENDING` (issue #1925, I5.5/I5.6).
@@ -4585,6 +4597,7 @@ pub trait OperationalRecoveryStore: Send + Sync {
     ) -> Result<Option<WorkerReplayRequestRecord>, OrsError>;
 }
 
+#[derive(Clone, Copy)]
 struct HostRequestResultPersistence<'a> {
     operation_id: &'a crate::OperationIdentity,
     request_digest: &'a str,
@@ -4594,6 +4607,13 @@ struct HostRequestResultPersistence<'a> {
     result_response: &'a serde_json::Value,
     result_evidence: Option<&'a crate::HostRequestEffectEvidence>,
     result_lineage: Option<&'a crate::HostRequestRetainedLineage>,
+}
+
+#[derive(Clone, Copy)]
+struct OriginalWriteResultEvidence<'a> {
+    prepared_transition_sha256: &'a str,
+    reservation: &'a crate::ReservationRecord,
+    envelope: &'a crate::RecoveryPayloadEnvelope,
 }
 
 /// Exact owner-supplied Observe completion retained under its durable claim.
@@ -4623,7 +4643,8 @@ fn validate_host_request_result_scope(
     record: &crate::HostRequestRecord,
     observe_attempt: Option<&crate::HostRequestAttempt>,
     prepared_transition_sha256: Option<&str>,
-    original_write_binding: Option<&crate::RecoveryWriteBinding>,
+    original_reservation: Option<&crate::ReservationRecord>,
+    original_envelope: Option<&crate::RecoveryPayloadEnvelope>,
     response: &serde_json::Value,
     lineage: Option<&crate::HostRequestRetainedLineage>,
 ) -> Result<(), OrsError> {
@@ -4634,7 +4655,8 @@ fn validate_host_request_result_scope(
     let Some(attempt) = observe_attempt else {
         if record.executable_input.is_some()
             || prepared_transition_sha256.is_some()
-            || original_write_binding.is_some()
+            || original_reservation.is_some()
+            || original_envelope.is_some()
         {
             return Err(invalid());
         }
@@ -4646,8 +4668,8 @@ fn validate_host_request_result_scope(
         prepared_transition_sha256,
         "host_request_prepared_transition_sha256",
     )?;
-    let original_write_binding = original_write_binding.ok_or_else(invalid)?;
-    original_write_binding.validate()?;
+    let original_reservation = original_reservation.ok_or_else(invalid)?;
+    let original_envelope = original_envelope.ok_or_else(invalid)?;
     validate_observe_attempt_binding(record, attempt, input)?;
     let lineage = lineage.ok_or_else(invalid)?;
     if lineage.result_class != crate::HostRequestRetainedResultClass::CanonicalWriteReceipt {
@@ -4660,15 +4682,12 @@ fn validate_host_request_result_scope(
     let envelope = receipt
         .require_reconciliation_envelope()
         .map_err(|_| invalid())?;
-    validate_observe_receipt_binding(
-        record,
-        input,
+    let original_write = OriginalWriteResultEvidence {
         prepared_transition_sha256,
-        original_write_binding,
-        &receipt,
-        envelope,
-        lineage,
-    )
+        reservation: original_reservation,
+        envelope: original_envelope,
+    };
+    validate_observe_receipt_binding(record, input, &original_write, &receipt, envelope, lineage)
 }
 
 fn validate_observe_attempt_binding(
@@ -4704,8 +4723,7 @@ fn validate_observe_attempt_binding(
 fn validate_observe_receipt_binding(
     record: &crate::HostRequestRecord,
     input: &crate::HostRequestExecutableInput,
-    prepared_transition_sha256: &str,
-    original_write_binding: &crate::RecoveryWriteBinding,
+    original_write: &OriginalWriteResultEvidence<'_>,
     receipt: &eliot_store_api::WriteReceipt,
     envelope: &eliot_receipts::ReceiptEnvelope,
     lineage: &crate::HostRequestRetainedLineage,
@@ -4714,6 +4732,9 @@ fn validate_observe_receipt_binding(
         field: "host_request_result_observe_binding",
         reason: "canonical receipt must join the original staged write and source request",
     };
+    let prepared_transition_sha256 = original_write.prepared_transition_sha256;
+    let original_reservation = original_write.reservation;
+    let original_envelope = original_write.envelope;
     let source_request = input
         .application_binding
         .source_request_identity
@@ -4736,25 +4757,43 @@ fn validate_observe_receipt_binding(
     let Some(work_scope) = record.scope_ref.as_ref() else {
         return Err(invalid());
     };
+    let write_binding = original_reservation
+        .token
+        .write_binding
+        .as_ref()
+        .ok_or_else(invalid)?;
+    write_binding.validate()?;
+    let binding_matches_original = write_binding_matches_token(write_binding, &original_reservation.token)
+        && write_binding.operation_id == record.operation_id
+        && write_binding.idempotency_key.as_str() == record.idempotency_key.as_str()
+        && write_binding.canonical_request_sha256 == receipt.canonical_request_hash
+        && write_binding.prepared_transition_sha256 == prepared_transition_sha256
+        && write_binding.operation_manifest_digest.as_str()
+            == receipt.operation_manifest_digest.as_str();
     if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
         || receipt.operation_id.as_str() != record.operation_id.as_str()
         || receipt.idempotency_key != record.idempotency_key.as_str()
-        || receipt.canonical_request_hash != original_write_binding.canonical_request_sha256
-        || original_write_binding.operation_id != record.operation_id
-        || original_write_binding.idempotency_key.as_str() != record.idempotency_key.as_str()
-        || original_write_binding.prepared_transition_sha256 != prepared_transition_sha256
-        || original_write_binding.admission_contract_set_digest != receipt.admission_digest
-        || original_write_binding.operation_manifest_digest.as_str()
-            != receipt.operation_manifest_digest.as_str()
-        || original_write_binding
-            .state_fence
-            .validate()
-            .is_err()
-        || serde_json::from_str::<eliot_contracts::StateFence>(
-            &original_write_binding.state_fence.canonical_json,
+        || original_reservation.token.operation_id != record.operation_id
+        || original_reservation.token.prepared_transition_sha256 != prepared_transition_sha256
+        || original_reservation.token.write_binding.as_ref() != Some(write_binding)
+        || !binding_matches_original
+        || original_reservation.token.state_fence.validate().is_err()
+        || original_envelope.operation_or_checkpoint_id != record.operation_id
+        || original_envelope.authority_epoch != original_reservation.token.writer_epoch
+        || original_envelope.state_fence != original_reservation.token.state_fence
+        || original_envelope.write_binding.as_ref() != Some(write_binding)
+        || original_envelope.privacy_and_visibility_class
+            != input.protected_envelope.privacy_and_visibility_class
+        || !matches!(
+            &original_envelope.payload,
+            crate::RecoveryPayload::Encrypted { .. }
         )
-        .map(|fence| fence != input.application_binding.state_fence || fence != receipt.state_fence)
-        .unwrap_or(true)
+        || serde_json::from_str::<eliot_contracts::StateFence>(
+            &original_reservation.token.state_fence.canonical_json,
+        )
+        .map_or(true, |fence| {
+            fence != input.application_binding.state_fence || fence != receipt.state_fence
+        })
         || envelope.core.request.metadata.request_id.as_str() != source_request_id
         || envelope.core.request.metadata.product_id.as_str() != source_product_id
         || envelope.core.request.metadata.source_id.as_str() != source_id
@@ -11673,7 +11712,41 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
-        let original_write_binding = if observe_attempt.is_some() {
+        let original_reservation = if observe_attempt.is_some() {
+            let reservation_id = {
+                let operations = write.open_table(OPERATIONS).map_err(storage)?;
+                operations
+                    .get(operation_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| value.value().to_owned())
+            }
+            .ok_or(OrsError::ReservationNotFound)?;
+            let reservation_id = OperationIdentity::new(reservation_id)?;
+            let reservation = {
+                let reservations = write.open_table(RESERVATIONS).map_err(storage)?;
+                reservations
+                    .get(reservation_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<ReservationRecord>(value.value()))
+                    .transpose()?
+            }
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "reservation_operation_index",
+                reason: "operation index names a missing primary reservation".to_owned(),
+            })?;
+            if reservation.token.reservation_id != reservation_id
+                || reservation.token.operation_id != *operation_id
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "reservation_operation_index",
+                    reason: "operation index differs from the primary reservation".to_owned(),
+                });
+            }
+            Some(reservation)
+        } else {
+            None
+        };
+        let original_envelope = if observe_attempt.is_some() {
             let envelope = {
                 let table = write.open_table(ENVELOPES).map_err(storage)?;
                 table
@@ -11693,14 +11766,7 @@ impl RedbRecoveryStore {
                     request_digest: request_digest.to_owned(),
                 });
             }
-            Some(
-                envelope
-                    .write_binding
-                    .ok_or(OrsError::InvalidField {
-                        field: "host_request_result_observe_binding",
-                        reason: "protected Observe requires the exact staged write binding",
-                    })?,
-            )
+            Some(envelope)
         } else {
             None
         };
@@ -11708,7 +11774,8 @@ impl RedbRecoveryStore {
             &existing,
             observe_attempt,
             prepared_transition_sha256,
-            original_write_binding.as_ref(),
+            original_reservation.as_ref(),
+            original_envelope.as_ref(),
             result_response,
             result_lineage,
         )?;
@@ -28574,6 +28641,15 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Loads the exact original reservation through its operation index and
+    /// validates the primary row and its durable indexes in one read snapshot.
+    pub fn load_write_reservation_by_operation(
+        &self,
+        operation_id: &OperationIdentity,
+    ) -> Result<Option<ReservationRecord>, OrsError> {
+        load_write_reservation_by_operation_in_read(&self.database, operation_id)
+    }
+
     fn load_record(
         table: &impl ReadableTable<&'static str, &'static str>,
         reservation_id: &crate::OperationIdentity,
@@ -34778,6 +34854,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             .transpose()
     }
 
+    fn load_write_reservation_by_operation(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<ReservationRecord>, OrsError> {
+        RedbRecoveryStore::load_write_reservation_by_operation(self, operation_id)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "durable staging and exact envelope readback form one acceptance boundary"
@@ -35959,6 +36042,16 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.verify_staged_envelope(operation_id)
     }
 
+    /// Loads the exact original reservation through its durable operation
+    /// index and validates the primary row and indexes before returning it.
+    pub fn load_write_reservation_by_operation(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<ReservationRecord>, OrsError> {
+        self.store
+            .load_write_reservation_by_operation(operation_id)
+    }
+
     /// Retains one caller-reported missing-key/decryption-failure problem.
     /// Digest-only: no payload bytes are accepted or stored.
     pub fn report_recovery_problem(
@@ -36580,6 +36673,47 @@ pub(super) fn validate_write_reservation_inventory_in_read(
 }
 
 fn ignore_census_observation(_: &str, _: &str, _: &str) {}
+
+fn load_write_reservation_by_operation_in_read(
+    database: &Database,
+    operation_id: &OperationIdentity,
+) -> Result<Option<ReservationRecord>, OrsError> {
+    let read = database.begin_read().map_err(storage)?;
+    let reservation_id = {
+        let operations = read.open_table(OPERATIONS).map_err(storage)?;
+        operations
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+    };
+    let Some(reservation_id) = reservation_id else {
+        return Ok(None);
+    };
+    validate_write_reservation_operation_in_read(
+        &read,
+        operation_id.as_str(),
+        &reservation_id,
+    )?;
+    let reservation_id = OperationIdentity::new(reservation_id)?;
+    let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+    let record = RedbRecoveryStore::load_record(&reservations, &reservation_id)?;
+    drop(reservations);
+    if record.token.operation_id != *operation_id
+        || record.token.reservation_id != reservation_id
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "reservation_operation_index",
+            reason: "operation index differs from the primary reservation".to_owned(),
+        });
+    }
+    validate_write_reservation_primary_in_read(
+        &read,
+        reservation_id.as_str(),
+        &record,
+        &mut ignore_census_observation,
+    )?;
+    Ok(Some(record))
+}
 
 fn validate_write_reservation_primary_in_read(
     read: &redb::ReadTransaction,
