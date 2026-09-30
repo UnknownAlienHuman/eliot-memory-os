@@ -204,6 +204,10 @@ fn validate_receipt_identity(
 /// persisted, in `prepare_admission_reservation_transition`, by comparing the
 /// caller's request against the row's own `last_transition`; that is the
 /// existing replay path and this record adds no second comparison scheme.
+///
+/// The committed content itself is re-read before activation by
+/// [`crate::launch_outbox_readback`], which compares the owner's `WriteReceipt`
+/// for the ORIGINAL operation identity against this record BY VALUE.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionReservationCanonicalAdmission {
@@ -228,10 +232,17 @@ pub struct AdmissionReservationCanonicalAdmission {
     /// receipt the canonical owner returned from the `ADMITTED` commit; it is
     /// copied verbatim and never fabricated in Kernel.
     pub admission_receipt: ReceiptIdentity,
-    /// Time the canonical owner committed the `ADMITTED` decision, in Unix
-    /// milliseconds. Retained so a readback can distinguish the original
-    /// commit from any later observation without re-deriving it.
-    pub committed_at_unix_ms: i64,
+    /// The commit-time marker the canonical owner recorded on the `WriteReceipt`
+    /// for this `ADMITTED` commit, copied verbatim (I5.19 `committed_at`).
+    ///
+    /// This is the OWNER's string, not a wall clock and not a Kernel reading:
+    /// the canonical store issues it as its own allocation-derived commit
+    /// marker, so retaining it is what lets a later readback compare this
+    /// reservation against the exact commit it was admitted under. It is never
+    /// parsed into a different time base, because converting it here would
+    /// invent a value the owner never issued and would then have to be trusted.
+    #[serde(default)]
+    pub committed_at_marker: String,
 }
 
 impl AdmissionReservationCanonicalAdmission {
@@ -254,6 +265,10 @@ impl AdmissionReservationCanonicalAdmission {
             (
                 self.launch_outbox_id.as_str(),
                 "canonical_admission.launch_outbox_id",
+            ),
+            (
+                self.committed_at_marker.as_str(),
+                "canonical_admission.committed_at_marker",
             ),
         ] {
             crate::model::validate_text(value, field)?;
@@ -288,12 +303,6 @@ impl AdmissionReservationCanonicalAdmission {
             &self.admission_receipt,
             "canonical_admission.admission_receipt",
         )?;
-        if self.committed_at_unix_ms <= 0 {
-            return Err(OrsError::InvalidField {
-                field: "canonical_admission.committed_at_unix_ms",
-                reason: "canonical commit time must be greater than zero",
-            });
-        }
         Ok(())
     }
 }

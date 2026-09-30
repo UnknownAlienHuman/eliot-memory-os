@@ -79,11 +79,148 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdmissionReservationActivatedOutcome, AdmissionReservationActivationEvidence,
-    AdmissionReservationActivationRequest, AdmissionReservationClaimRef,
-    AdmissionReservationClaims, AdmissionReservationRecord, AdmissionReservationSnapshot,
-    AdmissionReservationStage, AdmissionReservationState, EpochIdentity, EpochLineage, OpaqueLabel,
-    OperationIdentity, OperationalRecoveryStore, OrsError, StateFenceSnapshot, model::sha256_hex,
+    AdmissionReservationActivationRequest, AdmissionReservationCanonicalAdmission,
+    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationRecord,
+    AdmissionReservationSnapshot, AdmissionReservationStage, AdmissionReservationState,
+    EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, OperationalRecoveryStore,
+    OrsError, StateFenceSnapshot, model::sha256_hex,
 };
+
+/// One committed canonical `WriteReceipt` as the canonical owner issued it.
+///
+/// This is the owner's own receipt, carried whole. Every value below is copied
+/// verbatim from it — nothing here is recomputed, re-derived, or synthesized in
+/// Kernel, and the receipt is not a claim that a transport call returned
+/// success: it is the terminal artifact the canonical store created inside the
+/// transaction that also committed the `ADMITTED` decision and the launch
+/// outbox row. It is validated with the canonical owner's own
+/// `WriteReceipt::validate()` against the ORIGINAL recorded value, and its
+/// `commit_id` is the store-issued commit identity that the outbox row shares.
+pub type CanonicalWriteReceipt = eliot_store_api::WriteReceipt;
+
+/// Builds the retained canonical-commit record from the owner's own receipt.
+///
+/// This is the only way a caller obtains an
+/// [`AdmissionReservationCanonicalAdmission`], and it takes the canonical
+/// owner's `WriteReceipt` for the exact operation — not a copy of some fields,
+/// not a caller assertion. Every retained value is read out of that receipt:
+/// the operation identity, the idempotency key, the admission-decision and
+/// mutation-plan digests, the store-issued `commit_id`, the owner's
+/// `admission_receipt` reference, and the commit time. Nothing is defaulted and
+/// nothing is derived, so what the reservation row retains is exactly what the
+/// canonical owner committed.
+///
+/// The commit time is taken from the receipt's own `committed_at` string,
+/// which the store issues as Unix milliseconds. A receipt that is not
+/// `committed`, or whose `committed_at` is not a positive integer, cannot back
+/// an `ADMITTED` decision and is refused here rather than defaulted to the
+/// caller's clock.
+///
+/// # Errors
+///
+/// Returns [`OrsError::ReconciliationMismatch`] when the receipt does not carry
+/// a committed `ADMITTED` decision for a named operation: a non-committed
+/// status, an absent commit id, or an absent/non-numeric commit time. Returns
+/// [`OrsError::Contract`] when the owner's own `validate()` refuses the receipt.
+pub fn canonical_admission_from_owner_commit(
+    receipt: &CanonicalWriteReceipt,
+    operation_id: &str,
+    admission_receipt: &ReceiptIdentity,
+    launch_outbox_operation_id: &OperationIdentity,
+    launch_outbox_id: &str,
+) -> Result<AdmissionReservationCanonicalAdmission, OrsError> {
+    receipt
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != operation_id
+    {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    let Some(commit_id) = receipt.commit_id.clone() else {
+        return Err(OrsError::ReconciliationMismatch);
+    };
+    let Some(committed_at_marker) = receipt.committed_at.clone() else {
+        return Err(OrsError::ReconciliationMismatch);
+    };
+    let retained = AdmissionReservationCanonicalAdmission {
+        operation_id: OperationIdentity::new(operation_id).map_err(|_| OrsError::InvalidField {
+            field: "canonical_admission.operation_id",
+            reason: "canonical operation identity must be non-blank",
+        })?,
+        idempotency_key: receipt.idempotency_key.clone(),
+        admission_digest: receipt.admission_digest.clone(),
+        mutation_plan_digest: receipt.mutation_plan_digest.clone(),
+        commit_id: commit_id.as_str().to_owned(),
+        launch_outbox_operation_id: launch_outbox_operation_id.clone(),
+        launch_outbox_id: launch_outbox_id.to_owned(),
+        admission_receipt: admission_receipt.clone(),
+        committed_at_marker,
+    };
+    retained.validate()?;
+    Ok(retained)
+}
+
+/// Reads the committed launch outbox back and compares it BY VALUE against the
+/// evidence the reservation retained (#1678 A3, REQ5).
+///
+/// A3 requires that the committed outbox entry "is read back before
+/// activation; response loss never mints a second admission". The read is the
+/// canonical owner's own `WriteReceipt` for the original operation identity —
+/// the same artifact the first commit produced — and it is resolved by
+/// identity through the existing receipt readback. There is no second read
+/// path and no outbox table owned here.
+///
+/// The comparison is by VALUE, not existence. The readback must agree with the
+/// retained evidence on the admission-decision digest, the mutation-plan
+/// digest, the commit id, the operation identity, and the commit time. An
+/// admitted decision whose committed content does not match the retained
+/// evidence is a typed [`OrsError::ReconciliationMismatch`], not a pass: that
+/// is the case where the receipt under this operation identity is not the one
+/// the reservation was staged against, and activating on it would authorize
+/// work from a different commit.
+///
+/// Absent receipt is likewise a refusal, never a default. Per I5.19 an unknown
+/// commit is never assumed to be a non-commit, so a missing receipt leaves the
+/// reservation inactive and the launch blocked; the caller retries under the
+/// original operation identity rather than admitting again.
+///
+/// # Errors
+///
+/// Returns [`OrsError::ReconciliationMismatch`] when the owner has no committed
+/// receipt for the retained operation identity, or when the receipt's content
+/// disagrees with the retained evidence on any compared field.
+pub fn launch_outbox_readback(
+    readback: Option<&CanonicalWriteReceipt>,
+    retained: &AdmissionReservationCanonicalAdmission,
+) -> Result<(), OrsError> {
+    let receipt = readback.ok_or(OrsError::ReconciliationMismatch)?;
+    receipt
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    retained.validate()?;
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != retained.operation_id.as_str()
+        || receipt.idempotency_key != retained.idempotency_key
+        || receipt.admission_digest != retained.admission_digest
+        || receipt.mutation_plan_digest != retained.mutation_plan_digest
+        || receipt
+            .commit_id
+            .as_ref()
+            .map(eliot_store_api::CommitId::as_str)
+            != Some(retained.commit_id.as_str())
+    {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    // The commit marker is compared as the owner recorded it, byte for byte, not
+    // as a re-derived instant: a receipt for the same digests under a different
+    // commit marker is a different observation of the commit and is refused
+    // rather than accepted as "close enough".
+    if receipt.committed_at.as_deref() != Some(retained.committed_at_marker.as_str()) {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    Ok(())
+}
 
 /// Wire revision of this stage identity contract.
 ///

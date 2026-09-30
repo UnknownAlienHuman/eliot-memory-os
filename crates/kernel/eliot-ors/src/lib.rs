@@ -34,7 +34,8 @@ pub mod test_support;
 pub use admission_reservation::{
     ActiveAdmissionReservation, AdmissionReservationActivatedOutcome,
     AdmissionReservationActivationEvidence, AdmissionReservationActivationRequest,
-    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationDisposition,
+    AdmissionReservationCanonicalAdmission, AdmissionReservationClaimRef,
+    AdmissionReservationClaims, AdmissionReservationDisposition,
     AdmissionReservationLaunchPrerequisite, AdmissionReservationRecord,
     AdmissionReservationSnapshot, AdmissionReservationStage, AdmissionReservationState,
     AdmissionReservationTransitionRequest, verify_admission_reservation_launch_prerequisite,
@@ -43,9 +44,10 @@ pub use admission_reservation_stage::{
     ADMISSION_RESERVATION_STAGE_VERSION, AdmissionReservationIdentityInput,
     AdmissionReservationStageRequest, AdmissionReservationStagedOutcome, StagedClaimRole,
     activate_admission_reservation_from_owner_evidence, activation_operation_identity,
-    admission_reservation_identity, epoch_lineage_for, proposed_attempt_identity,
-    reload_staged_admission_reservation, stage_admission_reservation_inactive,
-    stage_operation_identity, verify_staged_claim_completeness,
+    admission_reservation_identity, canonical_admission_from_owner_commit, epoch_lineage_for,
+    launch_outbox_readback, proposed_attempt_identity, reload_staged_admission_reservation,
+    stage_admission_reservation_inactive, stage_operation_identity,
+    verify_staged_claim_completeness,
 };
 pub use backup_snapshot::{
     BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, MAX_BACKUP_BYTES,
