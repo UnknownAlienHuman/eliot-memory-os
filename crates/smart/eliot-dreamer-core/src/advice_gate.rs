@@ -255,7 +255,10 @@ impl AdviceGate {
         for (field, value) in [
             ("statement", proposal.statement.as_str()),
             ("expected_benefit", proposal.expected_benefit.as_str()),
-            ("cost_counter_metrics", proposal.cost_counter_metrics.as_str()),
+            (
+                "cost_counter_metrics",
+                proposal.cost_counter_metrics.as_str(),
+            ),
             ("owner", proposal.owner.as_str()),
         ] {
             if trim_to_owned(value).is_empty() {
