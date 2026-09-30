@@ -56,6 +56,10 @@ Enforces that:
     lock, toolchain, source manifests, and event/fork trust class on every
     cache step of every workflow, so a cache hit never crosses a trust,
     source or toolchain boundary (AC10).
+14. The --json-out run manifest records the oracle identity (issue #1225
+    N_step10; I18.27): the sha256 of every oracle-owned file, so the
+    independent/manual source-candidate or Review owner attests the exact
+    oracle bytes that produced the verdict instead of a self-certified pass.
 """
 
 from __future__ import annotations
@@ -63,6 +67,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import fnmatch
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -1383,6 +1388,48 @@ def collect_action_identities(root: Path) -> list[dict[str, str]]:
     return records
 
 
+# Oracle-owned files (issue #1225 N_step10). A change to workflow YAML, this
+# verifier, profile definitions, lock validation or the repository-policy
+# denominator cannot use only its newly modified oracle as acceptance (I18.27:
+# "Changes to implementation and oracle in one candidate are split unless the
+# oracle is mechanically derived from the same unchanged source"). The run
+# manifest therefore records the exact oracle bytes behind the verdict, so the
+# existing independent/manual source-candidate or Review owner attests a named
+# oracle instead of a self-certified pass: a candidate that weakens any file
+# below ships a manifest whose digest differs from the reviewed baseline.
+ORACLE_VERSION = "github-workflow-oracle-v1"
+ORACLE_OWNED_PATHS = (
+    "scripts/verify-github-workflows.py",
+    ".github/workflows/ci.yml",
+    ".github/workflows/integration.yml",
+    ".github/workflows/repository-policy.yml",
+    ".github/workflows/source-candidate.yml",
+    "scripts/verify.ps1",
+)
+
+
+def collect_oracle_identity(root: Path) -> dict[str, Any]:
+    """Digest identity for the oracle files that produced this verdict.
+
+    Sorted and bounded like collect_action_identities: an unchanged tree yields
+    a byte-identical record, and any oracle byte change alters `digest`. Files
+    absent from `root` are omitted from `files` (a fixture tree carries no
+    oracle), so the record never fails a tree it only describes; judging
+    workflows is left to the check_* rules.
+    """
+    files: list[dict[str, str]] = []
+    for rel_path in ORACLE_OWNED_PATHS:
+        candidate = root.joinpath(*rel_path.split("/"))
+        if not candidate.is_file():
+            continue
+        digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        files.append({"path": rel_path, "sha256": digest})
+    combined = hashlib.sha256(
+        "".join(f"{entry['path']}\0{entry['sha256']}\n" for entry in files).encode("utf-8")
+    ).hexdigest()
+    return {"version": ORACLE_VERSION, "digest": combined, "files": files}
+
+
 def check_action_pin_divergence(root: Path) -> list[Finding]:
     """One action, one pin: reject the same action carried at two different SHAs.
 
@@ -1920,6 +1967,8 @@ def verify_all(root: Path) -> list[Finding]:
 
 
 def run_self_tests() -> int:
+    import contextlib
+    import io
     import tempfile
 
     # (name, filename, workflow yaml, expected finding or None for clean[, extra files]).
@@ -2472,6 +2521,23 @@ def run_self_tests() -> int:
             fixture_body("lock-stale.packages.lock.json"),
         )
 
+    def call_lock_graph(tmp_root: Path) -> list[Finding]:
+        """Judge the materialized Operator project against its checked-in lock.
+
+        check_nuget_lock_graph takes the project bytes and the parsed lock
+        rather than a repository root, so the adapter reads exactly the two
+        files the setup wrote and calls the production rule by name. The
+        verify_all dispatch probe then proves the same rule is reached from the
+        production dispatch (verify_all -> check_nuget_lock ->
+        check_nuget_lock_graph), so deleting the rule from either place fails
+        the suite.
+        """
+        rel_csproj = "apps/Eliot.Operator/Eliot.Operator.csproj"
+        rel_lock = "apps/Eliot.Operator/packages.lock.json"
+        content = (tmp_root / rel_csproj).read_text(encoding="utf-8")
+        lock = json.loads((tmp_root / rel_lock).read_text(encoding="utf-8"))
+        return check_nuget_lock_graph(rel_csproj, rel_lock, content, lock)
+
     fail_closed_tables = [
         (
             "GWF-021",
@@ -2505,7 +2571,7 @@ def run_self_tests() -> int:
         ),
         (
             "GWF-013",
-            check_nuget_lock,
+            call_lock_graph,
             setup_lock_graph,
             [
                 ("nuget_lock_graph_stale_rejected", "lock-stale.csproj", True),
@@ -2543,11 +2609,72 @@ def run_self_tests() -> int:
                     )
                     return 1
 
+    # Oracle identity (issue #1225 N_step10; I18.27). Every property is judged
+    # against real file bytes: the record derives from the files, is
+    # deterministic, changes when any oracle byte changes, covers the closed
+    # oracle set on the production tree, and reaches the machine-readable
+    # payload through the real main() caller.
+    oracle_case_count = 0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        if collect_oracle_identity(tmp_root) != collect_oracle_identity(tmp_root):
+            print("SELF_TEST_FAILURE in oracle_identity_empty_deterministic", file=sys.stderr)
+            return 1
+        if collect_oracle_identity(tmp_root)["files"] != []:
+            print("SELF_TEST_FAILURE in oracle_identity_empty_covers_absent_files", file=sys.stderr)
+            return 1
+        oracle_case_count += 2
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        oracle_target = tmp_root / ".github" / "workflows" / "ci.yml"
+        oracle_target.parent.mkdir(parents=True, exist_ok=True)
+        oracle_target.write_text(fixture_body("accept-privilege.yml"), encoding="utf-8")
+        derived = collect_oracle_identity(tmp_root)
+        expected_sha = hashlib.sha256(oracle_target.read_bytes()).hexdigest()
+        if derived["files"] != [{"path": ".github/workflows/ci.yml", "sha256": expected_sha}]:
+            print(f"SELF_TEST_FAILURE in oracle_identity_derived_from_bytes: got {derived}", file=sys.stderr)
+            return 1
+        oracle_case_count += 1
+        oracle_target.write_text(fixture_body("accept-privilege.yml") + "\n# drift\n", encoding="utf-8")
+        mutated = collect_oracle_identity(tmp_root)
+        if mutated["digest"] == derived["digest"]:
+            print("SELF_TEST_FAILURE in oracle_identity_mutation_sensitive: digest unchanged after oracle byte change", file=sys.stderr)
+            return 1
+        oracle_case_count += 1
+    repo_root = Path(__file__).resolve().parent.parent
+    production_oracle = collect_oracle_identity(repo_root)
+    if [entry["path"] for entry in production_oracle["files"]] != list(ORACLE_OWNED_PATHS):
+        print(f"SELF_TEST_FAILURE in oracle_identity_production_coverage: got {production_oracle}", file=sys.stderr)
+        return 1
+    oracle_case_count += 1
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        wf_dir = tmp_root / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "test.yml").write_text(fixture_body("accept-privilege.yml"), encoding="utf-8")
+        payload_path = tmp_root / "gwf.json"
+        saved_argv = sys.argv
+        sys.argv = ["verify-github-workflows.py", "--root", str(tmp_root), "--json-out", str(payload_path)]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                main()
+        finally:
+            sys.argv = saved_argv
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        if payload.get("oracle") != collect_oracle_identity(tmp_root):
+            print(f"SELF_TEST_FAILURE in oracle_identity_payload_carriage: got {payload.get('oracle')}", file=sys.stderr)
+            return 1
+        if "actions" not in payload or "status" not in payload or "findings" not in payload:
+            print(f"SELF_TEST_FAILURE in oracle_identity_payload_additive: got {sorted(payload)}", file=sys.stderr)
+            return 1
+        oracle_case_count += 2
+
     # 31 single-file workflow cases + 2 cross-workflow divergence cases
     # + 1 derived-identity case + 7 rule-level cases below, plus the two
     # cache-key groups (issue #1923) and the four fail-closed rule tables
     # (issue #1225 N_step9), each judged directly with every refusal re-judged
-    # through verify_all (dispatch_probes). The reported count is derived from
+    # through verify_all (dispatch_probes), plus the seven oracle-identity
+    # cases (issue #1225 N_step10; oracle_case_count). The reported count is derived from
     # the case lists themselves: a hardcoded total would keep reporting PASS
     # with the same number after a case group was added, which is the count
     # reading as evidence when it is not counting the cases that actually ran.
@@ -2562,6 +2689,7 @@ def run_self_tests() -> int:
         + 1
         + sum(len(cases) for _, _, _, cases in fail_closed_tables)
         + dispatch_probes
+        + oracle_case_count
     )
     print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")
     return 0
@@ -2600,6 +2728,12 @@ def main() -> int:
             # keep their meaning and ordering unchanged. Sorted and bounded, so
             # an unchanged tree yields a byte-identical file.
             "actions": collect_action_identities(root),
+            # Oracle identity (issue #1225 N_step10). Additive key like
+            # `actions`: existing consumers read status/findings/actions
+            # unchanged, and the independent/manual source-candidate or Review
+            # owner reads `oracle` to attest the exact oracle bytes behind the
+            # verdict for this source.
+            "oracle": collect_oracle_identity(root),
         }
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
