@@ -541,14 +541,40 @@ impl<'a> VerifierHarness<'a> {
                 ));
             }
         };
-        let output = run_bounded_command(
+        // Issue #1897 (AUD7): the lane is refused here, before any process
+        // exists, and the refusal is RECORDED as a run rather than propagated.
+        // Propagating it would abort `PatchRunner::apply` after `git apply`
+        // had already mutated the checkout, skipping the rollback that
+        // containment depends on. A recorded `NotAllowed` run is the same
+        // shape the adjacent Cargo-admission refusal already uses, and it can
+        // never satisfy `required_verifiers_passed`, so the patch still rolls
+        // back through the ordinary path.
+        let output = match run_bounded_command(
             &admitted[0],
             &admitted[1..],
             &self.repo_root,
             self.timeout_seconds,
             self.blob_store,
         )
-        .await?;
+        .await
+        {
+            Ok(output) => output,
+            Err(refusal) => {
+                return Ok(verifier_run(
+                    project_id,
+                    task_id,
+                    agent_id,
+                    requirement,
+                    VerifierStatus::NotAllowed,
+                    None,
+                    0,
+                    None,
+                    None,
+                    format!("{QUARANTINED_LEGACY_LANE} {refusal}"),
+                    started_at,
+                ));
+            }
+        };
         let status = if output.timed_out {
             VerifierStatus::TimedOut
         } else if output.success {
@@ -880,6 +906,9 @@ fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {
 /// and no [`BuildTestGraph`](eliot_build_test_graph::BuildTestGraph) source
 /// exists at either seam — so claiming that origin here would be an unbacked
 /// assertion rather than an admission.
+///
+/// That same absent declaration is why this lane REFUSES to launch Cargo at
+/// all rather than binding a target root: see [`governed_lane_refusal`].
 ///
 /// # Errors
 ///
@@ -1233,6 +1262,85 @@ fn git_apply_args(repo_root: &Path, check: bool, reverse: bool, diff_path: &Path
     args
 }
 
+/// The governed-build-lane service name this lane refuses under.
+const GOVERNED_BUILD_LANE_SERVICE: &str = "governed-build-lane";
+
+/// The single owner of this lane's governed-lane admission, which today is a
+/// typed refusal instead of a chosen Cargo target root.
+///
+/// Both the recorded verifier refusal in [`VerifierHarness::run_requirement`]
+/// and the launch-site backstop in [`run_bounded_command`] read this one
+/// function, so the policy has a single owner and the two cannot disagree
+/// about when Cargo is allowed to run. Admitting this lane means binding
+/// `GovernedWorkEnvelope::cargo_environment()` here rather than returning
+/// this error; nothing else may construct the environment.
+///
+/// I2.22 requires every mutating work item to be allocated a worktree
+/// identity, a `BuildFingerprint`, a target/build mode, a fixture namespace, a
+/// runtime-environment lease, resource claims, a contract revision and a
+/// candidate identity, and fixes the governed target root at
+/// `%LOCALAPPDATA%\Eliot\build\<workspace-id>\<worktree-id>\<build-mode>\
+/// <fingerprint>`. It also states plainly that governed instruments do not use
+/// the repository `target/` directory by default. This lane previously did
+/// exactly that: `run_bounded_command` set `CARGO_TARGET_DIR` to
+/// `repo_root.join("target")` for every admitted Cargo verifier, so concurrent
+/// patch work in separate worktrees collided through one shared target.
+///
+/// It cannot mint the tuple, and the reason is structural rather than a missing
+/// convenience. `BuildFingerprint` requires `candidate`, `contract_revision`,
+/// `toolchain`, `target`, `environment_class` and `build_class` plus two
+/// digests. This lane holds six of those honestly:
+///
+/// * `workspace_id` and `worktree_id` from the verified canonical repo root;
+/// * `build_class` from
+///   [`BuildClass::for_instrument_kind`](eliot_instrument_api::BuildClass::for_instrument_kind)
+///   over the requirement's own instrument class;
+/// * `manifest_digest` over the real workspace `Cargo.toml` bytes and
+///   `source_closure_digest` over the admitted diff and changed-file set.
+///
+/// It holds none of the other five. `PatchRequest`, `ActionLease`,
+/// `VerifierPlan` and `VerifierRequirement` — the only inputs
+/// [`PatchRunnerInput`] admits — carry no candidate identity and no contract
+/// revision at all, and no owner-observed toolchain, target triple or
+/// environment class is reachable from them. `environment_class` in particular
+/// is a class label, not an observation: there is no admitted environment
+/// classification on this lane to copy, so any value here would be invented.
+///
+/// Supplying a plausible-looking string for any of those five would produce a
+/// governed-looking fingerprint that proves nothing and would place every build
+/// under a root keyed by a value no work item actually holds — which is the
+/// exact defect class this item exists to remove, and a worse one than an
+/// honest refusal because it reads as governed to every later reader. So this
+/// lane refuses.
+///
+/// The producer that must own the missing five is the admission path that
+/// issues an [`ActionLease`]: a candidate identity and a frozen contract
+/// revision belong on that lease beside its scope and verifier plan, alongside
+/// the resolved toolchain, target and environment class the process admission
+/// already proves for the productive Testd route. Once that material reaches
+/// [`PatchRunnerInput`], this same function admits the lane and binds
+/// `GovernedWorkEnvelope::cargo_environment`.
+///
+/// Returns [`EngineError::ServiceNotReady`] naming this service.
+fn governed_lane_refusal() -> EngineError {
+    EngineError::ServiceNotReady {
+        service: GOVERNED_BUILD_LANE_SERVICE.to_owned(),
+        reason: "I2.22 forbids the repository target/ directory for a governed instrument, and \
+                 the engine patch/verifier lane holds no BuildFingerprint candidate identity, \
+                 contract revision, toolchain, target or environment class to derive a governed \
+                 target root from; refusing rather than inventing them (issue #1897 AUD7)"
+            .to_owned(),
+    }
+}
+
+/// Runs one bounded command.
+///
+/// Cargo is refused here rather than bound to `cwd.join("target")`: this module
+/// is the only launch site for the engine patch/verifier lane, it holds no
+/// admitted `GovernedWorkEnvelope`, and no reachable producer supplies the
+/// fingerprint fields one needs. [`governed_lane_refusal`] records exactly
+/// which producer is missing. Every other program is unaffected; `git apply`
+/// does not write to a target directory.
 async fn run_bounded_command<S>(
     program: &str,
     args: &[S],
@@ -1243,6 +1351,9 @@ async fn run_bounded_command<S>(
 where
     S: AsRef<str>,
 {
+    if program == "cargo" {
+        return Err(governed_lane_refusal());
+    }
     let started = Instant::now();
     let mut command = Command::new(program);
     command
@@ -1252,9 +1363,6 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if program == "cargo" {
-        command.env("CARGO_TARGET_DIR", cwd.join("target"));
-    }
     let child = command.spawn()?;
     let result = tokio::time::timeout(
         StdDuration::from_secs(timeout_seconds.max(1)),
