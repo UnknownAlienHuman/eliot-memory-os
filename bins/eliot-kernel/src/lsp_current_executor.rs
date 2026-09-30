@@ -268,7 +268,7 @@ impl AsyncProcessRunner for KernelGitProcessRunner {
                 .admissions
                 .admit_git_command(exe, args, cwd, stdin, profile)
                 .await?;
-            validate_git_admission(&admission, exe, args, cwd, profile)?;
+            validate_git_admission(&admission, &identity, exe, args, cwd, profile)?;
             let deadline_unix_ms = identity.deadline_unix_ms;
             let stdout_limit = admission.intent().resource_limits().stdout_bytes();
             let stderr_limit = admission.intent().resource_limits().stderr_bytes();
@@ -540,6 +540,7 @@ fn owner_rejection(rejection: ProcessExecutionRejection) -> LspProcessOwnerError
 
 fn validate_git_admission(
     admission: &ProcessExecutionAdmissionRequest,
+    identity: &RequestIdentity,
     exe: &str,
     args: &[&str],
     cwd: &Path,
@@ -548,7 +549,11 @@ fn validate_git_admission(
     admission.validate().map_err(|error| {
         git_rejection("GIT_ADMISSION_INVALID", &error.to_string())
     })?;
+    identity.validate().map_err(|error| {
+        git_rejection("GIT_IDENTITY_INVALID", &error.to_string())
+    })?;
     let intent = admission.intent();
+    let operation_id = intent.operation_id().as_str();
     let expected_cwd = cwd.to_str().ok_or_else(|| {
         git_rejection("GIT_WORKSPACE_PATH_INVALID", "Git workspace path is not UTF-8")
     })?;
@@ -562,7 +567,15 @@ fn validate_git_admission(
         }))
         .transpose()?;
     let actual_index = intent.environment().non_secret().get("GIT_INDEX_FILE");
-    if !exe.eq_ignore_ascii_case("git")
+    if identity.request.metadata.request_id.as_str() != operation_id
+        || identity.deadline_unix_ms != admission.deadline_unix_ms()
+        || !admission
+            .state_fence()
+            .authority_epoch()
+            .is_same_authority(&identity.request.state_fence.authority_epoch)
+        || admission.state_fence().generation().get()
+            != identity.request.state_fence.resource_generation.value()
+        || !exe.eq_ignore_ascii_case("git")
         || !executable_name.is_some_and(|name| name.eq_ignore_ascii_case("git"))
         || intent.argv() != args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()
         || intent.working_directory() != expected_cwd
