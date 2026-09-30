@@ -2408,9 +2408,36 @@ impl KernelStoreGateway {
             ));
         };
         let operation_id = user_automation_obligation_operation_id(obligation)?;
-        for target in [HostRequestState::Admitted, HostRequestState::Routed] {
-            match ors.advance_host_request(&operation_id, &obligation.request_digest, target, None)
-            {
+        let Some(existing) = ors
+            .load_host_request(&operation_id, &obligation.request_digest)
+            .map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the retained horizon obligation could not be read: {error}"),
+                )
+            })?
+        else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "the retained horizon obligation record disappeared before its possible owner effect \
+                 could be recorded"
+                    .to_owned(),
+            ));
+        };
+        // Only the edges this row has not already taken are walked. A record
+        // that already reached `Routed` proves the possible effect durably, and
+        // this contour never moves a row backward out of it.
+        let mut target = existing.state;
+        for next in [
+            HostRequestState::Admitted,
+            HostRequestState::Routed,
+            HostRequestState::Routed,
+        ] {
+            if target == HostRequestState::Routed {
+                break;
+            }
+            target = next;
+            match ors.advance_host_request(&operation_id, &obligation.request_digest, target, None) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     return Err(unretained_obligation_reason(
@@ -2430,6 +2457,14 @@ impl KernelStoreGateway {
                     ));
                 }
             }
+        }
+        if target != HostRequestState::Routed {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "the retained wake horizon obligation could not reach a durable possible-effect \
+                 state before the schedule owner handoff"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
