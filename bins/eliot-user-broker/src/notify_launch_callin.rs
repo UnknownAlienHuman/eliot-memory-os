@@ -218,6 +218,17 @@ pub fn resolve_broker_notify_launch(
 /// fallback route (one installed image, one record).
 const NOTIFY_DECLARATION_RELATIVE: &str = "Eliot/notify/watchdog-verification.json";
 
+/// Stable deferral code for a declaration path this broker could not probe.
+///
+/// It is deliberately the SAME code the sibling fallback ensure uses for its
+/// own unprobeable contour ([`crate::NotifyFallbackDeclaration::Unreadable`]
+/// maps to that ensure's `DECLARATION_UNREADABLE`). The two staging paths read
+/// ONE installer-published record, so an operator who cannot traverse the
+/// per-user contour must be told the same thing whichever half of the broker
+/// is reporting — not "the installer published nothing" on one path and
+/// "deferred" on the other for the same unreadable file.
+const DECLARATION_UNREADABLE: &str = "DECLARATION_UNREADABLE";
+
 /// Upper bound for the single protected declaration lease read at the broker
 /// edge. The record is a small fixed-field JSON document; anything larger
 /// fails closed before parsing.
@@ -552,8 +563,10 @@ pub fn render_notify_deliver_line(delivery: &NotifyDeliver) -> Result<String, Br
 /// retains the verified launch inputs that
 /// [`crate::BrokerComposition::launch_notify`] later spawns.
 /// Best-effort and infallible by design — like the fallback ensure, staging
-/// must never fail broker startup. Absence skips explicitly; staging failure
-/// defers with a stable code and retains no reference.
+/// must never fail broker startup. Only a proven-absent declaration skips
+/// explicitly; a declaration this broker cannot PROBE or read defers under the
+/// named reason and retries on the next start. No outcome retains a reference,
+/// so an unverified image can never be launched as a notification adapter.
 pub fn stage_normal_notify_launch(
     composition: &crate::BrokerComposition,
 ) -> BrokerNotifyLaunchAuthority {
@@ -563,18 +576,46 @@ pub fn stage_normal_notify_launch(
             reason: "PROTECTED",
         });
     };
-    if !std::path::Path::new(&path).exists() {
-        return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::SkippedNoDeclaration);
+    // `Path::exists` answers "is it absent?" for EVERY failure alike — a denied
+    // traversal of this user's protected ProgramData contour, a dangling
+    // reparse point, a reparse loop, a mid-rename race — so it cannot tell a
+    // record that was never published from a record this broker is not allowed
+    // to read. `SkippedNoDeclaration` asserts the installer published nothing,
+    // is byte-identical on every subsequent broker start, and is not retried as
+    // a fault, so a broker that merely cannot traverse the contour would
+    // permanently report that normal notification is permanently out of scope
+    // and never retry. Inability to establish the fact is its own state with a
+    // named reason, so only a `NotFound` may skip; every other observation
+    // defers under `DECLARATION_UNREADABLE` and retries on the next start.
+    //
+    // This mirrors [`crate::NotifyFallbackDeclaration::Unreadable`] on the
+    // sibling fallback trigger, which reads the SAME record: the two halves of
+    // one broker start must not disagree about whether it exists.
+    match std::fs::metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return BrokerNotifyLaunchAuthority::unstaged(
+                NotifyLaunchStage::SkippedNoDeclaration,
+            );
+        }
+        Err(_) => {
+            return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
+                reason: DECLARATION_UNREADABLE,
+            });
+        }
     }
+    // From here the record is known to EXIST, so a lease or read that fails is
+    // never absence either: it is an unreadable file that is present, which is
+    // the same named fact as an unreadable contour.
     let Ok(lease) = eliot_platform_windows::ProtectedPathLease::open_existing_absolute(&path)
     else {
         return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
-            reason: "PROTECTED",
+            reason: DECLARATION_UNREADABLE,
         });
     };
     let Ok(bytes) = lease.read_bounded(DECLARATION_BYTES_LIMIT) else {
         return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
-            reason: "PROTECTED",
+            reason: DECLARATION_UNREADABLE,
         });
     };
     match composition.resolve_notify_launch(&bytes) {
