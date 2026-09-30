@@ -1,8 +1,8 @@
 //! Durable non-truth observability contracts.
 
 use crate::{
-    ul::injection::MEMORY_INFLUENCE_ACK_FIELDS, MemoryInfluenceAckInput, MemoryInfluenceClass,
-    MemoryInfluenceTrace, MemoryRevision, ProjectId, SessionId, TaskId, WriteId,
+    MemoryInfluenceAckInput, MemoryInfluenceClass, MemoryInfluenceTrace, MemoryRevision, ProjectId,
+    SessionId, TaskId, WriteId, ul::injection::MEMORY_INFLUENCE_ACK_FIELDS,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -250,7 +250,7 @@ impl<'de> serde::de::Visitor<'de> for MemoryInfluenceToolInputVisitor {
                 }
                 _ => {
                     map.next_value::<serde::de::IgnoredAny>()?;
-                    foreign_key = foreign_key.or(key);
+                    foreign_key.get_or_insert(key);
                 }
             }
         }
