@@ -98,7 +98,7 @@ fn supervision_lease_operation_context(ticket: &SupervisionLeaseCommitTicket) ->
         Some(ticket.operation_id.as_str()),
         Some(&generation),
         state_fence.as_deref(),
-        epoch_digest.as_ref().map(|epoch| epoch.as_str()),
+        epoch_digest.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
     );
     record_supervision_ticket_context(&context, ticket);
     context
@@ -214,7 +214,7 @@ fn supervision_expiry_operation_context(
         None,
         Some(&generation),
         state_fence.as_deref(),
-        epoch_digest.as_ref().map(|epoch| epoch.as_str()),
+        epoch_digest.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
     );
     let lease = bound_field(supervision_lease_id);
     context.record("lease", lease.text());
@@ -231,6 +231,15 @@ fn supervision_authority_terminal_code(error: &SupervisionLeaseAuthorityError) -
         SupervisionLeaseAuthorityError::Configuration(_) => "SUPERVISION_CONFIGURATION",
         SupervisionLeaseAuthorityError::ProtectedKeyUnavailable => "SUPERVISION_KEY_UNAVAILABLE",
         SupervisionLeaseAuthorityError::Contract(_) => "SUPERVISION_CONTRACT",
+        SupervisionLeaseAuthorityError::Ors(
+            OrsError::DuplicateConflict | OrsError::SupervisionLeaseTicketConflict,
+        ) => "SUPERVISION_IDENTITY_CONFLICT",
+        SupervisionLeaseAuthorityError::Ors(OrsError::SupervisionLeaseStaleRevision) => {
+            "SUPERVISION_STALE_REVISION"
+        }
+        SupervisionLeaseAuthorityError::Ors(OrsError::SupervisionLeaseTicketExpired) => {
+            "SUPERVISION_TICKET_EXPIRED"
+        }
         SupervisionLeaseAuthorityError::Ors(_) => "SUPERVISION_ORS",
     }
 }
@@ -1025,13 +1034,12 @@ impl KernelSupervisionLeaseAuthority {
         supplied_context: Option<&tracing::Span>,
     ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
         let owned_context;
-        let context = match supplied_context {
-            Some(context) => context,
-            None => {
-                owned_context =
-                    supervision_expiry_operation_context(supervision_lease_id, expected_fence);
-                &owned_context
-            }
+        let context = if let Some(context) = supplied_context {
+            context
+        } else {
+            owned_context =
+                supervision_expiry_operation_context(supervision_lease_id, expected_fence);
+            &owned_context
         };
         let record_ticket_operation = supplied_context.is_none();
         let mut child_terminal_owned = false;
