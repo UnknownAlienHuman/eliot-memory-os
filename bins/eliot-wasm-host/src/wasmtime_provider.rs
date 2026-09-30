@@ -27,6 +27,18 @@ const RUN_EXPORT: &str = "run";
 /// claimed by carrying it.
 const ENGINE_FIXTURE_IDENTITY: &[u8] = b"wasmtime-component/47.0.4";
 pub(crate) const PROVIDER_STACK_SIZE: usize = 8 * 1024;
+/// Fixed memory-COUNT ceiling for the provider Store. `InvocationLimits`
+/// bounds memory bytes and instance count but carries no memory count, so
+/// the provider fixes it here. Forwarded through
+/// `ResourceLimiter::memories` so `Store::limiter` snapshots it as the hard
+/// store limit; caller-supplied counts are never accepted, so an
+/// unknown/invalid count cannot become unlimited.
+pub(crate) const PROVIDER_MAX_MEMORIES: usize = 1;
+/// Fixed table-COUNT ceiling for the provider Store. `InvocationLimits`
+/// bounds table elements and instance count but carries no table count, so
+/// the provider fixes it here. Forwarded through `ResourceLimiter::tables`
+/// for the same snapshot reason as [`PROVIDER_MAX_MEMORIES`].
+pub(crate) const PROVIDER_MAX_TABLES: usize = 1;
 const EPOCH_DRIVER_THREAD_PREFIX: &str = "eliot-wasm-epoch";
 #[cfg(test)]
 const COMPONENT_CONFIGURATION: &[u8] =
@@ -117,6 +129,14 @@ impl ResourceLimiter for StoreState {
 
     fn instances(&self) -> usize {
         self.limits.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.limits.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.limits.memories()
     }
 }
 
@@ -403,9 +423,11 @@ impl WasmtimeComponentEngine {
             StoreState {
                 limits: StoreLimitsBuilder::new()
                     .memory_size(usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX))
+                    .memories(PROVIDER_MAX_MEMORIES)
                     .table_elements(
                         usize::try_from(limits.max_table_elements).unwrap_or(usize::MAX),
                     )
+                    .tables(PROVIDER_MAX_TABLES)
                     .instances(usize::try_from(limits.max_instances).unwrap_or(usize::MAX))
                     .build(),
                 peak_memory_bytes: None,
@@ -695,7 +717,7 @@ pub fn provider_configuration_digest() -> Sha256Digest {
 }
 
 fn canonical_configuration_descriptor() -> &'static [u8] {
-    b"wasmtime=47.0.4;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;max_epoch_deadline_ticks=1024;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
+    b"wasmtime=47.0.4;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;max_memories=1;max_tables=1;max_epoch_deadline_ticks=1024;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
 }
 
 fn configured_engine(consume_fuel: bool) -> Result<Engine, WasmtimeBuildError> {
