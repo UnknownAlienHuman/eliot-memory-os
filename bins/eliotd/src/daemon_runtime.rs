@@ -6750,10 +6750,9 @@ fn decide_watchdog_export_drain_tick(
 ///
 /// Two phases, matching the phase split the other owner drains already use: the
 /// Kernel claim runs with no composition guard held, and only the admission
-/// itself runs under it. Nothing here decides a cursor: the step admits the
-/// window, derives the terminal dispositions from the canonical receipts the
-/// Governor actually issued, and records those dispositions back through Kernel
-/// so the Watchdog's next replay of the same immutable window can answer them.
+/// itself runs under it. The admission and the result recording are the
+/// library's [`eliotd::DaemonComposition::admit_and_record_watchdog_export`];
+/// this flight owns the one-in-flight decision and nothing else.
 async fn run_watchdog_export_drain(
     kernel: &DaemonKernelClient,
     composition: SharedComposition,
@@ -6761,6 +6760,8 @@ async fn run_watchdog_export_drain(
     // #740-style receipt span over the claim/admit/record step. Counts are
     // named; digests and payload bytes never are.
     let _span = tracing::info_span!("eliotd.watchdog_export_drain").entered();
+    // Phase (b): no composition guard. A null poll backs the tick off until the
+    // Watchdog submits the next window.
     let Some(batch) = kernel
         .claim_watchdog_export_batch_async()
         .await
@@ -6768,41 +6769,37 @@ async fn run_watchdog_export_drain(
     else {
         return Ok(WatchdogExportDrainCompletion::Idle);
     };
-    let entries = batch.entries.len();
-    let acknowledgement = {
+    // Phase (c): guard held for the admission and the result recording only.
+    let step = {
         let guard = composition.lock().await;
-        crate::observation_adapters::admit_claimed_watchdog_export(&guard, &batch).await?
+        guard
+            .admit_and_record_watchdog_export(kernel, &batch)
+            .await?
     };
-    let result = crate::daemon_kernel_client::watchdog_export_result_for_acknowledgement(
-        &batch,
-        &acknowledgement,
-    )?;
-    // No terminal outcome means the Governor decided nothing yet. Nothing is
-    // submitted, so the window stays pending and the Watchdog's cursor does not
-    // move; the next tick re-claims it and the admission replays the same
-    // receipts.
-    let Some(result) = result else {
+    if step.terminal == 0 {
+        // No terminal outcome means the Governor decided nothing yet. Nothing
+        // was submitted, so the window stays pending and the Watchdog's cursor
+        // does not move; the next tick re-claims it and the admission replays
+        // the same receipts.
         tracing::info!(
             target: "eliotd::diagnostics",
             event = "eliotd.watchdog_export_drain_pending",
-            entries,
+            entries = step.entries,
             "the Governor admitted the drain window but decided no terminal entry; the window stays pending"
         );
-        return Ok(WatchdogExportDrainCompletion::Recorded { entries, terminal: 0 });
-    };
-    let terminal = result.outcomes.len();
-    kernel
-        .submit_watchdog_export_result_async(&result)
-        .await
-        .map_err(|error| format!("Watchdog spool drain result: {error}"))?;
-    tracing::info!(
-        target: "eliotd::diagnostics",
-        event = "eliotd.watchdog_export_drain_recorded",
-        entries,
-        terminal,
-        "the Governor recorded terminal dispositions for the claimed Watchdog spool drain window"
-    );
-    Ok(WatchdogExportDrainCompletion::Recorded { entries, terminal })
+    } else {
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.watchdog_export_drain_recorded",
+            entries = step.entries,
+            terminal = step.terminal,
+            "the Governor recorded terminal dispositions for the claimed Watchdog spool drain window"
+        );
+    }
+    Ok(WatchdogExportDrainCompletion::Recorded {
+        entries: step.entries,
+        terminal: step.terminal,
+    })
 }
 
 /// Starts one Watchdog spool-drain step when its flight is idle. Checked on the

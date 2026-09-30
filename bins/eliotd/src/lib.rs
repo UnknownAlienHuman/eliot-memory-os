@@ -229,6 +229,8 @@ pub use daemon_kernel_client::{
     ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
     ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
+#[cfg(windows)]
+pub use observation_adapters::WatchdogExportDrainStep;
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
 #[cfg(windows)]

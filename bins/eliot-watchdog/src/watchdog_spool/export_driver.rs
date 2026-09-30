@@ -856,8 +856,6 @@ fn acknowledgement_from_kernel_outcome(
     payload: &WatchdogSpoolExportBatchPayload,
     schema_version: u16,
 ) -> Result<WatchdogSpoolAcknowledgement, SpoolError> {
-    use eliot_watchdog_core::{WatchdogSpoolEntryDisposition, WatchdogSpoolSinkDisposition};
-
     if outcome.get("status").and_then(serde_json::Value::as_str) != Some("known") {
         return Err(SpoolError::LeaseFenced(
             "Kernel did not return a known export outcome".to_owned(),
@@ -891,73 +889,7 @@ fn acknowledgement_from_kernel_outcome(
         .iter()
         .zip(&payload.entries)
         .map(|(projection, submitted)| {
-            if projection
-                .get("sequence")
-                .and_then(serde_json::Value::as_u64)
-                != Some(submitted.sequence)
-                || projection
-                    .get("idempotency_key")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(submitted.idempotency_key.as_str())
-                || projection
-                    .get("entry_kind")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(submitted.entry_kind.as_str())
-                || projection
-                    .get("record_digest")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(submitted.record_digest.as_str())
-                || projection
-                    .get("payload_digest")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(submitted.payload_digest.as_str())
-                || projection
-                    .get("operation_id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(str::is_empty)
-                || projection
-                    .get("admitted_now")
-                    .and_then(serde_json::Value::as_bool)
-                    .is_none()
-            {
-                return Err(SpoolError::LeaseFenced(
-                    "Kernel export projection did not bind the exact retained record".to_owned(),
-                ));
-            }
-            // Only the Governor's own recorded terminal disposition may answer an
-            // entry. While the durable record is a pending projection with no
-            // recorded outcome, the honest sink disposition is the non-terminal
-            // `AdmittedCandidate`, which this owner refuses to advance on: the
-            // window replays and the cursor stays exactly where it is.
-            let disposition = match projection.get("outcome") {
-                None | Some(serde_json::Value::Null) => {
-                    if projection.get("state").and_then(serde_json::Value::as_str)
-                        != Some("ADMITTED")
-                    {
-                        return Err(SpoolError::LeaseFenced(
-                            "Kernel export projection reported no outcome for an undecided record"
-                                .to_owned(),
-                        ));
-                    }
-                    WatchdogSpoolSinkDisposition::AdmittedCandidate
-                }
-                Some(outcome) => {
-                    if projection.get("state").and_then(serde_json::Value::as_str)
-                        != Some("RESULT_RECEIVED")
-                    {
-                        return Err(SpoolError::LeaseFenced(
-                            "Kernel export projection reported an outcome for an undecided record"
-                                .to_owned(),
-                        ));
-                    }
-                    terminal_disposition_from_kernel_outcome(outcome)?
-                }
-            };
-            Ok(WatchdogSpoolEntryDisposition {
-                sequence: submitted.sequence,
-                disposition,
-                record_digest: submitted.record_digest.clone(),
-            })
+            entry_disposition_from_export_projection(projection, submitted)
         })
         .collect::<Result<Vec<_>, SpoolError>>()
         .map(|dispositions| WatchdogSpoolAcknowledgement {
@@ -973,6 +905,87 @@ fn acknowledgement_from_kernel_outcome(
             installation_id: payload.installation_id.clone(),
             dispositions,
         })
+}
+
+/// Projects one answered export entry onto its sink-owned disposition.
+///
+/// This is the one per-entry concern [`acknowledgement_from_kernel_outcome`]
+/// delegates, and the two halves are kept together because they are one proof:
+/// the projection must first bind the exact retained record this owner
+/// submitted, and only then may its durable state decide which disposition is
+/// honest. Reading a disposition off a projection that names a different
+/// sequence, kind, or digest would advance the cursor on someone else's record.
+fn entry_disposition_from_export_projection(
+    projection: &serde_json::Value,
+    submitted: &WatchdogSpoolExportSubmission,
+) -> Result<WatchdogSpoolEntryDisposition, SpoolError> {
+    use eliot_watchdog_core::{WatchdogSpoolEntryDisposition, WatchdogSpoolSinkDisposition};
+
+    if projection
+        .get("sequence")
+        .and_then(serde_json::Value::as_u64)
+        != Some(submitted.sequence)
+        || projection
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str)
+            != Some(submitted.idempotency_key.as_str())
+        || projection
+            .get("entry_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some(submitted.entry_kind.as_str())
+        || projection
+            .get("record_digest")
+            .and_then(serde_json::Value::as_str)
+            != Some(submitted.record_digest.as_str())
+        || projection
+            .get("payload_digest")
+            .and_then(serde_json::Value::as_str)
+            != Some(submitted.payload_digest.as_str())
+        || projection
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        || projection
+            .get("admitted_now")
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel export projection did not bind the exact retained record".to_owned(),
+        ));
+    }
+    // Only the Governor's own recorded terminal disposition may answer an entry.
+    // While the durable record is a pending projection with no recorded outcome,
+    // the honest sink disposition is the non-terminal `AdmittedCandidate`, which
+    // this owner refuses to advance on: the window replays and the cursor stays
+    // exactly where it is.
+    let disposition = match projection.get("outcome") {
+        None | Some(serde_json::Value::Null) => {
+            if projection.get("state").and_then(serde_json::Value::as_str) != Some("ADMITTED") {
+                return Err(SpoolError::LeaseFenced(
+                    "Kernel export projection reported no outcome for an undecided record"
+                        .to_owned(),
+                ));
+            }
+            WatchdogSpoolSinkDisposition::AdmittedCandidate
+        }
+        Some(outcome) => {
+            if projection.get("state").and_then(serde_json::Value::as_str)
+                != Some("RESULT_RECEIVED")
+            {
+                return Err(SpoolError::LeaseFenced(
+                    "Kernel export projection reported an outcome for an undecided record"
+                        .to_owned(),
+                ));
+            }
+            terminal_disposition_from_kernel_outcome(outcome)?
+        }
+    };
+    Ok(WatchdogSpoolEntryDisposition {
+        sequence: submitted.sequence,
+        disposition,
+        record_digest: submitted.record_digest.clone(),
+    })
 }
 
 /// Decodes the one closed terminal disposition the Governor recorded.

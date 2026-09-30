@@ -8158,7 +8158,7 @@ fn watchdog_export_projection_record(
         // The exact submitted entry and its batch envelope are committed with
         // this row, so the later Governor admission reads the original bytes off
         // the durable record rather than from a queue copy.
-        payload_schema_id: label(eliot_protocol::WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID)?,
+        payload_schema_id: Some(label(eliot_protocol::WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID)?),
         payload_body: Some(body),
         connection_ref: label(&payload.sink_id)?,
         session_ref: None,

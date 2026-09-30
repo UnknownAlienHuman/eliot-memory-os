@@ -226,6 +226,86 @@ pub fn acknowledgement_for_batch(
     }
 }
 
+/// What one Watchdog spool-drain step decided about the window it claimed.
+///
+/// Counts only: the durable owner of one export entry is its ORS record and
+/// the Governor's canonical receipt, and neither this struct nor its caller may
+/// state a per-entry outcome that the Governor did not itself record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WatchdogExportDrainStep {
+    /// Entries the Kernel served in the claimed window.
+    pub entries: usize,
+    /// How many of those entries the Governor decided terminally this step.
+    ///
+    /// Fewer than `entries` means the Governor decided nothing yet for the
+    /// rest: those entries stay pending and the Watchdog's cursor stays exactly
+    /// where its own owner left it.
+    pub terminal: usize,
+}
+
+impl super::DaemonComposition {
+    /// Admits one claimed Watchdog spool export window and records the
+    /// Governor's own terminal dispositions for it.
+    ///
+    /// This is the production caller of the module's
+    /// `admit_claimed_watchdog_export` and of the kernel client's
+    /// `watchdog_export_result_for_acknowledgement`, and therefore the production
+    /// caller of [`ForwardingObservationReconciliation::admit_watchdog_batch`]
+    /// and, through it, of the Governor's own
+    /// `GovernorObservationReconciliation::admit_watchdog_batch`.
+    ///
+    /// The claim itself deliberately does **not** live here: the daemon flight
+    /// polls the Kernel for the next window before it takes the composition
+    /// guard, so one bounded step cannot stall every other task waiting on that
+    /// lock behind a Kernel round trip. Only the admission and the result
+    /// recording run under the guard, and both are narrow.
+    ///
+    /// Nothing here decides a cursor. The step admits the window, derives the
+    /// terminal dispositions from the canonical receipts the Governor actually
+    /// issued, and records those dispositions back through Kernel so the
+    /// Watchdog's next replay of the same immutable window can answer them. An
+    /// undecided entry produces no outcome at all, because the closed result
+    /// vocabulary has no "not yet" value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the composition's readiness refusal, the Governor's typed
+    /// [`CompositionError`], or a protocol refusal when the publication
+    /// identity is not a valid contract value, each with its own reason text.
+    /// Every one of those is a refusal, not a publication: the window stays
+    /// pending and the Watchdog replays it.
+    #[cfg(windows)]
+    pub async fn admit_and_record_watchdog_export(
+        &self,
+        kernel: &super::DaemonKernelClient,
+        batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
+    ) -> Result<WatchdogExportDrainStep, String> {
+        let entries = batch.entries.len();
+        let acknowledgement = admit_claimed_watchdog_export(self, batch).await?;
+        let Some(result) =
+            crate::daemon_kernel_client::watchdog_export_result_for_acknowledgement(
+                batch,
+                &acknowledgement,
+            )?
+        else {
+            // The Governor admitted the window but decided no entry terminally.
+            // Nothing is submitted, so the durable rows stay pending and the
+            // Watchdog's cursor does not move; the next tick re-claims the same
+            // window and the admission replays the same receipts.
+            return Ok(WatchdogExportDrainStep {
+                entries,
+                terminal: 0,
+            });
+        };
+        let terminal = result.outcomes.len();
+        kernel
+            .submit_watchdog_export_result_async(&result)
+            .await
+            .map_err(|error| format!("Watchdog spool drain result: {error}"))?;
+        Ok(WatchdogExportDrainStep { entries, terminal })
+    }
+}
+
 /// Admits one claimed Watchdog spool export window through the Governor's
 /// canonical observation path and returns the exact sink-owned acknowledgement.
 ///
@@ -254,7 +334,8 @@ pub fn acknowledgement_for_batch(
 /// [`CompositionError`], or a protocol refusal when the publication identity is
 /// not a valid contract value. Every one of those is a refusal, not a
 /// publication: the window stays pending and is replayed by the next tick.
-pub async fn admit_claimed_watchdog_export(
+#[cfg(windows)]
+async fn admit_claimed_watchdog_export(
     composition: &super::DaemonComposition,
     batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
 ) -> Result<eliot_watchdog_core::WatchdogSpoolAcknowledgement, String> {
@@ -318,6 +399,7 @@ pub async fn admit_claimed_watchdog_export(
 /// The window is already freshness-bounded by the Watchdog owner's own export
 /// window, so this is a transport deadline, not a semantic one: it exists so a
 /// stuck canonical commit cannot hold the single in-flight drain step open.
+#[cfg(windows)]
 const WATCHDOG_DRAIN_ADMIT_DEADLINE_MS: u64 = 30_000;
 
 /// Forwards one Watchdog export batch through the live disposition mapping.
