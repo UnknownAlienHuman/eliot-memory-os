@@ -674,6 +674,10 @@ impl RetentionReleaseProof {
 /// Both settlement constructors converge here, so gateway identity, digest,
 /// downstream retention, and authorization time are checked once for every
 /// release. Every error authorizes nothing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the release proof binds eight independent settlement dimensions exactly once"
+)]
 fn authorize_inner(
     gateway_id: &str,
     authorization_digest: &str,
