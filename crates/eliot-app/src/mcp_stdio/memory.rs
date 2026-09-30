@@ -755,6 +755,7 @@ pub(crate) fn canonical_utility_sources(
             let mut target_refs = BTreeSet::new();
             target_refs.insert(record.subject_ref.clone());
             collect_memory_target_refs(&record.receipt_body, None, &mut target_refs);
+            let measurement = canonical_memory_payload_measurement(&record.receipt_body)?;
             Ok(MemoryUtilitySourceRecord {
                 record_ref: format!("canonical:{}", record.record_id),
                 record_kind: record.receipt_kind.clone(),
@@ -763,7 +764,7 @@ pub(crate) fn canonical_utility_sources(
                 payload: record.receipt_body.clone(),
                 memory_revision: record.memory_revision,
                 project_sequence: record.project_sequence,
-                serialized_bytes: u64::try_from(serde_json::to_vec(&record.receipt_body)?.len())?,
+                serialized_bytes: measurement.byte_len,
             })
         })
         .collect()
@@ -877,7 +878,7 @@ pub(crate) fn canonical_distillation_items(
                     role.as_str(),
                     "counterexample" | "minority" | "audit_history" | "current_truth"
                 );
-            let serialized_bytes = u64::try_from(serde_json::to_vec(&record.receipt_body)?.len())?;
+            let measurement = canonical_memory_payload_measurement(&record.receipt_body)?;
             let mut evidence_refs =
                 distillation_strings(metadata, &record.receipt_body, "evidence_refs");
             evidence_refs.push(format!("receipt:{}", record.canonical_receipt.receipt_id));
@@ -914,7 +915,7 @@ pub(crate) fn canonical_distillation_items(
                     .copied()
                     .unwrap_or(MemoryLifecycleState::Active),
                 status,
-                token_units: serialized_bytes.div_ceil(4).max(1),
+                token_units: measurement.stu_estimate,
                 current_truth,
                 negative_memory,
                 protected,
