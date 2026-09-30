@@ -594,8 +594,17 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// installed under an older registry cannot stay generally deliverable
     /// without a display call ever reaching them. Quarantined entries are
     /// left untouched; already-stale entries report no change. Returns the
-    /// count of newly staled entries. Synchronous: each guard is taken and
-    /// dropped in a closed scope and never crosses an await.
+    /// count of newly staled entries. Tool and definition legs only: both
+    /// read the live Governor-admitted canonical source through
+    /// `eliot_governor::canonical_skill_tool_source`, never a cached copy.
+    /// The dependency-set and host/profile legs of `LiveSkillWorld` have no
+    /// producer on main — install pins arrive wire-carried
+    /// (`CatalogueInstallContext` crosses as JSON), `ClientHello` carries no
+    /// dep/host/profile fields, and the host owner records no version
+    /// strings — so the full `reconcile_staleness` sweep stays STITCH rather
+    /// than comparing presented material against itself. Synchronous: each
+    /// guard is taken and dropped in a closed scope and never crosses an
+    /// await.
     pub(crate) fn reconcile_tool_basis(
         &self,
         source: &dyn CanonicalToolSource,
