@@ -109,10 +109,10 @@ impl EventCounts {
     }
 
     fn validate(&self) -> Result<(), EvaluationContractError> {
-        if self.accounted()? > self.received {
+        if self.accounted()? != self.received {
             return Err(EvaluationContractError::EvidenceState {
                 field: "counts.received/applied/rejected/unknown",
-                reason: "applied, rejected and unknown cannot exceed received",
+                reason: "applied, rejected and unknown must fully account received events",
             });
         }
         Ok(())
@@ -613,10 +613,12 @@ impl<'a> BoundComplianceInputs<'a> {
 
 /// Derives a [`HostObservedComplianceTrace`] from bound manifest and
 /// evidence only. The binding is verified by
-/// [`BoundComplianceInputs::bind`]; the derived trace is re-validated before
-/// it is returned, so an invalid or unbound pair fails typed instead of
-/// producing a valid `PASS`. This is the single derivation scheme: no
-/// unbound manifest plus evidence pair can produce a trace.
+/// [`BoundComplianceInputs::bind`]; the derived trace carries the bound
+/// allowed-manifest revision (refused typed when it does not, so the check
+/// holds in release builds too, not only under `debug_assertions`) and is
+/// re-validated before it is returned, so an invalid or unbound pair fails
+/// typed instead of producing a valid `PASS`. This is the single derivation
+/// scheme: no unbound manifest plus evidence pair can produce a trace.
 ///
 /// Classification, in order: forbidden tool action yields `FAIL`;
 /// undeclared or hidden access, out-of-namespace write, blind interval, or
@@ -630,11 +632,13 @@ pub fn derive_compliance_trace(
     inputs: &BoundComplianceInputs<'_>,
 ) -> Result<HostObservedComplianceTrace, EvaluationContractError> {
     let trace = derive_core(inputs.manifest, inputs.evidence);
+    if trace.permitted_manifest_digest != inputs.allowed_manifest_digest {
+        return Err(EvaluationContractError::EvidenceState {
+            field: "trace.permitted_manifest_digest",
+            reason: "derived trace does not carry the bound allowed manifest revision",
+        });
+    }
     trace.validate()?;
-    debug_assert_eq!(
-        trace.permitted_manifest_digest, inputs.allowed_manifest_digest,
-        "bound derivation must carry the allowed manifest revision",
-    );
     Ok(trace)
 }
 
@@ -849,11 +853,14 @@ pub fn coverage_percentage_for_proof(
 }
 
 /// Returns a coverage percentage only for `source_class` in a valid, declared
-/// complete denominator with continuous cursors, a consistent numerator, and
-/// a caller total that equals the checked manifest received count; otherwise
-/// returns `None`. A numerator above the denominator is inconsistent
-/// evidence, never a valid claim above 100 %, and an arbitrary denominator
-/// is refused even when `covered <= total` holds.
+/// complete single-stream denominator with continuous cursors, a consistent
+/// numerator, and a caller total that equals the checked manifest received
+/// count; otherwise returns `None`. A numerator above the denominator is
+/// inconsistent evidence, never a valid claim above 100 %, and an arbitrary
+/// denominator is refused even when `covered <= total` holds. A multi-stream
+/// denominator refuses here because the global received count cannot bind a
+/// per-source claim to its exact stream interval; that claim requires the
+/// typed [`CoverageDenominatorProof`] via [`coverage_percentage_for_proof`].
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn coverage_percentage(
@@ -863,6 +870,9 @@ pub fn coverage_percentage(
     total: u64,
 ) -> Option<f64> {
     if !complete_source_class_denominator_admissible(manifest, source_class) || total == 0 {
+        return None;
+    }
+    if manifest.first_and_last_expected_cursors_by_stream.len() != 1 {
         return None;
     }
     if total != manifest.counts.received {
@@ -995,13 +1005,21 @@ impl ComplianceTraceLedger {
 
     /// Retains one validated trace with its source dependencies, supersedes
     /// older versions of the same fingerprint, and returns the assigned
-    /// version. An invalid trace is refused typed and retained nowhere.
+    /// version. An invalid trace is refused typed and retained nowhere, as is
+    /// a version carrying no source dependency: without at least one
+    /// invalidation handle no source change could ever lower the version, so
+    /// dependency-free retention is rejected fail-closed.
     pub fn append(
         &mut self,
         trace: HostObservedComplianceTrace,
         source_dependencies: Vec<String>,
     ) -> Result<u64, EvaluationContractError> {
         trace.validate()?;
+        if source_dependencies.is_empty() {
+            return Err(EvaluationContractError::EmptyCollection {
+                field: "versioned_trace.source_dependencies",
+            });
+        }
         unique_texts(&source_dependencies, "versioned_trace.source_dependencies")?;
         let version = (self.records.len() as u64).checked_add(1).ok_or(
             EvaluationContractError::InvalidInterval {

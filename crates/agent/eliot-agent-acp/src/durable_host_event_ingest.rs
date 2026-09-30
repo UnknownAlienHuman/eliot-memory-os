@@ -57,8 +57,8 @@ use eliot_agent_api::{
 use eliot_contracts::sha256_hex;
 use eliot_evaluation_contracts::{
     CoverageBlindInterval, CoverageCompleteness, DenominatorOrigin, EvaluationContractError,
-    EventCounts, MaterialActionCoverage, ObservationCoverageManifest, RunFingerprint,
-    SequenceFaults, StreamCursorRange,
+    EventCounts, ImmutableHostEvidence, MaterialActionCoverage, ObservationCoverageManifest,
+    ObservedToolCall, RunFingerprint, SequenceFaults, StreamCursorRange,
 };
 use eliot_receipts::ProofCeiling;
 use serde::{Deserialize, Serialize};
@@ -532,13 +532,16 @@ pub struct AllowedHostManifestView<'a> {
 }
 
 /// One committed record resolved to host-observed compliance facts: retained
-/// event identity, normalized envelope digest, bound transformation version,
-/// and the tool or non-tool action identity with its declared/forbidden
-/// decision resolved against the allowed revision.
+/// raw and normalized event identities, normalized envelope digest, bound
+/// transformation version, and the tool or non-tool action identity with its
+/// declared/forbidden decision resolved against the allowed revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedHostRecord {
     /// Sequence within the owning stream.
     pub sequence: u64,
+    /// Immutable hash of the retained original transport bytes (raw event
+    /// identity; a redacted projection hash when the source was redacted).
+    pub transport_hash: String,
     /// Retained normalized event identity.
     pub event_id: String,
     /// Canonical digest of the retained normalized envelope.
@@ -568,6 +571,66 @@ pub struct ResolvedHostComplianceFacts {
     pub stream: StreamCursorState,
     /// One row per committed record, in sequence order.
     pub records: Vec<ResolvedHostRecord>,
+}
+
+impl ResolvedHostComplianceFacts {
+    /// Assembles immutable host evidence from resolved per-stream facts for
+    /// one allowed-manifest revision (issue #1936, I7.23).
+    ///
+    /// Tool rows carry only the retained normalized tool identities with the
+    /// declared/forbidden decisions resolved against the allowed revision in
+    /// [`DurableHostEventJournal::resolve_host_compliance_facts`]; the
+    /// constructor accepts resolved facts alone, so model JSON can never be
+    /// copied into an [`ObservedToolCall`]. Non-tool action identities are
+    /// sorted and deduplicated to satisfy the evidence uniqueness invariant.
+    /// Access, write, and external-effect rows are always empty: retained
+    /// envelopes carry no filesystem path, URL, or effect-route facts, and
+    /// fabricating them would be a self-reported PASS. That host-access
+    /// coverage stays unobservable on the denominator, forcing the derived
+    /// trace to `UNKNOWN` or `TAINTED` instead.
+    ///
+    /// Facts from mixed allowed-manifest revisions fail closed with
+    /// [`IngestError::InvalidInput`]: one evidence value binds exactly one
+    /// revision.
+    pub fn assemble_immutable_evidence(
+        facts: &[ResolvedHostComplianceFacts],
+    ) -> Result<ImmutableHostEvidence, IngestError> {
+        let Some(first) = facts.first() else {
+            return Err(IngestError::InvalidInput("evidence.facts"));
+        };
+        if facts
+            .iter()
+            .any(|candidate| candidate.manifest_digest != first.manifest_digest)
+        {
+            return Err(IngestError::InvalidInput("evidence.manifest_digest"));
+        }
+        let mut observed_tool_calls = Vec::new();
+        let mut observed_non_tool_actions = Vec::new();
+        for candidate in facts {
+            for record in &candidate.records {
+                if let Some(tool_name) = record.tool_name.clone() {
+                    observed_tool_calls.push(ObservedToolCall {
+                        tool_name,
+                        declared: record.declared,
+                        forbidden: record.forbidden,
+                    });
+                }
+                if let Some(action) = record.non_tool_action.clone() {
+                    observed_non_tool_actions.push(action);
+                }
+            }
+        }
+        observed_non_tool_actions.sort();
+        observed_non_tool_actions.dedup();
+        Ok(ImmutableHostEvidence {
+            manifest_digest: first.manifest_digest.clone(),
+            observed_tool_calls,
+            observed_non_tool_actions,
+            accesses: Vec::new(),
+            writes: Vec::new(),
+            external_effects: Vec::new(),
+        })
+    }
 }
 
 /// Caller-declared denominator half of one coverage manifest, joined by
@@ -1174,9 +1237,10 @@ impl DurableHostEventJournal {
     /// Resolves host-observed compliance facts for one stream from retained
     /// immutable records only (issue #1936, I7.23).
     ///
-    /// Every returned fact comes from a committed journal record: the
-    /// retained event identity, the normalized envelope digest, the bound
-    /// transformation version, and the exact stream cursor. Declared and
+    /// Every returned fact comes from a committed journal record: the retained
+    /// raw transport hash and normalized event identity, the normalized
+    /// envelope digest, the bound transformation version, and the exact stream
+    /// cursor. Declared and
     /// forbidden tool facts resolve against the caller-supplied allowed
     /// Tool/Facet manifest revision (`allowed`); tool names are the retained
     /// normalized payload identities, never caller-supplied model JSON. A
@@ -1250,6 +1314,7 @@ impl DurableHostEventJournal {
             };
             records.push(ResolvedHostRecord {
                 sequence: record.sequence,
+                transport_hash: record.transport_hash.as_str().to_owned(),
                 event_id: record.envelope.event_id.as_str().to_owned(),
                 envelope_digest: record.envelope_digest.as_str().to_owned(),
                 transformation_version: record.transformation_version.clone(),
@@ -1278,18 +1343,32 @@ impl DurableHostEventJournal {
     }
 
     /// Measured per-stream expected cursor ranges for one coverage manifest:
-    /// every committed stream binds `1..=last_durable` (commits are
-    /// contiguous from one, and cursor facts are never evicted). No committed
-    /// stream is an invalid plan.
+    /// every committed stream binds its earliest retained committed cursor
+    /// through `last_durable` (commits are contiguous from one, cursor facts
+    /// are never evicted, and acknowledgement compaction evicts only the acked
+    /// prefix, so the retained suffix is exactly the evidence partition the
+    /// denominator may claim). Anchoring at genesis after the acked prefix was
+    /// compacted away would overstate the denominator: the declared range span
+    /// and the received count must agree on the same retained partition. No
+    /// committed stream is an invalid plan.
     fn measured_cursor_ranges(&self) -> Result<Vec<StreamCursorRange>, IngestError> {
         let mut ranges = Vec::new();
         for (stream_id, progress) in &self.progress {
             if progress.last_durable_sequence == 0 {
                 continue;
             }
+            let first_retained = self
+                .records
+                .iter()
+                .filter(|((record_stream, _), record)| {
+                    record_stream == stream_id && record.disposition.committed
+                })
+                .map(|((_, sequence), _)| *sequence)
+                .min()
+                .unwrap_or(1);
             ranges.push(StreamCursorRange {
                 stream: stream_id.clone(),
-                first_expected_cursor: 1,
+                first_expected_cursor: first_retained,
                 last_expected_cursor: progress.last_durable_sequence,
             });
         }
@@ -1315,8 +1394,10 @@ impl DurableHostEventJournal {
     }
 
     /// Measured blind intervals from the retained best-effort drop gaps: one
-    /// localized blind interval per dropped sequence, plus the raw gap count
-    /// for the sequence-fault facts.
+    /// localized blind interval per dropped sequence, plus the matching
+    /// sequence-fault count. The fault count is the deduplicated interval
+    /// count, not the raw gap tally, so a twice-dropped cursor never
+    /// double-counts one blind interval.
     fn measured_blind_intervals(&self) -> (Vec<CoverageBlindInterval>, u64) {
         let mut blind_cursors: Vec<(String, u64, &'static str)> = self
             .dropped_gaps
@@ -1333,7 +1414,7 @@ impl DurableHostEventJournal {
             .collect();
         blind_cursors.sort();
         blind_cursors.dedup_by(|first, second| first.0 == second.0 && first.1 == second.1);
-        let intervals = blind_cursors
+        let intervals: Vec<CoverageBlindInterval> = blind_cursors
             .into_iter()
             .map(|(stream, sequence, reason)| CoverageBlindInterval {
                 stream,
@@ -1342,7 +1423,8 @@ impl DurableHostEventJournal {
                 reason: reason.to_owned(),
             })
             .collect();
-        (intervals, self.dropped_gaps.len() as u64)
+        let gaps = intervals.len() as u64;
+        (intervals, gaps)
     }
 
     /// Constructs and retains the coverage denominator for one
@@ -1350,9 +1432,11 @@ impl DurableHostEventJournal {
     ///
     /// The caller declares the denominator halves the journal cannot observe
     /// ([`CoverageManifestPlan`]); the journal measures the halves it owns:
-    /// per-stream expected cursor ranges from the durable cursors (commits
-    /// are contiguous from one, and cursor facts are never evicted, so each
-    /// committed stream binds `1..=last_durable`), received/applied/unknown
+    /// per-stream expected cursor ranges from the durable cursors (commits are
+    /// contiguous from one, and cursor facts are never evicted, so each
+    /// committed stream binds its earliest retained committed cursor through
+    /// `last_durable`; the ack-compacted prefix is excluded, keeping the
+    /// declared range span and the received count on one retained partition),
     /// counts from the committed records (rejections stay typed
     /// [`IngestError`] returns, never records), sequence gaps from the
     /// retained best-effort drop gaps with one localized blind interval per
