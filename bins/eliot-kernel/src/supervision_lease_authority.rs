@@ -98,7 +98,9 @@ fn supervision_lease_operation_context(ticket: &SupervisionLeaseCommitTicket) ->
         Some(ticket.operation_id.as_str()),
         Some(&generation),
         state_fence.as_deref(),
-        epoch_digest.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
+        epoch_digest
+            .as_ref()
+            .map(eliot_contracts::LowercaseSha256::as_str),
     );
     record_supervision_ticket_context(&context, ticket);
     context
@@ -214,7 +216,9 @@ fn supervision_expiry_operation_context(
         None,
         Some(&generation),
         state_fence.as_deref(),
-        epoch_digest.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
+        epoch_digest
+            .as_ref()
+            .map(eliot_contracts::LowercaseSha256::as_str),
     );
     let lease = bound_field(supervision_lease_id);
     context.record("lease", lease.text());

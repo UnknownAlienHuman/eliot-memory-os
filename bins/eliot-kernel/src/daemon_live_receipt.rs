@@ -71,8 +71,16 @@ fn record_process_receipt_context(context: &tracing::Span, process: &ProcessStar
         record_live_receipt_context_field(context, "authority_epoch", epoch);
     }
     let identity = process.identity();
-    record_live_receipt_context_field(context, "process_id", &identity.physical().process_id().to_string());
-    record_live_receipt_context_field(context, "process_start_100ns", &identity.physical().start_time_100ns().to_string());
+    record_live_receipt_context_field(
+        context,
+        "process_id",
+        &identity.physical().process_id().to_string(),
+    );
+    record_live_receipt_context_field(
+        context,
+        "process_start_100ns",
+        &identity.physical().start_time_100ns().to_string(),
+    );
     record_live_receipt_context_field(context, "image_sha256", identity.executable_sha256());
 }
 
@@ -149,7 +157,11 @@ impl KernelComposition {
         ) {
             Ok(receipt) => {
                 if replayed {
-                    observe_live_receipt("kernel.live_receipt.publication_replayed", "confirmed", context);
+                    observe_live_receipt(
+                        "kernel.live_receipt.publication_replayed",
+                        "confirmed",
+                        context,
+                    );
                 } else {
                     observe_live_receipt("kernel.live_receipt.published", "success", context);
                 }

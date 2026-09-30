@@ -3226,9 +3226,8 @@ impl ProcessExecutionGateway {
             registry.registered_operation_ids()
         } else {
             let context = super::kernel_diagnostics::operation_context(None, None, None, None);
-            let error = ProcessExecutionError::Unavailable(
-                "descendant registry lock poisoned".to_owned(),
-            );
+            let error =
+                ProcessExecutionError::Unavailable("descendant registry lock poisoned".to_owned());
             observe_process_in_context(
                 &context,
                 "kernel.process.descendant_close_failed",
