@@ -7027,9 +7027,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         })?;
         let current_scope = work_scope_owner
             .read_current(&state_fence)
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+            .map_err(SourceArtifactAdmissionError::from)?;
         ensure_snapshot_fresh(&current_scope, "source-effect WorkScope is not fresh")
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+            .map_err(|error| SourceArtifactAdmissionError::OwnerComposition(Box::new(error)))?;
         let current_binding = &current_scope.binding;
         if input.work_scope.scope_id.as_str() != current_binding.scope.scope_ref
             || input.work_scope.resource_generation.value() != current_binding.scope.generation
@@ -7046,7 +7046,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .task
             .task(&input.task.task_id)
             .ok_or_else(|| SourceArtifactAdmissionError::Owner("task is absent".to_owned()))?;
-        if task.revision != input.task.task_revision.value()
+        if task.task_id != input.task.task_id
+            || task.revision != input.task.task_revision.value()
+            || state_fence
+                .task_revision
+                .is_some_and(|expected_revision| expected_revision.value() != task.revision)
             || task.state_fence != state_fence
             || input.task.state_fence != state_fence
             || !task.state.is_active()
@@ -7078,7 +7082,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .owners
             .authority
             .snapshot()
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+            .map_err(SourceArtifactAdmissionError::from)?;
         if authority_snapshot.state_fence != state_fence {
             return Err(SourceArtifactAdmissionError::Owner(
                 "source-effect AuthorityOwner is stale against the current Governor fence"

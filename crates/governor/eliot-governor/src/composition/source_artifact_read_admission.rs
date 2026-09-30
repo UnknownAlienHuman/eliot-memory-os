@@ -226,9 +226,15 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
     let current_task = composition.owners.task.task(metadata_task).ok_or(
         SourceArtifactAdmissionError::Binding("current Task owner lacks the requested task"),
     )?;
-    if !current_task.state.is_active() || current_task.state_fence != *fence {
+    if current_task.task_id != *metadata_task
+        || !current_task.state.is_active()
+        || current_task.state_fence != *fence
+        || fence
+            .task_revision
+            .is_some_and(|expected_revision| expected_revision.value() != current_task.revision)
+    {
         return Err(SourceArtifactAdmissionError::Binding(
-            "current Task owner is not active under the admitted request fence",
+            "current Task owner identity, revision, or active fence differs from the admitted request",
         ));
     }
     let task = TaskBinding {
