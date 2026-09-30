@@ -170,7 +170,7 @@ impl OwnerCurrentness {
     ///
     /// # Errors
     ///
-    /// Returns [`CoordinatorError::InvalidField`]     /// [`CoordinatorError::ProviderContract`] for a malformed current
+    /// Returns [`CoordinatorError::ProviderContract`] for a malformed current
     /// expectation shape or an invalid live fence.
     pub fn new(
         expectation: ProviderCapabilityExpectation,

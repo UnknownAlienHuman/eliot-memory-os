@@ -263,7 +263,8 @@ pub enum ProviderCapabilityError {
     /// Canonical payload digest is not a lowercase SHA-256 digest.
     #[error("invalid canonical payload digest")]
     InvalidPayloadDigest,
-    /// Request or expectation shape is blank, control-bearing, or overlong.
+    /// Request, expectation, or loaded durable row shape is blank,
+    /// control-bearing, or overlong.
     #[error("malformed provider capability presentation")]
     MalformedRequest,
 }
@@ -287,11 +288,11 @@ pub enum ProviderCapabilityError {
 /// # Errors
 ///
 /// Returns the typed [`ProviderCapabilityError`] naming the first failed
-/// gate, checked in this order: presentation shape, revocation, exact
-/// attempt match, exact operation match, epoch currency (expectation epoch
-/// versus the live `live_epoch` parameter), route revision, capacity
-/// revision, binding/executable digest equality, worker-generation equality,
-/// then fence-digest equality.
+/// gate, checked in this order: presentation shape, loaded-row shape,
+/// revocation, exact attempt match, exact operation match, epoch currency
+/// (expectation epoch versus the live `live_epoch` parameter), route
+/// revision, capacity revision, binding/executable digest equality,
+/// worker-generation equality, then fence-digest equality.
 #[allow(
     clippy::too_many_arguments,
     reason = "the owner check is one flat tuple: presented request, current expectation, six loaded durable row fields, and the live epoch; grouping them would invent a second contract beside the wire request"
@@ -309,6 +310,20 @@ pub fn verify_provider_capability(
 ) -> Result<(), ProviderCapabilityError> {
     request.validate()?;
     expectation.validate()?;
+    // The recorded row is validated with the existing shape owners, never
+    // trusted by position: the receipt's attempt/operation/payload legs are
+    // compared below against these ORIGINAL recorded values, so a corrupt
+    // durable row fails closed here instead of comparing garbage. Nothing
+    // is recomputed: the row travels verbatim from the loader (exact
+    // `claim_id` key plus the attempt/operation reverse projection).
+    validate_wire_text(loaded_claim_attempt_id)?;
+    validate_wire_text(loaded_claim_operation_id)?;
+    if !is_lowercase_sha256(loaded_claim_binding_digest)
+        || !is_lowercase_sha256(loaded_claim_executable_digest)
+        || !is_lowercase_sha256(loaded_claim_fence_digest)
+    {
+        return Err(ProviderCapabilityError::MalformedRequest);
+    }
     if expectation.revoked {
         return Err(ProviderCapabilityError::Revoked);
     }
