@@ -42,7 +42,9 @@
 //!   executed rather than from a value it was handed. The `--version` read that
 //!   pins each tool's identity is launched the same way, under its own one-shot
 //!   permit, so this entry has no launch of any kind outside that single
-//!   executor. That stage launch is gated by
+//!   executor. Each such child is observed to a terminal lifecycle before its
+//!   evidence is read, because the executor's `reconcile` is terminal-only: see
+//!   [`await_terminal_view`]. That stage launch is gated by
 //!   `StageOrchestrator::launch_plan_live`, which refuses to launch a plan
 //!   compiled against a replaced registry generation and admits each stage
 //!   through `AdmittedStage::admit_live` against the live [`InstrumentRegistry`]
@@ -95,6 +97,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eliot_contracts::{
     ClockReading, ContractId, EpochContractError, EpochId, EpochLineageId, ProductId, RequestId,
@@ -197,6 +200,25 @@ const VERSION_STDOUT_BYTES: u64 = 64 * 1024;
 /// A version read answers with a single line from the tool itself, so a wider
 /// descendant tree than [`STAGE_MAX_DESCENDANTS`] is not a normal observation.
 const VERSION_MAX_DESCENDANTS: u32 = 8;
+
+/// Bound on waiting for the permit-bound `--version` child to settle.
+///
+/// Set equal to [`VERSION_WALL_TIMEOUT_MS`], the wall bound that child was
+/// sealed with, because that deadline is what makes the wait finite: the
+/// executor's own operation-bound deadline watcher terminates the version child
+/// at it, so the view reaches a terminal lifecycle at or before this bound and
+/// this constant invents no timing policy of its own. A child still not settled
+/// at the bound is refused, never reported.
+const VERSION_OBSERVE_TIMEOUT: Duration = Duration::from_millis(VERSION_WALL_TIMEOUT_MS);
+
+/// Cadence for observing the permit-bound `--version` child's lifecycle.
+///
+/// Reused rather than introduced: the same 25ms bound is the executor's own
+/// terminal-wait poll, and the same cadence the two existing production callers
+/// of a real child already poll [`ProcessExecutor::inspect`] at — the
+/// `RECONCILE_OBSERVE_POLL` of `wasm_p03_adapter.rs` and `BOUND_RUN_POLL` of
+/// `eliot-git-bridge`.
+const VERSION_OBSERVE_POLL: Duration = Duration::from_millis(25);
 
 /// The exact invocation this binary reads.
 struct Request {
@@ -704,6 +726,47 @@ fn file_digest(path: &Path) -> Result<String, CliError> {
     Ok(sha256_hex(&bytes))
 }
 
+/// The `--version` child through this ONE executor, bounded-poll until it settles.
+///
+/// `ProcessExecutor::reconcile` is TERMINAL-ONLY: `reconcile_inner` calls
+/// `join_streams` unconditionally (`eliot-process-executor/src/lib.rs`), which
+/// cancels the still-running capture thread's IO and can therefore quarantine
+/// this operation. `start` returns at child-CREATE, so the version child is
+/// still driving when the very next call lands — calling `reconcile` there is
+/// destructive, not merely early. So this wait observes the child the way the
+/// two existing production callers of a real child already do: bounded-poll the
+/// NON-DESTRUCTIVE `inspect` view of THIS operation on the executor that
+/// recorded the `start`, then perform the single terminal `reconcile`. Nothing
+/// here launches, cancels, re-permits, or retries anything, and the existing
+/// operation registry is the only state involved.
+///
+/// The bound is [`VERSION_OBSERVE_TIMEOUT`] and the cadence is
+/// [`VERSION_OBSERVE_POLL`]; both are justified on their constants. This returns
+/// only a TERMINAL view — the refusal is its own return type, so no caller can
+/// read an exit observation off a child that has not finished.
+fn await_terminal_view(
+    executor: &WindowsProcessExecutor,
+    operation: &OperationId,
+    executable: &Path,
+) -> Result<ProcessExecutionView, CliError> {
+    let started = Instant::now();
+    loop {
+        let view = block_on(executor.inspect(operation.clone()))?;
+        if view.lifecycle().is_terminal() {
+            return Ok(view);
+        }
+        if started.elapsed() >= VERSION_OBSERVE_TIMEOUT {
+            return Err(CliError::Contract(format!(
+                "tool {} was still {:?} after {}ms of governed observation; its version is unknown rather than unobserved",
+                executable.display(),
+                view.lifecycle(),
+                VERSION_OBSERVE_TIMEOUT.as_millis()
+            )));
+        }
+        std::thread::sleep(VERSION_OBSERVE_POLL);
+    }
+}
+
 /// Observes one tool's reported version by really running that tool.
 ///
 /// `ExecutableObservation::is_complete` refuses an identity that carries no
@@ -734,19 +797,20 @@ fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, C
     // validation context. It is still the same authority composition, the same
     // epoch, and the same generation, so this run has exactly one epoch.
     let cell = Arc::new(DispatchCell::activate()?);
+    // ONE executor for the whole lifecycle of this read. Its registry is an
+    // instance field, so the `inspect` below must cross the same instance the
+    // `start` registered on; a second executor would read an empty registry and
+    // refuse `NotFound`, which says nothing about the operation.
     let executor = StageExecutor::with(Arc::clone(&cell));
     let request = seal_version_request(&cell, epoch, executable)?;
     let receipt = block_on(executor.start(
         request,
         Arc::new(RetainedEvidenceSink::default()) as Arc<dyn ProcessEvidenceSink>,
     ))?;
-    let view = block_on(executor.inspect(receipt.operation_id().clone()))?;
-    if !view.lifecycle().is_terminal() {
-        return Err(CliError::Contract(format!(
-            "tool {} version read did not reach a terminal state",
-            executable.display()
-        )));
-    }
+    // Settle first, then read the exit, then reconcile: the exit observation is
+    // only meaningful once the tree is closed, and the reconcile is the single
+    // terminal call the poll above was waiting to make safe.
+    let view = await_terminal_view(executor.executor(), receipt.operation_id(), executable)?;
     // `ExitDisposition::Completed` is the executor's own observed terminal
     // classification, so this is the governed equivalent of the old
     // `output.status.success()` test: a signalled, resource-limited, cancelled,
@@ -1208,6 +1272,10 @@ impl StageExecutor {
     }
 
     /// The P-07 authority composition every lifecycle call crosses.
+    ///
+    /// Borrowed by [`await_terminal_view`] so the version probe's bounded
+    /// inspect-poll observes THIS executor's registry — the one the `start`
+    /// registered on — rather than a second executor that never saw the child.
     fn executor(&self) -> &WindowsProcessExecutor {
         &self.executor
     }
