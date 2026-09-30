@@ -863,9 +863,8 @@ fn corpus_profile(
             MemoryDistillationService::tier(item, utility.get(item.target_ref.as_str()).copied());
         *tier_counts.entry(tier).or_insert(0) += 1;
         if matches!(tier, MemoryTier::Hot | MemoryTier::Warm) {
-            active_bytes = active_bytes.saturating_add(canonical_bytes_for_measured_units(
-                item.token_units,
-            ));
+            active_bytes =
+                active_bytes.saturating_add(canonical_bytes_for_measured_units(item.token_units));
         }
     }
     MemoryDistillationCorpusProfile {

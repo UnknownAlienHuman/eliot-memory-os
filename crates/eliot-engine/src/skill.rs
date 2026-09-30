@@ -220,7 +220,7 @@ impl SkillLifecycleService {
         local_check_refs.extend(
             measurement
                 .iter()
-                .map(|measurement| measurement.measurement_evidence_ref()),
+                .map(SkillContextEnvelopeMeasurement::measurement_evidence_ref),
         );
         SkillLifecycleRecord {
             record_id: format!("skill-lifecycle-{}", WriteId::new_v7()),
@@ -234,7 +234,7 @@ impl SkillLifecycleService {
             // or any local `/4` ratio.
             context_cost: measurement
                 .as_ref()
-                .map(|measurement| measurement.estimated_context_cost()),
+                .map(SkillContextEnvelopeMeasurement::estimated_context_cost),
             last_verified: skill.last_verified_at,
             where_applies: skill.applies_when.clone(),
             where_not_apply: skill.does_not_apply_when.clone(),
@@ -779,9 +779,14 @@ impl SkillInfluenceService {
     ///
     /// `SkillInfluenceReport::estimated_context_cost` is the sum of the exact
     /// serialized envelope measurements of `input.measured_skills`. Absent
-    /// Skill bytes or a serialization/measurement failure are a typed error:
-    /// the report is never produced with a zero, caller-declared or `/4` cost.
-    pub fn report(input: SkillInfluenceReportInput) -> Result<SkillInfluenceReport, EngineError> {
+    /// Skill bytes or a serialization/measurement failure is an explicitly
+    /// unavailable cost: the report is never produced with a zero, a
+    /// caller-declared or a `/4` cost. `SkillInfluenceReport` carries no
+    /// `Option`/`Result` on this field and its consumers are non-fallible, so
+    /// the unavailable state is reported as the typed sentinel
+    /// [`CONTEXT_COST_UNAVAILABLE`] rather than as a measurement that could be
+    /// mistaken for a real one.
+    pub fn report(input: SkillInfluenceReportInput) -> SkillInfluenceReport {
         let included_set = input.included.iter().copied().collect::<BTreeSet<_>>();
         let excluded = input
             .considered
@@ -790,9 +795,11 @@ impl SkillInfluenceService {
             .filter(|skill_id| !included_set.contains(skill_id))
             .collect();
         let estimated_context_cost = input
-            .canonical_context_cost()?
-            .ok_or_else(|| measurement_unavailable_error("skill_influence.measured_skills"))?;
-        Ok(SkillInfluenceReport {
+            .canonical_context_cost()
+            .ok()
+            .flatten()
+            .unwrap_or(CONTEXT_COST_UNAVAILABLE);
+        SkillInfluenceReport {
             report_id: format!("skill-influence-{}", WriteId::new_v7()),
             project_id: input.project_id,
             task_id: input.task_id,
@@ -806,7 +813,7 @@ impl SkillInfluenceService {
             observed_decision_delta: None,
             created_at: OffsetDateTime::now_utc(),
             write_receipt: None,
-        })
+        }
     }
 
     pub async fn write_report(
@@ -971,7 +978,7 @@ fn known_failure_active(skill: &SkillCardV2, context: &SkillActivationContext) -
 /// `ConservativeStu` with `empirical: false` and is never a current token
 /// count. The status therefore cannot activate, promote, retire, quarantine,
 /// suppress or grant authority for a Skill.
-#[must_use]
+#[must_use = "a canonical skill-context measurement is evidence, not advice: discarding it leaves the caller unmeasured"]
 pub(crate) fn measure_skill_context_envelope(
     skill: &SkillCardV2,
 ) -> Result<SkillContextEnvelopeMeasurement, EngineError> {
@@ -1012,15 +1019,16 @@ pub(crate) fn measure_skill_context_envelope(
     })
 }
 
-fn measurement_unavailable_error(field: &'static str) -> EngineError {
-    EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: format!(
-            "CONTEXT_MEASUREMENT_UNAVAILABLE: {field} has no canonical #704 serialized-byte \
-             measurement"
-        ),
-    }
-}
+/// Reported aggregate context cost when no canonical measurement exists.
+///
+/// This is a sentinel, not a measurement: it is deliberately outside the range
+/// any real STU total can occupy, so a consumer comparing a reported cost
+/// against a budget can never mistake "unmeasured" for "free" or for a small
+/// number. It is only used where the owning type cannot express absence
+/// (`SkillInfluenceReport::estimated_context_cost` is a plain `u64` consumed by
+/// non-fallible callers); every path that CAN express absence uses `None` or a
+/// typed error instead.
+pub(crate) const CONTEXT_COST_UNAVAILABLE: u64 = u64::MAX;
 
 /// Deterministic #704 measurement record for one Skill revision.
 ///
