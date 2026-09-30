@@ -66,6 +66,47 @@ pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 15] = [
     ("eliotd.json", false),
 ];
 
+/// Optional canonical contract and module-specific builder proof carried by
+/// new release bundles. Legacy source bundles remain readable, while a bundle
+/// that carries either file must carry and bind both.
+pub(crate) const MODULE_BUILD_PROVENANCE_ROLES: [(&str, bool); 2] = [
+    ("module.eliotd.toml", false),
+    ("module.eliotd.provenance.json", false),
+];
+
+pub(crate) fn package_inventory_roles(include_module_provenance: bool) -> Vec<(&'static str, bool)> {
+    let mut roles = REQUIRED_PACKAGE_ROLES.to_vec();
+    if include_module_provenance {
+        roles.extend(MODULE_BUILD_PROVENANCE_ROLES);
+    }
+    roles
+}
+
+fn module_provenance_present(names: impl IntoIterator<Item = String>) -> Result<bool, InstallationError> {
+    let names = names.collect::<BTreeSet<_>>();
+    let has_manifest = names.contains("module.eliotd.toml");
+    let has_proof = names.contains("module.eliotd.provenance.json");
+    if has_manifest != has_proof {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(has_manifest)
+}
+
+fn package_roles_for_manifest(
+    manifest: &PackageManifest,
+) -> Result<Vec<(&'static str, bool)>, InstallationError> {
+    let include_module_provenance = module_provenance_present(
+        manifest.files.iter().map(|file| file.relative_path.clone()),
+    )?;
+    let roles = package_inventory_roles(include_module_provenance);
+    if manifest.files.len() != roles.len() {
+        return Err(InstallationError::IncompleteObservation(
+            "package manifest must contain the complete approved runtime inventory".to_owned(),
+        ));
+    }
+    Ok(roles)
+}
+
 /// Per-user notification adapter staged in Phase A but never Kernel-dispatched.
 /// `eliot-notify.exe` has no launch descriptor binding. The User Broker is
 /// also staged in the per-user branch, but its exact path and digest are
@@ -349,11 +390,10 @@ pub(crate) fn artifact_set_evidence_digest(
     manifest: &PackageManifest,
     expected: &[PackageArtifactDigest],
 ) -> Result<PlatformHandle, InstallationError> {
-    if manifest.files.len() != REQUIRED_PACKAGE_ROLES.len()
-        || expected.len() != REQUIRED_PACKAGE_ROLES.len()
-    {
+    let roles = package_roles_for_manifest(manifest)?;
+    if expected.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
-            "canary artifact evidence requires the complete fifteen-file Phase-A runtime inventory"
+            "canary artifact evidence requires every file in the approved runtime inventory"
                 .to_owned(),
         ));
     }
@@ -361,9 +401,9 @@ pub(crate) fn artifact_set_evidence_digest(
         .map_err(|error| package_plan_error(&error))?;
     let mut manifest_names = BTreeSet::new();
     let mut expected_names = BTreeSet::new();
-    let mut facts = Vec::with_capacity(REQUIRED_PACKAGE_ROLES.len());
+    let mut facts = Vec::with_capacity(roles.len());
 
-    for (role, executable) in REQUIRED_PACKAGE_ROLES {
+    for &(role, executable) in &roles {
         let spec = manifest
             .files
             .iter()
@@ -407,8 +447,8 @@ pub(crate) fn artifact_set_evidence_digest(
 
     if manifest_names.len() != manifest.files.len()
         || expected_names.len() != expected.len()
-        || manifest_names.len() != REQUIRED_PACKAGE_ROLES.len()
-        || expected_names.len() != REQUIRED_PACKAGE_ROLES.len()
+        || manifest_names.len() != roles.len()
+        || expected_names.len() != roles.len()
     {
         return Err(InstallationError::IdentityConflict);
     }
@@ -800,12 +840,7 @@ pub(crate) fn validate_exact_candidate_package_binding(
     if manifest.generation != candidate.generation.as_str() {
         return Err(InstallationError::IdentityConflict);
     }
-    if manifest.files.len() != REQUIRED_PACKAGE_ROLES.len() {
-        return Err(InstallationError::IncompleteObservation(
-            "package manifest must contain the complete fifteen-file Phase-A runtime inventory"
-                .to_owned(),
-        ));
-    }
+    let roles = package_roles_for_manifest(manifest)?;
     let bindings = strict_role_bindings(candidate);
     let mut expected_names = BTreeSet::new();
     let mut candidate_paths = BTreeSet::new();
@@ -867,6 +902,25 @@ pub(crate) fn validate_exact_candidate_package_binding(
     if !USER_BROKER_STAGED_EXECUTABLE || !broker_spec.executable || broker_spec.expected_size == 0 {
         return Err(InstallationError::IdentityConflict);
     }
+    for &(name, executable) in &roles {
+        if !MODULE_BUILD_PROVENANCE_ROLES
+            .iter()
+            .any(|(optional_name, _)| optional_name == &name)
+        {
+            continue;
+        }
+        let spec = manifest
+            .files
+            .iter()
+            .find(|spec| spec.relative_path == name)
+            .ok_or(InstallationError::IdentityConflict)?;
+        if spec.executable != executable
+            || spec.expected_size == 0
+            || !expected_names.insert(name.to_ascii_lowercase())
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
     let mut manifest_names = BTreeSet::new();
     for spec in &manifest.files {
         if spec.relative_path == NOTIFY_STAGED_ROLE {
@@ -877,7 +931,7 @@ pub(crate) fn validate_exact_candidate_package_binding(
             }
             continue;
         }
-        let Some((name, executable)) = REQUIRED_PACKAGE_ROLES
+        let Some((name, executable)) = roles
             .iter()
             .find(|(name, _)| *name == spec.relative_path)
         else {
@@ -921,9 +975,10 @@ pub(crate) fn validate_exact_expected_file_digests(
     expected: &[PackageArtifactDigest],
 ) -> Result<(), InstallationError> {
     validate_exact_candidate_package_binding(candidate, manifest)?;
-    if expected.len() != REQUIRED_PACKAGE_ROLES.len() {
+    let roles = package_roles_for_manifest(manifest)?;
+    if expected.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
-            "expected package digest set must contain all fifteen Phase-A runtime files".to_owned(),
+            "expected package digest set must contain every approved runtime file".to_owned(),
         ));
     }
     let bindings = strict_role_bindings(candidate);
@@ -948,6 +1003,24 @@ pub(crate) fn validate_exact_expected_file_digests(
                 return Err(InstallationError::IdentityConflict);
             }
             crate::sha256_handle(&item.sha256, "expected package digest")?;
+            continue;
+        }
+        if MODULE_BUILD_PROVENANCE_ROLES
+            .iter()
+            .any(|(name, _)| *name == item.relative_path)
+        {
+            let spec = manifest
+                .files
+                .iter()
+                .find(|spec| spec.relative_path == item.relative_path)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if spec.executable
+                || item.expected_size == 0
+                || item.expected_size != spec.expected_size
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            crate::sha256_handle(&item.sha256, "expected module proof digest")?;
             continue;
         }
         if item.relative_path == USER_BROKER_STAGED_ROLE {
@@ -990,7 +1063,7 @@ pub(crate) fn validate_exact_expected_file_digests(
             return Err(InstallationError::IdentityConflict);
         }
     }
-    let expected_names = REQUIRED_PACKAGE_ROLES
+    let expected_names = roles
         .iter()
         .map(|(name, _)| (*name).to_owned())
         .collect::<BTreeSet<_>>();
@@ -1339,6 +1412,10 @@ impl GenerationPackagePlanner {
             InstallationError::Platform(format!("source observe failed: {error}"))
         })?;
         validate_exact_source_inventory(&observed)?;
+        let include_module_provenance = module_provenance_present(
+            observed.files.iter().map(|file| file.relative_path.clone()),
+        )?;
+        let package_roles = package_inventory_roles(include_module_provenance);
         let governor_lease = source
             .retain_file("eliotd-governor.json")
             .map_err(|error| {
@@ -1373,7 +1450,7 @@ impl GenerationPackagePlanner {
             None
         };
 
-        let files = REQUIRED_PACKAGE_ROLES
+        let files = package_roles
             .iter()
             .map(|(name, executable)| {
                 let entry = observed
@@ -1439,7 +1516,7 @@ impl GenerationPackagePlanner {
         }
 
         let expected_file_digests = derive_expected_digests(&observed, &package_manifest)?;
-        if expected_file_digests.len() != REQUIRED_PACKAGE_ROLES.len() {
+        if expected_file_digests.len() != package_manifest.files.len() {
             return Err(InstallationError::IncompleteObservation(
                 "trusted source digest set is incomplete".to_owned(),
             ));
@@ -1719,7 +1796,7 @@ impl GenerationPackagePlanner {
             artifact_set_evidence_digest(&package_manifest, &expected_file_digests)?;
         let candidate = CandidateManifest {
             generation: input.generation.clone(),
-            components: REQUIRED_PACKAGE_ROLES
+            components: package_roles
                 .iter()
                 .map(|(name, _)| {
                     PlatformHandle::new(format!("component:{name}")).map_err(|error| {
@@ -1789,6 +1866,15 @@ impl GenerationPackagePlanner {
                 // Per-user adapter digest is bound by the fifteen-file
                 // evidence digest and the manifest size match above; it has
                 // no launch-descriptor digest slot by design.
+                continue;
+            }
+            if MODULE_BUILD_PROVENANCE_ROLES
+                .iter()
+                .any(|(name, _)| *name == digest.relative_path)
+            {
+                // The full artifact evidence digest binds these exact files.
+                // Host later parses the per-module source proof and joins it
+                // to the admitted contract and active launch fence.
                 continue;
             }
             if digest.relative_path == USER_BROKER_STAGED_ROLE {
@@ -2170,12 +2256,16 @@ impl GenerationPackagePlanner {
 fn validate_exact_source_inventory(
     observed: &eliot_platform_windows::PackageSourceObservation,
 ) -> Result<(), InstallationError> {
-    if observed.files.len() != REQUIRED_PACKAGE_ROLES.len() {
+    let include_module_provenance = module_provenance_present(
+        observed.files.iter().map(|file| file.relative_path.clone()),
+    )?;
+    let roles = package_inventory_roles(include_module_provenance);
+    if observed.files.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
-            "trusted source must contain exactly fifteen Phase-A runtime files".to_owned(),
+            "trusted source must contain the complete approved runtime inventory".to_owned(),
         ));
     }
-    let expected = REQUIRED_PACKAGE_ROLES
+    let expected = roles
         .iter()
         .map(|(name, _)| *name)
         .collect::<BTreeSet<_>>();
@@ -2266,16 +2356,14 @@ fn validate_source_bundle_publication_binding(
             reason: "published root identity differs from the planner observation".to_owned(),
         });
     }
-    if binding.files.len() != REQUIRED_PACKAGE_ROLES.len()
-        || expected.len() != REQUIRED_PACKAGE_ROLES.len()
-        || manifest.files.len() != REQUIRED_PACKAGE_ROLES.len()
-    {
+    let roles = package_roles_for_manifest(manifest)?;
+    if binding.files.len() != roles.len() || expected.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
-            "source publication binding must contain the complete fifteen-role inventory"
+            "source publication binding must contain the complete approved role inventory"
                 .to_owned(),
         ));
     }
-    for (index, (role, executable)) in REQUIRED_PACKAGE_ROLES.iter().enumerate() {
+    for (index, &(role, executable)) in roles.iter().enumerate() {
         let bound = binding
             .files
             .get(index)
@@ -2284,22 +2372,22 @@ fn validate_source_bundle_publication_binding(
             ))?;
         let observed = expected
             .iter()
-            .find(|item| item.relative_path == *role)
+            .find(|item| item.relative_path == role)
             .ok_or(InstallationError::IncompleteObservation(
                 "planner source observation is missing an ordered role".to_owned(),
             ))?;
         let spec = manifest
             .files
             .iter()
-            .find(|item| item.relative_path == *role)
+            .find(|item| item.relative_path == role)
             .ok_or(InstallationError::IncompleteObservation(
                 "planner package manifest is missing an ordered role".to_owned(),
             ))?;
         if bound != observed
-            || bound.relative_path != *role
-            || observed.relative_path != *role
-            || spec.relative_path != *role
-            || spec.executable != *executable
+            || bound.relative_path != role
+            || observed.relative_path != role
+            || spec.relative_path != role
+            || spec.executable != executable
         {
             return Err(InstallationError::InvalidField {
                 field: format!("generation.source_publication.files[{index}]"),

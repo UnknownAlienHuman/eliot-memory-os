@@ -548,6 +548,34 @@ impl ModuleManifest {
         Ok(self)
     }
 
+    /// Returns the digest of the exact declared capability profile.
+    ///
+    /// Artifact, config and protocol identities are carried separately by a
+    /// generation candidate. This projection binds the module identity,
+    /// capability intents, overall effect ceiling, approved scopes, and the
+    /// execution policy that narrows those intents for Kernel. It is semantic
+    /// catalog content, not build-source provenance.
+    pub fn capability_profile_digest(&self, module_id: &ModuleId) -> Result<String, ModuleError> {
+        #[derive(Serialize)]
+        struct CapabilityProfile<'a> {
+            domain: &'static str,
+            module_id: &'a ModuleId,
+            effect_ceiling: EffectCeiling,
+            capability_intents: &'a [CapabilityIntent],
+            approved_scope_refs: &'a [String],
+            execution_policy: &'a Option<GenerationExecutionPolicy>,
+        }
+
+        digest_value(&CapabilityProfile {
+            domain: "eliot.module-capability-profile.v1",
+            module_id,
+            effect_ceiling: self.effect_ceiling,
+            capability_intents: &self.capability_intents,
+            approved_scope_refs: &self.approved_scope_refs,
+            execution_policy: &self.execution_policy,
+        })
+    }
+
     fn identity_digest(&self) -> Result<String, ModuleError> {
         #[derive(Serialize)]
         struct Identity<'a> {
@@ -654,13 +682,24 @@ pub struct GenerationCandidateReceipt {
     pub artifact_digest: String,
     pub config_digest: String,
     pub protocol_digest: String,
+    /// Digest of the independently owner-issued build/source provenance row.
     pub build_provenance_digest: String,
+    /// Digest from [`ModuleManifest::capability_profile_digest`] for this module.
     pub capability_profile_digest: String,
+    /// Digest of the build/source owner's fence; it is not the Governor
+    /// admission `StateFence` unless that owner explicitly defines the same
+    /// identity.
     pub source_fence_digest: String,
     pub candidate_digest: String,
 }
 
 impl GenerationCandidateReceipt {
+    /// Creates a self-digested candidate wire value.
+    ///
+    /// This constructor proves only internal digest consistency. It does not
+    /// establish that a builder/source owner issued the supplied provenance
+    /// values; production admission must join them to that owner's current
+    /// independent record before accepting this receipt.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         candidate_id: GenerationId,
@@ -850,10 +889,16 @@ impl GenerationAdmission {
         self.state_fence
             .validate()
             .map_err(|error| ModuleError::Contract(error.to_string()))?;
+        // These are structural/manifest joins only. In particular,
+        // `source_fence_digest` belongs to the independent build/source owner
+        // and is not guessed to be a digest of this admission fence.
         if self.catalog_revision == 0
             || self.catalog_revision != self.execution.accepted_catalog_revision
             || self.candidate.module_id != self.execution.module_id
             || self.candidate.candidate_id != self.execution.generation_id
+            || self.candidate.artifact_digest != self.execution.artifact_digest
+            || self.candidate.config_digest != self.execution.config_digest
+            || self.candidate.protocol_digest != self.execution.protocol_digest
             || self.admission_receipt != self.execution.accepted_catalog_receipt
         {
             return Err(ModuleError::IdentityConflict);

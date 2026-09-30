@@ -41,6 +41,8 @@ use eliot_contracts::{
     ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
     StateFence,
 };
+#[cfg(windows)]
+use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
@@ -60,6 +62,8 @@ use eliot_testd_core::{
     TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use eliot_runtime_contracts::{ModuleManifest, MODULE_MANIFEST_SCHEMA_VERSION};
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
@@ -83,6 +87,28 @@ use super::{
 };
 
 const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
+
+/// Renders the release builder's `eliotd` manifest from the exact contract
+/// constructor used by the live Kernel handshake.
+///
+/// This is a build-only export seam. It creates no admission or runtime
+/// authority; the caller supplies the artifact digest produced by the release
+/// build, and the running daemon later re-admits the retained sibling bytes
+/// against that same digest before publishing its contract.
+#[cfg(windows)]
+pub fn render_build_module_manifest(artifact_sha256: &str) -> Result<String, crate::DaemonError> {
+    let artifact_id = ArtifactId::new(artifact_sha256)
+        .map_err(|error| crate::DaemonError::LaunchConfig(error.to_string()))?;
+    let module_id = ContractId::new(SERVICE_NAME)
+        .map_err(|error| crate::DaemonError::LaunchConfig(error.to_string()))?;
+    let contract = handshake::declared_module_contract(module_id, artifact_id);
+    ModuleManifest {
+        schema_version: MODULE_MANIFEST_SCHEMA_VERSION,
+        contract,
+    }
+    .render_toml()
+    .map_err(|error| crate::DaemonError::LaunchConfig(error.to_string()))
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

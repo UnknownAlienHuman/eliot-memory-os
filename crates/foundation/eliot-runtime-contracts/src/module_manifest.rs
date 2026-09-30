@@ -73,6 +73,27 @@ pub struct ModuleManifest {
     pub contract: ModuleContract,
 }
 
+impl ModuleManifest {
+    /// Serializes this exact versioned contract envelope as the runtime TOML
+    /// bytes consumed by [`admit_module_manifest`].
+    ///
+    /// The release builder calls this through the canonical `eliotd` module
+    /// contract constructor. It does not maintain a second TOML schema or
+    /// hand-written copy of the protected contract fields.
+    pub fn render_toml(&self) -> Result<String, RuntimeContractError> {
+        self.contract.validate()?;
+        if self.schema_version != MODULE_MANIFEST_SCHEMA_VERSION {
+            return Err(RuntimeContractError::UnsupportedManifestSchemaVersion {
+                found: self.schema_version,
+                supported: MODULE_MANIFEST_SCHEMA_VERSION,
+            });
+        }
+        toml::to_string(self).map_err(|error| RuntimeContractError::MalformedModuleManifest {
+            reason: format!("the manifest is not serialisable as TOML: {error}"),
+        })
+    }
+}
+
 /// The identities retained when a manifest's exact bytes are admitted.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

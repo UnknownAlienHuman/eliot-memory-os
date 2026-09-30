@@ -1667,6 +1667,21 @@ function Get-FilteredFileHash([string]$Repo, [string]$RelativePath, [string]$Fil
     return $hash
 }
 
+function Get-PinnedSourceSha256([string]$Repo, [string]$SourceCommit, [string]$RelativePath) {
+    $normalized = Assert-SafeRelativePath $RelativePath 'module build source'
+    $path = Join-Path $Repo $normalized.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "module build source is missing: $normalized"
+    }
+    $file = Get-Item -LiteralPath $path -ErrorAction Stop
+    Assert-TrackedSourceFile $file $normalized
+    $expected = Get-GitBlobHash $Repo $SourceCommit $normalized
+    if ((Get-FilteredFileHash $Repo $normalized $file.FullName) -cne $expected) {
+        throw "module build source differs from the pinned source commit: $normalized"
+    }
+    return (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
 function Assert-TrackedSourceFile([System.IO.FileSystemInfo]$File, [string]$RelativePath) {
     if (-not ($File -is [System.IO.FileInfo])) {
         throw "tracked release source is not a regular file: $RelativePath"
@@ -2985,7 +3000,7 @@ function Assert-ClosedCodeBearingPayload([string]$BundlePath, [object[]]$Signing
 # below invoke that slice with the repository root, pinned source commit,
 # staged bundle root, and staged Bridge record.
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [object]$ModuleBuildProvenance, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -3046,6 +3061,20 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         generation = $SourceCommit
         proof_ceiling = 'unsigned-build-evidence'
         gate = $null
+    }
+    foreach ($moduleProof in @(
+            @{ path = [string]$ModuleBuildProvenance.manifest_path; selection = 'canonical `eliotd` ModuleManifest exported from the live handshake contract constructor'; owner = 'eliot-runtime-contracts ModuleManifest + eliotd build-only exporter'; proof = 'exact contract bytes bound to the built eliotd artifact' },
+            @{ path = [string]$ModuleBuildProvenance.provenance_path; selection = 'module-specific source/build proof generated from the pinned release source and exact artifact bytes'; owner = 'scripts/build-eliot-windows-x64-release.ps1'; proof = 'source commit/tree, build inputs, invocation, artifact and manifest digests' }
+        )) {
+        $entries += [ordered]@{
+            path = $moduleProof.path
+            selection = $moduleProof.selection
+            owner = $moduleProof.owner
+            install_destination = 'runtime/'
+            generation = $SourceCommit
+            proof_ceiling = $moduleProof.proof
+            gate = $null
+        }
     }
     if ($LegacyGovernorPresent) {
         $entries += [ordered]@{
@@ -3226,6 +3255,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         architecture = 'windows-x64'
         denominator_policy = 'registry-selected-only-no-wholesale'
         codex_plugin_base_version = $CodexPluginBaseVersion
+        module_build_provenance = $ModuleBuildProvenance
         governor_disposition = $GovernorDisposition
         governor_evidence = $GovernorEvidence
         governor_approval = $GovernorApproval
@@ -3296,6 +3326,8 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         'runtime/eliot-wasm-host.exe',
         'runtime/eliot-notify.exe',
         'runtime/surreal.exe',
+        'runtime/module.eliotd.toml',
+        'runtime/module.eliotd.provenance.json',
         'runtime/RUNTIME_ARTIFACTS.json',
         'operator/Eliot.Operator.exe',
         'operator/OPERATOR_BUILD_RECEIPT.json',
@@ -3544,6 +3576,96 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         [string]$runtimeManifest.architecture -ne 'windows-x64' -or
         [string]$runtimeManifest.catalog_path -ne $surrealCatalogRelativePath) {
         throw 'runtime artifact manifest does not match RELEASE.json'
+    }
+    $moduleBinding = $release.module_build_provenance
+    $moduleManifestPath = Join-Path $resolved 'runtime/module.eliotd.toml'
+    $moduleProvenancePath = Join-Path $resolved 'runtime/module.eliotd.provenance.json'
+    $moduleManifestEvidence = Read-VerifiedResidentFile $moduleManifestPath 'canonical eliotd module manifest'
+    $moduleProvenanceEvidence = Read-VerifiedResidentFile $moduleProvenancePath 'eliotd source/build provenance'
+    $moduleSourceProof = [System.Text.Encoding]::UTF8.GetString($moduleProvenanceEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    $expectedModuleProofFields = @(
+        'schema_version', 'module_id', 'package', 'binary', 'artifact_path', 'artifact_sha256',
+        'artifact_bytes', 'manifest_path', 'manifest_sha256', 'manifest_bytes', 'source_commit',
+        'source_tree_id', 'builder_script_sha256', 'cargo_manifest_sha256', 'cargo_lock_sha256',
+        'rust_toolchain_sha256', 'daemon_contract_source_sha256', 'module_manifest_source_sha256',
+        'cargo_profile', 'build_target', 'build_argv'
+    )
+    $observedModuleProofFields = @($moduleSourceProof.PSObject.Properties.Name | Sort-Object)
+    $expectedModuleProofFields = @($expectedModuleProofFields | Sort-Object)
+    $sourceTreeId = (& git -C $repo rev-parse ("{0}^{{tree}}" -f [string]$release.source_commit) 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or
+        ($observedModuleProofFields -join "`n") -cne ($expectedModuleProofFields -join "`n") -or
+        -not $moduleBinding -or
+        [string]$moduleBinding.module_id -cne 'eliotd' -or
+        [string]$moduleBinding.artifact_path -cne 'runtime/eliotd.exe' -or
+        [string]$moduleBinding.manifest_path -cne 'runtime/module.eliotd.toml' -or
+        [string]$moduleBinding.provenance_path -cne 'runtime/module.eliotd.provenance.json' -or
+        [string]$moduleBinding.source_commit -cne [string]$release.source_commit -or
+        [string]$moduleBinding.source_tree_id -cne $sourceTreeId -or
+        [string]$moduleBinding.manifest_sha256 -cne $moduleManifestEvidence.sha256 -or
+        [int64]$moduleBinding.manifest_bytes -ne [int64]$moduleManifestEvidence.length -or
+        [string]$moduleBinding.provenance_sha256 -cne $moduleProvenanceEvidence.sha256 -or
+        [int64]$moduleBinding.provenance_bytes -ne [int64]$moduleProvenanceEvidence.length -or
+        [int]$moduleSourceProof.schema_version -ne 1 -or
+        [string]$moduleSourceProof.module_id -cne 'eliotd' -or
+        [string]$moduleSourceProof.package -cne 'eliotd' -or
+        [string]$moduleSourceProof.binary -cne 'eliotd' -or
+        [string]$moduleSourceProof.artifact_path -cne 'runtime/eliotd.exe' -or
+        [string]$moduleSourceProof.manifest_path -cne 'runtime/module.eliotd.toml' -or
+        [string]$moduleSourceProof.manifest_sha256 -cne $moduleManifestEvidence.sha256 -or
+        [int64]$moduleSourceProof.manifest_bytes -ne [int64]$moduleManifestEvidence.length -or
+        [string]$moduleSourceProof.source_commit -cne [string]$release.source_commit -or
+        [string]$moduleSourceProof.source_tree_id -cne $sourceTreeId -or
+        [string]$moduleSourceProof.cargo_profile -cne 'release' -or
+        [string]$moduleSourceProof.build_target -cne 'x86_64-pc-windows-msvc' -or
+        (@($moduleSourceProof.build_argv) -join "`n") -cne (@('build', '--frozen', '--locked', '--offline', '--release', '-p', 'eliotd', '--bin', 'eliotd') -join "`n") -or
+        [string]$moduleSourceProof.artifact_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.builder_script_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.cargo_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.cargo_lock_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.rust_toolchain_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.daemon_contract_source_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.module_manifest_source_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [int64]$moduleSourceProof.artifact_bytes -le 0 -or
+        [string]$moduleBinding.artifact_sha256 -cne [string]$moduleSourceProof.artifact_sha256 -or
+        [int64]$moduleBinding.artifact_bytes -ne [int64]$moduleSourceProof.artifact_bytes) {
+        throw 'RELEASE.json and module-specific source/build provenance do not form one exact module binding'
+    }
+    $daemonArtifactPath = Join-Path $resolved 'runtime/eliotd.exe'
+    $daemonArtifactEvidence = Read-VerifiedResidentFile $daemonArtifactPath 'provenance-bound eliotd executable'
+    if ($daemonArtifactEvidence.sha256 -cne [string]$moduleSourceProof.artifact_sha256 -or
+        $daemonArtifactEvidence.length -ne [int64]$moduleSourceProof.artifact_bytes) {
+        throw 'module source/build provenance does not bind the exact staged eliotd executable'
+    }
+    foreach ($sourceBinding in @(
+            @{ field = 'builder_script_sha256'; path = 'scripts/build-eliot-windows-x64-release.ps1' },
+            @{ field = 'cargo_manifest_sha256'; path = 'bins/eliotd/Cargo.toml' },
+            @{ field = 'cargo_lock_sha256'; path = 'Cargo.lock' },
+            @{ field = 'rust_toolchain_sha256'; path = 'rust-toolchain.toml' },
+            @{ field = 'daemon_contract_source_sha256'; path = 'bins/eliotd/src/daemon_kernel_client/handshake.rs' },
+            @{ field = 'module_manifest_source_sha256'; path = 'crates/foundation/eliot-runtime-contracts/src/module_manifest.rs' }
+        )) {
+        $expectedSourceSha256 = Get-PinnedSourceSha256 $repo ([string]$release.source_commit) $sourceBinding.path
+        $sourceField = [string]$sourceBinding.field
+        if ([string]$moduleSourceProof.$sourceField -cne $expectedSourceSha256) {
+            throw "eliotd provenance differs from the pinned build source: $($sourceBinding.path)"
+        }
+    }
+    $runtimeModuleBinding = $runtimeManifest.module_build_provenance
+    if ([string]$runtimeModuleBinding.module_id -cne [string]$moduleBinding.module_id -or
+        [string]$runtimeModuleBinding.artifact_path -cne [string]$moduleBinding.artifact_path -or
+        [string]$runtimeModuleBinding.artifact_sha256 -cne [string]$moduleBinding.artifact_sha256 -or
+        [int64]$runtimeModuleBinding.artifact_bytes -ne [int64]$moduleBinding.artifact_bytes -or
+        [string]$runtimeModuleBinding.manifest_path -cne [string]$moduleBinding.manifest_path -or
+        [string]$runtimeModuleBinding.manifest_sha256 -cne [string]$moduleBinding.manifest_sha256 -or
+        [int64]$runtimeModuleBinding.manifest_bytes -ne [int64]$moduleBinding.manifest_bytes -or
+        [string]$runtimeModuleBinding.provenance_path -cne [string]$moduleBinding.provenance_path -or
+        [string]$runtimeModuleBinding.provenance_sha256 -cne [string]$moduleBinding.provenance_sha256 -or
+        [int64]$runtimeModuleBinding.provenance_bytes -ne [int64]$moduleBinding.provenance_bytes -or
+        [string]$runtimeModuleBinding.source_commit -cne [string]$moduleBinding.source_commit -or
+        [string]$runtimeModuleBinding.source_tree_id -cne [string]$moduleBinding.source_tree_id) {
+        throw 'runtime artifact manifest module binding differs from RELEASE.json'
     }
     $expectedRuntime = @(Get-RuntimeArtifactDefinitions)
     $declaredRuntime = @($runtimeManifest.artifacts)
@@ -4408,6 +4530,95 @@ try {
     foreach ($artifact in $runtimeArtifactPlan) {
         Copy-Item -LiteralPath $artifact.path -Destination (Join-Path $bundle $artifact.relative_path)
     }
+    # Issue #22 W1: the module contract bytes come from the exact constructor
+    # the live daemon handshake uses. The exported manifest is bound to the
+    # staged eliotd.exe digest, and this separate record binds its bytes to the
+    # pinned source tree, toolchain inputs, release-builder source and exact
+    # cargo invocation. Host later validates and durably records these values
+    # under its active RecordFence; this build artifact alone grants no runtime
+    # or generation authority.
+    $daemonArtifactPath = Join-Path $runtimeRoot 'eliotd.exe'
+    if (-not (Test-Path -LiteralPath $daemonArtifactPath -PathType Leaf)) {
+        throw 'module provenance export requires the staged runtime/eliotd.exe artifact'
+    }
+    $daemonArtifactFile = Get-Item -LiteralPath $daemonArtifactPath -ErrorAction Stop
+    Assert-NoSecretFile $daemonArtifactFile 'runtime/eliotd.exe'
+    [void](Assert-WindowsX64Pe $daemonArtifactFile.FullName 'runtime/eliotd.exe')
+    $daemonArtifactSha256 = (Get-FileHash -LiteralPath $daemonArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $moduleManifestPath = Join-Path $runtimeRoot 'module.eliotd.toml'
+    $manifestExport = Invoke-JobContainedNativeProcess $daemonArtifactPath @(
+        '--emit-build-module-manifest', $daemonArtifactSha256
+    ) $runtimeRoot 'eliotd-module-manifest-export'
+    if ([int]$manifestExport.exit_code -ne 0) {
+        throw "canonical eliotd module manifest export failed with exit code $($manifestExport.exit_code)"
+    }
+    $daemonArtifactReadback = Get-Item -LiteralPath $daemonArtifactPath -ErrorAction Stop
+    $daemonArtifactReadbackSha256 = (Get-FileHash -LiteralPath $daemonArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($daemonArtifactReadbackSha256 -cne $daemonArtifactSha256 -or
+        [int64]$daemonArtifactReadback.Length -ne [int64]$daemonArtifactFile.Length) {
+        throw 'staged eliotd.exe changed while its canonical module manifest was exported'
+    }
+    if (-not (Test-Path -LiteralPath $moduleManifestPath -PathType Leaf)) {
+        throw 'canonical eliotd module manifest export did not create runtime/module.eliotd.toml'
+    }
+    $moduleManifestFile = Get-Item -LiteralPath $moduleManifestPath -ErrorAction Stop
+    Assert-NoSecretFile $moduleManifestFile 'runtime/module.eliotd.toml'
+    $moduleManifestSha256 = (Get-FileHash -LiteralPath $moduleManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($moduleManifestFile.Length -le 0) {
+        throw 'canonical eliotd module manifest export produced empty bytes'
+    }
+    $sourceTreeId = (& git -C $repo rev-parse ("{0}^{{tree}}" -f $sourceCommit) 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $sourceTreeId -notmatch '^[0-9a-f]{40,64}$') {
+        throw 'failed to resolve the exact release source tree identity for module provenance'
+    }
+    $moduleBuildArguments = @(
+        'build', '--frozen', '--locked', '--offline', '--release', '-p', 'eliotd', '--bin', 'eliotd'
+    )
+    $moduleSourceProof = [ordered]@{
+        schema_version = 1
+        module_id = 'eliotd'
+        package = 'eliotd'
+        binary = 'eliotd'
+        artifact_path = 'runtime/eliotd.exe'
+        artifact_sha256 = $daemonArtifactSha256
+        artifact_bytes = [int64]$daemonArtifactFile.Length
+        manifest_path = 'runtime/module.eliotd.toml'
+        manifest_sha256 = $moduleManifestSha256
+        manifest_bytes = [int64]$moduleManifestFile.Length
+        source_commit = $sourceCommit
+        source_tree_id = $sourceTreeId
+        builder_script_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'scripts/build-eliot-windows-x64-release.ps1'
+        cargo_manifest_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'bins/eliotd/Cargo.toml'
+        cargo_lock_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'Cargo.lock'
+        rust_toolchain_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'rust-toolchain.toml'
+        daemon_contract_source_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'bins/eliotd/src/daemon_kernel_client/handshake.rs'
+        module_manifest_source_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'crates/foundation/eliot-runtime-contracts/src/module_manifest.rs'
+        cargo_profile = 'release'
+        build_target = 'x86_64-pc-windows-msvc'
+        build_argv = $moduleBuildArguments
+    }
+    $moduleProvenancePath = Join-Path $runtimeRoot 'module.eliotd.provenance.json'
+    [System.IO.File]::WriteAllText(
+        $moduleProvenancePath,
+        ($moduleSourceProof | ConvertTo-Json -Depth 6),
+        [System.Text.UTF8Encoding]::new($false))
+    $moduleProvenanceFile = Get-Item -LiteralPath $moduleProvenancePath -ErrorAction Stop
+    Assert-NoSecretFile $moduleProvenanceFile 'runtime/module.eliotd.provenance.json'
+    $moduleProvenanceSha256 = (Get-FileHash -LiteralPath $moduleProvenancePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $moduleBuildProvenance = [ordered]@{
+        module_id = 'eliotd'
+        artifact_path = 'runtime/eliotd.exe'
+        artifact_sha256 = $daemonArtifactSha256
+        artifact_bytes = [int64]$daemonArtifactFile.Length
+        manifest_path = 'runtime/module.eliotd.toml'
+        manifest_sha256 = $moduleManifestSha256
+        manifest_bytes = [int64]$moduleManifestFile.Length
+        provenance_path = 'runtime/module.eliotd.provenance.json'
+        provenance_sha256 = $moduleProvenanceSha256
+        provenance_bytes = [int64]$moduleProvenanceFile.Length
+        source_commit = $sourceCommit
+        source_tree_id = $sourceTreeId
+    }
     $surrealBundleEvidence = Read-VerifiedResidentFile $resolvedSurrealExe 'project-local SurrealDB artifact for staging'
     $stagedSurrealPath = Join-Path $bundle 'runtime/surreal.exe'
     $writtenSurreal = Write-VerifiedResidentFile $stagedSurrealPath $surrealBundleEvidence.bytes 'staged SurrealDB artifact'
@@ -4516,6 +4727,7 @@ try {
             features_policy = [string]$stageToolchain.build.features_policy
         }
         surreal_version = $verifiedPinnedSurreal.version
+        module_build_provenance = $moduleBuildProvenance
         artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal)
         bundle_signing_artifacts = @($bundleSigningArtifacts)
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'RUNTIME_ARTIFACTS.json') -Encoding utf8
@@ -4589,7 +4801,7 @@ try {
             $bundle $runtimeManifest $runtimeReceiptSha256 $operatorReceipt $operatorReceiptSha256 `
             $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes)
     Assert-ClosedCodeBearingPayload $bundle $signingInventory
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $moduleBuildProvenance $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     # Issue #1858 AUD6/W6: stage the installed-entrypoint readback PLAN beside
@@ -4657,6 +4869,7 @@ try {
         runtime_artifact_catalog_sha256 = $surrealCatalog.sha256
         runtime_artifact_catalog_source_commit = $surrealCatalog.source_commit
         runtime_artifact_count = $runtimeArtifactPlan.Count + 1
+        module_build_provenance = $moduleBuildProvenance
         runtime_artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal | ForEach-Object {
                 [ordered]@{
                     package = $_.package

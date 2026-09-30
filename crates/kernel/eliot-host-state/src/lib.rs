@@ -46,7 +46,7 @@ pub use model::{
     HostObservationRecord, HostState, HostStateRecord, IdempotencyIdentity,
     ImmutableProcessManifest, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
     KernelRecord, LifecycleTimestamps, ManagedDependencyRecord, NonceState, OneTimeNonceState,
-    PREDECESSOR_RETIREMENT_RELATION_CONTRACT, PredecessorRetirementRelation,
+    ModuleBuildProvenanceRecord, PREDECESSOR_RETIREMENT_RELATION_CONTRACT, PredecessorRetirementRelation,
     PriorKernelDisposition, PriorKernelSource, ReadinessApprovedContour, ReadinessEvidence,
     RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,
     StoreRebindRecord, StoreRebindState, WakeCancellationBatchEntry, WakeCancellationBatchRecord,
