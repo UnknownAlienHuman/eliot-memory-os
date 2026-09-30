@@ -11,7 +11,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{ContractIdentity, ContractVersion, StateFence, contract_identity};
 #[cfg(test)]
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
 #[cfg(test)]
@@ -21,6 +21,50 @@ use crate::budget::BudgetLimits;
 use crate::error::{
     ContractViolation, check_fence, check_text, check_vec_bound, closed_wire_enum, is_hex64_lower,
 };
+
+/// Returns the exact content-addressed contract identity for [`DreamJobInput`].
+///
+/// The identity reuses this crate's declared `CONTRACT_NAME` and
+/// `CONTRACT_VERSION`; its shape is the existing `JsonSchema` projection of
+/// `DreamJobInput`, hashed by the foundation contract owner.
+pub fn dream_job_input_contract_identity() -> Result<ContractIdentity, ContractViolation> {
+    let shape = schemars::schema_for!(DreamJobInput);
+    let version = parse_contract_version(crate::CONTRACT_VERSION)?;
+    contract_identity(crate::CONTRACT_NAME, version, &shape).map_err(|_| {
+        ContractViolation::Malformed {
+            field: "contract",
+            reason: "cannot derive DreamJobInput contract identity".to_owned(),
+        }
+    })
+}
+
+fn parse_contract_version(value: &str) -> Result<ContractVersion, ContractViolation> {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() != 3 {
+        return Err(invalid_contract_version());
+    }
+    let major = parts[0]
+        .parse::<u16>()
+        .map_err(|_| invalid_contract_version())?;
+    let minor = parts[1]
+        .parse::<u16>()
+        .map_err(|_| invalid_contract_version())?;
+    let patch = parts[2]
+        .parse::<u16>()
+        .map_err(|_| invalid_contract_version())?;
+    let version = ContractVersion::new(major, minor, patch);
+    if version.as_string() != value {
+        return Err(invalid_contract_version());
+    }
+    Ok(version)
+}
+
+fn invalid_contract_version() -> ContractViolation {
+    ContractViolation::Malformed {
+        field: "contract_version",
+        reason: "Dreamer CONTRACT_VERSION must be canonical major.minor.patch".to_owned(),
+    }
+}
 
 /// Exact wire `schema_version` admitted by [`DreamJobAdmission`].
 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1;
