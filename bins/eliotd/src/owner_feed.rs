@@ -81,8 +81,7 @@ const OWNER_BOUND_STATUS: &str = "bound";
 /// a principal, an admitted task, a work scope, an observing receipt, and a
 /// causal `transaction_sequence`. Admitting one there is a new owner, so this
 /// pass reports the gap rather than inventing the coordinates.
-const REVOCATION_OPERATION_IDENTITY_ABSENT: &str =
-    "owner feed restore has no admitted revocation operation identity: the \
+const REVOCATION_OPERATION_IDENTITY_ABSENT: &str = "owner feed restore has no admitted revocation operation identity: the \
      daemon maintenance surface that owns this closure pass must supply a \
      principal_ref, an admitted_task, a work_scope_ref, an observing_receipt, \
      and an operation_clock carrying transaction_sequence";
