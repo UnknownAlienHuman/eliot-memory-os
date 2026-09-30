@@ -86,14 +86,29 @@
 //! 2. `prepare_isolated_destination` must take that authority, and
 //!    `bins/eliot-host/tests/backup_preparation.rs` must move with it.
 //! 3. `HostComposition::dispatch_backup_owner_operation`'s
-//!    `BackupDispatchTarget::Prepare` arm (`lib.rs`) still returns a permanent
-//!    pre-effect refusal, and it cannot be lifted by this module alone: the
-//!    admitted `#954` body `BackupIsolatedRestorePrepare`
-//!    (`crates/foundation/eliot-protocol/src/backup.rs`) carries no
-//!    `staging_parent`, `class`, `target_build`, `target_profile`,
-//!    `build_digests`, `operation_id`, `authority_generation` or `state_fence`,
-//!    so no [`PresentedPreparationRequest`] can be built from an admitted
-//!    envelope without inventing every one of those values.
+//!    `BackupDispatchTarget::Prepare` arm (`lib.rs`) still returns a pre-effect
+//!    refusal, and it is no longer refused for want of a destination parent.
+//!    [`PresentedPreparationRequest::staging_parent`] was the one field of the
+//!    thirteen with no owner-issued source, and it now has one:
+//!    [`resolve_owner_staging_parent`] reads
+//!    `RuntimeStateRoots::isolated_restore_root`, a root the installation owner
+//!    declares beside `installations` and beside the package staging root, and
+//!    `DelegatedPreparation::prepare` refuses any presented parent that is not
+//!    that exact root. The remaining absent owner is the CALLER, not a path:
+//!    `HostComposition::prepare_backup_destination` takes a
+//!    [`BackupCallerAuth`] whose two digests are documented as owner-issued and
+//!    which no owner reachable from this contour produces, and
+//!    [`BackupCallerAuth::authenticate`] is the standing always-refuse stub. That
+//!    is a different obligation from A2's destination allocation, so it is named
+//!    there rather than answered here.
+//!
+//!    The second thing that arm would need is an answer to a `#954` interface
+//!    question, not a change in this module: `BackupOwnerOutcome` states that a
+//!    produced destination "travels as a bounded immutable handle, never as a
+//!    path, a URL, or an inline body", and
+//!    `crates/kernel/eliot-host-control-endpoint/src/backup.rs` contains no
+//!    occurrence of "path" at all, so whether the prepared destination can be
+//!    named across the seam is `eliot-protocol`'s decision, not this issue's.
 //!
 //! Writing an owner allocation seam in `crates/kernel/eliot-installation` while
 //! none of these can call it would add a public function with no caller, which
@@ -251,9 +266,18 @@
 //! Three admissions carry the guarantees issue #958 requires, and each one is
 //! decided before any effect:
 //!
-//! - **The staging parent is owner-proved, never client-named.**
-//!   [`admit_staging_parent`] keeps its structural checks and then proves the
-//!   parent through [`verify_staging_parent_lease`], which
+//! - **The staging parent is owner-issued and owner-proved, never
+//!   client-named.**
+//!   On the delegated path the parent is not a presented value at all:
+//!   [`resolve_owner_staging_parent`] derives it from the same owner record the
+//!   source root comes from, through
+//!   `RuntimeStateRoots::isolated_restore_root` — a sibling of `installations`
+//!   and of the installer's package staging root, so it is outside the source
+//!   installation and is not a second owner of the package root — and
+//!   [`DelegatedPreparation::prepare`] refuses a presented parent that is not
+//!   that exact root with [`PreparationError::UnapprovedTarget`]. Then
+//!   [`admit_staging_parent`] keeps its structural checks and proves the parent
+//!   through [`verify_staging_parent_lease`], which
 //!   containment-checks it against the real ELIOT protected contour and pins
 //!   the directory chain by retained handle. A client-supplied arbitrary path
 //!   is refused with [`PreparationError::ArbitraryPath`], and the parent this
@@ -517,7 +541,11 @@ pub enum PreparationError {
 // and `prove_created_destination` (`destination_lease`) proves the destination
 // this operation created before its identity is recorded. Both project facts the
 // owner already produced, and both refuse through the same
-// `protected_path_to_preparation` mapping.
+// `protected_path_to_preparation` mapping. The owner-issued parent read is a
+// third such point on its own static token: `resolve_owner_staging_parent`
+// (`staging_parent`) derives the admitted parent from the installation owner's
+// declared isolated restore root and observes its resolution exactly as
+// `resolve_owner_source_root` (`source_root`) does for the source.
 //
 // Explicit no-event list: `DelegatedPreparation::{reconcile, cancel, cleanup}`
 // (pure passthroughs; the inner operation owns the record),
@@ -558,6 +586,7 @@ const OP_CLEANUP: &str = "cleanup";
 const OP_DELEGATE: &str = "delegate_prepare";
 const OP_OWNER_EVIDENCE: &str = "owner_evidence";
 const OP_SOURCE_ROOT: &str = "source_root";
+const OP_STAGING_PARENT: &str = "staging_parent";
 const OP_STAGING_LEASE: &str = "staging_lease";
 const OP_DESTINATION_LEASE: &str = "destination_lease";
 const OP_CALLER_AUTH: &str = "caller_auth";
@@ -3235,6 +3264,58 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
     Ok(canonical)
 }
 
+/// Resolves the isolated-restore staging parent from the same manifest-bound
+/// owner runtime roots the source root is resolved from.
+///
+/// The parent is **owner-issued**, not presented and not derived from anything a
+/// caller supplied. It comes from
+/// [`RuntimeStateRoots::isolated_restore_root`], the root the installation owner
+/// declares one leaf below its profile root, beside `installations` and beside the
+/// package staging root, and the installer creates it as one admitted leaf of that
+/// same owner's root hierarchy. Three properties follow from the owner choosing
+/// the name, and they are why this is not a convenience:
+///
+/// * it is a **sibling of every installation root**, so it is never inside the
+///   source installation. That is what lets [`admit_staging_parent`] keep its
+///   refusal of a parent that is, or is nested under, the source: the only parent
+///   the delegated path can present already satisfies that refusal, so the
+///   guarantee is reached rather than bypassed;
+/// * it is **not the package staging root** (`<profile_root>\packages`), which is
+///   the installer's materialisation root for package bytes. Admitting that one
+///   would make the restore contour a second owner of a single directory;
+/// * it is **not derived from a CLI argument**. The key that names a new
+///   installation root is a caller-supplied installer argument, so a destination
+///   root taken from it is exactly the client-supplied arbitrary path issue #958
+///   requires to be rejected.
+///
+/// No filesystem observation happens here. The owner-issued name is returned as
+/// declared, and [`admit_staging_parent`] is what proves the object at that name
+/// through the protected-root owner: existing, a directory, reparse-free, not the
+/// source and not nested under it, and inside the ELIOT protected contour.
+/// Absence of a proof is never treated as proof of absence.
+///
+/// Fail-closed with a static reason: a profile that declares no isolated root
+/// outside the preparation source is refused with
+/// [`PreparationError::ArbitraryPath`], because there is no such root to admit.
+/// Owner error internals are never echoed.
+///
+/// Pairing this with [`resolve_owner_source_root`] is deliberate. Both values come
+/// from one owner record, so the source a preparation reads and the parent it
+/// writes into can never come from two different claims about one installation.
+pub fn resolve_owner_staging_parent(
+    roots: &RuntimeStateRoots,
+) -> Result<PathBuf, PreparationError> {
+    roots
+        .isolated_restore_root()
+        .map_err(|_| PreparationError::ArbitraryPath {
+            reason: "this installation profile declares no isolated restore root outside the \
+                     preparation source"
+                .to_owned(),
+        })
+        .map_err(|error| note_prepare_error(OP_STAGING_PARENT, "resolve", error, 0))
+        .map(|owner| PathBuf::from(owner.as_str()))
+}
+
 /// Caller-presented preparation fields for one delegated operation.
 ///
 /// The configuration manifest digest is deliberately absent: the manifest
@@ -3271,8 +3352,16 @@ pub struct PresentedPreparationRequest {
     pub class: PreparationClass,
     /// Source installation identity (bounded text).
     pub source_installation_id: String,
-    /// Explicitly admitted staging parent (verified through the
-    /// protected-root owner, never trusted as a name).
+    /// Staging parent, presented as a **claim** about the owner-issued one.
+    ///
+    /// On the delegated path it is compared against
+    /// [`resolve_owner_staging_parent`] and refused with
+    /// [`PreparationError::UnapprovedTarget`] when it is not that exact root, so
+    /// this value can never become a destination parent: the parent that is
+    /// admitted is the one the installation owner declares as its isolated
+    /// restore area, and the claim only has the right to confirm it. The direct
+    /// [`prepare_isolated_destination`] port still proves whatever parent its
+    /// caller built, through the protected-root owner.
     pub staging_parent: PathBuf,
     /// Target build identity for the destination (bounded text).
     ///
@@ -3398,9 +3487,15 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     /// [`OwnerEvidence::authority_generation`], so the presented
     /// `approved_generation` is admitted only if it matches committed owner
     /// evidence, and the presented `request.authority_generation` is not an
-    /// input to that decision at all. The presented `staging_parent` is proved
-    /// by the protected-root owner inside the preparation, so a
-    /// client-supplied arbitrary path is refused. The presented target build
+    /// input to that decision at all. The presented `staging_parent` is a claim
+    /// about the owner-issued isolated restore root
+    /// ([`resolve_owner_staging_parent`]): it must equal that exact root or the
+    /// preparation is refused, and the parent actually admitted is the
+    /// owner-issued one, which is then proved by the protected-root owner inside
+    /// the preparation. A client-supplied arbitrary path is therefore refused
+    /// twice over — once for not being the owner's root and once, at
+    /// [`admit_staging_parent`], for not being a protected, reparse-free parent
+    /// outside the source. The presented target build
     /// and profile are compared against the owner-issued approved-generation
     /// handle and approved profile token of the same validated record, so a
     /// build or profile the owner has not approved is refused rather than
@@ -3445,6 +3540,31 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
         }
         let source_root = resolve_owner_source_root(evidence.runtime_roots())
             .map_err(|error| note_prepare_error(OP_DELEGATE, "resolve_source", error, 0))?;
+        // The staging parent is owner-issued on this path, by the same rule that
+        // makes the target build and profile above owner-approved rather than
+        // presented: the parent is resolved from the owner record
+        // (`RuntimeStateRoots::isolated_restore_root`) and a presented parent is
+        // only a CLAIM about it. A claim that is not that exact root is refused
+        // with `UnapprovedTarget`, not adopted and not silently replaced, so a
+        // client-supplied arbitrary path is still rejected on this path instead
+        // of becoming a destination parent. The admission then carries the
+        // owner-issued parent, and `admit_staging_parent` still proves the object
+        // at it through the protected-root owner and still refuses a parent that
+        // is or is nested under the source.
+        let staging_parent = resolve_owner_staging_parent(evidence.runtime_roots())
+            .map_err(|error| note_prepare_error(OP_DELEGATE, "resolve_staging", error, 0))?;
+        if !windows_paths_equal(&request.staging_parent, &staging_parent) {
+            return Err(note_prepare_error(
+                OP_DELEGATE,
+                "resolve_staging",
+                PreparationError::UnapprovedTarget {
+                    field: "staging_parent",
+                    presented: request.staging_parent.to_string_lossy().into_owned(),
+                    approved: staging_parent.to_string_lossy().into_owned(),
+                },
+                0,
+            ));
+        }
         for digest in &request.build_digests {
             check_digest(digest, "build_digests")
                 .map_err(|error| note_prepare_error(OP_DELEGATE, "check_build", error, 0))?;
@@ -3480,7 +3600,9 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
             class: request.class,
             source_installation_id: request.source_installation_id.clone(),
             source_root,
-            staging_parent: request.staging_parent.clone(),
+            // Owner-issued, and the presented value already had to equal it:
+            // see the `UnapprovedTarget` refusal above.
+            staging_parent,
             target_build: request.target_build.clone(),
             target_profile: request.target_profile.clone(),
             approved_generation: request.approved_generation,
