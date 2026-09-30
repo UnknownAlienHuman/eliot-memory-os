@@ -130,6 +130,12 @@ $runtimeArtifactDefinitions = @(
         relative_path = 'runtime/eliot-wasm-host.exe'
     }
     [pscustomobject]@{
+        package = 'eliot-user-broker'
+        binary = 'eliot-user-broker'
+        role = 'user_broker'
+        relative_path = 'runtime/eliot-user-broker.exe'
+    }
+    [pscustomobject]@{
         package = 'eliot-notify'
         binary = 'eliot-notify'
         role = 'notify'
@@ -3324,6 +3330,7 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         'runtime/eliot-testd.exe',
         'runtime/eliot-native-worker.exe',
         'runtime/eliot-wasm-host.exe',
+        'runtime/eliot-user-broker.exe',
         'runtime/eliot-notify.exe',
         'runtime/surreal.exe',
         'runtime/module.eliotd.toml',

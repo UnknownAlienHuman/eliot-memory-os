@@ -689,6 +689,7 @@ function Get-StaticRuntimeAuthenticodeRoleDefinitions {
         [ordered]@{ role = 'testd'; path = 'runtime/eliot-testd.exe' }
         [ordered]@{ role = 'native_worker'; path = 'runtime/eliot-native-worker.exe' }
         [ordered]@{ role = 'wasm_host'; path = 'runtime/eliot-wasm-host.exe' }
+        [ordered]@{ role = 'user_broker'; path = 'runtime/eliot-user-broker.exe' }
         [ordered]@{ role = 'notify'; path = 'runtime/eliot-notify.exe' }
     )
 }
