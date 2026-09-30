@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.IO.Pipes;
 using System.Text;
@@ -208,6 +209,22 @@ internal static class BrokerPipeClient
         return pipeName;
     }
 
+    /// The generation's tick field is an OS creation instant, not an opaque
+    /// marker: OperatorProcessIdentityProvider.Observe minted it from
+    /// process.StartTime.ToUniversalTime().Ticks of the very process this
+    /// generation names. Range-checking that field only proves the token is
+    /// well shaped, so a forged "{pid}:1" would satisfy a shape check and be
+    /// accepted as the same process generation, while a replacement process
+    /// inheriting a recycled PID has a different creation instant. The instant
+    /// is therefore read live here, at comparison time, from the process that
+    /// holds this PID now - a fresh observation, never a remembered or cached
+    /// start time, so nothing can go stale between production and comparison.
+    ///
+    /// A start time that cannot be observed is a refusal, never a match: an
+    /// exited or replaced process, an invalid id and an unavailable API are all
+    /// conditions in which no continuity may be claimed. The PID equality above
+    /// is kept, and the shape parse keeps its NumberStyles.None /
+    /// CultureInfo.InvariantCulture discipline.
     private static bool ProcessGenerationMatches(string processGeneration, int processId)
     {
         var separator = processGeneration.IndexOf(':');
@@ -223,7 +240,26 @@ internal static class BrokerPipeClient
                 NumberStyles.None,
                 CultureInfo.InvariantCulture,
                 out var processStartTicks)
-            && processStartTicks > 0;
+            && processStartTicks > 0
+            && LiveStartTicksEqual(processId, processStartTicks);
+    }
+
+    /// Compares the generation's tick field against the live creation instant
+    /// of the process that currently owns the PID. Every way this observation
+    /// can fail is a fail-closed refusal, so a generation can never be honoured
+    /// on the strength of its shape alone.
+    private static bool LiveStartTicksEqual(int processId, long expectedStartTicks)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return process.StartTime.ToUniversalTime().Ticks == expectedStartTicks;
+        }
+        catch (Exception error) when (error is ArgumentException or InvalidOperationException
+            or NotSupportedException or System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
     }
 
     private static async Task WriteRequestAsync(
