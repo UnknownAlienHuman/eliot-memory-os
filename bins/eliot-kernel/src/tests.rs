@@ -2370,7 +2370,11 @@ async fn authenticated_handshake_fences_ready_without_production_supervision_dep
     let wait_receipt = receipt.clone();
     let waiter = tokio::spawn(async move {
         wait_kernel
-            .await_daemon_ready(&wait_receipt, Duration::from_millis(50))
+            .await_daemon_ready(
+                &wait_receipt,
+                Duration::from_millis(50),
+                &tracing::Span::none(),
+            )
             .await
     });
     tokio::task::yield_now().await;
