@@ -15,7 +15,7 @@ use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
     OperationId, StateFence, TaskId, canonical_json_bytes, fences_match_exact, sha256_hex,
 };
-use eliot_coordination::CoordinationOwner;
+use eliot_coordination::{CoordinationOwner, FinishCoordinationProjection};
 use eliot_finish::{
     FinishAdmission, FinishAttempt, FinishClosureIntent, FinishContext, FinishDecisionReceipt,
     FinishError, FinishService, TaskLifecycleState,
@@ -36,10 +36,10 @@ use eliot_testd_core::{
 use thiserror::Error;
 
 use crate::{
-    CanonicalAdmissionOwner, CanonicalAdmissionSnapshot, CanonicalFinishEvidence,
-    CanonicalPlanBinding, CanonicalVerifierExecutionFact, CompositionError, GovernorOwners,
-    KernelPortError, KernelTransitionPort, acceptance_coverage_from_verifier_fact,
-    evaluate_testd_verification_current,
+    CanonicalAdmissionOwner, CanonicalAdmissionSnapshot, CanonicalContractAcceptance,
+    CanonicalFinishEvidence, CanonicalPlanBinding, CanonicalVerifierExecutionFact,
+    CompositionError, GovernorOwners, KernelPortError, KernelTransitionPort,
+    acceptance_coverage_from_verifier_fact, evaluate_testd_verification_current,
 };
 
 /// The Governor's own canonical store scope identity.
@@ -338,20 +338,115 @@ fn prepare_receipt_readback(
 }
 
 impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
-    /// Rehydrates finish evidence from the current owner projections.
+    /// Rehydrates the contract's acceptance identity from the task-selection owner
+    /// (issue #325 P1, I7.9).
     ///
-    /// Every handle in the result comes from a same-fence task event,
-    /// task-and-plan-bound observation admission, or the coordination owner.
-    /// Missing material is retained as an explicit gap where the finish
-    /// contract permits it; missing owner identity or acceptance evidence
-    /// prevents publication entirely.
-    fn produce_finish_evidence(
+    /// The digest is read off the same-fence, task-and-plan-bound observation
+    /// receipts this path already required, at the exact `task.revision`. That
+    /// owner is different from the canonical plan's own binding, which is what
+    /// makes the digest an authority over the contract's obligation set rather
+    /// than an echo of the plan's list: the plan's declared items are admissible
+    /// as the contract's items only while the owner's digest admits them.
+    ///
+    /// Every accepted, task-and-plan-bound receipt also contributes its record id
+    /// to `observation_refs`, so the rehydration and the observation join cannot
+    /// drift apart. Task-bound receipts that disagree about the acceptance
+    /// identity are ambiguous owner state, not a majority vote, so this fails
+    /// closed rather than picking one.
+    fn rehydrate_contract_acceptance_digest(
+        &self,
+        task_id: &TaskId,
+        task: &TaskRecord,
+        plan: &CanonicalPlanBinding,
+        fence: &StateFence,
+        observation_refs: &mut BTreeSet<String>,
+    ) -> Result<String, FinishAttemptError> {
+        let mut contract_acceptance_digest: Option<String> = None;
+        for entry in self.observation.snapshot() {
+            let receipt = match &entry.result {
+                ObservationAdmissionResult::Accepted { receipt }
+                | ObservationAdmissionResult::Replayed { receipt } => receipt,
+                ObservationAdmissionResult::Rejected { .. } => continue,
+            };
+            let Some(selection) = receipt.task_selection.as_ref().filter(|selection| {
+                receipt.state_fence == *fence
+                    && selection.task_ref == task_id.as_str()
+                    && selection.task_revision == task.revision
+                    && matches_plan(receipt.plan.as_ref(), plan, fence)
+            }) else {
+                continue;
+            };
+            receipt.validate().map_err(|error| {
+                FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                    "accepted task observation receipt is invalid: {error}"
+                )))
+            })?;
+            if contract_acceptance_digest
+                .as_ref()
+                .is_some_and(|seen| *seen != selection.acceptance_digest)
+            {
+                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                    "task-bound owner evidence disagrees about the current contract acceptance set"
+                        .to_owned(),
+                )));
+            }
+            contract_acceptance_digest = Some(selection.acceptance_digest.clone());
+            observation_refs.insert(receipt.record_id.clone());
+        }
+        contract_acceptance_digest.ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "canonical finish evidence has no accepted task-and-plan-bound observation"
+                    .to_owned(),
+            ))
+        })
+    }
+
+    /// Reads the canonical owner fact that is the ONLY source of verifier
+    /// authority, and refuses it when it is stale for the current task or plan.
+    ///
+    /// Task commands and observation epistemic labels are requests and
+    /// projections; neither is an executed verifier outcome, so neither may
+    /// stand in for this fact. A fact bound to a different task revision or a
+    /// different plan describes a run of some other decision.
+    ///
+    /// Returns the fact and its run reference together so the caller cannot
+    /// derive the run id from anywhere but the fact it just admitted.
+    fn read_current_verifier_fact(
+        &self,
+        task_id: &TaskId,
+        task: &TaskRecord,
+        plan: &CanonicalPlanBinding,
+        fence: &StateFence,
+    ) -> Result<(CanonicalVerifierExecutionFact, String), FinishAttemptError> {
+        let verifier_fact = self
+            .canonical
+            .read_verifier_execution_fact(fence)
+            .map_err(FinishAttemptError::Composition)?;
+        if verifier_fact.task_id != task_id.as_str()
+            || verifier_fact.task_revision != task.revision
+            || verifier_fact.plan != *plan
+        {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "canonical verifier execution fact is stale for the current task/plan".to_owned(),
+            )));
+        }
+        let verifier_run_ref = verifier_fact.verification_run.run_id.to_string();
+        Ok((verifier_fact, verifier_run_ref))
+    }
+
+    /// Collects the frame references and the finish authority reference the
+    /// task itself carries, over the task's own committed event range.
+    ///
+    /// Only events inside the fence and the task's last sequence are read, so a
+    /// frame or authority from another fence, another task, or a sequence this
+    /// task has not reached cannot enter the evidence. The authority reference
+    /// is the LAST one in range, matching the task owner's own projection order.
+    fn scan_task_frame_and_authority(
         &self,
         task_id: &TaskId,
         task: &TaskRecord,
         fence: &StateFence,
-        plan: &CanonicalPlanBinding,
-    ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
+    ) -> (BTreeSet<String>, Option<String>) {
         let mut frame_refs = BTreeSet::new();
         let mut finish_authority_ref = None;
         for event in self.task.events().iter().filter(|event| {
@@ -374,6 +469,52 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                 _ => {}
             }
         }
+        (frame_refs, finish_authority_ref)
+    }
+
+    /// Reads the coordination owner's finish projection and refuses it when it
+    /// is not this task's projection under this fence.
+    ///
+    /// A projection carrying another task's id or another fence describes a
+    /// different decision's coordination state; adopting its artifact or effect
+    /// references would attribute them to this finish.
+    fn read_current_finish_projection(
+        &self,
+        task_id: &TaskId,
+        fence: &StateFence,
+    ) -> Result<FinishCoordinationProjection, FinishAttemptError> {
+        let coordination = self
+            .coordination
+            .finish_projection(task_id.as_str(), fence)
+            .map_err(|error| {
+                FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                    "coordination finish projection failed: {error}"
+                )))
+            })?;
+        if coordination.state_fence != *fence || coordination.task_id != task_id.as_str() {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "coordination finish projection has a stale task fence".to_owned(),
+            )));
+        }
+        Ok(coordination)
+    }
+
+    /// Rehydrates finish evidence from the current owner projections.
+    ///
+    /// Every handle in the result comes from a same-fence task event,
+    /// task-and-plan-bound observation admission, or the coordination owner.
+    /// Missing material is retained as an explicit gap where the finish
+    /// contract permits it; missing owner identity or acceptance evidence
+    /// prevents publication entirely.
+    fn produce_finish_evidence(
+        &self,
+        task_id: &TaskId,
+        task: &TaskRecord,
+        fence: &StateFence,
+        plan: &CanonicalPlanBinding,
+    ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
+        let (frame_refs, finish_authority_ref) =
+            self.scan_task_frame_and_authority(task_id, task, fence);
         let finish_authority_ref = finish_authority_ref.ok_or_else(|| {
             FinishAttemptError::Composition(CompositionError::Recovery(
                 "canonical task has no same-fence action authority for finish".to_owned(),
@@ -389,68 +530,47 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         // produced from the current durable TestD row. Task commands and
         // observation epistemic labels are requests/projections; neither is
         // an executed verifier outcome.
-        let verifier_fact = self
-            .canonical
-            .read_verifier_execution_fact(fence)
-            .map_err(FinishAttemptError::Composition)?;
-        if verifier_fact.task_id != task_id.as_str()
-            || verifier_fact.task_revision != task.revision
-            || verifier_fact.plan != *plan
-        {
-            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                "canonical verifier execution fact is stale for the current task/plan".to_owned(),
-            )));
-        }
-        let verifier_run_ref = verifier_fact.verification_run.run_id.to_string();
+        let (verifier_fact, verifier_run_ref) =
+            self.read_current_verifier_fact(task_id, task, plan, fence)?;
         // This fact has already been rehydrated and validated against the
         // current task, plan, fence, and durable terminal TestD receipt. A
         // failed or partial verifier is still an executed run; its outcome is
         // represented per required test below, not mislabeled as stale.
 
-        let coordination = self
-            .coordination
-            .finish_projection(task_id.as_str(), fence)
-            .map_err(|error| {
-                FinishAttemptError::Composition(CompositionError::Recovery(format!(
-                    "coordination finish projection failed: {error}"
-                )))
-            })?;
-        if coordination.state_fence != *fence || coordination.task_id != task_id.as_str() {
-            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                "coordination finish projection has a stale task fence".to_owned(),
-            )));
-        }
+        let coordination = self.read_current_finish_projection(task_id, fence)?;
 
         let mut observation_refs = BTreeSet::new();
-        for entry in self.observation.snapshot() {
-            let receipt = match &entry.result {
-                ObservationAdmissionResult::Accepted { receipt }
-                | ObservationAdmissionResult::Replayed { receipt } => receipt,
-                ObservationAdmissionResult::Rejected { .. } => continue,
-            };
-            if receipt.state_fence == *fence
-                && receipt.task_selection.as_ref().is_some_and(|selection| {
-                    selection.task_ref == task_id.as_str()
-                        && selection.task_revision == task.revision
-                })
-                && matches_plan(receipt.plan.as_ref(), plan, fence)
-            {
-                receipt.validate().map_err(|error| {
-                    FinishAttemptError::Composition(CompositionError::Recovery(format!(
-                        "accepted task observation receipt is invalid: {error}"
-                    )))
-                })?;
-                observation_refs.insert(receipt.record_id.clone());
-            }
-        }
-        if observation_refs.is_empty() {
-            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                "canonical finish evidence has no accepted task-and-plan-bound observation"
-                    .to_owned(),
-            )));
-        }
+        // Issue #325 P1, I7.9: the contract acceptance digest is rehydrated from
+        // the task-selection evidence the contract owner admitted for this exact
+        // task revision — a different owner than the canonical plan. It is the
+        // only thing that makes the plan's declared item set the contract's
+        // obligation set rather than the plan's own list, so a plan that names
+        // fewer obligations than the contract carries is refused below instead
+        // of shrinking the denominator the gate is computed over.
+        let contract_acceptance_digest = self.rehydrate_contract_acceptance_digest(
+            task_id,
+            task,
+            plan,
+            fence,
+            &mut observation_refs,
+        )?;
+        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "canonical plan has no verifier binding".to_owned(),
+            ))
+        })?;
+        let contract_acceptance = CanonicalContractAcceptance {
+            task_id: task_id.as_str().to_owned(),
+            task_revision: task.revision,
+            acceptance_digest: contract_acceptance_digest,
+            item_ids: verifier_plan.required_acceptance_item_ids.clone(),
+        };
 
-        let acceptance = acceptance_coverage_from_verifier_fact(plan, &verifier_fact)?;
+        let acceptance = acceptance_coverage_from_verifier_fact(
+            &contract_acceptance.denominator(),
+            plan,
+            &verifier_fact,
+        )?;
         let stale_verifier_run_refs = if verifier_fact.certifies_completion() {
             Vec::new()
         } else {
@@ -488,6 +608,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             .map_err(|error| FinishAttemptError::Finish(FinishError::from(error)))?;
         let canonical = CanonicalFinishEvidence {
             state_fence: fence.clone(),
+            contract_acceptance,
             evidence,
             effect_reference_bindings: verifier_fact.effect_reference_bindings.clone(),
             descendant_closure,
