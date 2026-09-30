@@ -19,11 +19,11 @@ use eliot_contracts::{
     contract_identity as make_contract_identity, sha256_hex,
 };
 use eliot_ipc::{NamedPipeTransport, TransportLimits};
-pub use eliot_platform::{HostProcessNonce, PlatformHandle};
 use eliot_platform::{
-    InstallationObservation, InstallationPort, InstallationRequest, PortError, PortOutcome,
-    ProviderError, ProviderErrorCode, UnknownReason,
+    GuardRevertOutcome, InstallationObservation, InstallationPort, InstallationRequest, PortError,
+    PortOutcome, ProviderError, ProviderErrorCode, UnknownReason,
 };
+pub use eliot_platform::{HostProcessNonce, PlatformHandle};
 pub use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{
     AgentBridgeSecurityConvergenceReceipt as PlatformAgentBridgeSecurityConvergenceReceipt,
@@ -47,11 +47,12 @@ use eliot_platform_windows::{
     ServiceRegistrationCurrent, ServiceRegistrationOutcome, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceRegistrationRuntimeReadback, ServiceStartMode,
     ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
-    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
-    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
+    SupervisionAuthorityKeyStoreRequest, TerminalContainmentReadback, UserOwnedPathLease,
+    WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider, WindowsPlatform,
+    WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -118,8 +119,11 @@ mod agent_bridge_profile;
 mod approved_generation_registry;
 mod canary_removal;
 mod credential_provision;
+mod guard_containment;
 mod installation_registry;
 mod integration_discovery;
+mod managed_change_admission;
+mod managed_change_plan;
 mod package;
 mod package_planner;
 mod plan;
@@ -134,6 +138,7 @@ mod signed_activation;
 mod survey;
 mod transaction;
 
+pub use guard_containment::RetainedGuardRevert;
 pub use installation_registry::RedbInstallationRegistry;
 #[cfg(test)]
 use installation_registry::classify_registry_table;
@@ -166,7 +171,24 @@ use approved_generation_registry::{
 
 pub(crate) use integration_discovery::WindowsPathIdentity;
 pub use integration_discovery::{
-    IntegrationCategory, IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry,
+    AcceptedCatalogueContext, AcceptedInstallationSurvey, AcceptedIntegrationCatalogue,
+    BoundedProbeInvocation, BoundedSafeProbe, CatalogueAdmissionError, DISCOVERY_CATALOGUE_SCHEMA,
+    DISCOVERY_CATALOGUE_SETTING_KEY, INTEGRATION_SEED_FAMILIES, IntegrationCategory,
+    IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry, MAX_CATALOGUE_FAMILIES,
+    ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
+    admit_installation_survey_and_compile_change, integration_seed_family_ids,
+    load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
+};
+
+pub use managed_change_admission::{
+    ManagedCapabilityAdvertisement, ManagedCapabilityState, ManagedCapabilityStatus,
+    ManagedChangeDispatch, ManagedChangeEffectOwner, ManagedEffectRoutingRefusal,
+    MissingQualification, RequalificationBinding, requalify_managed_capability,
+    route_managed_change_to_effect_owner, validate_advertisement,
+};
+
+pub use managed_change_plan::{
+    ManagedEnvironmentChangePlan, compile_managed_change_plan, revalidate_managed_change_plan,
 };
 
 pub use survey::{
@@ -209,7 +231,8 @@ pub use credential_provision::{
     decode_credential_control_response_frame, dispatch_credential_target_for_store_target,
     phase_b_credential_receipt_digest, phase_b_host_state_root_digest,
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest,
-    validate_store_credential_target,
+    provider_bootstrap_credential_target_for_store_target,
+    validate_provider_bootstrap_credential_target, validate_store_credential_target,
 };
 pub use package::{PackageObservationSnapshot, PackageObservedFile};
 use package::{
@@ -341,9 +364,10 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 /// pending Phase-B receipts and committed/rebound live bindings. Version 15
 /// binds each Watchdog approval to the exact installer-read SCM control grant.
 /// Version 16 carries the complete OWNER|GROUP|DACL proof in every durable
-/// service-control grant receipt.
+/// service-control grant receipt. Version 17 adds immutable User Broker path
+/// and digest pins to each candidate and runtime launch descriptor.
 /// Older projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(16, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(17, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -983,6 +1007,8 @@ pub struct CandidateManifest {
     pub testd_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved native worker image.
     pub native_worker_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the staged, per-user User Broker image.
+    pub user_broker_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved WASM-host image.
     pub wasm_host_artifact_digest: PlatformHandle,
     /// Canonical installation-approved Kernel executable path.
@@ -999,6 +1025,8 @@ pub struct CandidateManifest {
     pub testd_executable_path: PlatformHandle,
     /// Canonical installation-approved native worker executable path.
     pub native_worker_executable_path: PlatformHandle,
+    /// Canonical installation-approved staged per-user User Broker path.
+    pub user_broker_executable_path: PlatformHandle,
     /// Canonical installation-approved WASM-host executable path.
     pub wasm_host_executable_path: PlatformHandle,
     /// Canonical installation-approved generation configuration path.
@@ -1205,6 +1233,8 @@ pub struct RuntimeLaunchDescriptor {
     pub testd_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved native worker image.
     pub native_worker_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the staged, per-user User Broker image.
+    pub user_broker_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved WASM-host image.
     pub wasm_host_artifact_digest: PlatformHandle,
     /// Explicit installation-approved Doctor executable path.
@@ -1213,6 +1243,8 @@ pub struct RuntimeLaunchDescriptor {
     pub testd_executable_path: PlatformHandle,
     /// Explicit installation-approved native worker executable path.
     pub native_worker_executable_path: PlatformHandle,
+    /// Explicit installation-approved staged per-user User Broker path.
+    pub user_broker_executable_path: PlatformHandle,
     /// Explicit installation-approved WASM-host executable path.
     pub wasm_host_executable_path: PlatformHandle,
     /// SHA-256 of the descriptor fields excluding this digest.
@@ -1558,6 +1590,10 @@ impl RuntimeLaunchDescriptor {
             self.testd_artifact_digest.as_str().to_owned(),
             "--native-worker-artifact-sha256".to_owned(),
             self.native_worker_artifact_digest.as_str().to_owned(),
+            "--user-broker-executable".to_owned(),
+            self.user_broker_executable_path.as_str().to_owned(),
+            "--user-broker-artifact-sha256".to_owned(),
+            self.user_broker_artifact_digest.as_str().to_owned(),
             "--eliotd-descriptor".to_owned(),
             self.eliotd_descriptor_path.as_str().to_owned(),
             "--eliotd-descriptor-sha256".to_owned(),
@@ -1702,10 +1738,12 @@ impl RuntimeLaunchDescriptor {
             doctor_artifact_digest: &'a PlatformHandle,
             testd_artifact_digest: &'a PlatformHandle,
             native_worker_artifact_digest: &'a PlatformHandle,
+            user_broker_artifact_digest: &'a PlatformHandle,
             wasm_host_artifact_digest: &'a PlatformHandle,
             doctor_executable_path: &'a PlatformHandle,
             testd_executable_path: &'a PlatformHandle,
             native_worker_executable_path: &'a PlatformHandle,
+            user_broker_executable_path: &'a PlatformHandle,
             wasm_host_executable_path: &'a PlatformHandle,
         }
         serde_json::to_vec(&Unsigned {
@@ -1747,10 +1785,12 @@ impl RuntimeLaunchDescriptor {
             doctor_artifact_digest: &self.doctor_artifact_digest,
             testd_artifact_digest: &self.testd_artifact_digest,
             native_worker_artifact_digest: &self.native_worker_artifact_digest,
+            user_broker_artifact_digest: &self.user_broker_artifact_digest,
             wasm_host_artifact_digest: &self.wasm_host_artifact_digest,
             doctor_executable_path: &self.doctor_executable_path,
             testd_executable_path: &self.testd_executable_path,
             native_worker_executable_path: &self.native_worker_executable_path,
+            user_broker_executable_path: &self.user_broker_executable_path,
             wasm_host_executable_path: &self.wasm_host_executable_path,
         })
         .map_err(|error| InstallationError::InvalidField {
@@ -1997,6 +2037,19 @@ impl RuntimeLaunchDescriptor {
             "runtime_launch.native_worker_artifact_digest",
         )?;
         approved_path(
+            &self.user_broker_executable_path,
+            "runtime_launch.user_broker_executable_path",
+        )?;
+        approved_filename(
+            &self.user_broker_executable_path,
+            "eliot-user-broker.exe",
+            "runtime_launch.user_broker_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.user_broker_artifact_digest,
+            "runtime_launch.user_broker_artifact_digest",
+        )?;
+        approved_path(
             &self.wasm_host_executable_path,
             "runtime_launch.wasm_host_executable_path",
         )?;
@@ -2035,6 +2088,15 @@ impl RuntimeLaunchDescriptor {
             || self.wasm_host_executable_path == self.store_bridge_executable_path
             || self.wasm_host_executable_path == self.canonical_store_executable_path
             || self.wasm_host_executable_path == self.eliotd_executable_path
+            || self.user_broker_executable_path == self.doctor_executable_path
+            || self.user_broker_executable_path == self.testd_executable_path
+            || self.user_broker_executable_path == self.native_worker_executable_path
+            || self.user_broker_executable_path == self.wasm_host_executable_path
+            || self.user_broker_executable_path == self.host_executable_path
+            || self.user_broker_executable_path == self.watchdog_executable_path
+            || self.user_broker_executable_path == self.store_bridge_executable_path
+            || self.user_broker_executable_path == self.canonical_store_executable_path
+            || self.user_broker_executable_path == self.eliotd_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "runtime_launch.named_artifact_paths".to_owned(),
@@ -2093,6 +2155,10 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.native_worker_executable_path,
                 "runtime_launch.native_worker_executable_path",
+            ),
+            (
+                &self.user_broker_executable_path,
+                "runtime_launch.user_broker_executable_path",
             ),
             (
                 &self.wasm_host_executable_path,
@@ -2175,6 +2241,10 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.native_worker_executable_path,
                 "runtime_launch.native_worker_executable_path",
+            ),
+            (
+                &self.user_broker_executable_path,
+                "runtime_launch.user_broker_executable_path",
             ),
             (
                 &self.wasm_host_executable_path,
@@ -2265,6 +2335,10 @@ impl CandidateManifest {
         sha256_handle(
             &self.native_worker_artifact_digest,
             "manifest.native_worker_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.user_broker_artifact_digest,
+            "manifest.user_broker_artifact_digest",
         )?;
         sha256_handle(
             &self.wasm_host_artifact_digest,
@@ -2358,6 +2432,21 @@ impl CandidateManifest {
                 "manifest.native_worker_executable_path",
             )?;
         approved_path(
+            &self.user_broker_executable_path,
+            "manifest.user_broker_executable_path",
+        )?;
+        approved_filename(
+            &self.user_broker_executable_path,
+            "eliot-user-broker.exe",
+            "manifest.user_broker_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.user_broker_executable_path,
+                "manifest.user_broker_executable_path",
+            )?;
+        approved_path(
             &self.wasm_host_executable_path,
             "manifest.wasm_host_executable_path",
         )?;
@@ -2379,27 +2468,35 @@ impl CandidateManifest {
             || self.kernel_executable_path == self.testd_executable_path
             || self.kernel_executable_path == self.native_worker_executable_path
             || self.kernel_executable_path == self.wasm_host_executable_path
+            || self.kernel_executable_path == self.user_broker_executable_path
             || self.store_bridge_executable_path == self.canonical_store_executable_path
             || self.store_bridge_executable_path == self.host_executable_path
             || self.store_bridge_executable_path == self.doctor_executable_path
             || self.store_bridge_executable_path == self.testd_executable_path
             || self.store_bridge_executable_path == self.native_worker_executable_path
             || self.store_bridge_executable_path == self.wasm_host_executable_path
+            || self.store_bridge_executable_path == self.user_broker_executable_path
             || self.canonical_store_executable_path == self.host_executable_path
             || self.canonical_store_executable_path == self.doctor_executable_path
             || self.canonical_store_executable_path == self.testd_executable_path
             || self.canonical_store_executable_path == self.native_worker_executable_path
             || self.canonical_store_executable_path == self.wasm_host_executable_path
+            || self.canonical_store_executable_path == self.user_broker_executable_path
             || self.host_executable_path == self.doctor_executable_path
             || self.host_executable_path == self.testd_executable_path
             || self.host_executable_path == self.native_worker_executable_path
             || self.host_executable_path == self.wasm_host_executable_path
+            || self.host_executable_path == self.user_broker_executable_path
             || self.doctor_executable_path == self.testd_executable_path
             || self.doctor_executable_path == self.native_worker_executable_path
             || self.doctor_executable_path == self.wasm_host_executable_path
+            || self.doctor_executable_path == self.user_broker_executable_path
             || self.testd_executable_path == self.native_worker_executable_path
             || self.testd_executable_path == self.wasm_host_executable_path
+            || self.testd_executable_path == self.user_broker_executable_path
             || self.native_worker_executable_path == self.wasm_host_executable_path
+            || self.native_worker_executable_path == self.user_broker_executable_path
+            || self.wasm_host_executable_path == self.user_broker_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2449,6 +2546,7 @@ impl CandidateManifest {
             || self.runtime_launch.eliotd_executable_path == self.testd_executable_path
             || self.runtime_launch.eliotd_executable_path == self.native_worker_executable_path
             || self.runtime_launch.eliotd_executable_path == self.wasm_host_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.user_broker_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2528,6 +2626,11 @@ impl CandidateManifest {
             &self.wasm_host_executable_path,
             "manifest.wasm_host_executable_path",
         )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.user_broker_executable_path,
+            "manifest.user_broker_executable_path",
+        )?;
         if self.runtime_launch.canonical_store_executable_path
             != self.canonical_store_executable_path
         {
@@ -2551,6 +2654,8 @@ impl CandidateManifest {
                 != self.native_worker_executable_path
             || self.runtime_launch.native_worker_artifact_digest
                 != self.native_worker_artifact_digest
+            || self.runtime_launch.user_broker_executable_path != self.user_broker_executable_path
+            || self.runtime_launch.user_broker_artifact_digest != self.user_broker_artifact_digest
             || self.runtime_launch.wasm_host_executable_path != self.wasm_host_executable_path
             || self.runtime_launch.wasm_host_artifact_digest != self.wasm_host_artifact_digest
         {
@@ -4202,7 +4307,14 @@ impl WindowsInstallationEffectPort {
                     {
                         PortOutcome::Known(*receipt)
                     }
-                    Ok(_) | Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+                    Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {
+                        PortOutcome::Error(phase_b_unknown_port_error(request, &pending_ref))
+                    }
+                    Ok(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+                    Err(PortError::Provider(provider)) if provider.retryable => {
+                        PortOutcome::Unknown(UnknownReason::Indeterminate)
+                    }
+                    Err(error) => PortOutcome::Error(error),
                 }
             }
             Ok(HostCredentialControlResponse::Unknown { pending_ref }) => {
@@ -7037,6 +7149,8 @@ fn is_credential_unknown_reason(value: &str) -> bool {
             | "credential-final-marker-without-target"
             | "credential-csprng"
             | "credential-envelope"
+            | "credential-write"
+            | "credential-target-prewrite-race"
             | "credential-write-mismatch"
             | "credential-envelope-digest"
             | "credential-final-marker"
@@ -9788,6 +9902,71 @@ where
         })
     }
 
+    /// Retains the exact composite a guard owner returned inside the durable
+    /// transaction record, in the same single sealed compare-and-save that
+    /// records the dependent rollback.
+    ///
+    /// This is the normal-path persistence seam for a safe-return guard
+    /// failure: the composite reaches the durable transaction before any
+    /// dependent retry or rollback runs, and it survives restart. A persistence
+    /// failure returns the error with the composite still owned by the caller;
+    /// it never discards the original effects and never invents a cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::TransactionNotFound`] when no such
+    /// transaction exists, and any error from the composite's own validation or
+    /// the transaction's own invariants.
+    pub(crate) fn record_guard_revert(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        outcome: GuardRevertOutcome,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let expected = TransactionVersion::of(&transaction)?;
+        let result = transaction.record_guard_revert(outcome)?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(result)
+    }
+
+    /// Restart reader for the retained guard evidence of one exact
+    /// transaction.
+    ///
+    /// A restarted process calls this before it adopts or overwrites the object
+    /// a retained composite protects. The retained bounded terminal record is
+    /// validated by the terminal owner's own readback validator and compared
+    /// with this operation's own identity, so a missing, short, torn, foreign,
+    /// stale, or unbound record leaves the block in place. No automatic retry
+    /// is authorized here and no receipt is synthesized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::TransactionNotFound`] when no such
+    /// transaction exists, and any error from the transaction's own invariants.
+    pub(crate) fn reconcile_retained_guard_evidence(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        retained_record: &[u8],
+    ) -> Result<TerminalContainmentReadback, InstallationError> {
+        let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let readback = transaction.reconcile_guard_revert_evidence(retained_record)?;
+        if matches!(readback, TerminalContainmentReadback::Complete(_)) {
+            let expected = TransactionVersion::of(&transaction)?;
+            self.store.compare_and_save(expected, &transaction)?;
+        }
+        Ok(readback)
+    }
+
     /// Recovery-only readback reconciliation for a first-install service-start
     /// timeout, called before the Host registry abort in
     /// `rollback_with_activation_owner`.
@@ -10076,6 +10255,56 @@ where
     ) -> Result<InstallationStepOutcome, InstallationError> {
         self.inner
             .persist_non_effect_rejection(transaction_id, pending_ref)
+    }
+
+    /// Retains the exact composite a guard owner returned inside the durable
+    /// transaction record, in the same single sealed compare-and-save that
+    /// records the dependent rollback.
+    ///
+    /// This is the normal-path persistence seam for a safe-return guard
+    /// failure: the composite reaches the durable transaction before any
+    /// dependent retry or rollback runs, and it survives restart. A persistence
+    /// failure returns the error with the composite still owned by the caller;
+    /// it never discards the original effects and never invents a cleanup.
+    ///
+    /// The guard owners in `eliot-platform-windows` are the producers of this
+    /// composite (#860). Until they are wired, no in-tree caller exists and
+    /// this seam is the published entry point they call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::TransactionNotFound`] when no such
+    /// transaction exists, and any error from the composite's own validation or
+    /// the transaction's own invariants.
+    pub fn record_guard_revert(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        outcome: GuardRevertOutcome,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.inner.record_guard_revert(transaction_id, outcome)
+    }
+
+    /// Restart reader for the retained guard evidence of one exact
+    /// transaction.
+    ///
+    /// A restarted process calls this before it adopts or overwrites the object
+    /// a retained composite protects. The retained bounded terminal record is
+    /// validated by the terminal owner's own readback validator and compared
+    /// with this operation's own identity, so a missing, short, torn, foreign,
+    /// stale, or unbound record leaves the block in place. No automatic retry
+    /// is authorized here and no receipt is synthesized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::TransactionNotFound`] when no such
+    /// transaction exists, and any error from the transaction's own invariants.
+    pub fn reconcile_retained_guard_evidence(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        retained_record: &[u8],
+    ) -> Result<TerminalContainmentReadback, InstallationError> {
+        self.inner
+            .reconcile_retained_guard_evidence(transaction_id, retained_record)
     }
 
     /// Borrows only the durable store; the mutating port remains sealed.
