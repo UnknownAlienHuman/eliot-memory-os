@@ -191,6 +191,7 @@ impl ClassificationPolicy {
         input.preflight()?;
         self.preflight_fields(
             input,
+            &input.policy_digest,
             &input.target,
             &input.evidence,
             &input.features,
@@ -206,6 +207,7 @@ impl ClassificationPolicy {
         input.preflight()?;
         self.preflight_fields(
             input,
+            &input.policy_digest,
             &input.target,
             &input.evidence,
             &input.features,
@@ -216,6 +218,7 @@ impl ClassificationPolicy {
     fn preflight_fields<I: Serialize>(
         &self,
         input: &I,
+        policy_digest: &str,
         target: &AdmittedTargetRef,
         evidence: &[NamedEvidence],
         features: &[FeatureObservation],
@@ -246,7 +249,7 @@ impl ClassificationPolicy {
                 });
             }
         }
-        if self.policy_digest != self.computed_digest()? {
+        if policy_digest != self.policy_digest || self.policy_digest != self.computed_digest()? {
             return Err(ContractViolation::BindingMismatch {
                 field: "classification.policy_digest",
                 reason: "policy digest does not match execution policy".to_owned(),
