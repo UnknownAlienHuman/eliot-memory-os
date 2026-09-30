@@ -35,53 +35,53 @@
 //! The live leg, verified by following each hop:
 //!
 //! ```text
-//! bins/eliotd/src/main.rs:30                       daemon_runtime::run()
-//! -> daemon_runtime.rs:895                         runtime.block_on(run_loop(..))
-//! -> daemon_runtime.rs:1573                        run_loop
-//! -> daemon_runtime.rs:1795                        maybe_start_improvement_intake
-//! -> daemon_runtime.rs:5487                        run_improvement_intake(..).await
-//! -> daemon_runtime.rs:5150/5157                   improvement_intake_artifact
-//! -> daemon_runtime.rs:5025/5047                   assemble_improvement_artifact
-//! -> improvement_intake_dispatch.rs:379            pub fn assemble_improvement_artifact
+//! bins/eliotd/src/main.rs:121                      daemon_runtime::run()
+//! -> daemon_runtime.rs:904                         runtime.block_on(run_loop(..))
+//! -> daemon_runtime.rs:1582                        run_loop
+//! -> daemon_runtime.rs:1804                        maybe_start_improvement_intake
+//! -> daemon_runtime.rs:5919                        run_improvement_intake(..).await
+//! -> daemon_runtime.rs:5370                        improvement_intake_artifact
+//! -> daemon_runtime.rs:5242                        assemble_improvement_artifact
+//! -> improvement_intake_dispatch.rs:564            pub fn assemble_improvement_artifact
 //! ```
 //!
 //! From that entry point the crate is entered through exactly these items:
 //!
 //! | Crate item | Call site on the live leg |
 //! |---|---|
-//! | `evidence_sources::sourced_evidence` | `improvement_intake_dispatch.rs:416` |
-//! | `evidence_sources::candidate_from_evidence` | `improvement_intake_dispatch.rs:430` |
+//! | `evidence_sources::sourced_evidence` | `improvement_intake_dispatch.rs:601` |
+//! | `evidence_sources::candidate_from_evidence` | `improvement_intake_dispatch.rs:615` |
 //! | `ImprovementCandidate::new` | `evidence_sources.rs:89` |
-//! | `ImprovementCandidate::transition_lifecycle` | `improvement_intake_dispatch.rs:447` |
-//! | `ImprovementCandidate::validate` | `improvement_dedup_read.rs:555` (and internally at `evidence_sources.rs:114`, `brief.rs:279`) |
-//! | `brief::SafeBoundary::from_observed_closure` | `improvement_intake_dispatch.rs:491` |
-//! | `brief::brief_at_safe_boundary` | `improvement_intake_dispatch.rs:538` |
-//! | `brief::record_owner_decision` | `improvement_intake.rs:34` (from `improvement_intake_dispatch.rs:585`) |
-//! | `application_class::classify` | `improvement_intake_dispatch.rs:804` |
-//! | `application_class::check_class_gate` | `improvement_intake_dispatch.rs:805` |
-//! | `application_class::ChangeDescriptor::from_recorded_surface` | `improvement_intake_dispatch.rs:803` |
-//! | `candidate_bounds::BoundedBacklog::restored` | `improvement_dedup_read.rs:483` |
-//! | `candidate_bounds::BoundedBacklog::admit_reporting_pressure` | `improvement_intake_dispatch.rs:1239` |
-//! | `candidate_bounds::BoundedBacklog::entry_for` | `improvement_intake_dispatch.rs:1286` |
-//! | `candidate_bounds::canonical_evidence_lineage` | `improvement_dedup_read.rs:540`, `candidate_dispatch.rs:591` |
-//! | `candidate_bounds::evidence_lineage_digest` | `improvement_dedup_read.rs:546`, `candidate_dispatch.rs:591` |
-//! | `candidate_bounds::CandidateBoundPolicy` | `improvement_intake_dispatch.rs:1060,1085` |
-//! | `ImprovementSurface::closed_name` | `improvement_candidate_dispatch.rs:497` |
-//! | `ImprovementLifecycle::is_terminal` | `improvement_dedup_read.rs:626` |
-//! | `ImprovementCandidate`, `ImprovementSurface`, `ImprovementLifecycle`, `ReplayPlan`, `SourcedEvidence`, `EvidenceSource`, `OwnerDecision`, `OwnerDecisionKind`, `ImprovementBrief`, `SafeBoundary`, `ImprovementError`, `AdmitOutcome`, `AdmitReport`, `TrackedCandidate`, `ArchivedCandidate`, `DurableCandidateRecord`, `BoundsError` | type positions in `improvement_intake.rs`, `improvement_intake_dispatch.rs`, `improvement_dedup_read.rs`, `improvement_candidate_dispatch.rs`, `daemon_runtime.rs:58,5106` |
+//! | `ImprovementCandidate::transition_lifecycle` | `improvement_intake_dispatch.rs:632` |
+//! | `ImprovementCandidate::validate` | `improvement_dedup_read.rs:637` (and internally at `evidence_sources.rs:114`, `brief.rs:317`) |
+//! | `brief::SafeBoundary::from_observed_closure` | `improvement_intake_dispatch.rs:673` |
+//! | `brief::brief_at_safe_boundary` | `improvement_intake_dispatch.rs:716` |
+//! | `brief::record_owner_decision` | `improvement_intake.rs:46` (from `improvement_intake_dispatch.rs:803`) |
+//! | `application_class::classify` | `improvement_intake_dispatch.rs:1042` |
+//! | `application_class::check_class_gate` | `improvement_intake_dispatch.rs::enforce_advisory_class_gate` |
+//! | `application_class::ChangeDescriptor::from_recorded_surface` | `improvement_intake_dispatch.rs:1041` |
+//! | `candidate_bounds::BoundedBacklog::restored` | `improvement_dedup_read.rs:556` |
+//! | `candidate_bounds::BoundedBacklog::admit_reporting_pressure` | `improvement_intake_dispatch.rs:1630` |
+//! | `candidate_bounds::BoundedBacklog::entry_for` | `improvement_intake_dispatch.rs:1677` |
+//! | `candidate_bounds::canonical_evidence_lineage` | `improvement_dedup_read.rs:622`, `improvement_candidate_dispatch.rs:1199` |
+//! | `candidate_bounds::evidence_lineage_digest` | `improvement_dedup_read.rs:628`, `improvement_candidate_dispatch.rs:1199` |
+//! | `candidate_bounds::CandidateBoundPolicy` | `improvement_intake_dispatch.rs:1451,1476` |
+//! | `ImprovementSurface::closed_name` | `improvement_candidate_dispatch.rs:1072` |
+//! | `ImprovementLifecycle::is_terminal` | `improvement_dedup_read.rs:797` |
+//! | `ImprovementCandidate`, `ImprovementSurface`, `ImprovementLifecycle`, `ReplayPlan`, `SourcedEvidence`, `EvidenceSource`, `OwnerDecision`, `OwnerDecisionKind`, `ImprovementBrief`, `SafeBoundary`, `ImprovementError`, `AdmitOutcome`, `AdmitReport`, `TrackedCandidate`, `ArchivedCandidate`, `DurableCandidateRecord`, `BoundsError` | type positions in `improvement_intake.rs`, `improvement_intake_dispatch.rs`, `improvement_dedup_read.rs`, `improvement_candidate_dispatch.rs`, `daemon_runtime.rs:58,5301` |
 //!
 //! The consumer half of the same pass — the leg that reads a candidate back —
-//! rides the same observation at `daemon_runtime.rs:5263`
+//! rides the same observation at `daemon_runtime.rs:5544`
 //! (`dispatch_improvement_candidate_route` ->
-//! `improvement_candidate_dispatch.rs:260 route_improvement_candidate` ->
-//! `improvement_candidate_route.rs:100`). The path that consumes a candidate
+//! `improvement_candidate_dispatch.rs:677 route_improvement_candidate` ->
+//! `improvement_candidate_route.rs:115`). The path that consumes a candidate
 //! is the path that constructs it.
 //!
 //! One crate reaches in from inside that leg. `crates/meta/eliot-self-quality`
 //! calls `evidence_sources::sourced_evidence` at `improvement_handoff.rs:69`
 //! and returns `SourcedEvidence` at `conformance_evidence.rs:98`;
 //! `git grep -n "sourced_evidence_from_conformance_diagnosis"` shows its
-//! production call at `improvement_intake_dispatch.rs:1003`, so the
+//! production call at `improvement_intake_dispatch.rs:1394`, so the
 //! conformance-diagnosis arm of the live leg reaches this crate through
 //! `eliot_self_quality::conformance_evidence.rs:111`. `eliotd` depends on
 //! `eliot-self-quality` (`bins/eliotd/Cargo.toml:94`), so this is one consumer
@@ -98,8 +98,8 @@
 //!   inside `admit_governed_host`, and
 //!   `crates/smart/eliot-context-compiler-wasm/src/governed_compose.rs:149`.
 //!   `git grep -n "admit_governed_host" -- '*.rs'` returns only its definition,
-//!   the `pub use` in `bins/eliot-wasm-host/src/lib.rs:78`, and one prose
-//!   mention in `eliot-context-admission/src/lib.rs:271` — zero callers.
+//!   the `pub use` in `bins/eliot-wasm-host/src/lib.rs:79`, and one prose
+//!   mention in `eliot-context-admission/src/lib.rs:274` — zero callers.
 //!   `compose_governed_compilation` is likewise only its definition and the
 //!   `lib.rs:55` re-export of a crate that is not in the root `Cargo.toml`
 //!   members list at all. **Open disposition: live contract, bounded reference
@@ -130,11 +130,11 @@
 //! `crates/meta/eliot-improvement/**`:
 //!
 //! - `intake_from_evidence` — zero call sites. The three `eliotd` hits at
-//!   `improvement_intake_dispatch.rs:95,100,452` are prose explaining why the
+//!   `improvement_intake_dispatch.rs:145,146,150` are prose explaining why the
 //!   daemon deliberately does NOT call it.
 //! - `require_matched_budget_for_promotion` — zero external call sites. The two
-//!   `eliotd` hits (`improvement_intake_dispatch.rs:88,96`) are prose. Its only
-//!   callers are internal: `intake.rs:284` and `lib.rs:933`.
+//!   `eliotd` hits (`improvement_intake_dispatch.rs:138,146`) are prose. Its only
+//!   callers are internal: `intake.rs::prepare_intake` and `lib.rs:944`.
 //! - `intake_from_evidence_governed`, `IntakeRequest`, `IntakeOutcome`,
 //!   `GovernedIntakeOutcome`, `GovernedIntakeError`,
 //!   `RetainedCampaignLearning`, `RetainedReusableClosure` — no `.rs` hit
@@ -142,7 +142,7 @@
 //!   `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
 //!   projection.
 //! - `stamp_outcome_budget` — exactly one external caller,
-//!   `bins/eliotd/src/improvement_intake.rs:46`, inside
+//!   `bins/eliotd/src/improvement_intake.rs:58`, inside
 //!   `stamp_promotion_budget`. `git grep -n "stamp_promotion_budget"` returns
 //!   only that definition. So the one budget-stamping bridge is itself
 //!   uncalled, and `BudgetProof` and `OutcomeEvidence` are named in
@@ -200,7 +200,7 @@
 //!   `tests/`, or doc prose. The live daemon reaches the backlog only through
 //!   `restored`, `admit_reporting_pressure` and `entry_for`.
 //! - `CrossTaskCarryover::verify` is reached from
-//!   `improvement_intake_dispatch.rs:1486` inside
+//!   `improvement_intake_dispatch.rs:1877` inside
 //!   `verify_cross_task_carryover`, and `git grep -n
 //!   "verify_cross_task_carryover"` returns only that definition plus its own
 //!   doc comments — so the cross-task revalidation seam is present and typed
@@ -209,9 +209,9 @@
 //! ### Names that are NOT this crate's
 //!
 //! `crates/governor/eliot-maintenance/src/improvement_pipeline.rs` declares its
-//! OWN `ExperimentPlan` (`:429`), `MechanismDeclaration` (`:366`),
-//! `ActivationEvidence` (`:491`), `RollbackContract` (`:524`) and
-//! `ImprovementProposal` (`:544`). Those five names have ZERO occurrences
+//! OWN `ExperimentPlan` (`:495`), `MechanismDeclaration` (`:432`),
+//! `ActivationEvidence` (`:557`), `RollbackContract` (`:590`) and
+//! `ImprovementProposal` (`:610`). Those five names have ZERO occurrences
 //! anywhere in `crates/meta/eliot-improvement`, verified by `Select-String`
 //! over `src/*.rs` and `tests/*.rs`. Reading a #1145 claim about "the six exact
 //! identities" as a claim about this crate substitutes one crate for another;
@@ -234,7 +234,7 @@
 //!   `BoundedBacklog::{admit, admit_governed, admit_reporting_pressure,
 //!   archive, bind_local_overlay, bind_reusable_candidate}`. `BoundedBacklog`
 //!   is the crate's one stateful aggregate and it is a plain value the CALLER
-//!   owns; `eliotd` constructs one per pass at `daemon_runtime.rs:5106` and
+//!   owns; `eliotd` constructs one per pass at `daemon_runtime.rs:5301` and
 //!   drops it at the end of that pass.
 //! - **No filesystem, process, network, thread, env or async effect.**
 //!   `grep` for `std::fs`, `std::net`, `std::process`, `std::thread`,
@@ -247,12 +247,12 @@
 //!   `[workspace.lints.rust]`, and `overlay_policy_routing.rs:19` repeats it
 //!   at module scope.
 //! - **Clock.** Ten clock reads in total, all in construction or bookkeeping
-//!   paths, none in a gate: `OffsetDateTime::now_utc()` at `lib.rs:646` (`new`),
-//!   `lib.rs:724,863,946` (`set_details`, `transition`,
-//!   `apply_lifecycle_edge`), `lib.rs:969` (`promotion_input`),
-//!   `brief.rs:299,322` (`brief_at_safe_boundary`, `record_owner_decision`) and
+//!   paths, none in a gate: `OffsetDateTime::now_utc()` at `lib.rs:658` (`new`),
+//!   `lib.rs:736,875,958` (`set_details`, `transition`,
+//!   `apply_lifecycle_edge`), `lib.rs:981` (`promotion_input`),
+//!   `brief.rs:337,360` (`brief_at_safe_boundary`, `record_owner_decision`) and
 //!   `candidate_bounds.rs:1122` (a lineage merge), plus `Uuid::now_v7()` at
-//!   `lib.rs:961` and `brief.rs:288`. `datetime_from_unix` converts a
+//!   `lib.rs:973` and `brief.rs:326`. `datetime_from_unix` converts a
 //!   caller-supplied timestamp and reads no clock. No expiry, admission or
 //!   promotion decision in this crate consults the clock on its own behalf;
 //!   `now` is always a parameter (`candidate_bounds.rs:1370,1877,1897,2237,2355`
@@ -260,10 +260,10 @@
 //!   learning loop are clock-free outright: `Select-String` for
 //!   `OffsetDateTime` over `learning_closure.rs` and `promotion_input.rs`
 //!   returns nothing, so neither module can read a clock even by accident.
-//! - **One owner-held read.** `brief.rs:200` calls
+//! - **One owner-held read.** `brief.rs:232` calls
 //!   `CanonicalLearningDeltaStore::load()`, a read of already-committed
 //!   IN-PROCESS state the caller passes in. It opens no transport, no store
-//!   client and no durability path; `brief.rs:176-181` states the caller's
+//!   client and no durability path; `brief.rs:207-209` states the caller's
 //!   mutex obligation.
 //!
 //! Per acceptance item A9 — "cannot edit source/config/policy, install
@@ -274,11 +274,11 @@
 //! has no generation API and reads no generation store; authority issuance:
 //! every boundary is a refusal (`SelfPromotionForbidden`,
 //! `ApplicationClassViolation`, `UnsafeBoundary`, `BudgetGateViolation`,
-//! `MissingBudgetProof`), and `validate_base` at `lib.rs:805` refuses
-//!   `advisory_only: false` at `lib.rs:820` outright; support/truth promotion
+//! `MissingBudgetProof`), and `validate_base` at `lib.rs:817` refuses
+//!   `advisory_only: false` at `lib.rs:832` outright; support/truth promotion
 //!   and `VERIFIED_COMPLETE`: no name in this crate's source spells either, and
 //!   the only transition into a promoting disposition, `promote_lifecycle`
-//! (`lib.rs:916`), is unreachable from production because it has no caller
+//! (`lib.rs:928`), is unreachable from production because it has no caller
 //! and `require_matched_budget_for_promotion` is itself uncalled externally.
 //!
 //! ## Experiment path
@@ -286,16 +286,16 @@
 //! Nothing in this crate RUNS an experiment. What it holds is record and
 //! validation only:
 //!
-//! - `ReplayPlan` (`lib.rs:570`) names the fixed-replay, holdout, transfer and
-//!   counter-metric references. `ReplayPlan::validate` (`lib.rs:579`) refuses
+//! - `ReplayPlan` (`lib.rs:582`) names the fixed-replay, holdout, transfer and
+//!   counter-metric references. `ReplayPlan::validate` (`lib.rs:591`) refuses
 //!   empty reference groups and an empty `transfer_refs`. It matches
 //!   I12.24:67, "fixed replay as diagnostic evidence only".
 //! - `canary_plan`, `rollback` and `stop_condition` are `String` REFERENCES on
-//!   the candidate (`lib.rs:617-621`); `validate` (`lib.rs:744-746`) requires
+//!   the candidate (`lib.rs:629-633`); `validate` (`lib.rs:756-758`) requires
 //!   them to be non-empty and never resolves them.
 //! - `BudgetProof` / `ComplexityEconomicsDelta` /
 //!   `require_matched_budget_for_promotion` are the I12.24:76 matched-budget
-//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1008`) refuses a
+//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1020`) refuses a
 //!   promotion-bound outcome that lacks a budget ledger, a conclusive
 //!   economics delta, affected checks, live shadow/canary evidence or
 //!   delayed-harm visibility. That is I12.24:76's "An unmatched ledger or
@@ -303,10 +303,10 @@
 //!   replay or a local metric improved."
 //! - The lifecycle enums carry the experiment states and enforce the edge
 //!   table: `AcceptedForExperiment` and `Running` exist only as transitions
-//!   `lifecycle_edge_allowed` (`lib.rs:517`) permits, and the promoting step
+//!   `lifecycle_edge_allowed` (`lib.rs:529`) permits, and the promoting step
 //!   "promote, narrow, rollback or archive" (I12.24:70) is gated so that
 //!   `transition_lifecycle` refuses `Supported`/`Narrowed` outright
-//!   (`lib.rs:892`) and only `promote_lifecycle` admits them, and only with a
+//!   (`lib.rs:903`) and only `promote_lifecycle` admits them, and only with a
 //!   budget proof.
 //! - `promotion_input::prepare_promotion_input` (`promotion_input.rs:551`) is a
 //!   pure gate over already-supplied evidence, and it has no production caller.
