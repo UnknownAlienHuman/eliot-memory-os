@@ -1482,7 +1482,7 @@ struct StoreApplyOperation {
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     original_write_submission: Option<eliot_store_api::OriginalWriteSubmission>,
 }
 
@@ -8700,7 +8700,14 @@ impl KernelComposition {
             ));
         }
         let gateway = self.retained_store_gateway()?;
-        let reserved_seed = match self.observe_reservation_seed(&gateway, &operation).await {
+        let reserved_seed = match self
+            .observe_reservation_seed(
+                &gateway,
+                &operation,
+                operation.original_write_submission.as_ref(),
+            )
+            .await
+        {
             Ok(seed) => seed,
             Err(error) => return Ok(Self::store_error_response_text("write_receipt", &error)),
         };
@@ -8806,6 +8813,7 @@ impl KernelComposition {
         &self,
         gateway: &Arc<KernelStoreGateway>,
         operation: &StoreApplyOperation,
+        original_submission: Option<&eliot_store_api::OriginalWriteSubmission>,
     ) -> Result<Option<ReservationSeed>, String> {
         let transition = &operation.transition;
         let operation_identity =
@@ -8822,6 +8830,11 @@ impl KernelComposition {
         let Some(input) = Self::retained_observe_reservation_input(&record, operation)? else {
             return Ok(None);
         };
+        let original_submission = original_submission.ok_or_else(|| {
+            "protected Observe request is missing its original write submission".to_owned()
+        })?;
+        self.validate_original_write_submission_source(&record, original_submission)
+            .map_err(|error| format!("original Observe write source mismatch: {error}"))?;
         let current_time_ms = unix_ms();
         if current_time_ms >= record.deadline_unix_ms {
             return Err("protected Observe request deadline has expired".to_owned());
