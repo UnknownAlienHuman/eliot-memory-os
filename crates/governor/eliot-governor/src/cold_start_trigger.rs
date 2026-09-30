@@ -62,8 +62,8 @@ use eliot_security_contracts::PrivacyClass;
 use eliot_workscope::{
     BootstrapScanEvidence, BootstrapScanOutcome, ColdStartTrigger, DiscoveryLeaseKey,
     DiscoveryReadLease, GoverningSourceSet, LeaseJoin, OnboardingLease, PrivacyBoundary,
-    PrivacyProfile, RepositoryLineageIdentity, ScanDisclosureOwnerBinding, ScopeIdentity, ScopeKind,
-    TaskBindingInput, WorkScopeCandidate, WorkspaceInstanceIdentity,
+    PrivacyProfile, RepositoryLineageIdentity, ScanDisclosureOwnerBinding, ScopeIdentity,
+    ScopeKind, TaskBindingInput, WorkScopeCandidate, WorkspaceInstanceIdentity,
 };
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
