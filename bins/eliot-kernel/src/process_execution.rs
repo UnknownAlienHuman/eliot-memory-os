@@ -405,12 +405,11 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 },
                 git: None,
             };
-            transition_unrecorded = !Self::confirm_external_transition(&hint_id, hint, &verification);
+            transition_unrecorded =
+                !Self::confirm_external_transition(&hint_id, hint, &verification);
         }
-        if !transition_unrecorded {
-            if let Ok(mut last) = self.last_observed.lock() {
-                last.insert(resource.clone(), first_digest.clone());
-            }
+        if !transition_unrecorded && let Ok(mut last) = self.last_observed.lock() {
+            last.insert(resource.clone(), first_digest.clone());
         }
         Ok(GovernedProcessEffectBaseline {
             binding: binding.clone(),
