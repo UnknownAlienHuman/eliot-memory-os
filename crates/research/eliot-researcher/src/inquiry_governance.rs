@@ -6255,14 +6255,23 @@ impl InquiryGovernance {
         // run-bound reference manifest and the admitted disclosure class, so a
         // member the freeze excluded, the manifest revoked or the disclosure
         // forbids is a published omission rather than a silent one.
+        //
+        // The question and the disclosure class are read off the PROFILE, not off
+        // the `Observation`, for the same reason
+        // `validate_committed_freeze_and_synthesis_input` reads them off the
+        // profile: the record has to re-derive the same pack from the values it
+        // publishes, and the observation is consumed here. The profile carries
+        // the admitted question verbatim (`profile_params` copies it) and the
+        // admitted disclosure class as its `disclosure_ceiling`, so a re-proof
+        // that read either from the observation could not exist.
         let synthesis_input = crate::synthesis_input::SynthesisInputPack::resolve(
             &committed_freeze,
             &freeze,
             &observation.reference_manifest,
             &admitted_records(&admissibility),
             &committed_freeze.members_by_handle(),
-            &observation.question,
-            observation.disclosure,
+            &profile.question,
+            profile.disclosure_ceiling,
             &lane_discipline,
         )?;
         let record = Self {
@@ -6411,6 +6420,7 @@ impl InquiryGovernance {
             record.validate_integrity()?;
         }
         self.validate_source_admission_requests()?;
+        self.validate_committed_freeze_and_synthesis_input()?;
         for diagnostic in &self.unadmitted_references {
             diagnostic.validate_integrity()?;
             if diagnostic.inquiry_id != self.inquiry_id
@@ -6619,6 +6629,80 @@ impl InquiryGovernance {
         if expected != carried {
             return Err(InquiryError::IntegrityMismatch {
                 field: "inquiry.source_admission_request_coverage",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves the committed-freeze proof and the synthesis pack this record
+    /// carries against the ORIGINAL recorded values they were built from.
+    ///
+    /// Neither value is re-derived here. Each is re-proved by running the
+    /// **existing** validators over the values a *different* owner recorded, which
+    /// is the whole difference between a check that can fire and a recomputation
+    /// that would agree with whatever it was handed:
+    ///
+    /// 1. [`crate::synthesis_input::CommittedFreeze::commit`] is re-run over
+    ///    **this record's own** `source_admission_requests` and `freeze`. That
+    ///    re-proves, per request through the admission owner's own
+    ///    `validate_integrity`, the five [`FreezeCommitment`] fields a
+    ///    `CommittedFreeze` member carries: `freeze_id` and `freeze_digest`
+    ///    against the freeze this record published, `retained_content_digest`
+    ///    against the admitted record's own `content_digest`, and
+    ///    `retained_revision_digest` / `retained_artifact_ref` against the
+    ///    retained revision the persistence owner committed. The reconstructed
+    ///    value is then compared **by content** with the carried one, so a
+    ///    `committed_freeze` that was swapped for another commit cannot pass on
+    ///    the strength of re-deriving cleanly.
+    /// 2. [`crate::synthesis_input::SynthesisInputPack::resolve`] is re-run over
+    ///    that re-proven commit, this record's `freeze`, its own re-proved
+    ///    `run_reference_manifest`, the admitted source records and the
+    ///    lane discipline. This is what makes the W3 membership rule *fire*:
+    ///    resolution is driven by [`EvidenceFreeze::includes`], so a pack that
+    ///    resolved a member the freeze excluded, or dropped a member it
+    ///    included, is caught here rather than read off the pack's own list.
+    ///    The reconstructed pack is again compared by content with the carried
+    ///    one.
+    ///
+    /// The comparison is content equality over the whole typed value rather than
+    /// a digest spot-check, because the pack's `digest` already covers every
+    /// field and comparing digests would only re-ask the question the value's own
+    /// `validate_integrity` answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming the first field whose
+    /// carried value disagrees with the value re-proved from this record's own
+    /// requests, freeze, manifest, admitted records and lane discipline.
+    fn validate_committed_freeze_and_synthesis_input(&self) -> Result<(), InquiryError> {
+        let re_proven = crate::synthesis_input::CommittedFreeze::commit(
+            &self.freeze,
+            &self.source_admission_requests,
+        )?;
+        if re_proven != self.committed_freeze {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.committed_freeze",
+            });
+        }
+        let repacked = crate::synthesis_input::SynthesisInputPack::resolve(
+            &self.committed_freeze,
+            &self.freeze,
+            &self.run_reference_manifest,
+            &admitted_records(&self.admissibility),
+            &self.committed_freeze.members_by_handle(),
+            &self.profile.question,
+            // The disclosure class the run admitted, read back from the profile
+            // that resolved this run under its own reference manifest rather than
+            // from a value only the consumed `Observation` carried: the profile's
+            // `disclosure_ceiling` is the governed value the record publishes for
+            // exactly this question, and I21.7 makes it the ceiling a source
+            // record may not exceed.
+            self.profile.disclosure_ceiling,
+            &self.lane_discipline,
+        )?;
+        if repacked != self.synthesis_input {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.synthesis_input",
             });
         }
         Ok(())
