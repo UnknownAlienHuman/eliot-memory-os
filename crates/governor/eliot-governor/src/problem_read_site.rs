@@ -221,9 +221,9 @@ fn decode_history_entry(
         .map_err(|error| undecodable(error.to_string()))?;
     let problem: Problem = serde_json::from_value(decoded.record_json)
         .map_err(|error| undecodable(format!("committed record is not a Problem: {error}")))?;
-    problem
-        .validate()
-        .map_err(|error| undecodable(format!("committed record is not a valid Problem: {error}")))?;
+    problem.validate().map_err(|error| {
+        undecodable(format!("committed record is not a valid Problem: {error}"))
+    })?;
     let replaced_revision = match decoded.transition {
         ProblemOwnerTransition::Create => None,
         _ => Some(decoded.expected_revision),
@@ -268,7 +268,11 @@ fn owner_transition_parameters(
         return None;
     }
     let parameters = record.get("parameters")?;
-    if parameters.get(PROBLEM_PARAM_PROBLEM_ID).and_then(Value::as_str) != Some(problem_id) {
+    if parameters
+        .get(PROBLEM_PARAM_PROBLEM_ID)
+        .and_then(Value::as_str)
+        != Some(problem_id)
+    {
         return None;
     }
     serde_json::from_value(parameters.clone()).ok()
