@@ -32,6 +32,21 @@
 //! `INCONCLUSIVE`, and each of those is a durable disposition, because silence
 //! is not a disposition (I12.24 line 291).
 //!
+//! Repeated verifier failure (issue #1867 W2/A1): a repeat is the one thing a
+//! stored record could not previously express. `derive_boundaries` sees it — a
+//! failed, physically repeated attempt derives
+//! `LifecycleActivity::RepeatedFailureSignature` — but the record keeps only
+//! `boundaries[0]`, so it was stamped `VerifierOutcome` and read back exactly
+//! like a single run. This seam now also compares the durable terminal job row's
+//! own attempt count, settled state and execution projection against the
+//! canonical run's finished execution and `Fail` outcome, and records the
+//! verifier that repeated as `repeated-verifier-failure:<verifier>` among the
+//! record's own evidence references — the I12.24 evaluator-verdict trigger the
+//! daemon improvement intake reads through
+//! `eliot_improvement::sourced_evidence_from_repeated_verifier_failure`. Both
+//! sides of that comparison are records this seam did not author together, and
+//! a repeat that cannot be proven records nothing.
+//!
 //! Non-blocking: this edge runs after the finish decision has committed, is
 //! purely in-process against retained owner images, performs no transport, and
 //! never gates or fails the finish ceremony (I12.24 line 293).
@@ -74,13 +89,13 @@ use eliot_instrument_api::{ExecutionStatus, VerificationOutcome};
 use eliot_learning_contracts::{AgentAttemptId, CampaignId, OverlayId};
 use eliot_learning_delta::{
     AdmissionReceipt, AttemptCloseDisposition, ConsequentialBoundary, DeliveryRefusal,
-    LearningDeltaError, LifecycleActivity, RetryEquivalence, RetryEquivalenceBasis, RetryReason,
-    StoredLearningDelta, StoredRetryRelation, derive_boundaries,
+    LearningDeltaError, LifecycleActivity, REPEATED_VERIFIER_FAILURE_REF_PREFIX, RetryEquivalence,
+    RetryEquivalenceBasis, RetryReason, StoredLearningDelta, StoredRetryRelation, derive_boundaries,
 };
 use eliot_store_api::{
     OrderingHeadExpectation, OrderingScopeId, RevisionHeadExpectation, RevisionKey, StoreError,
 };
-use eliot_testd_core::{JobState as TestdJobState, TestdTerminalCompletionEvidence};
+use eliot_testd_core::{JobState as TestdJobState, TestdJob, TestdTerminalCompletionEvidence};
 use thiserror::Error;
 
 use crate::composition::{
@@ -658,6 +673,61 @@ fn strategy_fingerprint(
     Ok(sha256_hex(&bytes))
 }
 
+/// The verifier identity of a REPEATED verifier failure, when the two
+/// independent owner records together prove one.
+///
+/// # Why this comparison and not an assertion
+///
+/// I12.24's second acceptance trigger is a "real repeated verifier failure", and
+/// this seam is where a verifier actually runs and fails. Before this, the fact
+/// that the failure REPEATED was derivable only inside
+/// [`observed_activities`] and was then dropped: `close_attempt` keeps
+/// `boundaries[0]`, and a repeated failure derives
+/// `[VerifierOutcome, RepeatedFailureSignature, …]`, so the stored record was
+/// stamped `VerifierOutcome` and read back exactly like a single passing run.
+/// Nothing downstream could tell the two apart — not the disposition (a failed
+/// run closes `INVALID_EVIDENCE` here, exactly as a passed one does, because
+/// `derived` is false at this seam) and not the evidence refs.
+///
+/// So the repeat is compared, not claimed, and the comparison is between two
+/// records this process did not author together:
+///
+/// - the DURABLE terminal job row (`eliot_testd_core::TestJob`), which records
+///   how many physical attempts the job took and how it settled, and
+/// - the CANONICAL verifier-execution fact, whose
+///   [`CanonicalVerifierExecutionFact::verification_run`] is the run itself.
+///
+/// A marker is minted only when the job row says the attempt was physically
+/// repeated and failed, the row's own execution projection agrees that it
+/// failed, and the canonical run finished with a failed execution and a failed
+/// semantic outcome. `None` is the ordinary answer for a first-attempt failure,
+/// a repeated PASS (`SubstantialRecovery`), an unsettled, blocked or cancelled
+/// run, and any row whose execution disagrees with the run — a repeat nobody can
+/// prove is a repeat, and `None` never becomes an invented marker.
+///
+/// The caller still cross-checks `fact.job_id` against the row and the finish
+/// decision against the fact before calling this, so the two records compared
+/// here are already bound to the same attempt.
+fn repeated_verifier_failure_verifier(
+    job: &TestdJob,
+    fact: &CanonicalVerifierExecutionFact,
+) -> Option<&str> {
+    if job.state != TestdJobState::Failed || job.attempts <= 1 {
+        return None;
+    }
+    if job.execution != Some(ExecutionStatus::Failed) {
+        return None;
+    }
+    let run = &fact.verification_run;
+    if run.finished_at.is_none()
+        || run.execution != ExecutionStatus::Failed
+        || run.outcome != VerificationOutcome::Fail
+    {
+        return None;
+    }
+    Some(run.verifier.as_str())
+}
+
 /// Exact raw trace, artifact, and evaluator references the canonical fact
 /// observed for this attempt.
 fn observed_evidence_refs(
@@ -832,7 +902,21 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         let fingerprint = strategy_fingerprint(&fact)?;
-        let evidence_refs = observed_evidence_refs(&fact)?;
+        // The raw trace/artifact/evaluator references the canonical fact
+        // observed, plus the repeated-verifier-failure marker when the durable
+        // job row and that fact together prove one (issue #1867 W2/A1). The
+        // marker joins the same `BTreeSet` rather than being appended, so the
+        // committed reference list stays canonically ordered and duplicate-free
+        // exactly as `observed_evidence_refs` leaves it.
+        let mut observed_refs: BTreeSet<ArtifactId> =
+            observed_evidence_refs(&fact)?.into_iter().collect();
+        if let Some(verifier) = repeated_verifier_failure_verifier(job, &fact) {
+            observed_refs.insert(artifact_id(
+                &format!("{REPEATED_VERIFIER_FAILURE_REF_PREFIX}{verifier}"),
+                "repeated verifier failure marker",
+            )?);
+        }
+        let evidence_refs: Vec<ArtifactId> = observed_refs.into_iter().collect();
         let identity = ClosureIdentityInput {
             task_id: fact.task_id.clone(),
             job_id: job.job_id.clone(),

@@ -52,8 +52,8 @@ pub use retry::{
     prior_retry_lineage, retry_reason_name,
 };
 pub use stored::{
-    AttemptCloseDisposition, RetryEquivalence, RetryEquivalenceBasis, StoredDeltaDisposition,
-    StoredLearningDelta, StoredRetryRelation,
+    AttemptCloseDisposition, REPEATED_VERIFIER_FAILURE_REF_PREFIX, RetryEquivalence,
+    RetryEquivalenceBasis, StoredDeltaDisposition, StoredLearningDelta, StoredRetryRelation,
 };
 
 pub use eliot_learning_contracts::{
