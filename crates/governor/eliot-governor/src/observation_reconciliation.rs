@@ -157,7 +157,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{
-    ArtifactId, ClockReading, OperationId, SessionId, StateFence, canonical_json_bytes, sha256_hex,
+    ArtifactId, ClockReading, OperationId, SessionId, StateFence, TaskId, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_doctor_core::{IndependentVerification, VerificationReport};
 use eliot_observation::{
@@ -174,6 +175,7 @@ use eliot_problem::{
 };
 use eliot_receipts::WorkScopeId;
 use eliot_security_contracts::{InstructionTaint, PrivacyClass};
+use eliot_session::{SessionLifecycleOwner, SessionState};
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
@@ -318,9 +320,9 @@ impl ObservationCaptureOwnerBinding {
             || self.access.privacy != self.work_scope_binding.binding.privacy_class
             || self.access.visibility != ObservationCaptureVisibility::LocalOnly
             || self.access.instruction_taint != InstructionTaint::CommandLike
-            || !is_sha256(&self.policy_named_read_digest)
-            || !is_sha256(&self.config_policy_snapshot_sha256)
-            || !is_sha256(&self.work_scope_canonical_read_digest)
+            || !crate::composition::is_sha256(&self.policy_named_read_digest)
+            || !crate::composition::is_sha256(&self.config_policy_snapshot_sha256)
+            || !crate::composition::is_sha256(&self.work_scope_canonical_read_digest)
             || self.work_scope_binding_sha256 != self.work_scope_canonical_read_digest
             || self.ingress_setting_key != eliot_config::OBSERVATION_INGRESS_POLICY_KEY
             || self.ingress_setting_owner_ref != self.config_policy_snapshot.policy_owner.owner_ref
@@ -614,7 +616,6 @@ const PRODUCTION_MANIFEST_NAME: &str = "eliot.storage.store-surreal-adapter";
 /// live sequence; the expectation shape mirrors the T1.5 lifecycle path).
 const GOVERNOR_ORDERING_SCOPE: &str = "scope:governor";
 /// Governor canonical scope addressed by both envelopes.
-const GOVERNOR_SCOPE_ID: &str = "governor";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -658,21 +659,26 @@ fn mcp_observation_envelope(
     operation_id: &OperationId,
     submission: &ObservationSubmission,
     work_scope_ref: &str,
+    expected_ordering_sequence: u64,
+    task_selection: Option<&TaskSelectionAdmissionBinding>,
 ) -> Result<CanonicalWriteEnvelope, CompositionError> {
     let request_digest = submission
         .request_digest()
         .map_err(|error| owner_refused(error.to_string()))?;
+    let submission_value = serde_json::to_value(submission)
+        .map_err(|error| owner_refused(error.to_string()))?;
     let mut parameters = BTreeMap::new();
     for (name, value) in [
-        ("record_id", submission.record.record_id.clone()),
+        ("subject", submission.record.record_id.clone()),
         ("request_digest", request_digest),
         ("operation_id", submission.operation_id.clone()),
         ("idempotency_key", submission.idempotency_key.clone()),
     ] {
         parameters.insert(name.to_owned(), serde_json::Value::String(value));
     }
+    parameters.insert("observation_submission".to_owned(), submission_value);
     let fence = &identity.request.metadata.state_fence;
-    let envelope = CanonicalWriteEnvelope {
+    let mut envelope = CanonicalWriteEnvelope {
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
@@ -702,10 +708,25 @@ fn mcp_observation_envelope(
         expected_ordering_heads: vec![OrderingHeadExpectation {
             scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
                 .map_err(|error| owner_refused(error.to_string()))?,
-            expected_sequence: 1,
+            expected_sequence: expected_ordering_sequence,
             state_fence: fence.clone(),
         }],
     };
+    if let Some(selection) = task_selection {
+        let task_ref = identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(TaskId::as_str)
+            .ok_or_else(|| identity_refused("task selection exists without a request task"))?;
+        crate::task_lifecycle::bind_task_selection_evidence_to_envelope(
+            &mut envelope,
+            identity,
+            task_ref,
+            selection,
+        )?;
+    }
     envelope.validate()?;
     Ok(envelope)
 }
@@ -718,6 +739,7 @@ pub struct GovernorObservationReconciliation<'a, P: ?Sized> {
     canonical: &'a CanonicalAdmissionOwner,
     policy: Option<&'a PolicyOwner>,
     work_scope: Option<&'a eliot_workscope::WorkScopeBindingOwner>,
+    session: Option<&'a SessionLifecycleOwner>,
     kernel: &'a P,
     readiness: CompositionReadiness,
 }
@@ -734,6 +756,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
         canonical: &'a CanonicalAdmissionOwner,
         policy: Option<&'a PolicyOwner>,
         work_scope: Option<&'a eliot_workscope::WorkScopeBindingOwner>,
+        session: Option<&'a SessionLifecycleOwner>,
         kernel: &'a P,
         readiness: CompositionReadiness,
     ) -> Self {
@@ -743,6 +766,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             canonical,
             policy,
             work_scope,
+            session,
             kernel,
             readiness,
         }
@@ -800,6 +824,55 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                 "authenticated Observe principal must be non-blank and free of controls",
             ));
         }
+        let session_id = input
+            .identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .ok_or_else(|| identity_refused("Observe request has no authenticated Session"))?;
+        let session_owner = self.session.ok_or_else(|| {
+            CompositionError::Recovery(
+                "current Session owner is unavailable for Observe capture".to_owned(),
+            )
+        })?;
+        let session = session_owner.session(session_id).ok_or_else(|| {
+            CompositionError::Recovery(
+                "current Session owner has no admitted Observe session".to_owned(),
+            )
+        })?;
+        if session.status != SessionState::Active
+            || session.state_fence != *fence
+            || !session.authority_epoch.is_same_authority(&fence.authority_epoch)
+            || input
+                .identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .is_some_and(|task_id| session.task_scope.as_deref() != Some(task_id.as_str()))
+        {
+            return Err(identity_refused(
+                "Observe Session owner is stale or incompatible with task applicability",
+            ));
+        }
+        let session_actor = session_owner
+            .snapshot()
+            .events
+            .into_iter()
+            .rev()
+            .find(|event| event.session_id == *session_id)
+            .map(|event| event.actor_ref)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Session owner has no retained authenticated actor for Observe".to_owned(),
+                )
+            })?;
+        if session_actor != input.authenticated_principal_ref {
+            return Err(identity_refused(
+                "authenticated Observe principal does not match the Session owner actor",
+            ));
+        }
         let policy = self.current_ingress_policy()?;
         if policy.state_fence != *fence {
             return Err(identity_refused(
@@ -813,7 +886,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             ));
         }
 
-        let task_selection = match (
+        let task_selection_evidence = match (
             &input.identity.request.metadata.task_id,
             &input.task_selection,
         ) {
@@ -831,7 +904,8 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                     || selection.principal_ref() != input.authenticated_principal_ref
                     || selection.state_fence() != fence
                     || selection.work_scope() != &current_scope
-                    || selection.evidence().work_scope_ref != current_scope.binding.scope.scope_ref
+                        || selection.evidence().work_scope_ref
+                            != current_scope.binding.scope.scope_ref
                 {
                     return Err(CompositionError::Kernel(
                         KernelPortError::TaskScopeIncompatible,
@@ -885,7 +959,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                     affected_scope: ObservationScope {
                         work_scope: WorkScopeId::new(scope_ref)
                             .map_err(|error| owner_refused(error.to_string()))?,
-                        task_ref: task_selection
+                        task_ref: task_selection_evidence
                             .as_ref()
                             .map(|selection| selection.task_ref.clone()),
                         attempt_ref: None,
@@ -925,7 +999,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             capture_route: CaptureRoute::CanonicalJournal,
             durability: Durability::Durable,
             plan: None,
-            task_selection,
+            task_selection: task_selection_evidence,
             evidence: None,
         };
         submission
@@ -945,14 +1019,35 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                 )));
             }
         }
-        let envelope =
-            mcp_observation_envelope(&input.identity, &input.operation_id, &submission, scope_ref)?;
-        let exchange =
-            crate::finish_attempt::prepare_exchange(self.canonical, &input.identity, envelope)
-                .map_err(|error| match error {
-                    FinishAttemptError::Composition(error) => error,
-                    other => owner_refused(other.to_string()),
-                })?;
+        let ordering_head = self
+            .canonical
+            .scope()
+            .ordering_heads
+            .iter()
+            .find(|head| head.scope.as_str() == GOVERNOR_ORDERING_SCOPE)
+            .filter(|head| head.state_fence == *fence)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "current Governor ordering head is unavailable at the Observe fence".to_owned(),
+                )
+            })?;
+        let envelope = mcp_observation_envelope(
+            &input.identity,
+            &input.operation_id,
+            &submission,
+            scope_ref,
+            ordering_head.sequence,
+            input.task_selection.as_ref(),
+        )?;
+        let exchange = crate::finish_attempt::prepare_exchange(
+            self.canonical,
+            &input.identity,
+            envelope,
+        )
+        .map_err(|error| match error {
+            FinishAttemptError::Composition(error) => error,
+            other => owner_refused(other.to_string()),
+        })?;
         let access = ObservationCaptureAccess {
             privacy: current_scope.binding.privacy_class,
             visibility: ObservationCaptureVisibility::LocalOnly,
@@ -3563,6 +3658,9 @@ mod tests {
             journal,
             revisions,
             canonical,
+            None,
+            None,
+            None,
             kernel,
             CompositionReadiness::Ready,
         )
