@@ -94,6 +94,9 @@ pub enum EngineError {
     },
 
     #[error(transparent)]
+    ContextMeasurement(#[from] eliot_context_contracts::ContextError),
+
+    #[error(transparent)]
     Store(#[from] eliot_store::StoreError),
 
     #[error(transparent)]

@@ -59,7 +59,7 @@
 
 use std::collections::BTreeMap;
 
-use eliot_context_contracts::{MeasurementStatus, StuEstimate};
+use eliot_context_contracts::{ContextError, MeasurementStatus, StuEstimate};
 use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
 use serde_json::Value;
 
@@ -149,7 +149,7 @@ impl PacketBudgetDecision {
     /// Revalidate an envelope against the original exact-byte/profile binding.
     /// This never creates or repairs a binding: changed bytes, profile, STU,
     /// actual-token claims, or fit claims are rejected.
-    pub fn validate_packet_envelope(&self, serialized: &[u8]) -> Result<(), String> {
+    pub fn validate_packet_envelope(&self, serialized: &[u8]) -> Result<(), ContextError> {
         let (serializer_id, serializer_version, options_digest, profile_digest) =
             packet_serializer_binding();
         if self.serializer_id != serializer_id
@@ -157,27 +157,26 @@ impl PacketBudgetDecision {
             || self.serializer_options_digest != options_digest
             || self.serializer_profile_digest != profile_digest
         {
-            return Err("context packet serializer profile has changed".to_owned());
+            return Err(ContextError::IdentityConflict);
         }
         if self.actual_tokens.is_some()
             || self.measured_fit.is_some()
             || self.measurement_status != MeasurementStatus::ConservativeStu
             || self.stu_estimate.empirical
         {
-            return Err("context packet measurement contains unsupported evidence".to_owned());
+            return Err(ContextError::UnknownMeasurement);
         }
         let envelope = validate_envelope(
             serialized,
             self.rendered_utf8_bytes,
             &self.content_digest,
             MAX_MEASUREMENT_BYTES,
-        )
-        .map_err(|error| error.to_string())?;
-        let stu = stu_for_bytes(envelope.byte_len).map_err(|error| error.to_string())?;
+        )?;
+        let stu = stu_for_bytes(envelope.byte_len)?;
         if self.stu_estimate.value != stu
             || usize::try_from(stu).ok() != Some(self.estimated_tokens)
         {
-            return Err("context packet STU estimate does not match its bound bytes".to_owned());
+            return Err(ContextError::IdentityConflict);
         }
         Ok(())
     }

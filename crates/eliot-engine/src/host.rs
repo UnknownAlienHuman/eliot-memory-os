@@ -1,5 +1,5 @@
 use crate::EngineError;
-use eliot_context_contracts::{MeasurementStatus, StuEstimate};
+use eliot_context_contracts::{ContextError, MeasurementStatus, StuEstimate};
 use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
 use eliot_contracts::sha256_hex;
 use eliot_skills::{
@@ -374,20 +374,10 @@ impl SkillPackService {
 }
 
 fn exact_text_measurement(bytes: &[u8]) -> Result<(u64, StuEstimate, String), EngineError> {
-    let declared_len = u64::try_from(bytes.len()).map_err(|_| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: "UTF-8 byte length is not representable as u64".to_owned(),
-    })?;
+    let declared_len = u64::try_from(bytes.len()).map_err(|_| ContextError::Overflow)?;
     let content_digest = sha256_hex(bytes);
-    let envelope = validate_envelope(bytes, declared_len, &content_digest, MAX_MEASUREMENT_BYTES)
-        .map_err(|error| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: error.to_string(),
-    })?;
-    let value = stu_for_bytes(envelope.byte_len).map_err(|error| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: error.to_string(),
-    })?;
+    let envelope = validate_envelope(bytes, declared_len, &content_digest, MAX_MEASUREMENT_BYTES)?;
+    let value = stu_for_bytes(envelope.byte_len)?;
     Ok((
         envelope.byte_len,
         StuEstimate {
@@ -412,16 +402,8 @@ fn validate_exact_text(
         recorded_byte_len,
         recorded_digest,
         MAX_MEASUREMENT_BYTES,
-    )
-    .map_err(|error| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: error.to_string(),
-    })?;
-    let expected_stu =
-        stu_for_bytes(envelope.byte_len).map_err(|error| EngineError::ServiceNotReady {
-            service: "context-measurement".to_owned(),
-            reason: error.to_string(),
-        })?;
+    )?;
+    let expected_stu = stu_for_bytes(envelope.byte_len)?;
     if recorded_stu.value != expected_stu {
         return Err(measurement_error(
             "unvalidated STU does not match the bound UTF-8 bytes",
@@ -456,11 +438,8 @@ fn profile_binding(id: &str, version: &str, options: &[u8]) -> (String, String, 
     )
 }
 
-fn measurement_error(reason: &str) -> EngineError {
-    EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: reason.to_owned(),
-    }
+fn measurement_error(field: &'static str) -> EngineError {
+    ContextError::InvalidField(field).into()
 }
 
 const DERIVED_PACKAGE_NOTICE: &str = "\

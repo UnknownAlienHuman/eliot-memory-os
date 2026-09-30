@@ -9,7 +9,7 @@ use crate::{
     SkillDistractorFilterService, StopCoordinationGate, WorkState, WriteAdmissionService,
     WriterHandle,
 };
-use eliot_context_contracts::{MeasurementStatus, StuEstimate};
+use eliot_context_contracts::{ContextError, MeasurementStatus, StuEstimate};
 use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
 use eliot_types::memory::{
     CurrentGitScopeView, GovernedGitScope, MemoryApplicabilityDecision,
@@ -516,6 +516,12 @@ impl ContextCompiler {
             "memory was loaded, but influence is not claimed until an outcome records an observable decision or verifier delta"
                 .to_owned(),
         );
+        refinalize_compiled_packet(
+            &mut packet,
+            None,
+            request.max_tokens,
+            &request.candidate_handles,
+        )?;
         Ok(packet)
     }
 
@@ -534,7 +540,12 @@ impl ContextCompiler {
             &visible_skills,
             skill_context,
         );
-        enforce_budget(&mut packet, request.max_tokens, &request.candidate_handles)?;
+        refinalize_compiled_packet(
+            &mut packet,
+            None,
+            request.max_tokens,
+            &request.candidate_handles,
+        )?;
         Ok(packet)
     }
 
@@ -2827,37 +2838,18 @@ pub fn serialized_supplement_tokens<T: serde::Serialize>(
 }
 
 fn canonical_stu_for_byte_len(byte_len: usize) -> Result<usize, EngineError> {
-    let byte_len = u64::try_from(byte_len).map_err(|_| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: "serialized byte length is not representable as u64".to_owned(),
-    })?;
-    let stu = stu_for_bytes(byte_len).map_err(|error| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: error.to_string(),
-    })?;
-    usize::try_from(stu).map_err(|_| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: "STU estimate is not representable as usize".to_owned(),
-    })
+    let byte_len = u64::try_from(byte_len).map_err(|_| ContextError::Overflow)?;
+    let stu = stu_for_bytes(byte_len)?;
+    usize::try_from(stu).map_err(|_| ContextError::Overflow.into())
 }
 
 fn canonical_measurement_for_payload(
     serialized: &[u8],
 ) -> Result<(u64, StuEstimate, String), EngineError> {
-    let byte_len = u64::try_from(serialized.len()).map_err(|_| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: "serialized byte length is not representable as u64".to_owned(),
-    })?;
+    let byte_len = u64::try_from(serialized.len()).map_err(|_| ContextError::Overflow)?;
     let digest = eliot_contracts::sha256_hex(serialized);
-    let envelope = validate_envelope(serialized, byte_len, &digest, MAX_MEASUREMENT_BYTES)
-        .map_err(|error| EngineError::ServiceNotReady {
-            service: "context-measurement".to_owned(),
-            reason: error.to_string(),
-        })?;
-    let stu = stu_for_bytes(envelope.byte_len).map_err(|error| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: error.to_string(),
-    })?;
+    let envelope = validate_envelope(serialized, byte_len, &digest, MAX_MEASUREMENT_BYTES)?;
+    let stu = stu_for_bytes(envelope.byte_len)?;
     Ok((
         envelope.byte_len,
         StuEstimate {
@@ -3016,10 +3008,7 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
         let (rendered_utf8_bytes, stu_estimate, content_digest) =
             canonical_measurement_for_payload(&final_serialized_packet)?;
         budget.estimated_tokens =
-            usize::try_from(stu_estimate.value).map_err(|_| EngineError::ServiceNotReady {
-                service: "context-measurement".to_owned(),
-                reason: "STU estimate is not representable as usize".to_owned(),
-            })?;
+            usize::try_from(stu_estimate.value).map_err(|_| ContextError::Overflow)?;
         budget.rendered_utf8_bytes = rendered_utf8_bytes;
         budget.stu_estimate = stu_estimate;
         let (
@@ -3048,7 +3037,7 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
         if next_metadata_tokens == budget_metadata_tokens {
             budget
                 .validate_packet_envelope(&final_serialized_packet)
-                .map_err(EngineError::WriteRejected)?;
+                .map_err(EngineError::from)?;
             let project_understanding =
                 rendered_packet
                     .project_understanding
@@ -3105,14 +3094,12 @@ fn render_packet_with_budget_policy(
         PacketRenderMode::WithinPreferred
     };
     let reason = match render_mode {
-        PacketRenderMode::WithinPreferred => {
-            "within_preferred_unvalidated_stu_planning_estimate; actual_token_count_unknown; measured_fit_unknown"
-        }
+        PacketRenderMode::WithinPreferred => "within_preferred_budget",
         PacketRenderMode::PreferredBudgetExceededByMandatoryFloor => {
-            "unvalidated_stu_planning_estimate_exceeds_preferred_budget_by_mandatory_floor; actual_token_count_unknown; measured_fit_unknown"
+            "preferred_budget_exceeded_by_mandatory_floor"
         }
         PacketRenderMode::PreferredBudgetClampedToHardCeiling => {
-            "unvalidated_stu_planning_budget_clamped_to_hard_ceiling; actual_token_count_unknown; measured_fit_unknown"
+            "preferred_budget_clamped_to_hard_ceiling"
         }
     }
     .to_owned();
@@ -3137,10 +3124,7 @@ fn render_packet_with_budget_policy(
     let (rendered_utf8_bytes, stu_estimate, content_digest) =
         canonical_measurement_for_payload(&packet_bytes)?;
     let estimated_tokens =
-        usize::try_from(stu_estimate.value).map_err(|_| EngineError::ServiceNotReady {
-            service: "context-measurement".to_owned(),
-            reason: "STU estimate is not representable as usize".to_owned(),
-        })?;
+        usize::try_from(stu_estimate.value).map_err(|_| ContextError::Overflow)?;
     let (serializer_id, serializer_version, serializer_options_digest, serializer_profile_digest) =
         packet_serializer_binding();
     let mut section_tokens = packet_section_accounting(&packet)?;
@@ -4835,7 +4819,7 @@ mod current_git_scope_tests {
         );
         assert_eq!(
             outcome.budget.reason,
-            "unvalidated_stu_planning_estimate_exceeds_preferred_budget_by_mandatory_floor; actual_token_count_unknown; measured_fit_unknown"
+            "preferred_budget_exceeded_by_mandatory_floor"
         );
         assert_eq!(
             outcome.packet.token_budget_report.max_tokens,

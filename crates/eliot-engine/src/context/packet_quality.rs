@@ -46,6 +46,7 @@
 //! authority imports are introduced.
 
 use crate::EngineError;
+use eliot_context_contracts::ContextError;
 use eliot_types::{ContextPacketL3, MaterialPacketFrame, PacketQualityReport, PacketQualityResult};
 use std::collections::BTreeSet;
 
@@ -132,15 +133,8 @@ impl PacketQualityService {
         };
         let seed_serialized = serde_json::to_vec(&packet)?;
         let (seed_bytes, seed_stu, _) = super::canonical_measurement_for_payload(&seed_serialized)?;
-        let seed_bytes = usize::try_from(seed_bytes).map_err(|_| EngineError::ServiceNotReady {
-            service: "context-measurement".to_owned(),
-            reason: "serialized byte length is not representable as usize".to_owned(),
-        })?;
-        let seed_stu =
-            usize::try_from(seed_stu.value).map_err(|_| EngineError::ServiceNotReady {
-                service: "context-measurement".to_owned(),
-                reason: "STU estimate is not representable as usize".to_owned(),
-            })?;
+        let seed_bytes = usize::try_from(seed_bytes).map_err(|_| ContextError::Overflow)?;
+        let seed_stu = usize::try_from(seed_stu.value).map_err(|_| ContextError::Overflow)?;
         let report = PacketQualityReport {
             packet_id: packet.packet_id.clone(),
             task_id: packet.task_id.clone(),
@@ -178,22 +172,14 @@ impl PacketQualityService {
         loop {
             let serialized = serde_json::to_vec(&packet)?;
             if !observed_envelopes.insert(serialized.clone()) {
-                return Err(EngineError::WriteRejected(
-                    "packet measurement cycles between serialized envelopes".to_owned(),
-                ));
+                return Err(ContextError::IdentityConflict.into());
             }
             let (structured_bytes, stu_estimate, _) =
                 super::canonical_measurement_for_payload(&serialized)?;
             let structured_bytes =
-                usize::try_from(structured_bytes).map_err(|_| EngineError::ServiceNotReady {
-                    service: "context-measurement".to_owned(),
-                    reason: "serialized byte length is not representable as usize".to_owned(),
-                })?;
+                usize::try_from(structured_bytes).map_err(|_| ContextError::Overflow)?;
             let estimated_tokens =
-                usize::try_from(stu_estimate.value).map_err(|_| EngineError::ServiceNotReady {
-                    service: "context-measurement".to_owned(),
-                    reason: "STU estimate is not representable as usize".to_owned(),
-                })?;
+                usize::try_from(stu_estimate.value).map_err(|_| ContextError::Overflow)?;
             let signal_density = if structured_bytes == 0 {
                 0.0
             } else {
