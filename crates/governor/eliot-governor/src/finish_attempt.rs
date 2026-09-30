@@ -732,32 +732,46 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     /// read is bounded to one round trip; the write legs of the finish path
     /// still run with no composition borrow held, as before.
     ///
-    /// Fails closed with a typed [`AcceptanceDenominatorError`] when the live
-    /// canonical fence does not carry this exact task revision, when the port
-    /// route is not admitted, or when the returned set is bound to another task,
-    /// revision, or fence. There is no fallback to the plan's declared list.
+    /// The task revision is the live task-lifecycle owner's own `TaskRecord`
+    /// revision, never a value the caller supplies and never a
+    /// `StateFence::task_revision`. That field is `None` on every production
+    /// Kernel-generation fence by construction
+    /// (`KernelGenerationSnapshot::state_fence` is
+    /// `StateFence::new(authority_epoch, resource_generation)`), and
+    /// `StateFence::I45_KEY_OMISSIONS` assigns the task-revision dimension to
+    /// the operation's own owner record instead of the transport fence. The
+    /// task-lifecycle owner already holds the current `TaskRecord.revision`,
+    /// which is the durable task-bound write precondition I5.5 requires, so
+    /// requiring the fence to restate it could only ever refuse.
+    ///
+    /// Fails closed with a typed [`AcceptanceDenominatorError`] when this task
+    /// has no live owner record, when the port route is not admitted, or when
+    /// the returned set is bound to another task, revision, or fence. There is
+    /// no fallback to the plan's declared list.
     pub async fn rehydrate_task_contract_acceptance(
         &self,
         task_id: &TaskId,
-        task_revision: u64,
     ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         let fence = self.canonical.state_fence().clone();
-        if fence
-            .task_revision
-            .as_ref()
-            .map(|revision| revision.value())
-            != Some(task_revision)
-        {
+        let task = self.task.task(task_id).ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "canonical task {} is absent; its acceptance set cannot be rehydrated",
+                task_id.as_str()
+            )))
+        })?;
+        // A zero owner revision is not a current revision, so it never reaches
+        // the contract owner's read.
+        if task.revision == 0 {
             return Err(AcceptanceDenominatorError::TaskRevisionStale.into());
         }
         let set = self
             .kernel
-            .task_contract_acceptance_set(task_id, task_revision, &fence)
+            .task_contract_acceptance_set(task_id, task.revision, &fence)
             .await?;
         if set.task_id.as_str() != task_id.as_str() {
             return Err(AcceptanceDenominatorError::TaskSubstituted.into());
         }
-        if set.task_revision != task_revision {
+        if set.task_revision != task.revision {
             return Err(AcceptanceDenominatorError::TaskRevisionStale.into());
         }
         if set.read_state_fence != fence {
@@ -1102,27 +1116,23 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             )
             .into());
         }
-        let expected_revision = fence
-            .task_revision
-            .as_ref()
-            .map(|revision| revision.value())
-            .ok_or_else(|| {
-                FinishAttemptError::Serialization(
-                    "finish request is missing its task revision fence".to_owned(),
-                )
-            })?;
-        if expected_revision != draft.expected_task_revision {
-            return Err(
-                FinishError::Canonical(eliot_canonical::CanonicalError::StaleTaskRevision).into(),
-            );
-        }
         let task = self.task.task(&task_id).ok_or_else(|| {
             FinishAttemptError::Serialization(format!(
                 "canonical task {} is absent",
                 task_id.as_str()
             ))
         })?;
-        validate_task(task, &fence, expected_revision)?;
+        // The current task revision is the live task-lifecycle owner record's
+        // revision, not `fence.task_revision` (structurally `None` on the
+        // production Kernel-generation fence) and not the draft's claim. The
+        // draft's `expected_task_revision` is the candidate's stale-write guard
+        // and is compared against that owner-resolved value.
+        if task.revision != draft.expected_task_revision {
+            return Err(
+                FinishError::Canonical(eliot_canonical::CanonicalError::StaleTaskRevision).into(),
+            );
+        }
+        validate_task(task, &fence)?;
         let plan = self.canonical.read_current_plan(&fence)?;
         if plan.task_id != task_id {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
@@ -1189,27 +1199,20 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             )
             .into());
         }
-        let expected_revision = fence
-            .task_revision
-            .as_ref()
-            .map(|revision| revision.value())
-            .ok_or_else(|| {
-                FinishAttemptError::Serialization(
-                    "finish request is missing its task revision fence".to_owned(),
-                )
-            })?;
-        if expected_revision != draft.expected_task_revision {
-            return Err(
-                FinishError::Canonical(eliot_canonical::CanonicalError::StaleTaskRevision).into(),
-            );
-        }
         let task = self.task.task(&task_id).ok_or_else(|| {
             FinishAttemptError::Serialization(format!(
                 "canonical task {} is absent",
                 task_id.as_str()
             ))
         })?;
-        validate_task(task, &fence, expected_revision)?;
+        // Same owner-resolved revision as the evidence leg: the live
+        // task-lifecycle record, with the draft's claim checked against it.
+        if task.revision != draft.expected_task_revision {
+            return Err(
+                FinishError::Canonical(eliot_canonical::CanonicalError::StaleTaskRevision).into(),
+            );
+        }
+        validate_task(task, &fence)?;
         let plan = self.canonical.read_current_plan(&fence)?;
         if plan.task_id != task_id {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
@@ -1314,15 +1317,18 @@ fn evidence_task_binding(identity: &RequestIdentity) -> Result<(TaskId, u64), Fi
     Ok((task_id, task_revision))
 }
 
-fn validate_task(
-    task: &TaskRecord,
-    fence: &StateFence,
-    expected_revision: u64,
-) -> Result<(), FinishAttemptError> {
+/// Proves the live task-lifecycle record belongs to this exact fence and holds
+/// a real current revision.
+///
+/// The revision itself is the owner record's own value: the caller does not
+/// supply it and the transport fence does not carry it, so this proves fence
+/// identity only and refuses a zero revision. Callers compare the owner value
+/// against their candidate's `expected_task_revision` themselves.
+fn validate_task(task: &TaskRecord, fence: &StateFence) -> Result<(), FinishAttemptError> {
     if task.state_fence != *fence {
         return Err(FinishError::FenceMismatch.into());
     }
-    if task.revision != expected_revision || task.revision == 0 {
+    if task.revision == 0 {
         return Err(
             FinishError::Canonical(eliot_canonical::CanonicalError::StaleTaskRevision).into(),
         );

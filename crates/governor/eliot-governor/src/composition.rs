@@ -6233,8 +6233,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     }
 
     /// Rehydrates the contract owner's acceptance-item enumeration for one
-    /// finish candidate, at the exact task id and task revision the admitted
-    /// request carries (issue #1741, I7.9).
+    /// finish candidate, at the exact task id the admitted request carries
+    /// (issue #1741, I7.9).
     ///
     /// This is the async half of the denominator join and the only place the
     /// finish path may obtain it. It is deliberately separate from
@@ -6243,19 +6243,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// prepare with the owner's set in hand instead of holding a composition
     /// borrow across a Kernel round trip for the write legs.
     ///
+    /// The task revision is resolved inside the finish owner from the live
+    /// task-lifecycle owner record, so this boundary names only the task and
+    /// never a caller-held revision.
+    ///
     /// A read that is absent, refused, unadmitted, or bound to another task,
     /// revision or fence is a typed
     /// [`AcceptanceDenominatorError`], never a substituted plan list.
     pub async fn rehydrate_task_contract_acceptance(
         &self,
         task_id: &TaskId,
-        task_revision: u64,
     ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.finish_attempt_service()
-            .rehydrate_task_contract_acceptance(task_id, task_revision)
+            .rehydrate_task_contract_acceptance(task_id)
             .await
     }
 
@@ -6357,9 +6360,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // enumeration rather than the plan's declared list.
         let task_id = TaskId::new(draft.task_id.clone())
             .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
-        let contract_acceptance = self
-            .rehydrate_task_contract_acceptance(&task_id, draft.expected_task_revision)
-            .await?;
+        let contract_acceptance = self.rehydrate_task_contract_acceptance(&task_id).await?;
         let evidence =
             self.prepare_finish_evidence(identity, &operation_id, &draft, &contract_acceptance)?;
         if let Some(prepared) = evidence.as_ref() {

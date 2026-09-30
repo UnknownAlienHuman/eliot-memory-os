@@ -41,7 +41,6 @@ use std::time::Duration;
 use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
     ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
-    StateFence,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
@@ -677,11 +676,19 @@ pub struct FinishClaimedInvocation {
 /// Derives the Governor request identity for one admitted finish candidate.
 ///
 /// The task binding comes exclusively from the digest-bound admitted draft
-/// plus the admitted envelope fence: the task id from the draft, the task
-/// revision the caller captured, and the envelope's live authority epoch and
-/// resource generation. The Governor finish owner re-proves that claimed
-/// revision against the canonical owner fence before any evaluation, so a
-/// stale or substituted claim fails closed instead of being trusted.
+/// plus the admitted envelope fence: the task id from the draft and the
+/// envelope's live fence unchanged.
+///
+/// The fence deliberately carries no `task_revision`. It is the Kernel
+/// generation fence (`KernelGenerationSnapshot::state_fence` is
+/// `StateFence::new(authority_epoch, resource_generation)`), so it is `None`
+/// there by construction, and every Governor owner read on this lane compares
+/// that fence for exact equality — a fence restating a caller-captured
+/// revision could never match one. `StateFence::I45_KEY_OMISSIONS` gives the
+/// task-revision dimension to the operation's own owner record, so the draft's
+/// `expected_task_revision` is re-proved by the Governor finish owner against
+/// its live task-lifecycle `TaskRecord` instead: an owner-held value, strictly
+/// stronger than a restated caller claim.
 fn derive_finish_request_identity(
     draft: &eliot_governor::FinishAttemptDraft,
     envelope: &HostRequestEnvelope,
@@ -689,13 +696,7 @@ fn derive_finish_request_identity(
     draft
         .validate()
         .map_err(|error| format!("claimed finish draft is invalid: {error}"))?;
-    let fence = StateFence {
-        task_revision: Some(
-            eliot_contracts::TaskRevision::new(draft.expected_task_revision)
-                .map_err(|error| format!("claimed finish revision is invalid: {error}"))?,
-        ),
-        ..envelope.state_fence.clone()
-    };
+    let fence = envelope.state_fence.clone();
     let session_id = envelope
         .identity
         .session_id
@@ -760,12 +761,7 @@ fn validate_finish_claim_request_identity(
             != expected_identity.request.metadata.product_id
         || request_identity.request.metadata.source_id
             != expected_identity.request.metadata.source_id
-        || request_identity
-            .request
-            .metadata
-            .state_fence
-            .task_revision
-            .is_none_or(|revision| revision.value() != draft.expected_task_revision)
+        || request_identity.request.metadata.state_fence != envelope.state_fence
     {
         return Err("Kernel finish identity does not bind its admitted envelope".to_owned());
     }

@@ -246,20 +246,21 @@ pub async fn serve_finish_claim(
         .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
 
     // Issue #1741, I7.9: rehydrate the contract owner's acceptance-item
-    // enumeration for this exact task id and task revision BEFORE any evidence
-    // is prepared. This is one bounded read on the existing authenticated
-    // Kernel named-read route, so the composition borrow is held across it; the
-    // two write legs below still run with no lock held across their exchange, as
-    // before. A refusal here is a typed rejection body: the plan's own
+    // enumeration for this exact task id BEFORE any evidence is prepared. The
+    // task revision is read by the Governor finish owner from its live
+    // task-lifecycle record; this lane supplies only the task id, so the
+    // denominator read can never be aimed at a revision the caller chose. This
+    // is one bounded read on the existing authenticated Kernel named-read
+    // route, so the composition borrow is held across it; the two write legs
+    // below still run with no lock held across their exchange, as before. A
+    // refusal here is a typed rejection body: the plan's own
     // `required_acceptance_item_ids` are never used as the denominator, so a
     // candidate whose plan narrows the contract's obligations cannot proceed.
     let task_id = eliot_contracts::TaskId::new(draft.task_id.clone())
         .map_err(|error| format!("admitted finish draft names an invalid task: {error}"))?;
     let contract_acceptance = {
         let guard = composition.lock().await;
-        guard
-            .rehydrate_task_contract_acceptance(&task_id, draft.expected_task_revision)
-            .await
+        guard.rehydrate_task_contract_acceptance(&task_id).await
     };
     let contract_acceptance = match contract_acceptance {
         Ok(acceptance) => acceptance,

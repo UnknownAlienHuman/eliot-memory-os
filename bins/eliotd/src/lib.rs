@@ -1606,7 +1606,11 @@ impl DaemonComposition {
     // re-checks the pre-commit fence before the receipt is admitted.
 
     /// Rehydrates the contract owner's acceptance-item enumeration for one finish
-    /// candidate at the exact task id and task revision (issue #1741, I7.9).
+    /// candidate at the exact task id (issue #1741, I7.9).
+    ///
+    /// The task revision is resolved by the Governor finish owner from its live
+    /// task-lifecycle owner record; this binary supplies only the task, so it
+    /// cannot hand the denominator read a revision of its own choosing.
     ///
     /// This is the single bounded read the finish path performs before it
     /// prepares anything, and it is the only route to the denominator. It holds
@@ -1619,13 +1623,12 @@ impl DaemonComposition {
     pub async fn rehydrate_task_contract_acceptance(
         &self,
         task_id: &eliot_contracts::TaskId,
-        task_revision: u64,
     ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.governor
-            .rehydrate_task_contract_acceptance(task_id, task_revision)
+            .rehydrate_task_contract_acceptance(task_id)
             .await
     }
 

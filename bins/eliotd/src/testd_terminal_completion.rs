@@ -575,12 +575,14 @@ pub async fn commit_testd_terminal_owner_fact(
     // derive the finish-evidence leg against that image.
     //
     // Issue #1741, I7.9: the denominator is the contract owner's enumeration at
-    // the exact task id and task revision, never the plan's own declared list.
-    // The rehydration is one bounded read on the existing authenticated Kernel
-    // named-read route and is taken after the refresh, so it runs against the
-    // canonical owner image this phase just published. A refusal is the
-    // Governor's typed `AcceptanceDenominatorError` and rejects the row
-    // owner-side; there is no fallback to the plan's list.
+    // the exact task id, never the plan's own declared list. The task revision
+    // is resolved by the Governor finish owner from its live task-lifecycle
+    // record, so this lane names only the task. The rehydration is one bounded
+    // read on the existing authenticated Kernel named-read route and is taken
+    // after the refresh, so it runs against the canonical owner image this
+    // phase just published. A refusal is the Governor's typed
+    // `AcceptanceDenominatorError` and rejects the row owner-side; there is no
+    // fallback to the plan's list.
     let evidence_leg = {
         let mut guard = composition.lock().await;
         guard.accept_testd_terminal_owner_fact(fact)?;
@@ -589,7 +591,7 @@ pub async fn commit_testd_terminal_owner_fact(
             completion_error(format!("finish draft names an invalid task: {error}"))
         })?;
         let contract_acceptance = guard
-            .rehydrate_task_contract_acceptance(&task_id, plan.finish_draft.expected_task_revision)
+            .rehydrate_task_contract_acceptance(&task_id)
             .await
             .map_err(DaemonError::Finish)?;
         guard.plan_testd_terminal_owner_evidence(
