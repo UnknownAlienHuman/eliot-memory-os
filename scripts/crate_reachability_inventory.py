@@ -1974,6 +1974,12 @@ def check_admission_decisions(
                     for name in declared["consumers"]
                 ):
                     defects.append(AdmissionDefect.ADMISSION_MIGRATION_UNBOUNDED.value)
+                # The expiry arm is licensed only for a package with no real
+                # consumer (I2.23): a Cargo dependent visible in the tree
+                # refutes the "no first real consumer" premise, so the record
+                # must name that consumer instead of claiming the expiry arm.
+                if any(name != package and package in deps for name, deps in edges_by_package.items()):
+                    defects.append(AdmissionDefect.ADMISSION_CONSUMER_ABSENT.value)
 
             functional_cell = str(
                 ((_read_toml(root, root / package_dir[package] / "Cargo.toml").get("package") or {}).get("metadata") or {})
