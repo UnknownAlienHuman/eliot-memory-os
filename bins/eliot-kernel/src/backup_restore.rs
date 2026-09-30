@@ -1937,21 +1937,40 @@ impl<'a> KernelRestoreTarget<'a> {
         // two leave a name that points at bytes the target never made stable.
         sync_file(&tmp)?;
         std::fs::rename(&tmp, &path).map_err(|error| BackupError::Target(error.to_string()))?;
-        // Flush the directory entry that now names the published file, so the
-        // name itself survives the same power loss the bytes must survive.
-        // `contained_member_path` admits only one or more plain relative
-        // segments, so the joined path always has a parent; it is still
-        // resolved rather than assumed, because a member that named none
-        // would leave the publication above unflushable, and that must be a
-        // refusal rather than a silent skip of the durability step.
-        sync_parent_directory(path.parent().ok_or(BackupError::RestoreJournalCorrupt)?)?;
+        // The RENAME is the publication. From this line the member exists under
+        // its final name on disk, and the durable journal may record this phase
+        // as applied while its receipt attests these bytes. So the counters and
+        // the retained set are committed HERE, immediately after the rename, and
+        // not after the parent flush below.
+        //
+        // The order matters and it is the opposite of what looks tidy. If the
+        // parent flush were last, a failure there would leave a member that is
+        // genuinely published on disk but absent from `published`, and
+        // `refuse_with_staged_cleanup` decides what to tell the caller from
+        // `published.is_empty()` — so the caller would be told nothing survived
+        // while a retained member sat in the destination. Accounting follows the
+        // filesystem, not the tidiness of the code.
         self.staged_members = members;
         self.staged_bytes = staged_bytes;
-        // Publication, not a temporary any more: from here the durable journal may
-        // record this member as an applied phase and its receipt may attest
-        // these bytes, so it joins the retained set, and the temporary name
-        // stops naming anything on disk.
-        self.published.push(path);
+        self.published.push(path.clone());
+        // Flush the directory entry that now names the published file, so the
+        // NAME survives the same power loss the bytes must survive. The bytes
+        // above are unconditional; this one is best-effort on Windows, where
+        // `sync_parent_directory` absorbs `InvalidInput`, `PermissionDenied` and
+        // `Unsupported` (see `backup_restore_ports.rs`). That absorbed step was
+        // written for the ORS sealed body, where the *body* flush is
+        // unconditional and this call is defence in depth; reused here it is
+        // weaker than the preceding comment would suggest, so it is stated
+        // rather than implied. A name lost this way is not a false success: the
+        // receipt is already durable, so the next resume reads `NotFound` at
+        // `check_attested_material` and refuses as `RestoreJournalCorrupt`.
+        //
+        // `contained_member_path` admits only one or more plain relative
+        // segments, so the joined path always has a parent; it is still
+        // resolved rather than assumed, because a member that named none would
+        // leave the publication above unflushable, and that must be a refusal
+        // rather than a silent skip of the durability step.
+        sync_parent_directory(path.parent().ok_or(BackupError::RestoreJournalCorrupt)?)?;
         Ok(())
     }
 
@@ -2348,13 +2367,21 @@ impl<'a> KernelRestoreTarget<'a> {
             RestorePhase::ApplyPurgeLedger => self.digested_member("purge_ledger.json"),
             RestorePhase::ImportSealedBlob { hash } => Ok(PhaseMaterial {
                 member: Some(self.contained_member_path(&format!("blobs/{hash}"))?),
-                // `apply_blob` digests `ObservedBlobRestore` — the observed
-                // re-seal, including a `resealed_sha256` that is a
-                // destination-encrypted digest no archive member carries.
-                // That document is never persisted, so the receipt attests no
-                // digest of the re-sealed bytes and only their presence is
-                // re-provable. Stated here rather than papered over; the
-                // content binding this phase does own is
+                // `apply_blob` digests `ObservedBlobRestore` — an observation
+                // assembled in memory and never persisted. The check therefore
+                // cannot be made here, and the reason is specifically the
+                // carrier, not the digest: `RestoredSealedBlob::resealed_sha256`
+                // IS an exact digest of the bytes this phase writes to
+                // `blobs/{hash}` (`owner_adapters.rs` sets it from those bytes),
+                // so a value that could be compared exists. It simply is not
+                // durably recorded anywhere, because the document that carries
+                // it was never written. Writing that digest into the receipt to
+                // make the comparison possible would be new capture policy on a
+                // receipt this file does not own, and the phase's real content
+                // binding is re-established by its own owner anyway. Stated
+                // here rather than papered over, because the honest scope is
+                // "removal is detected, substitution is not" for this phase
+                // alone. The content binding this phase does own is
                 // `BlobOwnerClient::restore_blob`, which re-verifies the
                 // plaintext digest and the restoration receipt before it
                 // stages anything.
@@ -2656,7 +2683,21 @@ impl<'a> KernelRestoreTarget<'a> {
         let restored: RestoredSealedBlob = client.restore_blob(&adapter, blob)?;
         self.write_file(&format!("blobs/{hash}"), &restored.resealed_bytes)?;
         let observed = ObservedBlobRestore {
-            resealed_sha256: restored.resealed_sha256.clone(),
+            // Verified to equal `sha256_hex` of the bytes just written, not
+            // assumed: the observation this receipt digests is otherwise never
+            // persisted, so this is the only place the equivalence is checked.
+            // A mismatch means the owner's digest does not describe the member
+            // this phase published, which is precisely the substitution the
+            // durable record would then fail to catch.
+            resealed_sha256: {
+                let observed_sha256 = sha256_hex(&restored.resealed_bytes);
+                if restored.resealed_sha256 != observed_sha256 {
+                    return Err(BackupError::IntegrityMismatch {
+                        subject: "restored blob member digest".to_owned(),
+                    });
+                }
+                restored.resealed_sha256.clone()
+            },
             receipt_id: restored.receipt_id.clone(),
             key_lineage: restored.key_lineage.clone(),
             source_plaintext_sha256: restored.source_plaintext_sha256.clone(),
