@@ -4024,6 +4024,11 @@ pub trait OperationalRecoveryStore: Send + Sync {
         token: &WriterReservationToken,
         writer_epoch: &EpochIdentity,
     ) -> Result<ReservationRecord, OrsError>;
+    fn claim_execute(
+        &self,
+        token: &WriterReservationToken,
+        writer_epoch: &EpochIdentity,
+    ) -> Result<ReservationRecord, OrsError>;
     fn mark_unknown(
         &self,
         token: &WriterReservationToken,
@@ -28847,6 +28852,25 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    fn validate_execute_transition(
+        write: &redb::WriteTransaction,
+        table: &impl ReadableTable<&'static str, &'static str>,
+        record: &ReservationRecord,
+        token: &WriterReservationToken,
+        allow_executing_replay: bool,
+    ) -> Result<bool, OrsError> {
+        Self::validate_token(record, token)?;
+        match record.state {
+            ReservationState::Eligible => {
+                Self::ensure_no_predecessor(table, token)?;
+                Self::ensure_canonical_heads(write, token)?;
+                Ok(false)
+            }
+            ReservationState::Executing if allow_executing_replay => Ok(true),
+            _ => Err(OrsError::InvalidTransition),
+        }
+    }
+
     fn clear_recovery_blocks(
         write: &redb::WriteTransaction,
         closed: &ReservationRecord,
@@ -34792,14 +34816,32 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         {
             let mut table = write.open_table(RESERVATIONS).map_err(storage)?;
             record = Self::load_record(&table, &token.reservation_id)?;
-            Self::validate_token(&record, token)?;
-            match record.state {
-                ReservationState::Executing => return Ok(record),
-                ReservationState::Eligible => {}
-                _ => return Err(OrsError::InvalidTransition),
+            if Self::validate_execute_transition(&write, &table, &record, token, true)? {
+                return Ok(record);
             }
-            Self::ensure_no_predecessor(&table, token)?;
-            Self::ensure_canonical_heads(&write, token)?;
+            record.state = ReservationState::Executing;
+            let payload = encode(&record)?;
+            table
+                .insert(token.reservation_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
+        write.commit().map_err(storage)?;
+        Ok(record)
+    }
+
+    fn claim_execute(
+        &self,
+        token: &WriterReservationToken,
+        writer_epoch: &EpochIdentity,
+    ) -> Result<ReservationRecord, OrsError> {
+        require_writer_epoch(token, writer_epoch)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut record;
+        {
+            let mut table = write.open_table(RESERVATIONS).map_err(storage)?;
+            record = Self::load_record(&table, &token.reservation_id)?;
+            Self::validate_execute_transition(&write, &table, &record, token, false)?;
             record.state = ReservationState::Executing;
             let payload = encode(&record)?;
             table
