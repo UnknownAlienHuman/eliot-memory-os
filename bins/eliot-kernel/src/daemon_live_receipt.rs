@@ -35,11 +35,7 @@ use std::path::Path;
 /// correlation; no receipt roots, artifact/evidence material, or owner error
 /// strings are attached (I15.4, I07.20).
 #[cfg(windows)]
-fn observe_live_receipt(
-    event: &'static str,
-    outcome: &'static str,
-    context: &tracing::Span,
-) {
+fn observe_live_receipt(event: &'static str, outcome: &'static str, context: &tracing::Span) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
@@ -55,11 +51,7 @@ fn observe_live_receipt(
 /// Records one validated correlation identity on the shared live-receipt
 /// span after screening it through the Kernel diagnostics policy.
 #[cfg(windows)]
-fn record_live_receipt_context_field(
-    context: &tracing::Span,
-    field: &'static str,
-    original: &str,
-) {
+fn record_live_receipt_context_field(context: &tracing::Span, field: &'static str, original: &str) {
     let value = super::kernel_diagnostics::bound_field(original);
     context.record(field, value.text());
 }
@@ -67,11 +59,8 @@ fn record_live_receipt_context_field(
 /// Builds a live-receipt context from the exact process receipt binding.
 #[cfg(windows)]
 fn process_receipt_context(process: &ProcessStartReceipt) -> tracing::Span {
-    let generation = process.accepted_generation().value().to_string();
-    let epoch_digest = process
-        .binding()
-        .state_fence()
-        .canonical_epoch_digest();
+    let generation = process.accepted_generation().get().to_string();
+    let epoch_digest = process.binding().state_fence().canonical_epoch_digest();
     super::kernel_diagnostics::operation_context(
         Some(process.operation_id().as_str()),
         Some(&generation),
@@ -149,11 +138,7 @@ impl KernelComposition {
             &context,
         ) {
             Ok(receipt) => {
-                observe_live_receipt(
-                    "kernel.live_receipt.published",
-                    "success",
-                    &context,
-                );
+                observe_live_receipt("kernel.live_receipt.published", "success", &context);
                 // Issue #1837: durable audit evidence for receipt issuance.
                 self.audit_observe(AuditEventDraft::receipt_live_published(
                     process,
@@ -527,19 +512,11 @@ impl KernelComposition {
             .await
         {
             Ok(()) => {
-                observe_live_receipt(
-                    "kernel.live_receipt.readiness_proven",
-                    "success",
-                    &context,
-                );
+                observe_live_receipt("kernel.live_receipt.readiness_proven", "success", &context);
                 Ok(())
             }
             Err(error) => {
-                observe_live_receipt(
-                    "kernel.live_receipt.readiness_rejected",
-                    "fenced",
-                    &context,
-                );
+                observe_live_receipt("kernel.live_receipt.readiness_rejected", "fenced", &context);
                 super::kernel_diagnostics::observe_terminal_error_in_context(
                     live_receipt_terminal_code(&error),
                     &context,

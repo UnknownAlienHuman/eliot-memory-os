@@ -239,15 +239,24 @@ impl KernelComposition {
     ) -> Result<KernelControlResponse, TransportError> {
         let validated = request.validate().is_ok();
         let generation = validated.then(|| request.generation.value().to_string());
-        let epoch = validated.then(|| StateFence::canonical_epoch_digest(&request.candidate.kernel_epoch).ok()).flatten();
+        let epoch = validated
+            .then(|| StateFence::canonical_epoch_digest(&request.candidate.kernel_epoch).ok())
+            .flatten();
         let context = super::kernel_diagnostics::operation_context(
-            validated.then(|| request.command.operation_id().map_or(request.message_id.as_str(), |value| value.as_str())),
+            validated.then(|| {
+                request
+                    .command
+                    .operation_id()
+                    .map_or(request.message_id.as_str(), |value| value.as_str())
+            }),
             generation.as_deref(),
             None,
             epoch.as_ref().map(|value| value.as_str()),
         );
         observe_control_in_context("kernel.control.request_received", "attempt", &context);
-        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence, &context)).await {
+        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence, &context))
+            .await
+        {
             Ok(response) => {
                 observe_control_in_context("kernel.control.request_admitted", "success", &context);
                 Ok(response)
@@ -263,10 +272,15 @@ impl KernelComposition {
                         TransportError::SessionFenced,
                         true,
                     ),
-                    ControlRequestFailure::TerminalOwned(error) => (control_request_terminal_code(&error), error, false),
+                    ControlRequestFailure::TerminalOwned(error) => {
+                        (control_request_terminal_code(&error), error, false)
+                    }
                 };
                 if emit_terminal {
-                    super::kernel_diagnostics::observe_terminal_error_in_context(terminal_code, &context);
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        terminal_code,
+                        &context,
+                    );
                 }
                 Err(transport_error)
             }

@@ -70,11 +70,7 @@ fn observe_process(event: &'static str, outcome: &'static str) {
 /// Emits one process observation under its explicitly propagated operation
 /// context. The unscoped wrapper above uses an explicit all-unavailable span;
 /// neither path inherits whichever span happens to be current on this task.
-fn observe_process_in_context(
-    context: &tracing::Span,
-    event: &'static str,
-    outcome: &'static str,
-) {
+fn observe_process_in_context(context: &tracing::Span, event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
@@ -2127,9 +2123,7 @@ impl ProcessExecutionGateway {
                 .controller
                 .lock()
                 .map_err(|_| {
-                    ProcessExecutionError::Unavailable(
-                        "process authority lock poisoned".to_owned(),
-                    )
+                    ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
                 })?
                 .origin_grant_reconciliation_source(request_nonce, &self.snapshot_binding)
                 .map_err(Self::origin_contract_error)?;
@@ -2418,7 +2412,11 @@ impl ProcessExecutionGateway {
         match port.read_after(&baseline, evidence) {
             Ok(receipt) => match port.ingest(baseline, receipt) {
                 Ok(()) => {
-                    observe_process_in_context(context, "kernel.process.effect_observed", "success");
+                    observe_process_in_context(
+                        context,
+                        "kernel.process.effect_observed",
+                        "success",
+                    );
                 }
                 Err(error) => observe_process_in_context(
                     context,
@@ -2510,18 +2508,17 @@ impl ProcessExecutionGateway {
         path_proof: ProcessPathProof,
         outer_binding: HostKernelCandidateBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        let context = if admission.validate().is_ok()
-            && self.validate_admission(&admission, owner).is_ok()
-        {
-            process_operation_context(
-                Some(admission.intent().operation_id()),
-                Some(admission.intent().generation()),
-                Some(admission.state_fence()),
-                Some(owner.authority_epoch()),
-            )
-        } else {
-            super::kernel_diagnostics::operation_context(None, None, None, None)
-        };
+        let context =
+            if admission.validate().is_ok() && self.validate_admission(&admission, owner).is_ok() {
+                process_operation_context(
+                    Some(admission.intent().operation_id()),
+                    Some(admission.intent().generation()),
+                    Some(admission.state_fence()),
+                    Some(owner.authority_epoch()),
+                )
+            } else {
+                super::kernel_diagnostics::operation_context(None, None, None, None)
+            };
         self.start_in_context(owner, admission, path_proof, outer_binding, &context)
             .await
     }
@@ -2560,12 +2557,9 @@ impl ProcessExecutionGateway {
         // pre-effect point that still carries the admission the binding is
         // formed from, and the retained path proof whose lease owns the
         // image the port opens.
-        if let Err(error) = self.capture_governed_effect_baseline(
-            owner,
-            &admission,
-            &path_proof,
-            context,
-        ) {
+        if let Err(error) =
+            self.capture_governed_effect_baseline(owner, &admission, &path_proof, context)
+        {
             observe_process_in_context(context, "kernel.process.start_failed", "rejected");
             super::kernel_diagnostics::observe_terminal_error_in_context(
                 process_terminal_code(&error),
@@ -2678,10 +2672,7 @@ impl ProcessExecutionGateway {
             None,
             Some(owner.authority_epoch()),
         );
-        match self
-            .inspect_inner(owner, operation_id, &context)
-            .await
-        {
+        match self.inspect_inner(owner, operation_id, &context).await {
             Ok(view) => {
                 record_process_context_field(
                     &context,
@@ -2950,7 +2941,11 @@ impl ProcessExecutionGateway {
                 }
                 Ok(OriginGrantEffectOutcome::Unknown) => {}
                 Err(error) => {
-                    observe_process_in_context(&context, "kernel.process.cancel_rejected", "fenced");
+                    observe_process_in_context(
+                        &context,
+                        "kernel.process.cancel_rejected",
+                        "fenced",
+                    );
                     super::kernel_diagnostics::observe_terminal_error_in_context(
                         process_terminal_code(&error),
                         &context,
@@ -3147,10 +3142,7 @@ impl ProcessExecutionGateway {
                         process_terminal_code(&error),
                         &context,
                     );
-                    outcomes.push((
-                        operation_id,
-                        Err(error),
-                    ));
+                    outcomes.push((operation_id, Err(error)));
                     continue;
                 }
             };
@@ -3192,11 +3184,7 @@ impl ProcessExecutionGateway {
                 // #1824 (I10.21 A1/W2): read the terminal source state against
                 // the retained pre-effect baseline and ingest the validated
                 // receipt. Monitor-path failure never fails the reconcile.
-                self.ingest_governed_effect_observation(
-                    &effect_operation_id,
-                    &evidence,
-                    &context,
-                );
+                self.ingest_governed_effect_observation(&effect_operation_id, &evidence, &context);
                 let view = evidence.view();
                 record_process_context_field(
                     &context,
@@ -3211,7 +3199,11 @@ impl ProcessExecutionGateway {
                         .canonical_epoch_digest()
                         .as_deref(),
                 );
-                observe_process_in_context(&context, "kernel.process.reconcile_reported", "success");
+                observe_process_in_context(
+                    &context,
+                    "kernel.process.reconcile_reported",
+                    "success",
+                );
                 Ok(evidence)
             }
             Err(error) => {
