@@ -908,7 +908,7 @@ pub fn parse_finish_submit_outcome(
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::local_read_claim`)
 /// answers the single-`operation`-key poll with `{"pair": {"envelope",
-/// "tool", "attempt", "record", "durable_attempt"}}` or `{"pair": null}`. `None` is the empty-queue
+/// "tool", "attempt"}}` or `{"pair": null}`. `None` is the empty-queue
 /// backoff signal, not an error — exactly like the activation ticket `None`
 /// case. The claimed envelope must already decode as admitted shape and the
 /// attempt must already decode as a bound capability (operation handle equal
@@ -1065,6 +1065,9 @@ pub enum ObserveDeferOutcome {
 pub struct ObserveClaimedPair {
     /// Original admitted host request envelope.
     pub envelope: HostRequestEnvelope,
+    /// Original Governor request identity retained from the admitted Host
+    /// Request Frame, distinct from the flat HostRequestIdentity above.
+    pub source_request_identity: RequestIdentity,
     /// Exact decoded original ToolRequest value retained by Kernel.
     pub tool: serde_json::Value,
     /// Current Kernel-issued daemon claim capability.
@@ -1149,6 +1152,24 @@ pub fn parse_observe_claimed_pair(
             executable_input
                 .validate_for(&record)
                 .map_err(|error| format!("Kernel retained executable input is invalid: {error}"))?;
+            let source_request_identity: RequestIdentity = serde_json::from_value(
+                executable_input
+                    .application_binding
+                    .source_request_identity
+                    .clone(),
+            )
+            .map_err(|error| {
+                format!("Kernel original request identity does not decode: {error}")
+            })?;
+            source_request_identity
+                .validate()
+                .map_err(|error| format!("Kernel original request identity is invalid: {error}"))?;
+            if serde_json::to_value(&source_request_identity).map_err(|error| {
+                format!("Kernel original request identity cannot encode: {error}")
+            })? != executable_input.application_binding.source_request_identity
+            {
+                return Err("Kernel original RequestIdentity differs from the retained ORS source".to_owned());
+            }
             if record.operation_id.as_str() != attempt.operation_id
                 || record.request_digest != envelope.envelope_sha256
                 || record.payload_digest != envelope.identity.payload_sha256
@@ -1160,9 +1181,13 @@ pub fn parse_observe_claimed_pair(
                 || record.attempt.as_ref() != Some(&durable_attempt)
                 || durable_attempt.attempt_id.as_str() != attempt.attempt_id
                 || durable_attempt.generation != attempt.fencing_generation
-                || durable_attempt.input_commitment_sha256 != executable_input.commitment_sha256
+                || durable_attempt.input_commitment_sha256.as_deref()
+                    != Some(executable_input.commitment_sha256.as_str())
                 || executable_input.payload_sha256 != envelope.identity.payload_sha256
-                || executable_input.application_binding.state_fence != envelope.state_fence
+                || !host_request_fence_matches_semantic(
+                    &envelope.state_fence,
+                    &executable_input.application_binding.state_fence,
+                )
                 || durable_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
                 || Some(attempt.session_id.as_str()) != envelope.identity.session_id.as_deref()
                 || attempt.authority_epoch != envelope.state_fence.authority_epoch
@@ -1183,6 +1208,36 @@ pub fn parse_observe_claimed_pair(
                         .to_owned(),
                 );
             }
+            if source_request_identity.request.metadata.request_id != envelope.identity.request_id
+                || source_request_identity.idempotency_key != envelope.identity.idempotency_key
+                || source_request_identity.cancellation_id != envelope.identity.cancellation_id
+                || source_request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+                || source_request_identity.request.state_fence
+                    != executable_input.application_binding.state_fence
+                || source_request_identity.request.metadata.state_fence
+                    != executable_input.application_binding.state_fence
+                || source_request_identity
+                    .request
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .map(eliot_contracts::SessionId::as_str)
+                    != envelope.identity.session_id.as_deref()
+                || source_request_identity
+                    .request
+                    .metadata
+                    .task_id
+                    .as_ref()
+                    .map(eliot_contracts::TaskId::as_str)
+                    != envelope.identity.task_id.as_deref()
+                || source_request_identity.request.metadata.work_scope_id.as_deref()
+                    != envelope.identity.work_scope_id.as_deref()
+            {
+                return Err(
+                    "Kernel original RequestIdentity differs from the admitted Host request"
+                        .to_owned(),
+                );
+            }
             let tool_bytes = canonical_json_bytes(&tool)
                 .map_err(|error| format!("original observe tool cannot canonicalize: {error}"))?;
             let tool_length = u64::try_from(tool_bytes.len())
@@ -1197,6 +1252,7 @@ pub fn parse_observe_claimed_pair(
             }
             Ok(Some(ObserveClaimedPair {
                 envelope,
+                source_request_identity,
                 tool,
                 attempt,
                 record,
@@ -1207,6 +1263,17 @@ pub fn parse_observe_claimed_pair(
             "Kernel semantic_observe_claim pair is neither an admitted pair nor null".to_owned(),
         ),
     }
+}
+
+fn host_request_fence_matches_semantic(
+    transport: &eliot_contracts::StateFence,
+    semantic: &eliot_contracts::StateFence,
+) -> bool {
+    transport.authority_epoch.is_same_authority(&semantic.authority_epoch)
+        && transport.resource_generation == semantic.resource_generation
+        && transport.task_revision.is_none()
+        && transport.policy_revision.is_none()
+        && transport.integration_revision.is_none()
 }
 
 /// Parses one unwrapped `semantic_observe_result` answer value into the
