@@ -817,7 +817,7 @@ impl UserAutomationHostExecutionRequest {
                 }
             }
             UserAutomationHostExecutionOperation::PublishOccurrenceWake { request } => {
-                request.validate_wake_publication(&self.channel)?;
+                self.validate_wake_publication(request)?;
             }
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 request
