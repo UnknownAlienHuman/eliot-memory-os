@@ -6107,8 +6107,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut conflict_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
-        &tracing::Span::none(),
-    ),
+            &tracing::Span::none(),
+        ),
         Err(SupervisionProgressRenewalError::Heartbeat(
             DaemonSupervisionHeartbeatError::IdentityConflict { .. }
         ))
@@ -6132,8 +6132,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut degraded_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
-        &tracing::Span::none(),
-    );
+            &tracing::Span::none(),
+        );
         if attempt < 2 {
             let blocked_decision = blocked.expect("degraded progress is reported, not renewed");
             assert_eq!(
@@ -6169,8 +6169,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut degraded_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
-        &tracing::Span::none(),
-    ),
+            &tracing::Span::none(),
+        ),
         Err(SupervisionProgressRenewalError::Heartbeat(
             DaemonSupervisionHeartbeatError::SupervisionLeaseExpired
         ))

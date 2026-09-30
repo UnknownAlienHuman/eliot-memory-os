@@ -193,9 +193,18 @@ fn observe_supervision_lease_expiry() {
 #[cfg(windows)]
 fn daemon_progress_operation_context(request: &DaemonSupervisionRenewalRequest) -> tracing::Span {
     let observation = request.validate().is_ok().then_some(&request.observation);
-    let generation = observation.map(|value| value.generation_binding.process_generation.value().to_string());
-    let epoch = observation.and_then(|value| StateFence::canonical_epoch_digest(&value.kernel_epoch).ok());
-    let fence = observation.and_then(|value| StateFence::canonical_epoch_digest(&value.state_fence.authority_epoch).ok());
+    let generation = observation.map(|value| {
+        value
+            .generation_binding
+            .process_generation
+            .value()
+            .to_string()
+    });
+    let epoch =
+        observation.and_then(|value| StateFence::canonical_epoch_digest(&value.kernel_epoch).ok());
+    let fence = observation.and_then(|value| {
+        StateFence::canonical_epoch_digest(&value.state_fence.authority_epoch).ok()
+    });
     let context = kernel_diagnostics::operation_context(
         observation.map(|value| value.observation_id.as_str()),
         generation.as_deref(),
@@ -3889,7 +3898,12 @@ impl KernelComposition {
             // failure replaces the refusal with the fenced authority error
             // and is retried on the next tick through the staged-ticket
             // resume.
-            authority.expire_past_due_lease_in_context(lease_id, &contour.state_fence, now_ms, &context)?;
+            authority.expire_past_due_lease_in_context(
+                lease_id,
+                &contour.state_fence,
+                now_ms,
+                &context,
+            )?;
             return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
         }
         authority.verify_active_snapshot(&current_snapshot, lease_id, now_ms)?;

@@ -52,11 +52,7 @@ use crate::daemon_supervision::DaemonSupervisionProgressState;
 /// operation. Identity references are screened and recorded on the span,
 /// never repeated as event fields (I15.4).
 #[cfg(windows)]
-fn observe_supervision_lease(
-    context: &tracing::Span,
-    event: &'static str,
-    outcome: &'static str,
-) {
+fn observe_supervision_lease(context: &tracing::Span, event: &'static str, outcome: &'static str) {
     use crate::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
@@ -74,13 +70,12 @@ fn observe_supervision_lease(
 /// lineage-aware epoch digest and that fence's original resource generation;
 /// it is a scope projection, not the full fence or nonce identity.
 #[cfg(windows)]
-fn supervision_lease_operation_context(
-    ticket: &SupervisionLeaseCommitTicket,
-) -> tracing::Span {
+fn supervision_lease_operation_context(ticket: &SupervisionLeaseCommitTicket) -> tracing::Span {
     use crate::kernel_diagnostics::operation_context;
 
     let binding = &ticket.binding;
-    let epoch_digest = StateFence::canonical_epoch_digest(&binding.state_fence.authority_epoch).ok();
+    let epoch_digest =
+        StateFence::canonical_epoch_digest(&binding.state_fence.authority_epoch).ok();
     let generation = binding
         .generation_binding
         .process_generation
@@ -691,11 +686,7 @@ impl KernelSupervisionLeaseAuthority {
         // is read back inside, not recommitted; exactly one terminal is
         // emitted per failed commit and no lease material is logged.
         record_supervision_ticket_context(context, ticket);
-        observe_supervision_lease(
-            context,
-            "kernel.supervision.commit_requested",
-            "attempt",
-        );
+        observe_supervision_lease(context, "kernel.supervision.commit_requested", "attempt");
         match self.commit_active_inner(ticket) {
             Ok(snapshot) => {
                 observe_supervision_lease(
@@ -706,11 +697,7 @@ impl KernelSupervisionLeaseAuthority {
                 Ok(snapshot)
             }
             Err(error) => {
-                observe_supervision_lease(
-                    context,
-                    "kernel.supervision.commit_failed",
-                    "rejected",
-                );
+                observe_supervision_lease(context, "kernel.supervision.commit_failed", "rejected");
                 crate::kernel_diagnostics::observe_terminal_error_in_context(
                     supervision_authority_terminal_code(&error),
                     context,
@@ -773,11 +760,7 @@ impl KernelSupervisionLeaseAuthority {
         // boundary. A terminal disposition stays terminal; exactly one
         // terminal diagnostic is emitted per failed commit.
         record_supervision_ticket_context(context, ticket);
-        observe_supervision_lease(
-            context,
-            "kernel.supervision.terminal_requested",
-            "attempt",
-        );
+        observe_supervision_lease(context, "kernel.supervision.terminal_requested", "attempt");
         match self.commit_terminal_inner(ticket) {
             Ok(snapshot) => {
                 observe_supervision_lease(
@@ -988,11 +971,7 @@ impl KernelSupervisionLeaseAuthority {
             owned_context = supervision_lease_operation_context(&stage.ticket);
             &owned_context
         };
-        observe_supervision_lease(
-            context,
-            "kernel.supervision.expire_requested",
-            "attempt",
-        );
+        observe_supervision_lease(context, "kernel.supervision.expire_requested", "attempt");
         match self.commit_terminal_in_context(&stage.ticket, context) {
             Ok(snapshot) => {
                 if snapshot.record.state != LeaseState::Expired
@@ -1022,11 +1001,7 @@ impl KernelSupervisionLeaseAuthority {
             Err(error) => {
                 // `commit_terminal_in_context` owns the one terminal. Expiry
                 // only observes this propagated failure at its own level.
-                observe_supervision_lease(
-                    context,
-                    "kernel.supervision.expire_failed",
-                    "rejected",
-                );
+                observe_supervision_lease(context, "kernel.supervision.expire_failed", "rejected");
                 Err(error)
             }
         }

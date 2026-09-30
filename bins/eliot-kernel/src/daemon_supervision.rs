@@ -751,7 +751,11 @@ impl DaemonSupervisionProgressState {
     pub(crate) fn note_reconciliation_pending_in_context(&mut self, context: &tracing::Span) {
         // F-LOG-KERNEL-3 (#901): unknown-outcome observation; the outcome
         // stays unknown until the owner reconciles it exactly.
-        observe_supervision(context, "kernel.supervision.reconciliation_required", "unknown");
+        observe_supervision(
+            context,
+            "kernel.supervision.reconciliation_required",
+            "unknown",
+        );
         self.reconciliation_pending = true;
     }
 }
