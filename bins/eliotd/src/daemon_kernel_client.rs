@@ -1993,8 +1993,8 @@ impl DaemonKernelClient {
                 "original request identity does not bind the current process operation and Kernel fence".to_owned(),
             ));
         }
-        if let eliot_kernel_service::ProcessExecutionRequest::Start(admission) = &request {
-            if admission.recipient_module_id() != current.service.as_str()
+        if let eliot_kernel_service::ProcessExecutionRequest::Start(admission) = &request
+            && (admission.recipient_module_id() != current.service.as_str()
                 || admission.deadline_unix_ms() != identity.deadline_unix_ms
                 || admission.intent().operation_id().as_str() != operation_id.as_str()
                 || !admission
@@ -2002,12 +2002,11 @@ impl DaemonKernelClient {
                     .authority_epoch()
                     .is_same_authority(&binding.state_fence.authority_epoch)
                 || admission.state_fence().generation().get()
-                    != binding.state_fence.resource_generation.value()
-            {
-                return Err(KernelClientError::Contract(
-                    "original process admission differs from its request identity".to_owned(),
-                ));
-            }
+                    != binding.state_fence.resource_generation.value())
+        {
+            return Err(KernelClientError::Contract(
+                "original process admission differs from its request identity".to_owned(),
+            ));
         }
 
         let value = self
