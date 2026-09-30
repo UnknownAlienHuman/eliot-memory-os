@@ -179,8 +179,11 @@ impl WindowsBlobPlatform {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| BlobError::Provider("system clock is before Unix epoch".to_owned()))?
             .as_nanos();
+        let now = u64::try_from(now).map_err(|_| {
+            BlobError::Provider("physical Blob provider generation could not be established".to_owned())
+        })?;
         let sequence = PHYSICAL_PROVIDER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let backend_generation = (now as u64)
+        let backend_generation = now
             ^ (u64::from(owner.process_id()) << 32)
             ^ sequence;
         if backend_generation == 0 {
@@ -234,6 +237,31 @@ impl WindowsBlobPlatform {
 
     fn probe_permission_proof(&self) -> Result<(), BlobError> {
         self.files.prove_root_permissions().map_err(map_file_error)
+    }
+
+    fn previous_cas_result(
+        &self,
+        request: &BlobCasRequest,
+        operation_id: &str,
+        commitment: &str,
+    ) -> Result<Option<BlobCasProviderResult>, BlobError> {
+        let previous = self
+            .cas_statuses
+            .lock()
+            .map_err(|_| BlobError::Provider("Blob CAS status lock poisoned".to_owned()))?
+            .get(operation_id)
+            .cloned();
+        let Some((previous_commitment, previous_result)) = previous else {
+            return Ok(None);
+        };
+        if previous_commitment.as_str() != commitment {
+            return Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::IdentityConflict {
+                    request: Box::new(request.clone()),
+                }),
+            });
+        }
+        Ok(Some(previous_result))
     }
 }
 
@@ -326,20 +354,9 @@ impl BlobPlatformPort for WindowsBlobPlatform {
         }
         let operation_id = request.context.operation.operation_id.as_str().to_owned();
         let commitment = request.request_commitment_sha256()?;
-        if let Some((previous_commitment, previous_result)) = self
-            .cas_statuses
-            .lock()
-            .map_err(|_| BlobError::Provider("Blob CAS status lock poisoned".to_owned()))?
-            .get(&operation_id)
-            .cloned()
+        if let Some(previous_result) =
+            self.previous_cas_result(request, &operation_id, &commitment)?
         {
-            if previous_commitment != commitment {
-                return Err(BlobError::CasFailure {
-                    failure: Box::new(BlobCasFailure::IdentityConflict {
-                        request: Box::new(request.clone()),
-                    }),
-                });
-            }
             return Ok(previous_result);
         }
         let observed_bytes = match self
