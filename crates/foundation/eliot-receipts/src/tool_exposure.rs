@@ -14,6 +14,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::{canonical_json_bytes, sha256_hex};
+
 /// Validation failure for tool intent and exposure records.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ToolExposureError {
@@ -1590,6 +1592,33 @@ impl ToolExposureHistoryEntry {
         self.terminal_task_or_product_outcome_ref = Some(outcome_ref);
         self.validate()?;
         Ok(self)
+    }
+
+    /// Derives the content-bound persistence key for this recorded revision.
+    ///
+    /// The key is the existing foundation hash over the canonical bytes of
+    /// the recorded entry — every supplied-or-unresolved stage, identity,
+    /// and source reference as recorded, compared with this operation. The
+    /// owning persistence seam keys its write on this value through the
+    /// existing observation/receipt/outbox path: an identical redelivery
+    /// (lost acknowledgement, replayed publication) yields the identical key
+    /// and reconciles the original event instead of executing again, while
+    /// any recorded difference yields a different key instead of a false
+    /// dedupe. Like the receipt envelope's idempotency identity, this is a
+    /// dedupe locator only: it authorizes no replay and mutates no store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry is inconsistent or its recorded
+    /// content cannot be canonically serialized for keying.
+    pub fn persistence_idempotency_key(&self) -> Result<String, ToolExposureError> {
+        self.validate()?;
+        let bytes =
+            canonical_json_bytes(self).map_err(|_| ToolExposureError::InvalidField {
+                field: "history.revision.idempotency_key",
+                reason: "recorded exposure history cannot be canonically keyed for persistence",
+            })?;
+        Ok(sha256_hex(&bytes))
     }
 }
 

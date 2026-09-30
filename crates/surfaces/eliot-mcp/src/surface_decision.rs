@@ -1339,6 +1339,54 @@ pub struct AdvertisedExposureHistory {
     pub lineage: ExposureRevisionLineage,
 }
 
+impl AdvertisedExposureHistory {
+    /// Binds one owner-populated entry to its durable revision lineage.
+    ///
+    /// The entry validates supplied-or-explicitly-unresolved and the lineage
+    /// validates shape; a carried idempotency key must equal the key derived
+    /// from this revision's recorded content
+    /// ([`ToolExposureHistoryEntry::persistence_idempotency_key`]), compared
+    /// with this operation rather than trusted from the caller. An all-`None`
+    /// lineage still binds: no durable identity is bound yet, a visible
+    /// pending obligation on the owning persistence seam, never a silent gap.
+    /// This seam mints no identities and opens no second store.
+    ///
+    /// STITCH(bridge/host projection + eliot.observe): no production caller
+    /// binds this pair on main yet. The owning caller - the bridge/host
+    /// projection that renders the advertised surface, joined with the
+    /// execution/transport/retry/verifier owners for their stages - binds the
+    /// entry and persists the returned revision through the existing
+    /// observation/receipt path (`eliot.observe` capture via
+    /// ReceiptEnvelope/CausalBinding), keyed by the lineage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry is inconsistent, the lineage is
+    /// malformed or links without its own receipt identity, or a carried
+    /// persistence key diverges from the recorded revision content.
+    pub fn bind(
+        entry: ToolExposureHistoryEntry,
+        lineage: ExposureRevisionLineage,
+    ) -> Result<Self, SurfaceDecisionError> {
+        entry
+            .validate()
+            .map_err(|error| map_exposure_error(&error))?;
+        validate_revision_lineage(&lineage)?;
+        if let Some(key) = &lineage.idempotency_key {
+            let derived = entry
+                .persistence_idempotency_key()
+                .map_err(|error| map_exposure_error(&error))?;
+            if key != &derived {
+                return Err(SurfaceDecisionError::InvalidField {
+                    field: "history.revision.idempotency_key",
+                    reason: "carried persistence key diverges from the recorded revision content",
+                });
+            }
+        }
+        Ok(Self { entry, lineage })
+    }
+}
+
 /// Validates the revision lineage shape without minting identities.
 ///
 /// # Errors
