@@ -382,20 +382,7 @@ impl<C> CanonicalUserAutomationStore<C> {
                 field: "automation.revision",
                 reason: "requested immutable revision is not retained",
             })?;
-        let document =
-            entry
-                .get("revision_json")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "automation.revision_json",
-                    reason: "stored owner revision document is malformed",
-                })?;
-        let revision: UserAutomationRevision = serde_json::from_str(document)
-            .map_err(|error| StoreError::Serialization(error.to_string()))?;
-        revision.validate().map_err(|_| StoreError::InvalidField {
-            field: "automation.revision",
-            reason: "stored owner revision failed domain validation",
-        })?;
+        let revision = retained_owner_revision(entry)?;
         if revision.automation_id != lookup.automation_id
             || revision.revision != lookup.requested_revision
             || revision.owner_principal != lookup.authenticated_principal
@@ -427,6 +414,29 @@ impl<C> CanonicalUserAutomationStore<C> {
     pub(crate) fn client(&self) -> &C {
         &self.client
     }
+}
+
+/// Decodes the immutable owner revision the Store retained on one row.
+///
+/// The stored document is read back as bytes and run through the revision's own
+/// `validate()`, so a row is accepted because the domain says it is well-formed
+/// rather than because it parsed. Nothing here is derived from the request.
+fn retained_owner_revision(entry: &Value) -> Result<UserAutomationRevision, StoreError> {
+    let document =
+        entry
+            .get("revision_json")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision_json",
+                reason: "stored owner revision document is malformed",
+            })?;
+    let revision: UserAutomationRevision = serde_json::from_str(document)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    revision.validate().map_err(|_| StoreError::InvalidField {
+        field: "automation.revision",
+        reason: "stored owner revision failed domain validation",
+    })?;
+    Ok(revision)
 }
 
 /// Decodes the owner-issued schedule normalization envelope the Store retained
