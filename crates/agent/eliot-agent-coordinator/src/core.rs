@@ -434,6 +434,7 @@ fn class_report(
 ) -> WorkClassSelectionReport {
     WorkClassSelectionReport {
         work_class,
+        capacity_partition: work_class.capacity_class(),
         ready_items: view.ready.len(),
         in_flight_items: view.in_flight.len(),
         in_flight_bytes: view.in_flight_bytes,
@@ -654,6 +655,10 @@ fn item_block(
 
 /// Smooth weighted round robin over the classes that offered a head.
 ///
+/// The protected control partition is settled first and separately, and this
+/// rotation then runs over the normal classes only. See
+/// [`choose_protected_head`] for why the protected class does not take part.
+///
 /// The lowest virtual time among the participating classes wins, an exact tie
 /// goes to the lower scheduler rank (so equal weights keep the I14.1 class
 /// order), and **only the winner** then advances by
@@ -662,9 +667,16 @@ fn item_block(
 /// minimum unchanged between pulls, so the same class would win every pull.
 ///
 /// Service bound, as implemented and checked: over any complete round of
-/// `W = sum(weight)` pulls, class `i` is selected exactly `weight_i` times. In
-/// a shorter window the observed share deviates from `weight_i / W` by at most
-/// one round, so `weight / W` is the round share and not a per-pull guarantee.
+/// `W = sum(weight)` pulls **among the classes this rotation runs over**, class
+/// `i` is selected exactly `weight_i` times. In a shorter window the observed
+/// share deviates from `weight_i / W` by at most one round, so `weight / W` is
+/// the round share and not a per-pull guarantee.
+///
+/// The sum runs over the eight **normal** classes only. The protected control
+/// class is not a rotation participant (issue #1683 W4), so it contributes no
+/// weight to `W` and receives no round share; it is selected ahead of the
+/// rotation whenever it offers a head. `W` is therefore the sum of the eight
+/// normal weights, and a round is eight-normal-participants wide, not nine.
 ///
 /// Credit bound. A class's credit is its virtual time minus the winner's, so it
 /// is non-negative. For a class served at global time `T`, its virtual time is
@@ -692,7 +704,24 @@ fn choose_fair_head<'a, 'profile>(
 ) -> (Option<&'a AttemptRecord>, [u64; 9], [Option<u64>; 9]) {
     let mut virtual_time = *current;
     let mut credits: [Option<u64>; 9] = [None; 9];
+
+    // Issue #1683 W4: the protected control partition is settled before the
+    // rotation, and it does not participate in it. See `choose_protected_head`.
+    if let Some(attempt) = choose_protected_head(views, &mut credits) {
+        return (Some(attempt), virtual_time, credits);
+    }
+
+    // The normal rotation, over the eight normal classes only. The protected
+    // class is excluded by the same `is_protected_partition` predicate that
+    // `choose_protected_head` used to admit it, so the partition split is
+    // derived from one function and the two filters cannot drift apart. The
+    // exclusion is redundant for the winner — a protected head reaching this
+    // point would already have returned above — and is kept so the rotation is
+    // correct as a standalone statement of "over the normal classes", which is
+    // what the round-share bound below is stated for.
+    let is_normal = |index: &usize| !WorkClass::ALL[*index].is_protected_partition();
     let winner = (0..WorkClass::ALL.len())
+        .filter(is_normal)
         .filter(|index| views[*index].head.is_some())
         .min_by_key(|index| (virtual_time[*index], *index));
     let Some(winner) = winner else {
@@ -700,13 +729,69 @@ fn choose_fair_head<'a, 'profile>(
     };
     let base = virtual_time[winner];
     for index in 0..WorkClass::ALL.len() {
-        if views[index].head.is_some() {
+        if is_normal(&index) && views[index].head.is_some() {
             credits[index] = Some(virtual_time[index] - base);
         }
     }
     let weight = resolve(WorkClass::ALL[winner]).map_or(1, |profile| u64::from(profile.weight));
     virtual_time[winner] = virtual_time[winner].saturating_add(FAIRNESS_QUANTUM / weight);
     (views[winner].head, virtual_time, credits)
+}
+
+/// The reserved protected-control head for one pull, or `None` when the
+/// protected partition offers nothing this pull (issue #1683 W4).
+///
+/// Why the protected class is settled outside the rotation rather than weighted
+/// inside it. I14.3 states "Normal workload cannot consume it", and I14.8
+/// requires a "strong reviewer/arbitration reserve protected from bulk
+/// workers". A weight is a *share*: a `control` item holding weight `w` out of
+/// a total `W` is served `w / W` of the pulls, so under saturated
+/// `normal_background` / `model_jobs` / `swarm` traffic it would wait for a
+/// fraction of the rotation, and its service bound would be a preference rather
+/// than a reservation. That is the exact defect W4 names: reserved capacity that
+/// bulk workers can delay is not reserved. Selecting the protected head first
+/// makes the reserve a bound — a ready control item is served by the next pull
+/// regardless of what the eight normal classes are doing — while the normal
+/// rotation is unchanged for the eight classes that actually rotate.
+///
+/// What the reserve does **not** do, stated so this is not overclaimed:
+///
+/// - It does not let control exceed its own bound. The protected class is gated
+///   by the same per-class ceilings as every other class inside
+///   [`offer_class_head`], including `max_concurrency`, so a protected class
+///   already at its concurrency ceiling offers no head and this returns `None`.
+///   The reserve therefore cannot be over-consumed; the ceiling refuses first.
+/// - It does not let control borrow normal capacity. The partition is decided by
+///   [`WorkClass::capacity_class`], and the Kernel enforces the same split
+///   physically in `eliot_kernel_core::ControlReserve`. This function adds no
+///   new capacity notion; it only stops the *rotation* from spending control's
+///   service opportunities.
+/// - It does not starve the normal classes. Control takes at most one pull per
+///   ready control item, and its own `max_concurrency` ceiling bounds how many
+///   such items can be in flight, so a permanently-ready control class still
+///   lets the normal rotation run whenever the protected partition is closed.
+///
+/// The credit array is filled for the protected class alone (as `Some(0)`, the
+/// winner's own credit, matching the rotation's convention that the winner's
+/// credit is zero) so a caller publishing per-class credit sees the protected
+/// class accounted for rather than silently absent.
+///
+/// Ordering *within* the protected partition needs no rotation: `control` is
+/// currently its only member, and within the class the order is already
+/// oldest-canonical-enqueue-first via `offer_class_head`. If a second class ever
+/// joins the protected partition, it would need an intra-partition rotation here
+/// and this function would stop being a single lookup; the closed nine-class
+/// `WorkClass::ALL` denominator is what makes the current shape total.
+fn choose_protected_head<'a>(
+    views: &'a [ClassPullView<'a>],
+    credits: &mut [Option<u64>; 9],
+) -> Option<&'a AttemptRecord> {
+    let index = WorkClass::ALL
+        .iter()
+        .position(|work_class| work_class.is_protected_partition())?;
+    let attempt = views[index].head?;
+    credits[index] = Some(0);
+    Some(attempt)
 }
 
 /// Published claim state of every deliverable that currently has a live writer.
@@ -1360,10 +1445,17 @@ impl AgentCoordinator {
     /// [`SchedulingProfile`]: every class then carries equal weight and **no
     /// per-class item, byte, concurrency, deadline or WIP limit is applied** —
     /// the ceilings it publishes are `None`, not unlimited ones. Only the
-    /// canonical enqueue age order inside a class and the cross-class rank
-    /// tie-break on an exact virtual-time tie apply. The call is a read: it
+    /// canonical enqueue age order inside a class and the cross-class scheduler
+    /// rank tie-break on an exact virtual-time tie apply. The call is a read: it
     /// consumes no fairness credit, so two peeks over unchanged state return the
     /// same item and a peek never changes what a later pull selects.
+    ///
+    /// Because no limit applies here, the protected control reservation also has
+    /// no ceiling to be refused by on this path: a ready `control` item is
+    /// returned by this peek whenever one exists, with nothing to bound how many
+    /// may be in flight. That is inherent to the profile-free peek and is the
+    /// reason the reserve is a bound only on the profile-bound
+    /// [`Self::pull_next`].
     ///
     /// The coordinator's global limits are **not** applied here. `max_ready_items`,
     /// `max_admitted_attempts` and `max_active_per_route` are admission-time
@@ -1406,11 +1498,20 @@ impl AgentCoordinator {
     /// Service bounds, each stated for what this code does (see
     /// [`choose_fair_head`] for the derivation):
     ///
-    /// - **round share**: over any complete round of `W = sum(weight)` pulls,
-    ///   class `i` is selected exactly `weight_i` times, so `weight / W` is the
-    ///   share it receives in a round. In a window shorter than a round the
-    ///   observed share deviates from it by at most one round; it is not a
-    ///   per-pull guarantee.
+    /// - **reserved protected partition** (issue #1683 W4): `control` is not a
+    ///   rotation participant. It draws only [`WorkClass::capacity_class`]'s
+    ///   `ProtectedControl` partition, and a ready control item is selected by
+    ///   the next pull regardless of what the eight normal classes are doing, so
+    ///   its service bound is a reservation rather than the `weight / W` share
+    ///   below. `W` in the round-share bound is therefore the sum of the eight
+    ///   **normal** weights. Control's own per-class ceilings still apply and
+    ///   still refuse first; the reserve changes which partition a pull draws
+    ///   from, not whether a ceiling can be exceeded.
+    /// - **round share**: over any complete round of `W = sum(weight)` pulls
+    ///   among the normal classes, class `i` is selected exactly `weight_i`
+    ///   times, so `weight / W` is the share it receives in a round. In a window
+    ///   shorter than a round the observed share deviates from it by at most one
+    ///   round; it is not a per-pull guarantee.
     /// - **returning class**: a class that becomes eligible again keeps the
     ///   virtual time it had, so it is not charged for the pulls it missed. It
     ///   wins again as soon as its frozen time is the lowest among the eligible
