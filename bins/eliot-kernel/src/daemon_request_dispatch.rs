@@ -9088,7 +9088,7 @@ impl KernelComposition {
                     "accepted_pending": false,
                     "stage_receipt": serde_json::Value::Null,
                     "poll_handle": serde_json::Value::Null,
-                    "owner_outcome": staging_owner_outcome(error),
+                    "owner_outcome": Self::staging_owner_outcome(error),
                     "state_fence": state_fence,
                 },
             },
