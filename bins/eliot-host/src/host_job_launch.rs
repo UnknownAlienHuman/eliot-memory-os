@@ -702,6 +702,23 @@ impl HostJobBranches {
                 if evidence.enforced_limits() != Some(resource_limits) {
                     return Err("approved job limits diverged before resume".to_owned());
                 }
+                // Issue #1775 (W5-boot): observe the real process identity
+                // before resume. The suspended child must report a genuine OS
+                // identity — nonzero PID plus nonzero process start time —
+                // alongside the approved image below; a degenerate identity
+                // refuses before resume rather than admitting an unidentified
+                // process into the owned branches. PID alone never authorizes
+                // control: the start identity is what distinguishes this child
+                // from a PID reuse, and both ride the retained handle into
+                // later ownership checks.
+                let observed_identity = evidence.process();
+                if observed_identity.process_id == 0 || observed_identity.start_time_100ns == 0 {
+                    host_launch_observe("host.launch process identity unobservable");
+                    return Err(
+                        "suspended child has no observable process identity before resume"
+                            .to_owned(),
+                    );
+                }
                 let observed = std::fs::canonicalize(&evidence.process().image_path)
                     .map_err(|error| error.to_string())?;
                 if observed != expected {
