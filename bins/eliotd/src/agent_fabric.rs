@@ -1239,7 +1239,9 @@ fn require_durable_owner_revision(
     owner_revision
         .validate()
         .map_err(FabricError::RevisionNotDurable)?;
-    if serde_json::from_str::<serde_json::Value>(&owner_revision.record_json).ok().as_ref()
+    if serde_json::from_str::<serde_json::Value>(&owner_revision.record_json)
+        .ok()
+        .as_ref()
         != Some(record)
     {
         return Err(FabricError::RevisionNotDurable(StoreError::InvalidField {
