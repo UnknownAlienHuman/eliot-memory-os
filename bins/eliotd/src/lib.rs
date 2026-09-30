@@ -1161,7 +1161,7 @@ impl DaemonComposition {
                 readiness.now,
                 readiness.lease.lineage_candidate_ref.as_str(),
                 readiness.lease.workspace_instance_candidate_ref.as_str(),
-                readiness.lease.privacy_class.clone(),
+                readiness.lease.privacy_class,
                 readiness.lease.governing_source_generation,
             )?;
             crate::task_binding_admission::admit_canonical_write_with_activation(
