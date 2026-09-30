@@ -917,6 +917,7 @@ struct DispositionedTable {
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
 /// time of writing: 74 distinct declared tables, of which 46 back a dispositioned
 /// row family and 28 are explicit source-bound exclusions.
+=======
 /// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
 ///
@@ -1179,6 +1180,17 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             super::META,
             RowDisposition::NonrestorableHistorical,
             "store-owned counters and schema keys are re-established by the receiving owner; a restored counter would let a fresh file claim an ordering head it never had",
+        ),
+        // #1872: the generation a capability route scope started at. It is
+        // installation-bound generation authority, not history: it is what makes
+        // "no committed cutover for this scope" name one generation instead of
+        // any. A restored row would present the destination with the source
+        // installation's initial route owner, so recovery must not resurrect it
+        // (I14.14 / ARCH-RES-03).
+        excluded(
+            super::CANONICAL_STORE_ROUTE_OWNERSHIP,
+            RowDisposition::NonrestorableHistorical,
+            "the established owner of a capability route scope is installation-bound generation authority naming the generation that scope started at; recovery must not resurrect another installation's initial route owner",
         ),
         // Not a row family: the durable operation index is re-derived by the
         // canonical ordering owner from the operational history it admits, so a

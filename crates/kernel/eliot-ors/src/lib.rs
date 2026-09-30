@@ -25,6 +25,7 @@ mod snapshot_model;
 mod status;
 mod status_projection;
 mod store;
+mod store_route_ownership;
 mod user_broker;
 mod versioned_artifact;
 
@@ -137,6 +138,7 @@ pub use store::{
     OrsCoordinator, OrsStoreIdentity, RedbRecoveryStore, RuntimeLeaseCensusRows,
     ScanDisclosureRecordOwner,
 };
+pub use store_route_ownership::CanonicalStoreRouteOwnership;
 pub use user_broker::{
     UserBrokerHeartbeat, UserBrokerRegistrationSnapshot, UserBrokerResourceSelectionSnapshot,
 };
