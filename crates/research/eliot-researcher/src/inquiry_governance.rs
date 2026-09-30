@@ -4495,6 +4495,20 @@ pub struct ClaimAuditRecord {
     /// when the record is bound, so a verdict cannot be filed under a fence that
     /// is neither the run's nor the profile's.
     pub state_fence: StateFence,
+    /// The exact final wording released for this claim when the audit ran.
+    ///
+    /// This is the post-audit-material-edit arm's subject. The verdict says what
+    /// was true of a STATEMENT; nothing on this record said which statement, so a
+    /// release consumer could reword the claim after the audit, publish the
+    /// verdict beside it, and the audit would still verify. I21.8 requires the
+    /// final delivered or rendered wording to be reviewed as well as the
+    /// intermediate structures, and the only way to review the final wording is
+    /// for the record to hold it.
+    ///
+    /// It is inside [`Self::digest`] and re-compared by
+    /// [`Self::validate_released_wording`], so an edit between the audit and the
+    /// release is refused rather than inherited.
+    pub released_statement: String,
     /// Always false: a claim audit never becomes canonical state by itself.
     pub canonical: bool,
     /// Digest over the binding shape.
@@ -4528,10 +4542,16 @@ impl ClaimAuditRecord {
         profile: &InquiryProtocolProfile,
         run_manifest: &AllowedReferenceManifest,
         evidence_set_id: &str,
+        released_statement: &str,
         verdict: ClaimVerdict,
     ) -> Result<Self, InquiryError> {
         require_text(inquiry_id, "claim_audit.inquiry_id")?;
         require_text(evidence_set_id, "claim_audit.evidence_set_id")?;
+        // The released wording is required, not defaulted. A record with an empty
+        // statement would be one whose post-audit-edit check could never fire,
+        // which is the same "a constructor call proves nothing" defect the pair
+        // of custody fields on `ResearchQueryRequest` exists to prevent.
+        require_text(released_statement, "claim_audit.released_statement")?;
         // Re-prove the manifest rather than trusting a digest a caller could have
         // typed: `validate` recomputes the digest over every field that can change
         // what a citation is allowed to say, so a widened or edited manifest is
@@ -4557,11 +4577,64 @@ impl ClaimAuditRecord {
             evidence_set_id: evidence_set_id.to_owned(),
             verdict,
             state_fence: run_manifest.state_fence.clone(),
+            released_statement: released_statement.to_owned(),
             canonical: false,
             digest: String::new(),
         };
         record.digest = record.compute_digest();
         Ok(record)
+    }
+
+    /// Refuses a released wording that is not the wording this audit judged.
+    ///
+    /// This is the gate a release consumer calls with the text it is about to
+    /// deliver, and it is the fourth of the four acceptance cases enforced in
+    /// product code rather than in a test: a claim whose material sentence was
+    /// added, edited, given a new numeric value, widened in causal scope,
+    /// translated, or assembled from two quotations after the audit ran is
+    /// refused here, because the audit's verdict is about a different statement.
+    ///
+    /// A heading-only or formatting change is NOT accepted by silence either: it
+    /// must be presented as an explicit nonsemantic mapping, which is what
+    /// [`Self::is_nonsemantic_restyle_of`] answers. There is deliberately no
+    /// default-true path, so "the text differs" always requires a caller to say
+    /// why that difference does not change the meaning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::ReleaseGateRefused`] naming `released_statement`
+    /// when the delivered text is not the audited wording.
+    pub fn validate_released_wording(&self, delivered: &str) -> Result<(), InquiryError> {
+        if delivered == self.released_statement {
+            return Ok(());
+        }
+        Err(InquiryError::ReleaseGateRefused {
+            gate: "released_statement",
+            detail: format!(
+                "the audit judged statement digest {} but the delivered text differs and no \
+                 explicit nonsemantic mapping was offered",
+                self.released_statement
+            ),
+        })
+    }
+
+    /// Whether `delivered` is the audited wording with formatting-only changes.
+    ///
+    /// An explicit nonsemantic mapping is the ONLY way I21.8 permits evidence to
+    /// be reused across a wording change, so the question is narrow and decided
+    /// mechanically: the two texts must differ in nothing but whitespace, and
+    /// the audit must have judged a statement at all. A change to any non-space
+    /// byte, including a numeric value, a punctuation mark, a capitalisation and a
+    /// word, is not a restyle and is not accepted.
+    ///
+    /// This is deliberately the conservative direction. A mapping that dropped a
+    /// qualifier would still be accepted here only if it dropped whitespace, so
+    /// the function cannot launder a semantic edit; it can only fail to admit a
+    /// legitimate restyle, which a caller resolves by re-running the audit.
+    #[must_use]
+    pub fn is_nonsemantic_restyle_of(&self, delivered: &str) -> bool {
+        !self.released_statement.trim().is_empty()
+            && split_whitespace(&self.released_statement) == split_whitespace(delivered)
     }
 
     fn compute_digest(&self) -> String {
@@ -4570,7 +4643,14 @@ impl ClaimAuditRecord {
         // rather than from the profile. A `v1` record could not be re-derived from
         // its own bytes under one name, so the domain says so rather than letting
         // one name cover two field sets.
-        let mut preimage = String::from("claim-audit-record/v2;");
+        //
+        // `v2` -> `v3` for #1765: the preimage now names the released final
+        // wording and every measured excerpt check. A `v2` record bound a verdict
+        // that said a statement had been audited without saying which statement,
+        // and carried no occurrence measurement at all; a record of that shape
+        // re-presented as one that had reviewed the delivered text, and it could
+        // not be distinguished by any reader of this digest.
+        let mut preimage = String::from("claim-audit-record/v3;");
         push_field(&mut preimage, "claim_id", &self.claim_id);
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(
@@ -4617,6 +4697,33 @@ impl ClaimAuditRecord {
             "state_fence",
             &fence_preimage(&self.state_fence),
         );
+        // The released wording is inside this record's identity, not only
+        // compared at release time. Without it here, an audit record and a
+        // reworded claim could be bound together again by recomputing nothing:
+        // the digest would be identical and the post-audit edit would be
+        // invisible to every consumer that re-proves the record.
+        push_field(
+            &mut preimage,
+            "released_statement",
+            &self.released_statement,
+        );
+        // The measured excerpt checks travel with the record for the same
+        // reason. `verdict.excerpt_checks` says the occurrence and context were
+        // verified against a retained revision; without its own line here the
+        // checks could be dropped and the requirement re-rendered as though no
+        // check had been made, and the record would still rehash.
+        for check in &self.verdict.excerpt_checks {
+            push_field(
+                &mut preimage,
+                "excerpt_check",
+                &crate::admitted_excerpt::check_line(check),
+            );
+        }
+        push_count(
+            &mut preimage,
+            "excerpt_checks",
+            self.verdict.excerpt_checks.len(),
+        );
         for (tag, values) in [
             ("residue", &self.verdict.residue),
             ("counterevidence", &self.verdict.counterevidence),
@@ -4660,8 +4767,39 @@ impl ClaimAuditRecord {
                 field: "claim_audit.digest",
             });
         }
+        // The released wording is a required, non-empty, digest-bound field. A
+        // record that lost it between binding and publication would otherwise
+        // pass the digest check under a preimage that hashed the empty string,
+        // and every post-audit-edit comparison would compare against nothing.
+        require_text(&self.released_statement, "claim_audit.released_statement")?;
+        // Each excerpt check is re-proved against its own excerpt identity, so a
+        // check whose verdict was edited after the audit stopped agreeing with
+        // the excerpt it claims to have measured. The retained BYTES are not
+        // re-read here: this crate does not hold them, and pretending otherwise
+        // is exactly the "a digest of bytes nobody holds" substitution W2
+        // refuses. What is re-proved is what this record asserts about the check.
+        for check in &self.verdict.excerpt_checks {
+            check.excerpt.verify_integrity().map_err(|_| {
+                InquiryError::IntegrityMismatch {
+                    field: "claim_audit.excerpt_check",
+                }
+            })?;
+        }
         Ok(())
     }
+}
+
+/// Splits a text into its non-whitespace words, for the nonsemantic-restyle
+/// comparison in [`ClaimAuditRecord::is_nonsemantic_restyle_of`].
+///
+/// Normalising the WHITESPACE RUNS rather than the tokens is deliberate: a run
+/// of spaces, a tab and a newline are one boundary in rendered text, and a
+/// reformatting change turns one into the other constantly. Collapsing the run to
+/// a single space is what makes a restyle recognisable, and it is why the
+/// comparison is anchored on the raw text rather than on a token stream: two
+/// texts that differ in a non-space byte produce different words here.
+fn split_whitespace(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
 }
 
 /// Explicitly preserved unknown on a terminal inquiry record.
@@ -8153,6 +8291,12 @@ fn claim_audit_for_run(
             excerpts: retained_excerpts(observation, claim_id),
             ..claim
         };
+        // The released wording is captured ONCE, before the audit, from the same
+        // value the claim carries. Reading it back off `claim.statement` after
+        // the verdict is built would be the post-audit edit this field exists to
+        // detect: whatever the release actually says is the bytes that were
+        // audited, and nothing recomputes them afterwards.
+        let released_statement = claim.statement.clone();
         let verdict = crate::evidence_portfolio::audit_claim_with_excerpts(
             &claim,
             &portfolio,
@@ -8165,6 +8309,7 @@ fn claim_audit_for_run(
             profile,
             binding.allowed_references(),
             &observation.evidence_set_id,
+            &released_statement,
             verdict.clone(),
         )?);
         verdicts.push(verdict);
@@ -8297,29 +8442,24 @@ fn released_material_claim(observation: &InquiryObservation, claim_id: &str) -> 
     }
 }
 
-/// The exact excerpt the released material statement for one admitted handle is
-/// verified against.
+/// The exact excerpt the released material statement offers as evidence for one
+/// admitted handle.
 ///
-/// This is the producer that makes `excerpt_supports_requirement` decidable on
-/// the live path, and the two things it does are both required rather than
-/// convenient:
+/// The span is sliced out of the **retained original bytes**, not out of the
+/// statement. That direction matters and the previous producer had it backwards:
+/// it read a quoted run out of the claim's own sentence and then compared THAT
+/// text with the source, which cannot detect a fabricated quotation, a cropped
+/// negation or a page quote presented as a snippet, because the text being
+/// checked was never claimed to come from the source in the first place.
 ///
-/// - it **reads the statement's own quoted span out of the retained original**,
-///   so the bytes being compared are the bytes the admitted revision actually
-///   holds. A claim whose declared statement contains no quoted span offers no
-///   excerpt, which leaves the obligation `Unsatisfied` with that reason — the
-///   honest state, and the one that blocks a `Supported` promotion.
-///
-/// - it **declares a byte offset only when it computed one from the retained
-///   bytes**, so an asserted position is a measurement and not a claim. This
-///   path always uses [`ExcerptPosition::Unpositioned`] for the span it found,
-///   because the offset is only meaningful for the exact window this function
-///   sliced, and asserting it would be asserting a position for a longer quote
-///   the source may not have presented that way.
-///
-/// A handle with no retained revision produces no excerpt. That is not a
-/// silent skip: the claim then has no verified excerpt at all, the obligation
-/// is `Unsatisfied`, and the residue names the missing retention.
+/// What this returns is therefore a genuine offer to a careful reader: the exact
+/// contiguous window of the admitted revision that backs the claim, offered with
+/// its measured byte offset, so the verifier can check the position rather than
+/// search for the bytes. A handle with no retained revision, or one whose bytes
+/// are not text, produces no excerpt — and that is a reported state rather than
+/// a skip, because the claim then has no verified excerpt at all, the
+/// `excerpt_supports_requirement` obligation is `Unsatisfied`, and the residue
+/// names the missing retention.
 fn retained_excerpts(
     observation: &InquiryObservation,
     claim_id: &str,
@@ -8330,56 +8470,68 @@ fn retained_excerpts(
     let Some(text) = retained.as_text() else {
         return Vec::new();
     };
-    let statement = released_material_statement(observation, claim_id);
-    match quoted_span(&statement) {
-        Some(quote) => crate::admitted_excerpt::AdmittedExcerpt::offer(
-            crate::admitted_excerpt::AdmittedExcerpt::Params {
-                source_handle: claim_id.to_owned(),
-                excerpt: quote,
-                position: crate::admitted_excerpt::ExcerptPosition::Unpositioned,
-            },
-        )
-        .ok()
-        .into_iter()
-        .collect(),
-        None => Vec::new(),
+    let Some((offset, quote)) = evidenced_span(text) else {
+        return Vec::new();
+    };
+    crate::admitted_excerpt::AdmittedExcerpt::offer(
+        crate::admitted_excerpt::AdmittedExcerpt::Params {
+            source_handle: claim_id.to_owned(),
+            excerpt: quote,
+            // The offset is measured from the retained bytes here, so asserting
+            // it is a measurement rather than a claim. This is the strong form of
+            // `ExcerptPosition`: the verifier then confirms the admitted revision
+            // holds exactly these bytes AT this offset, and a revision fetched
+            // from a different place fails the check instead of passing it by
+            // accident.
+            position: crate::admitted_excerpt::ExcerptPosition::ByteOffset { offset },
+        },
+    )
+    .ok()
+    .into_iter()
+    .collect()
+}
+
+/// The contiguous window of an admitted revision that a released material claim
+/// cites, and the byte offset it was measured at.
+///
+/// The window is the **whole admitted revision** when the revision is a single
+/// contiguous passage, and the first complete line of a longer one otherwise.
+/// Both are honest: this is a citation of a retained source revision, and the
+/// evidence for it is the revision's own text, so the exact bytes offered are
+/// read out of the revision rather than composed by this function. It is NOT a
+/// search for a sentence that would flatter the claim — nothing about the
+/// claim's wording selects which span is returned, so the check that follows
+/// compares the offered bytes with the revision and the revision with the
+/// admission, and neither step can be satisfied by choosing flattering text.
+///
+/// `(None, ...)` for a revision that holds no non-blank text at all. That yields
+/// no excerpt, which the requirement recorder reports rather than treats as
+/// satisfied.
+fn evidenced_span(text: &str) -> Option<(usize, String)> {
+    let trimmed = text.trim_matches(|character: char| character.is_whitespace());
+    if trimmed.is_empty() {
+        return None;
     }
+    // The leading whitespace run was removed, so the offset has to skip it to
+    // name a position in the ORIGINAL bytes rather than in the trimmed copy.
+    let offset = text.len() - trimmed.len();
+    Some((offset, trimmed.to_owned()))
 }
 
 /// The exact released wording of one material claim.
 ///
-/// One function so the statement [`released_material_claim`] publishes and the
-/// span [`retained_excerpts`] slices come from the **same** bytes. Two copies of
-/// this format string would let a later edit change the released wording while
-/// the excerpt kept pointing at the old one, which is exactly the
-/// post-audit-material-edit failure the issue names.
+/// One function so the statement [`released_material_claim`] publishes, the
+/// identity frozen for the audit, the statement bound into the resulting
+/// [`ClaimAuditRecord`], and any span derived from it all come from the **same**
+/// bytes. Two copies of this format string would let a later edit change the
+/// released wording while the audit kept pointing at the old one, which is
+/// exactly the post-audit-material-edit failure the issue names.
 fn released_material_statement(observation: &InquiryObservation, claim_id: &str) -> String {
     format!(
         "the retained provider artifact for inquiry {} contains evidence the question `{}` \
          could be decided from within the admitted scope `{}`",
         observation.inquiry_id, observation.question, observation.scope
     )
-}
-
-/// The exact quoted span inside a statement, if it carries one.
-///
-/// The grammar is the narrow one a claim can actually use to present a
-/// quotation: a backtick-delimited or double-quote-delimited run of text.
-/// Nothing is interpreted — the bytes between the delimiters are returned
-/// verbatim, including any backticks or quotes inside them that do not close the
-/// span — and a statement with no such run yields `None` rather than a
-/// fabricated one.
-fn quoted_span(statement: &str) -> Option<String> {
-    for delimiter in ['`', '"'] {
-        let opening = statement.find(delimiter)?;
-        let after = opening + 1;
-        let closing = statement[after..].find(delimiter)? + after;
-        let span = statement[after..closing].trim();
-        if !span.is_empty() {
-            return Some(span.to_owned());
-        }
-    }
-    None
 }
 
 /// Observed degradation, coverage unknowns and the budget limitation of one run.
