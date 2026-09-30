@@ -26,7 +26,22 @@
 //!
 //! [`stamp_outcome_budget`] stamps a validated proof onto an
 //! [`OutcomeEvidence`], binding the outcome to the same canonical records the
-//! gate just checked.
+//! gate just checked, and refuses to SUBSTITUTE one canonical record for
+//! another: an outcome already bound to a ledger, a delta or an evidence leg
+//! cannot be re-bound to a different one, because the evaluation record must
+//! not name a budget under which the outcome was never observed.
+//!
+//! ## What this module cannot discharge
+//!
+//! The outcome-side fields of [`OutcomeEvidence`] are a caller-fillable
+//! projection declared in the crate root, and nothing in this file can make
+//! them non-forgeable: a caller that writes the seven fields by hand gets a
+//! projection identical to the one this module writes. Closing that needs the
+//! crate root to carry the bound [`BudgetProof`] instead of the names, which
+//! is out of this file's reach. What this module does discharge is that a
+//! projection is only ever written from records that
+//! [`BudgetProof::supports_promotion`] checked, and that such a projection is
+//! never silently replaced by a different one.
 
 use eliot_evaluation_contracts::{
     BudgetEquivalence, BudgetEquivalenceLedger, EvaluationContractError,
@@ -208,16 +223,76 @@ pub fn require_matched_budget_for_promotion(
     }
 }
 
+/// Binds a gate-checked proof onto a promotion-bound outcome.
+///
+/// Every value written here is read out of the records
+/// [`BudgetProof::supports_promotion`] just validated, so the outcome never
+/// carries a name, a Boolean or an evidence leg the gate did not check. The
+/// proof is validated BEFORE any field is written, and the writes are
+/// validate-then-commit: a refused proof leaves the outcome exactly as it was.
+///
+/// # The binding is not substitutable (I12.24:76)
+///
+/// I12.24:76 requires the evaluation record to bind THE canonical
+/// `BudgetEquivalenceLedger` and `ComplexityEconomicsDelta`, so a record that
+/// already carries a binding must not be re-pointed at a different one. An
+/// outcome that already names a ledger, a delta or any of the four evidence
+/// legs therefore admits only the SAME proof:
+///
+/// - no binding recorded yet — the proof's records are written, as before;
+/// - a binding that equals this proof's records — idempotent, `Ok(())`;
+/// - a binding that differs in any way — refused with a typed
+///   [`ImprovementError::BudgetGateViolation`] and nothing written.
+///
+/// Without that refusal a second promotable proof could silently overwrite the
+/// first, and the record would name a budget the outcome was never evaluated
+/// under while still reading as gate-checked. Refusal is per-field, so
+/// dropping recorded live-canary evidence, affected checks or delayed-harm
+/// visibility by re-stamping a weaker proof is refused too.
+///
+/// The comparison is over the ORIGINAL recorded records this function already
+/// holds: the ledger identity is [`BudgetEquivalenceLedger::ledger_id`] and the
+/// delta identity is [`ComplexityEconomicsDelta::delta_ref`], both read from the
+/// bound values. No ledger is recomputed, re-derived or substituted, and the
+/// canonical [`BudgetEquivalenceLedger::validate`] remains the only admissible
+/// check on the ledger.
 pub fn stamp_outcome_budget(
     outcome: &mut OutcomeEvidence,
     proof: &BudgetProof,
 ) -> Result<(), ImprovementError> {
     proof.supports_promotion()?;
-    // Both bindings are read out of the records the gate just validated; the
-    // outcome never carries a name the gate did not check.
-    outcome.budget_ledger_ref = proof.budget_ledger.ledger_id.to_string();
-    outcome.complexity_delta_ref = proof.complexity_delta.delta_ref.clone();
-    outcome.economics_conclusive = proof.complexity_delta.is_conclusive();
+    // Both bindings and both evidence legs are read out of the records the gate
+    // just validated; the outcome never carries a name the gate did not check.
+    let ledger_ref = proof.budget_ledger.ledger_id.to_string();
+    let delta_ref = proof.complexity_delta.delta_ref.clone();
+    let conclusive = proof.complexity_delta.is_conclusive();
+
+    // A binding exists as soon as either canonical record is named; the
+    // remaining fields are then part of that same binding and are compared
+    // with it.
+    let already_bound = !outcome.budget_ledger_ref.trim().is_empty()
+        || !outcome.complexity_delta_ref.trim().is_empty();
+    if already_bound {
+        let same_binding = outcome.budget_ledger_ref == ledger_ref
+            && outcome.complexity_delta_ref == delta_ref
+            && outcome.economics_conclusive == conclusive
+            && outcome.affected_check_refs == proof.affected_check_refs
+            && outcome.live_shadow_refs == proof.live_shadow_refs
+            && outcome.live_canary_refs == proof.live_canary_refs
+            && outcome.delayed_harm_window_ref == proof.delayed_harm_window_ref;
+        if !same_binding {
+            return Err(ImprovementError::BudgetGateViolation(
+                "the outcome is already bound to a different budget-equivalence ledger, \
+                 complexity-economics delta or evidence leg; the I12.24:76 binding is not \
+                 substitutable",
+            ));
+        }
+        return Ok(());
+    }
+
+    outcome.budget_ledger_ref = ledger_ref;
+    outcome.complexity_delta_ref = delta_ref;
+    outcome.economics_conclusive = conclusive;
     outcome.affected_check_refs = proof.affected_check_refs.clone();
     outcome.live_shadow_refs = proof.live_shadow_refs.clone();
     outcome.live_canary_refs = proof.live_canary_refs.clone();
