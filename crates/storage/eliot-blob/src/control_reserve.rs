@@ -27,26 +27,35 @@
 //! the request, so pressure evidence is never manufactured.
 //!
 //! This module has no production caller yet (STITCH): it publishes the owner
-//! evidence the disk profile composition will join. There is no emergency
-//! partition here; recording reserve loss stays with the front-door
-//! last-resort slot until a later wave wires disk-side loss reporting.
+//! evidence the Kernel profile composition will join. Each claimed disk
+//! dimension publishes its live partition evidence through
+//! [`DiskReserve::publish_owner_rows`] as validated
+//! [`BottleneckCapacityProfile`] rows, in frozen contract order; every row is
+//! re-validated by the existing [`BottleneckCapacityProfile::validate`] before
+//! it is returned, so a missing/duplicate/foreign row fails closed here rather
+//! than publishing evidence the composition would have to lower to `UNKNOWN`.
+//! There is no emergency partition here; recording reserve loss stays with the
+//! front-door last-resort slot until a later wave wires disk-side loss
+//! reporting.
 //! DISCLOSED LIMIT: `profile_revision` on the response is caller-supplied
 //! metadata echoed into the directive; the `Current` currentness claim refers
 //! to the live-observed saturation at call time, not to a re-read of the
 //! profile revision. Full installed-saturation proof stays #11 Product scope.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
-    ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
-    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
-    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
-    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
+    CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
+    I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
+    I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome,
+    NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -70,7 +79,7 @@ pub enum DiskReserveError {
     /// The normal partition cannot satisfy the request; the protected
     /// partition is untouched.
     #[error(
-        "disk normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner}"
+        "disk normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     NormalCapacityExhausted {
         /// Bottleneck whose normal partition is saturated.
@@ -81,10 +90,12 @@ pub enum DiskReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
     /// The protected partition cannot satisfy the request.
     #[error(
-        "disk protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner}"
+        "disk protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     ProtectedReserveExhausted {
         /// Bottleneck whose protected partition is saturated.
@@ -95,6 +106,8 @@ pub enum DiskReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
 }
 
@@ -145,8 +158,13 @@ pub struct DiskReserve {
     inner: Arc<DiskReserveInner>,
 }
 
-/// One held disk capacity permit, bound to class, operation and owner.
-/// Releasing is automatic on drop and returns exactly the consumed partition.
+/// One held disk capacity permit, bound to class, operation, owner and
+/// Authority Epoch. Releasing is automatic on drop and returns exactly the
+/// consumed partition.
+///
+/// The permit is bound to the typed Authority Epoch the caller resolved at
+/// acquisition: evidence from a fenced epoch never authorizes consumption
+/// under the current one.
 ///
 /// Permits are deliberately not [`Clone`]: duplicating a permit handle must
 /// never duplicate the underlying capacity.
@@ -157,6 +175,7 @@ pub struct DiskPermit {
     operation: DiskPermitOperation,
     operation_id: String,
     owner: String,
+    epoch: AuthorityEpoch,
 }
 
 impl DiskPermit {
@@ -170,6 +189,12 @@ impl DiskPermit {
     #[must_use]
     pub const fn bottleneck(&self) -> CapacityBottleneck {
         DISK_QUEUE_BOTTLENECK
+    }
+
+    /// Returns the exact unit this permit was granted in.
+    #[must_use]
+    pub const fn unit(&self) -> CapacityUnit {
+        DISK_QUEUE_BOTTLENECK.unit()
     }
 
     /// Returns the amount held in the bottleneck's exact unit (disk-queue
@@ -195,6 +220,12 @@ impl DiskPermit {
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Returns the Authority Epoch bound at acquisition.
+    #[must_use]
+    pub const fn epoch(&self) -> AuthorityEpoch {
+        self.epoch
     }
 }
 
@@ -321,19 +352,22 @@ impl DiskReserve {
     /// Attempts to acquire one normal disk-queue slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected disk
-    /// capacity is unreachable through this path by construction.
+    /// capacity is unreachable through this path by construction. The granted
+    /// permit binds `epoch`; a caller presenting it under a different epoch
+    /// holds evidence that no longer matches the current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`DiskReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`DiskReserveError::NormalCapacityExhausted`] naming the
-    /// disk bottleneck and shed work when the normal partition is saturated.
-    /// The protected partition is untouched in every case.
+    /// disk bottleneck, shed work and observed epoch when the normal partition
+    /// is saturated. The protected partition is untouched in every case.
     pub fn try_acquire_normal_slot(
         &self,
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<DiskPermit, DiskReserveError> {
         validate_text(owner, "disk_permit.owner")?;
         validate_text(operation_id, "disk_permit.operation_id")?;
@@ -343,6 +377,7 @@ impl DiskReserve {
                 work_class: work,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(DiskPermit {
@@ -351,6 +386,7 @@ impl DiskReserve {
             operation: DiskPermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -359,19 +395,22 @@ impl DiskReserve {
     /// Only [`ControlOperationClass`] operations typecheck here: ordinary work
     /// cannot name a protected operation and therefore cannot acquire this
     /// partition. This is the path an admitted cancellation/recovery record
-    /// keeps while normal disk work reports `BUSY`.
+    /// keeps while normal disk work reports `BUSY`. The granted permit binds
+    /// `epoch` so the recovery record proves it was admitted under the current
+    /// owner state.
     ///
     /// # Errors
     ///
     /// Returns [`DiskReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`DiskReserveError::ProtectedReserveExhausted`] naming
-    /// the disk bottleneck, operation, owner and request when the protected
-    /// partition is saturated.
+    /// the disk bottleneck, operation, owner, request and observed epoch when
+    /// the protected partition is saturated.
     pub fn try_acquire_protected_slot(
         &self,
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<DiskPermit, DiskReserveError> {
         validate_text(owner, "disk_permit.owner")?;
         validate_text(operation_id, "disk_permit.operation_id")?;
@@ -384,6 +423,7 @@ impl DiskReserve {
                 operation,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(DiskPermit {
@@ -392,6 +432,7 @@ impl DiskReserve {
             operation: DiskPermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -449,6 +490,70 @@ impl DiskReserve {
             RecoveryCommitStatus::None,
         )
     }
+
+    /// Publishes the live partition evidence for the disk dimension as a
+    /// claimed [`BottleneckCapacityProfile`] row, in frozen contract order.
+    ///
+    /// The result carries exactly one row for [`DISK_QUEUE_BOTTLENECK`]. The
+    /// row names the frozen owner the contract binds to that dimension, the
+    /// exact bottleneck unit, the physical total and the disjoint normal and
+    /// protected partitions read from this reserve. There is no emergency
+    /// partition here, so none is claimed. The owner generation, proof
+    /// profile, evidence and invalidation references are composition-supplied
+    /// metadata echoed into the row from `ctx`; the Kernel composition wraps
+    /// this row in its own evidence record with the configuration snapshot
+    /// and Authority Epoch it resolved.
+    ///
+    /// The row is checked by the existing
+    /// [`BottleneckCapacityProfile::validate`] before it is returned, so a
+    /// missing owner, generation, physical total, protected partition,
+    /// enforcement, proof, evidence or invalidation reference fails here
+    /// rather than publishing a row the Kernel composition would have to lower
+    /// to `UNKNOWN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiskReserveError::Contract`] when the frozen owner map binds
+    /// no owner to the disk dimension, when the configured partition
+    /// capacities cannot form a positive physical total, or when the assembled
+    /// row fails the existing contract validation.
+    pub fn publish_owner_rows(
+        &self,
+        ctx: &DiskOwnerEvidenceContext,
+    ) -> Result<[BottleneckCapacityProfile; 1], DiskReserveError> {
+        let row = disk_owner_capacity_row(
+            self.inner.normal_capacity,
+            self.inner.protected_capacity,
+            ctx,
+        )?;
+        Ok([row])
+    }
+}
+
+/// Composition-resolved references published beside the disk owner row.
+///
+/// The reserve contributes only what it observes and enforces at call time for
+/// publication: the live partition capacities read from the reserve itself
+/// and their physical total, and the [`CapacityEnforcement::ConfigurationPartition`]
+/// mechanism those partitions are held under. The composition supplies the
+/// references that identify the observation: its own owner-generation
+/// reference for the disk owner, the independent proof-profile reference, and
+/// the current evidence and invalidation references. Both halves are required:
+/// [`DiskReserve::publish_owner_rows`] fails closed through the existing
+/// [`BottleneckCapacityProfile::validate`] when any reference is missing or
+/// non-canonical, so the composition must resolve canonical (strictly
+/// ascending, duplicate-free) reference sets rather than have them defaulted
+/// or sorted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiskOwnerEvidenceContext {
+    /// Owner generation/revision reference for the disk path owner.
+    pub owner_generation_ref: String,
+    /// Independent proof-profile reference produced for the disk dimension.
+    pub proof_profile_ref: String,
+    /// Current owner evidence references supporting the published row.
+    pub evidence_refs: Vec<String>,
+    /// Exact invalidation set of the published row.
+    pub invalidation_set: Vec<String>,
 }
 
 /// Exact parts of one disk rejection directive shared by every constructor.
@@ -504,4 +609,74 @@ impl DiskRejectionParts {
             .map_err(|error| DiskReserveError::Contract(error.to_string()))?;
         Ok(response)
     }
+}
+
+/// Builds the claimed owner row for the disk dimension from the reserve's
+/// configured partition capacities and the composition-resolved references.
+///
+/// The owner reference is read from the frozen owner map, never restated here;
+/// the unit is the bottleneck's own declared unit. The physical total is
+/// exactly the sum of the two disjoint partitions, so the existing partition
+/// accounting check always bounds them. A zero partition capacity or a missing
+/// frozen owner fails closed: the reserve constructor already refuses zero
+/// partitions, and a dimension without a frozen owner has no claim to publish.
+fn disk_owner_capacity_row(
+    normal_capacity: u64,
+    protected_capacity: u64,
+    ctx: &DiskOwnerEvidenceContext,
+) -> Result<BottleneckCapacityProfile, DiskReserveError> {
+    let owner = frozen_bottleneck_owner_map()
+        .into_iter()
+        .find(|bound| bound.bottleneck == DISK_QUEUE_BOTTLENECK)
+        .map(|bound| bound.owner)
+        .ok_or_else(|| {
+            DiskReserveError::Contract(format!(
+                "frozen owner map binds no owner to {DISK_QUEUE_BOTTLENECK:?}; no disk row to publish"
+            ))
+        })?;
+    let unit = DISK_QUEUE_BOTTLENECK.unit();
+    let limit = |field: &'static str, amount: u64| {
+        NonZeroU64::new(amount)
+            .map(|quantity| CapacityLimit { unit, quantity })
+            .ok_or(DiskReserveError::InvalidField {
+                field,
+                reason: "partition capacity must be greater than zero",
+            })
+    };
+    let normal_limit = limit("disk_reserve.normal_limit", normal_capacity)?;
+    let protected_limit = limit("disk_reserve.protected_limit", protected_capacity)?;
+    let physical_total =
+        normal_capacity
+            .checked_add(protected_capacity)
+            .ok_or(DiskReserveError::InvalidField {
+                field: "disk_reserve.physical_total_limit",
+                reason: "disjoint partition capacities overflow the physical total",
+            })?;
+    let physical_total_limit =
+        NonZeroU64::new(physical_total).ok_or(DiskReserveError::InvalidField {
+            field: "disk_reserve.physical_total_limit",
+            reason: "physical total must be greater than zero",
+        })?;
+    let row = BottleneckCapacityProfile {
+        bottleneck: DISK_QUEUE_BOTTLENECK,
+        coverage_state: BottleneckCoverageState::Claimed,
+        owner_ref: owner.to_owned(),
+        owner_generation_ref: ctx.owner_generation_ref.clone(),
+        unit,
+        physical_total_limit: Some(CapacityLimit {
+            unit,
+            quantity: physical_total_limit,
+        }),
+        normal_work_applicable: true,
+        normal_limit: Some(normal_limit),
+        protected_limit: Some(protected_limit),
+        emergency_limit: None,
+        enforcement: Some(CapacityEnforcement::ConfigurationPartition),
+        proof_profile_ref: ctx.proof_profile_ref.clone(),
+        evidence_refs: ctx.evidence_refs.clone(),
+        invalidation_set: ctx.invalidation_set.clone(),
+    };
+    row.validate()
+        .map_err(|error| DiskReserveError::Contract(error.to_string()))?;
+    Ok(row)
 }

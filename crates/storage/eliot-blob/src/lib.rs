@@ -52,7 +52,8 @@ pub use backup_io::{
 };
 mod control_reserve;
 pub use control_reserve::{
-    DISK_QUEUE_BOTTLENECK, DiskPermit, DiskPermitOperation, DiskReserve, DiskReserveError,
+    DISK_QUEUE_BOTTLENECK, DiskOwnerEvidenceContext, DiskPermit, DiskPermitOperation, DiskReserve,
+    DiskReserveError,
 };
 pub mod demand;
 pub mod key_ports;
