@@ -189,7 +189,7 @@ pub fn classify_orientation(
     }
     let semantics = ClassificationSemantics::from_orientation(input);
     validate_target_semantics(&semantics, policy)?;
-    let mut budget = policy.preflight_orientation(input)?;
+    let budget = policy.preflight_orientation(input)?;
     let report = crate::selection::select_orientation(input, policy)?;
     let profile_digest = digest_hex(&canonical_bytes(input)?);
     let disposition = result_disposition(&report.kind);
@@ -210,30 +210,58 @@ pub fn classify_orientation(
         omitted_alternatives,
         conflict,
         budget,
-        result_digest: String::new(),
+        // Include the final digest's serialized width while reconciling the
+        // output budget. The digest preimage excludes this field, so replacing
+        // the fixed-width placeholder cannot change the final byte count.
+        result_digest: "0".repeat(64),
         reason: report.reason,
     };
-    for _ in 0..8 {
-        let observed = u64::try_from(canonical_bytes(&result)?.len()).map_err(|_| {
+    reconcile_orientation_output(&mut result, policy.max_output_bytes)?;
+    result.result_digest = orientation_result_digest(&result)?;
+    let final_bytes = u64::try_from(canonical_bytes(&result)?.len()).map_err(|_| {
+        ContractViolation::Budget {
+            dimension: "output_bytes",
+            reason: "output length cannot be represented".to_owned(),
+        }
+    })?;
+    if result.budget.output_bytes != final_bytes {
+        return Err(ContractViolation::Budget {
+            dimension: "output_bytes",
+            reason: "final digest changed the reconciled output length".to_owned(),
+        });
+    }
+    Ok(result)
+}
+
+fn reconcile_orientation_output(
+    result: &mut OrientationClassificationResult,
+    max: u64,
+) -> Result<(), ContractViolation> {
+    // Updating the decimal output length can itself alter the serialized
+    // length at a power-of-ten boundary. It can grow at most once per u64
+    // decimal digit, so this bound covers every representable fixed point.
+    for _ in 0..20 {
+        let len = u64::try_from(canonical_bytes(result)?.len()).map_err(|_| {
             ContractViolation::Budget {
                 dimension: "output_bytes",
                 reason: "output length cannot be represented".to_owned(),
             }
         })?;
-        if observed > policy.max_output_bytes {
+        if len > max {
             return Err(ContractViolation::Budget {
                 dimension: "output_bytes",
-                reason: format!("{observed} exceeds {}", policy.max_output_bytes),
+                reason: format!("{len} exceeds {max}"),
             });
         }
-        if result.budget.output_bytes == observed {
-            break;
+        if result.budget.output_bytes == len {
+            return Ok(());
         }
-        budget.output_bytes = observed;
-        result.budget = budget.clone();
+        result.budget.output_bytes = len;
     }
-    result.result_digest = orientation_result_digest(&result)?;
-    Ok(result)
+    Err(ContractViolation::Budget {
+        dimension: "output_bytes",
+        reason: "serialized output length did not stabilize".to_owned(),
+    })
 }
 
 fn enforce_job_deadline(
