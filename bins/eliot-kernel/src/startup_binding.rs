@@ -209,6 +209,9 @@ pub(crate) struct KernelLaunchOptions {
     pub(crate) doctor_executable_path: Option<PathBuf>,
     pub(crate) testd_artifact_sha256: Option<String>,
     pub(crate) native_worker_artifact_sha256: Option<String>,
+    /// Host-injected absolute native-worker image path, paired with the
+    /// exact installer-approved digest.
+    pub(crate) native_worker_executable_path: Option<PathBuf>,
     pub(crate) user_broker_executable_path: Option<PathBuf>,
     pub(crate) user_broker_artifact_sha256: Option<String>,
 }
@@ -249,6 +252,8 @@ where
             testd_artifact_digest,
             native_worker_artifact_flag,
             native_worker_artifact_digest,
+            native_worker_executable_flag,
+            native_worker_executable_path,
             user_broker_executable_flag,
             user_broker_executable_path,
             user_broker_artifact_flag,
@@ -267,6 +272,7 @@ where
             && doctor_executable_flag == "--doctor-executable-path"
             && testd_artifact_flag == "--testd-artifact-sha256"
             && native_worker_artifact_flag == "--native-worker-artifact-sha256"
+            && native_worker_executable_flag == "--native-worker-executable-path"
             && user_broker_executable_flag == "--user-broker-executable"
             && user_broker_artifact_flag == "--user-broker-artifact-sha256"
             && daemon_flag == "--eliotd-descriptor"
@@ -317,6 +323,18 @@ where
                     "Host launch must inject the exact Doctor executable path bound to the digested doctor role",
                 ));
             }
+            let native_worker_executable_path = PathBuf::from(native_worker_executable_path);
+            if !native_worker_executable_path.is_absolute()
+                || native_worker_executable_path.as_os_str().is_empty()
+                || native_worker_executable_path
+                    .to_string_lossy()
+                    .chars()
+                    .any(char::is_control)
+            {
+                return Err(invalid_input(
+                    "Host launch must inject the exact native-worker executable path bound to the digested native-worker role",
+                ));
+            }
             Ok(KernelLaunchOptions {
                 work_root: canonical_directory(work_root)?,
                 store_config: Some(StoreConfigLocator::NeutralDescriptor(PathBuf::from(
@@ -332,6 +350,7 @@ where
                 doctor_executable_path: Some(doctor_executable_path),
                 testd_artifact_sha256: Some(testd_artifact_digest.into_owned()),
                 native_worker_artifact_sha256: Some(native_worker_artifact_digest.into_owned()),
+                native_worker_executable_path: Some(native_worker_executable_path),
                 user_broker_executable_path: Some(user_broker_executable_path),
                 user_broker_artifact_sha256: Some(user_broker_artifact_digest.into_owned()),
             })
@@ -418,7 +437,7 @@ where
             ))
         }
         _ => Err(invalid_input(
-            "expected the exact mandatory 28-value Host launch contour",
+            "expected the exact mandatory 30-value Host launch contour",
         )),
     }
 }
@@ -618,6 +637,7 @@ mod tests {
         let root = TempRoot::new();
         let digest = "a".repeat(64);
         let doctor_path = root.0.join("eliot-doctor.exe");
+        let native_worker_path = root.0.join("eliot-native-worker.exe");
         let user_broker_path = root.0.join("eliot-user-broker.exe");
         let options = parse_launch_options([
             "--work-root".into(),
@@ -640,6 +660,8 @@ mod tests {
             digest.clone().into(),
             "--native-worker-artifact-sha256".into(),
             digest.clone().into(),
+            "--native-worker-executable-path".into(),
+            native_worker_path.clone().into_os_string(),
             "--user-broker-executable".into(),
             user_broker_path.clone().into_os_string(),
             "--user-broker-artifact-sha256".into(),
@@ -660,6 +682,11 @@ mod tests {
         assert_eq!(options.testd_artifact_sha256, Some(digest.clone()));
         assert_eq!(options.native_worker_artifact_sha256, Some(digest.clone()));
         assert_eq!(
+            options.native_worker_executable_path,
+            Some(native_worker_path),
+            "the Host-pinned native-worker path must be retained exactly"
+        );
+        assert_eq!(
             options.user_broker_executable_path,
             Some(user_broker_path),
             "the installer-pinned User Broker path must be retained exactly"
@@ -673,6 +700,7 @@ mod tests {
         let root = TempRoot::new();
         let digest = "a".repeat(64);
         let doctor_path = root.0.join("eliot-doctor.exe");
+        let native_worker_path = root.0.join("eliot-native-worker.exe");
         // The legacy 22-value contour carries a digested doctor role but no
         // absolute path anchor: it must fail closed naming the doctor role,
         // never defaulting a path.
@@ -695,6 +723,8 @@ mod tests {
             digest.clone().into(),
             "--native-worker-artifact-sha256".into(),
             digest.clone().into(),
+            "--native-worker-executable-path".into(),
+            native_worker_path.clone().into_os_string(),
             "--eliotd-descriptor".into(),
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
@@ -728,6 +758,8 @@ mod tests {
             digest.clone().into(),
             "--native-worker-artifact-sha256".into(),
             digest.clone().into(),
+            "--native-worker-executable-path".into(),
+            native_worker_path.clone().into_os_string(),
             "--user-broker-executable".into(),
             root.0.join("eliot-user-broker.exe").into_os_string(),
             "--user-broker-artifact-sha256".into(),
@@ -764,6 +796,8 @@ mod tests {
             digest.clone().into(),
             "--native-worker-artifact-sha256".into(),
             digest.clone().into(),
+            "--native-worker-executable-path".into(),
+            native_worker_path.clone().into_os_string(),
             "--user-broker-executable".into(),
             root.0.join("eliot-user-broker.exe").into_os_string(),
             "--user-broker-artifact-sha256".into(),
@@ -775,6 +809,10 @@ mod tests {
         ])
         .expect("digest-bound doctor path must parse");
         assert_eq!(accepted.doctor_executable_path, Some(doctor_path));
+        assert_eq!(
+            accepted.native_worker_executable_path,
+            Some(native_worker_path)
+        );
     }
 
     #[test]

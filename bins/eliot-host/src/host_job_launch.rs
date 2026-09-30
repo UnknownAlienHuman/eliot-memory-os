@@ -557,6 +557,86 @@ pub(super) fn kernel_arguments_with_doctor_anchor(
     Ok(injected)
 }
 
+/// Adds the Host-sealed native-worker executable anchor beside its exact
+/// digest in the Kernel child contour. The path and expected digest come
+/// from the validated `RuntimeLaunchDescriptor`; neither is derived from the
+/// current directory or a neighboring artifact name.
+#[cfg(windows)]
+pub(super) fn kernel_arguments_with_native_worker_anchor(
+    kernel_arguments: &[PlatformHandle],
+    native_worker_executable_path: &PlatformHandle,
+    native_worker_artifact_digest: &PlatformHandle,
+) -> Result<Vec<PlatformHandle>, HostError> {
+    const NATIVE_WORKER_DIGEST_FLAG: &str = "--native-worker-artifact-sha256";
+    const NATIVE_WORKER_PATH_FLAG: &str = "--native-worker-executable-path";
+    host_launch_observe("host.launch native-worker anchor requested");
+    if kernel_arguments
+        .iter()
+        .any(|argument| argument.as_str() == NATIVE_WORKER_PATH_FLAG)
+    {
+        host_launch_observe("host.launch native-worker anchor typed rejection");
+        return Err(HostError::ProcessContour(
+            "Kernel launch contour already carries a native-worker path anchor".to_owned(),
+        ));
+    }
+    if !Path::new(native_worker_executable_path.as_str()).is_absolute()
+        || native_worker_executable_path.as_str().trim().is_empty()
+        || native_worker_executable_path.as_str().chars().any(char::is_control)
+    {
+        host_launch_observe("host.launch native-worker anchor typed rejection");
+        return Err(HostError::ProcessContour(
+            "native-worker executable path anchor must be absolute and non-blank".to_owned(),
+        ));
+    }
+    let path_flag = PlatformHandle::new(NATIVE_WORKER_PATH_FLAG).map_err(|error| {
+        host_launch_observe("host.launch native-worker anchor typed rejection");
+        HostError::ProcessContour(error.to_string())
+    })?;
+    let mut injected = Vec::with_capacity(kernel_arguments.len().saturating_add(2));
+    let mut index = 0;
+    let mut anchored = false;
+    while index < kernel_arguments.len() {
+        let argument = kernel_arguments[index].clone();
+        injected.push(argument.clone());
+        if argument.as_str() == NATIVE_WORKER_DIGEST_FLAG {
+            if anchored {
+                host_launch_observe("host.launch native-worker anchor typed rejection");
+                return Err(HostError::ProcessContour(
+                    "Kernel launch contour has multiple native-worker artifact roles".to_owned(),
+                ));
+            }
+            let digest = kernel_arguments.get(index.saturating_add(1)).ok_or_else(|| {
+                host_launch_observe("host.launch native-worker anchor typed rejection");
+                HostError::ProcessContour(
+                    "Kernel launch contour is missing the native-worker artifact digest".to_owned(),
+                )
+            })?;
+            if digest != native_worker_artifact_digest {
+                host_launch_observe("host.launch native-worker anchor typed rejection");
+                return Err(HostError::ProcessContour(
+                    "native-worker executable anchor differs from the sealed artifact digest"
+                        .to_owned(),
+                ));
+            }
+            injected.push(digest.clone());
+            injected.push(path_flag.clone());
+            injected.push(native_worker_executable_path.clone());
+            index = index.saturating_add(2);
+            anchored = true;
+            continue;
+        }
+        index = index.saturating_add(1);
+    }
+    if !anchored {
+        host_launch_observe("host.launch native-worker anchor typed rejection");
+        return Err(HostError::ProcessContour(
+            "Kernel launch contour is missing the native-worker artifact role".to_owned(),
+        ));
+    }
+    host_launch_observe("host.launch native-worker anchor admitted");
+    Ok(injected)
+}
+
 #[cfg(windows)]
 impl HostJobBranches {
     #[allow(
@@ -1057,9 +1137,14 @@ impl HostJobBranches {
         // digest-bound Doctor executable path into the stored 22-value
         // contour so the Kernel receives the exact 24-value launch options.
         // Missing or relative anchors fail closed here, never defaulted.
-        let kernel_arguments = kernel_arguments_with_doctor_anchor(
+        let doctor_anchored_arguments = kernel_arguments_with_doctor_anchor(
             &launch.kernel_arguments,
             &launch.doctor_executable_path,
+        )?;
+        let kernel_arguments = kernel_arguments_with_native_worker_anchor(
+            &doctor_anchored_arguments,
+            &launch.native_worker_executable_path,
+            &launch.native_worker_artifact_digest,
         )?;
         // Issue #1775: resolve collision before credential use. Listener PID
         // is observation only; the preflight does not prove socket identity.

@@ -1137,6 +1137,7 @@ impl KernelComposition {
         let doctor_artifact_sha256 = config.doctor_artifact_sha256.clone();
         let testd_artifact_sha256 = config.testd_artifact_sha256.clone();
         let native_worker_artifact_sha256 = config.native_worker_artifact_sha256.clone();
+        let native_worker_executable_path = config.native_worker_executable_path.clone();
         let user_broker_executable_path = config.user_broker_executable_path.clone();
         let user_broker_artifact_sha256 = config.user_broker_artifact_sha256.clone();
         let eliotd_receipt_binding = config.eliotd_receipt_binding.clone();
@@ -1231,6 +1232,22 @@ impl KernelComposition {
         if user_broker_executable_path.is_some() != user_broker_artifact_sha256.is_some() {
             return Err(KernelBuildError::Service(
                 "User Broker executable path and artifact digest must be injected together"
+                    .to_owned(),
+            ));
+        }
+        if native_worker_executable_path.is_some() != native_worker_artifact_sha256.is_some() {
+            return Err(KernelBuildError::Service(
+                "native-worker executable path and artifact digest must be injected together"
+                    .to_owned(),
+            ));
+        }
+        if let Some(path) = &native_worker_executable_path
+            && (!path.is_absolute()
+                || path.as_os_str().is_empty()
+                || path.to_string_lossy().chars().any(char::is_control))
+        {
+            return Err(KernelBuildError::Service(
+                "native-worker executable path must be Host-injected, absolute, and non-blank"
                     .to_owned(),
             ));
         }

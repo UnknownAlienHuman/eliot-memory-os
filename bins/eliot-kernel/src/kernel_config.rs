@@ -79,6 +79,9 @@ pub struct KernelConfig {
     pub testd_artifact_sha256: Option<String>,
     /// Independent digest of the approved native worker image injected by Host.
     pub native_worker_artifact_sha256: Option<String>,
+    /// Host-injected absolute native-worker executable path, paired with its
+    /// installer-approved artifact digest.
+    pub native_worker_executable_path: Option<PathBuf>,
     /// Host-injected absolute User Broker executable path, paired with its
     /// installer-approved artifact digest. Missing keeps the User Broker
     /// role out of the front-door peer set.
@@ -156,6 +159,7 @@ impl KernelConfig {
             doctor_executable_path: None,
             testd_artifact_sha256: None,
             native_worker_artifact_sha256: None,
+            native_worker_executable_path: None,
             user_broker_executable_path: None,
             user_broker_artifact_sha256: None,
             wasm_host_artifact_sha256: None,
@@ -275,6 +279,19 @@ impl KernelConfig {
     /// Injects the independently approved native worker executable digest.
     #[must_use]
     pub fn with_native_worker_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.native_worker_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the Host-approved native-worker executable path and its exact
+    /// installer-approved digest as one retained binding.
+    #[must_use]
+    pub fn with_native_worker_artifact_binding(
+        mut self,
+        path: PathBuf,
+        digest: impl Into<String>,
+    ) -> Self {
+        self.native_worker_executable_path = Some(path);
         self.native_worker_artifact_sha256 = Some(digest.into());
         self
     }

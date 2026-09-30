@@ -835,8 +835,17 @@ pub struct ComposedDispatchContour {
     principal_owner: String,
     doctor: Mutex<Option<DoctorFrontDoorState>>,
     testd_installed_digest: Mutex<Option<String>>,
-    native_worker_installed_digest: Mutex<Option<String>>,
+    native_worker_anchor: Mutex<Option<NativeWorkerExecutableAnchor>>,
     launches: Mutex<LaunchRecords>,
+}
+
+/// Exact Host-injected path and digest for the installed native worker.
+/// Both values cross the startup boundary together and are retained here as
+/// one immutable composition binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeWorkerExecutableAnchor {
+    executable: PathBuf,
+    digest: String,
 }
 
 impl ComposedDispatchContour {
@@ -964,7 +973,7 @@ pub fn compose_dispatch_contour(installation_id: String) -> Result<(), DispatchL
             principal_owner: installation_id,
             doctor: Mutex::new(None),
             testd_installed_digest: Mutex::new(None),
-            native_worker_installed_digest: Mutex::new(None),
+            native_worker_anchor: Mutex::new(None),
             launches: Mutex::new(LaunchRecords::default()),
         })
         .map_err(|_| DispatchLaunchError::AlreadyComposed("dispatch contour"))?;
@@ -1065,9 +1074,12 @@ pub fn compose_production_testd_front_door(
 /// Composes the production native-worker side from its installed package
 /// artifact digest (Implements #461 DISPATCH-WIRE E2E).
 ///
-/// `installed_native_worker_digest` is the installed native-worker package
-/// artifact digest (lowercase SHA-256) from the installation manifest
-/// through the Host injection — never minted here. Native-worker admission
+/// `installed_native_worker_executable` and `installed_native_worker_digest`
+/// are the exact installed native-worker path and package artifact digest
+/// (lowercase SHA-256) from the installation manifest through the Host
+/// injection — never minted here. They remain paired for the lifetime of
+/// this contour, so later launch material cannot substitute a sibling image.
+/// Native-worker admission
 /// runs through live service authority plus the ORS claim table, so no
 /// ledger composition is required: this records the verified digest on the
 /// contour cell from [`compose_dispatch_contour`] as the
@@ -1078,18 +1090,30 @@ pub fn compose_production_testd_front_door(
 /// This is the production caller `main` uses once the contour carries the
 /// digest, mirroring [`compose_production_doctor_front_door`].
 pub fn compose_production_native_worker_front_door(
+    installed_native_worker_executable: &Path,
     installed_native_worker_digest: &str,
 ) -> Result<(), DispatchLaunchError> {
     require_digest(
         installed_native_worker_digest,
         "installed native-worker digest must be a lowercase SHA-256 digest",
     )?;
+    if !installed_native_worker_executable.is_absolute()
+        || installed_native_worker_executable.as_os_str().is_empty()
+        || installed_native_worker_executable
+            .to_string_lossy()
+            .chars()
+            .any(char::is_control)
+    {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "installed native-worker path must be the absolute Host-injected path".to_owned(),
+        ));
+    }
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed(
             "compose the dispatch contour before its native-worker side",
         ))?;
-    let mut composed = contour.native_worker_installed_digest.lock().map_err(|_| {
+    let mut composed = contour.native_worker_anchor.lock().map_err(|_| {
         DispatchLaunchError::Gate("native-worker front-door lock poisoned".to_owned())
     })?;
     if composed.is_some() {
@@ -1097,7 +1121,10 @@ pub fn compose_production_native_worker_front_door(
             "native-worker front door",
         ));
     }
-    *composed = Some(installed_native_worker_digest.to_owned());
+    *composed = Some(NativeWorkerExecutableAnchor {
+        executable: installed_native_worker_executable.to_path_buf(),
+        digest: installed_native_worker_digest.to_owned(),
+    });
     Ok(())
 }
 
@@ -1128,7 +1155,7 @@ pub fn testd_production_composed() -> bool {
 pub fn native_worker_production_composed() -> bool {
     DISPATCH_CONTOUR.get().is_some_and(|contour| {
         contour
-            .native_worker_installed_digest
+            .native_worker_anchor
             .lock()
             .is_ok_and(|composed| composed.is_some())
     })
@@ -4802,7 +4829,28 @@ pub fn prepare_native_worker_launch(
             "admission time must be non-zero".to_owned(),
         ));
     }
-    let material_dir = material.executable.parent().ok_or_else(|| {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let anchor = contour
+        .native_worker_anchor
+        .lock()
+        .map_err(|_| {
+            DispatchLaunchError::Gate("native-worker front-door lock poisoned".to_owned())
+        })?
+        .clone()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "Host-injected native-worker executable anchor",
+        ))?;
+    if material.executable != anchor.executable
+        || material.executable_sha256 != anchor.digest
+    {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "native-worker launch material differs from the exact Host-injected executable anchor"
+                .to_owned(),
+        ));
+    }
+    let material_dir = anchor.executable.parent().ok_or_else(|| {
         DispatchLaunchError::InvalidMaterial(
             "dispatch child executable has no parent directory".to_owned(),
         )
@@ -4827,9 +4875,6 @@ pub fn prepare_native_worker_launch(
                 .to_owned(),
         ));
     }
-    let contour = DISPATCH_CONTOUR
-        .get()
-        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
     let now_unix_ms = now_unix_nanos / 1_000_000;
     if now_unix_ms == 0 {
         return Err(DispatchLaunchError::InvalidMaterial(
@@ -4999,8 +5044,8 @@ pub fn prepare_native_worker_launch(
         nonce,
         operation_id,
         material_path,
-        executable: material.executable.to_path_buf(),
-        executable_sha256: material.executable_sha256.to_owned(),
+        executable: anchor.executable,
+        executable_sha256: anchor.digest,
         working_directory: material.working_directory.to_path_buf(),
         authority_epoch,
         generation,
@@ -6398,16 +6443,21 @@ mod tests {
             compose_production_testd_front_door(&installed_testd_digest),
             Err(DispatchLaunchError::AlreadyComposed(_))
         ));
-        let installed_native_digest =
-            eliot_contracts::sha256_hex(b"eliot-native-worker-installed-package-bytes");
-        compose_production_native_worker_front_door(&installed_native_digest)
+        let installed_native_digest = "a".repeat(64);
+        let installed_native_path = root
+            .join("testd-child")
+            .join("eliot-native-worker.exe");
+        compose_production_native_worker_front_door(&installed_native_path, &installed_native_digest)
             .expect("production native composition");
         assert!(
             native_worker_production_composed(),
             "composed native side must report composed"
         );
         assert!(matches!(
-            compose_production_native_worker_front_door(&installed_native_digest),
+            compose_production_native_worker_front_door(
+                &installed_native_path,
+                &installed_native_digest
+            ),
             Err(DispatchLaunchError::AlreadyComposed(_))
         ));
         assert!(matches!(
@@ -6415,7 +6465,10 @@ mod tests {
             Err(DispatchLaunchError::InvalidMaterial(_))
         ));
         assert!(matches!(
-            compose_production_native_worker_front_door("not-a-sha256-digest"),
+            compose_production_native_worker_front_door(
+                &std::env::temp_dir().join("eliot-native-worker-installed.exe"),
+                "not-a-sha256-digest"
+            ),
             Err(DispatchLaunchError::InvalidMaterial(_))
         ));
 
@@ -6627,7 +6680,7 @@ mod tests {
         let native_material = NativeWorkerLaunchMaterial {
             request: &native_request,
             executable: &child_dir.join("eliot-native-worker.exe"),
-            executable_sha256: &"ef".repeat(32),
+            executable_sha256: &"a".repeat(64),
             working_directory: &child_dir,
         };
         let native_first =
@@ -7889,7 +7942,10 @@ mod tests {
             Err(DispatchLaunchError::InvalidMaterial(_))
         ));
         assert!(matches!(
-            compose_production_native_worker_front_door("not-a-sha256-digest"),
+            compose_production_native_worker_front_door(
+                &std::env::temp_dir().join("eliot-native-worker-installed.exe"),
+                "not-a-sha256-digest"
+            ),
             Err(DispatchLaunchError::InvalidMaterial(_))
         ));
     }
