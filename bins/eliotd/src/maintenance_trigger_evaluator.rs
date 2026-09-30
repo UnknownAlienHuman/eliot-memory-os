@@ -47,8 +47,8 @@ use eliot_maintenance::{
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_ACK_WIRE_ID, MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
-    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MaintenanceTriggerAck, MaintenanceTriggerClaim,
-    MaintenanceTriggerDecisionReceipt, MaintenanceTriggerGapKind,
+    MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MaintenanceTriggerAck,
+    MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt, MaintenanceTriggerGapKind,
     MaintenanceTriggerPendingSummary, MaintenanceTriggerRecord, ProtocolError,
 };
 use eliot_store_api::{StoreError, WriteReceiptStatus};
@@ -986,7 +986,8 @@ impl DaemonComposition {
     ) -> Result<MaintenanceTriggerDriveOutcome, MaintenanceDecisionCommitError> {
         let owner_session = self.owner_session.as_ref().ok_or_else(|| {
             MaintenanceDecisionCommitError::Daemon(DaemonError::Lifecycle(
-                "owner session is not bound; drop and re-run authenticated connect+start".to_owned(),
+                "owner session is not bound; drop and re-run authenticated connect+start"
+                    .to_owned(),
             ))
         })?;
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
@@ -1072,7 +1073,8 @@ impl DaemonComposition {
     ) -> Result<Vec<MaintenanceTriggerRecord>, MaintenanceDecisionCommitError> {
         let owner_session = self.owner_session.as_ref().ok_or_else(|| {
             MaintenanceDecisionCommitError::Daemon(DaemonError::Lifecycle(
-                "owner session is not bound; drop and re-run authenticated connect+start".to_owned(),
+                "owner session is not bound; drop and re-run authenticated connect+start"
+                    .to_owned(),
             ))
         })?;
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
@@ -1130,12 +1132,15 @@ impl DaemonComposition {
             if !page.has_more {
                 break;
             }
-            let next = page.continuation.clone().ok_or(
-                MaintenanceDecisionCommitError::Protocol(ProtocolError::InvalidField {
-                    field: "maintenance_trigger_page.continuation",
-                    reason: "a further page must carry its resume cursor",
-                }),
-            )?;
+            let next =
+                page.continuation
+                    .clone()
+                    .ok_or(MaintenanceDecisionCommitError::Protocol(
+                        ProtocolError::InvalidField {
+                            field: "maintenance_trigger_page.continuation",
+                            reason: "a further page must carry its resume cursor",
+                        },
+                    ))?;
             if !seen_continuations.insert(next.clone()) {
                 return Err(MaintenanceDecisionCommitError::Protocol(
                     ProtocolError::InvalidField {
@@ -1208,10 +1213,8 @@ impl DaemonComposition {
         live_fence: &eliot_contracts::StateFence,
         now: u64,
     ) -> Result<(), MaintenanceDecisionCommitError> {
-        let receipt =
-            kernel.recover_maintenance_trigger_commit(live_fence, &member.trigger_id)?;
-        if receipt.operation_hash != member.operation_hash || receipt.revision != member.revision
-        {
+        let receipt = kernel.recover_maintenance_trigger_commit(live_fence, &member.trigger_id)?;
+        if receipt.operation_hash != member.operation_hash || receipt.revision != member.revision {
             return Err(MaintenanceDecisionCommitError::Protocol(
                 ProtocolError::ReplayConflict,
             ));
@@ -1231,11 +1234,8 @@ impl DaemonComposition {
             live_fence,
             now,
         )?;
-        let recorded = kernel.record_maintenance_trigger_decision(
-            live_fence,
-            &member.trigger_id,
-            &receipt,
-        )?;
+        let recorded =
+            kernel.record_maintenance_trigger_decision(live_fence, &member.trigger_id, &receipt)?;
         let ack = MaintenanceTriggerAck {
             wire_id: MAINTENANCE_TRIGGER_ACK_WIRE_ID.to_owned(),
             wire_version: MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,

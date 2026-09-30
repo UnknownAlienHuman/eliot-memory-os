@@ -31,8 +31,8 @@ use eliot_maintenance::MaintenanceJob;
 use eliot_protocol::{
     MaintenanceTriggerAck, MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt,
     MaintenanceTriggerGap, MaintenanceTriggerGapKind, MaintenanceTriggerPage,
-    MaintenanceTriggerRecord, MaintenanceTriggerTerminalDisposition, MaintenanceTriggerTerminalKind,
-    RequestIdentity,
+    MaintenanceTriggerRecord, MaintenanceTriggerTerminalDisposition,
+    MaintenanceTriggerTerminalKind, RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
@@ -753,8 +753,9 @@ pub(crate) const MAINTENANCE_TRIGGER_PAGE_OPERATION: &str = "maintenance_trigger
 pub(crate) const MAINTENANCE_TRIGGER_REPLAY_OPERATION: &str = "maintenance_trigger_replay";
 pub(crate) const MAINTENANCE_TRIGGER_RECOVER_OPERATION: &str = "maintenance_trigger_recover_commit";
 pub(crate) const MAINTENANCE_TRIGGER_RECORD_OPERATION: &str = "maintenance_trigger_record_decision";
-pub(crate) const MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION: &str = "maintenance_trigger_acknowledge";
-pub(crate) const MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION: &str = "maintenance_trigger_mark_ambiguous";
+pub(crate) const MAINTENANCE_TRIGGER_ACKNOWLEDGE_OPERATION: &str =
+    "maintenance_trigger_acknowledge";
+pub(crate) const MAINTENANCE_TRIGGER_AMBIGUOUS_OPERATION: &str =
+    "maintenance_trigger_mark_ambiguous";
 pub(crate) const MAINTENANCE_TRIGGER_GAP_OPERATION: &str = "maintenance_trigger_record_gap";
 pub(crate) const MAINTENANCE_TRIGGER_EXPIRE_OPERATION: &str = "maintenance_trigger_expire";
-}

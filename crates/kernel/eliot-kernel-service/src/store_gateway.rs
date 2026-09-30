@@ -1728,9 +1728,8 @@ impl KernelStoreGateway {
         let ors = self.commit_ors.as_deref().ok_or_else(|| {
             MaintenanceTriggerDeliveryError::StagingProof(OrsError::IntegrityProblem {
                 record_type: "maintenance_trigger_delivery",
-                reason:
-                    "maintenance trigger delivery snapshot requires the composition-bound ORS"
-                        .to_owned(),
+                reason: "maintenance trigger delivery snapshot requires the composition-bound ORS"
+                    .to_owned(),
             })
         })?;
         for row in rows {
@@ -1808,8 +1807,7 @@ impl KernelStoreGateway {
         let (claim, rows) = {
             let service = self.lock_maintenance_service()?;
             let mut ledger = self.lock_maintenance_ledger()?;
-            let claim =
-                handle_maintenance_trigger_claim(&service, &session, &mut ledger, request)?;
+            let claim = handle_maintenance_trigger_claim(&service, &session, &mut ledger, request)?;
             (claim, ledger.durable_rows())
         };
         self.persist_maintenance_trigger_snapshot(&rows)?;

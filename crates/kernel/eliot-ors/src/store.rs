@@ -12244,9 +12244,7 @@ impl RedbRecoveryStore {
         row_json: &str,
     ) -> Result<(), OrsError> {
         crate::model::validate_text(trigger_id, "maintenance_trigger_delivery.trigger_id")?;
-        if row_json.is_empty()
-            || row_json.len() > MAX_MAINTENANCE_TRIGGER_DELIVERY_SNAPSHOT_BYTES
-        {
+        if row_json.is_empty() || row_json.len() > MAX_MAINTENANCE_TRIGGER_DELIVERY_SNAPSHOT_BYTES {
             return Err(OrsError::InvalidField {
                 field: "maintenance_trigger_delivery.row_json",
                 reason: "delivery snapshot must be non-empty bounded row bytes",
@@ -12260,7 +12258,7 @@ impl RedbRecoveryStore {
         })?;
         let write = self.database.begin_write().map_err(storage)?;
         {
-            let snapshots = write
+            let mut snapshots = write
                 .open_table(MAINTENANCE_TRIGGER_DELIVERY)
                 .map_err(storage)?;
             if snapshots.get(trigger_id).map_err(storage)?.is_none() {

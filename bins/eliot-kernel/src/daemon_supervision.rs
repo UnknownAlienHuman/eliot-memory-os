@@ -7,10 +7,6 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
-use eliot_protocol::{
-    MAINTENANCE_TRIGGER_REVOCATION_WIRE_ID, MAINTENANCE_TRIGGER_REVOCATION_WIRE_VERSION,
-    MaintenanceTriggerRevocation, ProtocolError,
-};
 #[cfg(windows)]
 use eliot_kernel_service::KernelServiceState;
 use eliot_kernel_service::{KernelActivationReceipt, KernelServiceError};
@@ -21,6 +17,10 @@ use eliot_process::ProcessStartReceipt;
 use eliot_process::{
     EliotdLiveReadyEvidence, EliotdLiveReceipt, ExitDisposition, ProcessExecutionView,
     ProcessStartReceipt,
+};
+use eliot_protocol::{
+    MAINTENANCE_TRIGGER_REVOCATION_WIRE_ID, MAINTENANCE_TRIGGER_REVOCATION_WIRE_VERSION,
+    MaintenanceTriggerRevocation, ProtocolError,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
