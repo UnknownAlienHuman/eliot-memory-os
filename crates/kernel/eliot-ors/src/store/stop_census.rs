@@ -23,6 +23,7 @@ use super::{
     STORE_REBIND_REPLAY, SUPERVISION_LEASE_CURRENT, SUPERVISION_LEASE_STAGED,
     UNKNOWN_COMMIT_RECOVERY, decode, decode_named, read_store_object_identity, storage,
 };
+use crate::model::{SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt};
 use crate::{
     AdmissionReservationState, HostRequestRecord, KernelReconciliationItem, OperationalPhase,
     RecoveryInboxDisposition, RecoveryProblem, ReservationRecord, UnknownCommitRecord,
