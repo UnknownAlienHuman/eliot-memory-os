@@ -1129,6 +1129,16 @@ impl KernelBackupRestore {
     ///
     /// ## Why it is reachable
     ///
+    /// Both call sites are on the production front door,
+    /// `request_dispatch::handle_backup_restore_test`: it calls
+    /// [`Self::admit_restore_journal`], which binds the identity the owner
+    /// binding carries BEFORE the stream is issued, and then
+    /// `KernelComposition::backup_restore_with_ors_journal`, which re-enters
+    /// this function through that same admission and through the execution body
+    /// before the engine is entered. `check_ors_journal_binding` refuses typed
+    /// when the identity the binding carries and the identity the ports carry
+    /// differ, so the admitted stream and the executed stream are one stream.
+    ///
     /// A plan the engine has executed under one operation carries that
     /// operation in its `plan_id`, so its receipt names it too. Anything that
     /// later compares a presented plan against such a receipt — notably
