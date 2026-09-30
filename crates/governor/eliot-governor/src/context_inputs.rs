@@ -498,26 +498,9 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 request.projection_max_records,
             )
             .await?;
-        // Negative memory reuses the cue read only when it deliberately
-        // addresses the SAME exact source snapshot — identical selector and
-        // bound. A different source set is read separately, so the two slots
-        // stay separately identified (inputs.rs:1-13) without one unrelated
-        // result being relabelled into both roles.
-        let negative_memory = if request.negative_memory_selector == request.projection_selector
-            && request.negative_memory_max_records == request.projection_max_records
-        {
-            cue.clone()
-        } else {
-            self.acquire_projection_inputs(
-                ctx,
-                request,
-                &ordering,
-                ROLE_NEGATIVE_MEMORY,
-                &request.negative_memory_selector,
-                request.negative_memory_max_records,
-            )
-            .await?
-        };
+        let negative_memory = self
+            .acquire_negative_memory(ctx, request, &ordering, &cue)
+            .await?;
         let evidence = self.acquire_evidence(ctx, request, &ordering).await?;
         let affordances = self
             .acquire_state(
@@ -713,6 +696,37 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 identity: None,
             }),
         }
+    }
+
+    /// Acquires the negative-memory role, reusing the cue acquisition only when
+    /// the request deliberately addresses the same exact source snapshot.
+    ///
+    /// Negative memory reuses the cue read only when it deliberately addresses
+    /// the SAME exact source snapshot — identical selector and bound. A
+    /// different source set is read separately, so the two slots stay separately
+    /// identified (inputs.rs:1-13) without one unrelated result being relabelled
+    /// into both roles.
+    async fn acquire_negative_memory(
+        &self,
+        ctx: &RequestMetadata,
+        request: &ContextReconstructionRequest,
+        ordering: &ReadOrderingBinding,
+        cue: &RoleAcquisition,
+    ) -> Result<RoleAcquisition, ContextInputsError> {
+        if request.negative_memory_selector == request.projection_selector
+            && request.negative_memory_max_records == request.projection_max_records
+        {
+            return Ok(cue.clone());
+        }
+        self.acquire_projection_inputs(
+            ctx,
+            request,
+            ordering,
+            ROLE_NEGATIVE_MEMORY,
+            &request.negative_memory_selector,
+            request.negative_memory_max_records,
+        )
+        .await
     }
 
     async fn acquire_epistemic(
