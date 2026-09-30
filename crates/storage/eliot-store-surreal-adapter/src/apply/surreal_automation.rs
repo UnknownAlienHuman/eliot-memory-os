@@ -32,8 +32,8 @@ use eliot_store_api::{
     AutomationContinuationBinding, AutomationContinuationDirection, AutomationContinuationFailure,
     AutomationContinuationOrder, AutomationContinuationOrderKey, AutomationContinuationQuery,
     AutomationContinuationReadBinding, AutomationContinuationRef, DecodedAutomationMutation,
-    NamedMutationOperation, NamedReadOperation, StateFence, StoreError, TransitionClass,
-    decode_automation_mutation, verify_automation_continuation,
+    NamedMutationOperation, NamedReadOperation, ReceiptEnvelope, StateFence, StoreError,
+    TransitionClass, decode_automation_mutation, verify_automation_continuation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -59,6 +59,9 @@ pub(crate) struct AutomationRevisionWrite {
     pub revision: String,
     /// Verbatim canonical revision document.
     pub revision_json: String,
+    /// Owner-issued schedule normalization envelope retained beside the
+    /// revision, as the ORIGINAL canonical bytes the owning leg submitted.
+    pub normalization_receipt_json: Option<Value>,
     /// Admission fence of the transition.
     pub state_fence: StateFence,
     /// Scope provenance from the transition envelope.
@@ -162,6 +165,8 @@ pub(crate) struct StoredAutomationRevision {
     pub revision: String,
     /// Verbatim canonical revision document.
     pub revision_json: String,
+    /// Owner-issued schedule normalization envelope retained on the row.
+    pub normalization_receipt_json: Option<Value>,
     /// Admission fence.
     pub state_fence: StateFence,
 }
@@ -1309,11 +1314,50 @@ pub(crate) async fn prepare_automation_writes(
     Ok(writes)
 }
 
+/// The revision-leg payload the create and edit arms commit together.
+///
+/// Grouped as one field group rather than five positionals because the two arms
+/// that write a revision row take exactly these five values and differ only in
+/// whether the pointer is created or moved off a lineage base: `Edit` adds
+/// `previous_revision` and `Create` does not. The memory adapter groups the
+/// same five values under the same name for the same reason.
+struct AutomationRevisionLeg {
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    configuration_state: String,
+    normalization_receipt_json: Option<Value>,
+}
+
 /// Pre-transaction compute context shared by the automation leg helpers.
 struct PrepareContext<'a> {
     db: &'a RpcTransport,
     config: &'a SurrealAdapterConfig,
     transition: &'a eliot_store_api::PreparedTransition,
+}
+
+/// Validates the owner-issued schedule normalization envelope a revision leg
+/// carried and returns the ORIGINAL canonical bytes for retention.
+///
+/// This is the same edge the notification upsert leg applies to
+/// `source_receipt_json`: the envelope is decoded with the shared
+/// `ReceiptEnvelope` type and checked with its own `validate()`, and what is
+/// persisted is what the owning leg submitted — never a re-derivation, a
+/// re-issue, or a digest. Absent stays absent, so a revision leg that carried
+/// no envelope retains none and its compiled occurrence set stays unadmitted
+/// by name downstream.
+fn validate_automation_normalization_envelope(
+    envelope: Option<Value>,
+) -> Result<Option<Value>, AdapterError> {
+    let Some(envelope) = envelope else {
+        return Ok(None);
+    };
+    let decoded: ReceiptEnvelope = serde_json::from_value(envelope.clone())
+        .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
+    decoded
+        .validate()
+        .map_err(|_| AdapterError::Store(StoreError::InvalidReceipt))?;
+    Ok(Some(envelope))
 }
 
 impl PrepareContext<'_> {
@@ -1329,13 +1373,17 @@ impl PrepareContext<'_> {
                 revision,
                 revision_json,
                 configuration_state,
+                normalization_receipt_json,
             } => {
                 self.apply_create(
                     writes,
-                    automation_id,
-                    revision,
-                    revision_json,
-                    configuration_state,
+                    AutomationRevisionLeg {
+                        automation_id,
+                        revision,
+                        revision_json,
+                        configuration_state,
+                        normalization_receipt_json,
+                    },
                 )
                 .await
             }
@@ -1345,14 +1393,18 @@ impl PrepareContext<'_> {
                 revision,
                 revision_json,
                 configuration_state,
+                normalization_receipt_json,
             } => {
                 self.apply_edit(
                     writes,
-                    automation_id,
                     previous_revision,
-                    revision,
-                    revision_json,
-                    configuration_state,
+                    AutomationRevisionLeg {
+                        automation_id,
+                        revision,
+                        revision_json,
+                        configuration_state,
+                        normalization_receipt_json,
+                    },
                 )
                 .await
             }
@@ -1413,11 +1465,17 @@ impl PrepareContext<'_> {
     async fn apply_create(
         &self,
         writes: &mut AutomationWrites,
-        automation_id: String,
-        revision: String,
-        revision_json: String,
-        configuration_state: String,
+        leg: AutomationRevisionLeg,
     ) -> Result<(), AdapterError> {
+        let AutomationRevisionLeg {
+            automation_id,
+            revision,
+            revision_json,
+            configuration_state,
+            normalization_receipt_json,
+        } = leg;
+        let normalization_receipt_json =
+            validate_automation_normalization_envelope(normalization_receipt_json)?;
         require_absent_revision(self.db, self.config, &automation_id, &revision).await?;
         require_absent_current(self.db, self.config, &automation_id).await?;
         let (state_fence, scope_id, task_id) = self.provenance();
@@ -1425,6 +1483,7 @@ impl PrepareContext<'_> {
             automation_id: automation_id.clone(),
             revision: revision.clone(),
             revision_json,
+            normalization_receipt_json,
             state_fence: state_fence.clone(),
             scope_id: scope_id.clone(),
             task_id: task_id.clone(),
@@ -1445,12 +1504,18 @@ impl PrepareContext<'_> {
     async fn apply_edit(
         &self,
         writes: &mut AutomationWrites,
-        automation_id: String,
         previous_revision: String,
-        revision: String,
-        revision_json: String,
-        configuration_state: String,
+        leg: AutomationRevisionLeg,
     ) -> Result<(), AdapterError> {
+        let AutomationRevisionLeg {
+            automation_id,
+            revision,
+            revision_json,
+            configuration_state,
+            normalization_receipt_json,
+        } = leg;
+        let normalization_receipt_json =
+            validate_automation_normalization_envelope(normalization_receipt_json)?;
         let current =
             require_current_revision(self.db, self.config, &automation_id, &previous_revision)
                 .await?;
@@ -1463,6 +1528,7 @@ impl PrepareContext<'_> {
             automation_id: automation_id.clone(),
             revision: revision.clone(),
             revision_json,
+            normalization_receipt_json,
             state_fence: state_fence.clone(),
             scope_id: scope_id.clone(),
             task_id: task_id.clone(),
@@ -1844,8 +1910,26 @@ fn decode_revision_row(value: &Value) -> Result<StoredAutomationRevision, Adapte
         automation_id: text_row_field(object, "automation_id")?,
         revision: text_row_field(object, "revision")?,
         revision_json: text_row_field(object, "revision_json")?,
+        normalization_receipt_json: envelope_row_field(object),
         state_fence: fence_row_field(object)?,
     })
+}
+
+/// Reads the retained owner normalization envelope column, when the row
+/// carries one.
+///
+/// A row written before the envelope was retained has no such column and reads
+/// as absent, which is `unknown`, never an empty or synthesized envelope: the
+/// caller reports the missing owner rather than substituting a receipt. A
+/// present column is passed through verbatim — its integrity is decided once,
+/// by the consumer's own `ReceiptEnvelope::validate()`, so a malformed stored
+/// envelope fails closed there instead of being silently downgraded to absent
+/// here.
+fn envelope_row_field(object: &Map<String, Value>) -> Option<Value> {
+    object
+        .get(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+        .filter(|value| !value.is_null())
+        .cloned()
 }
 
 fn decode_current_row(value: &Value) -> Result<StoredAutomationCurrent, AdapterError> {
@@ -1961,6 +2045,7 @@ fn append_revision_statement(
             "automation_id": write.automation_id,
             "revision": write.revision,
             "revision_json": write.revision_json,
+            "normalization_receipt_json": write.normalization_receipt_json,
             "state_fence": write.state_fence,
             "scope_id": write.scope_id,
             "task_id": write.task_id,
@@ -2260,6 +2345,7 @@ mod template_tests {
                 automation_id: "auto-1".to_owned(),
                 revision: "r-1".to_owned(),
                 revision_json: r#"{"revision":"r-1"}"#.to_owned(),
+                normalization_receipt_json: None,
                 state_fence: test_fence(),
                 scope_id: "user-automation".to_owned(),
                 task_id: None,
