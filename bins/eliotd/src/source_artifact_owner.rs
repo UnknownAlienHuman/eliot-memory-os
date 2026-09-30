@@ -176,61 +176,7 @@ impl SourceArtifactOwner {
             return Err(SourceArtifactOwnerError::WrongLspObservationOperationKind);
         }
 
-        let decoded: RetainedLspObservationV1 = serde_json::from_slice(original_payload)
-            .map_err(SourceArtifactOwnerError::LspObservationPayload)?;
-        let invocation_request = &record.instrument_invocation.request;
-        let source_binding = record.result.receipt().source_binding.as_ref();
-        let dispatch_source = source_binding
-            .and_then(|binding| binding.source_artifact_at_dispatch.as_ref());
-        let expected_source_artifact_id = format!(
-            "source-snapshot:{}",
-            invocation_request.request_id.as_str()
-        );
-        let source_artifact_joins_request =
-            |source: &eliot_lsp_bridge::LspSourceArtifactProjectionV1| {
-                let identity = &source.artifact_reference.identity;
-                identity.artifact_id.as_str() == expected_source_artifact_id.as_str()
-                    && identity.source.as_ref().is_some_and(|source_binding| {
-                        source_binding.integrity.as_deref()
-                            == Some(identity.content.digest_hex.as_str())
-                            && source_binding.revision == source.git_tree_id
-                    })
-                    && record
-                        .instrument_invocation
-                        .input_artifacts
-                        .iter()
-                        .filter(|artifact| *artifact == &identity.artifact_id)
-                        .count()
-                        == 1
-            };
-        let dispatch_source_joins_request =
-            dispatch_source.is_some_and(|source| source_artifact_joins_request(source));
-        let after_run_source_joins_request = source_binding
-            .and_then(|binding| binding.source_artifact_after_run.as_ref())
-            .is_none_or(|source| source_artifact_joins_request(source));
-        let source_binding_joins_invocation = source_binding.is_some_and(|binding| {
-            binding.instrument_request_id == invocation_request.request_id.as_str()
-                && binding.instrument_target == record.instrument_invocation.target
-                && binding.instrument_declared_scope
-                    == record.instrument_invocation.declared_scope
-                && binding.instrument_input_artifacts
-                    == record.instrument_invocation.input_artifacts
-        });
-        if decoded != *record
-            || invocation_request != &admission.request().metadata
-            || invocation_request.product_id != admission.work_scope().product_id
-            || invocation_request.task_id.as_ref() != Some(&admission.task().task_id)
-            || invocation_request.session_id.as_ref() != Some(&admission.session().session_id)
-            || invocation_request.state_fence != operation.state_fence
-            || operation.request_id != invocation_request.request_id
-            || !dispatch_source_joins_request
-            || !after_run_source_joins_request
-            || !source_binding_joins_invocation
-            || !projection.matches_retained_observation(record)
-            || projection.observation() != &record.result
-        {
-            return Err(SourceArtifactOwnerError::LspObservationBindingMismatch);
-        }
+        validate_live_lsp_observation_binding(admission, projection, record, original_payload)?;
 
         profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
         let policy = blob_policy_binding(profile)?;
@@ -389,6 +335,66 @@ impl SourceArtifactOwner {
             },
         )?)
     }
+}
+
+fn validate_live_lsp_observation_binding(
+    admission: &SourceArtifactAdmission,
+    projection: &LspAdoptionProjection,
+    record: &RetainedLspObservationV1,
+    original_payload: &[u8],
+) -> Result<(), SourceArtifactOwnerError> {
+    let decoded: RetainedLspObservationV1 = serde_json::from_slice(original_payload)
+        .map_err(SourceArtifactOwnerError::LspObservationPayload)?;
+    let invocation_request = &record.instrument_invocation.request;
+    let source_binding = record.result.receipt().source_binding.as_ref();
+    let dispatch_source =
+        source_binding.and_then(|binding| binding.source_artifact_at_dispatch.as_ref());
+    let expected_source_artifact_id =
+        format!("source-snapshot:{}", invocation_request.request_id.as_str());
+    let source_artifact_joins_request =
+        |source: &eliot_lsp_bridge::LspSourceArtifactProjectionV1| {
+            let identity = &source.artifact_reference.identity;
+            identity.artifact_id.as_str() == expected_source_artifact_id.as_str()
+                && identity.source.as_ref().is_some_and(|source_binding| {
+                    source_binding.integrity.as_deref()
+                        == Some(identity.content.digest_hex.as_str())
+                        && source_binding.revision == source.git_tree_id
+                })
+                && record
+                    .instrument_invocation
+                    .input_artifacts
+                    .iter()
+                    .filter(|artifact| *artifact == &identity.artifact_id)
+                    .count()
+                    == 1
+        };
+    let dispatch_source_joins_request =
+        dispatch_source.is_some_and(|source| source_artifact_joins_request(source));
+    let after_run_source_joins_request = source_binding
+        .and_then(|binding| binding.source_artifact_after_run.as_ref())
+        .is_none_or(|source| source_artifact_joins_request(source));
+    let source_binding_joins_invocation = source_binding.is_some_and(|binding| {
+        binding.instrument_request_id == invocation_request.request_id.as_str()
+            && binding.instrument_target == record.instrument_invocation.target
+            && binding.instrument_declared_scope == record.instrument_invocation.declared_scope
+            && binding.instrument_input_artifacts == record.instrument_invocation.input_artifacts
+    });
+    if decoded != *record
+        || invocation_request != &admission.request().metadata
+        || invocation_request.product_id != admission.work_scope().product_id
+        || invocation_request.task_id.as_ref() != Some(&admission.task().task_id)
+        || invocation_request.session_id.as_ref() != Some(&admission.session().session_id)
+        || invocation_request.state_fence != admission.operation().state_fence
+        || admission.operation().request_id != invocation_request.request_id
+        || !dispatch_source_joins_request
+        || !after_run_source_joins_request
+        || !source_binding_joins_invocation
+        || !projection.matches_retained_observation(record)
+        || projection.observation() != &record.result
+    {
+        return Err(SourceArtifactOwnerError::LspObservationBindingMismatch);
+    }
+    Ok(())
 }
 
 struct AdmissionBlobReader<'a> {

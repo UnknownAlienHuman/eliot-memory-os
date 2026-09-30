@@ -34,7 +34,7 @@ pub struct ArtifactIdentity {
 impl ArtifactIdentity {
     /// Binds the complete source archive captured for one admitted Instrument
     /// invocation. The operation identity namespaces the artifact handle; the
-    /// existing ArtifactIdentity content address is computed from every exact
+    /// existing `ArtifactIdentity` content address is computed from every exact
     /// archive byte. Callers must first establish that `operation` is the
     /// retained, admitted invocation for the selected source candidate.
     pub fn bind_source_snapshot(
