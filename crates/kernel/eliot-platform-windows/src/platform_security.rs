@@ -1541,7 +1541,7 @@ fn run_user_mode_profile_task_windows(
                 &BSTR::from(receipt.sid.as_str()),
             )
         };
-        let clear_result = unsafe { VariantClear(&mut run_parameters) };
+        let clear_result = unsafe { VariantClear(&raw mut run_parameters) };
         let running = run_result.map_err(|_| WindowsAdapterError::Unavailable)?;
         clear_result.map_err(|_| WindowsAdapterError::Unavailable)?;
         let state = unsafe {
@@ -1600,7 +1600,9 @@ fn user_mode_runex_parameters(
         (1_i32, &receipt.effect_id),
     ] {
         let value = BSTR::from(value.as_str());
-        if unsafe { SafeArrayPutElement(array, &index, (&value as *const BSTR).cast()) }.is_err() {
+        if unsafe { SafeArrayPutElement(array, &raw const index, (&raw const value).cast()) }
+            .is_err()
+        {
             let _ = unsafe { SafeArrayDestroy(array) };
             return Err(WindowsAdapterError::Unavailable);
         }
