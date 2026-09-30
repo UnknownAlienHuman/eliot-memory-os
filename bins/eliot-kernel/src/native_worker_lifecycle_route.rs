@@ -405,11 +405,7 @@ fn native_worker_presented_currentness(
                 .get("binding")
                 .filter(|binding| binding.is_object())
                 .ok_or(NativeWorkerRouteError::Shape { field: "binding" })?;
-            (
-                binding,
-                Some(require_op_id(binding, "claim_id")?),
-                None,
-            )
+            (binding, Some(require_op_id(binding, "claim_id")?), None)
         }
     };
     let worker_generation = require_nonzero_u64(owner, "worker_generation")?;
@@ -867,9 +863,9 @@ impl KernelComposition {
         frame: &Frame,
     ) -> Result<(), TransportError> {
         let operation = match &frame.payload {
-            ProtocolPayload::Json(payload) => payload
-                .get("operation")
-                .and_then(serde_json::Value::as_str),
+            ProtocolPayload::Json(payload) => {
+                payload.get("operation").and_then(serde_json::Value::as_str)
+            }
             _ => None,
         };
         if operation != Some(NATIVE_WORKER_REGISTRATION_OPERATION) {
@@ -890,9 +886,8 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         let identity_value =
             serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?;
-        let request_deadline_unix_ms =
-            require_nonzero_u64(&identity_value, "deadline_unix_ms")
-                .map_err(NativeWorkerRouteError::into_transport)?;
+        let request_deadline_unix_ms = require_nonzero_u64(&identity_value, "deadline_unix_ms")
+            .map_err(NativeWorkerRouteError::into_transport)?;
         let launch_nonce = session.launch_nonce.clone();
         tokio::task::spawn_blocking(move || {
             super::dispatch_launch::wait_for_native_worker_process_start(
@@ -1058,12 +1053,13 @@ impl KernelComposition {
         let process_receipt = &process_start.receipt;
         let process_identity = process_receipt.identity();
         let physical = process_identity.physical();
-        let executable_binding = request
-            .executable_binding
-            .as_ref()
-            .ok_or(NativeWorkerRouteError::Fence {
-                field: "executable_binding",
-            })?;
+        let executable_binding =
+            request
+                .executable_binding
+                .as_ref()
+                .ok_or(NativeWorkerRouteError::Fence {
+                    field: "executable_binding",
+                })?;
         request
             .validate()
             .and_then(|()| request.validate_canonical_digest())
@@ -1107,8 +1103,7 @@ impl KernelComposition {
             || session.module_generation.module_id.as_str()
                 != super::front_door_session::NATIVE_MODULE_ID
             || session.module_generation.generation.value() != request.worker_generation
-            || session.module_generation.artifact_id.as_str()
-                != request.worker_artifact_digest
+            || session.module_generation.artifact_id.as_str() != request.worker_artifact_digest
             || session.module_generation.state_fence != request.state_fence
             || session.launch_nonce != process_start.launch_nonce
             || process_start.launch_nonce != executable_binding.launch_nonce
@@ -1138,8 +1133,7 @@ impl KernelComposition {
             || durable.state == NativeWorkerClaimState::Requested
             || durable.capability_cell.as_ref().map(|cell| cell.as_str())
                 != Some(executable_binding.capability_cell.as_str())
-            || durable.capability_cell_registry_digest.as_deref()
-                != Some(registry_digest.as_str())
+            || durable.capability_cell_registry_digest.as_deref() != Some(registry_digest.as_str())
             || executable_binding.capability_cell_registry_digest != registry_digest
         {
             return Err(NativeWorkerRouteError::Fence {
@@ -1219,9 +1213,8 @@ impl KernelComposition {
         let ProtocolPayload::Json(receipt) = frame.payload else {
             return Err(TransportError::SessionFenced);
         };
-        frame.payload = ProtocolPayload::Json(Self::attach_native_worker_proof_to_receipt(
-            receipt, proof,
-        )?);
+        frame.payload =
+            ProtocolPayload::Json(Self::attach_native_worker_proof_to_receipt(receipt, proof)?);
         frame
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
