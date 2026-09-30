@@ -20,8 +20,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_context::campaign_publication::{
     ContextCampaignRecipeBody, context_delivery_body_digest, context_recipe_body_digest,
 };
-use eliot_context_contracts::{ProjectedCitation, SessionDeliverySnapshot};
-use eliot_contracts::{ArtifactId, StateFence, TaskId, canonical_json_bytes, sha256_hex};
+use eliot_context_candidates::CandidateRequest;
+use eliot_context_contracts::{ContextRecipe, ProjectedCitation, SessionDeliverySnapshot};
+use eliot_contracts::{
+    ArtifactId, RequestId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+};
 use eliot_learning_contracts::{
     CampaignLearningStateView, CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind,
     CampaignPositionRef, CampaignSourceBinding, CampaignSourceRequirement,
@@ -113,6 +116,10 @@ pub enum CampaignPacketError {
     /// A current task recipe is missing, stale, or not bound to the admitted task.
     #[error("campaign TaskPlan recipe does not match the admitted task and fence")]
     InvalidTaskPlan,
+    /// The Context owner recipe is invalid or does not bind to the admitted
+    /// task, scope and fence.
+    #[error("campaign Context recipe does not match the admitted task, scope and fence")]
+    UnboundContextRecipe,
 }
 
 struct ResolvedCampaignSources {
@@ -165,13 +172,14 @@ enum CampaignPacketGapCode {
     /// `eliot_context_admission::admit_context_traced`, reached from the
     /// composition through
     /// `KernelContextReadClient::compile_context_packet`. That composition
-    /// takes the owner-minted closure `PacketAdmissionBundle`, whose four
-    /// identities (`SafetyFloorIdentity`, `PriorityPolicyIdentity`,
-    /// `AdmissionRuleIdentity`, `MeasurementCompositionProfile`) have zero
-    /// production construction sites in this tree, and whose typed candidate
-    /// set is itself reached by no caller. The daemon therefore closes over no
-    /// protected floor, priority policy, admission rule, or measurement
-    /// composition profile.
+    /// closes its owner-minted pieces through the one validating builder
+    /// `PacketAdmissionBundle::build`, but the pieces themselves
+    /// (`SafetyFloorIdentity`, `PriorityPolicyIdentity`,
+    /// `AdmissionRuleIdentity`, `MeasurementCompositionProfile`, and the
+    /// remaining seven-role, candidate-policy, quality, assembly-policy and
+    /// measurement suppliers) still have zero production construction sites
+    /// in this tree. The daemon therefore closes over no protected floor,
+    /// priority policy, admission rule, or measurement composition profile.
     ///
     /// Minting any of them here from a constant, a CLI flag, an env var, or a
     /// caller-supplied string would fabricate the exact selection record I12.26
@@ -439,6 +447,49 @@ pub fn validate_campaign_packet_pair(
             material_refs: arguments.material_refs,
         },
     ))
+}
+
+/// Binds the admitted packet to the current compiler's request identity.
+///
+/// Validation by construction for the #2564 packet-compile edge
+/// (`KernelContextReadClient::compile_context_packet`): the owner recipe is
+/// re-validated and its task/scope/fence binding is compared against the
+/// Kernel-admitted binding field by field, so a substituted recipe fails
+/// closed here instead of supporting a compiled packet. The request identity
+/// is the deterministic Kernel operation handle and the idempotency key is
+/// the Kernel-minted boot-unique attempt identity — never a caller selector.
+///
+/// The returned request is the proof artifact the compile edge will consume
+/// once its remaining owner suppliers land (STITCH-2564-PACKET-SUPPLY: seven
+/// roles, candidate policy, admission bundle pieces, quality card, assembly
+/// policy, measurement). Today only its success signal gates the product
+/// path: the value proves the owner recipe binds the admitted packet, and a
+/// failure takes the typed context-recipe gap below.
+fn candidate_request_for_packet(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    recipe: &ContextRecipe,
+    binding: &CampaignPacketBinding,
+) -> Result<CandidateRequest, CampaignPacketError> {
+    recipe
+        .validate()
+        .map_err(|_| CampaignPacketError::UnboundContextRecipe)?;
+    if recipe.binding.task_id.as_str() != binding.task_id
+        || recipe.binding.scope_id.as_str() != binding.work_scope_id
+        || recipe.binding.state_fence != binding.state_fence
+    {
+        return Err(CampaignPacketError::UnboundContextRecipe);
+    }
+    let request = CandidateRequest {
+        binding: recipe.binding.clone(),
+        request_id: RequestId::new(host_request_operation_id(envelope))
+            .map_err(|_| CampaignPacketError::InvalidInvocation)?,
+        idempotency_key: attempt.attempt_id.clone(),
+    };
+    request
+        .validate()
+        .map_err(|_| CampaignPacketError::InvalidInvocation)?;
+    Ok(request)
 }
 
 /// Resolves one admitted packet into an immutable view and compiles its
@@ -972,6 +1023,29 @@ async fn resolve_compile_and_bind_result(
         &binding.state_fence,
     )
     .is_err()
+    {
+        return campaign_packet_result_body(
+            envelope,
+            attempt,
+            context_blocked_response(
+                publication,
+                CampaignPacketGapCode::ContextRecipeUnavailable,
+                Some(CampaignSourceRole::ContextRecipe),
+                &resolved.resolutions,
+                prior.is_some() && !prior_is_current,
+            ),
+        );
+    }
+    // Issue #2564 I2: bind the admitted packet to the current compiler's
+    // request identity before the product path continues. The owner recipe
+    // must bind the admitted task, scope and fence exactly; a substituted
+    // recipe fails closed through the same context-recipe gap above rather
+    // than supporting a compiled packet. The request itself is consumed by
+    // the future compile edge (STITCH-2564-PACKET-SUPPLY), so only its
+    // success signal gates this path today and the product below is
+    // unchanged.
+    if candidate_request_for_packet(envelope, attempt, &context_recipe_body.recipe, &binding)
+        .is_err()
     {
         return campaign_packet_result_body(
             envelope,
