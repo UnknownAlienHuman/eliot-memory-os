@@ -54,18 +54,63 @@
 //! privacy/authority omission may never be declared reversible. Everything
 //! else in that sentence needs the independent owners and belongs to W3, not
 //! to this schema.
+//!
+//! # W2 — resolving exactly one applicable approved recipe
+//!
+//! A [`ContextRecipePolicy`] is a versioned definition, not a selection. The
+//! selection itself is [`ApprovedRecipeCatalogue`]: the owner-published
+//! configuration that carries the compilation's own applicability dimensions
+//! and compiler-generation profile, the independent
+//! [`GoverningContextRequirements`] every candidate is measured against, and
+//! every approved candidate revision the owner currently holds.
+//! [`ApprovedRecipeCatalogue::resolve`] returns exactly one
+//! [`ResolvedContextRecipe`] or a typed [`RecipeResolutionRefusal`]. There is
+//! no first-match, no latest-by-name and no default: precedence is the
+//! owner-minted [`PolicyRevision`], an exact tie between distinct policy
+//! identities refuses, and an unresolved governing input refuses before any
+//! candidate is examined.
+//!
+//! # W3 — validating against independent governing requirements
+//!
+//! [`GoverningContextRequirements`] composes records owned elsewhere in this
+//! crate: the owner-issued [`DecisionSafetyFloor`](crate::DecisionSafetyFloor),
+//! the six applicability inputs of
+//! [`QualityApplicability`](crate::QualityApplicability) over the independent
+//! [`QUALITY_APPLICABILITY_INPUTS`](crate::QUALITY_APPLICABILITY_INPUTS)
+//! denominator, scorecard dimensions drawn from the independent
+//! [`QUALITY_DIMENSIONS`] denominator, omission reasons owned by
+//! [`OmissionRecord`](crate::OmissionRecord), and
+//! [`ProofCeiling`](eliot_receipts::ProofCeiling). No field is derived from a
+//! candidate recipe, so the comparisons in
+//! [`GoverningContextRequirements::authorize`] are never a candidate checked
+//! against a copy of its own content.
+//!
+//! Two named owners are deliberately NOT read here and are recorded as
+//! boundaries instead of being replaced by a stand-in:
+//!
+//! * I7.11 `ContextAtomPolicy` class comparison is owned by
+//!   `eliot-context-admission` (`FloorAtomPolicy`). That crate depends on this
+//!   one, so this contract cannot read its record content; the only binding
+//!   available here is the admission-rule/floor evidence identity compared in
+//!   `authorize`.
+//! * I12.13's active `Recovery`/`Conflict` Directives have no record type
+//!   anywhere in the workspace. The only owner spelling is
+//!   [`QualityApplicabilityInput::ActiveDirective`], so that is what is
+//!   resolved: an unresolved directive input refuses the whole resolution.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use eliot_contracts::{ArtifactId, PolicyRevision};
-use eliot_receipts::ProtectedReserves;
+use eliot_receipts::{ProofCeiling, ProtectedReserves};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     BoundaryDisposition, BoundaryTransformerRevision, BoundaryUnitKind, ContextError,
-    ContextRecipe, LossPolicy, NonRecoverableReason, OmissionReason, QUALITY_DIMENSIONS,
-    QualityDimension, SemanticRole, validate_digest, validate_text,
+    ContextRecipe, DecisionSafetyFloor, LossPolicy, NonRecoverableReason, OmissionReason,
+    QUALITY_DIMENSIONS, QualityApplicability, QualityApplicabilityInput, QualityDimension,
+    SemanticRole, validate_digest, validate_text,
 };
 
 /// Wire revision of the reusable recipe policy definition.
@@ -138,6 +183,25 @@ impl RecipeApplicability {
             }
         }
         Ok(())
+    }
+
+    /// Whether `declared` names every profile `required` names, in all four
+    /// dimensions.
+    ///
+    /// This is the applicability rule I12.13 states and it is a subset test,
+    /// not an equality test: a policy may apply more broadly than one
+    /// compilation needs, but it cannot apply to a compilation whose declared
+    /// profile it never names. A candidate therefore cannot widen its own
+    /// applicability by editing the compilation side of the comparison.
+    fn declared_covers(declared: &Self, required: &Self) -> bool {
+        [
+            (&declared.task_profiles, &required.task_profiles),
+            (&declared.route_profiles, &required.route_profiles),
+            (&declared.impact_profiles, &required.impact_profiles),
+            (&declared.governance_profiles, &required.governance_profiles),
+        ]
+        .into_iter()
+        .all(|(declared, required)| required.iter().all(|profile| declared.contains(profile)))
     }
 }
 
@@ -823,5 +887,626 @@ impl ContextRecipePolicy {
             }
         }
         Ok(())
+    }
+}
+
+/// Digest domain separator for one pinned recipe resolution.
+///
+/// A third domain, after [`CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN`] and the
+/// instance's own `canonical_policy_digest`. The resolution digest binds the
+/// selected revision, its exact content, the approval decision, the
+/// applicability dimensions and the compiler-generation profile, so a
+/// resolution cannot be replayed against a different compilation.
+pub const CONTEXT_RECIPE_RESOLUTION_DIGEST_DOMAIN: &str =
+    "eliot.smart.context.recipe-resolution.v1";
+
+/// The four applicability dimensions I12.13 declares a recipe against.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecipeApplicabilityDimension {
+    /// `applicable_task_..._profiles`.
+    Task,
+    /// `..._route_..._profiles`.
+    Route,
+    /// `..._impact_..._profiles`.
+    Impact,
+    /// `..._governance_profiles`.
+    Governance,
+}
+
+impl RecipeApplicabilityDimension {
+    /// The declared profile list of this dimension.
+    fn profiles(self, applicability: &RecipeApplicability) -> &[String] {
+        match self {
+            Self::Task => &applicability.task_profiles,
+            Self::Route => &applicability.route_profiles,
+            Self::Impact => &applicability.impact_profiles,
+            Self::Governance => &applicability.governance_profiles,
+        }
+    }
+}
+
+/// Identity of exactly one approved policy revision.
+///
+/// These are the three values that recover the immutable approved content: the
+/// policy identity, its owner-minted revision and the digest of its bytes in
+/// the policy digest domain.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecipePolicyIdentity {
+    /// Stable identity of the selected policy.
+    pub policy_id: ArtifactId,
+    /// Owner-minted reusable policy revision.
+    pub policy_revision: PolicyRevision,
+    /// Digest of the selected policy's exact content.
+    pub policy_sha256: String,
+}
+
+impl RecipePolicyIdentity {
+    /// Read the identity an owner-published candidate already carries.
+    fn of(policy: &ContextRecipePolicy) -> Self {
+        Self {
+            policy_id: policy.policy_id.clone(),
+            policy_revision: policy.policy_revision,
+            policy_sha256: policy.policy_sha256.clone(),
+        }
+    }
+
+    /// Check that this identity still names exactly this content.
+    ///
+    /// The ORIGINAL recorded values of both records are compared. No digest is
+    /// recomputed here to stand in for the owner's record; the policy's own
+    /// `validate` is what re-derives its content digest.
+    fn validate(&self, policy: &ContextRecipePolicy) -> Result<(), ContextError> {
+        policy.validate()?;
+        if self.policy_id != policy.policy_id
+            || self.policy_revision != policy.policy_revision
+            || self.policy_sha256 != policy.policy_sha256
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Why one owner-published candidate is not the resolution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecipeRejectionReason {
+    /// An owner kill or rollback decision revoked this revision.
+    Revoked {
+        /// The owner decision that revoked the revision.
+        decision: ArtifactId,
+    },
+    /// The candidate does not declare one applicability profile of this
+    /// compilation.
+    UndeclaredApplicability {
+        /// Dimension whose profile the candidate never names.
+        dimension: RecipeApplicabilityDimension,
+        /// The exact profile the candidate omits.
+        profile: String,
+    },
+    /// The candidate was issued under a different compiler-generation or route
+    /// profile, including a different transform configuration digest.
+    StaleCompilerGeneration {
+        /// The compiler-generation profile this compilation runs under.
+        expected: RecipeExecutionContour,
+        /// The compiler-generation profile the candidate was issued under.
+        observed: RecipeExecutionContour,
+    },
+}
+
+/// One rejected candidate, with the exact reason it did not apply.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeCandidateRejection {
+    /// Identity of the rejected candidate.
+    pub identity: RecipePolicyIdentity,
+    /// Why it was not selected.
+    pub reason: RecipeRejectionReason,
+}
+
+/// Typed refusal of a dependent Context compilation.
+///
+/// I12.13 requires a missing or ambiguous applicability to block the dependent
+/// compilation rather than fall back. Every variant names what was missing or
+/// which candidates were indistinguishable; none of them resolves to a default.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecipeResolutionRefusal {
+    /// The owner configuration itself is not a closed, valid record, so no
+    /// resolution may be attempted from it.
+    InvalidCatalogue {
+        /// Bounded field-level reason from the closed record validator.
+        reason: String,
+    },
+    /// One or more of the six independent applicability inputs is unresolved,
+    /// so the candidate set cannot be compared against a governing answer.
+    UnresolvedGoverningInput {
+        /// Every unresolved input, in canonical order.
+        inputs: Vec<QualityApplicabilityInput>,
+    },
+    /// No approved, unrevoked, applicable candidate remains.
+    NoApplicableCandidate {
+        /// Every candidate the owner published, with its rejection reason.
+        rejected: Vec<RecipeCandidateRejection>,
+    },
+    /// More than one approved, applicable candidate survived the precedence
+    /// rule at the same owner-minted revision.
+    AmbiguousCandidates {
+        /// The indistinguishable candidates, in policy-identity order.
+        candidates: Vec<RecipePolicyIdentity>,
+    },
+}
+
+fn applicability_input_label(input: QualityApplicabilityInput) -> &'static str {
+    match input {
+        QualityApplicabilityInput::TaskAcceptance => "task_acceptance",
+        QualityApplicabilityInput::Route => "route",
+        QualityApplicabilityInput::Impact => "impact",
+        QualityApplicabilityInput::GovernanceProfile => "governance_profile",
+        QualityApplicabilityInput::ProtectedFloor => "protected_floor",
+        QualityApplicabilityInput::ActiveDirective => "active_directive",
+    }
+}
+
+impl fmt::Display for RecipeResolutionRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCatalogue { reason } => {
+                write!(formatter, "owner recipe catalogue is invalid: {reason}")
+            }
+            Self::UnresolvedGoverningInput { inputs } => {
+                let labels: Vec<&str> = inputs
+                    .iter()
+                    .map(|input| applicability_input_label(*input))
+                    .collect();
+                write!(formatter, "governing applicability unresolved: {labels:?}")
+            }
+            Self::NoApplicableCandidate { rejected } => write!(
+                formatter,
+                "no applicable approved recipe among {} owner candidate(s)",
+                rejected.len()
+            ),
+            Self::AmbiguousCandidates { candidates } => write!(
+                formatter,
+                "{} applicable approved recipes share the highest policy revision",
+                candidates.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecipeResolutionRefusal {}
+
+#[derive(Serialize)]
+struct RecipeResolutionDigestInput<'a> {
+    domain: &'static str,
+    resolution: &'a ResolvedContextRecipe,
+}
+
+/// Exactly one applicable approved recipe, pinned for a whole compilation.
+///
+/// The pinned revision is recoverable: `identity` plus `policy` re-derive the
+/// immutable approved content, `approval` names the owner decision that made
+/// it current, and `execution` names the compiler-generation and route profile
+/// the compilation is bound to. `resolution_sha256` binds all five, so a
+/// resolution cannot be carried into another compilation, another revision or
+/// another generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedContextRecipe {
+    /// Identity of the selected revision.
+    pub identity: RecipePolicyIdentity,
+    /// The exact recoverable immutable approved content that was selected.
+    pub policy: ContextRecipePolicy,
+    /// Owner activation decision that made the selected revision current.
+    pub approval: ArtifactId,
+    /// Applicability dimensions this resolution was made against.
+    pub applicability: RecipeApplicability,
+    /// Compiler-generation and route profile this resolution is pinned to.
+    pub execution: RecipeExecutionContour,
+    /// Digest pinning identity, content, approval, applicability and execution.
+    pub resolution_sha256: String,
+}
+
+impl ResolvedContextRecipe {
+    /// Compute the digest expected in `resolution_sha256`.
+    pub fn canonical_resolution_digest(&self) -> Result<String, ContextError> {
+        let mut canonical = self.clone();
+        canonical.resolution_sha256 = "0".repeat(64);
+        let input = RecipeResolutionDigestInput {
+            domain: CONTEXT_RECIPE_RESOLUTION_DIGEST_DOMAIN,
+            resolution: &canonical,
+        };
+        let bytes = eliot_contracts::canonical_json_bytes(&input)
+            .map_err(|_| ContextError::InvalidField("recipe_resolution.canonical"))?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+
+    /// Re-derive every recorded value of this resolution from the selected
+    /// policy it carries.
+    ///
+    /// A stored resolution is not evidence of its own applicability: the
+    /// approval must be the policy's own activation decision, the pinned
+    /// compiler-generation profile must equal the policy's, the declared
+    /// applicability must cover every profile this compilation named, and the
+    /// recorded digest must match.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.identity.validate(&self.policy)?;
+        validate_text(self.approval.as_str(), "recipe_resolution.approval")?;
+        self.applicability.validate()?;
+        if self.approval != self.policy.supersession.activation
+            || self.execution != self.policy.execution
+            || !RecipeApplicability::declared_covers(
+                &self.policy.applicability,
+                &self.applicability,
+            )
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        validate_digest(
+            &self.resolution_sha256,
+            "recipe_resolution.resolution_sha256",
+        )?;
+        if self.canonical_resolution_digest()? != self.resolution_sha256 {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Independent governing requirements every candidate is validated against.
+///
+/// Every member is an owner record or an owner constant that exists outside
+/// this module: the Decision Safety Floor for this decision boundary, the six
+/// I12.13 applicability inputs with their resolved/unknown partition, the
+/// scorecard dimensions the owner requires this revision to block on, the
+/// omission reasons the owner requires the revision to be able to apply, the
+/// complete ceiling of reasons that may be non-recoverable, and the maximum
+/// proof this decision boundary may carry. None of them is read from, or
+/// derivable from, a candidate recipe.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GoverningContextRequirements {
+    /// Owner-issued Decision Safety Floor for this decision boundary.
+    pub floor: DecisionSafetyFloor,
+    /// Applicability inputs resolved before grading, from the quality owner.
+    pub applicability: QualityApplicability,
+    /// Scorecard dimensions the owner requires this revision to block on.
+    ///
+    /// The set is required and may not be empty: an owner requirement set that
+    /// blocked nothing would let any candidate pass this dimension.
+    pub required_blocking_dimensions: Vec<QualityDimension>,
+    /// Omission reasons the owner requires this revision to be able to apply.
+    pub required_omission_reasons: Vec<OmissionReason>,
+    /// Complete ceiling of reasons that may stand as non-recoverable.
+    ///
+    /// This is a ceiling, not a floor: a recipe may declare fewer
+    /// non-recoverable reasons than this, and any reason outside it refuses.
+    pub permitted_non_recoverable_reasons: Vec<NonRecoverableReason>,
+    /// Maximum proof this decision boundary may carry.
+    pub required_proof_ceiling: ProofCeiling,
+}
+
+impl GoverningContextRequirements {
+    fn validate(&self) -> Result<(), ContextError> {
+        self.floor.validate()?;
+        self.applicability.validate()?;
+        Self::validate_blocking_dimensions(&self.required_blocking_dimensions)?;
+        Self::distinct_omissions(
+            &self.required_omission_reasons,
+            "governing.required_omission_reasons",
+        )?;
+        Self::distinct_omissions(
+            &self.permitted_non_recoverable_reasons,
+            "governing.permitted_non_recoverable_reasons",
+        )
+    }
+
+    fn validate_blocking_dimensions(dimensions: &[QualityDimension]) -> Result<(), ContextError> {
+        if dimensions.is_empty() || dimensions.len() > QUALITY_DIMENSIONS.len() {
+            return Err(ContextError::Bounds {
+                field: "governing.required_blocking_dimensions",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for dimension in dimensions {
+            if !QUALITY_DIMENSIONS.contains(dimension) || !seen.insert(*dimension) {
+                return Err(ContextError::InvalidField(
+                    "governing.required_blocking_dimensions",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn distinct_omissions<T: Copy + Ord>(
+        reasons: &[T],
+        field: &'static str,
+    ) -> Result<(), ContextError> {
+        if reasons.len() > 16 {
+            return Err(ContextError::Bounds { field });
+        }
+        let mut seen = BTreeSet::new();
+        for reason in reasons {
+            if !seen.insert(*reason) {
+                return Err(ContextError::Duplicate(field));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate one resolved recipe against these requirements.
+    ///
+    /// The comparisons are set comparisons against owner requirements, so a
+    /// candidate cannot make itself valid: it may not drop a role the floor
+    /// makes mandatory, shave the floor's capacity envelope, block fewer
+    /// scorecard dimensions than the owner requires, drop a required omission
+    /// reason, widen the non-recoverable set beyond the owner's ceiling, or
+    /// serve a decision boundary whose proof ceiling exceeds its empirical
+    /// qualification.
+    pub fn authorize(
+        &self,
+        resolved: &ResolvedContextRecipe,
+        instance: &ContextRecipe,
+    ) -> Result<(), ContextError> {
+        self.validate()?;
+        resolved.validate()?;
+        let policy = &resolved.policy;
+        policy.binds_recipe(instance)?;
+
+        if self.floor.binding != instance.binding {
+            return Err(ContextError::InvalidFence);
+        }
+        if policy.admission.safety_floor != self.floor.rule_evidence {
+            return Err(ContextError::IdentityConflict);
+        }
+        let features = policy.configured_features()?;
+        let budgeted: BTreeSet<SemanticRole> = policy
+            .section_budgets
+            .iter()
+            .map(|budget| budget.semantic_role)
+            .collect();
+        let mandatory: BTreeSet<SemanticRole> = instance.mandatory_roles.iter().copied().collect();
+        for role in &self.floor.mandatory_roles {
+            if !features.contains(role) || !budgeted.contains(role) || !mandatory.contains(role) {
+                return Err(ContextError::MissingFloor);
+            }
+            if policy.admission.suppressible_roles.contains(role) {
+                return Err(ContextError::MissingFloor);
+            }
+        }
+
+        let floor_capacity = &self.floor.capacity;
+        if instance.capacity.route_capacity < floor_capacity.route_capacity
+            || instance.capacity.output_reserve < floor_capacity.output_reserve
+            || instance.capacity.review_reserve < floor_capacity.review_reserve
+            || instance.capacity.fixed_overhead > floor_capacity.fixed_overhead
+        {
+            return Err(ContextError::CapacityExceeded);
+        }
+
+        let blocked: BTreeSet<QualityDimension> =
+            policy.blocking_dimensions.iter().copied().collect();
+        if !self
+            .required_blocking_dimensions
+            .iter()
+            .all(|dimension| blocked.contains(dimension))
+        {
+            return Err(ContextError::QualityIncomplete);
+        }
+
+        let permitted: BTreeSet<OmissionReason> =
+            policy.omission.permitted_reasons.iter().copied().collect();
+        if !self
+            .required_omission_reasons
+            .iter()
+            .all(|reason| permitted.contains(reason))
+        {
+            return Err(ContextError::OmissionHandleInvalid);
+        }
+        let non_recoverable: BTreeSet<NonRecoverableReason> = policy
+            .omission
+            .non_recoverable_reasons
+            .iter()
+            .copied()
+            .collect();
+        let ceiling: BTreeSet<NonRecoverableReason> = self
+            .permitted_non_recoverable_reasons
+            .iter()
+            .copied()
+            .collect();
+        if !non_recoverable.is_subset(&ceiling) {
+            return Err(ContextError::OmissionHandleInvalid);
+        }
+
+        if self.required_proof_ceiling > ProofCeiling::Observation
+            && policy.qualification.state != RecipeQualificationState::Qualified
+        {
+            return Err(ContextError::QualityIncomplete);
+        }
+
+        if self
+            .applicability
+            .resolved
+            .contains(&QualityApplicabilityInput::ActiveDirective)
+            && (!features.contains(&SemanticRole::Conflict)
+                || !features.contains(&SemanticRole::Negative))
+        {
+            return Err(ContextError::MissingField(
+                "recipe_policy.candidate_features",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The current owner configuration from which exactly one applicable approved
+/// recipe is resolved.
+///
+/// This is the owner catalogue, not the compiler. It carries the compilation's
+/// own applicability dimensions and compiler-generation profile, the
+/// independent governing requirements, and every approved candidate revision the
+/// owner currently holds. The pure compiler receives the result of
+/// [`ApprovedRecipeCatalogue::resolve`]; it never consults this record, a
+/// mutable registry, the filesystem, the network or a model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedRecipeCatalogue {
+    /// Compiler-generation and route profile this compilation runs under.
+    pub execution: RecipeExecutionContour,
+    /// Applicability dimensions of this compilation.
+    pub applicability: RecipeApplicability,
+    /// Independent governing requirements every candidate is measured against.
+    pub governing: GoverningContextRequirements,
+    /// Owner-published approved candidate policy revisions.
+    pub candidates: Vec<ContextRecipePolicy>,
+}
+
+impl ApprovedRecipeCatalogue {
+    /// Validate the closed owner configuration before any candidate is
+    /// compared.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        if self.candidates.is_empty() || self.candidates.len() > 64 {
+            return Err(ContextError::Bounds {
+                field: "recipe_catalogue.candidates",
+            });
+        }
+        self.execution.validate()?;
+        self.applicability.validate()?;
+        self.governing.validate()?;
+        let mut seen = BTreeSet::new();
+        for candidate in &self.candidates {
+            candidate.validate()?;
+            if !seen.insert((candidate.policy_id.clone(), candidate.policy_revision)) {
+                return Err(ContextError::Duplicate("recipe_catalogue.candidates"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve exactly one applicable approved recipe.
+    ///
+    /// Precedence, in order and with no fallback:
+    ///
+    /// 1. an unresolved governing applicability input refuses the compilation
+    ///    before any candidate is read;
+    /// 2. a candidate revoked by an owner kill or rollback decision, issued
+    ///    under another compiler-generation or route profile, or not declaring
+    ///    every applicability profile of this compilation is rejected with that
+    ///    exact reason;
+    /// 3. among the surviving candidates the greatest owner-minted
+    ///    [`PolicyRevision`] wins; an exact tie between distinct policy
+    ///    identities refuses as ambiguous.
+    ///
+    /// The result is pinned by its own digest so the same revision cannot be
+    /// reused for another compilation, task or generation.
+    pub fn resolve(&self) -> Result<ResolvedContextRecipe, RecipeResolutionRefusal> {
+        self.validate()
+            .map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
+                reason: error.to_string(),
+            })?;
+        let unresolved = self.governing.applicability.unresolved();
+        if !unresolved.is_empty() {
+            return Err(RecipeResolutionRefusal::UnresolvedGoverningInput { inputs: unresolved });
+        }
+
+        let mut applicable: Vec<&ContextRecipePolicy> = Vec::new();
+        let mut rejected = Vec::new();
+        for candidate in &self.candidates {
+            match self.applicability_rejection(candidate) {
+                Some(reason) => rejected.push(RecipeCandidateRejection {
+                    identity: RecipePolicyIdentity::of(candidate),
+                    reason,
+                }),
+                None => applicable.push(candidate),
+            }
+        }
+        if applicable.is_empty() {
+            rejected.sort_by(|left, right| left.identity.cmp(&right.identity));
+            return Err(RecipeResolutionRefusal::NoApplicableCandidate { rejected });
+        }
+
+        // `applicable` is non-empty here: the `is_empty` arm above returned.
+        // `max()` is still an `Option`, so the highest revision is taken by
+        // folding from the first candidate rather than unwrapping, which keeps
+        // that invariant structural instead of asserted.
+        let mut highest = applicable[0].policy_revision;
+        for candidate in &applicable[1..] {
+            if candidate.policy_revision > highest {
+                highest = candidate.policy_revision;
+            }
+        }
+        let mut winners: Vec<&ContextRecipePolicy> = applicable
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.policy_revision == highest)
+            .collect();
+        winners.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
+        if winners.len() != 1 {
+            return Err(RecipeResolutionRefusal::AmbiguousCandidates {
+                candidates: winners
+                    .iter()
+                    .map(|candidate| RecipePolicyIdentity::of(candidate))
+                    .collect(),
+            });
+        }
+        let winner = winners[0];
+
+        let mut resolution = ResolvedContextRecipe {
+            identity: RecipePolicyIdentity::of(winner),
+            policy: winner.clone(),
+            approval: winner.supersession.activation.clone(),
+            applicability: self.applicability.clone(),
+            execution: self.execution.clone(),
+            resolution_sha256: "0".repeat(64),
+        };
+        resolution.resolution_sha256 =
+            resolution.canonical_resolution_digest().map_err(|error| {
+                RecipeResolutionRefusal::InvalidCatalogue {
+                    reason: error.to_string(),
+                }
+            })?;
+        Ok(resolution)
+    }
+
+    fn applicability_rejection(
+        &self,
+        candidate: &ContextRecipePolicy,
+    ) -> Option<RecipeRejectionReason> {
+        if let Some(decision) = candidate
+            .supersession
+            .kill
+            .clone()
+            .or(candidate.supersession.rollback.clone())
+        {
+            return Some(RecipeRejectionReason::Revoked { decision });
+        }
+        if candidate.execution != self.execution {
+            return Some(RecipeRejectionReason::StaleCompilerGeneration {
+                expected: self.execution.clone(),
+                observed: candidate.execution.clone(),
+            });
+        }
+        for dimension in [
+            RecipeApplicabilityDimension::Task,
+            RecipeApplicabilityDimension::Route,
+            RecipeApplicabilityDimension::Impact,
+            RecipeApplicabilityDimension::Governance,
+        ] {
+            let declared = dimension.profiles(&candidate.applicability);
+            for profile in dimension.profiles(&self.applicability) {
+                if !declared.contains(profile) {
+                    return Some(RecipeRejectionReason::UndeclaredApplicability {
+                        dimension,
+                        profile: profile.clone(),
+                    });
+                }
+            }
+        }
+        None
     }
 }

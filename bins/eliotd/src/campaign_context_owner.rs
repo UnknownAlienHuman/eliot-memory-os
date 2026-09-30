@@ -175,7 +175,7 @@ pub(crate) fn derive_context_recipe_record(
 ) -> Result<CampaignSourceRecord, String> {
     let recipe_owner = context_recipe_publication(
         &recipe_body.recipe,
-        &recipe_body.policy,
+        &recipe_body.catalogue,
         &recipe_body.compiler_input,
     )
     .map_err(|error| error.to_string())?;
@@ -215,7 +215,7 @@ pub fn build_context_owner_publications(
 ) -> Result<Vec<CampaignSourcePublication>, ContextPublicationError> {
     let recipe_owner = context_recipe_publication(
         &recipe_body.recipe,
-        &recipe_body.policy,
+        &recipe_body.catalogue,
         &recipe_body.compiler_input,
     )?;
     let delivery_owner = context_delivery_publication(&recipe_body.recipe, prior_delivery)?;
@@ -271,7 +271,7 @@ pub(crate) fn validate_context_owner_bodies(
     }
     let recipe_owner = context_recipe_publication(
         &recipe_body.recipe,
-        &recipe_body.policy,
+        &recipe_body.catalogue,
         &recipe_body.compiler_input,
     )
     .map_err(|error| error.to_string())?;

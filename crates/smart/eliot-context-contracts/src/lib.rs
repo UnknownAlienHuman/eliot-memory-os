@@ -111,11 +111,14 @@ pub use readback::{
     ReadbackRefusal, ReadbackRefusalKind, ReadbackRequest,
 };
 pub use recipe::{
-    CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN, CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, ContextRecipePolicy,
-    ContextSectionBudget, CounterMetricMovement, ProtectedReservePolicy, RecipeAdmissionPolicy,
-    RecipeApplicability, RecipeCounterMetric, RecipeExecutionContour, RecipeLayoutPolicy,
-    RecipeOmissionPolicy, RecipeQualification, RecipeQualificationState, RecipeRolePosition,
-    RecipeStage, RecipeSupersession,
+    ApprovedRecipeCatalogue, CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN,
+    CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, CONTEXT_RECIPE_RESOLUTION_DIGEST_DOMAIN,
+    ContextRecipePolicy, ContextSectionBudget, CounterMetricMovement, GoverningContextRequirements,
+    ProtectedReservePolicy, RecipeAdmissionPolicy, RecipeApplicability,
+    RecipeApplicabilityDimension, RecipeCandidateRejection, RecipeCounterMetric,
+    RecipeExecutionContour, RecipeLayoutPolicy, RecipeOmissionPolicy, RecipePolicyIdentity,
+    RecipeQualification, RecipeQualificationState, RecipeRejectionReason, RecipeResolutionRefusal,
+    RecipeRolePosition, RecipeStage, RecipeSupersession, ResolvedContextRecipe,
 };
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 

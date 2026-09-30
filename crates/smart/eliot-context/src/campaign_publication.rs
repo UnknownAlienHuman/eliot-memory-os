@@ -5,8 +5,8 @@
 //! publication path remains responsible for admitting and persisting them.
 
 use eliot_context_contracts::{
-    ContextError as ContractContextError, ContextRecipe, ContextRecipePolicy, ReactiveInputError,
-    SessionDeliverySnapshot,
+    ApprovedRecipeCatalogue, ContextError as ContractContextError, ContextRecipe,
+    ReactiveInputError, RecipeResolutionRefusal, SessionDeliverySnapshot,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_learning_contracts::{CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceRole};
@@ -30,21 +30,22 @@ pub enum ContextSourceDocument {
     Delivery(Box<SessionDeliverySnapshot>),
 }
 
-/// Current Context Compiler recipe identity, its approved policy, and the
-/// exact compiler input admitted for it.
+/// Current Context Compiler owner recipe configuration, the recipe identity it
+/// resolves, and the exact compiler input admitted for it.
 ///
-/// The three members are the three revisions I12.13 and #1724 W1 keep apart:
-/// `policy` is the stable reusable policy definition and its own revision,
-/// `recipe` is the compilation-bound instance that carries the task/attempt/
-/// scope/fence binding and the task revision, and `compiler_input` is the
-/// admitted input for that one compilation. The policy is a required member,
-/// not a defaulted one: a body published without it is refused rather than
-/// read as an instance that was compiled under no approved policy.
+/// The three members are the three revisions I12.13 and #1724 keep apart:
+/// `catalogue` is the owner-published configuration from which exactly one
+/// applicable approved policy revision is resolved, `recipe` is the
+/// compilation-bound instance that carries the task/attempt/scope/fence binding
+/// and the task revision, and `compiler_input` is the admitted input for that
+/// one compilation. The catalogue is a required member, not a defaulted one: a
+/// body published without it is refused rather than read as an instance that
+/// was compiled under no approved recipe configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextCampaignRecipeBody {
-    /// Exact approved reusable policy this instance was issued under.
-    pub policy: ContextRecipePolicy,
+    /// Owner recipe configuration this instance is resolved from.
+    pub catalogue: ApprovedRecipeCatalogue,
     /// Exact rich immutable `ContextRecipe` policy instance.
     pub recipe: ContextRecipe,
     /// Current admitted Context input used by the compiler for this recipe.
@@ -80,6 +81,11 @@ pub enum ContextPublicationError {
     /// A typed owner body could not be canonically serialized.
     #[error("Context source body serialization failed: {0}")]
     Serialization(String),
+    /// Exactly one applicable approved recipe could not be resolved from the
+    /// owner catalogue. The typed refusal is preserved rather than collapsed
+    /// into a generic invalid-recipe answer.
+    #[error("Context recipe resolution refused: {0}")]
+    Resolution(#[from] RecipeResolutionRefusal),
     /// The real source data does not bind to the admitted recipe.
     #[error("Context source does not bind field {field}")]
     BindingMismatch { field: &'static str },
@@ -176,26 +182,30 @@ impl ContextSourcePublication {
 }
 
 /// Build the exact campaign source for an admitted current `ContextRecipe`, the
-/// approved reusable policy it was issued under, and its compiler input. This
+/// owner recipe configuration it is resolved from, and its compiler input. This
 /// publication is available before Context view compilation and therefore does
 /// not depend on a later delivery.
 ///
-/// The policy is validated against the instance before either is published:
-/// `binds_recipe` compares the policy's own recorded digest with the digest the
-/// instance recorded in its `DecisionRevision`, and refuses a mandatory role the
-/// policy does not configure or declares suppressible. Nothing here resolves a
-/// policy — the caller supplies the owner-approved one.
+/// #1724 W2: exactly one applicable approved recipe is resolved from the owner
+/// catalogue before anything is published. An ambiguous, unrevoked-but-
+/// inapplicable or stale candidate set returns the typed
+/// [`RecipeResolutionRefusal`]; there is no first-match and no fallback.
+/// W3: the resolved revision is then validated against the catalogue's
+/// independent governing requirements, and against the instance through
+/// `binds_recipe`, which compares the policy's own recorded digest with the
+/// digest the instance recorded in its `DecisionRevision`.
 pub fn context_recipe_publication(
     recipe: &ContextRecipe,
-    policy: &ContextRecipePolicy,
+    catalogue: &ApprovedRecipeCatalogue,
     compiler_input: &ContextInput,
 ) -> Result<ContextSourcePublication, ContextPublicationError> {
-    policy.binds_recipe(recipe)?;
+    let resolved = catalogue.resolve()?;
+    catalogue.governing.authorize(&resolved, recipe)?;
     compiler_input.validate()?;
     validate_recipe_input_binding(recipe, compiler_input)?;
 
     let document = ContextSourceDocument::Recipe(Box::new(ContextCampaignRecipeBody {
-        policy: policy.clone(),
+        catalogue: catalogue.clone(),
         recipe: recipe.clone(),
         compiler_input: compiler_input.clone(),
     }));
@@ -239,11 +249,18 @@ pub fn context_delivery_publication(
     })
 }
 
-/// Compute the canonical digest of the exact current policy, recipe and input.
+/// Compute the canonical digest of the exact current catalogue, recipe and input.
+///
+/// The resolution is re-derived from the catalogue on every consumption rather
+/// than read from the stored body, so an altered, revoked, stale or ambiguous
+/// owner configuration refuses here exactly as it does at publication.
 pub fn context_recipe_body_digest(
     body: &ContextCampaignRecipeBody,
 ) -> Result<String, ContextPublicationError> {
-    body.policy.binds_recipe(&body.recipe)?;
+    let resolved = body.catalogue.resolve()?;
+    body.catalogue
+        .governing
+        .authorize(&resolved, &body.recipe)?;
     body.compiler_input.validate()?;
     validate_recipe_input_binding(&body.recipe, &body.compiler_input)?;
     let bytes = canonical_json_bytes(body)
