@@ -1777,6 +1777,70 @@ impl ToolExposureHistoryEntry {
     }
 }
 
+/// Classifies a redelivered exposure-history entry against the recorded original.
+///
+/// Both entries validate as recorded first:
+/// [`ToolExposureHistoryEntry::validate`] checks the recorded owner facts and
+/// never re-resolves them. Recorded content then decides, compared with this
+/// operation:
+/// - identical recorded entries are
+///   [`ExposureReplaySignal::IdempotentReplay`]: a replayed publication or
+///   redelivery (for example a lost acknowledgement), reconciled against the
+///   original event with no duplicate execution and no new use;
+/// - entries bound to the same lineage — same versioned tool identity, route
+///   scope, and owner identities — with divergent recorded evidence are a typed
+///   conflict; the caller stages a successor revision through
+///   [`ToolExposureHistoryEntry::successor_reopening`] instead of rewriting,
+///   so a replay can produce neither duplicate execution nor false usage
+///   evidence;
+/// - anything else is `Ok(None)`: not a replay pair, routed to its owners.
+///
+/// Linked expansion across receipt identities stays with the revision-lineage
+/// seam, which owns the receipt identities this contract never mints; a signal
+/// here is evidence for the owning persistence seam to dispose through the
+/// existing observation/receipt/outbox path, never permission to execute again.
+///
+/// The owning persistence seam is the STITCH caller: it disposes the classified
+/// pair through the existing observation/receipt/outbox path keyed by the
+/// revision lineage — `IdempotentReplay` retains the prior and reconciles the
+/// original event, a typed conflict persists a successor revision alongside the
+/// retained prior — while lost acknowledgements reconcile the original event
+/// and unavailable writeback leaves a visible pending obligation on that seam.
+///
+/// # Errors
+///
+/// Returns an error when either entry is inconsistent, or when one bound
+/// lineage carries conflicting recorded evidence.
+pub fn detect_history_replay(
+    previous: &ToolExposureHistoryEntry,
+    current: &ToolExposureHistoryEntry,
+) -> Result<Option<ExposureReplaySignal>, ToolExposureError> {
+    previous.validate()?;
+    current.validate()?;
+    if previous == current {
+        return Ok(Some(ExposureReplaySignal::IdempotentReplay));
+    }
+    if same_history_lineage(previous, current) {
+        return Err(ToolExposureError::InvalidField {
+            field: "history.revision.lineage",
+            reason: "redelivered history lineage carries conflicting recorded evidence; persist a successor revision instead of rewriting",
+        });
+    }
+    Ok(None)
+}
+
+/// Whether both entries record the same bound lineage: versioned tool identity,
+/// route scope, and owner identities as recorded.
+fn same_history_lineage(
+    previous: &ToolExposureHistoryEntry,
+    current: &ToolExposureHistoryEntry,
+) -> bool {
+    previous.tool_definition == current.tool_definition
+        && previous.definition_version == current.definition_version
+        && previous.route_fingerprint == current.route_fingerprint
+        && previous.identities == current.identities
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
