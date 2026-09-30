@@ -28,7 +28,7 @@ use super::{
     GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector, IpcImplementation,
     KernelAuditChain, KernelAuditFallback, KernelBackupCapture, KernelBackupRestore,
     KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey, KernelError,
-    KernelPathAdmission, KernelService, KernelStartupMode, KernelStoreRebindProductionBoundary,
+    KernelPathAdmission, KernelService, KernelStoreRebindProductionBoundary,
     KernelSupervisionLeaseAuthority, ModuleGeneration, ModuleGenerationState,
     OperationalRecoveryStore, OrsError, OrsGenerationCoordinator, PROTOCOL_VERSION,
     PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
@@ -306,7 +306,7 @@ impl KernelComposition {
     /// authenticated handoff. Test-only adapter construction is available
     /// under the test configuration.
     ///
-    /// A config carrying [`KernelStartupMode::ShadowCandidate`] builds the
+    /// A config carrying `KernelStartupMode::ShadowCandidate` builds the
     /// restricted I14.16 inspection posture instead (issue #1953): the
     /// capability set is selected before any mutable resource opens and the
     /// composition-owned durable writes are skipped. The service stays `Cold`
@@ -448,9 +448,27 @@ impl KernelComposition {
         })
         .map_err(&terminal)?;
         #[cfg(windows)]
+        Self::adopt_descriptor_supervision_authority(&mut config, &prepared.descriptor)
+            .map_err(&terminal)?;
+        Self::assemble_with_prepared_material(config, prepared, ors, ors_path, platform)
+            .map_err(&terminal)
+    }
+
+    /// Adopts the installer-provisioned supervision authority from the
+    /// protected handoff descriptor.
+    ///
+    /// Mechanical split of `new_with_authority_descriptor` (issue #1953):
+    /// the match arms and observations are verbatim, and the mismatch error
+    /// is returned raw so the caller applies the same terminal observation
+    /// exactly once.
+    #[cfg(windows)]
+    fn adopt_descriptor_supervision_authority(
+        config: &mut KernelConfig,
+        descriptor: &ProcessAuthorityHandoffDescriptor,
+    ) -> Result<(), KernelBuildError> {
         if config.require_descriptor_supervision_authority {
             let descriptor_authority = SupervisionLeaseAuthorityConfig {
-                authority: prepared.descriptor.supervision_authority.clone(),
+                authority: descriptor.supervision_authority.clone(),
             };
             match &config.supervision_lease_authority {
                 Some(configured) if configured != &descriptor_authority => {
@@ -458,10 +476,10 @@ impl KernelComposition {
                         EntrypointStage::SupervisionAuthority,
                         "kernel.composition.supervision_authority_mismatch",
                     );
-                    return Err(terminal(KernelBuildError::Service(
+                    return Err(KernelBuildError::Service(
                         "configured supervision authority does not match the protected handoff descriptor"
                             .to_owned(),
-                    )));
+                    ));
                 }
                 Some(_) => {
                     observe_entrypoint_with_detail(
@@ -478,12 +496,28 @@ impl KernelComposition {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Binds the prepared descriptor snapshot, consumes the authority
+    /// handoff, and assembles the process-authority composition.
+    ///
+    /// Mechanical split of `new_with_authority_descriptor` (issue #1953):
+    /// the bindings and owner-typed mappings are verbatim, and errors are
+    /// returned raw so the caller applies the same terminal observation
+    /// exactly once.
+    fn assemble_with_prepared_material(
+        config: KernelConfig,
+        prepared: PreparedAuthorityMaterial,
+        ors: Arc<RedbRecoveryStore>,
+        ors_path: PathBuf,
+        platform: Arc<WindowsPlatform>,
+    ) -> Result<Self, KernelBuildError> {
         let snapshot_binding = AuthoritySnapshotBinding::from_wire(
             prepared.descriptor.snapshot_binding.clone(),
             &prepared.descriptor.authority_id,
         )
-        .map_err(|error| KernelBuildError::Core(error.to_string()))
-        .map_err(&terminal)?;
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         let codec: Arc<dyn DispatchSnapshotCodec> = Arc::new(WindowsDispatchSnapshotCodec::new(
             Arc::clone(&platform),
             prepared.descriptor.dispatch_key.clone(),
@@ -498,11 +532,9 @@ impl KernelComposition {
             &prepared.descriptor,
             &handoff,
         )
-        .map_err(|error| KernelBuildError::Core(error.to_string()))
-        .map_err(&terminal)?;
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         Self::consume_authority_handoff(&ors, &handoff)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))
-            .map_err(&terminal)?;
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         Self::assemble_with_process_controller(
             config,
             controller,
@@ -511,7 +543,6 @@ impl KernelComposition {
             ors_path,
             platform,
         )
-        .map_err(&terminal)
     }
 
     /// Builds a production composition with an externally supplied process
