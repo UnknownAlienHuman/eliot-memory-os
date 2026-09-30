@@ -7785,6 +7785,9 @@ pub struct HostRequestApplicationBinding {
     /// join the inert workspace selector and request identity to the peer
     /// receipt without reconstructing them.
     pub source_activation_ticket: Value,
+    /// Exact original Kernel activation decision, including its disposition
+    /// and any host-policy readback.
+    pub source_activation_result: Value,
     /// Exact retained activation result digest.
     pub activation_result_sha256: Option<String>,
     /// P07 owner revision captured by the admission owner.
@@ -7852,6 +7855,7 @@ impl HostRequestApplicationBinding {
             });
         }
         self.validate_source_activation_ticket()?;
+        self.validate_source_activation_result()?;
         if let Some(digest) = &self.activation_result_sha256 {
             validate_digest(digest, "host_request_activation_result_sha256")?;
         }
@@ -7911,6 +7915,124 @@ impl HostRequestApplicationBinding {
                     &serde_json::to_value(&self.state_fence)
                         .map_err(|error| OrsError::Encoding(error.to_string()))?,
                 )
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_source_activation_result(&self) -> Result<(), OrsError> {
+        let Some(result_object) = self.source_activation_result.as_object() else {
+            return Err(OrsError::InvalidField {
+                field: "host_request_source_activation_result",
+                reason: "the exact original activation result must be retained as an object",
+            });
+        };
+        let result_digest = result_object
+            .get("result_sha256")
+            .and_then(Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_source_activation_result_digest",
+                reason: "the original result digest is required",
+            })?;
+        validate_digest(result_digest, "host_request_source_activation_result_digest")?;
+        let mut unsigned_result = self.source_activation_result.clone();
+        unsigned_result
+            .as_object_mut()
+            .ok_or(OrsError::PayloadIntegrityMismatch)?
+            .insert("result_sha256".to_owned(), Value::String(String::new()));
+        let bytes = canonical_json_bytes(&unsigned_result)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let ticket = &self.source_activation_ticket;
+        if sha256_hex(&bytes) != result_digest
+            || result_object.get("ticket_id") != ticket.get("ticket_id")
+            || result_object.get("ticket_sha256") != ticket.get("ticket_sha256")
+            || result_object.get("ticket_state_fence") != ticket.get("state_fence")
+            || result_object.get("cancellation_id") != ticket.get("cancellation_id")
+            || result_object.get("ticket_state_fence")
+                != Some(
+                    &serde_json::to_value(&self.state_fence)
+                        .map_err(|error| OrsError::Encoding(error.to_string()))?,
+                )
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        self.validate_source_activation_disposition(result_digest)
+    }
+
+    fn validate_source_activation_disposition(
+        &self,
+        result_digest: &str,
+    ) -> Result<(), OrsError> {
+        let result = &self.source_activation_result;
+        let disposition = result
+            .get("disposition")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_source_activation_disposition",
+                reason: "the original activation disposition is required",
+            })?;
+        let host_origin = self
+            .observation_policy_binding
+            .get("origin")
+            .and_then(|origin| origin.get("kind"))
+            .and_then(Value::as_str)
+            == Some("HOST_PEER");
+        let resolved = disposition == "RESOLVED";
+        if (host_origin && resolved)
+            || (resolved && self.activation_result_sha256.as_deref() != Some(result_digest))
+            || (!resolved && self.activation_result_sha256.is_some())
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        if resolved
+            && (result
+                .get("disposition")
+                .and_then(|value| value.get("binding"))
+                != self.resolved_application_binding.as_ref()
+                || result.get("owner_evidence") != self.activation_owner_evidence.as_ref())
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        if host_origin {
+            if !matches!(
+                disposition,
+                "TASK_SELECTION_REQUIRED" | "SCOPE_SELECTION_REQUIRED" | "SCOPE_AMBIGUOUS"
+            ) {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_source_activation_disposition",
+                    reason: "host-origin capture requires the retained unresolved selection disposition",
+                });
+            }
+            self.validate_host_policy_readback(result)?;
+        }
+        Ok(())
+    }
+
+    fn validate_host_policy_readback(&self, result: &Value) -> Result<(), OrsError> {
+        let readback = result
+            .get("observation_host_policy_readback")
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_source_activation_policy_readback",
+                reason: "negative host-origin results must retain their exact policy readback",
+            })?;
+        if readback.get("owner_projection_value")
+            != Some(&self.observation_policy_binding)
+            || readback
+                .get("owner_projection_sha256")
+                .and_then(Value::as_str)
+                != Some(self.observation_policy_binding_sha256.as_str())
+            || readback
+                .get("kernel_owner")
+                .and_then(|owner| owner.get("revision"))
+                .and_then(Value::as_u64)
+                != self.p07_revision
+            || readback
+                .get("kernel_owner")
+                .and_then(|owner| owner.get("bundle_sha256"))
+                .and_then(Value::as_str)
+                != self.p07_bundle_sha256.as_deref()
         {
             return Err(OrsError::FenceMismatch);
         }
