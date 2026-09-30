@@ -19,6 +19,13 @@
 //! form. Line pins are the current reading of a hop, not the durable evidence —
 //! the hop names are.
 //!
+//! The INTRA-FILE PINS in the mutable-state, clock and experiment-path sections
+//! below were re-measured in the same #1145 pass, on the base of the branch that
+//! carries them. This module document is itself inserted ABOVE the code it cites,
+//! so any edit here shifts every pin below it; that is why each of those pins
+//! names the SYMBOL it resolves to and carries the line number only as the
+//! current reading of that symbol.
+//!
 //! ## Public surface
 //!
 //! 192 top-level `pub` items and 80 `pub` methods across twelve source files.
@@ -258,24 +265,26 @@
 //!   `[workspace.lints.rust]`, and `overlay_policy_routing.rs:19` repeats it
 //!   at module scope.
 //! - **Clock.** Ten clock reads in total, all in construction or bookkeeping
-//!   paths, none in a gate: `OffsetDateTime::now_utc()` at `lib.rs:646` (`new`),
-//!   `lib.rs:724,863,946` (`set_details`, `transition`,
-//!   `apply_lifecycle_edge`), `lib.rs:969` (`promotion_input`),
-//!   `brief.rs:299,322` (`brief_at_safe_boundary`, `record_owner_decision`) and
-//!   `candidate_bounds.rs:1122` (a lineage merge), plus `Uuid::now_v7()` at
-//!   `lib.rs:961` and `brief.rs:288`. `datetime_from_unix` converts a
-//!   caller-supplied timestamp and reads no clock. No expiry, admission or
-//!   promotion decision in this crate consults the clock on its own behalf;
+//!   paths, none in a gate: `OffsetDateTime::now_utc()` in
+//!   `ImprovementCandidate::new` (`lib.rs:703`), in `set_details` (`lib.rs:781`),
+//!   in `transition` (`lib.rs:920`), in `apply_lifecycle_edge` (`lib.rs:1003`) and
+//!   in `promotion_input` (`lib.rs:1057`); in `brief::brief_at_safe_boundary`
+//!   (`brief.rs:337`) and `brief::record_owner_decision` (`brief.rs:360`); and
+//!   at `candidate_bounds.rs:1122`, a lineage merge. Plus `Uuid::now_v7()` in
+//!   `promotion_input` (`lib.rs:1048`) and in `brief.rs:326`.
+//!   `datetime_from_unix` converts a caller-supplied timestamp and reads no
+//!   clock. No expiry, admission or promotion decision in this crate consults
+//!   the clock on its own behalf;
 //!   `now` is always a parameter (`candidate_bounds.rs:1370,1877,1897,2237,2355`
 //!   and `governed_screen.rs:83,152,190`). The two modules that own the inner
 //!   learning loop are clock-free outright: `Select-String` for
 //!   `OffsetDateTime` over `learning_closure.rs` and `promotion_input.rs`
 //!   returns nothing, so neither module can read a clock even by accident.
-//! - **One owner-held read.** `brief.rs:200` calls
-//!   `CanonicalLearningDeltaStore::load()`, a read of already-committed
-//!   IN-PROCESS state the caller passes in. It opens no transport, no store
-//!   client and no durability path; `brief.rs:176-181` states the caller's
-//!   mutex obligation.
+//! - **One owner-held read.** `brief::SafeBoundary::from_observed_closure`
+//!   calls `CanonicalLearningDeltaStore::load()` (`brief.rs:232`), a read of
+//!   already-committed IN-PROCESS state the caller passes in. It opens no
+//!   transport, no store client and no durability path; the caller's mutex
+//!   obligation is stated at `brief.rs:207-209`.
 //!
 //! Per acceptance item A9 — "cannot edit source/config/policy, install
 //! artifacts, activate generations, issue authority, promote support/truth or
@@ -285,8 +294,9 @@
 //! has no generation API and reads no generation store; authority issuance:
 //! every boundary is a refusal (`SelfPromotionForbidden`,
 //! `ApplicationClassViolation`, `UnsafeBoundary`, `BudgetGateViolation`,
-//! `MissingBudgetProof`), and `validate_base` at `lib.rs:805` refuses
-//!   `advisory_only: false` at `lib.rs:820` outright; support/truth promotion
+//! `MissingBudgetProof`), and `ImprovementCandidate::validate_base`
+//!   (`lib.rs:862`) refuses `advisory_only: false` (`lib.rs:877`) outright;
+//!   support/truth promotion
 //!   and `VERIFIED_COMPLETE`: no name in this crate's source spells either, and
 //!   the only transition into a promoting disposition,
 //!   `ImprovementCandidate::promote_lifecycle`, is unreachable from production
@@ -301,16 +311,16 @@
 //! Nothing in this crate RUNS an experiment. What it holds is record and
 //! validation only:
 //!
-//! - `ReplayPlan` (`lib.rs:598`) names the fixed-replay, holdout, transfer and
-//!   counter-metric references. `ReplayPlan::validate` (`lib.rs:579`) refuses
+//! - `ReplayPlan` (`lib.rs:627`) names the fixed-replay, holdout, transfer and
+//!   counter-metric references. `ReplayPlan::validate` (`lib.rs:636`) refuses
 //!   empty reference groups and an empty `transfer_refs`. It matches
 //!   I12.24:67, "fixed replay as diagnostic evidence only".
 //! - `canary_plan`, `rollback` and `stop_condition` are `String` REFERENCES on
-//!   the candidate (`lib.rs:617-621`); `validate` (`lib.rs:744-746`) requires
-//!   them to be non-empty and never resolves them.
+//!   the candidate (`lib.rs:674-678`); `ImprovementCandidate::validate`
+//!   (`lib.rs:801-803`) requires them to be non-empty and never resolves them.
 //! - `BudgetProof` / `ComplexityEconomicsDelta` /
 //!   `require_matched_budget_for_promotion` are the I12.24:76 matched-budget
-//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1101`) refuses a
+//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1140`) refuses a
 //!   promotion-bound outcome that lacks a budget ledger, a conclusive
 //!   economics delta, affected checks, live shadow/canary evidence or
 //!   delayed-harm visibility. That is I12.24:76's "An unmatched ledger or
@@ -337,11 +347,11 @@
 //!   ledger or delta is recomputed, re-derived or substituted on either path.
 //! - The lifecycle enums carry the experiment states and enforce the edge
 //!   table: `AcceptedForExperiment` and `Running` exist only as transitions
-//!   `lifecycle_edge_allowed` (`lib.rs:545`) permits, and the promoting step
+//!   `lifecycle_edge_allowed` (`lib.rs:574`) permits, and the promoting step
 //!   "promote, narrow, rollback or archive" (I12.24:70) is gated so that
-//!   `transition_lifecycle` refuses `Supported`/`Narrowed` outright
-//!   (`lib.rs:915`) and only `promote_lifecycle` admits them, and only with a
-//!   budget proof.
+//!   `ImprovementCandidate::transition_lifecycle` refuses `Supported`/`Narrowed`
+//!   outright (`lib.rs:948`) and only `promote_lifecycle` admits them, and only
+//!   with a budget proof.
 //! - `promotion_input::prepare_promotion_input` (`promotion_input.rs:551`) is a
 //!   pure gate over already-supplied evidence, and it has no production caller.
 //!
