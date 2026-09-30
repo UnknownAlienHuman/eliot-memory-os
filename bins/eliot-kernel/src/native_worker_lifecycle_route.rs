@@ -60,11 +60,10 @@ use eliot_kernel_service::{
     NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
 };
 use eliot_ors::{
-    AdmissionReservationClaimRef, AdmissionReservationClaims,
-    AdmissionReservationIdentityInput, AdmissionReservationStageRequest, NativeWorkerClaimRecord,
-    NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OrsError, StateFenceSnapshot,
-    admission_reservation_identity, epoch_lineage_for, stage_admission_reservation_inactive,
-    stage_operation_identity,
+    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationIdentityInput,
+    AdmissionReservationStageRequest, NativeWorkerClaimRecord, NativeWorkerClaimState, OpaqueLabel,
+    OperationIdentity, OrsError, StateFenceSnapshot, admission_reservation_identity,
+    epoch_lineage_for, stage_admission_reservation_inactive, stage_operation_identity,
 };
 use eliot_process::OperationId;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -2126,10 +2125,11 @@ impl KernelComposition {
         now_unix_ms: i64,
     ) -> Result<OperationIdentity, NativeWorkerRouteError> {
         let claims = Self::admission_reservation_claims(request, claim, registration)?;
-        let authority_epoch = epoch_lineage_for(&request.authority_epoch, None)
-            .map_err(|_| NativeWorkerRouteError::Fence {
+        let authority_epoch = epoch_lineage_for(&request.authority_epoch, None).map_err(|_| {
+            NativeWorkerRouteError::Fence {
                 field: "authority_epoch",
-            })?;
+            }
+        })?;
         // The fence is captured from the EXACT fence the claim was admitted
         // under and validated against the canonical EpochId with the existing
         // validator. The digest is checked against the ORIGINAL recorded fence
@@ -2147,11 +2147,8 @@ impl KernelComposition {
             field: "state_fence",
         })?;
         let identity_input = AdmissionReservationIdentityInput {
-            work_item_id: OperationIdentity::new(&request.claim_id).map_err(|_| {
-                NativeWorkerRouteError::Shape {
-                    field: "claim_id",
-                }
-            })?,
+            work_item_id: OperationIdentity::new(&request.claim_id)
+                .map_err(|_| NativeWorkerRouteError::Shape { field: "claim_id" })?,
             proposed_attempt_id: OperationIdentity::new(&request.attempt_id).map_err(|_| {
                 NativeWorkerRouteError::Shape {
                     field: "attempt_id",
@@ -2175,11 +2172,10 @@ impl KernelComposition {
         // The expiry boundary is the claim's own deadline, already validated
         // as strictly in the future by `require_claim_deadline` above. The
         // `expires_at_ms` is therefore the deadline, never a fresh clock read.
-        let expires_at_ms = i64::try_from(request.deadline_unix_ms).map_err(|_| {
-            NativeWorkerRouteError::Fence {
+        let expires_at_ms =
+            i64::try_from(request.deadline_unix_ms).map_err(|_| NativeWorkerRouteError::Fence {
                 field: "deadline_unix_ms",
-            }
-        })?;
+            })?;
         stage_admission_reservation_inactive(
             self.generation_gateway.ors.as_ref(),
             &AdmissionReservationStageRequest {
@@ -2218,9 +2214,7 @@ impl KernelComposition {
         // recomputed in order to be trusted later; `AdmissionReservationClaimRef
         // ::validate` only checks its shape, and the typed ORS owner re-reads
         // and re-validates the recorded value on every readback.
-        fn digest<T: Serialize>(
-            value: &T,
-        ) -> Result<String, NativeWorkerRouteError> {
+        fn digest<T: Serialize>(value: &T) -> Result<String, NativeWorkerRouteError> {
             sha256_json(value).map_err(|_| NativeWorkerRouteError::Shape {
                 field: "admission_reservation.claim_digest",
             })
@@ -2228,13 +2222,10 @@ impl KernelComposition {
         // Resource claim: the installed worker artifact + configuration content
         // the presenting registration already bound.
         let resources = AdmissionReservationClaimRef {
-            reference: OpaqueLabel::new(require_claim_text(
-                registration,
-                "installation_id",
-            )?)
-            .map_err(|_| NativeWorkerRouteError::Fence {
-                field: "installation_id",
-            })?,
+            reference: OpaqueLabel::new(require_claim_text(registration, "installation_id")?)
+                .map_err(|_| NativeWorkerRouteError::Fence {
+                    field: "installation_id",
+                })?,
             sha256: digest(&(
                 &request.installation_id,
                 &request.worker_artifact_digest,
@@ -2254,10 +2245,11 @@ impl KernelComposition {
         // Environment claim: the exact task WorkScope and governed decision
         // environment the unit is admitted into.
         let environment = AdmissionReservationClaimRef {
-            reference: OpaqueLabel::new(require_claim_text(claim, "work_scope_id")?)
-                .map_err(|_| NativeWorkerRouteError::Fence {
+            reference: OpaqueLabel::new(require_claim_text(claim, "work_scope_id")?).map_err(
+                |_| NativeWorkerRouteError::Fence {
                     field: "work_scope_id",
-                })?,
+                },
+            )?,
             sha256: digest(&(
                 &request.work_scope_id,
                 &request.task_id,
@@ -2380,15 +2372,10 @@ impl KernelComposition {
         // environment. The derived reservation identity is stable across a
         // crash, so a restart re-derives and reloads this same reservation
         // (#1678 A2) instead of minting a second one.
-        let stage_now_ms = i64::try_from(now).map_err(|_| NativeWorkerRouteError::Fence {
-            field: "now",
-        })?;
-        let reservation_id = self.stage_claim_admission_reservation(
-            &request,
-            claim,
-            registration,
-            stage_now_ms,
-        )?;
+        let stage_now_ms =
+            i64::try_from(now).map_err(|_| NativeWorkerRouteError::Fence { field: "now" })?;
+        let reservation_id =
+            self.stage_claim_admission_reservation(&request, claim, registration, stage_now_ms)?;
         let service = self.service_guard()?;
         let live_epoch = service.authority_epoch();
         let decision = service

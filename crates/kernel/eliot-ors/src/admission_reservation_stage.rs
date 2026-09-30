@@ -78,12 +78,11 @@ use eliot_receipts::ReceiptIdentity;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdmissionReservationActivationEvidence, AdmissionReservationActivationRequest,
-    AdmissionReservationActivatedOutcome, AdmissionReservationClaimRef,
+    AdmissionReservationActivatedOutcome, AdmissionReservationActivationEvidence,
+    AdmissionReservationActivationRequest, AdmissionReservationClaimRef,
     AdmissionReservationClaims, AdmissionReservationRecord, AdmissionReservationSnapshot,
-    AdmissionReservationStage, AdmissionReservationState, EpochIdentity, EpochLineage,
-    OpaqueLabel, OperationIdentity, OperationalRecoveryStore, OrsError, StateFenceSnapshot,
-    model::sha256_hex,
+    AdmissionReservationStage, AdmissionReservationState, EpochIdentity, EpochLineage, OpaqueLabel,
+    OperationIdentity, OperationalRecoveryStore, OrsError, StateFenceSnapshot, model::sha256_hex,
 };
 
 /// Wire revision of this stage identity contract.
@@ -588,10 +587,10 @@ pub fn activation_operation_identity(
         activation_receipt,
     ))
     .map_err(|error| OrsError::Encoding(error.to_string()))?;
-    Ok(OperationIdentity::new(format!(
+    OperationIdentity::new(format!(
         "admission-reservation-activation:{}",
         sha256_hex(&preimage)
-    ))?)
+    ))
 }
 
 /// Activates the exact reservation from owner evidence and returns the durable

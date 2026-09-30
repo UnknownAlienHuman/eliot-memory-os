@@ -30055,6 +30055,123 @@ impl RedbRecoveryStore {
     }
 }
 
+/// Target-specific evidence carried by one reservation transition.
+///
+/// Both lifecycle shapes the owner supports — a receipt-backed disposition
+/// (`Reconciling`/`Released`/`Expired`) and a receipt-backed activation
+/// (`Active`) — flow through the same CAS, replay, epoch, fence, source state
+/// and time checks in
+/// `RedbRecoveryStore::prepare_admission_reservation_transition`. This enum
+/// only selects the target state and the evidence that target commits, so
+/// `Active` gets exactly the same concurrency and identity guarantees the
+/// disposition transitions already had, rather than a second scheme.
+#[derive(Clone, Copy)]
+enum AdmissionReservationTransitionSpec<'a> {
+    /// A receipt-backed disposition of an inactive/reconciling reservation.
+    Disposition {
+        /// The caller-supplied disposition with its reason and evidence.
+        disposition: &'a AdmissionReservationDisposition,
+        /// The lifecycle target this disposition names.
+        target: AdmissionReservationState,
+    },
+    /// A receipt-backed activation of a staged/reconciling reservation.
+    Activation {
+        /// The caller-supplied owner evidence for the activation.
+        request: &'a AdmissionReservationActivationRequest,
+    },
+}
+
+impl AdmissionReservationTransitionSpec<'_> {
+    fn reservation_id(&self) -> &OperationIdentity {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.reservation_id,
+            Self::Activation { request } => &request.reservation_id,
+        }
+    }
+
+    fn operation_id(&self) -> &OperationIdentity {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.operation_id,
+            Self::Activation { request } => &request.operation_id,
+        }
+    }
+
+    fn expected_current_receipt(&self) -> &OperationalMutationReceipt {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.expected_current_receipt,
+            Self::Activation { request } => &request.expected_current_receipt,
+        }
+    }
+
+    fn authority_epoch(&self) -> &EpochLineage {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.authority_epoch,
+            Self::Activation { request } => &request.authority_epoch,
+        }
+    }
+
+    fn state_fence(&self) -> &StateFenceSnapshot {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.state_fence,
+            Self::Activation { request } => &request.state_fence,
+        }
+    }
+
+    fn now_ms(&self) -> i64 {
+        match self {
+            Self::Disposition { disposition, .. } => disposition.now_ms,
+            Self::Activation { request } => request.now_ms,
+        }
+    }
+
+    fn target_state(&self) -> AdmissionReservationState {
+        match self {
+            Self::Disposition { target, .. } => *target,
+            Self::Activation { .. } => AdmissionReservationState::Active,
+        }
+    }
+
+    /// The exact persisted transition request this transition commits.
+    ///
+    /// Both shapes project onto the owner's one transition record, so the
+    /// replay, CAS, fence and epoch checks below compare one request type
+    /// rather than two. An activation is not a disposition: it is neither
+    /// released nor expired, so it records no disposition reason and no
+    /// disposition evidence — its evidence is the pair of owner receipts.
+    fn persisted_request(&self) -> AdmissionReservationTransitionRequest {
+        match self {
+            Self::Disposition {
+                disposition,
+                target,
+            } => AdmissionReservationTransitionRequest {
+                operation_id: disposition.operation_id.clone(),
+                target_state: *target,
+                reason: Some(disposition.reason.clone()),
+                evidence: Some(disposition.evidence.clone()),
+                expected_current_receipt: disposition.expected_current_receipt.clone(),
+                authority_epoch: disposition.authority_epoch.clone(),
+                state_fence: disposition.state_fence.clone(),
+                now_ms: disposition.now_ms,
+                activation: None,
+            },
+            Self::Activation { request } => AdmissionReservationTransitionRequest {
+                operation_id: request.operation_id.clone(),
+                target_state: AdmissionReservationState::Active,
+                reason: None,
+                evidence: None,
+                expected_current_receipt: request.expected_current_receipt.clone(),
+                authority_epoch: request.authority_epoch.clone(),
+                state_fence: request.state_fence.clone(),
+                now_ms: request.now_ms,
+                activation: Some(AdmissionReservationActivationEvidence {
+                    canonical_admission_receipt: request.canonical_admission_receipt.clone(),
+                    activation_receipt: request.activation_receipt.clone(),
+                }),
+            },
+        }
+    }
+}
+
 impl RedbRecoveryStore {
     pub(super) fn admission_reservation_input(
         record: &AdmissionReservationRecord,
@@ -30131,82 +30248,6 @@ impl RedbRecoveryStore {
         ))
     }
 
-    /// Target-specific evidence carried by one reservation transition.
-    ///
-    /// Both lifecycle shapes the owner supports — a receipt-backed disposition
-    /// (`Reconciling`/`Released`/`Expired`) and a receipt-backed activation
-    /// (`Active`) — flow through the same CAS, replay, epoch, fence, source
-    /// state and time checks in
-    /// [`Self::prepare_admission_reservation_transition`]. This enum only
-    /// selects the target state and the evidence that target commits, so
-    /// `Active` gets exactly the same concurrency and identity guarantees the
-    /// disposition transitions already had, rather than a second scheme.
-    enum AdmissionReservationTransitionSpec<'a> {
-        /// A receipt-backed disposition of an inactive/reconciling reservation.
-        Disposition {
-            /// The caller-supplied disposition with its reason and evidence.
-            disposition: &'a AdmissionReservationDisposition,
-            /// The lifecycle target this disposition names.
-            target: AdmissionReservationState,
-        },
-        /// A receipt-backed activation of a staged/reconciling reservation.
-        Activation {
-            /// The caller-supplied owner evidence for the activation.
-            request: &'a AdmissionReservationActivationRequest,
-        },
-    }
-
-    impl AdmissionReservationTransitionSpec<'_> {
-        fn reservation_id(&self) -> &OperationIdentity {
-            match self {
-                Self::Disposition { disposition, .. } => &disposition.reservation_id,
-                Self::Activation { request } => &request.reservation_id,
-            }
-        }
-
-        fn operation_id(&self) -> &OperationIdentity {
-            match self {
-                Self::Disposition { disposition, .. } => &disposition.operation_id,
-                Self::Activation { request } => &request.operation_id,
-            }
-        }
-
-        fn expected_current_receipt(&self) -> &OperationalMutationReceipt {
-            match self {
-                Self::Disposition { disposition, .. } => &disposition.expected_current_receipt,
-                Self::Activation { request } => &request.expected_current_receipt,
-            }
-        }
-
-        fn authority_epoch(&self) -> &EpochLineage {
-            match self {
-                Self::Disposition { disposition, .. } => &disposition.authority_epoch,
-                Self::Activation { request } => &request.authority_epoch,
-            }
-        }
-
-        fn state_fence(&self) -> &StateFenceSnapshot {
-            match self {
-                Self::Disposition { disposition, .. } => &disposition.state_fence,
-                Self::Activation { request } => &request.state_fence,
-            }
-        }
-
-        fn now_ms(&self) -> i64 {
-            match self {
-                Self::Disposition { disposition, .. } => disposition.now_ms,
-                Self::Activation { request } => request.now_ms,
-            }
-        }
-
-        fn target_state(&self) -> AdmissionReservationState {
-            match self {
-                Self::Disposition { target, .. } => *target,
-                Self::Activation { .. } => AdmissionReservationState::Active,
-            }
-        }
-    }
-
     fn prepare_admission_reservation_transition(
         record: &mut AdmissionReservationRecord,
         spec: AdmissionReservationTransitionSpec<'_>,
@@ -30246,41 +30287,7 @@ impl RedbRecoveryStore {
         // recognized, while a same-identity different-content request is a
         // conflict. For an activation the request additionally carries the
         // committed owner evidence.
-        let request = match &spec {
-            AdmissionReservationTransitionSpec::Disposition { disposition, target } => {
-                AdmissionReservationTransitionRequest {
-                    operation_id: disposition.operation_id.clone(),
-                    target_state: *target,
-                    reason: Some(disposition.reason.clone()),
-                    evidence: Some(disposition.evidence.clone()),
-                    expected_current_receipt: disposition.expected_current_receipt.clone(),
-                    authority_epoch: disposition.authority_epoch.clone(),
-                    state_fence: disposition.state_fence.clone(),
-                    now_ms: disposition.now_ms,
-                    activation: None,
-                }
-            }
-            AdmissionReservationTransitionSpec::Activation { request } => {
-                AdmissionReservationTransitionRequest {
-                    operation_id: request.operation_id.clone(),
-                    target_state: AdmissionReservationState::Active,
-                    // An activation is not a disposition: it is neither
-                    // released nor expired, so it records no disposition
-                    // reason and no disposition evidence. Its evidence is the
-                    // pair of owner receipts below, and nothing else.
-                    reason: None,
-                    evidence: None,
-                    expected_current_receipt: request.expected_current_receipt.clone(),
-                    authority_epoch: request.authority_epoch.clone(),
-                    state_fence: request.state_fence.clone(),
-                    now_ms: request.now_ms,
-                    activation: Some(AdmissionReservationActivationEvidence {
-                        canonical_admission_receipt: request.canonical_admission_receipt.clone(),
-                        activation_receipt: request.activation_receipt.clone(),
-                    }),
-                }
-            }
-        };
+        let request = spec.persisted_request();
         if record.operation_id == *spec.operation_id() {
             if record.last_transition.as_ref() == Some(&request) && record.state == target {
                 return Ok(false);
@@ -30358,10 +30365,8 @@ impl RedbRecoveryStore {
         spec: AdmissionReservationTransitionSpec<'_>,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
         let target = spec.target_state();
-        let key = Self::operational_key(
-            OperationalKind::AdmissionReservation,
-            spec.reservation_id(),
-        );
+        let key =
+            Self::operational_key(OperationalKind::AdmissionReservation, spec.reservation_id());
         let write = self.database.begin_write().map_err(storage)?;
         let mut durable =
             Self::decode_operational_current(&write, &key)?.ok_or(OrsError::ReservationNotFound)?;
@@ -30381,11 +30386,8 @@ impl RedbRecoveryStore {
                 reason: "reservation identity does not match its operational key".to_owned(),
             });
         }
-        let should_commit = Self::prepare_admission_reservation_transition(
-            &mut record,
-            spec,
-            &current_snapshot,
-        )?;
+        let should_commit =
+            Self::prepare_admission_reservation_transition(&mut record, spec, &current_snapshot)?;
         if !should_commit {
             return Ok(current_snapshot);
         }
@@ -31280,7 +31282,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         activation: AdmissionReservationActivationRequest,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
         self.transition_kernel_admission_reservation(
-            RedbRecoveryStore::AdmissionReservationTransitionSpec::Activation {
+            AdmissionReservationTransitionSpec::Activation {
                 request: &activation,
             },
         )
@@ -31291,7 +31293,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
         self.transition_kernel_admission_reservation(
-            RedbRecoveryStore::AdmissionReservationTransitionSpec::Disposition {
+            AdmissionReservationTransitionSpec::Disposition {
                 disposition: &disposition,
                 target: AdmissionReservationState::Reconciling,
             },
@@ -31303,7 +31305,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
         self.transition_kernel_admission_reservation(
-            RedbRecoveryStore::AdmissionReservationTransitionSpec::Disposition {
+            AdmissionReservationTransitionSpec::Disposition {
                 disposition: &disposition,
                 target: AdmissionReservationState::Released,
             },
@@ -31315,7 +31317,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
         self.transition_kernel_admission_reservation(
-            RedbRecoveryStore::AdmissionReservationTransitionSpec::Disposition {
+            AdmissionReservationTransitionSpec::Disposition {
                 disposition: &disposition,
                 target: AdmissionReservationState::Expired,
             },
