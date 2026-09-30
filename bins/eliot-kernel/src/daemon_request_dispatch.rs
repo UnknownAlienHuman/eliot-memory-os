@@ -4898,8 +4898,9 @@ impl KernelComposition {
         // Store dispatch. See `improvement_brief_decision_refusal` for the
         // closed disposition this returns and for the exact route that is
         // missing.
-        if let eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { brief_id, .. } =
-            &request.intent.operation
+        if let eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief {
+            brief_id, ..
+        } = &request.intent.operation
         {
             return Self::bind_user_automation_operator_response(
                 &request,
@@ -5034,15 +5035,13 @@ impl KernelComposition {
         request: &eliot_kernel_service::UserAutomationServiceRequest,
         brief_id: &str,
     ) -> serde_json::Value {
-        Self::user_automation_runtime_error_response(UserAutomationRuntimeError::Rejected(
-            format!(
-                "the authenticated principal {} may select a non-mutating disposition (reject or \
+        Self::user_automation_runtime_error_response(UserAutomationRuntimeError::Rejected(format!(
+            "the authenticated principal {} may select a non-mutating disposition (reject or \
                  investigate) over improvement brief {brief_id}, but this Kernel route owns no \
                  durable writer for a brief decision, so the selection is declined rather than \
                  recorded; the decision has not been executed and nothing was changed",
-                request.authenticated_principal,
-            ),
-        ))
+            request.authenticated_principal,
+        )))
     }
 
     #[cfg(windows)]
