@@ -1186,6 +1186,12 @@ pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
         // from the variant, never from reading the code out of the message.
         DaemonError::Composition(_)
         | DaemonError::Finish(_)
+        // Issue #370 R1: a coordination admission or owner-image persistence
+        // failure is the Governor refusing or failing the coordination
+        // lifecycle, so it reports to the same Governor semantic owner as
+        // composition and finish above. The owner comes from the variant, never
+        // from reading the code out of the message.
+        | DaemonError::Coordination(_)
         | DaemonError::Maintenance(_)
         | DaemonError::TaskBinding(_)
         // Issue #18: a diverged cell declaration refuses composition like a
@@ -1525,6 +1531,12 @@ impl ErrorRecord {
         let (code, detail) = match error {
             DaemonError::Composition(_) => ("composition", error.to_string()),
             DaemonError::Finish(_) => ("finish-attempt", error.to_string()),
+            // Issue #370 R1: `coordination` names the coordination owner edge —
+            // admission, the fenced owner-image commit, or its rehydration —
+            // and the detail keeps the typed owner refusal verbatim, so an
+            // unknown work item, an expired or foreign lease, a moved fence,
+            // and a store compare-and-set conflict stay distinguishable.
+            DaemonError::Coordination(_) => ("coordination", error.to_string()),
             DaemonError::Kernel(_) => ("kernel-transport", error.to_string()),
             DaemonError::ActivationExpired => ("activation-expired", error.to_string()),
             DaemonError::LaunchConfig(_) => ("launch-config", error.to_string()),
