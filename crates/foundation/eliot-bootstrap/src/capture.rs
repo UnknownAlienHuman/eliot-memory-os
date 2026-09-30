@@ -20,7 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use cap_fs_ext::{ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, ambient_authority};
 use cap_std::fs::{
     Dir as CapabilityDir, File as CapabilityFile, OpenOptions as CapabilityOpenOptions,
 };
@@ -1114,11 +1114,7 @@ pub fn observe_selected_workspace_source_contents(
                 reason: WorkspaceSourceContentUnavailableReason::SymlinkRefused,
             },
             RootRelativeFileOpen::Opened(file) => {
-                if !file.metadata()?.is_file() {
-                    WorkspaceSourceContentObservation::Unavailable {
-                        reason: WorkspaceSourceContentUnavailableReason::NotRegularFile,
-                    }
-                } else {
+                if file.metadata()?.is_file() {
                     let mut bytes = Vec::with_capacity(normative::MAX_RECEIPT_BYTES + 1);
                     file.take((normative::MAX_RECEIPT_BYTES + 1) as u64)
                         .read_to_end(&mut bytes)?;
@@ -1131,6 +1127,10 @@ pub fn observe_selected_workspace_source_contents(
                         WorkspaceSourceContentObservation::Observed {
                             original_content_sha256: format!("sha256:{}", sha256_hex(&bytes)),
                         }
+                    }
+                } else {
+                    WorkspaceSourceContentObservation::Unavailable {
+                        reason: WorkspaceSourceContentUnavailableReason::NotRegularFile,
                     }
                 }
             }
@@ -1205,13 +1205,11 @@ fn classify_root_relative_open_error(
         Ok(metadata) if !require_directory && !metadata.is_file() => {
             Ok(RootRelativeFileOpen::NotRegularFile)
         }
-        Ok(_) if is_missing_path_error(&open_error) => Ok(RootRelativeFileOpen::Missing),
-        Ok(_) => Err(open_error.into()),
         Err(metadata_error) if is_missing_path_error(&metadata_error) => {
             Ok(RootRelativeFileOpen::Missing)
         }
-        Err(_) if is_missing_path_error(&open_error) => Ok(RootRelativeFileOpen::Missing),
-        Err(_) => Err(open_error.into()),
+        Ok(_) | Err(_) if is_missing_path_error(&open_error) => Ok(RootRelativeFileOpen::Missing),
+        Ok(_) | Err(_) => Err(open_error.into()),
     }
 }
 
