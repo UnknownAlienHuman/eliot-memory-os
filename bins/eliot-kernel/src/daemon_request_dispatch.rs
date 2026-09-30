@@ -7050,7 +7050,8 @@ impl KernelComposition {
             return Ok(Self::store_staging_refusal_response(
                 "write_receipt",
                 campaign_source_operation_id.as_str(),
-                &error.to_string(),
+                &operation.context.state_fence,
+                &error,
             ));
         }
         let gateway = self.retained_store_gateway()?;
@@ -9031,7 +9032,7 @@ impl KernelComposition {
     }
 
     /// Renders one refused pre-call durable staging attempt as the operation's
-    /// error response (issue #1681 W4, I5.6, I14.4).
+    /// error response (issue #1681 W4, I5.6, I14.4; issue #1679 W7-daemon).
     ///
     /// This refusal is reached only BEFORE any possible Store call: the ORS
     /// reservation above is the durable intent record that must precede every
@@ -9049,16 +9050,36 @@ impl KernelComposition {
     /// entered only on a real `reserve_campaign_source_publications` error, so
     /// the durable staging attempt is known to have failed rather than inferred
     /// from a later check being absent.
+    ///
+    /// Issue #1679 W7-daemon: the owner outcome travels typed. `error` is the
+    /// exact [`eliot_ors::OrsError`] the ORS owner returned, and
+    /// [`staging_owner_outcome`] names its variant (plus the conflicting
+    /// durable key for a publication conflict) instead of flattening it into
+    /// prose, so the caller can tell a slot held by another live operation
+    /// from malformed input without parsing the reason string. The admitted
+    /// attempt fence travels beside it: a retry binds this same fence, and no
+    /// capacity, permit, or protected partition is consulted or manufactured
+    /// here.
+    ///
+    /// Disclosed limit (#1679 A9 remainder): this answer carries no versioned
+    /// `I14BackpressureResponseV1` directive because the owner reports no
+    /// measured durable-bytes exhaustion — only identity-conflict, contract,
+    /// or storage failures — and the existing contract check rejects a
+    /// `STORAGE_BACKPRESSURE` directive without a claimed exhausted
+    /// `ORS_DURABLE_QUEUE_BYTES` observation. Emitting one would manufacture
+    /// evidence. The full-directive upgrade waits on the ORS owner reporting
+    /// measured queue pressure.
     #[cfg(windows)]
     fn store_staging_refusal_response(
         kind: &str,
         operation_id: &str,
-        refusal: &str,
+        state_fence: &StateFence,
+        error: &eliot_ors::OrsError,
     ) -> serde_json::Value {
         serde_json::json!({
             "status": "error",
             "code": "STORAGE_BACKPRESSURE",
-            "reason": refusal,
+            "reason": error.to_string(),
             "value": { "kind": kind, "value": null },
             "recovery": {
                 "staging": {
@@ -9067,9 +9088,34 @@ impl KernelComposition {
                     "accepted_pending": false,
                     "stage_receipt": serde_json::Value::Null,
                     "poll_handle": serde_json::Value::Null,
+                    "owner_outcome": staging_owner_outcome(error),
+                    "state_fence": state_fence,
                 },
             },
         })
+    }
+
+    /// Names the exact typed ORS owner outcome behind one staging refusal
+    /// (issue #1679 W7-daemon slice).
+    ///
+    /// The outcome is read off the typed [`eliot_ors::OrsError`] variant the
+    /// ORS owner returned, never matched out of rendered text: a publication
+    /// conflict names the conflicting durable key the owner proved, so the
+    /// caller can poll that slot's holder instead of blindly retrying; any
+    /// other owner refusal reports only that staging was refused, with the
+    /// full refusal text in `reason`. The `if let` stays non-exhaustive on
+    /// purpose: a new owner variant keeps failing closed through the generic
+    /// arm rather than breaking this dispatch arm.
+    #[cfg(windows)]
+    fn staging_owner_outcome(error: &eliot_ors::OrsError) -> serde_json::Value {
+        if let eliot_ors::OrsError::CampaignSourcePublicationConflict { key } = error {
+            serde_json::json!({
+                "outcome": "campaign_source_publication_conflict",
+                "conflicting_key": key,
+            })
+        } else {
+            serde_json::json!({ "outcome": "staging_refused" })
+        }
     }
 
     /// Renders one refused canonical read as the truthful `DB_UNAVAILABLE`
