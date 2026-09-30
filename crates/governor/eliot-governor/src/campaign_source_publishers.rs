@@ -81,8 +81,7 @@ pub fn campaign_owner_source_registry() -> Vec<CampaignOwnerSourceRegistration> 
 /// This registration is intentionally excluded from the fixed 26-role
 /// campaign learning-view denominator.
 #[must_use]
-pub fn orientation_classification_source_registration(
-) -> Option<CampaignOwnerSourceRegistration> {
+pub fn orientation_classification_source_registration() -> Option<CampaignOwnerSourceRegistration> {
     let role = CampaignSourceRole::OrientationClassification;
     Some(CampaignOwnerSourceRegistration {
         role,
@@ -97,8 +96,7 @@ pub fn orientation_classification_source_registration(
 /// Registration for the independently-read canonical Orientation admission
 /// source. It stays outside the fixed 26-role learning-view denominator.
 #[must_use]
-pub fn orientation_admission_source_registration(
-) -> Option<CampaignOwnerSourceRegistration> {
+pub fn orientation_admission_source_registration() -> Option<CampaignOwnerSourceRegistration> {
     let role = CampaignSourceRole::OrientationAdmission;
     Some(CampaignOwnerSourceRegistration {
         role,
@@ -116,16 +114,12 @@ fn campaign_owner_source_registration(
     campaign_owner_source_registry()
         .into_iter()
         .find(|registration| registration.role == role)
-        .or_else(|| {
-            match role {
-                CampaignSourceRole::OrientationClassification => {
-                    orientation_classification_source_registration()
-                }
-                CampaignSourceRole::OrientationAdmission => {
-                    orientation_admission_source_registration()
-                }
-                _ => None,
+        .or_else(|| match role {
+            CampaignSourceRole::OrientationClassification => {
+                orientation_classification_source_registration()
             }
+            CampaignSourceRole::OrientationAdmission => orientation_admission_source_registration(),
+            _ => None,
         })
 }
 
@@ -311,10 +305,10 @@ impl CampaignOwnerSourceInput {
         self,
     ) -> Result<CampaignSourcePublication, CampaignSourcePublisherError> {
         let registration = campaign_owner_source_registration(self.role).ok_or_else(|| {
-                CampaignSourcePublisherError::Invalid(
-                    "owner role is absent from the production registry".to_owned(),
-                )
-            })?;
+            CampaignSourcePublisherError::Invalid(
+                "owner role is absent from the production registry".to_owned(),
+            )
+        })?;
         let owner_matches = if self.role == CampaignSourceRole::ContextDelivery {
             self.owner_id.as_str().starts_with("owner:eliot-context/")
         } else {

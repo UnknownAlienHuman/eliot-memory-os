@@ -3095,8 +3095,7 @@ fn campaign_source_identity_matches(
         | R::ExperiencePosition
         | R::AdaptationPosition
         | R::EvaluationPosition
-        | R::EconomicsProgress
-        => matches!(
+        | R::EconomicsProgress => matches!(
             (record_id, revision),
             (
                 CampaignOwnerRecordId::Resource(_),
@@ -3190,8 +3189,7 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
         | R::ExperiencePosition
         | R::AdaptationPosition
         | R::EvaluationPosition
-        | R::EconomicsProgress
-        => matches!(
+        | R::EconomicsProgress => matches!(
             (&record.record_id, &record.revision),
             (
                 CampaignOwnerRecordId::Resource(_),
@@ -3737,10 +3735,7 @@ fn campaign_role_accepts_schema(
                 R::OrientationClassification,
                 D::OrientationClassificationProfile
             )
-            | (
-                R::OrientationAdmission,
-                D::OrientationAdmissionRecord
-            )
+            | (R::OrientationAdmission, D::OrientationAdmissionRecord)
     )
 }
 

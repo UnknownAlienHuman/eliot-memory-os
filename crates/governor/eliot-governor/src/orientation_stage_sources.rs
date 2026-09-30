@@ -55,8 +55,9 @@ impl<'a> OrientationClassificationSourceReadback<'a> {
     pub fn from_read(
         read: &'a CampaignSourceRevisionRead,
     ) -> Result<Self, OrientationClassificationSourceError> {
-        read.validate()
-            .map_err(|error| OrientationClassificationSourceError::InvalidRead(error.to_string()))?;
+        read.validate().map_err(|error| {
+            OrientationClassificationSourceError::InvalidRead(error.to_string())
+        })?;
         match read.status {
             CampaignSourceReadStatus::Current => {}
             CampaignSourceReadStatus::Stale => {
@@ -81,15 +82,16 @@ impl<'a> OrientationClassificationSourceReadback<'a> {
             serde_json::from_value(record.document.body.clone()).map_err(|error| {
                 OrientationClassificationSourceError::InvalidRead(error.to_string())
             })?;
-        body.validate()
-            .map_err(|error| OrientationClassificationSourceError::InvalidRead(error.to_string()))?;
-        let profile: OrientationClassificationProfile =
-            serde_json::from_value(body.projection).map_err(|error| {
+        body.validate().map_err(|error| {
+            OrientationClassificationSourceError::InvalidRead(error.to_string())
+        })?;
+        let profile: OrientationClassificationProfile = serde_json::from_value(body.projection)
+            .map_err(|error| {
                 OrientationClassificationSourceError::InvalidProfile(error.to_string())
             })?;
-        profile
-            .validate()
-            .map_err(|error| OrientationClassificationSourceError::InvalidProfile(error.to_string()))?;
+        profile.validate().map_err(|error| {
+            OrientationClassificationSourceError::InvalidProfile(error.to_string())
+        })?;
         if !orientation_record_matches_profile(record, &profile) {
             return Err(OrientationClassificationSourceError::IdentityMismatch);
         }
@@ -103,34 +105,44 @@ impl<'a> OrientationClassificationSourceReadback<'a> {
         scope_id: &str,
         state_fence: &StateFence,
     ) -> Result<(), OrientationClassificationSourceError> {
-        self.read
-            .validate()
-            .map_err(|error| OrientationClassificationSourceError::InvalidRead(error.to_string()))?;
+        self.read.validate().map_err(|error| {
+            OrientationClassificationSourceError::InvalidRead(error.to_string())
+        })?;
         if self.read.status != CampaignSourceReadStatus::Current {
-            return Err(OrientationClassificationSourceError::NotCurrent("not current"));
+            return Err(OrientationClassificationSourceError::NotCurrent(
+                "not current",
+            ));
         }
-        self.profile
-            .validate()
-            .map_err(|error| OrientationClassificationSourceError::InvalidProfile(error.to_string()))?;
+        self.profile.validate().map_err(|error| {
+            OrientationClassificationSourceError::InvalidProfile(error.to_string())
+        })?;
         let record = self
             .read
             .source
             .as_ref()
             .ok_or(OrientationClassificationSourceError::IncompleteRead)?;
-        if !is_orientation_record(record) || !orientation_record_matches_profile(record, &self.profile) {
+        if !is_orientation_record(record)
+            || !orientation_record_matches_profile(record, &self.profile)
+        {
             return Err(OrientationClassificationSourceError::IdentityMismatch);
         }
         if self.profile.target.task_id.as_str() != task_id {
-            return Err(OrientationClassificationSourceError::RuntimeBinding("task_id"));
+            return Err(OrientationClassificationSourceError::RuntimeBinding(
+                "task_id",
+            ));
         }
         if self.profile.target.scope_id.as_str() != scope_id {
-            return Err(OrientationClassificationSourceError::RuntimeBinding("scope_id"));
+            return Err(OrientationClassificationSourceError::RuntimeBinding(
+                "scope_id",
+            ));
         }
         if &self.profile.target.state_fence != state_fence
             || &record.recorded_state_fence != state_fence
             || &self.read.read_state_fence != state_fence
         {
-            return Err(OrientationClassificationSourceError::RuntimeBinding("state_fence"));
+            return Err(OrientationClassificationSourceError::RuntimeBinding(
+                "state_fence",
+            ));
         }
         Ok(())
     }
@@ -185,11 +197,13 @@ fn is_orientation_source(
 ) -> bool {
     is_orientation_record(record)
         && head.role == CampaignSourceRole::OrientationClassification
-        && head.owner_id.as_str() == campaign_source_owner_id(CampaignSourceRole::OrientationClassification)
+        && head.owner_id.as_str()
+            == campaign_source_owner_id(CampaignSourceRole::OrientationClassification)
         && head.record_id == record.record_id
         && head.revision == record.revision
         && receipt.role == CampaignSourceRole::OrientationClassification
-        && receipt.owner_id.as_str() == campaign_source_owner_id(CampaignSourceRole::OrientationClassification)
+        && receipt.owner_id.as_str()
+            == campaign_source_owner_id(CampaignSourceRole::OrientationClassification)
         && receipt.record_id == record.record_id
         && receipt.revision == record.revision
 }
@@ -206,8 +220,7 @@ fn orientation_record_matches_profile(
     record: &CampaignSourceRecord,
     profile: &OrientationClassificationProfile,
 ) -> bool {
-    record.record_id
-        == CampaignOwnerRecordId::Artifact(profile.target.target_id.clone())
+    record.record_id == CampaignOwnerRecordId::Artifact(profile.target.target_id.clone())
         && record.revision
             == CampaignOwnerRevision::ResourceSnapshot(profile.target.target_revision.clone())
 }

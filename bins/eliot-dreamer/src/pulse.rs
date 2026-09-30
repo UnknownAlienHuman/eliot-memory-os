@@ -77,9 +77,9 @@ use eliot_dreamer_conflict_analysis::{
 };
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
 use eliot_dreamer_contracts::{
-    DreamInputBundle, ModelRouteDisposition, ModelRouteOutcome,
-    OrientationClassificationProfile, ValidatedCurationItem,
-    ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
+    DreamInputBundle, ModelRouteDisposition, ModelRouteOutcome, OrientationClassificationProfile,
+    ValidatedCurationItem, ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes,
+    digest_hex,
 };
 use eliot_dreamer_orientation::OrientationError;
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
@@ -596,7 +596,7 @@ pub(crate) fn run_classification_stage(
                 return Err(PulseError::Classification);
             }
             let input_commitment = canonical_input_commitment(&(inputs.input, inputs.policy))
-            .ok_or(PulseError::Classification)?;
+                .ok_or(PulseError::Classification)?;
             let canonical = canonical_bytes(&output).ok();
             let commitment = output.result_digest.clone();
             Ok(PulseStage::executed(

@@ -2,9 +2,8 @@
 
 use eliot_contracts::ArtifactId;
 use eliot_dreamer_contracts::{
-    ClassificationCriterionRole, ClassificationInput, CriterionApplicability,
-    CriterionStatus, OrientationClassificationProfile, PriorAssignmentRef,
-    TaxonomyAlternative, TaxonomyCoverage,
+    ClassificationCriterionRole, ClassificationInput, CriterionApplicability, CriterionStatus,
+    OrientationClassificationProfile, PriorAssignmentRef, TaxonomyAlternative, TaxonomyCoverage,
 };
 use eliot_epistemic_contracts::{EvidenceGrade, GradeAssignment};
 use serde::{Deserialize, Serialize};

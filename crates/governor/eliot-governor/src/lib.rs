@@ -47,6 +47,7 @@ mod experience_commit;
 mod finish_attempt;
 mod governor_authority_projection;
 pub mod orientation_projection_owner;
+pub mod orientation_stage_sources;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
@@ -807,3 +808,7 @@ pub const fn degraded_health() -> HealthVector {
         capacity: HealthDimension::Unknown,
     }
 }
+
+pub use orientation_stage_sources::{
+    OrientationClassificationSourceError, OrientationClassificationSourceReadback,
+};

@@ -16,7 +16,9 @@ const MAX_TEXT: usize = 16_384;
 const MAX_SUPPORT_HANDLES: usize = 64;
 
 /// The eight precision distinctions in A-14b.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimKind {
     NumericQuantified,

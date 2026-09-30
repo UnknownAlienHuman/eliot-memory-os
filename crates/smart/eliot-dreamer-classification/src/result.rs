@@ -194,10 +194,7 @@ pub fn classify_orientation(
     let profile_digest = digest_hex(&canonical_bytes(input)?);
     let disposition = result_disposition(&report.kind);
     let selected_alternative_id = selected_id(&report.kind);
-    let conflict = conflict_set_for(
-        input.prior_assignment.as_ref(),
-        &report.kind,
-    );
+    let conflict = conflict_set_for(input.prior_assignment.as_ref(), &report.kind);
     let mut traces = report.traces;
     traces.sort_by(|left, right| left.alternative_id.cmp(&right.alternative_id));
     let mut omitted_alternatives = report.omitted_alternatives;

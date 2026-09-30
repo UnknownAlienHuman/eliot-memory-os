@@ -302,12 +302,14 @@ pub fn retained_source_set(input: &ClassificationInput) -> BTreeSet<String> {
 }
 
 pub(crate) fn retained_source_set_for(input: &ClassificationSemantics<'_>) -> BTreeSet<String> {
-    input.target
+    input
+        .target
         .source_handles
         .iter()
         .map(|id| id.as_str().to_owned())
         .chain(
-            input.evidence
+            input
+                .evidence
                 .iter()
                 .flat_map(|e| e.source_handles.iter().map(|id| id.as_str().to_owned())),
         )

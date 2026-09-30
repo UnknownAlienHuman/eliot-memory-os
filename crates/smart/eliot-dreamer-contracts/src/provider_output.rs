@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::draft::ModelDraft;
 use crate::error::{ContractViolation, check_schema_version, check_vec_bound};
-use crate::grounding::{MaterialClaim, MAX_CLAIMS, NonMaterialClaim};
+use crate::grounding::{MAX_CLAIMS, MaterialClaim, NonMaterialClaim};
 use crate::screen::ScreenBinding;
 
 /// Exact schema version accepted for the provider output envelope.
@@ -51,11 +51,7 @@ impl ProviderOutputV2 {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_schema_version(self.schema_version, PROVIDER_OUTPUT_SCHEMA_VERSION)?;
         self.draft.validate()?;
-        check_vec_bound(
-            self.grounding.claims.len(),
-            MAX_CLAIMS,
-            "grounding.claims",
-        )?;
+        check_vec_bound(self.grounding.claims.len(), MAX_CLAIMS, "grounding.claims")?;
         check_vec_bound(
             self.grounding.non_material_claims.len(),
             MAX_CLAIMS,

@@ -1598,11 +1598,105 @@ impl NotificationPageQuery {
     }
 }
 
+/// Keeps independent Orientation source publication separate from the fixed
+/// campaign source matrix while using the same canonical commit boundary.
+fn campaign_source_publications_for_transition(
+    transition: &PreparedTransition,
+    request_id: &eliot_contracts::RequestId,
+) -> Result<Vec<CampaignSourcePublication>, String> {
+    if transition.named_operations.iter().any(|operation| {
+        operation.operation
+            == eliot_store_api::NamedMutationOperation::RecordOrientationOwnerSources
+    }) {
+        orientation_owner_source_publications_for_transition(transition)
+    } else {
+        campaign_matrix_publications_for_transition(transition, request_id)
+    }
+}
+
+fn orientation_owner_source_publications_for_transition(
+    transition: &PreparedTransition,
+) -> Result<Vec<CampaignSourcePublication>, String> {
+    use eliot_store_api::{CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceRole};
+    if transition.named_operations.len() != 1
+        || transition.transition_class != eliot_store_api::TransitionClass::CaptureCandidate
+    {
+        return Err(
+            "Orientation source publication requires one candidate-source operation".into(),
+        );
+    }
+    let operation = &transition.named_operations[0];
+    if operation.parameters.len() != 2 {
+        return Err("Orientation source publication has undeclared parameters".into());
+    }
+    let task_id = operation
+        .parameters
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Orientation source publication lacks its exact task identity".to_owned())?;
+    if transition.task_id.as_deref() != Some(task_id) {
+        return Err("Orientation source publication does not bind the admitted task".into());
+    }
+    let task_revision = transition
+        .state_fence
+        .task_revision
+        .as_ref()
+        .ok_or_else(|| {
+            "Orientation source publication lacks the admitted task revision".to_owned()
+        })?;
+    let publications: Vec<CampaignSourcePublication> = serde_json::from_value(
+        operation
+            .parameters
+            .get("orientation_owner_sources")
+            .ok_or_else(|| {
+                "Orientation source publication lacks its original owner records".to_owned()
+            })?
+            .clone(),
+    )
+    .map_err(|_| "Orientation source publications are not the closed typed list".to_owned())?;
+    let expected = [
+        CampaignSourceRole::OrientationClassification,
+        CampaignSourceRole::OrientationAdmission,
+        CampaignSourceRole::OrientationCueBindings,
+    ];
+    let mut observed = BTreeSet::new();
+    for publication in &publications {
+        publication.validate().map_err(|error| error.to_string())?;
+        let record = &publication.record;
+        if !expected.contains(&record.role) || !observed.insert(record.role) {
+            return Err(
+                "Orientation source publication contains a duplicate or undeclared role".into(),
+            );
+        }
+        if publication.read_receipt.read_state_fence != transition.state_fence
+            || record.recorded_state_fence != transition.state_fence
+        {
+            return Err(
+                "Orientation source publication does not bind the original full fence".into(),
+            );
+        }
+        if record.role == CampaignSourceRole::OrientationAdmission
+            && (record.record_id
+                != CampaignOwnerRecordId::Task(
+                    eliot_contracts::TaskId::new(task_id.to_owned())
+                        .map_err(|error| error.to_string())?,
+                )
+                || record.revision != CampaignOwnerRevision::Task(*task_revision))
+        {
+            return Err("Orientation admission source is for another task or revision".into());
+        }
+    }
+    if observed.len() != expected.len() || expected.iter().any(|role| !observed.contains(role)) {
+        return Err("Orientation source publication omits a mandatory native owner".into());
+    }
+    Ok(publications)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the closed campaign publication admission path keeps the source transition, owner matrix, and recipe binding together"
 )]
-fn campaign_source_publications_for_transition(
+fn campaign_matrix_publications_for_transition(
     transition: &PreparedTransition,
     request_id: &eliot_contracts::RequestId,
 ) -> Result<Vec<CampaignSourcePublication>, String> {
