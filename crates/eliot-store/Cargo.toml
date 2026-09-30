@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 base64.workspace = true
 blake3.workspace = true
+eliot-contracts.workspace = true
 eliot-types.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-windows-ipc.workspace = true

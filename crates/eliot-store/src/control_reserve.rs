@@ -31,24 +31,32 @@
 //!
 //! This module has no production caller yet (STITCH): it publishes the owner
 //! evidence the Kernel profile composition will join, and that composition
-//! binds the profile revision and Authority Epoch it resolves. There is no
-//! emergency partition here; recording reserve loss stays with the front-door
-//! last-resort slot until a later wave wires Store-side loss reporting.
-//! DISCLOSED LIMIT: versioned I14 backpressure responses are not rendered here.
-//! The frozen validator pins `STORAGE_BACKPRESSURE` to ORS durable bytes, so a
-//! Store exhaustion response would be `BUSY`; rendering it needs the
-//! identity types the Store contour does not own, and is owed to the response
-//! wave once the composition joins this evidence. Full installed-saturation
-//! proof stays #11 Product scope.
+//! binds the profile revision it resolves. Exhausted normal Store partitions
+//! render as versioned [`I14BackpressureResponseV1`] answers with disposition
+//! `BUSY` naming exactly the saturated Store bottleneck in its exact unit;
+//! `STORAGE_BACKPRESSURE` is never rendered here because the frozen validator
+//! pins that disposition to ORS durable bytes. Every response is validated by
+//! the existing [`I14BackpressureResponseV1::validate`] before it is returned,
+//! so an inconsistent observation fails closed instead of emitting a
+//! disposition-only or generic queue-full answer. There is no emergency
+//! partition here; recording reserve loss stays with the front-door
+//! last-resort slot until a later wave wires Store-side loss reporting. Full
+//! installed-saturation proof stays #11 Product scope.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
-    BottleneckCapacityProfile, BottleneckCoverageState, CapacityBottleneck, CapacityClass,
-    CapacityEnforcement, CapacityLimit, ControlOperationClass, NormalWorkClass,
-    frozen_bottleneck_owner_map,
+    AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
+    CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
+    I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
+    I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome,
+    NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -190,8 +198,10 @@ pub struct StoreReserve {
 /// owner. Releasing is automatic on drop and returns exactly the consumed
 /// partition and amount.
 ///
-/// Permits are deliberately not [`Clone`]: duplicating a permit handle must
-/// never duplicate the underlying capacity.
+/// The permit is bound to the typed Authority Epoch the caller resolved at
+/// acquisition: evidence from a fenced epoch never authorizes consumption
+/// under the current one. Permits are deliberately not [`Clone`]: duplicating
+/// a permit handle must never duplicate the underlying capacity.
 #[derive(Debug)]
 pub struct StorePermit {
     inner: Arc<StoreReserveInner>,
@@ -201,6 +211,7 @@ pub struct StorePermit {
     operation: StorePermitOperation,
     operation_id: String,
     owner: String,
+    authority_epoch: AuthorityEpoch,
 }
 
 impl StorePermit {
@@ -220,6 +231,12 @@ impl StorePermit {
     #[must_use]
     pub const fn bottleneck(&self) -> CapacityBottleneck {
         self.dimension.bottleneck()
+    }
+
+    /// Returns the exact unit this permit was granted in.
+    #[must_use]
+    pub const fn unit(&self) -> CapacityUnit {
+        self.dimension.bottleneck().unit()
     }
 
     /// Returns the amount held in the bottleneck's exact unit.
@@ -244,6 +261,12 @@ impl StorePermit {
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Returns the typed Authority Epoch this permit was granted under.
+    #[must_use]
+    pub const fn authority_epoch(&self) -> AuthorityEpoch {
+        self.authority_epoch
     }
 }
 
@@ -481,7 +504,9 @@ impl StoreReserve {
     /// Attempts to acquire one normal connection slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected Store
-    /// capacity is unreachable through this path by construction.
+    /// capacity is unreachable through this path by construction. The returned
+    /// permit is bound to `authority_epoch` alongside class, bottleneck, unit,
+    /// amount, typed operation, operation identity and owner.
     ///
     /// # Errors
     ///
@@ -494,6 +519,7 @@ impl StoreReserve {
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
+        authority_epoch: AuthorityEpoch,
     ) -> Result<StorePermit, StoreReserveError> {
         validate_owner_text(owner, "store_permit.owner")?;
         validate_owner_text(operation_id, "store_permit.operation_id")?;
@@ -517,6 +543,7 @@ impl StoreReserve {
             operation: StorePermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            authority_epoch,
         })
     }
 
@@ -524,6 +551,9 @@ impl StoreReserve {
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected Store
     /// transaction capacity is unreachable through this path by construction.
+    /// The returned permit is bound to `authority_epoch` alongside class,
+    /// bottleneck, unit, amount, typed operation, operation identity and
+    /// owner.
     ///
     /// # Errors
     ///
@@ -536,6 +566,7 @@ impl StoreReserve {
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
+        authority_epoch: AuthorityEpoch,
     ) -> Result<StorePermit, StoreReserveError> {
         validate_owner_text(owner, "store_permit.owner")?;
         validate_owner_text(operation_id, "store_permit.operation_id")?;
@@ -559,6 +590,7 @@ impl StoreReserve {
             operation: StorePermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            authority_epoch,
         })
     }
 
@@ -566,6 +598,9 @@ impl StoreReserve {
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected Store
     /// pending-write capacity is unreachable through this path by construction.
+    /// The returned permit is bound to `authority_epoch` alongside class,
+    /// bottleneck, unit, amount, typed operation, operation identity and
+    /// owner.
     ///
     /// # Errors
     ///
@@ -580,6 +615,7 @@ impl StoreReserve {
         owner: &str,
         operation_id: &str,
         bytes: NonZeroU64,
+        authority_epoch: AuthorityEpoch,
     ) -> Result<StorePermit, StoreReserveError> {
         validate_owner_text(owner, "store_permit.owner")?;
         validate_owner_text(operation_id, "store_permit.operation_id")?;
@@ -603,6 +639,7 @@ impl StoreReserve {
             operation: StorePermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            authority_epoch,
         })
     }
 
@@ -613,7 +650,9 @@ impl StoreReserve {
     /// admission cannot name a protected operation and therefore cannot
     /// acquire this partition. This is the path an admitted
     /// cancellation/recovery record keeps while normal connection work is
-    /// saturated.
+    /// saturated. The returned permit is bound to `authority_epoch` alongside
+    /// class, bottleneck, unit, amount, typed operation, operation identity
+    /// and owner.
     ///
     /// # Errors
     ///
@@ -626,6 +665,7 @@ impl StoreReserve {
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
+        authority_epoch: AuthorityEpoch,
     ) -> Result<StorePermit, StoreReserveError> {
         validate_owner_text(owner, "store_permit.owner")?;
         validate_owner_text(operation_id, "store_permit.operation_id")?;
@@ -649,6 +689,7 @@ impl StoreReserve {
             operation: StorePermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            authority_epoch,
         })
     }
 
@@ -656,7 +697,9 @@ impl StoreReserve {
     ///
     /// Only [`ControlOperationClass`] operations typecheck here. This is the
     /// path an admitted cancellation/recovery record keeps while normal Store
-    /// transaction work is saturated.
+    /// transaction work is saturated. The returned permit is bound to
+    /// `authority_epoch` alongside class, bottleneck, unit, amount, typed
+    /// operation, operation identity and owner.
     ///
     /// # Errors
     ///
@@ -669,6 +712,7 @@ impl StoreReserve {
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
+        authority_epoch: AuthorityEpoch,
     ) -> Result<StorePermit, StoreReserveError> {
         validate_owner_text(owner, "store_permit.owner")?;
         validate_owner_text(operation_id, "store_permit.operation_id")?;
@@ -692,6 +736,7 @@ impl StoreReserve {
             operation: StorePermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            authority_epoch,
         })
     }
 
@@ -700,7 +745,9 @@ impl StoreReserve {
     ///
     /// Only [`ControlOperationClass`] operations typecheck here. This is the
     /// path an admitted cancellation/recovery record keeps while normal
-    /// pending-write work is saturated.
+    /// pending-write work is saturated. The returned permit is bound to
+    /// `authority_epoch` alongside class, bottleneck, unit, amount, typed
+    /// operation, operation identity and owner.
     ///
     /// # Errors
     ///
@@ -714,6 +761,7 @@ impl StoreReserve {
         owner: &str,
         operation_id: &str,
         bytes: NonZeroU64,
+        authority_epoch: AuthorityEpoch,
     ) -> Result<StorePermit, StoreReserveError> {
         validate_owner_text(owner, "store_permit.owner")?;
         validate_owner_text(operation_id, "store_permit.operation_id")?;
@@ -737,6 +785,7 @@ impl StoreReserve {
             operation: StorePermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            authority_epoch,
         })
     }
 
@@ -830,5 +879,223 @@ impl StoreReserve {
         row.validate()
             .map_err(|error| StoreReserveError::Contract(error.to_string()))?;
         Ok(row)
+    }
+
+    /// Reports exhausted normal connection slots as a `BUSY` response naming
+    /// exactly [`STORE_CONNECTION_BOTTLENECK`].
+    ///
+    /// `STORAGE_BACKPRESSURE` is never rendered here: the frozen validator
+    /// pins that disposition to ORS durable bytes. The response is built only
+    /// while [`Self::available_normal_connections`] is zero: pressure evidence
+    /// is never manufactured for a partition that still admits work. The
+    /// protected partition is not read and not claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] when normal connection
+    /// capacity remains or the operation identity is malformed, or
+    /// [`StoreReserveError::Contract`] when the assembled directive fails the
+    /// existing contract validation.
+    pub fn normal_connection_exhaustion_response(
+        &self,
+        work: NormalWorkClass,
+        operation_id: &str,
+        profile_revision: ArtifactId,
+    ) -> Result<I14BackpressureResponseV1, StoreReserveError> {
+        if self.available_normal_connections() > 0 {
+            return Err(StoreReserveError::InvalidField {
+                field: "store_reserve.normal_connection_slots",
+                reason: "normal connection partition is not saturated; no pressure evidence to report",
+            });
+        }
+        let operation =
+            OperationId::new(operation_id).map_err(|_| StoreReserveError::InvalidField {
+                field: "store_rejection.operation_id",
+                reason: "must be a bounded non-blank reference",
+            })?;
+        StoreRejectionParts {
+            affected: AffectedOperationClass::Normal(work),
+            observation: BottleneckObservationV1 {
+                bottleneck: STORE_CONNECTION_BOTTLENECK,
+                unit: STORE_CONNECTION_BOTTLENECK.unit(),
+                requested_amount: 1,
+                availability: BottleneckAvailability::Exhausted {
+                    available_amount: 0,
+                },
+                coverage_state: BottleneckCoverageState::Claimed,
+            },
+            operation_id: Some(operation),
+            profile_revision,
+        }
+        .into_response(
+            BackpressureDisposition::Busy,
+            I14WorkOutcome::NotAccepted,
+            RecoveryCommitStatus::None,
+        )
+    }
+
+    /// Reports exhausted normal transaction slots as a `BUSY` response naming
+    /// exactly [`STORE_TRANSACTION_BOTTLENECK`].
+    ///
+    /// `STORAGE_BACKPRESSURE` is never rendered here: the frozen validator
+    /// pins that disposition to ORS durable bytes. The response is built only
+    /// while [`Self::available_normal_transactions`] is zero: pressure
+    /// evidence is never manufactured for a partition that still admits work.
+    /// The protected partition is not read and not claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] when normal transaction
+    /// capacity remains or the operation identity is malformed, or
+    /// [`StoreReserveError::Contract`] when the assembled directive fails the
+    /// existing contract validation.
+    pub fn normal_transaction_exhaustion_response(
+        &self,
+        work: NormalWorkClass,
+        operation_id: &str,
+        profile_revision: ArtifactId,
+    ) -> Result<I14BackpressureResponseV1, StoreReserveError> {
+        if self.available_normal_transactions() > 0 {
+            return Err(StoreReserveError::InvalidField {
+                field: "store_reserve.normal_transaction_slots",
+                reason: "normal transaction partition is not saturated; no pressure evidence to report",
+            });
+        }
+        let operation =
+            OperationId::new(operation_id).map_err(|_| StoreReserveError::InvalidField {
+                field: "store_rejection.operation_id",
+                reason: "must be a bounded non-blank reference",
+            })?;
+        StoreRejectionParts {
+            affected: AffectedOperationClass::Normal(work),
+            observation: BottleneckObservationV1 {
+                bottleneck: STORE_TRANSACTION_BOTTLENECK,
+                unit: STORE_TRANSACTION_BOTTLENECK.unit(),
+                requested_amount: 1,
+                availability: BottleneckAvailability::Exhausted {
+                    available_amount: 0,
+                },
+                coverage_state: BottleneckCoverageState::Claimed,
+            },
+            operation_id: Some(operation),
+            profile_revision,
+        }
+        .into_response(
+            BackpressureDisposition::Busy,
+            I14WorkOutcome::NotAccepted,
+            RecoveryCommitStatus::None,
+        )
+    }
+
+    /// Reports exhausted normal pending-write bytes as a `BUSY` response
+    /// naming exactly [`STORE_PENDING_WRITE_BOTTLENECK`].
+    ///
+    /// `STORAGE_BACKPRESSURE` is never rendered here: the frozen validator
+    /// pins that disposition to ORS durable bytes. The response is built only
+    /// while the normal pending-write partition cannot satisfy
+    /// `requested_bytes`: pressure evidence is never manufactured for a
+    /// partition that still admits the request. The protected partition is not
+    /// read and not claimed, so an admitted cancellation/recovery record keeps
+    /// its path while this response is live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] when the normal
+    /// pending-write partition still satisfies the request or the operation
+    /// identity is malformed, or [`StoreReserveError::Contract`] when the
+    /// assembled directive fails the existing contract validation.
+    pub fn normal_pending_write_exhaustion_response(
+        &self,
+        work: NormalWorkClass,
+        operation_id: &str,
+        profile_revision: ArtifactId,
+        requested_bytes: NonZeroU64,
+    ) -> Result<I14BackpressureResponseV1, StoreReserveError> {
+        let available = self.available_normal_pending_write_bytes();
+        if available >= requested_bytes.get() {
+            return Err(StoreReserveError::InvalidField {
+                field: "store_reserve.normal_pending_write_bytes",
+                reason: "normal pending-write partition still admits the request; no pressure evidence to report",
+            });
+        }
+        let operation =
+            OperationId::new(operation_id).map_err(|_| StoreReserveError::InvalidField {
+                field: "store_rejection.operation_id",
+                reason: "must be a bounded non-blank reference",
+            })?;
+        StoreRejectionParts {
+            affected: AffectedOperationClass::Normal(work),
+            observation: BottleneckObservationV1 {
+                bottleneck: STORE_PENDING_WRITE_BOTTLENECK,
+                unit: STORE_PENDING_WRITE_BOTTLENECK.unit(),
+                requested_amount: requested_bytes.get(),
+                availability: BottleneckAvailability::Exhausted {
+                    available_amount: available,
+                },
+                coverage_state: BottleneckCoverageState::Claimed,
+            },
+            operation_id: Some(operation),
+            profile_revision,
+        }
+        .into_response(
+            BackpressureDisposition::Busy,
+            I14WorkOutcome::NotAccepted,
+            RecoveryCommitStatus::None,
+        )
+    }
+}
+
+/// Exact parts of one Store rejection directive shared by every constructor.
+struct StoreRejectionParts {
+    affected: AffectedOperationClass,
+    observation: BottleneckObservationV1,
+    operation_id: Option<OperationId>,
+    profile_revision: ArtifactId,
+}
+
+impl StoreRejectionParts {
+    /// Assembles the versioned response and validates it with the existing
+    /// contract check; an inconsistent observation fails closed here.
+    fn into_response(
+        self,
+        disposition: BackpressureDisposition,
+        work_outcome: I14WorkOutcome,
+        commit_status: RecoveryCommitStatus,
+    ) -> Result<I14BackpressureResponseV1, StoreReserveError> {
+        let response = I14BackpressureResponseV1 {
+            contract_version: I14_BACKPRESSURE_RESPONSE_VERSION,
+            disposition,
+            directive: I14RecoveryDirectiveV1 {
+                cause: I14BackpressureCause::CapacityExhaustion,
+                affected_operation_class: self.affected,
+                bottlenecks: vec![self.observation],
+                work_outcome,
+                commit_status,
+                state_preservation: StatePreservationStatus::Preserved,
+                operation_id: self.operation_id,
+                preserve_operation_id: true,
+                stage_receipt: None,
+                rollback_receipt: None,
+                retry_strategy: I14RecoveryAction::AwaitCondition,
+                earliest_permitted_condition: EarliestRecoveryCondition::CapacityAvailable,
+                earliest_permitted_unix_millis: None,
+                actions_temporarily_forbidden: Vec::<I14ForbiddenAction>::new(),
+                safe_fallback: None,
+                required_authority: I14RequiredAuthority::NoneRequired,
+                human_action_required: HumanActionRequirement::NoneRequired,
+                evidence_refs: Vec::new(),
+                evidence_coverage: EvidenceCoverageState::Unavailable,
+                escalation_condition: I14EscalationCondition::None,
+                resolution_state: I14ResolutionState::Pending,
+                currentness: I14CurrentnessState::Current,
+                profile_revision: self.profile_revision,
+                state_fence: None,
+                authority_epoch: None,
+            },
+        };
+        response
+            .validate()
+            .map_err(|error| StoreReserveError::Contract(error.to_string()))?;
+        Ok(response)
     }
 }
