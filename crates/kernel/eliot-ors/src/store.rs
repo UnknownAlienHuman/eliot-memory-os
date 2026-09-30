@@ -6108,7 +6108,30 @@ impl RedbRecoveryStore {
         };
         validate_cold_start_installation(claim, &store_identity)?;
 
-        let existing_index = {
+        if let Some(existing) = Self::load_cold_start_binding(&write, claim, &store_identity)? {
+            if now <= existing.claim.lease_deadline {
+                write.commit().map_err(storage)?;
+                return Ok(crate::ColdStartReadinessStageOutcome::AlreadyBound {
+                    record: Box::new(existing),
+                });
+            }
+        }
+
+        let revision = Self::next_cold_start_revision(&write, claim)?;
+        let record = crate::ColdStartReadinessOrsRecord::leased(claim.clone(), revision);
+        Self::persist_cold_start_claim(&write, claim, &record)?;
+        write.commit().map_err(storage)?;
+        Ok(crate::ColdStartReadinessStageOutcome::Stored {
+            record: Box::new(record),
+        })
+    }
+
+    fn load_cold_start_binding(
+        write: &redb::WriteTransaction,
+        claim: &crate::ColdStartReadinessClaim,
+        store_identity: &OrsStoreIdentity,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        let index = {
             let indexes = write
                 .open_table(COLD_START_READINESS_BINDINGS)
                 .map_err(storage)?;
@@ -6118,50 +6141,51 @@ impl RedbRecoveryStore {
                 .map(|value| decode::<ColdStartReadinessBindingIndex>(value.value()))
                 .transpose()?
         };
-        if let Some(index) = existing_index.as_ref() {
-            index.validate()?;
-            if index.binding_digest != claim.binding_digest
-                || index.base_identity_digest != claim.base_identity_digest
-            {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
-                    reason: "cold-start binding index disagrees with the presented key".to_owned(),
-                });
-            }
-            let existing = {
-                let records = write
-                    .open_table(COLD_START_READINESS_RECORDS)
-                    .map_err(storage)?;
-                let raw = records
-                    .get(index.record_key.as_str())
-                    .map_err(storage)?
-                    .ok_or_else(|| OrsError::IntegrityProblem {
-                        record_type: crate::COLD_START_READINESS_RECORD_TYPE,
-                        reason: "cold-start binding index points to a missing revision".to_owned(),
-                    })?;
-                decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
-            };
-            existing.validate()?;
-            validate_cold_start_installation(&existing.claim, &store_identity)?;
-            if existing.claim.binding_digest != claim.binding_digest
-                || !existing.claim.same_key(claim)
-                || existing.record_key != index.record_key
-                || existing.record_revision != index.record_revision
-            {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
-                    reason: "cold-start binding index does not identify its exact durable key"
-                        .to_owned(),
-                });
-            }
-            if now <= existing.claim.lease_deadline {
-                write.commit().map_err(storage)?;
-                return Ok(crate::ColdStartReadinessStageOutcome::AlreadyBound {
-                    record: Box::new(existing),
-                });
-            }
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        index.validate()?;
+        if index.binding_digest != claim.binding_digest
+            || index.base_identity_digest != claim.base_identity_digest
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index disagrees with the presented key".to_owned(),
+            });
         }
+        let existing = {
+            let records = write
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
+            let raw = records
+                .get(index.record_key.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "cold-start binding index points to a missing revision".to_owned(),
+                })?;
+            decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+        };
+        existing.validate()?;
+        validate_cold_start_installation(&existing.claim, store_identity)?;
+        if existing.claim.binding_digest != claim.binding_digest
+            || !existing.claim.same_key(claim)
+            || existing.record_key != index.record_key
+            || existing.record_revision != index.record_revision
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index does not identify its exact durable key"
+                    .to_owned(),
+            });
+        }
+        Ok(Some(existing))
+    }
 
+    fn next_cold_start_revision(
+        write: &redb::WriteTransaction,
+        claim: &crate::ColdStartReadinessClaim,
+    ) -> Result<u64, OrsError> {
         let head = {
             let heads = write
                 .open_table(COLD_START_READINESS_HEADS)
@@ -6172,62 +6196,65 @@ impl RedbRecoveryStore {
                 .map(|value| decode::<ColdStartReadinessRevisionHead>(value.value()))
                 .transpose()?
         };
-        let revision = match head.as_ref() {
-            Some(head) => {
-                head.validate()?;
-                if head.base_identity_digest != claim.base_identity_digest {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: crate::COLD_START_READINESS_RECORD_TYPE,
-                        reason: "cold-start revision head disagrees with its table key".to_owned(),
-                    });
-                }
-                let head_record = {
-                    let records = write
-                        .open_table(COLD_START_READINESS_RECORDS)
-                        .map_err(storage)?;
-                    let raw = records
-                        .get(head.record_key.as_str())
-                        .map_err(storage)?
-                        .ok_or_else(|| OrsError::IntegrityProblem {
-                            record_type: crate::COLD_START_READINESS_RECORD_TYPE,
-                            reason: "cold-start revision head points to a missing row".to_owned(),
-                        })?;
-                    decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
-                };
-                head_record.validate()?;
-                if head_record.record_revision != head.record_revision
-                    || head_record.claim.base_identity_digest != head.base_identity_digest
-                {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: crate::COLD_START_READINESS_RECORD_TYPE,
-                        reason: "cold-start revision head does not match its durable row"
-                            .to_owned(),
-                    });
-                }
-                head.record_revision
-                    .checked_add(1)
-                    .ok_or(OrsError::ProjectionLimitExceeded)?
-            }
-            None => 1,
+        let Some(head) = head else {
+            return Ok(1);
         };
-        let record = crate::ColdStartReadinessOrsRecord::leased(claim.clone(), revision);
+        head.validate()?;
+        if head.base_identity_digest != claim.base_identity_digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start revision head disagrees with its table key".to_owned(),
+            });
+        }
+        let head_record = {
+            let records = write
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
+            let raw = records
+                .get(head.record_key.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "cold-start revision head points to a missing row".to_owned(),
+                })?;
+            decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+        };
+        head_record.validate()?;
+        if head_record.record_revision != head.record_revision
+            || head_record.claim.base_identity_digest != head.base_identity_digest
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start revision head does not match its durable row".to_owned(),
+            });
+        }
+        head.record_revision
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)
+    }
+
+    fn persist_cold_start_claim(
+        write: &redb::WriteTransaction,
+        claim: &crate::ColdStartReadinessClaim,
+        record: &crate::ColdStartReadinessOrsRecord,
+    ) -> Result<(), OrsError> {
         record.validate()?;
         let head = ColdStartReadinessRevisionHead {
             contract_version: crate::CONTRACT_VERSION,
             base_identity_digest: claim.base_identity_digest.clone(),
             record_key: record.record_key.clone(),
-            record_revision: revision,
+            record_revision: record.record_revision,
         };
         let index = ColdStartReadinessBindingIndex {
             contract_version: crate::CONTRACT_VERSION,
             base_identity_digest: claim.base_identity_digest.clone(),
             binding_digest: claim.binding_digest.clone(),
             record_key: record.record_key.clone(),
-            record_revision: revision,
+            record_revision: record.record_revision,
         };
         head.validate()?;
         index.validate()?;
-        let record_bytes = encode(&record)?;
+        let record_bytes = encode(record)?;
         let head_bytes = encode(&head)?;
         let index_bytes = encode(&index)?;
         {
@@ -6265,10 +6292,7 @@ impl RedbRecoveryStore {
                 .insert(claim.binding_digest.as_str(), index_bytes.as_str())
                 .map_err(storage)?;
         }
-        write.commit().map_err(storage)?;
-        Ok(crate::ColdStartReadinessStageOutcome::Stored {
-            record: Box::new(record),
-        })
+        Ok(())
     }
 
     /// Publishes one immutable terminal readiness receipt for its claimed row.

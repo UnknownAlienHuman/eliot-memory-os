@@ -10018,6 +10018,14 @@ impl ColdStartReadinessOrsRecord {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
         }
         self.claim.validate()?;
+        self.validate_row_identity()?;
+        if let Some(terminal) = &self.terminal {
+            self.validate_terminal_receipt(terminal)?;
+        }
+        Ok(())
+    }
+
+    fn validate_row_identity(&self) -> Result<(), OrsError> {
         if self.record_revision == 0
             || self.record_key
                 != cold_start_readiness_record_key(
@@ -10030,123 +10038,140 @@ impl ColdStartReadinessOrsRecord {
                 reason: "cold-start row key does not match its durable revision".to_owned(),
             });
         }
-        if let Some(terminal) = &self.terminal {
-            validate_text(&terminal.receipt_ref, "cold_start_receipt_ref")?;
-            validate_digest(&terminal.receipt_digest, "cold_start_receipt_digest")?;
-            if terminal.receipt_revision != self.record_revision {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: COLD_START_READINESS_RECORD_TYPE,
-                    reason: "terminal readiness revision does not match its lease revision"
-                        .to_owned(),
-                });
+        Ok(())
+    }
+
+    fn validate_terminal_receipt(
+        &self,
+        terminal: &ColdStartReadinessTerminalReceipt,
+    ) -> Result<(), OrsError> {
+        let value = self.canonical_terminal_value(terminal)?;
+        self.validate_terminal_binding(terminal, &value)?;
+        self.validate_terminal_disposition(terminal, &value)
+    }
+
+    fn canonical_terminal_value(
+        &self,
+        terminal: &ColdStartReadinessTerminalReceipt,
+    ) -> Result<Value, OrsError> {
+        validate_text(&terminal.receipt_ref, "cold_start_receipt_ref")?;
+        validate_digest(&terminal.receipt_digest, "cold_start_receipt_digest")?;
+        if terminal.receipt_revision != self.record_revision {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal readiness revision does not match its lease revision"
+                    .to_owned(),
+            });
+        }
+        if terminal.receipt_bytes.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_receipt_bytes",
+                reason: "terminal receipt bytes must be non-empty",
+            });
+        }
+        if sha256_hex(terminal.receipt_bytes.as_bytes()) != terminal.receipt_digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal receipt bytes do not match their digest".to_owned(),
+            });
+        }
+        let value: Value = serde_json::from_str(&terminal.receipt_bytes).map_err(|_| {
+            OrsError::InvalidField {
+                field: "cold_start_receipt_bytes",
+                reason: "terminal receipt bytes must be JSON",
             }
-            if terminal.receipt_bytes.is_empty() {
-                return Err(OrsError::InvalidField {
-                    field: "cold_start_receipt_bytes",
-                    reason: "terminal receipt bytes must be non-empty",
-                });
+        })?;
+        let canonical = canonical_json_bytes(&value)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if canonical.as_slice() != terminal.receipt_bytes.as_bytes() {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_receipt_bytes",
+                reason: "terminal receipt bytes must use canonical JSON encoding",
+            });
+        }
+        Ok(value)
+    }
+
+    fn validate_terminal_binding(
+        &self,
+        terminal: &ColdStartReadinessTerminalReceipt,
+        value: &Value,
+    ) -> Result<(), OrsError> {
+        let expected_fence = serde_json::to_value(&self.claim.key.state_fence)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let expected_lineage = Value::String(self.claim.key.lineage_candidate_ref.clone());
+        let expected_vcs = serde_json::to_value(&self.claim.key.vcs_identity_ref)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let scope = value.get("scope");
+        let instance = value.get("instance");
+        let identity_matches = value.get("receipt_ref").and_then(Value::as_str)
+            == Some(terminal.receipt_ref.as_str())
+            && value.get("lease_ref").and_then(Value::as_str)
+                == Some(self.claim.lease_ref.as_str())
+            && value.get("receipt_revision").and_then(Value::as_u64)
+                == Some(self.record_revision)
+            && value
+                .get("governing_source_generation")
+                .and_then(Value::as_u64)
+                == Some(self.claim.key.governing_source_generation)
+            && value
+                .get("governing_source_set_ref")
+                .and_then(Value::as_str)
+                == Some(self.claim.key.governing_source_set_ref.as_str())
+            && value.get("state_fence") == Some(&expected_fence)
+            && scope.and_then(|scope| scope.get("lineage_ref")) == Some(&expected_lineage)
+            && scope
+                .and_then(|scope| scope.get("instance_ref"))
+                .and_then(Value::as_str)
+                == Some(self.claim.key.workspace_instance_candidate_ref.as_str())
+            && scope
+                .and_then(|scope| scope.get("root_identity"))
+                .and_then(Value::as_str)
+                == Some(self.claim.key.filesystem_identity_ref.as_str())
+            && instance
+                .and_then(|instance| instance.get("instance_ref"))
+                .and_then(Value::as_str)
+                == Some(self.claim.key.workspace_instance_candidate_ref.as_str())
+            && instance
+                .and_then(|instance| instance.get("root_identity"))
+                .and_then(Value::as_str)
+                == Some(self.claim.key.filesystem_identity_ref.as_str())
+            && instance.and_then(|instance| instance.get("vcs_identity_ref")) == Some(&expected_vcs)
+            && value.get("expiry_tick").and_then(Value::as_u64)
+                == Some(self.claim.lease_deadline);
+        if !identity_matches {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal receipt disagrees with its lease, identity, or fence".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_disposition(
+        &self,
+        terminal: &ColdStartReadinessTerminalReceipt,
+        value: &Value,
+    ) -> Result<(), OrsError> {
+        let readiness = value.get("readiness").and_then(Value::as_str);
+        let task_disposition = value
+            .get("task_binding")
+            .and_then(|binding| binding.get("disposition"))
+            .and_then(Value::as_str);
+        let receipt_disposition = match readiness {
+            Some("READY_MATERIAL" | "READY_READ_ONLY") => {
+                ColdStartReadinessTerminalDisposition::Ready
             }
-            if sha256_hex(terminal.receipt_bytes.as_bytes()) != terminal.receipt_digest {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: COLD_START_READINESS_RECORD_TYPE,
-                    reason: "terminal receipt bytes do not match their digest".to_owned(),
-                });
+            Some("NEEDS_TASK") if task_disposition == Some("ambiguous") => {
+                ColdStartReadinessTerminalDisposition::Ambiguous
             }
-            let value: Value = serde_json::from_str(&terminal.receipt_bytes).map_err(|_| {
-                OrsError::InvalidField {
-                    field: "cold_start_receipt_bytes",
-                    reason: "terminal receipt bytes must be JSON",
-                }
-            })?;
-            let canonical = canonical_json_bytes(&value)
-                .map_err(|error| OrsError::Encoding(error.to_string()))?;
-            if canonical.as_slice() != terminal.receipt_bytes.as_bytes() {
-                return Err(OrsError::InvalidField {
-                    field: "cold_start_receipt_bytes",
-                    reason: "terminal receipt bytes must use canonical JSON encoding",
-                });
-            }
-            let expected_fence = serde_json::to_value(&self.claim.key.state_fence)
-                .map_err(|error| OrsError::Encoding(error.to_string()))?;
-            let expected_lineage = Value::String(self.claim.key.lineage_candidate_ref.clone());
-            let expected_vcs = serde_json::to_value(&self.claim.key.vcs_identity_ref)
-                .map_err(|error| OrsError::Encoding(error.to_string()))?;
-            if value.get("receipt_ref").and_then(Value::as_str)
-                != Some(terminal.receipt_ref.as_str())
-                || value.get("lease_ref").and_then(Value::as_str)
-                    != Some(self.claim.lease_ref.as_str())
-                || value.get("receipt_revision").and_then(Value::as_u64)
-                    != Some(self.record_revision)
-                || value
-                    .get("governing_source_generation")
-                    .and_then(Value::as_u64)
-                    != Some(self.claim.key.governing_source_generation)
-                || value
-                    .get("governing_source_set_ref")
-                    .and_then(Value::as_str)
-                    != Some(self.claim.key.governing_source_set_ref.as_str())
-                || value.get("state_fence") != Some(&expected_fence)
-                || value
-                    .get("scope")
-                    .and_then(|scope| scope.get("lineage_ref"))
-                    != Some(&expected_lineage)
-                || value
-                    .get("scope")
-                    .and_then(|scope| scope.get("instance_ref"))
-                    .and_then(Value::as_str)
-                    != Some(self.claim.key.workspace_instance_candidate_ref.as_str())
-                || value
-                    .get("scope")
-                    .and_then(|scope| scope.get("root_identity"))
-                    .and_then(Value::as_str)
-                    != Some(self.claim.key.filesystem_identity_ref.as_str())
-                || value
-                    .get("instance")
-                    .and_then(|instance| instance.get("instance_ref"))
-                    .and_then(Value::as_str)
-                    != Some(self.claim.key.workspace_instance_candidate_ref.as_str())
-                || value
-                    .get("instance")
-                    .and_then(|instance| instance.get("root_identity"))
-                    .and_then(Value::as_str)
-                    != Some(self.claim.key.filesystem_identity_ref.as_str())
-                || value
-                    .get("instance")
-                    .and_then(|instance| instance.get("vcs_identity_ref"))
-                    != Some(&expected_vcs)
-                || value.get("expiry_tick").and_then(Value::as_u64)
-                    != Some(self.claim.lease_deadline)
-            {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: COLD_START_READINESS_RECORD_TYPE,
-                    reason: "terminal receipt disagrees with its lease, identity, or fence"
-                        .to_owned(),
-                });
-            }
-            let readiness = value.get("readiness").and_then(Value::as_str);
-            let task_disposition = value
-                .get("task_binding")
-                .and_then(|binding| binding.get("disposition"))
-                .and_then(Value::as_str);
-            let disposition_matches = match terminal.disposition {
-                ColdStartReadinessTerminalDisposition::Ready => {
-                    matches!(readiness, Some("READY_MATERIAL" | "READY_READ_ONLY"))
-                }
-                ColdStartReadinessTerminalDisposition::Ambiguous => {
-                    readiness == Some("NEEDS_TASK") && task_disposition == Some("ambiguous")
-                }
-                ColdStartReadinessTerminalDisposition::Failed => {
-                    !matches!(readiness, Some("READY_MATERIAL" | "READY_READ_ONLY"))
-                        && !(readiness == Some("NEEDS_TASK")
-                            && task_disposition == Some("ambiguous"))
-                }
-            };
-            if !disposition_matches {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: COLD_START_READINESS_RECORD_TYPE,
-                    reason: "terminal disposition disagrees with the readiness receipt".to_owned(),
-                });
-            }
+            _ => ColdStartReadinessTerminalDisposition::Failed,
+        };
+        if terminal.disposition != receipt_disposition {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal disposition disagrees with the readiness receipt".to_owned(),
+            });
         }
         Ok(())
     }
