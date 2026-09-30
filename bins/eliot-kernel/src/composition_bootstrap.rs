@@ -395,10 +395,9 @@ impl KernelComposition {
             Arc::clone(&platform),
             prepared.descriptor.dispatch_key.clone(),
         ));
-        let authority_id = prepared.descriptor.authority_id.clone();
         let handoff = prepared.handoff.clone();
         let controller = Self::prepare_descriptor_controller(
-            authority_id.clone(),
+            prepared.descriptor.authority_id.clone(),
             prepared.key,
             Arc::clone(&ors) as Arc<dyn OperationalRecoveryStore>,
             Arc::clone(&codec),
