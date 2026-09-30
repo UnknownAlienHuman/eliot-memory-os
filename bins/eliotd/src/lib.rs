@@ -2352,6 +2352,44 @@ impl DaemonComposition {
         Ok(locator.root.clone())
     }
 
+    /// Returns the retained Host workspace locator for a task-free request
+    /// whose authenticated principal/session and exact current WorkScope
+    /// snapshot match the accepted activation. The locator supplies only a
+    /// candidate root for fresh Host observation; the snapshot and that
+    /// observation remain the independent admission authorities.
+    pub fn activation_workspace_locator_for_scope(
+        &self,
+        principal_ref: &str,
+        session_ref: &str,
+        work_scope: &eliot_workscope::WorkScopeBindingSnapshot,
+    ) -> Result<PathBuf, crate::task_binding_admission::TaskBindingError> {
+        work_scope.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "current WorkScope snapshot is invalid: {error}"
+            ))
+        })?;
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        if !eliot_contracts::fences_match_exact(&work_scope.state_fence, live_fence) {
+            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "current WorkScope snapshot fence is no longer live",
+            ));
+        }
+        let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "no accepted activation retained a Host workspace locator",
+            )
+        })?;
+        if locator.principal_ref != principal_ref
+            || locator.session_ref != session_ref
+            || locator.work_scope_ref != work_scope.binding.scope.scope_ref
+        {
+            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "retained activation locator does not match the authenticated request and current WorkScope",
+            ));
+        }
+        Ok(locator.root.clone())
+    }
+
     /// Starts an owner-retained Task Controller selection read. The returned
     /// Governor token is passed across the exact Kernel acceptance-set read;
     /// callers release the shared composition lock before performing that I/O.
