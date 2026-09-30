@@ -1550,18 +1550,25 @@ impl AgentCoordinator {
     /// `max_active_per_route`, and a class may hold more admitted items than a
     /// single plan's `max_ready_items` would suggest.
     ///
-    /// Known limitation, stated here so a reader of the code does not need the
-    /// delivery report: the per-class partition is reachable only through the
-    /// profile-bound path [`Self::pull_next`], and in production this
+    /// **Reachability, measured.** This method has exactly two call sites in the
+    /// tree and both are in `src/tests.rs`; `git grep` finds no production
+    /// caller. It is a profile-free peek kept as a public read, and the
+    /// production join does not use it.
+    ///
+    /// The per-class partition is reachable only through the profile-bound
+    /// selector, and on a coordinator built by the plan/define path this
     /// coordinator's `attempts` map is **empty** — `AgentFabric` never calls
-    /// [`Self::admit`], because no production issuer of the provider-verified
-    /// [`ProviderAdmissionReceipt`] that `admit` requires exists in this tree.
-    /// So this method returns `None` on every production path today, no caller
-    /// invokes it, and `profile_revision` in any published outcome would be
-    /// `None`. A reader must not conclude from this method that saturated
-    /// low-priority work is prevented from consuming another class's
-    /// partition: nothing on this path does that. The full measurement is on
-    /// [`Self::pull_next`].
+    /// [`Self::admit`] directly, because no production issuer of the
+    /// provider-verified [`ProviderAdmissionReceipt`] that `admit` requires
+    /// exists in this tree. So this method returns `None` on every such
+    /// production path today, and `profile_revision` in any published outcome
+    /// would be `None`. As on [`Self::pull_next`], the honest claim is narrower
+    /// than "`admit` is unreachable": snapshot replay reaches it in production,
+    /// so this peek returns a real item over a coordinator restored from an
+    /// event log that contains an admission. A reader must not conclude from
+    /// this method that saturated low-priority work is prevented from consuming
+    /// another class's partition: nothing on this path does that. The full
+    /// measurement is on [`Self::pull_next`].
     pub fn next_ready(&mut self) -> Option<AttemptRecord> {
         let selected = self.select_ready(None, false).selected_attempt_id?;
         self.attempts.get(&selected).cloned()
@@ -1652,28 +1659,56 @@ impl AgentCoordinator {
     /// every start, so no selection it acts on is older than the view it was
     /// measured against.
     ///
-    /// Unreachable in production, and the reason is upstream of the profile.
-    /// Measured on `origin/main` @ `5d691922c`, the whole production gap is:
+    /// **This method has no caller anywhere in the tree.** That is measured, not
+    /// assumed: `git grep -nE '[.>]pull_next\('` over `origin/main` returns zero
+    /// hits, in production and in test alike. It is the profile-bound *single
+    /// pull* wrapper, and the production join reaches the same selector through
+    /// [`Self::drive_fair_pull`] instead, which calls the underlying selector
+    /// directly and needs the attempt record, enqueue ordinal and stored
+    /// admission receipt between pull and start — a hop this wrapper's return
+    /// type does not carry. It is retained as the public single-shot entry point
+    /// a caller outside this crate can use, and its selection behaviour is
+    /// identical to the drive's first pull; but a reader must not infer from its
+    /// existence that anything drives the loop through it.
+    ///
+    /// What a *freshly admitted* pull sees is a separate question, and the
+    /// answer is measured too:
     ///
     /// - No caller outside this crate constructs a [`ProviderAdmissionReceipt`].
     ///   Its `expires_at_unix_ms` doc records that "No production issuer exists
     ///   in this tree yet, so every construction site is a test fixture", and
-    ///   `git grep` finds no `bins/` construction site. The receipt is
-    ///   provider-verified on intake, so a pull cannot be fed a synthesized
-    ///   one without forging provider evidence.
-    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) calls exactly three
-    ///   coordinator methods — `plan` (twice), `snapshot`, and a lease
-    ///   `authorizes` on an unrelated `SwarmCoordinatorLease`. It never calls
-    ///   [`Self::admit`], so this coordinator's `attempts` map is empty in
-    ///   production and every pull over it would select nothing even if a
-    ///   profile were supplied.
+    ///   `git grep` finds no `bins/` construction site — every struct literal is
+    ///   in `src/tests.rs`, `src/core/admission_normalization_tests.rs` or
+    ///   `tests/coordinator.rs`. The receipt is provider-verified on intake, so a
+    ///   pull cannot be fed a synthesized one without forging provider evidence.
+    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) calls exactly four
+    ///   coordinator methods — `plan` (twice), `snapshot`, and
+    ///   [`Self::drive_fair_pull`] — plus a lease `authorizes` on an unrelated
+    ///   `SwarmCoordinatorLease`. It never calls [`Self::admit`], so on a
+    ///   coordinator built by the plan/define path this crate's `attempts` map
+    ///   is empty and every pull over it selects nothing even if a profile were
+    ///   supplied.
     ///
-    /// So the per-class partition is unexercised in production, and the
-    /// blocking join is `AgentFabric` -> [`Self::admit`], not a missing profile.
-    /// Building that join needs the #1678 admission saga's owner-issued
-    /// receipt; supplying only a `SchedulingProfile` would produce a selector
-    /// that is correct and permanently empty. See also the note on
-    /// [`Self::next_ready`].
+    /// One correction to a reading of that gap that has circulated: `admit` is
+    /// **not** unreachable in production. It has exactly one non-test call site,
+    /// `core.rs::replay_snapshot_events`, and that replay is production-reachable
+    /// through three `bins/eliotd` restore call sites
+    /// (`AgentCoordinator::restore_with_admitted_provider` at
+    /// `agent_fabric.rs:4257`, `agent_fabric.rs:4341` and `lib.rs:3553`).
+    /// Replaying an event log that contains `CoordinatorEvent::PlanAdmitted` does
+    /// repopulate `attempts`, and a drive over that restored coordinator selects
+    /// and starts for real. So the honest statement is not "no admitted
+    /// projection can exist in production" — it is that a fresh admit never
+    /// happens, so a populated projection can only ever come from a snapshot
+    /// some earlier coordinator wrote, and no such snapshot exists until the
+    /// #1678 admission saga's owner-issued receipt lands. Until then a drive
+    /// performs one pull over an empty projection and stops.
+    ///
+    /// So the per-class partition is unexercised in production today, and the
+    /// blocking join is an owner-issued [`ProviderAdmissionReceipt`] reaching
+    /// [`Self::admit`], not a missing profile. Supplying only a
+    /// `SchedulingProfile` would produce a selector that is correct and
+    /// permanently empty. See also the note on [`Self::next_ready`].
     ///
     /// # Errors
     ///
@@ -1693,11 +1728,11 @@ impl AgentCoordinator {
     /// I14.8: "Scheduler is pull-based: terminal/deferred/blocked attempt
     /// releases its slot, then the next currently admissible Ready Work Item is
     /// selected." This is that sentence as an operation. It pulls through the
-    /// same [`Self::pull_next`] selector under the same profile, and each
-    /// selection becomes a `Running` attempt through the existing
-    /// [`Self::start_attempt`] transition, so released capacity advances work
-    /// without another agent command and without a notification this method
-    /// could miss.
+    /// same bounded selector [`Self::pull_next`] wraps, called directly rather
+    /// than through that wrapper, and each selection becomes a `Running` attempt
+    /// through the existing [`Self::start_attempt`] transition, so released
+    /// capacity advances work without another agent command and without a
+    /// notification this method could miss.
     ///
     /// The `ExecutionContext` each started attempt receives is derived through
     /// `ExecutionContext::from` from the coordinator's **own stored admission
@@ -1749,14 +1784,30 @@ impl AgentCoordinator {
     /// start one item is not a durable `DEFERRED_CAPACITY` transition, so this
     /// method does not restate that vocabulary.
     ///
+    /// Production reachability, measured rather than asserted. This method has
+    /// three production call sites, none of them `cfg(test)`-gated:
+    /// `agent_fabric.rs::AgentFabric::drive_fair_pull` forwards to it, and that
+    /// forwarder has two production callers of its own —
+    /// `solo_agent_driver.rs::drive_fair_pull_after_release` (the event arm,
+    /// reached from `DaemonComposition::solo_ingest_result`) and
+    /// `solo_agent_driver.rs::solo_fair_pull_recovery` (the always-armed
+    /// recovery poll), the latter started on **every** tick of the daemon's
+    /// existing `ACTIVATION_POLL_INTERVAL` cadence by
+    /// `daemon_runtime.rs::maybe_start_fair_pull_recovery`. So the drive is
+    /// genuinely on the production path, not merely compiled.
+    ///
     /// Production residual, unchanged by this method and not worked around here:
     /// no issuer of the provider-verified [`ProviderAdmissionReceipt`] that
-    /// [`Self::admit`] requires exists in this tree, so in production `attempts`
-    /// is empty, a drive performs one pull, selects nothing, and stops. That is
-    /// the correct bounded behaviour of an empty projection, and the drive goes
-    /// live when that owner lands (issue #1678). It is called from production
-    /// by `AgentFabric::drive_fair_pull` in `bins/eliotd/src/agent_fabric.rs`,
-    /// from both the release event path and the bounded recovery poll.
+    /// [`Self::admit`] requires exists in this tree, so a drive over a freshly
+    /// built coordinator sees an empty `attempts` map, performs one pull, selects
+    /// nothing, and stops. That is the correct bounded behaviour of an empty
+    /// projection. The precise claim is narrower than "no admitted projection can
+    /// exist": [`Self::admit`] is reached in production through snapshot replay
+    /// (`core.rs::replay_snapshot_events`), so a drive over a *restored*
+    /// coordinator whose event log contains `CoordinatorEvent::PlanAdmitted`
+    /// does select and start for real. No such snapshot exists until the #1678
+    /// admission saga's owner-issued receipt lands (issue #1678). Full
+    /// measurement on [`Self::pull_next`].
     ///
     /// Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`].
     ///

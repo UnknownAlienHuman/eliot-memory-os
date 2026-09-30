@@ -1278,6 +1278,36 @@ pub const FAIRNESS_QUANTUM: u64 = 1_000_000;
 /// an item's age, and no caller-supplied clock participates in the decision.
 /// The ordinal is unique per attempt, so the within-class order is total and
 /// no further tie-break exists.
+///
+/// # Production readers
+///
+/// This constant is read on the coordinator's real selection path, and the
+/// readers are named here in `path.rs::symbol` form because a file path is not a
+/// checkable citation. Measured with `git grep` over `origin/main`: exactly two
+/// non-doc reads exist, both of which assign the value into a published pull
+/// outcome rather than merely mentioning it.
+///
+/// - `core.rs::AgentCoordinator::drive_fair_pull` — writes
+///   `FairPullOutcome::algorithm` for the drive that publishes
+///   [`crate::FairPullOutcome::started`] and `last_selection`. It is reached from
+///   production by `agent_fabric.rs::AgentFabric::drive_fair_pull`, which is
+///   itself called from `solo_agent_driver.rs::drive_fair_pull_after_release` and
+///   `solo_agent_driver.rs::solo_fair_pull_recovery`, the latter driven every tick
+///   by `daemon_runtime.rs::maybe_start_fair_pull_recovery`.
+/// - `core.rs::AgentCoordinator::select_ready` — writes
+///   `ReadySelectionOutcome::algorithm` for every single pull, including the
+///   ones the drive makes. In production it is reached only from that drive; the
+///   two single-shot wrappers `core.rs::AgentCoordinator::pull_next` and
+///   `core.rs::AgentCoordinator::next_ready` also call it, but neither wrapper
+///   has a production caller, so they are not counted as production readers of
+///   this constant. See the note on `core.rs::pull_next` for that measurement.
+///
+/// The constant is therefore live, not decorative: removing either reader would
+/// leave a published outcome unable to name the rule its own ordering
+/// implements. It is a `pub` item, so a reader outside this crate may also name
+/// it in a receipt; that is a naming affordance and is deliberately not counted
+/// as the caller, because an external naming of the constant proves nothing
+/// about whether the coordinator's own selection path runs.
 pub const FAIR_PULL_ALGORITHM: &str =
     "eliot-agent-coordinator/smooth-weighted-fair-pull-v1/oldest-canonical-enqueue-first";
 
