@@ -117,9 +117,10 @@ pub use transport_profile::{
 use understanding_bootstrap::validate_task_inputs_match_surface;
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootDelta, BootstrapContext, BootstrapError, BootstrapSession,
-    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition,
-    RoutePayloadMeasurement, ScopeLevel, SelectedTask, TaskCandidate, TaskSelectionDisposition,
-    TaskSelectionView, UnderstandingBootstrap, get_understanding_bootstrap, measure_route_payload,
+    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ProjectionFreshness,
+    ProjectionProvenance, ReadinessDisposition, RoutePayloadMeasurement, ScopeLevel, SelectedTask,
+    TaskCandidate, TaskSelectionDisposition, TaskSelectionView, UnderstandingBootstrap,
+    get_understanding_bootstrap, measure_route_payload,
 };
 
 fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
@@ -4776,11 +4777,29 @@ pub struct BridgeRunner {
 /// Fence, or another scope/task binding refuses instead of projecting
 /// stale authority as current. Noting again under the current attach
 /// reseals the snapshot.
+///
+/// The snapshot freezes every carried identity class at note time (issue #8
+/// W1): principal and Session through the seal itself, `WorkScope` through
+/// the seal plus the note-time content check, the task set through the
+/// note-time selection-vs-seal binding plus
+/// [`BootstrapSnapshot::delivery_tasks_match`], and source, route,
+/// workspace-instance, projection-source/generation, and receipt references
+/// by retaining the exact noted context — sealed delivery composes only
+/// from these frozen values and refuses any caller task set that differs.
+/// Frozen serializer/tokenizer identities arrive only through the
+/// Governor-compiled surface intake; the host-snapshot intake refuses them
+/// outright instead of clearing them, so a client-named rendering identity
+/// fails closed with `BOOTSTRAP_RENDERING_UNBOUND` rather than projecting
+/// an unidentified rendering. `owner_compiled` records which intake noted
+/// the snapshot so sealed delivery stamps the honest
+/// [`ProjectionProvenance`]/[`ProjectionFreshness`] instead of letting a
+/// host-carried bootstrap present itself as owner-issued (issue #8 P1/A2).
 #[derive(Clone, Debug)]
 struct BootstrapSnapshot {
     context: BootstrapContext,
     tasks: BootstrapTaskInputs,
     binding: Option<AttachBinding>,
+    owner_compiled: bool,
 }
 
 impl BootstrapSnapshot {
@@ -4949,6 +4968,35 @@ impl BootstrapSnapshot {
                         .to_owned(),
             })
         }
+    }
+}
+
+/// Stamps the sealed-delivery provenance and freshness on one composed bootstrap.
+///
+/// The composition itself always reports host-carried provenance with a
+/// partial (or unavailable, when no projection source was stated) freshness,
+/// because its inputs are caller-supplied. Sealed delivery upgrades both
+/// stamps exactly when the snapshot arrived through the Governor-compiled
+/// surface intake (`owner_compiled`) and the live attach still equals the
+/// noted seal — the caller of this helper has already established both, so
+/// the stamp records this operation's evidence instead of re-deriving it.
+/// A stated source on an owner-compiled snapshot delivers as
+/// [`ProjectionFreshness::Current`]; a stated source on a host-carried
+/// snapshot stays [`ProjectionFreshness::Partial`] (frozen under the seal,
+/// owner currency not independently established, refresh through the carried
+/// `next_safe_expansion`); an unstated source delivers as
+/// [`ProjectionFreshness::Unavailable`] on either intake.
+fn stamp_sealed_provenance(bootstrap: &mut UnderstandingBootstrap, owner_compiled: bool) {
+    if bootstrap.projection_source_ref.is_empty() {
+        bootstrap.projection_provenance = if owner_compiled {
+            ProjectionProvenance::OwnerCompiled
+        } else {
+            ProjectionProvenance::HostCarried
+        };
+        bootstrap.projection_freshness = ProjectionFreshness::Unavailable;
+    } else if owner_compiled {
+        bootstrap.projection_provenance = ProjectionProvenance::OwnerCompiled;
+        bootstrap.projection_freshness = ProjectionFreshness::Current;
     }
 }
 
@@ -5699,6 +5747,7 @@ impl BridgeRunner {
             context,
             tasks: empty_tasks,
             binding,
+            owner_compiled: false,
         });
         Ok(())
     }
@@ -5713,10 +5762,14 @@ impl BridgeRunner {
     /// later session, fence, or scope/task move refuses at compose time.
     /// Material readiness is refused on this generic context path because
     /// its fence is only an opaque reference, not a typed value comparable to
-    /// the live attach fence.
+    /// the live attach fence. Frozen serializer/tokenizer identities are
+    /// refused on this host path for the same reason: they arrive only
+    /// through the Governor-compiled surface intake, so a client-named
+    /// rendering identity fails closed with `BOOTSTRAP_RENDERING_UNBOUND`
+    /// instead of being silently cleared or projected.
     pub fn note_owner_snapshot(
         &mut self,
-        mut context: BootstrapContext,
+        context: BootstrapContext,
         tasks: BootstrapTaskInputs,
     ) -> Result<(), BootstrapError> {
         if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
@@ -5725,25 +5778,54 @@ impl BridgeRunner {
                 detail: "material readiness cannot be projected while the retained context carries only an opaque fence reference".to_owned(),
             });
         }
-        // The host-supplied path never carries frozen rendering identities:
-        // a client can name them in request JSON (bypassing the constructor),
-        // so they are cleared here before validation and retention. Only the
-        // compiled-surface intake re-applies the exact owner values below.
-        context.serializer_id.clear();
-        context.serializer_version.clear();
-        context.serializer_options_digest.clear();
-        context.tokenizer_id.clear();
-        context.tokenizer_version.clear();
-        context.tokenizer_hash.clear();
-        get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
+        if !context.serializer_id.is_empty()
+            || !context.serializer_version.is_empty()
+            || !context.serializer_options_digest.is_empty()
+            || !context.tokenizer_id.is_empty()
+            || !context.tokenizer_version.is_empty()
+            || !context.tokenizer_hash.is_empty()
+        {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_RENDERING_UNBOUND",
+                detail: "host-supplied snapshot names frozen serializer/tokenizer identities that only the Governor-compiled surface intake may carry".to_owned(),
+            });
+        }
+        self.retain_sealed_snapshot(context, tasks, false)
+    }
+
+    /// Validates one noted snapshot and seals it to the live attach binding.
+    ///
+    /// Shared retention core behind the host-snapshot and compiled-surface
+    /// intakes: fail-closed composition validation first (nothing invalid is
+    /// ever stored), then the principal/`WorkScope` content check against the
+    /// live seal, then the composed task-selection check against the sealed
+    /// activation task (issue #8 W1/P1: a `Bound`/`Unique` selection must name
+    /// the sealed task and revision before retention, so later
+    /// `delivery_tasks_match` equality preserves a seal-checked set instead
+    /// of two unbound host values; `Ambiguous`/`None` claims no task and
+    /// needs no agreement, exactly as at delivery), then retention of the
+    /// exact noted context, task set, seal, and intake provenance.
+    /// `owner_compiled` is true only for snapshots
+    /// whose context arrived through [`BootstrapContext::from_compiled_surface`]
+    /// with its owner-frozen rendering identities already validated there.
+    fn retain_sealed_snapshot(
+        &mut self,
+        context: BootstrapContext,
+        tasks: BootstrapTaskInputs,
+        owner_compiled: bool,
+    ) -> Result<(), BootstrapError> {
+        let composed =
+            get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
         let binding = self.attach_view().map(|view| view.binding().clone());
         if let Some(seal) = &binding {
             BootstrapSnapshot::content_matches_binding(&context, seal)?;
+            BootstrapSnapshot::selection_matches_sealed_task(&composed, seal)?;
         }
         self.bootstrap_snapshot = Some(BootstrapSnapshot {
             context,
             tasks,
             binding,
+            owner_compiled,
         });
         Ok(())
     }
@@ -5783,7 +5865,10 @@ impl BridgeRunner {
     /// those facts remain dependent on the live authenticated #8 producer.
     /// A no-task or ambiguous surface cannot be delivered through this
     /// attach-bound route: it needs an authenticated preselection transport
-    /// before a snapshot can be retained or served.
+    /// before a snapshot can be retained or served. Retention goes through
+    /// the shared sealed-snapshot core with `owner_compiled` set, so sealed
+    /// delivery stamps the owner-compiled provenance and current freshness
+    /// instead of the host-carried defaults.
     ///
     /// # Live status
     ///
@@ -5848,38 +5933,12 @@ impl BridgeRunner {
             next_safe_expansion,
             boot_delta,
         )?;
-        self.note_owner_snapshot(context, tasks)?;
-        // The generic note path clears frozen rendering identities (host
-        // clients can name them in request JSON); re-apply the exact values
-        // the compiled owner surface carried, already validated by
-        // `from_compiled_surface` above.
-        if let Some(snapshot) = self.bootstrap_snapshot.as_mut() {
-            snapshot
-                .context
-                .serializer_id
-                .clone_from(&surface.serializer_id);
-            snapshot
-                .context
-                .serializer_version
-                .clone_from(&surface.serializer_version);
-            snapshot
-                .context
-                .serializer_options_digest
-                .clone_from(&surface.serializer_options_digest);
-            snapshot
-                .context
-                .tokenizer_id
-                .clone_from(&surface.tokenizer_id);
-            snapshot
-                .context
-                .tokenizer_version
-                .clone_from(&surface.tokenizer_version);
-            snapshot
-                .context
-                .tokenizer_hash
-                .clone_from(&surface.tokenizer_hash);
-        }
-        Ok(())
+        // The context already carries the exact owner-frozen
+        // serializer/tokenizer identities validated by
+        // `from_compiled_surface` above, so retention keeps them verbatim:
+        // the host-snapshot intake (which refuses client-named rendering
+        // identities) is bypassed, not reused, here.
+        self.retain_sealed_snapshot(context, tasks, true)
     }
     /// Task inputs retained by the noted owner snapshot for auto-boot.
     ///
@@ -5909,7 +5968,10 @@ impl BridgeRunner {
     /// re-noting under the live attach. A
     /// composed selection that names any task other than the sealed
     /// activation task is refused the same way, so a forged or stale packet
-    /// can never retrieve `READY` through this path either.
+    /// can never retrieve `READY` through this path either. Delivery stamps
+    /// the snapshot intake's [`ProjectionProvenance`] and the projection's
+    /// [`ProjectionFreshness`] before measuring, so the returned bootstrap
+    /// never presents host-carried values as owner-issued (issue #8 P1/A2).
     pub fn get_understanding_bootstrap(
         &self,
         tasks: &BootstrapTaskInputs,
@@ -5931,6 +5993,7 @@ impl BridgeRunner {
         let mut bootstrap =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
         BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
+        stamp_sealed_provenance(&mut bootstrap, snapshot.owner_compiled);
         attach_route_payload_measurement(&mut bootstrap);
         Ok(bootstrap)
     }
@@ -5953,6 +6016,7 @@ impl BridgeRunner {
         session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
             .map(|mut bootstrap| {
+                stamp_sealed_provenance(&mut bootstrap, snapshot.owner_compiled);
                 attach_route_payload_measurement(&mut bootstrap);
                 bootstrap
             })
@@ -5969,6 +6033,8 @@ impl BridgeRunner {
     /// activation task yields `None` the same way, without consuming the
     /// once-per-session slot, so a forged or stale packet can never
     /// auto-boot `READY` and a later coherent response can still deliver.
+    /// Delivery stamps the snapshot intake's [`ProjectionProvenance`] and
+    /// the projection's [`ProjectionFreshness`] before measuring.
     pub fn take_first_response_bootstrap(
         &mut self,
         tasks: &BootstrapTaskInputs,
@@ -5983,6 +6049,7 @@ impl BridgeRunner {
         self.bootstrap_session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
             .map(|mut bootstrap| {
+                stamp_sealed_provenance(&mut bootstrap, snapshot.owner_compiled);
                 attach_route_payload_measurement(&mut bootstrap);
                 bootstrap
             })

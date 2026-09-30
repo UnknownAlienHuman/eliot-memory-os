@@ -90,6 +90,64 @@ pub enum CurrentAssessment {
     Degraded,
 }
 
+/// Intake provenance of one delivered bootstrap projection (issue #8 P1).
+///
+/// A host-authored bootstrap carries caller-supplied context and task inputs;
+/// it can never present itself as owner-issued. The sealed delivery path
+/// stamps every bootstrap it returns, so the agent can tell whether the
+/// projected task/scope/authority evidence came through the Governor-compiled
+/// surface intake or was carried from host input and compared with this
+/// operation only (live attach seal, frozen task set, governance shape).
+/// Unwitnessed compositions (direct [`get_understanding_bootstrap`] callers)
+/// always report [`ProjectionProvenance::HostCarried`]: their inputs are
+/// caller-supplied by construction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProjectionProvenance {
+    /// Governor-compiled readiness surface intake
+    /// ([`BootstrapContext::from_compiled_surface`], sealed by
+    /// `BridgeRunner::note_owner_surface`): readiness, task binding,
+    /// route/workspace/projection and frozen serializer/tokenizer identities
+    /// arrived on the owner surface. Receipt-digest authentication still
+    /// depends on the live authenticated #8 producer.
+    OwnerCompiled,
+    /// Caller-supplied context and task inputs (every other intake):
+    /// values were frozen under the live attach seal and re-checked at
+    /// delivery, but no owner minted them on this path.
+    #[default]
+    HostCarried,
+}
+
+/// Freshness disposition of one delivered projection (issue #8 A2, TASK
+/// Freshness).
+///
+/// Every delivered projection carries this instead of leaving currency
+/// implicit. Vocabulary follows the item text (`current`,
+/// `explicitly stale/partial`, `unavailable`); the refresh handle for a
+/// non-current projection is the carried `next_safe_expansion`, and the exact
+/// revisions are the carried receipt/projection/source references. A seal
+/// that moved since note time never delivers a silent stale packet: sealed
+/// delivery refuses with `BOOTSTRAP_SEAL_MISMATCH` instead.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProjectionFreshness {
+    /// Owner-compiled surface delivered under the still-live attach seal:
+    /// currency was established by the Governor compiler and the seal
+    /// (session, fence, scope/task binding) has not moved since.
+    Current,
+    /// Host-carried values frozen under the live attach seal at note time and
+    /// delivered only while that seal still holds. Owner currency is not
+    /// independently established on this path: the ceiling is the live seal
+    /// itself, and refresh travels through `next_safe_expansion` naming the
+    /// referenced receipt.
+    #[default]
+    Partial,
+    /// No projection source was stated (empty `projection_source_ref`): the
+    /// projection has no observable source, and the next action is the
+    /// carried `next_safe_expansion`.
+    Unavailable,
+}
+
 /// Canonical readiness disposition from the referenced
 /// `OnboardingReadinessReceipt` (I4.4.1 lifecycle).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -911,6 +969,25 @@ pub struct UnderstandingBootstrap {
     pub role_lease_ref: String,
     pub state_fence_ref: String,
     pub current_assessment: CurrentAssessment,
+    /// Intake provenance stamp (issue #8 P1).
+    ///
+    /// Composition sets [`ProjectionProvenance::HostCarried`]; the sealed
+    /// bridge delivery path upgrades it to
+    /// [`ProjectionProvenance::OwnerCompiled`] only for snapshots retained
+    /// through the Governor-compiled surface intake, so a host-authored
+    /// bootstrap can never present itself as owner-issued.
+    #[serde(default)]
+    pub projection_provenance: ProjectionProvenance,
+    /// Freshness disposition of this delivered projection (issue #8 A2).
+    ///
+    /// Composition reports [`ProjectionFreshness::Partial`] for stated
+    /// sources and [`ProjectionFreshness::Unavailable`] when no projection
+    /// source was stated; the sealed bridge delivery path upgrades a stated
+    /// source to [`ProjectionFreshness::Current`] only for snapshots
+    /// retained through the Governor-compiled surface intake while the live
+    /// attach seal still holds.
+    #[serde(default)]
+    pub projection_freshness: ProjectionFreshness,
     /// Workspace instance identity projected from the composed context.
     #[serde(default)]
     pub workspace_instance_ref: String,
@@ -1468,21 +1545,24 @@ fn compose_selection(tasks: &BootstrapTaskInputs) -> Result<TaskSelectionView, B
 /// `READY` (I4.4.1: `READY_MATERIAL` is always tied to one `TaskContract`
 /// revision). Fails closed whenever governance evidence, identity,
 /// revisions, acceptance, or selection integrity are missing.
-/// This bridge context carries only an opaque fence reference, so this
-/// projection also refuses `READY_MATERIAL` until an authenticated route can
-/// supply a typed fence comparable to the live attach.
+///
+/// This is the projection half of readiness admission (I7.17 bounded read
+/// composition): it caps and labels, it never admits. Material-readiness
+/// admission stays with the sealed note intakes — the host-snapshot intake
+/// refuses `READY_MATERIAL` outright, and the compiled-surface intake binds
+/// the typed owner fence — so a composed `READY` from caller-supplied inputs
+/// alone is never agent-facing delivery. The composed projection is stamped
+/// [`ProjectionProvenance::HostCarried`] with a
+/// [`ProjectionFreshness::Partial`] (or `Unavailable` when no projection
+/// source was stated) disposition; only the sealed bridge delivery path may
+/// upgrade those stamps for a Governor-compiled snapshot delivered under the
+/// still-live attach seal.
 pub fn get_understanding_bootstrap(
     context: &BootstrapContext,
     tasks: &BootstrapTaskInputs,
     requested_assessment: CurrentAssessment,
 ) -> Result<UnderstandingBootstrap, BootstrapError> {
     validate_context(context)?;
-    if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
-        return Err(BootstrapError::new(
-            "BOOTSTRAP_STATE_FENCE_UNBOUND",
-            "material readiness cannot be projected from a context carrying only an opaque fence reference",
-        ));
-    }
     validate_tasks(tasks)?;
     let task_selection = compose_selection(tasks)?;
     let mut relevant_handles = context.orientation_handles.clone();
@@ -1515,6 +1595,12 @@ pub fn get_understanding_bootstrap(
         role_lease_ref: context.role_lease_ref.clone(),
         state_fence_ref: context.state_fence_ref.clone(),
         current_assessment,
+        projection_provenance: ProjectionProvenance::HostCarried,
+        projection_freshness: if context.projection_source_ref.is_empty() {
+            ProjectionFreshness::Unavailable
+        } else {
+            ProjectionFreshness::Partial
+        },
         workspace_instance_ref: context.workspace_instance_ref.clone(),
         projection_source_ref: context.projection_source_ref.clone(),
         projection_generation: context.projection_generation,
