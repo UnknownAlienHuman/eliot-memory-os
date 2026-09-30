@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod capability_cell;
 pub mod dispatch_authority;
 pub mod dispatched_material;
 pub mod evidence;
@@ -35,6 +36,7 @@ use eliot_researcher::{
 use thiserror::Error;
 
 pub use admission::{AdmissionRefusal, ProviderAdmission};
+pub use capability_cell::resolve_admitted_cell;
 pub use dispatch_authority::{
     AdmittedRequestPort, ProviderEvidenceRecorder, ResearchAuthorityError,
     ResearchDispatchAuthority,

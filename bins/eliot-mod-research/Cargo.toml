@@ -9,29 +9,43 @@ description = "Kernel-gated ELIOT Researcher provider process; fails closed when
 [package.metadata.eliot]
 # Issue #24 research-provider capability declaration.
 #
-# What is declared here is only what the repo already states. The ownership
-# triple `functional_cell` / `lifecycle_owner` / `work_id` is deliberately NOT
-# written: no cell id, no lifecycle owner and no research-plane work-item id
-# exists for `eliot-mod-research` anywhere in the tree, and this package owns no
-# durable mutable state (its admission is immutable and per-operation, and the
-# Kernel/ORS research rows #15/#18 own are still absent). Naming a cell here
-# would therefore manufacture ownership rather than record it, and it would
-# also make this package a *declared* cell, which the capsule gate then reads
-# as requiring a full ModuleContractKit/CrateContextCapsule/ModuleTestCapsule
-# triad under `docs/code-navigation/capsules/<cell>/` — a path this work unit
-# does not own.
+# `functional_cell` names the cell this package's own source implements. It is
+# the same spelling the Kernel's authenticated research dispatch presents as
+# `ResearchProviderDispatch::module_id`, which `ProviderAdmission` seals as its
+# `CapabilityCellId` and which the launched `ImageId` is compared against
+# (`execution.rs`). Declaring it here is what turns that identity from free text
+# into a catalogued capability cell: `scripts/gen_capability_cell_registry.py`
+# projects it into a generated `CapabilityCellRecord`, and
+# `eliot_mod_research::capability_cell::resolve_admitted_cell` refuses any
+# admission whose sealed cell id the generated registry does not declare with a
+# current validated proof surface. Without this declaration the record cannot
+# exist and the proof surface is unbound.
 #
-# The three markers below are carried verbatim from this work unit's own
-# assignment record, `workstreams/core-daemons/assignments/
-# 024-research-provider-runtime.toml` (lines 4-6), so the manifest states the
-# research provider's real support level instead of implying a generated
-# registry record that does not exist.
+# `lifecycle_owner` / `work_id` name the work unit that owns this runtime root,
+# taken from the repository's own owner tables rather than invented:
+# `bins/AGENTS.md` records "eliot-mod-research | governed provider acquisition;
+# candidate-only output, #24", `workstreams/core-daemons/AGENTS.md` records
+# "#24 | governed Researcher provider process bridge", and this unit's own
+# assignment record `workstreams/core-daemons/assignments/
+# 024-research-provider-runtime.toml` carries `issue = 24`. No architecture item
+# id names the research plane, so the owner is spelled as the issue work unit
+# rather than as a made-up `A-nn` item.
+#
+# The three markers below are carried verbatim from that same assignment record
+# (lines 4-6), so the manifest states the research provider's real support
+# level instead of implying a stronger one.
+work_id = "issue-24"
+functional_cell = "mod-research-provider"
+lifecycle_owner = "issue-24"
 implementation_support = "GOVERNED_PROVIDER_BRIDGE_SOURCE_CURRENT_UNVERIFIED"
 evidence_execution_status = "SOURCE_AUDIT_EXECUTED_EDGE_PROOF_NOT_EXECUTED"
 proof_ceiling = "RESEARCH_PROVIDER_EDGE_CANDIDATE"
 # Mirrors the `crates/modules/eliot-native-worker-core` precedent: the package's
 # own test target is the honest proof surface for this source. This is a
-# command, not an ownership claim.
+# command, not an ownership claim. `scripts/code_navigation.py capsules` derives
+# the matching `ModuleTestCapsule::independent_proof_entrypoint` from this exact
+# field, and the registry generator refuses to emit a record whose test capsule
+# disagrees with it.
 proof_entrypoint = "cargo test -p eliot-mod-research --all-targets --all-features"
 independent_proof_profile = "eliot-mod-research"
 

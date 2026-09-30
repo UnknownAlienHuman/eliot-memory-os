@@ -47,6 +47,17 @@ pub enum AdmissionRefusal {
     NonPositiveCeiling,
     /// The request disagrees with the admission on a bound dimension.
     RequestMismatch,
+    /// The generated capability-cell registry is unusable: it cannot be typed
+    /// decoded, fails the #13 validator, declares no cell for this package, or
+    /// names a different source crate. The identity is refused rather than
+    /// resolved against a default record.
+    UndeclaredCapabilityCell,
+    /// The admitted Module/Capability Registry reference does not name the
+    /// capability cell this package declares.
+    CapabilityCellMismatch,
+    /// The declared cell carries no current, independently invokable proof
+    /// surface, so nothing on it may be admitted.
+    CapabilityCellUnsupported,
 }
 
 impl AdmissionRefusal {
@@ -59,6 +70,15 @@ impl AdmissionRefusal {
             Self::EpochFenceConflict => "admission epoch disagrees with fence authority epoch",
             Self::NonPositiveCeiling => "admission ceiling is not a positive bound",
             Self::RequestMismatch => "request disagrees with the admitted operation binding",
+            Self::UndeclaredCapabilityCell => {
+                "capability-cell registry declares no validated cell for this package"
+            }
+            Self::CapabilityCellMismatch => {
+                "admitted module registry reference names no declared capability cell"
+            }
+            Self::CapabilityCellUnsupported => {
+                "declared capability cell has no current validated proof surface"
+            }
         }
     }
 }
@@ -76,9 +96,10 @@ impl AdmissionRefusal {
 ///   authority or re-issuing admission, and they are the exact identities a
 ///   generated `CapabilityCellRecord` and its proof-surface readback are keyed
 ///   by. They are compared by value against the Kernel's own attested dispatch
-///   content, which is what makes them trustworthy as references. The generated
-///   research-provider cell *record* is still #13's to produce; see the note on
-///   [`ProviderAdmission::module_id`].
+///   content, which is what makes them trustworthy as references, and the sealed
+///   `module_id` is then bound by value to this package's own generated record
+///   through [`crate::capability_cell::resolve_admitted_cell`], which the
+///   production path calls before any executor contact.
 /// - `inquiry_digest` / `denominator_digest` bind the frozen Researcher
 ///   inquiry and its exact source-role portfolio / coverage denominator. A
 ///   coverage or absence claim must name its scope, revision, and the method
@@ -159,11 +180,10 @@ impl ProviderAdmission {
         // text. Their constructors are the registry's own fail-closed
         // validators, so a blank or control-bearing reference is refused by the
         // owner instead of by a second local shape check. This binds the process
-        // cell to the #13 proof surface: the admitted reference is exactly the
-        // spelling a generated `CapabilityCellRecord` and its
-        // `resolve_generation_via_registry` readback are keyed by, so the same
-        // identity that will be resolved for a proof entrypoint is the one
-        // sealed here.
+        // cell to the #13 proof surface: the admitted cell reference is exactly
+        // the spelling a generated `CapabilityCellRecord` declares, so the same
+        // identity that `crate::capability_cell` resolves against its compiled
+        // record is the one sealed here.
         let module_id =
             CapabilityCellId::new(module_id).map_err(|_| AdmissionRefusal::MalformedText)?;
         let module_generation_id = RuntimeBundleId::new(module_generation_id)
@@ -232,16 +252,14 @@ impl ProviderAdmission {
     /// Returns the Module/Capability Registry cell reference.
     ///
     /// The reference is carried as #13's own [`CapabilityCellId`], the exact
-    /// identity a generated `CapabilityCellRecord` declares and
-    /// `resolve_generation_via_registry` resolves against, and its content is
+    /// identity a generated `CapabilityCellRecord` declares, and its content is
     /// re-proved by value against the live authority in
-    /// [`ProviderAdmission::bind_admitted_dispatch`]. The named gap that remains
-    /// is the *record* side, not the identity side: no generated
-    /// research-provider cell record is compiled into the tree yet (only the
-    /// native-worker cell in `bins/eliot-kernel/src/composition_bootstrap.rs`),
-    /// and #13 owns producing it. When that record lands, the same
-    /// `CapabilityCellId` this field holds is the key it is looked up by, so the
-    /// proof surface binds without a rename or a second identity scheme.
+    /// [`ProviderAdmission::bind_admitted_dispatch`]. The record side exists:
+    /// `crate::capability_cell` holds the generated `CapabilityCellRecord` this
+    /// package's own manifest declared, and
+    /// [`crate::capability_cell::resolve_admitted_cell`] looks this field's
+    /// value up in it — refusing an admission whose sealed cell id names no
+    /// declared record with a current proof surface.
     #[must_use]
     pub const fn module_id(&self) -> &CapabilityCellId {
         &self.module_id
@@ -249,10 +267,13 @@ impl ProviderAdmission {
 
     /// Returns the Module generation evidence reference.
     ///
-    /// Carried as #13's [`RuntimeBundleId`], the field
-    /// `resolve_generation_via_registry` matches an installed generation
-    /// against, so the admitted generation is the same identity the readback
-    /// resolves. Same named record gap as [`ProviderAdmission::module_id`].
+    /// Carried as #13's [`RuntimeBundleId`] and re-proved by value against the
+    /// Kernel's attested dispatch content. This cell declares no
+    /// `runtime_bundle` in its generated record, because it executes inline in
+    /// this process rather than being delegated to a separate runtime bundle, so
+    /// this reference is deliberately not read as a bundle identity; see
+    /// [`crate::capability_cell`] for why reading one as the other would be a
+    /// fabricated delegation claim.
     #[must_use]
     pub const fn module_generation_id(&self) -> &RuntimeBundleId {
         &self.module_generation_id
