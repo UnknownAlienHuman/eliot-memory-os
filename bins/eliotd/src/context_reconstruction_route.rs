@@ -61,8 +61,8 @@ use eliot_contracts::{
 };
 use eliot_governor::{ContextReconstructionRequest, SevenRoleInputs};
 use eliot_learning_contracts::{
-    CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceBinding, CampaignSourceRole,
-    CampaignSourceRevisionRef, LearningStateViewRecipe, OwnerId, SlotRequirement,
+    CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceBinding, CampaignSourceRevisionRef,
+    CampaignSourceRole, LearningStateViewRecipe, OwnerId, SlotRequirement,
     TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
 };
 use eliot_protocol::{
@@ -71,10 +71,10 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
-    CampaignLearningStateViewReadStatus, CampaignSourceDocumentSchema,
-    CampaignSourceReadStatus, CampaignSourceRevisionLookup, CampaignSourceRevisionRead,
-    EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    ReadConsistency, RevisionHead, RevisionKey, ScopeId,
+    CampaignLearningStateViewReadStatus, CampaignSourceDocumentSchema, CampaignSourceReadStatus,
+    CampaignSourceRevisionLookup, CampaignSourceRevisionRead, EVIDENCE_PACK_MAX_RECORDS,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency, RevisionHead,
+    RevisionKey, ScopeId,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -296,8 +296,11 @@ pub(crate) async fn reconstruct_context_owner_inputs<'a>(
         &context_recipe,
     )
     .await?;
-    let dependency_revisions =
-        observed_scope_head(&recipe.response.revision_heads, &scope, &envelope.state_fence)?;
+    let dependency_revisions = observed_scope_head(
+        &recipe.response.revision_heads,
+        &scope,
+        &envelope.state_fence,
+    )?;
     let request = context_reconstruction_request(
         &scope,
         &dependency_revisions,
@@ -868,11 +871,17 @@ async fn read_authenticated_campaign_learning_view(
         || publication.task_id != lookup.task_id
         || publication.scope_id != lookup.scope_id
         || publication.state_fence != *fence
-        || publication.view.validate_against(&task_recipe.recipe).is_err()
+        || publication
+            .view
+            .validate_against(&task_recipe.recipe)
+            .is_err()
         || publication.view.binding.state_fence != *fence
-        || publication.view.provenance.source_resolutions.iter().any(|resolution| {
-            resolution.read_state_fence != *fence
-        })
+        || publication
+            .view
+            .provenance
+            .source_resolutions
+            .iter()
+            .any(|resolution| resolution.read_state_fence != *fence)
     {
         return Err(ReconstructionPrerequisite::CampaignLearningViewUnavailable);
     }

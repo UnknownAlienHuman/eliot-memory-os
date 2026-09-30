@@ -71,6 +71,7 @@ mod dreamer_materials;
 mod dreamer_model_adapter;
 /// Joins original context reconstruction, compilation and canonical projection owners.
 pub mod dreamer_orientation_context;
+pub mod dreamer_orientation_context;
 pub mod dreamer_orientation_model;
 /// Executes the admitted CC-002 worker from retained semantic source bytes.
 pub mod dreamer_orientation_model_worker;

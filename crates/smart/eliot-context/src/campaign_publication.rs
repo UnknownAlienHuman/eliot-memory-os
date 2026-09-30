@@ -6,11 +6,12 @@
 
 use eliot_context_candidates::{CandidatePolicy, CandidateRequest};
 use eliot_context_contracts::{
-    ApprovedRecipeCatalogue, RecipeResolutionRefusal, AssemblyPolicy, ContextError as ContractContextError, ContextRecipe, PacketAdmissionParts,
-    QualityScorecard, ReactiveInputError, SessionDeliverySnapshot,
+    ApprovedRecipeCatalogue, AssemblyPolicy, ContextError as ContractContextError, ContextRecipe,
+    PacketAdmissionParts, QualityScorecard, ReactiveInputError, RecipeResolutionRefusal,
+    SessionDeliverySnapshot,
 };
-use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_context_measurement::{MeasurementParams, measure_exact_utf8};
+use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_learning_contracts::{CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceRole};
 use eliot_protocol::ReactiveContextStage;
 use schemars::JsonSchema;
@@ -98,10 +99,8 @@ impl PartialEq for ContextCompilerSupplierProfileV1 {
             && self.admission_parts.floor == other.admission_parts.floor
             && self.admission_parts.priority == other.admission_parts.priority
             && self.admission_parts.rule == other.admission_parts.rule
-            && self.admission_parts.measurement_profile
-                == other.admission_parts.measurement_profile
-            && self.admission_parts.supplied_omissions
-                == other.admission_parts.supplied_omissions
+            && self.admission_parts.measurement_profile == other.admission_parts.measurement_profile
+            && self.admission_parts.supplied_omissions == other.admission_parts.supplied_omissions
             && self.admission_parts.measurements == other.admission_parts.measurements
             && self.quality_scorecard == other.quality_scorecard
             && self.assembly_policy == other.assembly_policy
@@ -185,7 +184,8 @@ impl ContextCompilerSupplierProfileV1 {
             || self.assembly_policy.max_serialized_bytes
                 != self.measurement_params.max_serialized_bytes
             || self.assembly_policy.serializer_id != parts.measurement_profile.serializer_id
-            || self.assembly_policy.serializer_version != parts.measurement_profile.serializer_version
+            || self.assembly_policy.serializer_version
+                != parts.measurement_profile.serializer_version
             || self.assembly_policy.serializer_options_digest
                 != parts.measurement_profile.serializer_options_digest
             || self.assembly_policy.route_id != parts.measurement_profile.route_id

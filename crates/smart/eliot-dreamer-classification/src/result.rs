@@ -218,12 +218,11 @@ pub fn classify_orientation(
     };
     reconcile_orientation_output(&mut result, policy.max_output_bytes)?;
     result.result_digest = orientation_result_digest(&result)?;
-    let final_bytes = u64::try_from(canonical_bytes(&result)?.len()).map_err(|_| {
-        ContractViolation::Budget {
+    let final_bytes =
+        u64::try_from(canonical_bytes(&result)?.len()).map_err(|_| ContractViolation::Budget {
             dimension: "output_bytes",
             reason: "output length cannot be represented".to_owned(),
-        }
-    })?;
+        })?;
     if result.budget.output_bytes != final_bytes {
         return Err(ContractViolation::Budget {
             dimension: "output_bytes",

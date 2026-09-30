@@ -402,6 +402,10 @@ pub struct TaskControllerInvocation {
     pub context_campaign_recipe: Value,
     /// Exact `ContextInput` admitted for the current Context compilation.
     pub context_input: Value,
+    /// Original explicit native compiler supplier profile for task owner publication.
+    /// Absence retains the legacy source ceiling; the daemon decodes its native type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compilation_input: Option<Value>,
     /// Optional selector for the persisted prior delivery snapshot. This is a
     /// lookup selector only and is never evidence or source authority.
     pub prior_delivery_selector: Option<Value>,
@@ -462,6 +466,12 @@ impl TaskControllerInvocation {
             ),
         ] {
             structured_object(value, field)?;
+        }
+        if let Some(profile) = &self.context_compilation_input {
+            structured_object(
+                profile,
+                "task_controller_invocation.context_compilation_input",
+            )?;
         }
         Ok(())
     }
