@@ -50,15 +50,15 @@ use eliot_contracts::{
     RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_governor::{
-    ActualRouteReceipt, CapabilityRouteRegistry, ExecutionIdentity, ObservedRoute,
-    RouteBehaviorFingerprint, RouteInstallationIdentity, RuntimeRoute,
+    ActualRouteReceipt, CapabilityRouteRegistry, ContextSerializerIdentity, ExecutionIdentity,
+    ObservedRoute, RouteBehaviorFingerprint, RouteInstallationIdentity, RuntimeRoute,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
     AGENT_BRIDGE_MODULE_ID, AckPhase, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, ContinuityKind, EncodingProfile,
     EventEnvelope, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
-    RequestIdentity,
+    RequestIdentity, protocol_contract_identity,
 };
 use eliot_receipts::RequestBinding;
 use eliot_runtime::{Runtime, RuntimeConfig};
@@ -5180,9 +5180,6 @@ fn attach_route_payload_measurement(bootstrap: &mut UnderstandingBootstrap) {
 /// - `workspace_scope_policy = "...activation-bound-scope"` (ASSUMPTION):
 ///   scope arrives via the activation-resolved task binding; the contour
 ///   mints none.
-/// - `serializer_fingerprint = "...frame-json-v1"` (ASSUMPTION): names the
-///   contour's actual frame encoding (`EncodingProfile::JsonV1`); the contour
-///   defines no reasoning serializer.
 /// - `provider_and_model_request`, `auth_profile_class`, `billing_mode`,
 ///   `required_capability_profile_ref`, `adapter_hash`, `runtime_hash`, `protocol_kind`,
 ///   `tool_call_id_and_role_ordering`,
@@ -5193,14 +5190,19 @@ fn attach_route_payload_measurement(bootstrap: &mut UnderstandingBootstrap) {
 ///   MCP-stdio-to-Kernel-IPC boundary) so the fingerprint is stable per
 ///   binary and profile.
 ///
+/// The serializer identity is not one of those assumptions: it is read from the
+/// owner that configures this lane, in
+/// [`bridge_contour_serializer_identity`].
+///
 /// Residual (not widened by this turn): the agent-facing transport profile
 /// (stdio vs loopback HTTP) is owned by the composition root and is not
 /// pinned in this fingerprint; threading it is future scope.
 fn bridge_contour_declaration(
     profile: Profile,
-) -> (RuntimeRoute, RouteInstallationIdentity, Option<String>) {
+) -> Result<(RuntimeRoute, RouteInstallationIdentity, Option<String>), BridgeError> {
     let contour = AGENT_BRIDGE_MODULE_ID;
     let version = env!("CARGO_PKG_VERSION").to_owned();
+    let context_serializer = bridge_contour_serializer_identity()?;
     let route = RuntimeRoute {
         route_id: format!("{contour}.{}", profile.as_str()),
         adapter_id: contour.to_owned(),
@@ -5214,7 +5216,7 @@ fn bridge_contour_declaration(
         network_policy: format!("{contour}.local-only-no-remote"),
         session_locator_semantics: format!("{contour}.kernel-issued-activation"),
         workspace_scope_policy: format!("{contour}.activation-bound-scope"),
-        serializer_fingerprint: format!("{contour}.frame-json-v1"),
+        context_serializer,
         privacy_classes: Vec::new(),
         quota_sources: Vec::new(),
         required_capability_profile_ref: format!("{contour}.kernel-front-door-admission"),
@@ -5232,7 +5234,63 @@ fn bridge_contour_declaration(
         reasoning_continuation_and_compaction: format!("{contour}.no-contour-reasoning"),
         feature_flags_and_behavior_affecting_profiles: profile.as_str().to_owned(),
     };
-    (route, installation, None)
+    Ok((route, installation, None))
+}
+
+/// The serializer identity this contour actually encodes with, read from the
+/// owner that configures the lane.
+///
+/// I3.4 lists the reasoning/tool/context serializer fingerprint as configured
+/// route intent the Governor route registry publishes, and this is the
+/// production producer of that record for the only route evidence this tree
+/// builds. Every component is read from `eliot_protocol`, which owns the EBP
+/// frame contract the contour sends, instead of being written here:
+///
+/// - `serializer_id` is the wire spelling of the
+///   [`EncodingProfile`] the contour stamps on every frame it builds (the
+///   `JsonV1` profile the `JsonCodec` accepts). It moves if the admitted
+///   encoding profile moves.
+/// - `serializer_version` is the EBP wire version those frames carry,
+///   [`ProtocolVersion::CURRENT`]. It moves with the admitted wire line.
+/// - `serializer_options_digest` is the protocol owner's own
+///   [`protocol_contract_identity`] shape digest, which that owner computes
+///   over the exact codec options in force: the encoding profile, the frame
+///   length-prefix width, and the maximum encoded body length. Nothing here
+///   re-digests a description of the options, so the digest cannot drift from
+///   the contract it binds.
+///
+/// The record is returned to the owner and validated there by
+/// `RuntimeRoute::is_well_formed`; a route that cannot name its own serializer
+/// is refused at `admit_bridge_route_launch` instead of entering the registry.
+fn bridge_contour_serializer_identity() -> Result<ContextSerializerIdentity, BridgeError> {
+    let encoding = serde_json::to_value(EncodingProfile::JsonV1).map_err(|error| {
+        BridgeError::ProviderContract(format!(
+            "bridge frame encoding profile is not serializable: {error}"
+        ))
+    })?;
+    let encoding_name = encoding
+        .as_str()
+        .ok_or_else(|| {
+            BridgeError::ProviderContract(
+                "bridge frame encoding profile does not serialize to a wire name".to_owned(),
+            )
+        })?
+        .to_owned();
+    let contract = protocol_contract_identity().map_err(|error| {
+        BridgeError::ProviderContract(format!(
+            "bridge protocol contract identity is unavailable: {error}"
+        ))
+    })?;
+    contract.validate().map_err(|error| {
+        BridgeError::ProviderContract(format!(
+            "bridge protocol contract identity is not a usable identity: {error}"
+        ))
+    })?;
+    Ok(ContextSerializerIdentity {
+        serializer_id: encoding_name,
+        serializer_version: ProtocolVersion::CURRENT.to_string(),
+        serializer_options_digest: contract.shape_sha256,
+    })
 }
 
 impl BridgeRunner {
@@ -5275,7 +5333,7 @@ impl BridgeRunner {
         )
         .map_err(RuntimeBuildError::BridgeContract)?;
         let (bridge_route, route_installation, delegated_user_broker_class) =
-            bridge_contour_declaration(profile);
+            bridge_contour_declaration(profile).map_err(RuntimeBuildError::BridgeContract)?;
         Ok(Self {
             profile,
             runtime,
@@ -5399,7 +5457,7 @@ impl BridgeRunner {
         let route_moved = match (&self.retained_route_launch, &self.active_route_fingerprint) {
             (Some(sealed), Some(prior)) => {
                 let profile = self.profile;
-                let (live_route, live_installation, _) = bridge_contour_declaration(profile);
+                let (live_route, live_installation, _) = bridge_contour_declaration(profile)?;
                 match self.attach_view() {
                     Some(live) => {
                         classify_bridge_route_reconnect(

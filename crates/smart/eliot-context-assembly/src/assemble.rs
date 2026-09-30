@@ -32,6 +32,14 @@ pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
 /// measurement status. The same values are then re-compared against the
 /// independently recorded measurement by `measurement::verify`, so a forged
 /// ceiling or serializer identity is refused rather than admitted.
+///
+/// The three serializer fields are the route's OWN RECORDED serializer
+/// identity, and the owner that publishes them is the Governor route/evidence
+/// view (`eliot_governor::RuntimeRoute::context_serializer`, I3.4's
+/// `reasoning/tool/context serializer fingerprint`). This cell mints none of
+/// them, defaults none, and never substitutes a caller-supplied label: it only
+/// compares, by content, the values that arrived on this port against the
+/// values the independently recorded measurement carries.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssemblyPolicy {

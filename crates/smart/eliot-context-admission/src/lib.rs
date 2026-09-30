@@ -1020,6 +1020,12 @@ fn assemble_admitted_set(
         decision_id: input.binding.decision_id.clone(),
         measurement: MeasurementRef {
             digest: "0".repeat(64),
+            // The port value verbatim. The owner that publishes
+            // `MeasurementCompositionProfile` is the Governor route/evidence
+            // view (`eliot_governor::RuntimeRoute::context_serializer`, I3.4's
+            // `reasoning/tool/context serializer fingerprint`); this cell
+            // copies what that port carries, mints no serializer identity,
+            // defaults none, and never substitutes a label of its own.
             serializer: input.measurement_profile.serializer_id.clone(),
         },
         requested,

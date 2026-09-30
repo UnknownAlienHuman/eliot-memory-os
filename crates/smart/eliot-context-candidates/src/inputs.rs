@@ -156,6 +156,16 @@ pub struct CandidatePolicy {
     ///
     /// A measurement from another serializer is foreign and is rejected; the
     /// candidate stage owns no serializer registry beyond this declaration.
+    ///
+    /// The declared value is therefore the route's OWN RECORDED serializer
+    /// identity, and the owner that publishes it is the Governor route/evidence
+    /// view (`eliot_governor::RuntimeRoute::context_serializer`, I3.4's
+    /// `reasoning/tool/context serializer fingerprint`): its
+    /// `serializer_id` is what a caller reads into this port. This cell
+    /// mints no serializer identity, defaults none, and never substitutes a
+    /// caller-supplied label for an owner-read one — it only compares, by
+    /// content, the value that arrived on this port against the value each
+    /// supplied measurement carries.
     pub serializer: String,
     /// Caller cancellation observation. A cancelled call fails with a typed
     /// error instead of returning a silent empty set.

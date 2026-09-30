@@ -89,6 +89,70 @@ fn is_identity_text(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
 }
 
+/// The reasoning/tool/context serializer identity a route assumes (I3.4
+/// `RuntimeRoute`).
+///
+/// I3.4 names exactly one field on `RuntimeRoute` for this —
+/// `reasoning/tool/context serializer fingerprint` — and states that
+/// "`RuntimeRoute` owns configured intent and compatibility only". This record
+/// is that one field resolved into the three values a consumer compares by
+/// content: the serializer implementation, its revision, and the digest of the
+/// options the serializer ran with.
+///
+/// One opaque string cannot say which of the three moved, so it cannot make a
+/// serializer-options change distinguishable from a rename. A record that
+/// carries all three is what lets every comparison in this crate — the
+/// requested-versus-observed comparison, the diverging-layer report, and the
+/// complete effective route key — move on a change to any one of them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSerializerIdentity {
+    /// Serializer implementation the route's Context lane runs under.
+    pub serializer_id: String,
+    /// Revision of that serializer implementation.
+    pub serializer_version: String,
+    /// Lowercase SHA-256 digest of the serializer options in force.
+    pub serializer_options_digest: String,
+}
+
+impl ContextSerializerIdentity {
+    /// Returns whether this recorded identity is a usable intent record.
+    ///
+    /// The ORIGINAL RECORDED values are re-proved: the two names as non-blank,
+    /// control-free identity text, and the options digest through
+    /// [`LowercaseSha256`], this crate's existing validating digest boundary —
+    /// the same boundary [`effective_route_key`] proves a published digest at.
+    /// The digest is never recomputed from another field, so a record cannot
+    /// satisfy this check by describing itself.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        is_identity_text(&self.serializer_id)
+            && is_identity_text(&self.serializer_version)
+            && serde_json::from_value::<LowercaseSha256>(serde_json::Value::String(
+                self.serializer_options_digest.clone(),
+            ))
+            .is_ok()
+    }
+
+    /// Returns the route-fingerprint serializer string this identity stands
+    /// for.
+    ///
+    /// I3.4's `RouteFingerprint` compares this one field, and the
+    /// requested-versus-observed comparison compares the string a runtime
+    /// reported against it. The three values are NUL-joined, which is
+    /// unambiguous because [`Self::is_well_formed`] proves every component
+    /// control-free, so no two distinct identities can render to one string and
+    /// any change to any component moves the fingerprint, the diverging-layer
+    /// report, and the complete effective route key.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        format!(
+            "{}\0{}\0{}",
+            self.serializer_id, self.serializer_version, self.serializer_options_digest
+        )
+    }
+}
+
 /// Configured route intent and compatibility (I3.4 `RuntimeRoute`).
 ///
 /// This is intent only. Liveness, readiness and capacity are joined from
@@ -128,8 +192,13 @@ pub struct RuntimeRoute {
     /// Workspace/scope policy the route runs under (I10.7 working
     /// root/scope).
     pub workspace_scope_policy: String,
-    /// Reasoning/tool/context serializer fingerprint the route assumes.
-    pub serializer_fingerprint: String,
+    /// Reasoning/tool/context serializer identity the route assumes.
+    ///
+    /// This is the I3.4 `reasoning/tool/context serializer fingerprint` field,
+    /// carried as the identity record it stands for rather than as one opaque
+    /// string, so that every consumer comparing a serializer can compare all
+    /// three of its components by content.
+    pub context_serializer: ContextSerializerIdentity,
     /// Privacy classes the route is allowed to observe.
     pub privacy_classes: Vec<String>,
     /// Quota sources the route may consume.
@@ -155,7 +224,11 @@ impl RuntimeRoute {
     /// account/credential mode and the retention/network, session locator,
     /// and workspace/scope policies are required here for the same reason:
     /// they are persisted route-fingerprint facets (issue #1816, I10.4–I10.7),
-    /// so a route that leaves one blank names no usable fingerprint.
+    /// so a route that leaves one blank names no usable fingerprint. The
+    /// serializer identity is required and re-proved through
+    /// [`ContextSerializerIdentity::is_well_formed`], so a route whose
+    /// serializer options digest is not a real digest is refused here instead
+    /// of entering the registry as an unnamed serializer.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         [
@@ -170,11 +243,11 @@ impl RuntimeRoute {
             &self.network_policy,
             &self.session_locator_semantics,
             &self.workspace_scope_policy,
-            &self.serializer_fingerprint,
             &self.required_capability_profile_ref,
         ]
         .iter()
         .all(|value| is_identity_text(value))
+            && self.context_serializer.is_well_formed()
             && self
                 .privacy_classes
                 .iter()
@@ -394,6 +467,14 @@ pub struct RouteBehaviorFingerprint {
     /// Workspace/scope policy the route runs under.
     pub workspace_scope_policy: String,
     /// Message serializer or chat template fingerprint.
+    ///
+    /// This is the fingerprint of the route's recorded
+    /// [`ContextSerializerIdentity`], derived by
+    /// [`ContextSerializerIdentity::fingerprint`] and not carried as a second,
+    /// independently supplied string. Two fingerprints therefore differ exactly
+    /// when the two recorded serializer identities differ, so a
+    /// serializer-options change moves the complete effective route key with
+    /// no route able to keep an unchanged fingerprint across it.
     pub serializer_fingerprint: String,
     /// Tool-call ID and role ordering semantics.
     pub tool_call_id_and_role_ordering: String,
@@ -426,7 +507,7 @@ impl RouteBehaviorFingerprint {
             network_policy: route.network_policy.clone(),
             session_locator_semantics: route.session_locator_semantics.clone(),
             workspace_scope_policy: route.workspace_scope_policy.clone(),
-            serializer_fingerprint: route.serializer_fingerprint.clone(),
+            serializer_fingerprint: route.context_serializer.fingerprint(),
             tool_call_id_and_role_ordering: installation.tool_call_id_and_role_ordering.clone(),
             reasoning_continuation_and_compaction: installation
                 .reasoning_continuation_and_compaction
@@ -707,7 +788,7 @@ impl ObservedRoute {
         if self
             .serializer_fingerprint
             .as_deref()
-            .is_some_and(|observed| observed != requested.serializer_fingerprint)
+            .is_some_and(|observed| observed != requested.context_serializer.fingerprint())
         {
             layers.push(RouteIdentityLayer::Serializer);
         }

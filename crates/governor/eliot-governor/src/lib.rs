@@ -277,11 +277,12 @@ pub use reactive_admission::{
     assess_reactive_risk, bind_atom_risk,
 };
 pub use route_registry::{
-    ActualRouteReceipt, CapabilityRouteRegistry, EFFECTIVE_ROUTE_KEY_DOMAIN, ExecutionIdentity,
-    ObservedRoute, RouteAdmission, RouteAdmissionDecision, RouteBehaviorFingerprint,
-    RouteEvidenceSummary, RouteIdentityLayer, RouteInstallationIdentity, RouteOutcomeCounts,
-    RouteOutcomeProfile, RouteOutcomeProfileIndex, RouteRefusalReason, RouteRegistryError,
-    RuntimeRoute, diverging_scope_layers, effective_route_key,
+    ActualRouteReceipt, CapabilityRouteRegistry, ContextSerializerIdentity,
+    EFFECTIVE_ROUTE_KEY_DOMAIN, ExecutionIdentity, ObservedRoute, RouteAdmission,
+    RouteAdmissionDecision, RouteBehaviorFingerprint, RouteEvidenceSummary, RouteIdentityLayer,
+    RouteInstallationIdentity, RouteOutcomeCounts, RouteOutcomeProfile, RouteOutcomeProfileIndex,
+    RouteRefusalReason, RouteRegistryError, RuntimeRoute, diverging_scope_layers,
+    effective_route_key,
 };
 pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 pub use scope_identity_admission::{
