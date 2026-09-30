@@ -1,7 +1,17 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Eliot.Operator.Protocol;
 using Eliot.Operator.Services;
 using Eliot.Operator.ViewModels;
+
+// Executed-assertion counter. Only the `True` and `Equal` helpers below touch
+// it, so it counts executed assertions and nothing else: no individual
+// assertion is rewritten to maintain it. The terminal receipt prints it, which
+// is what makes the executed count demonstrable — a run that executed one
+// assertion and a run that executed all of them can no longer produce
+// byte-identical output. It is a counter, not a gate: the helpers still throw
+// on the first failure, so a run that did not pass never reaches the receipt.
+var executedAssertions = 0;
 
 var manifestPath = Path.Combine(AppContext.BaseDirectory, "operator-contract-v1.json");
 var manifestBytes = await File.ReadAllBytesAsync(manifestPath);
@@ -31,16 +41,6 @@ Equal(
     "b00a82807e003ad1e1b9b717a9759024335ffe461a0cc3f5d67867ec8750394f",
     OperatorProtocol.PinnedContractHash,
     "canonical pinned BLAKE3 contract hash");
-
-if (args.Contains("--live", StringComparer.Ordinal))
-{
-    await using var liveClient = new GovernorPipeClient(new RuntimeDiscoveryService());
-    var liveSnapshot = await liveClient.SnapshotAsync();
-    var livePage = await liveClient.QueryAsync(new OperatorQueryRequest(
-        "overview", null, null, new OperatorProjectionFilter(), null, 20));
-    Console.WriteLine(
-        $"LIVE_OPERATOR_OK runtime={liveSnapshot.RuntimeId} auth_generation={liveSnapshot.AuthGeneration} overview_records={livePage.Returned}");
-}
 
 Equal(14, OperatorPageCatalog.All.Count, "required page count");
 Equal(14, OperatorPageCatalog.All.Select(page => page.Tag).Distinct(StringComparer.Ordinal).Count(), "unique page tags");
@@ -246,15 +246,54 @@ True(record.Length <= OperatorDiagnostics.MaxRecordChars, "diagnostic record bou
 True(OperatorDiagnostics.ShouldRotate(OperatorDiagnostics.MaxLogBytes + 1), "log rotates at the cap");
 True(!OperatorDiagnostics.ShouldRotate(0), "empty log does not rotate");
 
-Console.WriteLine("ELIOT Operator protocol, auth, paging, view-model, command, reconcile, bounds, redaction and invalidation tests passed");
-
-static void True(bool condition, string label)
+// The live probe runs AFTER every conformance assertion, and its failure is
+// bounded to one typed line. A run that reaches here has already executed and
+// passed every assertion above; a live probe that throws must not turn that
+// into a lost terminal receipt, and it must not be able to hide a conformance
+// failure either — a failing assertion above throws and never reaches this
+// block. The live line is NOT an assertion and adds none: it reports a probe
+// outcome, and the executed count above is unchanged by it.
+//
+// Redaction: one bounded line carrying the stage and the exception TYPE only.
+// No message, no stack trace, no endpoint, pipe name, nonce, credential or
+// command/query body (A11). The exception message may embed any of those.
+if (args.Contains("--live", StringComparer.Ordinal))
 {
+    try
+    {
+        await using var liveClient = new GovernorPipeClient(new RuntimeDiscoveryService());
+        var liveSnapshot = await liveClient.SnapshotAsync();
+        var livePage = await liveClient.QueryAsync(new OperatorQueryRequest(
+            "overview", null, null, new OperatorProjectionFilter(), null, 20));
+        Console.WriteLine(
+            $"LIVE_OPERATOR_OK runtime={liveSnapshot.RuntimeId} auth_generation={liveSnapshot.AuthGeneration} overview_records={livePage.Returned}");
+    }
+    catch (Exception liveError)
+    {
+        var liveType = (liveError.GetType().FullName ?? "System.Exception");
+        if (liveType.Length > OperatorDiagnostics.MaxTypeChars)
+        {
+            liveType = liveType[..OperatorDiagnostics.MaxTypeChars];
+        }
+        Console.WriteLine($"LIVE_OPERATOR_UNAVAILABLE stage=live_operator_probe type={liveType}");
+    }
+}
+
+Console.WriteLine(
+    $"ELIOT Operator protocol, auth, paging, view-model, command, reconcile, bounds, redaction and invalidation tests passed; assertions={executedAssertions}");
+
+// The only two places the executed count moves. Both still throw on the first
+// failure: counting an assertion never weakens it, and a failing run aborts
+// before the terminal receipt instead of printing one.
+void True(bool condition, string label)
+{
+    executedAssertions++;
     if (!condition) throw new Exception($"assertion failed: {label}");
 }
 
-static void Equal<T>(T expected, T actual, string label)
+void Equal<T>(T expected, T actual, string label)
 {
+    executedAssertions++;
     if (!EqualityComparer<T>.Default.Equals(expected, actual))
         throw new Exception($"assertion failed: {label}; expected={expected}; actual={actual}");
 }
@@ -268,6 +307,14 @@ sealed class FakeGovernorClient : IGovernorClient
         "active",
         7,
         []);
+
+    // The owner omits an absent receipt rather than sending a null member, so
+    // the harness omits it the same way instead of writing a null the client
+    // would have to reinterpret.
+    private static readonly JsonSerializerOptions OwnerReceiptJson = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
 
     public OperatorQueryRequest? LastQuery { get; private set; }
     public int CommandCount { get; private set; }
@@ -388,6 +435,57 @@ sealed class FakeGovernorClient : IGovernorClient
             DateTimeOffset.UtcNow);
     }
 
+    /// One owner-bound command receipt in the exact shape the serving owner
+    /// emits (`OperatorCommandReceipt` in `crates/eliot-types`, written at
+    /// `crates/eliot-app/src/mcp_stdio/operator.rs`). The owner echoes the
+    /// submitted `idempotency_key` as `operation_id` and the submitted
+    /// `expected_revision` verbatim, and reports the bound task `revision`;
+    /// `MainViewModel.ReadCommandReceipt` refuses a receipt that is not bound
+    /// to that exact operation identity, that exact expected revision and that
+    /// same produced revision, and it requires a `canonical_receipt.receipt_id`
+    /// whenever the owner claims `executed`. A receipt that omitted those
+    /// bindings modelled a transport the owner does not serve, so every value
+    /// is taken from the envelope this call actually received rather than
+    /// written as a constant.
+    ///
+    /// The owner derives `command_id` from a BLAKE3 digest of the identity. The
+    /// harness has no such dependency and inventing a digest would model a
+    /// value the owner never sends, so the field is absent; the client binds
+    /// nothing to it. The fake commits nothing, so the revision it reports is
+    /// the revision it was asked to act at.
+    private static JsonElement OwnerCommandReceipt(
+        JsonElement envelope,
+        string receiptId,
+        string writeId,
+        bool omitCanonicalReceipt)
+    {
+        var operationId = envelope.GetProperty("idempotency_key").GetString() ?? "unknown";
+        var expectedRevision = envelope.GetProperty("expected_revision").GetUInt64();
+        var taskId = envelope.GetProperty("task_id").GetString();
+        var command = envelope.GetProperty("command");
+        var action = command.ValueKind == JsonValueKind.Object
+            && command.TryGetProperty("command", out var actionName)
+            && actionName.ValueKind == JsonValueKind.String
+                ? actionName.GetString() ?? "unknown"
+                : "unknown";
+        return JsonSerializer.SerializeToElement(new
+        {
+            operation_id = operationId,
+            expected_revision = expectedRevision,
+            task_id = taskId,
+            action = action,
+            accepted = true,
+            executed = true,
+            outcome = "canonical_mutation_committed",
+            revision = expectedRevision,
+            reasons = Array.Empty<string>(),
+            canonical_receipt = omitCanonicalReceipt
+                ? null
+                : new { receipt_id = receiptId, write_id = writeId },
+            generated_at = DateTimeOffset.UtcNow
+        }, OwnerReceiptJson);
+    }
+
     public Task<JsonElement> CommandAsync(
         OperatorIntentEnvelope commandEnvelope,
         CancellationToken cancellationToken = default)
@@ -401,10 +499,8 @@ sealed class FakeGovernorClient : IGovernorClient
             throw new OperatorUnknownOutcomeException(
                 LastIdempotencyKey ?? "unknown", "eliot_operator_command", "simulated pipe loss");
         }
-        using var document = JsonDocument.Parse(OmitCanonicalReceipt
-            ? """{"accepted":true,"executed":true,"outcome":"canonical_mutation_committed"}"""
-            : """{"accepted":true,"executed":true,"outcome":"canonical_mutation_committed","canonical_receipt":{"receipt_id":"receipt-1","write_id":"write-1"}}""");
-        return Task.FromResult(document.RootElement.Clone());
+        return Task.FromResult(OwnerCommandReceipt(
+            envelope, "receipt-1", "write-1", OmitCanonicalReceipt));
     }
 
     public Task<JsonElement> ReconcileAsync(
@@ -412,12 +508,12 @@ sealed class FakeGovernorClient : IGovernorClient
         CancellationToken cancellationToken = default)
     {
         // Same-identity reconciliation: the retained envelope resends under
-        // its original key; no second logical mutation is minted.
+        // its original key; no second logical mutation is minted. The receipt
+        // is bound to the retained bytes, not to a fresh identity.
         ReconcileCount++;
         LastReconciledKey = commandEnvelope.GetProperty("idempotency_key").GetString();
-        using var document = JsonDocument.Parse(
-            """{"accepted":true,"executed":true,"outcome":"canonical_mutation_committed","canonical_receipt":{"receipt_id":"receipt-r","write_id":"write-r"}}""");
-        return Task.FromResult(document.RootElement.Clone());
+        return Task.FromResult(OwnerCommandReceipt(
+            commandEnvelope, "receipt-r", "write-r", OmitCanonicalReceipt));
     }
 
     public Task<JsonElement> UserAutomationAsync(
