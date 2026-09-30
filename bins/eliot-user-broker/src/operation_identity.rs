@@ -74,6 +74,19 @@ pub(crate) const FENCE_OPERATION: &str = "eliot.user-broker.fence";
 /// (`bind_operator_session_token`); the broker never mints the token itself.
 pub(crate) const OPERATOR_SESSION_TOKEN_OPERATION: &str =
     "eliot.user-broker.operator-session-token";
+/// Canonical prefix of the Kernel-minted Operator session grant's operation id.
+///
+/// This is the Kernel's own wire prefix, not a broker transport selector: the
+/// Kernel composes `operatorsession:<handoff-nonce>` at
+/// `crates/kernel/eliot-kernel-service/src/operator_session_token.rs`
+/// (`OPERATOR_SESSION_TOKEN_OPERATION_PREFIX`), and this broker re-declares the
+/// identical string at the authenticated boundary - the same paired-declaration
+/// contract its request/grant carriers use - so the grant this broker receives
+/// is compared against the exact id its own request should have produced
+/// instead of merely against a non-empty one. The broker cannot depend on the
+/// Kernel service crate (dependency direction), so the two declarations are
+/// cross-referenced rather than shared.
+pub(crate) const OPERATOR_SESSION_TOKEN_OPERATION_PREFIX: &str = "operatorsession:";
 /// Canonical read-only Kernel selector for receipt-bound native resource currentness.
 pub(crate) const VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION: &str =
     "eliot.user-broker.validate-native-resource-selection-current";

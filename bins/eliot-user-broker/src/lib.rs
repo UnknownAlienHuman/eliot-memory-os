@@ -456,8 +456,11 @@ impl OperatorClientBinding {
                 .with_platform("redeeming client session is not a bounded identity value"));
         }
         if !is_exact_session_token(&self.kernel_session_token) {
-            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
-                .with_platform("redeeming client session token is not a Kernel-issued token value"));
+            return Err(
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
+                    "redeeming client session token is not a Kernel-issued token value",
+                ),
+            );
         }
         Ok(())
     }
@@ -2076,10 +2079,10 @@ impl BrokerComposition {
             role: row.role.clone(),
             capabilities: row.capabilities.clone(),
         };
-        port.operator_session_token(&request, live).map_err(|error| {
-            BrokerAdmissionRefusal::OperatorSessionTokenStale { .. }
-                .with_platform(error.to_string())
-        })
+        port.operator_session_token(&request, live)
+            .map_err(|error| {
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(error.to_string())
+            })
     }
 
     /// Redeems one issued Operator handoff exactly once and returns the
@@ -2147,8 +2150,11 @@ impl BrokerComposition {
             || row.kernel_session_expires_at <= now
             || live.registration_digest != row.kernel_registration_digest
         {
-            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
-                .with_platform("redeemed handoff does not present the current Kernel session token"));
+            return Err(
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
+                    "redeemed handoff does not present the current Kernel session token",
+                ),
+            );
         }
         if client.windows_sid != row.windows_sid
             || client.interactive_session_id != row.interactive_session_id
@@ -2334,9 +2340,11 @@ impl BrokerComposition {
         let live = self.live_registration()?;
         let now = now_unix_ms()?;
         if !is_exact_session_token(&authority.kernel_session_token) {
-            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
-                "state-changing request does not present a Kernel-issued session token",
-            ));
+            return Err(
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
+                    "state-changing request does not present a Kernel-issued session token",
+                ),
+            );
         }
         let granted = self.operator_session_bindings.values().find(|row| {
             row.redeemed

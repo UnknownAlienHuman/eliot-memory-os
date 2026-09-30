@@ -32,7 +32,8 @@ use eliot_user_broker_core::{
 use super::SharedKernelClient;
 use crate::operation_identity::{
     AUTHORIZE_LAUNCH_OPERATION, BrokerOperation, FENCE_OPERATION, HEARTBEAT_OPERATION,
-    IssuerHandle, OPERATOR_SESSION_TOKEN_OPERATION, OperationIdentityError, REGISTER_OPERATION,
+    IssuerHandle, OPERATOR_SESSION_TOKEN_OPERATION, OPERATOR_SESSION_TOKEN_OPERATION_PREFIX,
+    OperationIdentityError, REGISTER_OPERATION,
     VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
 };
 
@@ -121,9 +122,18 @@ impl OperatorSessionTokenGrant {
                 "operator session token is not a lowercase SHA-256 token".to_owned(),
             ));
         }
-        if self.operation_id.trim().is_empty() || self.generation == 0 {
+        // The grant must be the answer to *this* operation, not merely some
+        // operation. The Kernel mints the id deterministically from the
+        // one-shot handoff nonce, so the expected id is derivable here and is
+        // compared exactly; a shape check on a non-empty id would accept a
+        // reply about a different operation.
+        let expected_operation_id = format!(
+            "{OPERATOR_SESSION_TOKEN_OPERATION_PREFIX}{}",
+            request.handoff_nonce
+        );
+        if self.operation_id != expected_operation_id || self.generation == 0 {
             return Err(PortError::Invalid(
-                "operator session token grant carries no exact operation identity".to_owned(),
+                "operator session token grant carries a different operation identity".to_owned(),
             ));
         }
         // The grant's own authority triple must be internally exact and must
@@ -131,7 +141,9 @@ impl OperatorSessionTokenGrant {
         // The broker cannot re-observe the Kernel's generation or fence, so it
         // records them as the Kernel's own observation rather than pretending
         // to have proven them a second time.
-        if !self.authority_epoch.is_same_authority(&live.authority_epoch)
+        if !self
+            .authority_epoch
+            .is_same_authority(&live.authority_epoch)
             || !self
                 .state_fence
                 .authority_epoch
@@ -276,8 +288,8 @@ impl KernelAuthorityPort {
         request: &OperatorSessionTokenRequest,
         live: &RegistrationReceipt,
     ) -> Result<OperatorSessionTokenGrant, PortError> {
-        let payload = serde_json::to_value(request)
-            .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let payload =
+            serde_json::to_value(request).map_err(|error| PortError::Invalid(error.to_string()))?;
         let now = now_unix_ms()?;
         let identity = self
             .issuer
