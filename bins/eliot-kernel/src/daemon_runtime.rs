@@ -21,10 +21,10 @@ use eliot_process::{
     ProcessOwnerBinding, ProcessStartReceipt,
 };
 
-use super::diagnostic_brief::DiagnosticTrigger;
-use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 #[cfg(windows)]
 use super::DaemonRestartRefusal;
+use super::diagnostic_brief::DiagnosticTrigger;
+use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
     ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, KernelBuildError, KernelComposition,
     daemon_class_withholds_replacement, daemon_refuses_replacement, daemon_restart_refusal_reason,
@@ -505,10 +505,8 @@ impl KernelComposition {
         previous_receipt: Option<&ProcessStartReceipt>,
     ) -> Result<Option<DaemonRestartRefusal>, KernelBuildError> {
         let admitted_generation = launch.generation;
-        let admitted_state_fence = eliot_contracts::StateFence::new(
-            launch.authority_epoch.clone(),
-            admitted_generation,
-        );
+        let admitted_state_fence =
+            eliot_contracts::StateFence::new(launch.authority_epoch.clone(), admitted_generation);
         let Some(admitted) = self.daemon_restart_policy.as_ref() else {
             return Ok(Some(DaemonRestartRefusal::PolicyNotAdmitted));
         };
@@ -517,12 +515,15 @@ impl KernelComposition {
         // binding that does not prove them is the same defect the class rule
         // already names for this identity, so it is refused with that same
         // reason instead of being reported as a budget of its own.
-        let declared_threshold = match admitted
-            .declared_attempt_threshold(admitted_generation, &admitted_state_fence)
-        {
-            Ok(declared) => declared,
-            Err(_) => return Ok(Some(DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration)),
-        };
+        let declared_threshold =
+            match admitted.declared_attempt_threshold(admitted_generation, &admitted_state_fence) {
+                Ok(declared) => declared,
+                Err(_) => {
+                    return Ok(Some(
+                        DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration,
+                    ));
+                }
+            };
         let store = self.generation_gateway.ors.as_ref();
         let recorded = store
             .load_kernel_restart_reconciliation(ACTIVE_DAEMON_CALLER, admitted_generation.value())
@@ -687,9 +688,8 @@ impl KernelComposition {
             if let Some(refusal) = refused {
                 let reason = daemon_restart_refusal_reason(&refusal);
                 observe_daemon_runtime("kernel.daemon.restart_refused", reason);
-                return Err(self.daemon_failure_error(format!(
-                    "eliotd automatic restart refused: {reason}"
-                )));
+                return Err(self
+                    .daemon_failure_error(format!("eliotd automatic restart refused: {reason}")));
             }
         }
         // The two refusals that no declared restart class may bypass (I14.10)
