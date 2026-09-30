@@ -357,6 +357,18 @@ public static class OperatorProjectionGuard
         {
             throw new OperatorProtocolException("projection", "count_cap");
         }
+        // The same derivation binds the reported count to the delivered records:
+        // `operator.rs` sets `returned: page.records.len()` and serialises the
+        // same `page.records` in the same struct literal, with nothing between
+        // the two that filters, truncates or replaces the vector, so a page
+        // whose `returned` disagrees with its `records` count is a page whose
+        // own count and own records are two numbers the owner never separated.
+        // `MainViewModel` renders `Records.Count` and never reads `Returned`, so
+        // an unreconciled page would render a count the owner never issued.
+        if (page.Returned != page.Records.Count)
+        {
+            throw new OperatorProtocolException("projection", "count_cap");
+        }
         // `total_matching` is derived over `matched_seen + records.len()`, so
         // the total the owner reports can never be smaller than the page it
         // counts.
