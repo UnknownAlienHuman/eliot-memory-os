@@ -1431,14 +1431,13 @@ fn require_current_automation_revision(
     expected: &str,
     transition: &PreparedTransition,
 ) -> Result<(), StoreError> {
-    let current =
-        state
-            .automation_currents
-            .get(automation_id)
-            .ok_or(StoreError::InvalidField {
-                field: "automation.automation_id",
-                reason: "unknown automation",
-            })?;
+    let current = state
+        .automation_currents
+        .get(automation_id)
+        .ok_or(StoreError::InvalidField {
+            field: "automation.automation_id",
+            reason: "unknown automation",
+        })?;
     if current.revision != expected {
         return Err(StoreError::IdentityConflict);
     }

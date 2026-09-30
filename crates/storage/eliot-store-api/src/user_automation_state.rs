@@ -1129,7 +1129,11 @@ pub fn decode_automation_mutation(
     // `validate_automation_mutation_params` already proved the shape, so this
     // only projects the object; an absent envelope is absence, never an empty
     // or synthesized one.
-    let envelope_of = || parameters.get(AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON).cloned();
+    let envelope_of = || {
+        parameters
+            .get(AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+            .cloned()
+    };
     match leg.as_str() {
         AUTOMATION_OPERATION_CREATE => Ok(DecodedAutomationMutation::Create {
             automation_id: text_of(AUTOMATION_PARAM_AUTOMATION_ID)?,
