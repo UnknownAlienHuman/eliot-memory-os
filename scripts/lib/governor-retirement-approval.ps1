@@ -1202,10 +1202,12 @@ function Test-GovernorRetirementCandidateTransition(
     [object[]]$ApprovedConsumers) {
     # The detached owner approval remains bound to its original source C. The
     # release candidate D is checked independently: it must descend from C,
-    # remove the legacy crate and every C-scanned path/token reference, add no
-    # new reference, and remove every owner-approved live_reference string from
-    # its proof path. The independent scan is the fixed closed-rule contract;
-    # no filename-only or inferred live-edge classifier is added.
+    # remove the legacy crate, add no independently scanned path/token pair,
+    # and remove every owner-approved live_reference string from its proof
+    # path. Existing scanned pairs remain bound by D's closure, but only the
+    # exact owner-approved consumer references are required to disappear. The
+    # independent scan is the fixed closed-rule contract; no filename-only or
+    # inferred live-edge classifier is added.
     $null = & git -C $Repo merge-base --is-ancestor $OwnerSourceCommit $CandidateCommit 2>$null
     if ($LASTEXITCODE -ne 0) {
         return [pscustomobject]@{ admitted = $false; reason = 'APPROVAL_OWNER_SOURCE_NOT_ANCESTOR' }
@@ -1248,7 +1250,6 @@ function Test-GovernorRetirementCandidateTransition(
             [void]$sourcePairs.Add("$($path.Length):$path|$($tokenText.Length):$tokenText")
         }
     }
-    $candidatePairs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($entry in @($CandidateClosure.entries)) {
         $path = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $entry 'path')
         foreach ($token in @(Read-GovernorApprovalField $entry 'tokens')) {
@@ -1257,20 +1258,8 @@ function Test-GovernorRetirementCandidateTransition(
             if (-not $sourcePairs.Contains($pair)) {
                 return [pscustomobject]@{ admitted = $false; reason = "APPROVAL_CANDIDATE_REFERENCE_NOT_IN_SOURCE_CLOSURE (path=$path token=$tokenText)" }
             }
-            [void]$candidatePairs.Add($pair)
         }
     }
-    foreach ($entry in @($SourceClosure.entries)) {
-        $path = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $entry 'path')
-        foreach ($token in @(Read-GovernorApprovalField $entry 'tokens')) {
-            $tokenText = [string]$token
-            $pair = "$($path.Length):$path|$($tokenText.Length):$tokenText"
-            if ($candidatePairs.Contains($pair)) {
-                return [pscustomobject]@{ admitted = $false; reason = "APPROVAL_CANDIDATE_REFERENCE_STILL_IN_CLOSURE (path=$path token=$tokenText)" }
-            }
-        }
-    }
-
     $proofPaths = @($ApprovedConsumers | ForEach-Object {
             ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $_ 'proof_path')
         } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
