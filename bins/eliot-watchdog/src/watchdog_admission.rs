@@ -258,6 +258,11 @@ impl FileWatchdogAdmission {
                 "watchdog has no retained file adapter for this installation profile".to_owned(),
             ));
         }
+        validate_system_service_host_root_receipt(
+            &registry,
+            &selected_manifest,
+            &host_state_root_lease,
+        )?;
         Ok(WatchdogReadiness {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
@@ -316,6 +321,30 @@ pub(crate) fn inspect_registry_at(
     host_root: ProtectedRootLease,
 ) -> Result<Option<ApprovedGenerationRegistry>, InstallationError> {
     RedbInstallationRegistry::inspect_existing_at(host_root)
+}
+
+fn validate_system_service_host_root_receipt(
+    registry: &ApprovedGenerationRegistry,
+    selected_manifest: &CandidateManifest,
+    host_state_root_lease: &ProtectedRootLease,
+) -> Result<(), SpoolError> {
+    let receipt = registry.system_service_host_root_receipt().ok_or_else(|| {
+        SpoolError::InvalidLease(
+            "SystemService registry has no persisted Host-root identity receipt".to_owned(),
+        )
+    })?;
+    receipt
+        .validate_against(
+            host_state_root_lease,
+            selected_manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .as_str(),
+        )
+        .map_err(|error| {
+            SpoolError::InvalidLease(format!("SystemService Host-root receipt: {error}"))
+        })
 }
 
 /// One externally admitted isolated destination installation.
@@ -645,6 +674,11 @@ fn load_runtime_binding(
             "watchdog has no retained file adapter for this installation profile".to_owned(),
         ));
     }
+    validate_system_service_host_root_receipt(
+        &registry,
+        &selected_manifest,
+        &host_state_root_lease,
+    )?;
     let mut provider = WindowsRuntimeRootLeaseProvider::for_roots(&roots)
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
     let leases = roots

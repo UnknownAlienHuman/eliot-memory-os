@@ -853,7 +853,7 @@ pub const SERVICE_EXPECTED_OWNER_SID: &str = "S-1-5-18";
 pub const SERVICE_EXPECTED_GROUP_AUTHORITY: &str = "NT AUTHORITY\\SYSTEM";
 
 /// Canonical group required by Host/Watchdog service-object readback.
-/// Keep this tied to the same LocalSystem authority as the owner contract.
+/// Keep this tied to the same `LocalSystem` authority as the owner contract.
 pub const SERVICE_EXPECTED_GROUP_SID: &str = SERVICE_EXPECTED_OWNER_SID;
 
 /// Typed diagnostics carried by fail-closed `Unknown` inspections

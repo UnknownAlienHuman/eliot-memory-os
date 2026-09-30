@@ -462,7 +462,87 @@ pub fn load_portable_dev_config(
     let bytes = lease
         .read_bounded(MAX_LAUNCH_CONFIG_BYTES)
         .map_err(|error| format!("read portable-dev config: {error}"))?;
-    parse_config_bytes(path, &bytes)
+    let config = parse_config_bytes(path, &bytes)?;
+    if config.runtime_launch.profile != eliot_installation::InstallationProfile::PortableDev {
+        return Err("PortableDev launch config does not select the PortableDev profile".to_owned());
+    }
+    validate_portable_dev_launch_root_binding(root, &config)?;
+    Ok(config)
+}
+
+/// Verifies that the retained repository root used to read the config is the
+/// same root admitted by the `PortableDev` runtime descriptor.
+fn validate_portable_dev_launch_root_binding(
+    root: &UserOwnedRootLease,
+    config: &StoreLaunchConfig,
+) -> Result<(), String> {
+    if config.runtime_launch.profile != eliot_installation::InstallationProfile::PortableDev {
+        return Err("user-owned launch roots are only admitted for PortableDev".to_owned());
+    }
+    root.verify_stable_identity()
+        .and_then(|()| root.verify_path_identity())
+        .map_err(|error| format!("revalidate PortableDev config root: {error}"))?;
+    let admitted_root = config
+        .runtime_launch
+        .portable_root
+        .as_ref()
+        .ok_or_else(|| "PortableDev runtime descriptor has no portable root".to_owned())?;
+    let admitted_root = Path::new(admitted_root.as_str());
+    if !eliot_platform_windows::windows_paths_equal(root.path(), admitted_root) {
+        return Err(
+            "retained repository root does not match the descriptor portable_root".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Loads one explicit `UserMode` Store config through the admitted
+/// immutable-binaries root. The caller supplies that root from the Host launch
+/// selection; this loader never derives it from the process environment or
+/// current directory.
+pub fn load_user_mode_config(
+    root: &UserOwnedRootLease,
+    path: &Path,
+) -> Result<StoreLaunchConfig, String> {
+    let lease = UserOwnedPathLease::open_existing(root, path)
+        .map_err(|error| format!("open UserMode config: {error}"))?;
+    let bytes = lease
+        .read_bounded(MAX_LAUNCH_CONFIG_BYTES)
+        .map_err(|error| format!("read UserMode config: {error}"))?;
+    let config = parse_config_bytes(path, &bytes)?;
+    if config.runtime_launch.profile != eliot_installation::InstallationProfile::UserMode {
+        return Err("UserMode launch config does not select the UserMode profile".to_owned());
+    }
+    validate_user_mode_launch_root_binding(root, &config)?;
+    Ok(config)
+}
+
+/// Verifies that a current-user retained root is the exact immutable launch
+/// root in the admitted descriptor. Store's `generation.json` is materialized
+/// beside the selected immutable binaries; the user configuration and cache
+/// roles remain separate profile roots.
+pub fn validate_user_mode_launch_root_binding(
+    root: &UserOwnedRootLease,
+    config: &StoreLaunchConfig,
+) -> Result<(), String> {
+    if config.runtime_launch.profile != eliot_installation::InstallationProfile::UserMode {
+        return Err("user-owned launch roots are only admitted for UserMode".to_owned());
+    }
+    root.verify_stable_identity()
+        .and_then(|()| root.verify_path_identity())
+        .map_err(|error| format!("revalidate user-owned config root: {error}"))?;
+    let admitted_root = Path::new(
+        &config
+            .runtime_launch
+            .profile_governed_roots
+            .immutable_binaries,
+    );
+    if !eliot_platform_windows::windows_paths_equal(root.path(), admitted_root) {
+        return Err(
+            "retained launch root does not match the descriptor immutable_binaries root".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<StoreLaunchConfig, String> {

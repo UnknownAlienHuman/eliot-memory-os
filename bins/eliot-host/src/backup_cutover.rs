@@ -2371,7 +2371,7 @@ fn execute_cutover_inner(
     // cross-record join, not a caller-controlled trusted flag.
     validated.recheck_admitted_body()?;
     host.ensure_material_admission_open_for_target(&validated.request().target_generation, false)?;
-    let store = super::open_registry_store_at(&host.registry_host_root)?;
+    let store = host.open_registry_store()?;
     let fresh = store
         .load()
         .map_err(|error| CutoverError::Registry(error.to_string()))?;
@@ -3595,7 +3595,7 @@ fn owner_predecessor_retirement_relation(
     //     contradicted by its own owner. A store that cannot be opened, loaded or
     //     validated yields no relation, which refuses the effect.
     let fresh = {
-        let store = super::open_registry_store_at(&host.registry_host_root).ok()?;
+        let store = host.open_registry_store().ok()?;
         let loaded = store.load().ok()?;
         // Release the bounded writer handle before anything else runs.
         drop(store);

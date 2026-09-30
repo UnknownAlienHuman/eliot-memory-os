@@ -3,12 +3,11 @@ use std::path::PathBuf;
 use super::{
     ApprovedGenerationRegistry, CandidateManifest, HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR,
     HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR, HostComposition, HostError, HostLaunchOptions,
-    phase_b_scm_selector,
+    InstallationProfile, phase_b_scm_selector,
 };
 #[cfg(windows)]
 use super::{
-    InstallationProfile, InstallerServiceRole, PhaseBLiveBinding, PlatformHandle,
-    approved_service_registration_request,
+    InstallerServiceRole, PhaseBLiveBinding, PlatformHandle, approved_service_registration_request,
 };
 
 // F-LOG-HOST-5 (#980) inner-phase observations for composition validation.
@@ -107,6 +106,9 @@ impl HostComposition {
         // be substituted by it.
         let manifest_descriptor_path = PathBuf::from(launch.authority_descriptor_path.as_str());
         let manifest_host_root = PathBuf::from(launch.runtime_state_roots.host_state_root.as_str());
+        // The typed Phase-A pending marker is never passed as a digest on
+        // argv. Every profile uses the same bounded SHA-256 selector until
+        // Phase-B publishes the live descriptor digest.
         let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest)
             .map_err(HostError::Installation)?;
         if manifest_descriptor_path != options.config_descriptor_path
@@ -119,7 +121,7 @@ impl HostComposition {
                 "host.phase-b composition fence mismatch preserved",
             );
             return Err(HostError::ProcessContour(
-                "SCM launch authority does not match the approved generation".to_owned(),
+                "profile launch authority does not match the approved generation".to_owned(),
             ));
         }
         Ok(())
@@ -141,7 +143,7 @@ impl HostComposition {
         }
         host_composition_validation_observe("host.phase-b composition fence mismatch preserved");
         Err(HostError::ProcessContour(
-            "SCM launch authority has no approved generation".to_owned(),
+            "profile launch authority has no approved generation".to_owned(),
         ))
     }
 

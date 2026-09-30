@@ -2,24 +2,103 @@
 
 use std::collections::BTreeSet;
 
-use eliot_platform_windows::{FileIdentity, PackageManifest};
+use eliot_platform_windows::{
+    FileIdentity, PackageManifest, PortableDevSupervisionAuthorityKeyRequest,
+};
+use eliot_runtime_contracts::PortableDevSupervisionKeyReference;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
     AgentBridgeSourceMaterializationPlan, CandidateManifest, ELIOT_HOST_SERVICE_NAME,
     ELIOT_WATCHDOG_SERVICE_NAME, HostPhaseBStaticTemplate, InstallationError, InstallationProfile,
-    PlatformHandle, RuntimeStateRoots, StoreCredentialProvisionPlan, WindowsPathIdentity,
+    PlatformHandle, RuntimeStateRoots, StoreCredentialProvisionPlan, StoreCredentialScope,
+    WindowsPathIdentity,
     approved_path, handle, package_plan_error, phase_b_host_state_root_digest,
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest, sha256_handle,
-    validate_package_relative_text,
+    sha256_hex, same_windows_root, validate_package_relative_text,
 };
+use super::credential_provision::valid_current_user_sid;
+use super::profile_supervision::UserModeTaskRegistrationPlan;
 mod contract_models;
 
 pub use contract_models::{
     InstallerAclPrincipal, InstallerServiceAccount, InstallerServiceRole, PackageArtifactDigest,
-    PlannedChange, SupervisionAuthorityProvisionPlan,
+    PlannedChange, SupervisionAuthorityProvisionPlan, UserModeSupervisionAuthorityProvisionPlan,
 };
+
+/// Profile-specific Phase-B signing-key provision plan.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "profile", content = "provision", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PhaseBSupervisionAuthorityProvisionPlan {
+    /// Service-SID sealed key provisioned by the elevated `SystemService` installer.
+    SystemService(Box<SupervisionAuthorityProvisionPlan>),
+    /// Current-user Credential Manager key provisioned for `UserMode`.
+    UserMode(Box<UserModeSupervisionAuthorityProvisionPlan>),
+    /// Disposable repository-local key provisioned for `PortableDev`.
+    PortableDev(Box<PortableDevSupervisionAuthorityKeyRequest>),
+}
+
+impl PhaseBSupervisionAuthorityProvisionPlan {
+    fn validate(&self) -> Result<(), InstallationError> {
+        match self {
+            Self::SystemService(provision) => provision.validate(),
+            Self::UserMode(provision) => provision.validate(),
+            Self::PortableDev(provision) => validate_portable_dev_authority_request(provision),
+        }
+    }
+
+    const fn profile(&self) -> InstallationProfile {
+        match self {
+            Self::SystemService(_) => InstallationProfile::SystemService,
+            Self::UserMode(_) => InstallationProfile::UserMode,
+            Self::PortableDev(_) => InstallationProfile::PortableDev,
+        }
+    }
+}
+
+fn validate_portable_dev_authority_request(
+    provision: &PortableDevSupervisionAuthorityKeyRequest,
+) -> Result<(), InstallationError> {
+    for (value, field) in [
+        (&provision.transaction_id, "portable_dev_authority.transaction_id"),
+        (&provision.effect_id, "portable_dev_authority.effect_id"),
+        (&provision.installation_id, "portable_dev_authority.installation_id"),
+        (&provision.candidate_generation, "portable_dev_authority.candidate_generation"),
+        (
+            &provision.supervision_lease_scope_id,
+            "portable_dev_authority.supervision_lease_scope_id",
+        ),
+        (&provision.signer_id, "portable_dev_authority.signer_id"),
+        (&provision.key_id, "portable_dev_authority.key_id"),
+    ] {
+        if value.trim().is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+            return Err(InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: "must be non-empty canonical text".to_owned(),
+            });
+        }
+    }
+    if provision.authority_generation.value() == 0
+        || !provision.repository_root.is_absolute()
+        || provision.repository_root.components().any(|component| {
+            matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
+        })
+        || provision.repository_root_identity.volume_serial_number == 0
+        || provision.repository_root_identity.file_index == 0
+        || provision.signer_id != "eliot-kernel"
+        || provision.key_id != format!("eliot-supervision-key:v1:{}", provision.candidate_generation)
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    PortableDevSupervisionKeyReference::new(provision.relative_path.clone()).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "portable_dev_authority.relative_path".to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(())
+}
 
 /// One immutable installer effect owned by the enclosing
 /// [`InstallationTransaction`]. The elevated adapter reports observations
@@ -58,6 +137,12 @@ pub enum InstallerEffectPlan {
         manifest: PackageManifest,
         /// Destination root for the immutable generation.
         staging_root: PlatformHandle,
+        /// Exact selected I3.1 immutable-binaries destination. When present,
+        /// this is the final generation directory itself; logical `generation`
+        /// remains a separate manifest identity and is never appended to this
+        /// path.
+        #[serde(default)]
+        destination_root: Option<PlatformHandle>,
         /// Expected file bytes bound to the candidate artifact set.
         expected_file_digests: Vec<PackageArtifactDigest>,
         /// Digest of the complete candidate manifest, including runtime argv.
@@ -104,6 +189,38 @@ pub enum InstallerEffectPlan {
         /// Secret-free immutable provision plan.
         provision: StoreCredentialProvisionPlan,
     },
+    /// Provision a Store credential in the exact `UserMode` or `PortableDev` current-user token.
+    ProvisionCurrentUserStoreCredential {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Secret-free immutable provision plan, with the current-user scope.
+        provision: StoreCredentialProvisionPlan,
+    },
+    /// Provision one current-user `UserMode` supervision key after package
+    /// publication. The durable coordinator retains the original key receipt
+    /// before the provider performs its create-only write.
+    ProvisionUserModeSupervisionAuthority {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Secret-free immutable current-user provision plan.
+        provision: Box<UserModeSupervisionAuthorityProvisionPlan>,
+    },
+    /// Provision one disposable repository-local `PortableDev` supervision authority key.
+    ProvisionPortableDevSupervisionAuthority {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Exact create-only authority-key request bound to the repository object identity.
+        provision: Box<PortableDevSupervisionAuthorityKeyRequest>,
+    },
+    /// Register the exact current-user Task Scheduler action for one `UserMode`
+    /// candidate. The typed registration template contains no Phase-B digest;
+    /// Host must materialize the live descriptor before this effect executes.
+    RegisterCurrentUserTask {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Immutable `UserMode` task registration template.
+        registration: Box<UserModeTaskRegistrationPlan>,
+    },
     /// Publish the Host-owned Phase-B overlay and hand the exact pending
     /// activation to Host after the credential effect has been durably read
     /// back. This is a separate effect so materialization has its own
@@ -120,7 +237,7 @@ pub enum InstallerEffectPlan {
         /// Exact immutable Watchdog selector binding.
         watchdog_selector_digest: PlatformHandle,
         /// Installer-owned service-SID sealed signing-key effect plan.
-        supervision_authority: Box<SupervisionAuthorityProvisionPlan>,
+        supervision_authority: Box<PhaseBSupervisionAuthorityProvisionPlan>,
         /// Exact bundled credential provision contract repeated for Host
         /// admission; no secret bytes cross this boundary.
         provision: Box<StoreCredentialProvisionPlan>,
@@ -139,6 +256,10 @@ impl InstallerEffectPlan {
             | Self::RegisterService { effect_id, .. }
             | Self::StartService { effect_id, .. }
             | Self::ProvisionStoreCredential { effect_id, .. }
+            | Self::ProvisionCurrentUserStoreCredential { effect_id, .. }
+            | Self::ProvisionUserModeSupervisionAuthority { effect_id, .. }
+            | Self::ProvisionPortableDevSupervisionAuthority { effect_id, .. }
+            | Self::RegisterCurrentUserTask { effect_id, .. }
             | Self::MaterializePhaseB { effect_id, .. } => effect_id,
         }
     }
@@ -176,6 +297,7 @@ impl InstallerEffectPlan {
                 generation,
                 manifest,
                 staging_root,
+                destination_root,
                 expected_file_digests,
                 candidate_manifest_digest,
                 package_manifest_digest,
@@ -183,6 +305,9 @@ impl InstallerEffectPlan {
             } => {
                 approved_path(source_bundle, "installer_effect.source_bundle")?;
                 approved_path(staging_root, "installer_effect.staging_root")?;
+                if let Some(destination_root) = destination_root {
+                    approved_path(destination_root, "installer_effect.destination_root")?;
+                }
                 handle(generation, "installer_effect.generation")?;
                 if source_bundle_identity.volume_serial_number == 0
                     || source_bundle_identity.file_index == 0
@@ -258,7 +383,54 @@ impl InstallerEffectPlan {
                 }
                 Ok(())
             }
-            Self::ProvisionStoreCredential { provision, .. } => provision.validate(),
+            Self::ProvisionStoreCredential { provision, .. } => {
+                provision.validate()?;
+                if provision.scope != StoreCredentialScope::LocalService {
+                    return Err(InstallationError::ProfileViolation(
+                        "LocalService Store effect requires LocalService scope".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::ProvisionCurrentUserStoreCredential { provision, .. } => {
+                provision.validate()?;
+                if provision.scope != StoreCredentialScope::CurrentUser {
+                    return Err(InstallationError::ProfileViolation(
+                        "current-user Store effect requires current-user scope".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::ProvisionUserModeSupervisionAuthority {
+                effect_id,
+                provision,
+            } => {
+                provision.validate()?;
+                if provision.effect_id != *effect_id {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(())
+            }
+            Self::RegisterCurrentUserTask {
+                effect_id,
+                registration,
+            } => {
+                registration.validate()?;
+                if registration.effect_id != *effect_id {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(())
+            }
+            Self::ProvisionPortableDevSupervisionAuthority {
+                effect_id,
+                provision,
+            } => {
+                validate_portable_dev_authority_request(provision)?;
+                if provision.effect_id != effect_id.as_str() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(())
+            }
             Self::MaterializePhaseB {
                 candidate_manifest_digest,
                 static_template,
@@ -283,6 +455,17 @@ impl InstallerEffectPlan {
                     "installer_effect.watchdog_selector_digest",
                 )?;
                 supervision_authority.validate()?;
+                let expected_scope = match supervision_authority.profile() {
+                    InstallationProfile::SystemService => StoreCredentialScope::LocalService,
+                    InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                        StoreCredentialScope::CurrentUser
+                    }
+                };
+                if provision.scope != expected_scope {
+                    return Err(InstallationError::ProfileViolation(
+                        "Phase-B authority profile and Store credential scope disagree".to_owned(),
+                    ));
+                }
                 provision.validate()?;
                 if let Some(source) = agent_bridge_source {
                     source.validate()?;
@@ -326,7 +509,6 @@ pub(super) fn validate_effect_profile(
         InstallerEffectPlan::RegisterService { .. }
         | InstallerEffectPlan::StartService { .. }
         | InstallerEffectPlan::ProvisionStoreCredential { .. }
-        | InstallerEffectPlan::MaterializePhaseB { .. }
             if profile == InstallationProfile::SystemService =>
         {
             Ok(())
@@ -341,9 +523,53 @@ pub(super) fn validate_effect_profile(
                 "Store credential provisioning requires SystemService profile".to_owned(),
             ))
         }
-        InstallerEffectPlan::MaterializePhaseB { .. } => Err(InstallationError::ProfileViolation(
-            "Phase-B materialization requires SystemService profile".to_owned(),
-        )),
+        InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+            if matches!(profile, InstallationProfile::UserMode | InstallationProfile::PortableDev) =>
+        {
+            Ok(())
+        }
+        InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. } => {
+            Err(InstallationError::ProfileViolation(
+                "current-user Store credential requires UserMode or PortableDev profile".to_owned(),
+            ))
+        }
+        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+        | InstallerEffectPlan::RegisterCurrentUserTask { .. }
+            if profile == InstallationProfile::UserMode =>
+        {
+            Ok(())
+        }
+        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
+            Err(InstallationError::ProfileViolation(
+                "current-user supervision authority provisioning requires UserMode profile"
+                    .to_owned(),
+            ))
+        }
+        InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
+            if profile == InstallationProfile::PortableDev =>
+        {
+            Ok(())
+        }
+        InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. } => {
+            Err(InstallationError::ProfileViolation(
+                "repository-local supervision authority provisioning requires PortableDev profile"
+                    .to_owned(),
+            ))
+        }
+        InstallerEffectPlan::RegisterCurrentUserTask { .. } => {
+            Err(InstallationError::ProfileViolation(
+                "current-user task registration requires UserMode profile".to_owned(),
+            ))
+        }
+        InstallerEffectPlan::MaterializePhaseB {
+            supervision_authority,
+            ..
+        } if supervision_authority.profile() == profile => Ok(()),
+        InstallerEffectPlan::MaterializePhaseB { .. } => {
+            Err(InstallationError::ProfileViolation(
+                "Phase-B materialization authority does not match its selected profile".to_owned(),
+            ))
+        }
     }
 }
 
@@ -368,19 +594,322 @@ pub(super) fn validate_phase_b_effect_bindings(
                 || static_template != &expected_template
                 || host_state_root_digest != &expected_root_digest
                 || watchdog_selector_digest != &expected_watchdog_digest
-                || supervision_authority.installation_id
-                    != candidate.runtime_launch.installation_epoch.installation
-                || supervision_authority.candidate_generation != candidate.generation
-                || supervision_authority.authority_generation
-                    != candidate.runtime_launch.authority_generation
-                || supervision_authority.supervision_lease_scope_id.as_str()
-                    != candidate.runtime_launch.supervision_lease_scope_id()
-                || supervision_authority.kernel_root != candidate.runtime_launch.kernel_work_root)
+                || !phase_b_authority_matches_candidate(supervision_authority, candidate)?)
         {
             return Err(InstallationError::IdentityConflict);
         }
     }
     Ok(())
+}
+
+fn phase_b_authority_matches_candidate(
+    authority: &PhaseBSupervisionAuthorityProvisionPlan,
+    candidate: &CandidateManifest,
+) -> Result<bool, InstallationError> {
+    let launch = &candidate.runtime_launch;
+    let matches_common = |installation_id: &str,
+                          generation: &str,
+                          authority_generation: eliot_contracts::ResourceGeneration,
+                          scope_id: &str| {
+        installation_id == launch.installation_epoch.installation.as_str()
+            && generation == candidate.generation.as_str()
+            && authority_generation == launch.authority_generation
+            && scope_id == launch.supervision_lease_scope_id()
+    };
+    Ok(match authority {
+        PhaseBSupervisionAuthorityProvisionPlan::SystemService(provision) => {
+            matches_common(
+                provision.installation_id.as_str(),
+                provision.candidate_generation.as_str(),
+                provision.authority_generation,
+                provision.supervision_lease_scope_id.as_str(),
+            ) && provision.kernel_root == launch.kernel_work_root
+        }
+        PhaseBSupervisionAuthorityProvisionPlan::UserMode(provision) => {
+            matches_common(
+                provision.installation_id.as_str(),
+                provision.candidate_generation.as_str(),
+                provision.authority_generation,
+                provision.supervision_lease_scope_id.as_str(),
+            ) && provision.profile_roots == launch.profile_governed_roots
+        }
+        PhaseBSupervisionAuthorityProvisionPlan::PortableDev(provision) => {
+            matches_common(
+                &provision.installation_id,
+                &provision.candidate_generation,
+                provision.authority_generation,
+                &provision.supervision_lease_scope_id,
+            ) && launch.profile == InstallationProfile::PortableDev
+                && same_windows_root(
+                    &provision.repository_root.to_string_lossy(),
+                    launch
+                        .profile_governed_roots
+                        .runtime_state_roots
+                        .profile_anchor_root
+                        .as_str(),
+                )?
+        }
+    })
+}
+
+pub(super) fn validate_user_mode_authority_effect_bindings(
+    transaction_id: &PlatformHandle,
+    candidate: &CandidateManifest,
+    roots: &super::InstallationRoots,
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    let mut matched = 0_usize;
+    for effect in effects {
+        let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+            effect_id,
+            provision,
+        } = effect
+        else {
+            continue;
+        };
+        matched += 1;
+        if candidate.runtime_launch.profile != InstallationProfile::UserMode
+            || provision.transaction_id != *transaction_id
+            || provision.effect_id != *effect_id
+            || provision.installation_id != candidate.runtime_launch.installation_epoch.installation
+            || provision.candidate_generation != candidate.generation
+            || provision.authority_generation != candidate.runtime_launch.authority_generation
+            || provision.supervision_lease_scope_id.as_str()
+                != candidate.runtime_launch.supervision_lease_scope_id()
+            || provision.profile_roots != *roots
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    match (candidate.runtime_launch.profile, matched) {
+        (InstallationProfile::UserMode, 1) => Ok(()),
+        (InstallationProfile::UserMode, 0) => Err(InstallationError::IncompleteObservation(
+            "UserMode candidate is missing its current-user authority effect".to_owned(),
+        )),
+        (InstallationProfile::UserMode, _) => Err(InstallationError::Duplicate {
+            kind: "UserMode supervision authority effect".to_owned(),
+            identity: transaction_id.as_str().to_owned(),
+        }),
+        (_, 0) => Ok(()),
+        (_, _) => Err(InstallationError::ProfileViolation(
+            "UserMode authority effect is inconsistent with the candidate profile".to_owned(),
+        )),
+    }
+}
+
+pub(super) fn validate_portable_dev_authority_effect_bindings(
+    transaction_id: &PlatformHandle,
+    candidate: &CandidateManifest,
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    let launch = &candidate.runtime_launch;
+    let expected_relative_path = portable_dev_authority_relative_path(candidate);
+    let mut matched = 0_usize;
+    for effect in effects {
+        let InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority {
+            effect_id,
+            provision,
+        } = effect
+        else {
+            continue;
+        };
+        matched += 1;
+        if launch.profile != InstallationProfile::PortableDev
+            || provision.transaction_id != transaction_id.as_str()
+            || provision.effect_id != effect_id.as_str()
+            || provision.effect_id
+                != format!("effect:portable-dev-supervision-authority:{}", candidate.generation)
+            || provision.installation_id != launch.installation_epoch.installation.as_str()
+            || provision.candidate_generation != candidate.generation.as_str()
+            || provision.authority_generation != launch.authority_generation
+            || provision.supervision_lease_scope_id != launch.supervision_lease_scope_id()
+            || provision.signer_id != "eliot-kernel"
+            || provision.key_id != format!("eliot-supervision-key:v1:{}", candidate.generation)
+            || provision.relative_path != expected_relative_path
+            || !same_windows_root(
+                &provision.repository_root.to_string_lossy(),
+                launch
+                    .profile_governed_roots
+                    .runtime_state_roots
+                    .profile_anchor_root
+                    .as_str(),
+            )?
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    match (launch.profile, matched) {
+        (InstallationProfile::PortableDev, 1) => Ok(()),
+        (InstallationProfile::PortableDev, 0) => Err(InstallationError::IncompleteObservation(
+            "PortableDev candidate is missing its repository-local supervision authority effect"
+                .to_owned(),
+        )),
+        (InstallationProfile::PortableDev, _) => Err(InstallationError::Duplicate {
+            kind: "PortableDev supervision authority effect".to_owned(),
+            identity: transaction_id.as_str().to_owned(),
+        }),
+        (_, 0) => Ok(()),
+        (_, _) => Err(InstallationError::ProfileViolation(
+            "PortableDev authority effect is inconsistent with the candidate profile".to_owned(),
+        )),
+    }
+}
+
+pub(super) fn validate_current_user_store_credential_effect_bindings(
+    candidate: &CandidateManifest,
+    roots: &super::InstallationRoots,
+    store_credential_target: &PlatformHandle,
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    let launch = &candidate.runtime_launch;
+    let mut matched = 0_usize;
+    for effect in effects {
+        let InstallerEffectPlan::ProvisionCurrentUserStoreCredential {
+            effect_id,
+            provision,
+        } = effect
+        else {
+            continue;
+        };
+        matched += 1;
+        let expected_effect_id = match launch.profile {
+            InstallationProfile::UserMode => "effect:user-mode-store-credential",
+            InstallationProfile::PortableDev => "effect:portable-dev-store-credential",
+            InstallationProfile::SystemService => "",
+        };
+        let expected_state_root = WindowsPathIdentity::parse_root(
+            roots.runtime_state_roots.host_state_root.as_str(),
+            "runtime_roots.host_state_root",
+        )?;
+        let planned_state_root = WindowsPathIdentity::parse_root(
+            provision.host_state_root.as_str(),
+            "credential.host_state_root",
+        )?;
+        if !matches!(launch.profile, InstallationProfile::UserMode | InstallationProfile::PortableDev)
+            || effect_id.as_str() != expected_effect_id
+            || provision.scope != StoreCredentialScope::CurrentUser
+            || provision.provider != super::StoreCredentialProvider::WindowsCredentialManager
+            || provision.target != *store_credential_target
+            || provision.target != candidate.store_credential_target
+            || provision.host_state_root.as_str()
+                != roots.runtime_state_roots.host_state_root.as_str()
+            || expected_state_root != planned_state_root
+            || provision.expected_host_executable != candidate.host_executable_path
+            || provision.expected_host_executable_sha256 != launch.host_artifact_digest
+            || provision.generation != launch.authority_generation
+            || provision.config_digest != candidate.config_digest
+            || provision.provider_bootstrap_target.is_some()
+            || !valid_current_user_sid(provision.expected_principal_sid.as_str())
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if launch.profile == InstallationProfile::UserMode {
+            let expected_owner = effects.iter().find_map(|candidate_effect| {
+                if let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+                    provision, ..
+                } = candidate_effect
+                {
+                    Some(&provision.owner_sid)
+                } else {
+                    None
+                }
+            });
+            if expected_owner != Some(&provision.expected_principal_sid) {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+    }
+    match (launch.profile, matched) {
+        (InstallationProfile::UserMode | InstallationProfile::PortableDev, 1) => Ok(()),
+        (InstallationProfile::UserMode | InstallationProfile::PortableDev, 0) => {
+            Err(InstallationError::IncompleteObservation(
+                "current-user profile is missing its exact Store credential effect".to_owned(),
+            ))
+        }
+        (InstallationProfile::UserMode | InstallationProfile::PortableDev, _) => {
+            Err(InstallationError::Duplicate {
+                kind: "current-user Store credential effect".to_owned(),
+                identity: launch.installation_epoch.installation.as_str().to_owned(),
+            })
+        }
+        (_, 0) => Ok(()),
+        (_, _) => Err(InstallationError::ProfileViolation(
+            "current-user Store credential effect is admitted only for UserMode or PortableDev"
+                .to_owned(),
+        )),
+    }
+}
+
+fn portable_dev_authority_relative_path(candidate: &CandidateManifest) -> String {
+    let launch = &candidate.runtime_launch;
+    let digest = sha256_hex(
+        format!(
+            "{}\0{}\0{}",
+            launch.installation_epoch.installation,
+            candidate.generation,
+            launch.authority_generation.value()
+        )
+        .as_bytes(),
+    );
+    format!(
+        "{}supervision-authority-{}.sealed",
+        eliot_runtime_contracts::PORTABLE_DEV_SUPERVISION_KEY_PREFIX,
+        &digest[..32]
+    )
+}
+
+pub(super) fn validate_user_mode_task_effect_bindings(
+    transaction_id: &PlatformHandle,
+    candidate: &CandidateManifest,
+    roots: &super::InstallationRoots,
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    let expected_manifest_digest = candidate.compute_digest()?;
+    let mut matched = 0_usize;
+    for effect in effects {
+        let InstallerEffectPlan::RegisterCurrentUserTask {
+            effect_id,
+            registration,
+        } = effect
+        else {
+            continue;
+        };
+        matched += 1;
+        let launch = &candidate.runtime_launch;
+        if launch.profile != InstallationProfile::UserMode
+            || registration.transaction_id != *transaction_id
+            || registration.effect_id != *effect_id
+            || registration.installation_id != launch.installation_epoch.installation
+            || registration.candidate_generation != candidate.generation
+            || registration.candidate_manifest_digest != expected_manifest_digest
+            || registration.profile_component != launch.profile_component
+            || registration.profile_version != launch.profile_version
+            || registration.profile_installation_key != launch.profile_installation_key
+            || registration.profile_roots.as_ref() != roots
+            || registration.authority_descriptor_path != launch.authority_descriptor_path
+            || registration.authority_generation != launch.authority_generation
+            || registration.host_executable_path != launch.host_executable_path
+            || registration.host_executable_sha256 != launch.host_artifact_digest
+            || registration.working_directory.as_str()
+                != launch.profile_governed_roots.immutable_binaries
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    match (candidate.runtime_launch.profile, matched) {
+        (InstallationProfile::UserMode, 1) => Ok(()),
+        (InstallationProfile::UserMode, 0) => Err(InstallationError::IncompleteObservation(
+            "UserMode candidate is missing its current-user task registration effect".to_owned(),
+        )),
+        (InstallationProfile::UserMode, _) => Err(InstallationError::Duplicate {
+            kind: "UserMode current-user task effect".to_owned(),
+            identity: transaction_id.as_str().to_owned(),
+        }),
+        (_, 0) => Ok(()),
+        (_, _) => Err(InstallationError::ProfileViolation(
+            "UserMode task effect is inconsistent with the candidate profile".to_owned(),
+        )),
+    }
 }
 
 #[allow(
@@ -420,8 +949,12 @@ pub(super) fn validate_installer_effects(
     let mut host_service_image = None;
     let mut credential_host_image = None;
     let mut credential_index = None;
+    let mut current_user_credential_index = None;
     let mut phase_b_index = None;
     let mut package_index = None;
+    let mut user_mode_authority_index = None;
+    let mut portable_dev_authority_index = None;
+    let mut user_mode_task_index = None;
     for (index, effect) in effects.iter().enumerate() {
         effect.validate()?;
         if !effect_ids.insert(effect.effect_id().as_str()) {
@@ -636,6 +1169,98 @@ pub(super) fn validate_installer_effects(
                     });
                 }
             }
+            InstallerEffectPlan::ProvisionCurrentUserStoreCredential { provision, .. } => {
+                if !matches!(profile, InstallationProfile::UserMode | InstallationProfile::PortableDev)
+                    || provision.scope != StoreCredentialScope::CurrentUser
+                    || provision.target != *store_credential_target
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "current-user credential effect must match the selected non-service profile and target"
+                            .to_owned(),
+                    ));
+                }
+                let host_root = WindowsPathIdentity::parse_root(
+                    roots.host_state_root.as_str(),
+                    "runtime_roots.host_state_root",
+                )?;
+                let planned_root = WindowsPathIdentity::parse_root(
+                    provision.host_state_root.as_str(),
+                    "credential.host_state_root",
+                )?;
+                if planned_root != host_root {
+                    return Err(InstallationError::ProfileViolation(
+                        "current-user credential marker must use the exact selected host_state_root"
+                            .to_owned(),
+                    ));
+                }
+                if current_user_credential_index.replace(index).is_some() {
+                    return Err(InstallationError::Duplicate {
+                        kind: "current-user Store credential effect".to_owned(),
+                        identity: provision.target.as_str().to_owned(),
+                    });
+                }
+            }
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { provision, .. } => {
+                if profile != InstallationProfile::UserMode {
+                    return Err(InstallationError::ProfileViolation(
+                        "current-user authority provisioning is UserMode-only".to_owned(),
+                    ));
+                }
+                if user_mode_authority_index.replace(index).is_some() {
+                    return Err(InstallationError::Duplicate {
+                        kind: "UserMode supervision authority effect".to_owned(),
+                        identity: provision.effect_id.as_str().to_owned(),
+                    });
+                }
+                if package_index.is_none_or(|package| index != package + 1) {
+                    return Err(InstallationError::IncompleteObservation(
+                        "UserMode authority provisioning must immediately follow package publication"
+                            .to_owned(),
+                    ));
+                }
+            }
+            InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { provision, .. } => {
+                if profile != InstallationProfile::PortableDev {
+                    return Err(InstallationError::ProfileViolation(
+                        "repository-local supervision authority provisioning is PortableDev-only"
+                            .to_owned(),
+                    ));
+                }
+                if portable_dev_authority_index.replace(index).is_some() {
+                    return Err(InstallationError::Duplicate {
+                        kind: "PortableDev supervision authority effect".to_owned(),
+                        identity: provision.effect_id.clone(),
+                    });
+                }
+                if package_index.is_none_or(|package| index != package + 1) {
+                    return Err(InstallationError::IncompleteObservation(
+                        "PortableDev authority provisioning must immediately follow package publication"
+                            .to_owned(),
+                    ));
+                }
+            }
+            InstallerEffectPlan::RegisterCurrentUserTask { registration, .. } => {
+                if profile != InstallationProfile::UserMode {
+                    return Err(InstallationError::ProfileViolation(
+                        "current-user task registration is admitted only for UserMode".to_owned(),
+                    ));
+                }
+                if user_mode_task_index.replace(index).is_some() {
+                    return Err(InstallationError::Duplicate {
+                        kind: "UserMode current-user task effect".to_owned(),
+                        identity: registration.effect_id.as_str().to_owned(),
+                    });
+                }
+                if user_mode_authority_index.is_none_or(|authority| index <= authority)
+                    || phase_b_index.is_none_or(|phase_b| index <= phase_b)
+                    || index + 1 != effects.len()
+                {
+                    return Err(InstallationError::IncompleteObservation(
+                        "UserMode task registration must follow Phase-B materialization as the final installer effect"
+                            .to_owned(),
+                    ));
+                }
+            }
             InstallerEffectPlan::MaterializePhaseB { .. } => {
                 if phase_b_index.replace(index).is_some() {
                     return Err(InstallationError::Duplicate {
@@ -777,6 +1402,69 @@ pub(super) fn validate_installer_effects(
             "non-service profiles must not start SCM services".to_owned(),
         ));
     }
+    if profile == InstallationProfile::UserMode && user_mode_authority_index.is_none() {
+        return Err(InstallationError::IncompleteObservation(
+            "UserMode transaction requires its current-user supervision authority effect"
+                .to_owned(),
+        ));
+    }
+    if profile == InstallationProfile::UserMode && user_mode_task_index.is_none() {
+        return Err(InstallationError::IncompleteObservation(
+            "UserMode transaction requires its current-user task registration effect".to_owned(),
+        ));
+    }
+    if profile == InstallationProfile::UserMode {
+        let (Some(authority), Some(credential), Some(phase_b)) = (
+            user_mode_authority_index,
+            current_user_credential_index,
+            phase_b_index,
+        ) else {
+            return Err(InstallationError::IncompleteObservation(
+                "UserMode transaction requires authority, current-user Store credential and Phase-B effects"
+                    .to_owned(),
+            ));
+        };
+        if !(authority < credential && credential < phase_b) {
+            return Err(InstallationError::IncompleteObservation(
+                "UserMode authority, Store credential and Phase-B effects are out of order"
+                    .to_owned(),
+            ));
+        }
+    }
+    if profile == InstallationProfile::PortableDev {
+        let (Some(authority), Some(credential), Some(phase_b)) = (
+            portable_dev_authority_index,
+            current_user_credential_index,
+            phase_b_index,
+        ) else {
+            return Err(InstallationError::IncompleteObservation(
+                "PortableDev transaction requires repository authority, current-user Store credential and Phase-B effects"
+                    .to_owned(),
+            ));
+        };
+        if !(authority < credential && credential < phase_b) {
+            return Err(InstallationError::IncompleteObservation(
+                "PortableDev authority, Store credential and Phase-B effects are out of order"
+                    .to_owned(),
+            ));
+        }
+    }
+    if profile != InstallationProfile::UserMode && user_mode_task_index.is_some() {
+        return Err(InstallationError::ProfileViolation(
+            "current-user task registration effect is admitted only for UserMode".to_owned(),
+        ));
+    }
+    if profile != InstallationProfile::UserMode && user_mode_authority_index.is_some() {
+        return Err(InstallationError::ProfileViolation(
+            "current-user supervision authority effect is admitted only for UserMode".to_owned(),
+        ));
+    }
+    if profile != InstallationProfile::PortableDev && portable_dev_authority_index.is_some() {
+        return Err(InstallationError::ProfileViolation(
+            "repository-local supervision authority effect is admitted only for PortableDev"
+                .to_owned(),
+        ));
+    }
     if profile == InstallationProfile::SystemService
         && (credential_host_image.is_none() || credential_host_image != host_service_image)
     {
@@ -788,6 +1476,18 @@ pub(super) fn validate_installer_effects(
     if profile != InstallationProfile::SystemService && credential_host_image.is_some() {
         return Err(InstallationError::ProfileViolation(
             "non-service profiles must not provision a LocalService Store credential".to_owned(),
+        ));
+    }
+    if profile == InstallationProfile::SystemService && current_user_credential_index.is_some() {
+        return Err(InstallationError::ProfileViolation(
+            "SystemService must not provision a current-user Store credential".to_owned(),
+        ));
+    }
+    if matches!(profile, InstallationProfile::UserMode | InstallationProfile::PortableDev)
+        && (credential_index.is_some() || current_user_credential_index.is_none())
+    {
+        return Err(InstallationError::ProfileViolation(
+            "UserMode and PortableDev require current-user Store credentials only".to_owned(),
         ));
     }
     if profile != InstallationProfile::SystemService && !service_roles.is_empty() {

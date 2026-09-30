@@ -14,8 +14,10 @@
 //! `registry_wire` owns shape selection, legacy migration, and decode dispatch;
 //! the installation registry/Host owns durable mutation and authority.
 
+use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
 use serde::Deserialize;
 
+use super::super::approved_generation_registry::UserModeTaskRunRecord;
 use super::super::{
     ActivationCommitFence, ActivePhaseBRebind, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
     ActivePhaseBRebindRecovery, AgentBridgeStagePrepared, ApprovedGeneration,
@@ -24,6 +26,7 @@ use super::super::{
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallerServiceRegistrationApproval, PendingActivation, PendingActivationAbortReceipt,
     PendingActivationState, PlatformHandle, ResourceGeneration, StateFence,
+    SystemServiceHostRootReceipt,
 };
 
 use super::{PendingActivationTerminal, PendingActivationTerminalDisposition};
@@ -74,6 +77,8 @@ struct ApprovedGenerationWire {
     approval: InstallationActivationApprovalWire,
     active: bool,
     last_known_good: bool,
+    #[serde(default)]
+    profile_selection_receipt: Option<ProfileSelectionReceipt>,
 }
 
 impl ApprovedGenerationWire {
@@ -83,6 +88,7 @@ impl ApprovedGenerationWire {
             approval: self.approval.into_approval(),
             active: self.active,
             last_known_good: self.last_known_good,
+            profile_selection_receipt: self.profile_selection_receipt,
         }
     }
 }
@@ -189,7 +195,7 @@ impl ActivePhaseBRebindWireV11 {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RegistryWireV11 {
+pub(super) struct RegistryWireV12 {
     pub(super) registry_wire_version: ContractVersion,
     pub(super) revision: u64,
     generations: Vec<ApprovedGenerationWire>,
@@ -198,6 +204,7 @@ pub(super) struct RegistryWireV11 {
     last_known_good_generation: RequiredOption<PlatformHandle>,
     pending_activation: RequiredOption<PendingActivationWire>,
     last_terminal_activation: RequiredOption<PendingActivationTerminalWire>,
+    system_service_host_root_receipt: RequiredOption<SystemServiceHostRootReceipt>,
     #[serde(default)]
     aborted_activation_receipts: Vec<PendingActivationAbortReceipt>,
     active_phase_b_rebind: RequiredOption<ActivePhaseBRebindWireV11>,
@@ -208,6 +215,7 @@ pub(super) struct RegistryWireV11 {
     /// migration.
     #[serde(default)]
     committed_cutover_activation: Option<CommittedCutoverActivation>,
+    user_mode_task_run_record: RequiredOption<UserModeTaskRunRecord>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -227,10 +235,11 @@ where
     }
 }
 
-impl RegistryWireV11 {
+impl RegistryWireV12 {
     pub(super) fn into_registry(self) -> ApprovedGenerationRegistry {
         ApprovedGenerationRegistry {
             registry_wire_version: self.registry_wire_version,
+            legacy_registry_identity_version: None,
             revision: self.revision,
             generations: self
                 .generations
@@ -248,12 +257,14 @@ impl RegistryWireV11 {
                 .last_terminal_activation
                 .0
                 .map(PendingActivationTerminalWire::into_terminal),
+            system_service_host_root_receipt: self.system_service_host_root_receipt.0,
             aborted_activation_receipts: self.aborted_activation_receipts,
             active_phase_b_rebind: self
                 .active_phase_b_rebind
                 .0
                 .map(ActivePhaseBRebindWireV11::into_rebind),
             committed_cutover_activation: self.committed_cutover_activation,
+            user_mode_task_run_record: self.user_mode_task_run_record.0,
         }
     }
 }

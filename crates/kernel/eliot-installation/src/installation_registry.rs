@@ -46,13 +46,16 @@ use std::path::{Path, PathBuf};
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     HostOwnerEpochCapability, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    require_protected_program_data_path,
+    UserOwnedPathLease, UserOwnedRootLease, require_protected_program_data_path,
 };
 use redb::{Database, TableDefinition};
 
 #[cfg(test)]
 use crate::InstallationTransactionStore;
-use crate::approved_generation_registry::PendingActivationTerminalDisposition;
+use crate::approved_generation_registry::{
+    PendingActivationTerminalDisposition, UserModeTaskRunHostAck,
+    UserModeTaskRunIntentProjection, UserModeTaskRunRecord,
+};
 #[cfg(any(test, feature = "test-support"))]
 use crate::approved_generation_registry::{
     TestSupportRegistryFixtureContour, test_support_activation_fixture,
@@ -90,7 +93,7 @@ pub(super) const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.
 /// ```
 pub struct RedbInstallationRegistry {
     pub(super) database: Database,
-    _path_lease: RegistryPathLease,
+    path_lease: RegistryPathLease,
 }
 
 enum RegistryPathLease {
@@ -100,6 +103,10 @@ enum RegistryPathLease {
     InstallationHost {
         _root: ProtectedRootLease,
         _file: ProtectedRuntimePathLease,
+    },
+    UserOwnedHost {
+        _root: UserOwnedRootLease,
+        _file: UserOwnedPathLease,
     },
     #[cfg(any(test, feature = "test-support"))]
     Test,
@@ -181,7 +188,7 @@ impl RedbInstallationRegistry {
     pub(super) fn from_database_for_test(database: Database) -> Self {
         Self {
             database,
-            _path_lease: RegistryPathLease::Test,
+            path_lease: RegistryPathLease::Test,
         }
     }
 
@@ -208,7 +215,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self {
             database,
-            _path_lease: RegistryPathLease::Test,
+            path_lease: RegistryPathLease::Test,
         })
     }
 
@@ -231,7 +238,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self {
             database,
-            _path_lease: RegistryPathLease::Legacy { _lease: path_lease },
+            path_lease: RegistryPathLease::Legacy { _lease: path_lease },
         })
     }
 
@@ -266,13 +273,19 @@ impl RedbInstallationRegistry {
         let database = crate::redb_state::open_registry_writer_create_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        Ok(Self {
+        let registry = Self {
             database,
-            _path_lease: RegistryPathLease::InstallationHost {
+            path_lease: RegistryPathLease::InstallationHost {
                 _root: host_root,
                 _file: file,
             },
-        })
+        };
+        let projection = registry.load()?;
+        registry.validate_system_service_host_root_binding(
+            &projection,
+            !projection.is_uninitialized_for_system_service_bootstrap(),
+        )?;
+        Ok(registry)
     }
 
     /// Opens an existing registry below one retained per-installation Host
@@ -318,13 +331,280 @@ impl RedbInstallationRegistry {
         let database = crate::redb_state::open_registry_writer_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let registry = Self {
+            database,
+            path_lease: RegistryPathLease::InstallationHost {
+                _root: host_root,
+                _file: file,
+            },
+        };
+        let projection = registry.load()?;
+        registry.validate_system_service_host_root_binding(&projection, true)?;
+        Ok(Some(registry))
+    }
+
+    /// Opens an existing `SystemService` registry for the installer replay
+    /// window before its first activation projection. This never creates a
+    /// file or database. A captured transaction receipt must bind the retained
+    /// Host root; only an exact uninitialized registry may lack its persisted
+    /// registry receipt.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the registry owner must retain the caller-provided Host root lease"
+    )]
+    pub fn open_existing_at_for_preprojection(
+        host_root: ProtectedRootLease,
+        expected_receipt: &crate::SystemServiceHostRootReceipt,
+        expected_host_state_root: &str,
+    ) -> Result<Option<Self>, InstallationError> {
+        expected_receipt.validate_against(&host_root, expected_host_state_root)?;
+        let path = installation_registry_path(&host_root)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                host_root
+                    .verify_stable_identity()
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                return Ok(None);
+            }
+            Ok(_) | Err(_) => {
+                return Err(InstallationError::Platform(
+                    "installation registry path is not an existing regular file".to_owned(),
+                ));
+            }
+        }
+        let file = ProtectedRuntimePathLease::open_existing_absolute(&path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if file.path() != path {
+            return Err(InstallationError::Platform(
+                "installation registry path is not the retained canonical Host child".to_owned(),
+            ));
+        }
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let database = crate::redb_state::open_registry_writer_with_retry(file.path())?;
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let registry = Self {
+            database,
+            path_lease: RegistryPathLease::InstallationHost {
+                _root: host_root,
+                _file: file,
+            },
+        };
+        let projection = registry.load()?;
+        if projection.is_uninitialized_for_system_service_bootstrap() {
+            registry.validate_system_service_host_root_binding(&projection, false)?;
+        } else {
+            let Some(persisted_receipt) = projection.system_service_host_root_receipt() else {
+                return Err(InstallationError::MigrationRequired {
+                    reason: "existing SystemService installation registry has a projection but no persisted Host-root identity receipt; explicit recovery is required"
+                        .to_owned(),
+                });
+            };
+            if persisted_receipt != expected_receipt {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.validate_system_service_host_root_binding(&projection, true)?;
+        }
+        Ok(Some(registry))
+    }
+
+    /// Opens or creates the registry below a retained current-user Host root.
+    ///
+    /// `UserMode` and `PortableDev` registries retain both the current-user root
+    /// and fixed child-file leases for the complete redb handle lifetime.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the registry owner must retain the caller-provided Host root lease"
+    )]
+    pub fn open_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: crate::InstallationProfile,
+        selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    ) -> Result<Self, InstallationError> {
+        Self::verify_user_owned_registry_root_binding(&host_root, profile, selection)?;
+        let path = installation_registry_path_user_owned(&host_root, profile)?;
+        let file = UserOwnedPathLease::open_or_create(&host_root, &path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if file.path() != path {
+            return Err(InstallationError::Platform(
+                "UserMode registry path is not the retained canonical Host child".to_owned(),
+            ));
+        }
+        let database = crate::redb_state::open_registry_writer_create_with_retry(file.path())?;
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        host_root
+            .verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        Ok(Self {
+            database,
+            path_lease: RegistryPathLease::UserOwnedHost {
+                _root: host_root,
+                _file: file,
+            },
+        })
+    }
+
+    /// Opens an existing current-user registry only after the profile-selection
+    /// receipt binds its retained Host-root object, canonical path, and owner SID.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the registry owner must retain the caller-provided Host root lease"
+    )]
+    pub fn open_existing_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: crate::InstallationProfile,
+        selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    ) -> Result<Option<Self>, InstallationError> {
+        Self::verify_user_owned_registry_root_binding(&host_root, profile, selection)?;
+        let path = installation_registry_path_user_owned(&host_root, profile)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => {
+                return Err(InstallationError::Platform(
+                    "UserMode registry path is not an existing regular file".to_owned(),
+                ));
+            }
+        }
+        let file = UserOwnedPathLease::open_existing(&host_root, &path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if file.path() != path {
+            return Err(InstallationError::Platform(
+                "UserMode registry path is not the retained canonical Host child".to_owned(),
+            ));
+        }
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let database = crate::redb_state::open_registry_writer_with_retry(file.path())?;
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        host_root
+            .verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Some(Self {
             database,
-            _path_lease: RegistryPathLease::InstallationHost {
+            path_lease: RegistryPathLease::UserOwnedHost {
                 _root: host_root,
                 _file: file,
             },
         }))
+    }
+
+    fn verify_user_owned_registry_root_binding(
+        root: &UserOwnedRootLease,
+        profile: crate::InstallationProfile,
+        selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    ) -> Result<(), InstallationError> {
+        let expected_profile = match profile {
+            crate::InstallationProfile::UserMode => {
+                eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+            }
+            crate::InstallationProfile::PortableDev => {
+                eliot_platform_windows::profile_supervision::ProfileSelection::PortableDev
+            }
+            crate::InstallationProfile::SystemService => {
+                return Err(InstallationError::ProfileViolation(
+                    "SystemService registry opens do not accept a current-user profile receipt"
+                        .to_owned(),
+                ));
+            }
+        };
+        let mut observations = selection
+            .roots
+            .iter()
+            .filter(|observation| observation.role == "runtime_state_roots.host_state_root");
+        let Some(observation) = observations.next() else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        if selection.profile != expected_profile || observations.next().is_some() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        root.verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        root.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let canonical_root = root
+            .canonical_path()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let canonical_root_text =
+            canonical_root
+                .to_str()
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "installation_registry.user_owned.host_state_root".to_owned(),
+                    reason: "current-user Host root cannot be represented losslessly".to_owned(),
+                })?;
+        if selection.owner_sid != root.current_user_sid()
+            || observation.identity != root.identity()
+            || !eliot_platform_windows::windows_paths_equal(
+                &observation.canonical_path,
+                Path::new(canonical_root_text),
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_system_service_host_root_binding(
+        &self,
+        registry: &ApprovedGenerationRegistry,
+        required: bool,
+    ) -> Result<(), InstallationError> {
+        let RegistryPathLease::InstallationHost {
+            _root: root,
+            _file: file,
+        } = &self.path_lease
+        else {
+            return Err(InstallationError::Platform(
+                "SystemService Host-root binding requires the retained protected Host registry root"
+                    .to_owned(),
+            ));
+        };
+        let Some(receipt) = registry.system_service_host_root_receipt() else {
+            if required {
+                return Err(InstallationError::MigrationRequired {
+                    reason: "existing SystemService installation registry has no persisted Host-root identity receipt; explicit recovery is required"
+                        .to_owned(),
+                });
+            }
+            root.verify_stable_identity()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            file.verify_path_identity()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            return Ok(());
+        };
+
+        let mut validated_descriptor = false;
+        for generation in registry.generations() {
+            let launch = &generation.manifest.runtime_launch;
+            if launch.profile == crate::InstallationProfile::SystemService {
+                receipt
+                    .validate_against(root, launch.runtime_state_roots.host_state_root.as_str())?;
+                validated_descriptor = true;
+            }
+        }
+        if let Some(pending) = registry.pending_activation() {
+            let launch = &pending.manifest.runtime_launch;
+            if launch.profile == crate::InstallationProfile::SystemService {
+                receipt
+                    .validate_against(root, launch.runtime_state_roots.host_state_root.as_str())?;
+                validated_descriptor = true;
+            }
+        }
+        if !validated_descriptor {
+            // The registry may be bound before its first generation projection.
+            // In that interval, the receipt itself still has to match the live
+            // retained root identity and canonical path.
+            receipt.validate_against(root, receipt.canonical_path())?;
+        }
+        root.verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        Ok(())
     }
 
     fn validate_host_owner_binding_for_identity(
@@ -340,12 +620,11 @@ impl RedbInstallationRegistry {
             host_state_root.as_str(),
             "installation_registry.owner.host_state_root",
         )?;
-        let actual_root = match &self._path_lease {
-            RegistryPathLease::InstallationHost { _root, .. } => {
-                _root
-                    .verify_stable_identity()
+        let actual_root = match &self.path_lease {
+            RegistryPathLease::InstallationHost { _root: root, .. } => {
+                root.verify_stable_identity()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
-                let canonical_root = _root
+                let canonical_root = root
                     .canonical_path()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
                 WindowsPathIdentity::parse_root(
@@ -353,7 +632,35 @@ impl RedbInstallationRegistry {
                     "installation_registry.owner.retained_host_state_root",
                 )?
             }
-            _ => {
+            RegistryPathLease::UserOwnedHost { _root: root, .. } => {
+                root.verify_stable_identity()
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                let canonical_root = root
+                    .canonical_path()
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                let canonical_root_text =
+                    canonical_root
+                        .to_str()
+                        .ok_or_else(|| InstallationError::InvalidField {
+                            field: "installation_registry.owner.retained_host_state_root"
+                                .to_owned(),
+                            reason:
+                                "retained current-user Host root cannot be represented losslessly"
+                                    .to_owned(),
+                        })?;
+                WindowsPathIdentity::parse_root(
+                    canonical_root_text,
+                    "installation_registry.owner.retained_host_state_root",
+                )?
+            }
+            RegistryPathLease::Legacy { .. } => {
+                return Err(InstallationError::Platform(
+                    "owner-bound abort requires the retained protected Host registry root"
+                        .to_owned(),
+                ));
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            RegistryPathLease::Test => {
                 return Err(InstallationError::Platform(
                     "owner-bound abort requires the retained protected Host registry root"
                         .to_owned(),
@@ -364,6 +671,32 @@ impl RedbInstallationRegistry {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
+    }
+
+    fn validate_user_mode_task_run_host_ack_binding(
+        &self,
+        registry: &ApprovedGenerationRegistry,
+        host: &HostOwnerEpochCapability,
+        ack: &UserModeTaskRunHostAck,
+    ) -> Result<(), InstallationError> {
+        let active = registry.validate_active_user_mode_task_run_intent(&ack.intent)?;
+        if ack.evidence.host_process_id != std::process::id()
+            || !eliot_platform_windows::windows_paths_equal(
+                Path::new(&ack.evidence.host_process_image_path),
+                Path::new(active.manifest.host_executable_path.as_str()),
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.validate_host_owner_binding_for_identity(
+            host,
+            &active.manifest.runtime_launch.installation_epoch.installation,
+            &active
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root,
+        )
     }
 
     fn validate_host_owner_binding(
@@ -480,6 +813,167 @@ impl RedbInstallationRegistry {
     ) -> Result<ActivationCommitReceipt, InstallationError> {
         self.load()?
             .read_committed_activation_receipt(transaction_id, plan_digest, generation)
+    }
+
+    /// Stages the exact `UserMode` task registration and `RunEx` intent before
+    /// the caller invokes Task Scheduler. The record remains explicitly
+    /// unresolved until Host commits readiness evidence; staging never implies
+    /// that `RunEx` was accepted.
+    ///
+    /// The caller supplies the revision from its current loaded projection.
+    /// Repeating the exact intent is idempotent even if the revision has since
+    /// advanced. A different intent cannot replace an unresolved record; an
+    /// acknowledged record may be superseded by the next active generation's
+    /// operation.
+    pub fn stage_user_mode_task_run_intent(
+        &self,
+        expected_revision: u64,
+        intent: &UserModeTaskRunIntentProjection,
+    ) -> Result<UserModeTaskRunRecord, InstallationError> {
+        let current = self.load()?;
+        current.validate_active_user_mode_task_run_intent(intent)?;
+        if let Some(record) = current.user_mode_task_run_record()
+            && record.intent() == intent
+        {
+            return Ok(record.clone());
+        }
+        if current.user_mode_task_run_record().is_some_and(|record| {
+            record.intent().transaction_id() == intent.transaction_id()
+                && record.intent().effect_id() == intent.effect_id()
+        }) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if current
+            .user_mode_task_run_record()
+            .is_some_and(|record| record.host_ack().is_none())
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if current.revision() != expected_revision {
+            return Err(InstallationError::CompareAndSaveConflict {
+                expected: expected_revision,
+                actual: current.revision(),
+            });
+        }
+        let staged_intent = (*intent).clone();
+        match self.mutate_atomic(expected_revision, |registry| {
+            registry.validate_active_user_mode_task_run_intent(&staged_intent)?;
+            if let Some(existing) = registry.user_mode_task_run_record()
+                && existing.intent() == &staged_intent
+            {
+                return Ok(existing.clone());
+            }
+            if registry.user_mode_task_run_record().is_some_and(|record| {
+                record.intent().transaction_id() == staged_intent.transaction_id()
+                    && record.intent().effect_id() == staged_intent.effect_id()
+            }) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if registry
+                .user_mode_task_run_record()
+                .is_some_and(|record| record.host_ack().is_none())
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let record = UserModeTaskRunRecord::staged(staged_intent.clone());
+            record.validate()?;
+            registry.user_mode_task_run_record = Some(record.clone());
+            Ok(record)
+        }) {
+            Ok(record) => Ok(record),
+            Err(conflict @ InstallationError::CompareAndSaveConflict { .. }) => {
+                let latest = self.load()?;
+                latest.validate_active_user_mode_task_run_intent(intent)?;
+                match latest.user_mode_task_run_record() {
+                    Some(record) if record.intent() == intent => Ok(record.clone()),
+                    _ => Err(conflict),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reads one exact transaction/effect task-run projection from an already
+    /// opened registry. This method does not create a registry or mutate it.
+    pub fn inspect_user_mode_task_run(
+        &self,
+        transaction_id: &PlatformHandle,
+        effect_id: &PlatformHandle,
+    ) -> Result<Option<UserModeTaskRunRecord>, InstallationError> {
+        let registry = self.load()?;
+        Ok(registry
+            .user_mode_task_run_record()
+            .filter(|record| {
+                record.intent().transaction_id() == transaction_id.as_str()
+                    && record.intent().effect_id() == effect_id.as_str()
+            })
+            .cloned())
+    }
+
+    /// Commits authenticated Host readiness for one exact staged `UserMode`
+    /// task-run intent. The Host launch markers must equal the original
+    /// transaction/effect IDs, and the current active generation, original
+    /// root receipt and Host-owner capability must still agree.
+    ///
+    /// This acknowledgement is Host readiness evidence only. It does not
+    /// stand in for Task Scheduler's `RunEx` receipt or an engine process ID.
+    pub fn acknowledge_user_mode_task_run(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        ack: &UserModeTaskRunHostAck,
+    ) -> Result<UserModeTaskRunRecord, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let current = self.load()?;
+        let existing = current.user_mode_task_run_record().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "no staged UserMode task-run intent exists".to_owned(),
+            )
+        })?;
+        if existing.intent() != &ack.intent {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.validate_user_mode_task_run_host_ack_binding(&current, host, ack)?;
+        if existing.host_ack() == Some(ack) {
+            return Ok(existing.clone());
+        }
+        if current.revision() != expected_revision {
+            return Err(InstallationError::CompareAndSaveConflict {
+                expected: expected_revision,
+                actual: current.revision(),
+            });
+        }
+        let staged_ack = (*ack).clone();
+        match self.mutate_atomic(expected_revision, |registry| {
+            self.validate_user_mode_task_run_host_ack_binding(registry, host, &staged_ack)?;
+            let record = registry
+                .user_mode_task_run_record()
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "no staged UserMode task-run intent exists".to_owned(),
+                    )
+                })?;
+            if record.intent() != &staged_ack.intent {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let mut record = record.clone();
+            record.acknowledge(staged_ack.clone())?;
+            registry.user_mode_task_run_record = Some(record.clone());
+            Ok(record)
+        }) {
+            Ok(record) => Ok(record),
+            Err(conflict @ InstallationError::CompareAndSaveConflict { .. }) => {
+                let latest = self.load()?;
+                self.validate_user_mode_task_run_host_ack_binding(&latest, host, ack)?;
+                match latest.user_mode_task_run_record() {
+                    Some(record) if record.host_ack() == Some(ack) => Ok(record.clone()),
+                    _ => Err(conflict),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Loads the sealed transaction and atomically stages its exact pending
@@ -1337,6 +1831,49 @@ pub(super) fn installation_registry_path(
         .canonical_path()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
     validate_installation_host_root(&canonical_root)?;
+    Ok(canonical_root.join(INSTALLATION_REGISTRY_FILE_NAME))
+}
+
+pub(super) fn installation_registry_path_user_owned(
+    host_root: &UserOwnedRootLease,
+    profile: crate::InstallationProfile,
+) -> Result<PathBuf, InstallationError> {
+    host_root
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let canonical_root = host_root
+        .canonical_path()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let canonical_root_text =
+        canonical_root
+            .to_str()
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "installation_registry.host_root".to_owned(),
+                reason: "current-user Host root cannot be represented losslessly".to_owned(),
+            })?;
+    match profile {
+        crate::InstallationProfile::UserMode => {
+            validate_installation_host_root(Path::new(canonical_root_text))?;
+        }
+        crate::InstallationProfile::PortableDev => {
+            if !canonical_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("host"))
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "installation_registry.host_root".to_owned(),
+                    reason: "PortableDev registry root must be its explicit Host state child"
+                        .to_owned(),
+                });
+            }
+        }
+        crate::InstallationProfile::SystemService => {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService cannot use a current-user registry lease".to_owned(),
+            ));
+        }
+    }
     Ok(canonical_root.join(INSTALLATION_REGISTRY_FILE_NAME))
 }
 
