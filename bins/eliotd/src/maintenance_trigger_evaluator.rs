@@ -805,11 +805,22 @@ impl DaemonComposition {
         // A job reference names an already-durable job only; it is bound as a
         // reference, never admitted or started here. A blank reference binds
         // nothing: the receipt validator would refuse it, so it is dropped up
-        // front under the same nonblank rule.
+        // front under the same nonblank rule. A nonblank reference is proven
+        // durable through the owning async read-back before anything is
+        // committed: the save transport acknowledgement alone proves nothing,
+        // so a dangling or foreign reference fails closed here and the
+        // trigger stays retained instead of binding a phantom intent.
         let job_ref = decision
             .durable_job_ref
             .clone()
             .filter(|reference| is_commit_ref_text(reference));
+        let job_ref = match job_ref {
+            None => None,
+            Some(reference) => Some(
+                prove_committed_job_ref(kernel, &reference, &live_fence, &record.trigger_id)
+                    .await?,
+            ),
+        };
         // The durable downstream intent through its existing outbox owner.
         // The leg submits the Governor prepared transition to the admitted
         // notification route and proves the canonical commit receipt in hand;
@@ -905,6 +916,46 @@ impl DaemonComposition {
         decision_receipt.validate()?;
         Ok(Some(decision_receipt))
     }
+}
+
+/// Proves one job intent reference names an already-durable job before the
+/// decision receipt binds it (I14.22, issue #1694 W4).
+///
+/// The #1688 decision only ever *references* a job, and the reference arrives
+/// with the evaluation rather than with commit proof. This reads the job back
+/// through the owning async durable-job path under the live fence — the same
+/// operation and the same single kind decode as the sync port read, without
+/// the sync bridge — and binds it only when the read-back revision carries
+/// the same job identity and answers this exact retained trigger. The shared
+/// decoder already validated the revision, so this checks binding, not shape.
+/// A refused read-back or an identity mismatch fails closed with the owner's
+/// typed refusal: the trigger stays retained under its existing claim and no
+/// receipt is fabricated. Transport refusal stays a [`KernelPortError`]
+/// through [`MaintenanceDecisionCommitError::Kernel`]; absence during an
+/// outage is not proof of non-commit, so the trigger stays open for
+/// receipt-lookup reconciliation instead of being reported either way.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceDecisionCommitError::Maintenance`] with
+/// [`MaintenanceError::InvalidField`] naming
+/// `maintenance_trigger_decision_receipt.job_ref` when the read-back does not
+/// bind this trigger's job identity, and
+/// [`MaintenanceDecisionCommitError::Kernel`] when the owning read-back is
+/// refused.
+async fn prove_committed_job_ref(
+    kernel: &Arc<DaemonKernelClient>,
+    job_ref: &str,
+    live_fence: &eliot_contracts::StateFence,
+    trigger_id: &str,
+) -> Result<String, MaintenanceDecisionCommitError> {
+    let stored = kernel.load_durable_job_async(job_ref, live_fence).await?;
+    if stored.job_id != job_ref || stored.trigger_id != trigger_id {
+        return Err(MaintenanceDecisionCommitError::Maintenance(
+            MaintenanceError::InvalidField("maintenance_trigger_decision_receipt.job_ref"),
+        ));
+    }
+    Ok(job_ref.to_owned())
 }
 
 /// Receipt bindings carried into [`DaemonComposition::bind_committed_decision_receipt`].

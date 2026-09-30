@@ -17,7 +17,7 @@ use eliot_governor::{
 };
 use eliot_maintenance::{MaintenanceJob, prove_job_intent_durable};
 
-use super::DaemonKernelClient;
+use super::{DaemonKernelClient, kernel_port_error};
 
 pub(crate) fn kind_value(
     value: &serde_json::Value,
@@ -129,5 +129,46 @@ impl KernelDurableJobPort for DaemonKernelClient {
         prove_job_intent_durable(job, &retained)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         Ok(())
+    }
+}
+
+impl DaemonKernelClient {
+    /// Reads one durable job back through the owning async transport path.
+    ///
+    /// Byte-identical route and decode to
+    /// [`KernelDurableJobPort::load_durable_job`]: the same
+    /// `"load_durable_job"` operation under the caller's fence and the same
+    /// single `"durable_job"` kind decode. The sync port method cannot serve
+    /// the async #1694 W4 decision-commit binding, which must not block the
+    /// executor on the sync bridge; this is that same read without the
+    /// bridge. A wrong kind, undecodable bytes, or a revision the maintenance
+    /// owner refuses is the transport's own contract refusal, and a read the
+    /// exchange cannot complete stays that refusal too: the commit binds
+    /// nothing and the trigger stays retained instead of binding a phantom
+    /// intent. This adds no policy and no receipt interpretation of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelPortError`] when the authenticated exchange refuses or
+    /// cannot complete the read, or when the committed bytes do not decode.
+    pub(super) async fn load_durable_job_async(
+        &self,
+        job_id: &str,
+        state_fence: &StateFence,
+    ) -> Result<MaintenanceJob, KernelPortError> {
+        // #740: request/result span over the durable-job read boundary.
+        let _span = tracing::info_span!(
+            "eliotd.kernel_durable_read",
+            job = %super::diagnostics::sanitize_identity(job_id)
+        )
+        .entered();
+        let value = self
+            .transact_async(
+                "load_durable_job",
+                serde_json::json!({ "job_id": job_id, "state_fence": state_fence }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        decode_committed_job(&value)
     }
 }
