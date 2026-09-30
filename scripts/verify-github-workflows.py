@@ -2864,6 +2864,14 @@ def main() -> int:
     if args.self_test:
         return run_self_tests()
 
+    # Self-gate (issue #1225 N_step9): the finite negative fixtures are
+    # the evidence the rules hold, so a failing self-test blocks any
+    # verdict before verify_all runs. No new finding code: the self-test
+    # failure line it already printed is the failure.
+    self_test_exit = run_self_tests()
+    if self_test_exit != 0:
+        return self_test_exit
+
     root = Path(args.root).resolve()
     findings = verify_all(root)
     if args.oracle_base is not None:
