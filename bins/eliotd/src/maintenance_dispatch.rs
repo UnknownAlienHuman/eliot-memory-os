@@ -1282,7 +1282,7 @@ pub enum MaintenanceTriggerRecoveryOutcome {
     /// Kernel owner's read-back, never a locally synthesized value.
     AcknowledgeReceipt {
         /// The committed decision receipt to acknowledge.
-        receipt: MaintenanceTriggerDecisionReceipt,
+        receipt: Box<MaintenanceTriggerDecisionReceipt>,
     },
 }
 
@@ -1336,7 +1336,9 @@ pub fn recover_maintenance_trigger_handoff(
                 trigger_id: trigger_id.to_owned(),
                 source: Box::new(source),
             })?;
-        Ok(MaintenanceTriggerRecoveryOutcome::AcknowledgeReceipt { receipt })
+        Ok(MaintenanceTriggerRecoveryOutcome::AcknowledgeReceipt {
+            receipt: Box::new(receipt),
+        })
     } else {
         // No committed receipt answers this identity (open row, unknown
         // trigger, or owner refusal): the crash happened before decision
