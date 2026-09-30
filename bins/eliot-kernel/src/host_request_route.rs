@@ -1250,14 +1250,13 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> bool {
-        let (descriptor, peer_receipt) =
-            match self.host_request_connection_gate_under_transition(envelope) {
-                Ok(pair) => pair,
-                Err(_) => return false,
-            };
-        let service = match self.service.lock() {
-            Ok(service) => service,
-            Err(_) => return false,
+        let Ok((descriptor, peer_receipt)) =
+            self.host_request_connection_gate_under_transition(envelope)
+        else {
+            return false;
+        };
+        let Ok(service) = self.service.lock() else {
+            return false;
         };
         KernelHostRequestBinder::run_admitted_read_leg(
             &service,
