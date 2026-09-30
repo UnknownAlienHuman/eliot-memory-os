@@ -141,8 +141,9 @@ use std::sync::Arc;
 
 use eliot_contracts::{EpochId, RequestMetadata, StateFence};
 use eliot_ors::{
-    CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation, EpochIdentity,
-    EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
+    AcceptedPending, CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation,
+    EpochIdentity, EpochLineage, ExpectedOrderingHead, OpaqueLabel,
+    OperationIdentity as OrsOperationIdentity,
     OperationalRecoveryStore, RecoveryAccessClass, RecoveryCursor, RecoveryEnvelopeContext,
     RecoveryOwner, RecoveryPage, RecoveryPayload, RecoveryPayloadEnvelope, RecoveryWriteBinding,
     RedbRecoveryStore, ReservationRecord, ReservationRequest, ReservationState,
@@ -155,7 +156,8 @@ use eliot_store_api::{
     OrderingHeadExpectation, OrderingScopeId, OriginalWriteSubmission, PreparedTransition,
     ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation,
     WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
-    WriterEpochBinding, prepared_transition_digest, sha256_hex, verify_canonical_request_hash,
+    WriteSubmission, WriterEpochBinding, prepared_transition_digest, sha256_hex,
+    verify_canonical_request_hash,
 };
 
 use crate::canonical_store_evidence::CanonicalStoreEvidence;
@@ -745,7 +747,9 @@ pub fn reserve_for_transition(
         expected_revision_heads,
         expected_ordering_heads,
         None,
+        false,
     )
+    .map(|(sealed, _)| sealed)
 }
 
 /// Reserves a CaptureObservation transition while binding the exact original
@@ -769,7 +773,46 @@ pub fn reserve_for_transition_with_original_submission(
         expected_revision_heads,
         expected_ordering_heads,
         Some(original_submission),
+        false,
     )
+    .map(|(sealed, _)| sealed)
+}
+
+pub(crate) fn accept_reservation_for_transition_with_original_submission(
+    owner: &CompositionReservation,
+    seed: &ReservationSeed,
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    original_submission: &OriginalWriteSubmission,
+) -> Result<(SealedReservation, AcceptedPending), ReservationWriteError> {
+    let (sealed, accepted) = reserve_for_transition_inner(
+        owner,
+        seed,
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        Some(original_submission),
+        true,
+    )?;
+    let accepted = accepted.ok_or_else(|| ReservationWriteError::Binding {
+        operation_id: transition.identity.operation_id.as_str().to_owned(),
+        detail: "ORS did not return its durable accepted-stage readback".to_owned(),
+    })?;
+    Ok((sealed, accepted))
+}
+
+/// Advances a reservation from `Eligible` to `Executing` before the first
+/// possible Store send. A crash after this transaction is receipt-only on
+/// recovery; callers must never infer that no effect occurred from the
+/// absence of a response.
+pub(crate) fn claim_execute_before_send(
+    owner: &CompositionReservation,
+    token: &WriterReservationToken,
+) -> Result<ReservationRecord, ReservationWriteError> {
+    Ok(owner.ors.claim_execute(token, owner.writer_identity())?)
 }
 
 fn reserve_for_transition_inner(
@@ -780,7 +823,8 @@ fn reserve_for_transition_inner(
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
     original_submission: Option<&OriginalWriteSubmission>,
-) -> Result<SealedReservation, ReservationWriteError> {
+    accept_after_stage: bool,
+) -> Result<(SealedReservation, Option<AcceptedPending>), ReservationWriteError> {
     let operation_id = transition.identity.operation_id.as_str().to_owned();
     let has_capture = transition
         .named_operations
@@ -884,7 +928,7 @@ fn reserve_for_transition_inner(
         })
         .collect::<Result<_, ReservationWriteError>>()?;
     scopes.sort_by(|left, right| left.scope.cmp(&right.scope));
-    let token = owner.ors.stage_and_reserve(ReservationRequest {
+    let request = ReservationRequest {
         reservation_id: OpaqueLabel::new(seed.reservation_id.clone())
             .map_err(ReservationWriteError::Ors)?,
         envelope,
@@ -894,7 +938,35 @@ fn reserve_for_transition_inner(
         expires_at_ms: seed.expires_at_ms,
         recovery_owner: RecoveryOwner::new(seed.recovery_owner.clone())
             .map_err(ReservationWriteError::Ors)?,
-    })?;
+    };
+    let (token, accepted) = if accept_after_stage {
+        let accepted = owner.ors.accept_after_stage(request)?;
+        let token = reservation_token_by_order(
+            owner,
+            accepted.reservation_order,
+            &accepted.operation_id,
+        )?;
+        if accepted.reservation_id != token.reservation_id
+            || accepted.operation_id != token.operation_id
+            || accepted.reservation_order != token.reservation_order
+            || accepted.prepared_transition_sha256 != token.prepared_transition_sha256
+            || accepted.write_binding != token.write_binding.as_ref().cloned().ok_or_else(|| {
+                ReservationWriteError::Binding {
+                    operation_id: operation_id.clone(),
+                    detail: "accepted ORS record has no original write binding".to_owned(),
+                }
+            })?
+        {
+            return Err(ReservationWriteError::Binding {
+                operation_id,
+                detail: "ORS accepted-stage evidence differs from its durable reservation token"
+                    .to_owned(),
+            });
+        }
+        (token, Some(accepted))
+    } else {
+        (owner.ors.stage_and_reserve(request)?, None)
+    };
     if token.reservation_order == 0
         || token.prepared_transition_sha256 != transition_digest
         || token.operation_id.as_str() != seed.operation_id
@@ -904,10 +976,54 @@ fn reserve_for_transition_inner(
             detail: "ORS token does not bind the admitted reservation inputs".to_owned(),
         });
     }
-    Ok(SealedReservation {
-        token,
-        created_at_ms: seed.created_at_ms,
-    })
+    Ok((
+        SealedReservation {
+            token,
+            created_at_ms: seed.created_at_ms,
+        },
+        accepted,
+    ))
+}
+
+fn reservation_token_by_order(
+    owner: &CompositionReservation,
+    reservation_order: u64,
+    operation_id: &OrsOperationIdentity,
+) -> Result<WriterReservationToken, ReservationWriteError> {
+    Ok(reservation_record_by_order(owner, reservation_order, operation_id)?.token)
+}
+
+pub(crate) fn reservation_record_by_order(
+    owner: &CompositionReservation,
+    reservation_order: u64,
+    operation_id: &OrsOperationIdentity,
+) -> Result<ReservationRecord, ReservationWriteError> {
+    let after_order = reservation_order.checked_sub(1).ok_or_else(|| {
+        ReservationWriteError::Binding {
+            operation_id: operation_id.as_str().to_owned(),
+            detail: "accepted ORS reservation order must be non-zero".to_owned(),
+        }
+    })?;
+    let cursor = RecoveryCursor::new(after_order, 1).map_err(ReservationWriteError::Ors)?;
+    let page = owner.ors.recover_page(cursor)?;
+    let mut exact = page.records.into_iter().filter(|record| {
+        record.token.reservation_order == reservation_order
+            && record.token.operation_id == *operation_id
+    });
+    let record = exact.next().ok_or_else(|| {
+        ReservationWriteError::Binding {
+            operation_id: operation_id.as_str().to_owned(),
+            detail: "durable ORS readback omitted the accepted reservation token".to_owned(),
+        }
+    })?;
+    if exact.next().is_some() {
+        return Err(ReservationWriteError::Binding {
+            operation_id: operation_id.as_str().to_owned(),
+            detail: "durable ORS readback returned duplicate accepted reservation tokens"
+                .to_owned(),
+        });
+    }
+    Ok(record)
 }
 
 fn bind_original_write_submission(
@@ -978,6 +1094,24 @@ pub fn project_reserved_write(
     transition: &PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
+) -> Result<ReservedWriteRequest, ReservationWriteError> {
+    project_reserved_write_inner(
+        sealed,
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        None,
+    )
+}
+
+fn project_reserved_write_inner(
+    sealed: &SealedReservation,
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    original_write_submission: Option<OriginalWriteSubmission>,
 ) -> Result<ReservedWriteRequest, ReservationWriteError> {
     let operation_id = transition.identity.operation_id.as_str().to_owned();
     validate_admitted(
@@ -1058,6 +1192,7 @@ pub fn project_reserved_write(
         admission,
         expected_revision_heads,
         expected_ordering_heads,
+        original_write_submission,
     };
     request.validate()?;
     Ok(request)
@@ -1539,11 +1674,44 @@ pub fn gateway_seed(
             ),
         }
     })?;
+    gateway_seed_from_protected_original_operation(
+        transition,
+        recovery_owner,
+        created_at_ms,
+        known_at_ms,
+        expires_at_ms,
+        recovery_access_class,
+        heads,
+        protected.as_bytes(),
+    )
+}
+
+/// Builds a reservation seed from the Kernel-protected bytes of the complete
+/// original Store apply operation. The Kernel owns serialization, protection,
+/// and recovery decryption; this boundary preserves those bytes unchanged and
+/// binds them to the admitted transition's operation identity.
+pub fn gateway_seed_from_protected_original_operation(
+    transition: &PreparedTransition,
+    recovery_owner: &str,
+    created_at_ms: i64,
+    known_at_ms: i64,
+    expires_at_ms: i64,
+    recovery_access_class: RecoveryAccessClass,
+    heads: &[ObservedHead],
+    protected_original_operation: &[u8],
+) -> Result<ReservationSeed, ReservationWriteError> {
+    let operation_id = transition.identity.operation_id.as_str().to_owned();
+    if protected_original_operation.is_empty() {
+        return Err(ReservationWriteError::Admission {
+            operation_id,
+            detail: "protected original Store apply operation must not be empty".to_owned(),
+        });
+    }
     Ok(ReservationSeed {
         reservation_id: operation_id.clone(),
         operation_id,
         recovery_owner: recovery_owner.to_owned(),
-        payload_bytes: protected.as_bytes().to_vec(),
+        payload_bytes: protected_original_operation.to_vec(),
         key_provider: RESERVATION_KEY_PROVIDER.to_owned(),
         key_name: RESERVATION_KEY_NAME.to_owned(),
         recovery_access_class,
@@ -1633,14 +1801,14 @@ impl ReservedSubmission {
                     .to_owned(),
             });
         }
-        let mut request = project_reserved_write(
+        let request = project_reserved_write_inner(
             sealed,
             context,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
+            Some(original_submission.clone()),
         )?;
-        request.original_write_submission = Some(original_submission.clone());
         Self::new(request)
     }
 
