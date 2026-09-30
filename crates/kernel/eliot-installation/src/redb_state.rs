@@ -815,7 +815,7 @@ impl RedbInstallationTransactionStore {
         Ok(transaction)
     }
 
-    /// Captures the original SystemService Host-root identity in the exact
+    /// Captures the original `SystemService` Host-root identity in the exact
     /// transaction store while the retained no-follow root lease is live.
     /// The existing transaction file is opened by its exact caller-selected
     /// path; no file or parent is created.
@@ -843,7 +843,7 @@ impl RedbInstallationTransactionStore {
         Ok(transaction)
     }
 
-    /// Rehydrates a SystemService transaction from the exact immutable receipt
+    /// Rehydrates a `SystemService` transaction from the exact immutable receipt
     /// already retained by its installation registry. The current Host-root
     /// lease is compared with that receipt before the transaction CAS.
     pub fn bind_system_service_host_root_receipt_at_exact_path(
@@ -3722,11 +3722,9 @@ fn encode(transaction: &InstallationTransaction) -> Result<Vec<u8>, Installation
     })
 }
 
-fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
-    let mut value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
-            reason: error.to_string(),
-        })?;
+fn prepare_transaction_envelope_for_current_wire(
+    value: &mut serde_json::Value,
+) -> Result<(), InstallationError> {
     let version =
         value
             .get("wire_version")
@@ -3817,6 +3815,15 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
             ),
         });
     }
+    Ok(())
+}
+
+fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    prepare_transaction_envelope_for_current_wire(&mut value)?;
     let envelope: DecodedTransactionEnvelope =
         serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
             reason: format!("transaction envelope is not the strict current shape: {error}"),
