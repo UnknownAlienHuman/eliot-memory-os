@@ -1729,9 +1729,9 @@ impl ChangeMonitor {
     /// Returns whether a host/filesystem hint for one tracked resource
     /// still needs a verified content/Git readback.
     pub fn has_pending_hint_for(&self, resource_ref: &str) -> bool {
-        self.hints.values().any(|record| {
-            record.verification.is_none() && record.hint.resource_ref == resource_ref
-        })
+        self.hints
+            .values()
+            .any(|record| record.verification.is_none() && record.hint.resource_ref == resource_ref)
     }
 
     /// Returns whether an unreconciled unknown-origin Material change
@@ -1741,9 +1741,10 @@ impl ChangeMonitor {
     pub fn has_unreconciled_unknown_change_for(&self, resource_ref: &str) -> bool {
         self.observations.keys().any(|change_id| {
             self.has_unresolved_unknown_change(change_id)
-                && self.observations.get(change_id).is_some_and(|record| {
-                    record.observation.resource_ref() == resource_ref
-                })
+                && self
+                    .observations
+                    .get(change_id)
+                    .is_some_and(|record| record.observation.resource_ref() == resource_ref)
         })
     }
 
