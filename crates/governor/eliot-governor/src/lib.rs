@@ -242,8 +242,8 @@ pub use operator_intent_execution::{
     OperatorIntentExecutionLink,
 };
 pub use operator_reconciliation::{
-    GovernorOperatorReconciliation, attention_evaluation_command_envelope,
-    operator_command_envelope,
+    AttentionEvaluationCommandParams, GovernorOperatorReconciliation,
+    attention_evaluation_command_envelope, operator_command_envelope,
 };
 pub use owner_closure_feed::{
     OwnerPublishPort, publish_owner_feed, synchronize_owner_feed,
