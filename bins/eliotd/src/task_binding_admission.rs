@@ -2823,36 +2823,6 @@ pub fn revalidate_dispatched_binding(
     )
 }
 
-/// Renders one non-`MATCHED` `MaterialEffect` trigger report as a
-/// conflict/rebind refusal preserving the exact disposition (issue #1746, W3).
-///
-/// `DIFFERENT_INSTANCE` and `AMBIGUOUS` quarantine: the retained binding is
-/// preserved and only an explicit owner receipt (`rebind_with_receipt`)
-/// establishes a new binding — never a silent move, never a task or memory
-/// transfer, never another scope's memory. `STALE_BINDING` withholds for
-/// refresh/rebind at the live generation. An identity-clear observation
-/// without a `MATCHED` receipt (source closure absent or unmatched — the
-/// provisional case) withholds pending source closure instead of allowing.
-fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> String {
-    match report.identity {
-        eliot_workscope::IdentityLegOutcome::DifferentInstance => {
-            "effect gate scope identity DIFFERENT_INSTANCE: quarantined, retained binding preserved; rebind with an explicit owner receipt, no silent move"
-                .to_owned()
-        }
-        eliot_workscope::IdentityLegOutcome::Ambiguous => {
-            "effect gate scope identity AMBIGUOUS: quarantined, retained binding preserved; rebind with an explicit owner receipt, no silent move"
-                .to_owned()
-        }
-        eliot_workscope::IdentityLegOutcome::StaleBinding => {
-            "effect gate scope identity STALE_BINDING: withheld; refresh or rebind at the live generation, no silent rebind"
-                .to_owned()
-        }
-        eliot_workscope::IdentityLegOutcome::IdentityClear => {
-            "effect gate scope identity is provisional: withheld pending source closure, never allowed without a MATCHED receipt"
-                .to_owned()
-        }
-    }
-}
 
 /// Revalidates one admitted task-bound transition at the effect gate against
 /// the live fence (issue #1746, W6/A5).
