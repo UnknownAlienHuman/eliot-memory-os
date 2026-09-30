@@ -726,10 +726,7 @@ pub struct KernelComposition {
     /// installation-bound ORS handle and the authenticated Store gateway.
     /// It contains evidence only during the gateway's synchronous local ORS
     /// transaction.
-    #[cfg_attr(
-        not(windows),
-        allow(dead_code, reason = "canonical Store attachment is Windows-only")
-    )]
+    #[cfg(windows)]
     canonical_store_evidence: Option<Arc<eliot_kernel_service::CanonicalStoreEvidence>>,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,

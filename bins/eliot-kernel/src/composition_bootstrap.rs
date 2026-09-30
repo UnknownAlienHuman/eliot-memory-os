@@ -1154,7 +1154,7 @@ impl KernelComposition {
         ors_object_path: PathBuf,
         process_gateway: Option<Arc<ProcessExecutionGateway>>,
         platform: Arc<WindowsPlatform>,
-        canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
+        _canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
     ) -> Result<Self, KernelBuildError> {
         // F-LOG-KERNEL-2 (#899): assembly phases only; the public
         // constructors own the single terminal per failed build. Only fixed
@@ -1794,7 +1794,8 @@ impl KernelComposition {
             backup_restore,
             backup_capture,
             backup_owner_clients,
-            canonical_store_evidence,
+            #[cfg(windows)]
+            canonical_store_evidence: _canonical_store_evidence,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]
