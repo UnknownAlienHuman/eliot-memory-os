@@ -18,6 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
+#[cfg(windows)]
+use eliot_ors::HostRequestRecord;
 // Issue #1872: the I5.11 `canonical_store` storage-replacement ingress. The
 // coordinator itself is the existing owner in `eliot_kernel_service`; this
 // import is the closed wire vocabulary the ingress projects out of it, never a
@@ -39,6 +41,8 @@ use eliot_kernel_service::{
     UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
     resolve_due_wake,
 };
+#[cfg(windows)]
+use eliot_kernel_service::StagedReservedWriteError;
 use eliot_kernel_service::{
     BorrowedCanonicalStoreClient, IrreversibleStorageEffect, ObservedHead, ReservationSeed,
     StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
@@ -8399,7 +8403,9 @@ impl KernelComposition {
                 // payload leaves behind. Step 6 is recorded only when that scan
                 // is exhaustive and clean; an unresolved reservation, a retained
                 // problem, or a truncated scan keeps normal writes gated, and
-                // nothing is retried, decoded, or dropped to reach readiness.
+                // The resume helper uses only this exact inventory and each
+                // original protected operation; any residual problem keeps
+                // normal writes gated.
                 let mut staged = match gateway
                     .reconcile_staged_writes(&recovery_fence, eliot_ors::MAX_RECOVERY_PAGE)
                     .await
@@ -8410,7 +8416,10 @@ impl KernelComposition {
                     }
                 };
                 if staged.readiness() == eliot_kernel_service::StagedWriteReadiness::Blocked {
-                    if let Err(error) = self.resume_staged_observe_reservations(&gateway).await {
+                    if let Err(error) = self
+                        .resume_staged_observe_reservations(&gateway, &staged)
+                        .await
+                    {
                         return Ok(Self::store_error_response_text("store_recovery", &error));
                     }
                     staged = match gateway
@@ -8778,12 +8787,13 @@ impl KernelComposition {
                     "protected Observe capture cannot share a campaign-source publication",
                 ));
             }
+            let original_submission = original_submission.clone();
             return Ok(self
                 .run_reserved_observe_write(
                     Arc::clone(&gateway),
                     operation,
                     seed,
-                    original_submission.clone(),
+                    original_submission,
                     deadline_unix_ms,
                 )
                 .await);
@@ -8899,16 +8909,21 @@ impl KernelComposition {
             .platform
             .protect_secret(&protected_operation_bytes)
             .map_err(|error| error.to_string())?;
-        let seed = gateway_seed_from_protected_original_operation(
-            transition,
-            "kernel-composition",
+        let operation_id = transition.identity.operation_id.as_str().to_owned();
+        let seed = ReservationSeed {
+            reservation_id: operation_id.clone(),
+            operation_id,
+            recovery_owner: "kernel-composition".to_owned(),
+            payload_bytes: protected_operation.as_bytes().to_vec(),
+            key_provider: eliot_kernel_service::RESERVATION_KEY_PROVIDER.to_owned(),
+            key_name: eliot_kernel_service::RESERVATION_KEY_NAME.to_owned(),
+            recovery_access_class: access,
             created_at_ms,
-            created_at_ms,
+            known_at_ms: created_at_ms,
             expires_at_ms,
-            access,
-            &observed_heads,
-            protected_operation.as_bytes(),
-        )
+            heads: observed_heads,
+        };
+        let seed = gateway_seed_from_protected_original_operation(transition, seed)
         .map_err(|error| error.to_string())?;
         Ok(Some((seed, record.deadline_unix_ms)))
     }
@@ -8931,19 +8946,26 @@ impl KernelComposition {
         let response_mode = original_submission.response_mode.clone();
         let staged = self.runtime.spawn(
             "kernel.observe-reserved-write",
-            move |_cancellation| async move {
+            move |cancellation| async move {
                 if unix_ms() >= deadline_unix_ms {
                     let _ = staged_sender.send(Err(
-                        "protected Observe request expired before durable staging".to_owned(),
+                        StagedReservedWriteError::Refused {
+                            detail: "protected Observe request expired before durable staging"
+                                .to_owned(),
+                        },
                     ));
                     return Ok::<(), TaskFailure>(());
                 }
+                let recovery_context = operation.context.clone();
+                let recovery_transition = operation.transition.clone();
+                let recovery_revision_heads = operation.expected_revision_heads.clone();
+                let recovery_ordering_heads = operation.expected_ordering_heads.clone();
                 let accepted = match gateway
                     .stage_reserved_with_original_submission(
                         &operation.context,
-                        operation.transition,
-                        operation.expected_revision_heads,
-                        operation.expected_ordering_heads,
+                        operation.transition.clone(),
+                        operation.expected_revision_heads.clone(),
+                        operation.expected_ordering_heads.clone(),
                         seed,
                         &original_submission,
                     )
@@ -8956,20 +8978,31 @@ impl KernelComposition {
                     }
                 };
                 let submission = accepted.submission().clone();
+                let token = accepted.token().clone();
                 if !write_submission_matches_staged_operation(
                     &submission,
                     &expected_operation_id,
                     &expected_request_hash,
                 ) {
                     let _ = staged_sender.send(Err(
-                        "durable Observe stage did not match the original operation".to_owned(),
+                        StagedReservedWriteError::OutcomeUnknown {
+                            operation_id: expected_operation_id,
+                            detail: "durable Observe stage did not match the original operation"
+                                .to_owned(),
+                        },
                     ));
-                    let receipt = gateway.execute_staged_reserved(accepted).await;
-                    let _ = receipt_sender.send(receipt);
                     return Ok::<(), TaskFailure>(());
                 }
                 let _ = staged_sender.send(Ok(submission));
-                let receipt = gateway.execute_staged_reserved(accepted).await;
+                let receipt = Self::execute_or_resume_reserved_observe_write(
+                    &gateway,
+                    accepted,
+                    operation,
+                    token,
+                    &expected_operation_id,
+                    cancellation,
+                )
+                .await;
                 let _ = receipt_sender.send(receipt);
                 Ok::<(), TaskFailure>(())
             },
@@ -8984,14 +9017,36 @@ impl KernelComposition {
             SpawnDisposition::Admitted(handle) => drop(handle),
         }
 
+        Self::finish_reserved_observe_response(
+            staged_receiver,
+            receipt_receiver,
+            response_mode,
+            deadline_unix_ms,
+        )
+        .await
+    }
+
+    #[cfg(windows)]
+    async fn finish_reserved_observe_response(
+        staged_receiver: tokio::sync::oneshot::Receiver<
+            Result<eliot_store_api::WriteSubmission, StagedReservedWriteError>,
+        >,
+        receipt_receiver: tokio::sync::oneshot::Receiver<
+            Result<WriteReceipt, StagedReservedWriteError>,
+        >,
+        response_mode: String,
+        deadline_unix_ms: u64,
+    ) -> serde_json::Value {
         let write_submission = match staged_receiver.await {
             Ok(Ok(submission)) => submission,
-            Ok(Err(_)) | Err(_) => {
-                return serde_json::json!({
-                    "status": "unknown",
-                    "value": { "kind": "write_receipt", "value": null },
-                    "recovery": null,
-                });
+            Ok(Err(error)) => {
+                return Self::store_error_response_text("write_receipt", &error.to_string());
+            }
+            Err(_) => {
+                return Self::store_error_response_text(
+                    "write_receipt",
+                    "protected Observe staging task ended before returning its durable stage",
+                );
             }
         };
         if response_mode == "accept_after_stage" {
@@ -9005,9 +9060,86 @@ impl KernelComposition {
         .await
         {
             Ok(Ok(Ok(receipt))) => store_apply_response(&receipt, None, None),
-            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
-                store_apply_staged_response(&write_submission)
+            Ok(Ok(Err(error))) => {
+                Self::store_error_response_text("write_receipt", &error.to_string())
             }
+            Ok(Err(_)) | Err(_) => store_apply_staged_response(&write_submission),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn execute_or_resume_reserved_observe_write(
+        gateway: &KernelStoreGateway,
+        accepted: eliot_kernel_service::AcceptedReservedWrite,
+        operation: StoreApplyOperation,
+        token: eliot_ors::WriterReservationToken,
+        expected_operation_id: &str,
+        cancellation: eliot_runtime::CancellationToken,
+    ) -> Result<WriteReceipt, StagedReservedWriteError> {
+        let original_submission = operation
+            .original_write_submission
+            .as_ref()
+            .ok_or_else(|| StagedReservedWriteError::Refused {
+                detail: "protected Observe operation has no original write source".to_owned(),
+            })?;
+        let mut result = gateway.execute_staged_reserved(accepted).await;
+        loop {
+            let pending_operation = match &result {
+                Err(StagedReservedWriteError::RetryablePredecessorPending { operation_id }) => {
+                    Some(operation_id.as_str())
+                }
+                _ => None,
+            };
+            let Some(pending_operation) = pending_operation else {
+                return result;
+            };
+            if pending_operation != expected_operation_id
+                || token.operation_id.as_str() != expected_operation_id
+                || operation.transition.identity.operation_id.as_str() != expected_operation_id
+            {
+                return Err(StagedReservedWriteError::OutcomeUnknown {
+                    operation_id: expected_operation_id.to_owned(),
+                    detail: "predecessor wait did not name the original Store operation".to_owned(),
+                });
+            }
+            if cancellation.is_cancelled() {
+                return Err(StagedReservedWriteError::OutcomeUnknown {
+                    operation_id: expected_operation_id.to_owned(),
+                    detail: "runtime shutdown interrupted the retained predecessor wait"
+                        .to_owned(),
+                });
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(StagedReservedWriteError::OutcomeUnknown {
+                        operation_id: expected_operation_id.to_owned(),
+                        detail: "runtime shutdown interrupted the retained predecessor wait"
+                            .to_owned(),
+                    });
+                }
+                waited = gateway.wait_for_staged_predecessor(
+                    &operation.context,
+                    &operation.transition,
+                    &token,
+                ) => waited?,
+            }
+            if cancellation.is_cancelled() {
+                return Err(StagedReservedWriteError::OutcomeUnknown {
+                    operation_id: expected_operation_id.to_owned(),
+                    detail: "runtime shutdown interrupted the retained predecessor wait"
+                        .to_owned(),
+                });
+            }
+            result = gateway
+                .restore_staged_reserved(
+                    &operation.context,
+                    operation.transition.clone(),
+                    operation.expected_revision_heads.clone(),
+                    operation.expected_ordering_heads.clone(),
+                    original_submission,
+                    token.clone(),
+                )
+                .await;
         }
     }
 
@@ -9950,6 +10082,9 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         let resulted = match self.submit_local_read_result(session, &submission)? {
             host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,
+            host_request_route::LocalReadSubmitDisposition::StagedWrite(_) => {
+                return Err(TransportError::SessionFenced);
+            }
             host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
                 return Err(TransportError::SessionFenced);
             }
