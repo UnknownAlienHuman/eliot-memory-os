@@ -3792,14 +3792,14 @@ impl AgentFabric {
             config.clone(),
             capability,
         )?;
-        Self::install_admitted_coordinator(
+        Ok(Self::install_admitted_coordinator(
             snapshot,
             admission_by_definition,
             coordinator,
             config,
             ports,
             semantic_revisions,
-        )
+        ))
     }
 
     /// Restores the fabric from a durable snapshot whose coordinator owner
@@ -3853,14 +3853,14 @@ impl AgentFabric {
             config.clone(),
             capability,
         )?;
-        Self::install_admitted_coordinator(
+        Ok(Self::install_admitted_coordinator(
             snapshot,
             admission_by_definition,
             coordinator,
             config,
             ports,
             semantic_revisions,
-        )
+        ))
     }
 
     /// Installs one already-restored coordinator into the fabric state carried
@@ -3874,7 +3874,7 @@ impl AgentFabric {
         config: CoordinatorConfig,
         ports: FabricPorts,
         semantic_revisions: Option<&SemanticRevisionStore>,
-    ) -> Result<Self, FabricError> {
+    ) -> Self {
         let mut definition_bytes = BTreeMap::new();
         for (key, definition) in &snapshot.definitions {
             definition_bytes.insert(key.clone(), definition.definition_digest.clone());
@@ -3919,7 +3919,7 @@ impl AgentFabric {
             initialized: true,
         };
         fabric.record("fabric_restored_verified", "fabric");
-        Ok(fabric)
+        fabric
     }
 
     /// Restores the fabric on freshly resolved owner material in one call
