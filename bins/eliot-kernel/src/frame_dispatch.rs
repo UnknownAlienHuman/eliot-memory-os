@@ -15,6 +15,10 @@ use super::daemon_request_dispatch::{
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
     USER_AUTOMATION_RUNTIME_OPERATION,
 };
+use super::daemon_request_dispatch::{
+    STORAGE_REPLACEMENT_OPERATION, STORAGE_REPLACEMENT_RESUME_OPERATION,
+    STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
+};
 use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::{
@@ -1414,6 +1418,20 @@ fn is_daemon_operation(operation: &str) -> bool {
             // epoch, route scope, and cutover state still come from the owner's
             // committed ORS cutover-ownership record rather than the payload.
             | GENERATION_CUTOVER_OPERATION
+        // Issue #1872: the I5.11 storage-replacement ingress. Same mirror
+        // obligation as `GENERATION_CUTOVER_OPERATION` above, and the same
+        // consequence if omitted: the drive, resume and rollback arms are
+        // dispatched by `daemon_request_dispatch.rs`, but without these
+        // markers a frame naming one falls through every predicate here, fails
+        // the `ProcessExecutionRequest` decode, and fences before the arm is
+        // entered. The three markers only let the frame reach the arm; the arm
+        // still proves the module binding, the peer principal, the exact
+        // session StateFence and generation, and the route scope, and the
+        // cutover state still comes from the committed ORS cutover-ownership
+        // record rather than the payload.
+        | STORAGE_REPLACEMENT_OPERATION
+        | STORAGE_REPLACEMENT_RESUME_OPERATION
+        | STORAGE_REPLACEMENT_ROLLBACK_OPERATION
             | DAEMON_STARTUP_EVIDENCE_OPERATION
             // Issue #1779: the authenticated `UserAutomation` runtime route.
             // The marker is the closed daemon operation name the retained

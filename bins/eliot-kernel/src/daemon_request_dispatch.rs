@@ -22,10 +22,6 @@ use eliot_kernel_service::AuthenticatedHostSession;
 // coordinator itself is the existing owner in `eliot_kernel_service`; this
 // import is the closed wire vocabulary the ingress projects out of it, never a
 // second stage machine or a second cutover gate.
-use eliot_kernel_service::{
-    IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
-    StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
-};
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
@@ -40,6 +36,10 @@ use eliot_kernel_service::{
     UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
     resolve_due_wake,
 };
+use eliot_kernel_service::{
+    IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
+    StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
+};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
@@ -50,12 +50,12 @@ use eliot_protocol::{
     LocalReadExecutionEvidence, RequestIdentity, TaskControllerResultBody,
     host_request_operation_id,
 };
+use eliot_runtime_contracts::GenerationCutoverState;
 #[cfg(windows)]
 use eliot_runtime_contracts::{
     DaemonChannelCursor, DaemonProgressObservation, DaemonSupervisionRenewalDecision,
     DaemonSupervisionRenewalReceipt, SupervisionLeasePredecessorProof,
 };
-use eliot_runtime_contracts::GenerationCutoverState;
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
@@ -238,13 +238,21 @@ pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automati
 /// **Availability is stated, not assumed.** The arm below is served, but the
 /// front-door frame selector that lets a frame *reach* a daemon arm is
 /// `frame_dispatch::is_daemon_operation`, a separate closed mirror of this
-/// table. Until [`STORAGE_REPLACEMENT_OPERATION`] appears in that mirror, a
-/// `daemon_storage_replacement` frame falls through every predicate there, fails
-/// the generic decode and fences the session, exactly as
-/// `GENERATION_CUTOVER_OPERATION` did before its mirror entry existed. The
-/// operation is therefore **recognized but unavailable** from the front door:
-/// it is not an advertised, operator-reachable cutover, and it must not be
-/// reported as one.
+/// table, which has already cost one operation its ingress: a marker absent
+/// there falls through every predicate, fails the generic decode, and fences
+/// the session, exactly as `GENERATION_CUTOVER_OPERATION` did before its mirror
+/// entry existed. [`STORAGE_REPLACEMENT_OPERATION`] is now present in that
+/// mirror, so the frame reaches the arm.
+///
+/// Reaching the arm is not the same as a cutover being available. The arm admits
+/// the exact session fence and generation and then drives the coordinator, which
+/// re-derives the route scope and cutover state from the committed ORS
+/// cutover-ownership record rather than the payload — and the durable
+/// `StorageReplacementCutoverReceiptRecord` is **not yet** in `eliot-ors`, so
+/// after a crash the operator must still hold the receipt. The operation is
+/// honestly *reachable and admitted*,
+/// not *durably recoverable*; the missing record is named in the issue's
+/// remaining work.
 pub(crate) const STORAGE_REPLACEMENT_OPERATION: &str = "daemon_storage_replacement";
 
 /// Authenticated daemon operation that reconstructs an I5.11 replacement whose
@@ -255,8 +263,7 @@ pub(crate) const STORAGE_REPLACEMENT_OPERATION: &str = "daemon_storage_replaceme
 /// already owns the pinned route through a committed cutover. It carries the same
 /// availability caveat as that operation — it is recognized here and unreachable
 /// from the front door until `frame_dispatch::is_daemon_operation` lists it.
-pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str =
-    "daemon_storage_replacement_resume";
+pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str = "daemon_storage_replacement_resume";
 
 /// Authenticated daemon operation that answers one I5.14 rollback request for a
 /// committed I5.11 replacement.
@@ -2208,9 +2215,7 @@ fn storage_replacement_response(outcome: StorageReplacementOutcome) -> serde_jso
 /// effect, owns no receipt and answers no rollback question. Reporting the
 /// refusal code alone is the honest shape — a refused request is not a
 /// replacement that made no progress, and it must not read as one.
-fn storage_replacement_refusal_outcome(
-    terminal_code: &'static str,
-) -> StorageReplacementOutcome {
+fn storage_replacement_refusal_outcome(terminal_code: &'static str) -> StorageReplacementOutcome {
     StorageReplacementOutcome {
         version: 1,
         terminal_code: Some(terminal_code),
@@ -2328,15 +2333,14 @@ impl KernelComposition {
         // constructed only from a durable linearization point. A refusal here
         // still reports the recorded stages and no receipt, because none was
         // constructed.
-        let terminal_code =
-            match replacement.commit_canonical_store_route_cutover(
-                ors,
-                &request.cutover_id,
-                &request.cutover_evidence,
-            ) {
-                Ok(_) => None,
-                Err(error) => Some(storage_replacement_terminal_code(&error)),
-            };
+        let terminal_code = match replacement.commit_canonical_store_route_cutover(
+            ors,
+            &request.cutover_id,
+            &request.cutover_evidence,
+        ) {
+            Ok(_) => None,
+            Err(error) => Some(storage_replacement_terminal_code(&error)),
+        };
         Ok(storage_replacement_response(storage_replacement_outcome(
             &replacement,
             terminal_code,
@@ -2455,7 +2459,9 @@ impl KernelComposition {
                     Some(StorageRollbackAnswer {
                         disposition: disposition.to_string(),
                         forward_repair_state: match disposition {
-                            StorageRollbackDisposition::ForwardRepairRequired { state } => Some(state),
+                            StorageRollbackDisposition::ForwardRepairRequired { state } => {
+                                Some(state)
+                            }
                             StorageRollbackDisposition::GenerationRollbackPermitted => None,
                         },
                     }),
