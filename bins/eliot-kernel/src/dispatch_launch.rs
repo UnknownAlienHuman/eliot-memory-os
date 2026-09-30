@@ -1752,20 +1752,19 @@ fn admitted_lane_identity(input: LaneIdentityInput) -> Result<LaneIdentity, Disp
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let source_closure_digest = sha256_hex(
-        canonical_json_bytes(&(
-            input.product.as_str(),
-            input.candidate.as_str(),
-            source_root_text.as_str(),
-            input.target.as_str(),
-            input.declared_scope.as_str(),
-            input_artifacts.as_slice(),
-            input.nextest_sha256.as_str(),
-            input.cargo_sha256.as_str(),
-            input.rustc_sha256.as_str(),
-        ))
-        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?,
-    );
+    let closure_bytes = canonical_json_bytes(&(
+        input.product.as_str(),
+        input.candidate.as_str(),
+        source_root_text.as_str(),
+        input.target.as_str(),
+        input.declared_scope.as_str(),
+        input_artifacts.as_slice(),
+        input.nextest_sha256.as_str(),
+        input.cargo_sha256.as_str(),
+        input.rustc_sha256.as_str(),
+    ))
+    .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let source_closure_digest = sha256_hex(&closure_bytes);
     let fingerprint = BuildFingerprint {
         workspace: input.workspace_id.clone(),
         candidate: input.candidate.clone(),
