@@ -413,6 +413,67 @@ pub enum QuotaKnowledge {
 
 /// Allowed effect classes.  The API describes ceilings; it never executes an
 /// effect or promotes a model proposal to an authorized transition.
+///
+/// W1 effect-boundary map (#1793 impl 1, I6.6): this cell owns only the
+/// candidate ceiling vocabulary below. The governing domain vocabulary is the
+/// shared `eliot-receipts::EffectClass`
+/// (Read/Candidate/ReversibleMutation/ExternalEffect), carried by
+/// `eliot-receipts::OperationBinding` and authorized by
+/// `crates/governor/eliot-authority/src/effects.rs::EffectAuthorizer::authorize_with_revoked_roots`
+/// under `crates/governor/eliot-authority/src/effects.rs::ActionContract::compile_proposal`.
+/// [`EffectKind::to_effect_class`] projects one ceiling kind to its exact
+/// domain class without widening; [`EffectCeiling::permits_effect_class`]
+/// checks coverage without rank upgrade. Roles stay distinct: a candidate
+/// ceiling is never an operation class, an authorization, or an executor
+/// grant.
+///
+/// In-scope effectful public paths (producer → contract → owner → executor →
+/// persisted intent/result → recovery reader; replay/simulation stays
+/// non-effectful via [`ProposedEffect::validate_against`] and
+/// [`AgentResult::validate_for_binding`]):
+/// - agent candidate: producer provider adapter (`AgentResult.proposed_effects`)
+///   → `ActionContract` → `EffectAuthorizer` → no executor here (candidate
+///   only) → persisted at admission, not here → recovery n/a (validate only).
+/// - native worker claimed effect: producer
+///   `crates/modules/eliot-native-worker-core/src/ports.rs::EffectAdmissionRequest::new`
+///   → `ActionContract` → `EffectAuthorizer` → exact executor process/adapter
+///   invoke behind `CapabilityGrant` via
+///   `crates/modules/eliot-native-worker-core/src/lib.rs::WorkerCore::authorize_effect`
+///   and `ports.rs::CapabilityAdmissionPort::authorize_effect` (never a
+///   caller-built api `AuthorizedEffect`) → persisted ledger
+///   `authorized_by_idempotency` + `EffectAuthorizerRecoverySnapshot` /
+///   `AuthorizedEffectRecoveryRecord` + governor `eliot-authority::EffectReceipt`
+///   → recovery `EffectAuthorizer::from_snapshot`/`restore_records` plus
+///   `crates/governor/eliot-governor/src/authority_recovery.rs::AuthorityOwner::rebuild_effect_obligations`.
+/// - protected User Broker launch: producer `UserBroker` selection/permit
+///   request → `ActionContract` (effectful broker ops) + broker-epoch fence →
+///   `EffectAuthorizer` (effect) + broker owner (launch permit) → exact
+///   executor broker-owned process start through Kernel
+///   `authority_controller.rs::ProcessDispatchAuthorityController` permits →
+///   persisted governor ledger + Kernel durable process-start replay
+///   (`ProcessExecutionReplayRecord`) + broker snapshot → recovery
+///   `AuthorityOwner` + `ProcessDispatchAuthorityController::restore` + broker
+///   restore.
+/// - direct/internal binary entrypoints: producer `ActionEnvelope` presenter
+///   (`bins/eliot-native-worker/src/governed_action.rs::EXTERNAL_ADAPTER_OPS`:
+///   register/claim/reconcile/start_claimed/serve_stdio) → Harness
+///   `validate_envelope` then governor `ActionContract` → Kernel (permits) +
+///   Governor (effect) → exact executor `run_governed_external_op` adapter
+///   closure → persisted `RecordedEffect` + governor receipt → recovery Kernel
+///   `restore` + `AuthorityOwner`.
+/// - MCP effectful tools: producer MCP tool-call presenter via
+///   `crates/surfaces/eliot-mcp/src/semantic_profile.rs::OperationClass` →
+///   profile + `ActionContract` → `EffectAuthorizer` → tool/adapter executor
+///   behind admission → persisted/recovery as the worker path.
+///
+/// Wire freeze: `CONTRACT_VERSION` (`eliot-agent-api/v8`),
+/// `deny_unknown_fields`; v6 string digest/time wires and stale stamps fail
+/// closed (`UnknownContractVersion`/deserialization failure, never silent
+/// upgrade). Finite callers: `ports.rs::EffectAdmissionRequest`,
+/// `ports.rs::EffectAdmissionFacts`, `lib.rs::WorkerCore::authorize_effect`,
+/// `protocol.rs` proposal field, generated `proposed_effect` facet,
+/// codex-adapter `proposed_effects`, coordinator intake. No new wire member
+/// and no third public representation in this slice.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -425,6 +486,28 @@ pub enum EffectKind {
     Network,
     CanonicalTransition,
     ExternalEffect,
+}
+
+impl EffectKind {
+    /// Projects this candidate ceiling kind to its exact shared domain class.
+    ///
+    /// Pure total map behind the existing `eliot-receipts` dependency (no new
+    /// dep, no string mapping, no widening): observation kinds project to
+    /// `Read`, bounded candidate artifacts to `Candidate`, bounded local
+    /// execution to `ReversibleMutation`, and externally visible effects to
+    /// `ExternalEffect`. A bounded execution that escapes its bound surfaces
+    /// as an `ExternalEffect` operation and fails closed here; replay and
+    /// simulation use this map read-only and start nothing.
+    pub const fn to_effect_class(self) -> eliot_receipts::EffectClass {
+        match self {
+            Self::Observe | Self::ReadWorkspace => eliot_receipts::EffectClass::Read,
+            Self::WriteCandidate | Self::CanonicalTransition => {
+                eliot_receipts::EffectClass::Candidate
+            }
+            Self::ProcessExecution => eliot_receipts::EffectClass::ReversibleMutation,
+            Self::Network | Self::ExternalEffect => eliot_receipts::EffectClass::ExternalEffect,
+        }
+    }
 }
 
 /// A scope/effect ceiling attached to one attempt.
@@ -449,6 +532,21 @@ impl EffectCeiling {
 
     pub fn permits(&self, effect: EffectKind) -> bool {
         self.allowed.contains(&effect)
+    }
+
+    /// Checks whether this candidate ceiling covers one shared domain
+    /// operation class without rank upgrade.
+    ///
+    /// Exact projection coverage only: returns true when some allowed ceiling
+    /// kind projects to `effect` via [`EffectKind::to_effect_class`]. A
+    /// ceiling that allows only `ProcessExecution` does not cover
+    /// `ExternalEffect`; rank-based admission stays with the governor
+    /// `ImpactClass` check. Pure read-only join helper for the worker
+    /// admission path; it mints no authorization and starts nothing.
+    pub fn permits_effect_class(&self, effect: eliot_receipts::EffectClass) -> bool {
+        self.allowed
+            .iter()
+            .any(|kind| kind.to_effect_class() == effect)
     }
 }
 
