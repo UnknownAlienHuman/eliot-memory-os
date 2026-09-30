@@ -77,12 +77,39 @@
 //!
 //! # What deduplication is and is NOT guaranteed here
 //!
-//! The candidate identity is content-derived
+//! The candidate identity IS content-derived
 //! ([`eliot_improvement::ImprovementCandidate::new`]), so a repeat of the same
-//! observation produces the same `candidate_id`, and therefore the same
-//! `improvement-candidate:<id>` commit key: the store converges on one row
-//! instead of appending a new candidate per cadence tick. That is the durable
-//! half of I12.24's "deduplicated by target surface and evidence lineage".
+//! observation produces the same `candidate_id` and therefore the same
+//! `improvement-candidate:<id>` HANDLE. The IN-MEMORY registry converges on one
+//! entry per candidate for that reason, and
+//! [`crate::improvement_dedup_read::restored_registry`] re-establishes it on
+//! every pass from the committed rows.
+//!
+//! It did NOT previously converge to one STORE row, and this claim used to say
+//! it did. It does not, and the reason is the brief: the committed document
+//! carries `artifact.brief` verbatim ([`commit_improvement_artifact`]), and
+//! [`eliot_improvement::brief_at_safe_boundary`] mints `brief_id` as a fresh
+//! `Uuid::now_v7()` and stamps `created_at` with `OffsetDateTime::now_utc()` on
+//! every call (`crates/meta/eliot-improvement/src/brief.rs:326,337`). The store
+//! keys a learning row by `(record_kind, handle, record_digest)`
+//! (`surreal_learning.rs::learning_row_key`), and the presented
+//! `record_digest` is the digest of those exact document bytes
+//! ([`commit_improvement_artifact`]). A fresh `brief_id` is therefore a fresh
+//! digest, a fresh row id, and a `CREATE` rather than the compare-and-set the
+//! adapter performs on an existing one
+//! (`surreal_learning.rs:189`). One cadence tick over one unchanged occurrence
+//! appends one new row under one unchanged handle. The improvement owner's own
+//! crate records this as the expected behaviour rather than a defect — "a
+//! re-commit under a new digest legitimately produces a second row for the same
+//! candidate" (`candidate_bounds.rs:640-646`) — and the read side tolerates it
+//! by keeping the highest `candidate.revision` per `candidate_id`
+//! (`restored_registry`, `improvement_dedup_read.rs:652-663`).
+//!
+//! Stated plainly because the previous claim was the opposite and would have
+//! been believed: the durable rows accumulate per tick; the convergence is
+//! real only in the registry rebuilt from them. This is also the precondition
+//! publication cannot yet meet — see "The brief reaches no owner, and the
+//! contour that would carry it is absent" below.
 //!
 //! The registry is REBUILT from this daemon's own committed rows, through the
 //! existing authenticated read route
@@ -240,6 +267,63 @@
 //! Until (1) and (2) exist, no code in this repository can make an owner's
 //! selection reach `record_owner_decision`, and this module will not pretend
 //! otherwise.
+//!
+//! # The brief reaches no owner, and the contour that would carry it is absent
+//!
+//! The three artifacts above are the DECISION half of I12.24:65. The BRIEF half
+//! — the arrow that has to arrive first, "concise Improvement Brief to active
+//! Main Agent or Human at a safe boundary", whose load-bearing sentence is
+//! I12.24:74: "The named decision owner does not search raw metrics" — is
+//! missing in a way that is measured here rather than assumed, because it is not
+//! the same gap and it is upstream of the three above.
+//!
+//! ## What the brief is today: a field of this daemon's own row
+//!
+//! [`commit_improvement_artifact`] already writes the brief verbatim into the
+//! `Candidate` learning record's canonical JSON document, as
+//! `{"candidate", "brief", "owner_decision", "enforced_bound",
+//! "governed_admission_digest"}`. So all eight I12.24:74 fields plus
+//! `brief_id` ARE durable, byte-for-byte, through the one governed seam. What
+//! is absent is any route by which a decision OWNER reaches that row. Measured
+//! on this tree:
+//!
+//! | candidate owner-facing surface | measured result |
+//! |---|---|
+//! | `LearningRecordKind` vocabulary | CLOSED at six variants — `Delta`, `Overlay`, `Closure`, `ActivationReceipt`, `Candidate`, `ViewRef` (`learning_store.rs:100-113`). There is NO `Brief` kind, so the brief cannot become a first-class durable record without a store-contract change this file does not own |
+//! | who reads `GetLearningRecordRange` for `Candidate` | the DAEMON ONLY. Three production call sites exist and every one filters a different kind: `improvement_dedup_read.rs:379` asks for `Candidate` and re-proves the daemon's own committed row (its `:849` check is a self-consistency proof of that row, not an owner reading it); `skill_evidence_read.rs:171` and `negative_memory_action_gate.rs:419` both ask for `ActivationReceipt`. `git grep -l GetLearningRecordRange -- "*.cs" -- bins/eliot/src` returns nothing: no Operator surface and no CLI reads any learning record |
+//! | ControlBoard | the `items` vector is a LITERAL `Vec::new()` (`controlboard_adapters.rs:987`), and the comment above it states why: the Governor owners carry no ControlBoard visibility/privacy/epistemic facts and inventing rows "would be a privacy expansion" (`controlboard_projection.rs:23-29`). A brief has no `BoardItem` to land in, and `BoardItem` itself carries no field for benefit, risk, cost, unknowns, or `brief_id` (`eliot-controlboard/src/lib.rs:467-478`) |
+//! | the ControlBoard read edge | not reachable either. `controlboard.read` is admitted by no host request: `daemon_runtime.rs:4144` records that "nothing in this repository presents a host request naming this capability" |
+//! | the canonical notification record | REAL, durable, and Human-read — it is the one owner-facing surface that genuinely exists, and it is the honest candidate. But its closed shape ([`eliot_kernel_core::Notification`], `notification_state.rs:317-337`) has `subject`, `summary`, `evidence_handles`, `affected_scope`, `owner`, `required_action` and no slot for likely benefit, risk, cost, next reversible step, unknowns, or `brief_id`. The brief would have to be re-spelled into `summary` prose, which is the "re-spelled into a log string" failure I12.24:74 exists to prevent, and the record's own `dedup_key` is derived from the maintenance decision (`automation_failure_key`), not from the brief — so two briefs over one trigger would collide onto one record or churn `IdentityConflict` |
+//! | the notification emitter's reachability | it is a free function in another file, `emit_blocked_automation_notification` (`notification_state_emit.rs:582`), reached from the health-heartbeat arm `note_blocked_automation_notification` (`daemon_runtime.rs:2641`). It is not reachable from this module and its signature takes an `AutomationTriggerDecision`, not a brief |
+//! | Host / operator console | `host_console_protocol.rs` serves exactly `Status` and `Stop`; `apps/Eliot.Operator` reads `controlboard.read` and the runtime-status contract only. Neither names a learning record, a brief, or `DecideImprovementBrief` |
+//!
+//! ## The two artifacts a publication would need, in two other owners
+//!
+//! 1. a durable WRITE the brief's own fields can occupy without re-spelling.
+//!    The existing `Candidate` document already carries them, so this half is
+//!    nearly free — but the record's KEY is the candidate id
+//!    (`improvement-candidate:<candidate_id>`), so an owner addressing a BRIEF
+//!    has no handle to name. Naming one needs either a `Brief` variant in the
+//!    closed [`eliot_store_api::LearningRecordKind`] set (`learning_store.rs`,
+//!    `eliot-store-api`) or a stable brief-keyed handle, and the second is
+//!    blocked by the digest churn measured above: with a fresh `brief_id` per
+//!    pass there is no stable brief identity to key on.
+//! 2. an owner-facing READ that projects that record to a Human or an active
+//!    Main Agent. The one contour that could carry it without a new owner is
+//!    the ControlBoard `items` projection, and that is exactly the projection
+//!    the Governor deliberately refuses to populate (the privacy-expansion note
+//!    cited above). Filling it is the ControlBoard/privacy owner's decision,
+//!    not this dispatch layer's.
+//!
+//! Neither is in this file, and neither can be honestly faked here. A
+//! `tracing` span field carrying `brief_id` (`daemon_runtime.rs:5340`) is a
+//! diagnostic, not a publication: nothing outside this process reads it, and no
+//! owner can act on it. So this module states the gap and stops.
+//!
+//! What I12.24:82 already guarantees keeps this honest in the meantime: the
+//! recorded disposition is `Investigate`, one of the kinds `is_non_mutating`
+//! admits, so nothing here changes a surface while the publication contour is
+//! absent.
 //!
 //! # Archive receipts are durable dispositions, not diagnostics (W3)
 //!
@@ -429,11 +513,19 @@ pub enum ImprovementDispatchError {
 /// One assembled, owner-actionable improvement artifact over a real
 /// observation, ready to be made durable.
 ///
-/// Every field is a function of the observed maintenance decision; the
-/// `ImprovementBrief` is the exact artifact I12.24:74 requires the decision
+/// Every field is a function of the observed maintenance decision, and the
+/// `ImprovementBrief` carries the exact content I12.24:74 requires a decision
 /// owner to read (problem, evidence, likely benefit, risk, proposed owner,
-/// cost, next reversible step, unknowns) so the owner never searches raw
-/// metrics.
+/// cost, next reversible step, unknowns) — so that content needs no raw-metric
+/// search once it REACHES an owner.
+///
+/// Stated precisely, because the previous wording of this field claimed the
+/// owner does not search raw metrics, and that is not yet true: no
+/// owner-facing contour reads this artifact. It is committed verbatim into the
+/// `Candidate` record and read back only by this daemon's own deduplication
+/// read. The CONTENT is complete; the DELIVERY is absent, and the missing
+/// contour is measured and named under "The brief reaches no owner, and the
+/// contour that would carry it is absent" in the module documentation.
 #[derive(Clone, Debug)]
 pub struct ImprovementArtifact {
     /// The evidence-bound candidate admitted to the deduplication registry.
