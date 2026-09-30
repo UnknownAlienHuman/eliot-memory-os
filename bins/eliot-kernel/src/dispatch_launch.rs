@@ -1674,7 +1674,7 @@ pub(crate) async fn submit_testd_owner_job(
     Ok(response)
 }
 
-/// Environment class the productive TestD profile runs under.
+/// Environment class the productive `TestD` profile runs under.
 ///
 /// A declaration, not a measurement: the productive profile is the closed
 /// non-inheriting `cargo nextest run` binding
@@ -1714,7 +1714,7 @@ struct LaneIdentityInput {
     build_class: BuildClass,
 }
 
-/// Builds the admitted lane identity for one productive TestD job.
+/// Builds the admitted lane identity for one productive `TestD` job.
 ///
 /// Issue #1897 (AUD1): I2.22 requires every mutating work item to be allocated
 /// a worktree identity, a `BuildFingerprint`, a target/build mode, a fixture
