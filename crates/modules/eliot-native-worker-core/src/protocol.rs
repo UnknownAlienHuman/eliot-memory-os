@@ -10,9 +10,9 @@ use eliot_process::{
     SecretRef,
 };
 use eliot_protocol::{
-    AckPhase, EncodingProfile, Frame, NativeWorkerFramePayloadV1, NativeWorkerOperationV1,
-    ProtocolPayload, ProtocolVersion, NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
-    NATIVE_WORKER_PROTOCOL_VERSION,
+    AckPhase, EncodingProfile, Frame, NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
+    NATIVE_WORKER_PROTOCOL_VERSION, NativeWorkerFramePayloadV1, NativeWorkerOperationV1,
+    ProtocolPayload, ProtocolVersion,
 };
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
@@ -331,9 +331,8 @@ impl WorkerFrame {
         if encoding_profile != EncodingProfile::JsonV1 {
             return Err(WorkerError::UnsupportedEncoding);
         }
-        let native = match payload {
-            ProtocolPayload::NativeWorkerFrameV1(native) => native,
-            _ => return Err(WorkerError::InvalidFrame("native_worker_payload")),
+        let ProtocolPayload::NativeWorkerFrameV1(native) = payload else {
+            return Err(WorkerError::InvalidFrame("native_worker_payload"));
         };
         let request_id = request_id.ok_or(WorkerError::InvalidFrame("request_id"))?;
         let body: WorkerFrameBody = serde_json::from_value(native.body)

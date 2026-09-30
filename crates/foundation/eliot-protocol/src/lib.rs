@@ -553,8 +553,12 @@ impl NativeWorkerOperationV1 {
     #[must_use]
     pub const fn frame_kind(self) -> FrameKind {
         match self {
-            Self::Execute | Self::Checkpoint | Self::Quiesce | Self::Reconnect
-            | Self::Reconcile | Self::Shutdown => FrameKind::Request,
+            Self::Execute
+            | Self::Checkpoint
+            | Self::Quiesce
+            | Self::Reconnect
+            | Self::Reconcile
+            | Self::Shutdown => FrameKind::Request,
             Self::Cancel => FrameKind::Cancel,
             Self::Heartbeat | Self::Health => FrameKind::Heartbeat,
             Self::Acknowledge => FrameKind::Control,
@@ -842,6 +846,55 @@ fn validate_event_message(
     }
 }
 
+fn validate_native_worker_frame(frame: &Frame) -> Result<bool, ProtocolError> {
+    let native_worker = match &frame.payload {
+        ProtocolPayload::NativeWorkerFrameV1(payload) => Some(payload),
+        _ => None,
+    };
+    if matches!(
+        frame.message_type,
+        MessageType::NativeWorkerHeartbeat
+            | MessageType::NativeWorkerReconnect
+            | MessageType::NativeWorkerReconcile
+            | MessageType::NativeWorkerAcknowledge
+    ) && native_worker.is_none()
+    {
+        return Err(ProtocolError::InvalidField {
+            field: "payload",
+            reason: "native-worker message types require NativeWorkerFrameV1",
+        });
+    }
+    if let Some(native_worker) = native_worker {
+        if frame.protocol_version.minor < NATIVE_WORKER_FRAME_EBP_MINOR {
+            return Err(ProtocolError::InvalidField {
+                field: "protocol_version.minor",
+                reason: "native-worker frames require EBP/1.1 or newer",
+            });
+        }
+        if frame.request_id.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "request_id",
+                reason: "required for every native-worker frame",
+            });
+        }
+        if frame.request_identity.is_some() {
+            return Err(ProtocolError::InvalidField {
+                field: "request_identity",
+                reason: "native-worker authority uses its versioned payload contract",
+            });
+        }
+        if frame.kind != native_worker.operation.frame_kind()
+            || frame.message_type != native_worker.operation.message_type()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "must match the native-worker operation mapping",
+            });
+        }
+    }
+    Ok(native_worker.is_some())
+}
+
 impl Frame {
     /// Validates identity, version and the request correlation boundary.
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -884,54 +937,10 @@ impl Frame {
                 reason: "required for request and cancel frames",
             });
         }
-        let native_worker = match &self.payload {
-            ProtocolPayload::NativeWorkerFrameV1(payload) => Some(payload),
-            _ => None,
-        };
-        if matches!(
-            self.message_type,
-            MessageType::NativeWorkerHeartbeat
-                | MessageType::NativeWorkerReconnect
-                | MessageType::NativeWorkerReconcile
-                | MessageType::NativeWorkerAcknowledge
-        ) && native_worker.is_none()
-        {
-            return Err(ProtocolError::InvalidField {
-                field: "payload",
-                reason: "native-worker message types require NativeWorkerFrameV1",
-            });
-        }
-        if let Some(native_worker) = native_worker {
-            if self.protocol_version.minor < NATIVE_WORKER_FRAME_EBP_MINOR {
-                return Err(ProtocolError::InvalidField {
-                    field: "protocol_version.minor",
-                    reason: "native-worker frames require EBP/1.1 or newer",
-                });
-            }
-            if self.request_id.is_none() {
-                return Err(ProtocolError::InvalidField {
-                    field: "request_id",
-                    reason: "required for every native-worker frame",
-                });
-            }
-            if self.request_identity.is_some() {
-                return Err(ProtocolError::InvalidField {
-                    field: "request_identity",
-                    reason: "native-worker authority uses its versioned payload contract",
-                });
-            }
-            if self.kind != native_worker.operation.frame_kind()
-                || self.message_type != native_worker.operation.message_type()
-            {
-                return Err(ProtocolError::InvalidField {
-                    field: "kind/message_type",
-                    reason: "must match the native-worker operation mapping",
-                });
-            }
-        }
+        let native_worker = validate_native_worker_frame(self)?;
         if matches!(self.kind, FrameKind::Request | FrameKind::Cancel)
             && self.request_identity.is_none()
-            && native_worker.is_none()
+            && !native_worker
         {
             return Err(ProtocolError::InvalidField {
                 field: "request_identity",

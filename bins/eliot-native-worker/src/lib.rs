@@ -9,17 +9,17 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
+use eliot_ipc::{TransportLimits, decode_frame, encode_frame};
 use eliot_native_worker_core::{
     ActionEnvelopeCarrier, CapabilityAdmissionFacts, CapabilityAdmissionPort,
     ClaimAdmissionRequest, DurableCheckpointPort, DurableReplayPort, NativeWorkerClaim,
     NativeWorkerReadiness, NativeWorkerRegistration, ReadinessSubmission, WorkerCore, WorkerError,
     WorkerEventEnvelope, WorkerFrame, WorkerHello, WorkerLifecycle, WorkerReady,
 };
-use eliot_ipc::{TransportLimits, decode_frame, encode_frame};
+use eliot_process::{ProcessExecutor, ProcessRequest};
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
 };
-use eliot_process::{ProcessExecutor, ProcessRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -62,7 +62,7 @@ pub use kernel_admission_client::{
     SharedKernelTransport,
 };
 
-const MAX_FRAME_BYTES: u32 = eliot_protocol::MAX_FRAME_BYTES as u32;
+const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
 
 /// A transport response containing only durable events produced by the core.
@@ -259,10 +259,8 @@ where
         );
         let response_context = WorkerResponseContext::from(&frame);
         let events = self.handle(frame).await?;
-        let response_wire = encode_worker_response_frame(
-            response_context,
-            &WorkerResponse { events },
-        )?;
+        let response_wire =
+            encode_worker_response_frame(response_context, &WorkerResponse { events })?;
         write_frame(&response_wire)?;
         Ok(shutdown)
     }
@@ -288,10 +286,8 @@ where
         );
         let response_context = WorkerResponseContext::from(&frame);
         let events = self.handle(frame).await?;
-        let response_wire = encode_worker_response_frame(
-            response_context,
-            &WorkerResponse { events },
-        )?;
+        let response_wire =
+            encode_worker_response_frame(response_context, &WorkerResponse { events })?;
         write_frame_to(&response_wire, writer)?;
         Ok(shutdown)
     }
@@ -2456,7 +2452,7 @@ fn read_frame_from<R: Read>(reader: &mut R) -> Result<Option<WorkerFrame>, Nativ
         match reader.read(&mut prefix[..1]) {
             Ok(0) => return Ok(None),
             Ok(_) => break,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(NativeWorkerError::Io(error)),
         }
     }
@@ -2490,7 +2486,7 @@ fn read_frame_from<R: Read>(reader: &mut R) -> Result<Option<WorkerFrame>, Nativ
 }
 
 fn write_frame_to<W: Write>(wire: &[u8], writer: &mut W) -> Result<(), NativeWorkerError> {
-    writer.write_all(&wire)?;
+    writer.write_all(wire)?;
     writer.flush()?;
     Ok(())
 }
