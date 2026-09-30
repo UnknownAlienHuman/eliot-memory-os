@@ -203,6 +203,94 @@ pub(super) async fn read_fence(
     take_optional::<FenceRecord>(&mut response, 0)
 }
 
+/// Reads one committed receipt for the success-path commit proof (S-CONC-TX,
+/// issue #989, audit `5919482812`).
+///
+/// Strict where [`read_receipt_by_operation`] is lenient: any statement-error
+/// set (including the `FROM ONLY` duplicate error), a missing row, a failed
+/// validation, or a missing reconciliation envelope is
+/// [`AdapterError::UnknownOutcome`] for same-operation reconciliation — a
+/// missing, duplicate, or malformed success artifact is a possible commit,
+/// never a local success and never a silent absence. The caller additionally
+/// proves operation/allocation binding through
+/// `plan::validate_receipt_identity_with_expected_heads` and the fence and
+/// effect-set comparisons in `apply::verify_durable_commit_bundle`.
+pub(super) async fn read_committed_receipt_strict(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation_id: &OperationId,
+) -> Result<WriteReceipt, AdapterError> {
+    let unknown = || AdapterError::UnknownOutcome { operation_id: operation_id.to_string() };
+    let mut bindings = Map::new();
+    bindings.insert("table".to_owned(), json!(schema::table::WRITE_RECEIPT));
+    bindings.insert("key".to_owned(), json!(operation_id.to_string()));
+    let mut response = client::query(
+        db,
+        config,
+        "read.committed_receipt",
+        schema::READ_RECEIPT_BY_OPERATION,
+        bindings,
+    )
+    .await
+    .map_err(|_| unknown())?;
+    if !response.take_errors().is_empty() {
+        return Err(unknown());
+    }
+    let receipt: Option<WriteReceipt> = response.take(0).map_err(|_| unknown())?;
+    let Some(receipt) = receipt else {
+        return Err(unknown());
+    };
+    receipt.validate().map_err(|_| unknown())?;
+    receipt.require_reconciliation_envelope().map_err(|_| unknown())?;
+    Ok(receipt)
+}
+
+/// Reads one committed operation's durable effect identities for the
+/// success-path commit proof (S-CONC-TX, issue #989, audit `5919482812`).
+///
+/// Returns the durable `(outbox_ids, event_ids)` bound to the exact admitted
+/// `operation_id`. Any statement-error set, decode failure, or row-shape
+/// mismatch is [`AdapterError::UnknownOutcome`] for same-operation
+/// reconciliation. The caller compares the exact identity sets against the
+/// attempted plan: a missing, duplicate, or extra effect row fails the
+/// commit, never the read.
+pub(super) async fn read_committed_effect_ids(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation_id: &OperationId,
+) -> Result<(Vec<String>, Vec<String>), AdapterError> {
+    let unknown = || AdapterError::UnknownOutcome { operation_id: operation_id.to_string() };
+    let mut bindings = Map::new();
+    bindings.insert("operation_id".to_owned(), json!(operation_id.to_string()));
+    let mut outbox_response = client::query(
+        db,
+        config,
+        "read.committed_outbox_ids",
+        schema::READ_OUTBOX_IDS_BY_OPERATION,
+        bindings.clone(),
+    )
+    .await
+    .map_err(|_| unknown())?;
+    if !outbox_response.take_errors().is_empty() {
+        return Err(unknown());
+    }
+    let outbox_ids: Vec<String> = outbox_response.take(0).map_err(|_| unknown())?;
+    let mut event_response = client::query(
+        db,
+        config,
+        "read.committed_event_ids",
+        schema::READ_EVENT_IDS_BY_OPERATION,
+        bindings,
+    )
+    .await
+    .map_err(|_| unknown())?;
+    if !event_response.take_errors().is_empty() {
+        return Err(unknown());
+    }
+    let event_ids: Vec<String> = event_response.take(0).map_err(|_| unknown())?;
+    Ok((outbox_ids, event_ids))
+}
+
 #[cfg(test)]
 mod idempotency_tests {
     #![allow(clippy::expect_used)]

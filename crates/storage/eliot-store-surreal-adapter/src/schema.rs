@@ -587,6 +587,19 @@ pub(crate) const TX_CREATE_OUTBOX: &str =
 pub(crate) const TX_CREATE_RECEIPT: &str =
     "CREATE type::record($receipt_table, $receipt_operation_id) CONTENT $receipt;";
 
+/// Terminal allocation proof of one canonical transaction (S-CONC-TX, #989).
+///
+/// Second-to-last statement of the assembled transaction, immediately before
+/// [`TX_COMMIT`]: binds the exact operation identity plus the allocation this
+/// attempt consumed (`commit_sequence`, `next_commit_sequence`,
+/// `next_outbox_sequence`) into one typed result slot owned by the same
+/// transaction. The writer validates this slot's operation binding and
+/// allocation equality on every error-free RPC: a missing, duplicate,
+/// malformed, or mismatched slot is a possible-commit outcome for
+/// same-operation reconciliation, never a local success. Adds no `CREATE`,
+/// so receipt/event/outbox row counts are unchanged.
+pub(crate) const TX_ALLOC_PROOF: &str = "LET $alloc_proof = { operation_id: $alloc_operation_id, commit_sequence: $alloc_commit_sequence, next_commit_sequence: $alloc_next_commit_sequence, next_outbox_sequence: $alloc_next_outbox_sequence };";
+
 /// Fenced upsert of the Governor finish-owner snapshot.  The outer recovery
 /// record is the only storage-owned part of a finish decision: its payload is
 /// opaque canonical receipt bytes, while the fixed `owner/finish` address,
@@ -722,6 +735,19 @@ pub(crate) const READ_FENCE: &str = "SELECT VALUE { state_fence: state_fence, ne
 
 pub(crate) const READ_RECEIPT_BY_OPERATION: &str =
     "SELECT VALUE body FROM ONLY type::record($table, $key);";
+
+/// Strict post-commit effect readback (S-CONC-TX, #989).
+///
+/// Both rows carry the admitted `operation_id` verbatim in their committed
+/// bindings (see the event/outbox bindings in `apply/atomic_write`), so these
+/// closed reads resolve the exact durable effect set of one operation: every
+/// missing, duplicate, or malformed row fails the success-path comparison in
+/// `apply` with a possible-commit outcome, never a local success. Reads, not
+/// DDL: no schema generation or migration change is involved.
+pub(crate) const READ_OUTBOX_IDS_BY_OPERATION: &str =
+    "SELECT VALUE outbox_id FROM outbox_event WHERE operation_id = $operation_id;";
+pub(crate) const READ_EVENT_IDS_BY_OPERATION: &str =
+    "SELECT VALUE event_id FROM canonical_event WHERE operation_id = $operation_id;";
 
 pub(crate) const READ_RECEIPT_IDEMPOTENCY: &str = r"
 SELECT VALUE body FROM write_receipt WHERE operation_id = $operation_id LIMIT 1;

@@ -29,10 +29,13 @@ pub enum AdapterError {
     /// Canonical allocation contention (S-CONC-TX, issue #989).
     ///
     /// The canonical transaction aborted on the shared fence/sequence
-    /// compare-and-set while carrying no semantic revision/ordering conflict
-    /// marker. The fence CAS precedes the receipt create in statement order,
-    /// so this outcome is proved-not-committed for this operation identity:
-    /// the bounded allocation retry may re-read the fence and recompute only
+    /// compare-and-set while carrying no semantic revision/ordering/owner-row
+    /// conflict marker. Classification is a closed typed protocol (exact
+    /// fence-CAS sentinel tokens plus a clean statement-error denominator in
+    /// `apply/atomic_write`, never prose inference), and the fence CAS
+    /// precedes the receipt create in statement order, so this outcome is
+    /// proved-not-committed for this operation identity: the bounded
+    /// allocation retry may re-read the fence and recompute only
     /// allocation-dependent values under the unchanged semantic contract. It
     /// is never a semantic stale-head conflict and never an unknown outcome.
     #[error(

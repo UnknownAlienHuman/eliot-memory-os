@@ -53,9 +53,12 @@ pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 pub(crate) mod surreal_swarm;
 pub(crate) mod surreal_task_acceptance;
-use atomic_write::{TxLane, to_value, write_transaction};
+use atomic_write::{
+    ErasureInTx, TxLane, erasure_in_tx_parts, read_sealed_erasure_outcomes, to_value,
+    write_canonical_transaction,
+};
 #[cfg(test)]
-use atomic_write::{ordering_write_template, revision_write_template};
+use atomic_write::{ordering_write_template, revision_write_template, write_transaction};
 use empty_migration::handle_empty_migration;
 pub(crate) async fn initialize_genesis(
     adapter: &SurrealStoreAdapter,
@@ -100,7 +103,10 @@ pub(crate) use read_boundary::{
     read_validation_snapshot,
 };
 pub(crate) use receipt_reconciliation::read_receipt;
-use receipt_reconciliation::{read_fence, read_idempotency, read_receipt_by_operation};
+use receipt_reconciliation::{
+    read_committed_effect_ids, read_committed_receipt_strict, read_fence, read_idempotency,
+    read_receipt_by_operation,
+};
 use recovery::{
     RecoverySnapshotInput, build_recovery_bindings, build_recovery_snapshot, build_recovery_sql,
 };
@@ -819,8 +825,8 @@ pub(crate) async fn apply_prepared(
 /// predicates arbitrate shared sequence allocation, so disjoint scopes
 /// commit concurrently while genuine conflicts fail closed. Each provider
 /// RPC stays atomic on its own session socket. The process-global write
-/// lock now guards only the migration and erasure-dispatch entrypoints,
-/// never normal-write allocation network I/O.
+/// lock now guards only the migration entrypoints, never normal-write
+/// allocation network I/O.
 const MAX_ALLOCATION_RETRIES: u32 = 7;
 
 pub(crate) async fn apply_prepared_with_authority(
@@ -1197,9 +1203,13 @@ impl VerifiedAttemptState {
 
 /// Admitted side-leg row writes for one apply attempt.
 ///
-/// Groups the sealed erasure dispatch plus the notification, reactive,
-/// automation and experience writes computed after every fallible
-/// precondition and before receipt planning.
+/// Groups the notification, reactive, automation, experience, and learning
+/// writes computed after every fallible precondition and before receipt
+/// planning. Each attempt recomputes from fresh rows; the in-transaction
+/// compare-and-set arbitrates concurrent writers, and owner-row drift
+/// surfaces the exact typed semantic/currentness conflict through the
+/// transaction classifier — never a silent allocation-contention retry under
+/// the old operation identity.
 struct AttemptLegWrites {
     notification: Vec<surreal_notification::SurrealNotificationWrite>,
     reactive: surreal_reactive::ReactiveWrites,
@@ -1299,42 +1309,34 @@ async fn load_verified_attempt_state(
     })
 }
 
-/// Admitted side-leg dispatch for one apply attempt.
-///
-/// Issue #1712: the admitted erasure operation dispatches its recorded
-/// intent-before-delete plan here, after every fallible precondition and
-/// before receipt planning. Dispatched once per operation: the sealed
-/// intent/outcome rows make a same-operation re-dispatch replay without
-/// duplicate destructive work, but allocation retries must not re-dispatch
-/// what the first attempt already sealed. Same-operation replay returns the
-/// sealed outcomes without duplicate destructive work; a lost commit
-/// response reconciles by same-operation retry through the receipt path,
-/// never by blind retry.
+/// Admitted side-leg computation for one apply attempt.
 ///
 /// Issue #1780: admitted notification-state legs compute their record writes
 /// here, after every fallible precondition and before receipt planning. Each
 /// attempt recomputes from fresh rows (no dispatched flag): the
-/// in-transaction revision compare-and-set arbitrates concurrent writers,
-/// and drift retries through allocation contention, never as a semantic
-/// conflict.
+/// in-transaction revision compare-and-set arbitrates concurrent writers.
+/// Owner-row drift is a typed semantic/currentness conflict through the
+/// transaction classifier, never an allocation-contention retry: the loop
+/// re-enters only on proved fence movement carrying no semantic marker, so a
+/// recomputed leg always observes current store state under the unchanged
+/// admitted operation.
 ///
 /// Issue #1941 C4: admitted reactive legs compute their row writes beside
 /// the notification legs: same position (after every fallible precondition,
-/// before receipt planning), same recompute-from-fresh-rows retry
-/// discipline, same in-transaction compare-and-set arbitration. Issue #1779
-/// admits the automation legs and issue #223 the experience bank/feedback
-/// legs beside the reactive legs under the same discipline.
+/// before receipt planning), same recompute-from-fresh-rows discipline, same
+/// in-transaction compare-and-set arbitration. Issue #1779 admits the
+/// automation legs and issue #223 the experience bank/feedback legs beside
+/// the reactive legs under the same discipline.
+///
+/// Admitted erasure intents do NOT dispatch here: they join the canonical
+/// transaction as an in-transaction bundle (see
+/// [`prepare_attempt_erasure_bundle`]), so no destructive effect ever
+/// commits ahead of the canonical receipt.
 async fn prepare_attempt_leg_writes(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
     transition: &eliot_store_api::PreparedTransition,
-    erasure_dispatched: &mut bool,
 ) -> Result<AttemptLegWrites, AdapterError> {
-    if transition.transition_class == TransitionClass::Erasure && !*erasure_dispatched {
-        let intent = surreal_intent_from_transition(transition)?;
-        apply_surreal_erasure(adapter, &intent).await?;
-        *erasure_dispatched = true;
-    }
     let notification_writes =
         surreal_notification::prepare_notification_writes(db, &adapter.config, transition).await?;
     let reactive_writes =
@@ -1362,18 +1364,23 @@ async fn prepare_attempt_leg_writes(
 /// plan values through [`plan::recompute_allocation`] under the unchanged
 /// semantic input/scope/fence/expected-head contract, and commits
 /// event/projection/relation/head/outbox/idempotency/receipt effects
-/// atomically with the fence CAS.
+/// atomically with the fence CAS. An admitted erasure bundle joins that same
+/// transaction (never a side transaction ahead of it), and an error-free RPC
+/// still proves its commit through the terminal allocation slot plus the
+/// durable receipt/fence/effect readback before any receipt is returned.
 ///
 /// Retry discipline: only a provider-classified allocation contention
 /// (`AllocationContention`, proved-not-committed: the fence CAS precedes the
-/// receipt create) re-enters the loop, and only after the next iteration
+/// receipt create, carries an exact fence token, and the error set holds no
+/// semantic token) re-enters the loop, and only after the next iteration
 /// re-proves absence through the idempotency read — a concurrent same-op
 /// winner observed there replays its original receipt instead of
-/// re-committing. Deterministic semantic conflicts, fence mismatches, and
-/// every unknown outcome return immediately: a transport timeout,
-/// cancellation, missing/malformed response, or possibly committed provider
-/// error is never retried and never allocates another operation; it requires
-/// exact same-operation receipt reconciliation before replay.
+/// re-committing. Deterministic semantic conflicts (including every
+/// owner-row/revision/snapshot drift marker), fence mismatches, and every
+/// unknown outcome return immediately: a transport timeout, cancellation,
+/// missing/malformed response, or possibly committed provider error is never
+/// retried and never allocates another operation; it requires exact
+/// same-operation receipt reconciliation before replay.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1390,7 +1397,6 @@ async fn apply_with_retry(
     lane: TxLane,
 ) -> Result<WriteReceipt, AdapterError> {
     let mut retries = 0u32;
-    let mut erasure_dispatched = false;
     // The full semantic plan is established once, on the first attempt.
     // Allocation-contention retries re-enter ONLY through
     // `plan::recompute_allocation` below, never through the full planner,
@@ -1427,11 +1433,17 @@ async fn apply_with_retry(
         .await?;
         let (next_commit_sequence, next_outbox_sequence) = verified.allocation_cursors();
 
-        // Admitted side-leg dispatch after every fallible precondition
-        // and before receipt planning (erasure once, other legs
-        // recomputed from fresh rows each attempt).
-        let legs =
-            prepare_attempt_leg_writes(adapter, db, &transition, &mut erasure_dispatched).await?;
+        // Admitted erasure bundle after every fallible precondition and
+        // before receipt planning: `None` for non-erasure transitions and
+        // for sealed erasures (exact outcomes replay with no duplicate
+        // destructive work); otherwise the frozen intent's in-transaction
+        // bundle, which joins the canonical transaction below.
+        let erasure = prepare_attempt_erasure_bundle(adapter, db, &transition).await?;
+
+        // Admitted side-leg computation after every fallible precondition
+        // and before receipt planning (recomputed from fresh rows each
+        // attempt; owner-row drift stays a typed semantic conflict).
+        let legs = prepare_attempt_leg_writes(adapter, db, &transition).await?;
 
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
@@ -1483,7 +1495,7 @@ async fn apply_with_retry(
             rendezvous_before_transaction(adapter).await?;
         }
 
-        match write_transaction(
+        match write_canonical_transaction(
             db,
             &adapter.config,
             &transition,
@@ -1506,20 +1518,27 @@ async fn apply_with_retry(
             &legs.automation,
             &legs.experience,
             &legs.learning,
+            erasure,
         )
         .await
         {
             Ok(()) => {
-                validate_receipt_identity_with_expected_heads(
-                    &receipt,
+                // The error-free RPC proved its terminal allocation slot;
+                // the returned receipt is the durable readback, never the
+                // locally constructed prediction.
+                let committed = verify_durable_commit_bundle(
+                    adapter,
+                    db,
                     ctx,
                     &transition,
+                    &plan,
                     &expected_revision_heads,
                     &expected_ordering_heads,
-                )?;
-                validate_committed_canonical_transition(&plan, &receipt)?;
-                validate_committed_projection_publications(&plan, &receipt)?;
-                return Ok(receipt);
+                )
+                .await?;
+                validate_committed_canonical_transition(&plan, &committed)?;
+                validate_committed_projection_publications(&plan, &committed)?;
+                return Ok(committed);
             }
             Err(AdapterError::AllocationContention { .. }) if retries < MAX_ALLOCATION_RETRIES => {
                 retries += 1;
@@ -1527,6 +1546,135 @@ async fn apply_with_retry(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Admitted erasure bundle for one apply attempt (S-CONC-TX, issue #989,
+/// audit `5919482812`).
+///
+/// `None` for every non-erasure transition and for a sealed erasure, whose
+/// exact per-surface outcomes replay verbatim with no duplicate destructive
+/// work. Otherwise the frozen intent's in-transaction bundle, spliced into
+/// the canonical transaction ahead of the receipt create by
+/// [`write_canonical_transaction`]: intent, destructive effects, canonical
+/// event, heads, outbox, and receipt commit atomically or not at all, so an
+/// allocation-contention abort, a semantic conflict, retry exhaustion, or an
+/// unknown outcome can never leave a separately committed destructive effect
+/// behind the canonical receipt. Allocation retry never outlives the effect
+/// it cannot roll back.
+async fn prepare_attempt_erasure_bundle(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<Option<ErasureInTx>, AdapterError> {
+    if transition.transition_class != TransitionClass::Erasure {
+        return Ok(None);
+    }
+    let sealed = read_sealed_erasure_outcomes(
+        db,
+        &adapter.config,
+        &transition.identity.operation_id,
+    )
+    .await?;
+    if sealed.is_some() {
+        return Ok(None);
+    }
+    let intent = surreal_intent_from_transition(transition)?;
+    let intent = record_surreal_erasure_intent(intent)?;
+    Ok(Some(erasure_in_tx_parts(&intent)?))
+}
+
+/// Proves one error-free canonical transaction actually committed before
+/// returning its receipt (S-CONC-TX, issue #989, audit `5919482812`).
+///
+/// The writer already validated the terminal allocation slot; this compares
+/// the durable readback under the same operation identity:
+///
+/// 1. the exact receipt row exists, validates, carries its reconciliation
+///    envelope, and binds this operation, idempotency key, canonical hash,
+///    and allocation (through
+///    [`validate_receipt_identity_with_expected_heads`]);
+/// 2. the fence row exists at this transition's fence with both cursors
+///    advanced exactly past this attempt's allocation — the single-row fence
+///    CAS effect, proving no global-counter collision was silently ignored;
+/// 3. the durable outbox/event identity sets equal exactly the attempted
+///    plan's sets: a missing, duplicate, or extra effect row fails the
+///    commit.
+///
+/// Every failure is [`AdapterError::UnknownOutcome`] for same-operation
+/// receipt reconciliation — never a local success over an unproven commit.
+/// Returns the durable receipt itself, so the caller returns owner evidence,
+/// not a local prediction.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the commit proof carries the exact admitted contract: context, transition, plan, and both head sets"
+)]
+async fn verify_durable_commit_bundle(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    ctx: &eliot_store_api::RequestMeta,
+    transition: &eliot_store_api::PreparedTransition,
+    plan: &plan::ApplyPlan,
+    expected_revision_heads: &[eliot_store_api::RevisionHeadExpectation],
+    expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
+) -> Result<WriteReceipt, AdapterError> {
+    let operation_id = transition.identity.operation_id.to_string();
+    let unknown = || AdapterError::UnknownOutcome { operation_id: operation_id.clone() };
+    let committed =
+        read_committed_receipt_strict(db, &adapter.config, &transition.identity.operation_id)
+            .await?;
+    validate_receipt_identity_with_expected_heads(
+        &committed,
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .map_err(|_| unknown())?;
+    let fence = read_fence(db, &adapter.config).await.map_err(|_| unknown())?;
+    let Some(fence) = fence else {
+        return Err(unknown());
+    };
+    if fence.state_fence != transition.state_fence
+        || fence.next_commit_sequence != plan.next_commit_sequence
+        || fence.next_outbox_sequence != plan.next_outbox_sequence
+    {
+        return Err(unknown());
+    }
+    let (outbox_ids, event_ids) =
+        read_committed_effect_ids(db, &adapter.config, &transition.identity.operation_id).await?;
+    let planned_outbox: Vec<String> = plan
+        .outbox_records
+        .iter()
+        .map(|record| record.outbox_id.to_string())
+        .collect();
+    let planned_events: Vec<String> = plan
+        .event_ids
+        .iter()
+        .map(|event_id| event_id.to_string())
+        .collect();
+    if !committed_effect_ids_match(&outbox_ids, &planned_outbox)
+        || !committed_effect_ids_match(&event_ids, &planned_events)
+    {
+        return Err(unknown());
+    }
+    Ok(committed)
+}
+
+/// Compares one durable effect identity set against the attempted plan set.
+///
+/// Order-insensitive (the provider returns rows in no promised order) but
+/// exact in membership and multiplicity: a missing, duplicate, or extra row
+/// never matches. Pure over already-read identities; every mismatch resolves
+/// as a possible commit through the caller, never as a local success.
+fn committed_effect_ids_match(durable: &[String], planned: &[String]) -> bool {
+    if durable.len() != planned.len() {
+        return false;
+    }
+    let mut durable_sorted = durable.to_vec();
+    let mut planned_sorted = planned.to_vec();
+    durable_sorted.sort();
+    planned_sorted.sort();
+    durable_sorted == planned_sorted
 }
 
 /// Post-commit atomicity gate for one canonical transition (issue #1931).
@@ -1618,12 +1766,12 @@ fn validate_committed_projection_publications(
     Ok(())
 }
 
-/// 688-B: the adapter's apply-path erasure execution.
+/// 688-B: the adapter's apply-path erasure gate.
 ///
 /// The erasure protocol needs the same intent-before-dispatch gate as the
-/// reference store: a `record_erasure_intent` step persists the intent row(s)
-/// in the same atomic transaction BEFORE any destructive statement (see the
-/// intent-before-delete template in `atomic_write`). This gate refuses
+/// reference store: a `record_erasure_intent` step freezes the intent the
+/// canonical transaction opens with BEFORE any destructive statement (see
+/// the intent-before-delete body in `atomic_write`). This gate refuses
 /// fail-closed with zero destructive effects when no recorded intent exists
 /// ([`StoreError::ReceiptNotFound`]), sealing the original per-surface
 /// outcomes for same-operation replay (idempotent on `operation_id`,
@@ -1637,8 +1785,11 @@ fn validate_committed_projection_publications(
 /// not in a separate crate).
 ///
 /// `record_surreal_erasure_intent` validates and freezes the intent: in the
-/// live path the returned intent is the durable row the atomic transaction
-/// below opens with, so no destructive statement can precede it.
+/// live path the returned intent feeds the in-transaction bundle the
+/// canonical transaction opens with (see [`prepare_attempt_erasure_bundle`]
+/// and `atomic_write::erasure_in_tx_parts`), so no destructive statement can
+/// precede it and no destructive effect can commit ahead of the canonical
+/// receipt.
 ///
 /// Issue #1712 admits the named dispatch: `apply_prepared_with_authority`
 /// routes an admitted `ApplyErasure` transition through this gate, so the
@@ -1652,44 +1803,6 @@ pub(crate) fn record_surreal_erasure_intent(
 ) -> Result<atomic_write::SurrealErasureIntent, AdapterError> {
     intent.validate().map_err(AdapterError::Store)?;
     Ok(intent)
-}
-
-/// 688-B: dispatches one recorded erasure intent through the atomic writer.
-///
-/// Same-operation replay returns the original per-surface outcomes without
-/// duplicate destructive work (the writer's sealed-outcome replay check);
-/// `Unknown` outcomes stay preserved for same-operation reconciliation.
-/// Fail-closed with zero destructive effects when the intent step above
-/// refuses: `write_erasure_transaction` is never reached, so no `DELETE`
-/// can precede the durable intent row.
-///
-/// Issue #1712 admits the named dispatch (see
-/// `apply_prepared_with_authority`); this entry executes only the recorded
-/// plan and never derives deletion semantics.
-///
-/// Follow-up integration slice (NOT this contour): `GetEvidencePack`
-/// suppression of sealed erasures plus the `erasure_intent`/`erasure_outcome`
-/// table migration stay with the real-Surreal integration owner.
-pub(crate) async fn apply_surreal_erasure(
-    adapter: &SurrealStoreAdapter,
-    intent: &atomic_write::SurrealErasureIntent,
-) -> Result<Vec<atomic_write::SurrealSurfaceOutcome>, AdapterError> {
-    // 688-FIX keeps the verifier boundary explicit: a terminal outcome is
-    // replayed by identity, and no destructive transaction is reachable
-    // unless the intent has first passed this validation gate.
-    let intent = record_surreal_erasure_intent(intent.clone())?;
-    let db = client(adapter).await?;
-    ensure_ready(adapter, db).await?;
-    // Issue #67 (R3/A6): this leg is dispatched from inside an ordinary
-    // canonical apply, so it already runs under that apply's shared
-    // `exclusive_admission` permit and is covered by it. It deliberately
-    // does not request the exclusive permit — the same task already holds
-    // the shared one, and a non-reentrant exclusive request from inside it
-    // would self-deadlock. The `write_lock` below is the retained
-    // exclusive-entrypoint mutual-exclusion guard; since ordinary applies
-    // no longer acquire it, it is not what excludes them from this leg.
-    let _guard = adapter.write_lock.lock().await;
-    atomic_write::write_erasure_transaction(db, &adapter.config, &intent).await
 }
 
 /// Builds the pure intent-before-delete ordering assertion used by tests:
