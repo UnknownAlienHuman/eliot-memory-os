@@ -28,9 +28,16 @@
 
 #![forbid(unsafe_code)]
 
+use eliot_kernel_service::{KernelStoreGateway, MaintenanceTriggerDeliveryError};
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, DecisionReason, MaintenanceFamily,
 };
+use eliot_ors::{
+    MaintenanceTriggerStagingRequest, OperationalRecoveryStore, OrsError,
+    stage_maintenance_trigger_intake,
+};
+use eliot_protocol::{MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, ProtocolError};
+use thiserror::Error;
 
 use crate::maintenance_family_catalog::MaintenanceFamilyDecision;
 
@@ -314,4 +321,167 @@ impl MaintenanceDispatch {
             existing_job = %existing_job,
         );
     }
+}
+
+/// Fail-closed refusals of the front-door maintenance-trigger intake (I14.22,
+/// issue #1694 W2).
+///
+/// Every variant keeps its owner's exact typed failure and the producer's
+/// retry identity (trigger identity plus operation hash): the staging-request
+/// / wire-record binding refusal stays a [`ProtocolError`], the ORS owner's
+/// durable-staging refusal stays an [`OrsError`], and the Kernel delivery
+/// owner's admission refusal stays a [`MaintenanceTriggerDeliveryError`]. No
+/// failure acknowledges acceptance or advances the producer cursor, and no
+/// variant invents a spill file: critical gaps travel the existing protected
+/// owner, never a new unbounded store.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerIntakeError {
+    /// The staging request and the wire record name different obligations, so
+    /// the intake would acknowledge the wrong bytes.
+    #[error("maintenance trigger intake binding mismatch for trigger {trigger_id}: {source}")]
+    BindingConflict {
+        /// Stable trigger identity the producer retries under.
+        trigger_id: String,
+        /// Operation hash the producer retries under.
+        operation_hash: String,
+        /// Exact binding refusal; changed content conflicts.
+        #[source]
+        source: ProtocolError,
+    },
+    /// The ORS owner could not durably stage the complete opaque input
+    /// (capacity, key, integrity, or durable-write refusal).
+    #[error("maintenance trigger intake staging refused for trigger {trigger_id}: {source}")]
+    Staging {
+        /// Stable trigger identity the producer retries under.
+        trigger_id: String,
+        /// Operation hash the producer retries under.
+        operation_hash: String,
+        /// Exact owner refusal; no receipt was issued.
+        #[source]
+        source: OrsError,
+    },
+    /// The Kernel delivery owner refused admission of the staged trigger.
+    #[error("maintenance trigger intake admission refused for trigger {trigger_id}: {source}")]
+    Admission {
+        /// Stable trigger identity the producer retries under.
+        trigger_id: String,
+        /// Operation hash the producer retries under.
+        operation_hash: String,
+        /// Exact owner refusal; nothing was admitted.
+        #[source]
+        source: MaintenanceTriggerDeliveryError,
+    },
+}
+
+impl MaintenanceTriggerIntakeError {
+    /// Returns the stable trigger identity the producer retries under.
+    #[must_use]
+    pub fn trigger_id(&self) -> &str {
+        match self {
+            Self::BindingConflict { trigger_id, .. }
+            | Self::Staging { trigger_id, .. }
+            | Self::Admission { trigger_id, .. } => trigger_id,
+        }
+    }
+
+    /// Returns the operation hash the producer retries under.
+    #[must_use]
+    pub fn operation_hash(&self) -> &str {
+        match self {
+            Self::BindingConflict { operation_hash, .. }
+            | Self::Staging { operation_hash, .. }
+            | Self::Admission { operation_hash, .. } => operation_hash,
+        }
+    }
+}
+
+/// Admits one retained maintenance trigger through the existing ORS and Kernel
+/// owners before any acknowledgement (I14.22, issue #1694 W2; STITCH).
+///
+/// This is the production front-door intake route caller: it stages first and
+/// admits second, and it acknowledges nothing itself. The producer cursor
+/// advances only on the returned receipt; every error returns with the
+/// producer's retry identity and no acceptance.
+///
+/// The payload-arm choice travels in `staging_request` and its resolution
+/// stays with the ORS owner
+/// ([`stage_maintenance_trigger_intake`]): a retained canonical source event
+/// is read back through the existing owner and only its delivery obligation
+/// is stored, otherwise the complete opaque input is staged as-is. An
+/// in-memory pointer, an ephemeral file, or an inaccessible source reference
+/// is not a complete durable payload, so both arms fail without a receipt —
+/// the retained arm on a missing envelope or hash mismatch, the opaque arm
+/// on envelope validation — and I05.02 applies verbatim: "if ORS cannot
+/// durably stage the complete opaque operation, accepted_pending is
+/// forbidden".
+///
+/// Completeness is proven against the owner read-back, not the staged bytes
+/// in hand: [`KernelStoreGateway::admit_maintenance_trigger`] re-proves the
+/// staged envelope through the ORS owner before admitting the record into
+/// the owned delivery ledger. An exact identity/hash replay returns the same
+/// staging receipt; changed content under the same identity conflicts. If
+/// capacity, key, integrity, or durable write fails, the exact bounded
+/// failure is returned with nothing admitted and the producer cursor
+/// unadvanced, so the trigger "remains durable and is surfaced on the next
+/// startup" (I14.22) instead of being acknowledged into loss.
+///
+/// This caller holds no ledger, opens no poller, creates no second database,
+/// and writes no spill file: delivery metadata stays with the Kernel ledger,
+/// staged bytes stay with the ORS inbox owner, and protected safety/recovery
+/// routing travels the existing owner-issued grant on both the staging
+/// request and the wire record.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerIntakeError`] keeping each owner's typed
+/// refusal: a staging-request / wire-record binding mismatch, an ORS
+/// staging refusal, or a Kernel admission refusal.
+pub fn admit_maintenance_trigger_intake(
+    store: &impl OperationalRecoveryStore,
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    staging_request: &MaintenanceTriggerStagingRequest,
+    record: MaintenanceTriggerRecord,
+) -> Result<MaintenanceTriggerIntakeReceipt, MaintenanceTriggerIntakeError> {
+    // Bind the delivery obligation before any write: the staged envelope
+    // reference, payload hash, trigger identity, and operation hash must name
+    // the same obligation on both sides. A staging that pointed beside its
+    // bytes would acknowledge the wrong obligation, so changed content
+    // conflicts here before any cursor could advance.
+    if staging_request.trigger_id != record.trigger_id
+        || staging_request.operation_hash != record.operation_hash
+        || staging_request.envelope_reference != record.payload.envelope_reference
+        || staging_request.payload_hash != record.payload.payload_hash
+    {
+        return Err(MaintenanceTriggerIntakeError::BindingConflict {
+            trigger_id: record.trigger_id.clone(),
+            operation_hash: record.operation_hash.clone(),
+            source: ProtocolError::ReplayConflict,
+        });
+    }
+    let retry_id = (record.trigger_id.clone(), record.operation_hash.clone());
+    // Persist before acknowledging: the complete opaque input (or the
+    // retained-source delivery obligation) commits through the ORS owner. An
+    // exact replay converges on the owner's existing receipt; changed content
+    // fails with a duplicate conflict. Any failure carries no receipt, so the
+    // producer keeps its retry identity and its cursor must not advance.
+    stage_maintenance_trigger_intake(store, staging_request).map_err(|source| {
+        MaintenanceTriggerIntakeError::Staging {
+            trigger_id: retry_id.0.clone(),
+            operation_hash: retry_id.1.clone(),
+            source,
+        }
+    })?;
+    // Admit the staged record into the owned delivery ledger. The owner entry
+    // re-proves staging through the ORS read-back, then admits: exact
+    // identity/hash replay returns the same receipt, changed content
+    // conflicts, and any failure admits nothing.
+    gateway
+        .admit_maintenance_trigger(principal_ref, record)
+        .map(|(receipt, _)| receipt)
+        .map_err(|source| MaintenanceTriggerIntakeError::Admission {
+            trigger_id: retry_id.0,
+            operation_hash: retry_id.1,
+            source,
+        })
 }
