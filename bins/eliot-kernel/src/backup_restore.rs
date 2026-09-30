@@ -1357,6 +1357,13 @@ impl KernelBackupRestore {
             ports.rehearsal,
             ports.manifest_evidence.as_ref(),
         )?;
+        // Third axis, and the one the two above cannot reach: the CONSTRUCTED
+        // root must still RESOLVE to `<work_root>/.eliot/restore-isolated/<label>`.
+        // The label is the request's own `target_id`, so a directory already
+        // carrying that name can be a reparse point, and a lexical containment
+        // check passes straight through one. This is the same link-resolved
+        // rule the bounded cleanup of this owner's own staging already applies.
+        Self::refuse_destination_outside_isolated_area(&destination, &self.work_root)?;
         let receipts = match ports.keys {
             Some(manifest) => issue_restoration_receipts(
                 bundle.manifest.backup_id.as_str(),
@@ -1414,6 +1421,79 @@ impl KernelBackupRestore {
         })
     }
 
+    /// Refuses a recovery import whose constructed destination root does not
+    /// still resolve to `<work_root>/.eliot/restore-isolated/<label>` (issue
+    /// #955, A11).
+    ///
+    /// A11's guarantee is "recovery import targets only the externally admitted
+    /// isolated new installation", and its negative direction is that the
+    /// recovery path must not be steerable at anything else. The two axes that
+    /// already hold are the identity axis — [`RestorePlan::compile`] refuses
+    /// `target_id == bundle.manifest.backup_id`, the ARCHIVE's own owner-issued
+    /// identity — and the path axis: `KernelIsolatedDestination::open` accepts
+    /// only a bounded label and CONSTRUCTS
+    /// `<work_root>/.eliot/restore-isolated/<label>`, never a presented path.
+    ///
+    /// Neither of those is the whole answer, and the reason is exactly the
+    /// reason the bounded cleanup of this owner's own staging already carries a
+    /// `StagedCleanupRefusal::OutsideIsolatedArea` reason: the label is the
+    /// REQUEST's own `target_id`
+    /// (`restore_target_shape`, `request_dispatch.rs`), so
+    /// `<work_root>/.eliot/restore-isolated/<label>` is a name a caller chooses,
+    /// and on Windows a directory carrying that name can be a reparse point. A
+    /// junction at the label resolves every subsequent write — canonical events,
+    /// receipts, projections, blobs, the pinned admission and the final
+    /// `evidence.json` — outside the isolated area and into whatever it names,
+    /// while every lexical check above still passes. The import would then be
+    /// steered at a store that is not the admitted isolated destination, which
+    /// is the failure this refusal exists to make impossible.
+    ///
+    /// So the import now applies, BEFORE the first destination byte is staged,
+    /// the same link-resolved containment rule the cleanup path already applies
+    /// after a failure: both the isolated area and the destination root are
+    /// resolved, the resolved root must be strictly inside the resolved area,
+    /// and its final component must still be the admitted label. Nothing is
+    /// compared against the caller's own copy of a path — the caller supplies a
+    /// label, and what is proved is the resolved topology of the root this owner
+    /// constructed.
+    ///
+    /// An absent or unresolvable root is a typed destination failure, never a
+    /// silent pass: the destination was constructed by this owner moments
+    /// earlier, so a root that cannot be resolved is a broken or replaced
+    /// contour, not a reason to import into an unproved location.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelRestoreError::DestinationNotAdmitted`] when the resolved
+    /// destination root is the isolated area itself, lies outside it, or no
+    /// longer ends in the admitted label; and
+    /// [`KernelRestoreError::DestinationInvalid`] when the isolated area or the
+    /// destination root cannot be resolved at all.
+    fn refuse_destination_outside_isolated_area(
+        destination: &KernelIsolatedDestination,
+        work_root: &Path,
+    ) -> Result<(), KernelRestoreError> {
+        let area = work_root.join(".eliot").join(RESTORE_ISOLATED_AREA);
+        let resolved_area = std::fs::canonicalize(&area).map_err(|error| {
+            KernelRestoreError::DestinationInvalid(format!(
+                "isolated restore area could not be resolved: {error}"
+            ))
+        })?;
+        let resolved_root = std::fs::canonicalize(destination.root()).map_err(|error| {
+            KernelRestoreError::DestinationInvalid(format!(
+                "isolated destination root could not be resolved: {error}"
+            ))
+        })?;
+        let admitted_label = destination.label();
+        if resolved_root == resolved_area
+            || !resolved_root.starts_with(&resolved_area)
+            || resolved_root.file_name().and_then(|name| name.to_str()) != Some(admitted_label)
+        {
+            return Err(KernelRestoreError::DestinationNotAdmitted);
+        }
+        Ok(())
+    }
+
     /// Refuses a destination pinned to a different transaction, target,
     /// rehearsal posture, or manifest evidence, and corrupt pinned
     /// admissions.
@@ -1425,8 +1505,11 @@ impl KernelBackupRestore {
     /// decides whether the destination may ever be qualified for cutover: a
     /// rehearsal-prepared root is never continued by a production run, and a
     /// production-prepared root is never downgraded to a rehearsal. An
-    /// unpinned destination proceeds: it is either fresh or a pre-prepare
-    /// crash whose byte staging the engine re-applies idempotently.
+    /// unpinned destination proceeds past THIS check when it is fresh or a
+    /// pre-prepare crash whose byte staging the engine re-applies idempotently;
+    /// that this root resolves to the admitted isolated location at all is
+    /// decided separately, against the resolved filesystem topology, by
+    /// [`Self::refuse_destination_outside_isolated_area`].
     fn refuse_foreign_destination(
         destination: &KernelIsolatedDestination,
         transaction_id: &str,

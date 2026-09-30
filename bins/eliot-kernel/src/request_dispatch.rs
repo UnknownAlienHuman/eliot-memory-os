@@ -3759,6 +3759,7 @@ const fn restore_error_code(error: &KernelRestoreError) -> &'static str {
         KernelRestoreError::JournalCorrupt => "restore-journal-corrupt",
         KernelRestoreError::JournalBindingConflict => "restore-journal-binding-conflict",
         KernelRestoreError::DestinationInvalid(_) => "restore-destination-invalid",
+        KernelRestoreError::DestinationNotAdmitted => "restore-destination-not-admitted",
         KernelRestoreError::FenceMismatch(_) => "restore-fence-mismatch",
         KernelRestoreError::ArchiveInvalid(_) => "restore-archive-invalid",
         KernelRestoreError::CapabilityMissing { .. } => "restore-capability-missing",
