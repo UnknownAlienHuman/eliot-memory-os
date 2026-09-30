@@ -386,6 +386,8 @@ pub struct TaskControllerOrientationPrepareInputV1 {
     pub input_bundle_ref: OpaqueContentRef,
     /// Exact canonical DreamInputBundle bytes named by `input_bundle_ref`.
     pub input_bundle_bytes: Vec<u8>,
+    /// Original Orientation owner publication including its frame and evidence.
+    pub admitted_orientation_job: TaskControllerCanonicalSourcePublication,
     /// Original K0 job-attempt identity issued for this job publication.
     pub job_attempt_id: eliot_contracts::ArtifactId,
     /// Original admitted WorkScope binding, checked again by Governor.
@@ -467,6 +469,9 @@ impl TaskControllerOrientationPrepareInputV1 {
             &self.input_bundle_ref,
             &self.input_bundle_bytes,
             "task_controller_invocation.orientation_prepare.input_bundle",
+        )?;
+        self.admitted_orientation_job.validate(
+            "task_controller_invocation.orientation_prepare.admitted_orientation_job",
         )?;
         Ok(())
     }
