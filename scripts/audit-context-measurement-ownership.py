@@ -1088,6 +1088,10 @@ def evaluate(root: Path) -> OwnershipResult:
             dependency={},
             schema_sites=[],
             owner_sites=[],
+            # No rows were read, so no baseline row was reconciled. The tally is
+            # an honest all-zero: the artifact is malformed, not a tree whose
+            # baseline happens to be empty.
+            baseline_dispositions={d: 0 for d in BASELINE_DISPOSITIONS},
         )
 
     # The scan universe is the artifact's own declared case set: #866's own
@@ -1382,6 +1386,9 @@ def evaluate(root: Path) -> OwnershipResult:
             )
         seen_owner_identity.add(identity)
 
+    # One reconciliation pass, producing both the findings and the tally that
+    # is reported from them. It runs here, once, and its tally is carried into
+    # ``_finalize`` instead of being recomputed there.
     return _finalize(
         root,
         findings,
@@ -1395,7 +1402,7 @@ def evaluate(root: Path) -> OwnershipResult:
         dependency=dependency,
         schema_sites=schema_sites,
         owner_sites=owner_sites,
-        extra_finding_check=lambda: _baseline_findings(rows, by_case, add),
+        baseline_dispositions=_baseline_findings(rows, by_case, add),
     )
 
 
@@ -1653,7 +1660,7 @@ def _finalize(
     dependency: dict[str, list[str]],
     schema_sites: list[dict[str, Any]],
     owner_sites: list[dict[str, Any]],
-    extra_finding_check: Any = None,
+    baseline_dispositions: dict[str, int],
 ) -> OwnershipResult:
     """Assemble the single immutable result, computing its digest over the
     full body (which excludes the digest itself)."""
@@ -1671,11 +1678,32 @@ def _finalize(
     ) -> None:
         _record(findings, code, detail, row_id, case_ref, path, span_start, span_end, rule)
 
-    dispositions = _baseline_findings(rows, by_case, add) if rows else {
-        d: 0 for d in BASELINE_DISPOSITIONS
-    }
-    if extra_finding_check is not None:
-        extra_finding_check()
+    # The baseline reconciliation ran EXACTLY ONCE, in ``evaluate``, which
+    # passes its tally in as ``baseline_dispositions``. Those findings are
+    # already in ``findings``.
+    #
+    # It used to run twice: once directly here and once again through
+    # ``extra_finding_check``. Both calls shared this one ``add`` closure and
+    # this one ``findings`` list, so every erased requirement was recorded
+    # TWICE -- thirty lost baseline rows produced sixty BASELINE_ROW_LOST
+    # findings. That inflated ``finding_count`` and ``result_digest`` with a
+    # duplicate that described no second defect, and it made the reported count
+    # of erased requirements depend on an implementation detail rather than on
+    # the tree. One pass, one tally, exactly one finding per erased
+    # requirement. No closed set, no rule and no threshold is touched: the
+    # findings this code emits are the same findings, counted once, and the
+    # tally is reported from the pass that emitted them.
+    # The tally must cover exactly the closed disposition set: a key outside
+    # it, or one missing, is a widened or eroded closed set and must fail
+    # loudly here rather than being silently dropped from the projection.
+    if set(baseline_dispositions) != set(BASELINE_DISPOSITIONS):
+        raise OracleError(
+            "DETERMINISTIC_INTERNAL_DEFECT",
+            "the baseline disposition tally keys "
+            f"{sorted(baseline_dispositions)} instead of the closed set "
+            f"{sorted(BASELINE_DISPOSITIONS)}",
+        )
+    dispositions = {d: int(baseline_dispositions[d]) for d in BASELINE_DISPOSITIONS}
 
     ordered = tuple(sorted(findings, key=lambda f: (f.code, f.case_ref, f.path, f.span_start)))
     result = OwnershipResult(
