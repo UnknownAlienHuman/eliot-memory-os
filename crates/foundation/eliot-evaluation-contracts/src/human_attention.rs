@@ -3313,12 +3313,14 @@ fn validate_assembled_groups(
         manifest,
         scope,
     )?;
-    groups.notification_approval_and_telemetry_profile.validate(
-        HumanAttentionMetricGroupKind::NotificationApprovalAndTelemetryProfile,
-        &input.observation_window,
-        manifest,
-        scope,
-    )?;
+    groups
+        .notification_approval_and_telemetry_profile
+        .validate(
+            HumanAttentionMetricGroupKind::NotificationApprovalAndTelemetryProfile,
+            &input.observation_window,
+            manifest,
+            scope,
+        )?;
     groups.missed_critical_and_false_critical_counts.validate(
         HumanAttentionMetricGroupKind::MissedCriticalAndFalseCriticalCounts,
         &input.observation_window,
@@ -3351,12 +3353,14 @@ fn validate_assembled_groups(
         manifest,
         scope,
     )?;
-    groups.task_correctness_rework_and_human_attention.validate(
-        HumanAttentionMetricGroupKind::TaskCorrectnessReworkAndHumanAttention,
-        &input.observation_window,
-        manifest,
-        scope,
-    )?;
+    groups
+        .task_correctness_rework_and_human_attention
+        .validate(
+            HumanAttentionMetricGroupKind::TaskCorrectnessReworkAndHumanAttention,
+            &input.observation_window,
+            manifest,
+            scope,
+        )?;
     groups
         .overtrust_undertrust_and_recoverability_observations
         .validate(
