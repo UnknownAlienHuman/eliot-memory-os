@@ -189,15 +189,18 @@ impl PartitionedInner {
     /// capacity observation never takes two shapes.
     fn partition_observation(&self, class: CapacityClass) -> String {
         let (capacity, in_flight) = match class {
-            CapacityClass::NormalWorkload => {
-                (self.normal_capacity, self.normal_in_flight.load(Ordering::Acquire))
-            }
-            CapacityClass::ProtectedControl => {
-                (self.protected_capacity, self.protected_in_flight.load(Ordering::Acquire))
-            }
-            CapacityClass::EmergencyLastResort => {
-                (self.emergency_capacity, self.emergency_in_flight.load(Ordering::Acquire))
-            }
+            CapacityClass::NormalWorkload => (
+                self.normal_capacity,
+                self.normal_in_flight.load(Ordering::Acquire),
+            ),
+            CapacityClass::ProtectedControl => (
+                self.protected_capacity,
+                self.protected_in_flight.load(Ordering::Acquire),
+            ),
+            CapacityClass::EmergencyLastResort => (
+                self.emergency_capacity,
+                self.emergency_in_flight.load(Ordering::Acquire),
+            ),
         };
         format!(
             "front-door:{}:{} capacity {capacity} in-flight {in_flight}",
