@@ -17,10 +17,16 @@ Ordered plan (``PREPARATION_PLAN``):
    ``scripts/provision-surrealdb-release.py`` so project-local
    source/tag/OSV/candidate artifacts are materialized with digest pins.
    Never hand-authors locks or receipts.
-3. ``standalone_resolver_inputs`` (source scope): declare every standalone
-   workspace and its adjacent-lock readiness using the verifier's own
-   manifest discovery. Binding stays with the verifier's actual resolver;
-   no lock is generated or copied here.
+3. ``standalone_resolver_inputs`` (source scope): supply every standalone
+   workspace's lock/resolution evidence from actual resolution using the
+   verifier's own manifest discovery and resolver commands. A present
+   adjacent lock is digested as-is; a missing one is resolved by running
+   real ``cargo metadata --offline --all-features`` in that workspace, so
+   the adjacent lock is materialized by Cargo itself, never hand-authored,
+   copied from another workspace, or force-added. Binding stays with the
+   verifier's actual resolver; a genuinely unresolvable workspace stays
+   visibly missing (``TOOL_UNAVAILABLE``/incomplete wording), never PASS
+   and never fabricated.
 4. ``installed_observation`` (installed scope, reported-only): classify the
    workstation ``observed_path`` binary without requiring or copying it.
 5. ``advisory_expectation`` (declared): state the profile's advisory proof
@@ -99,7 +105,7 @@ PREPARATION_PLAN: tuple[dict, ...] = (
     },
     {
         "name": "standalone_resolver_inputs",
-        "owner": "verifier actual resolver (bind_nonmember_resolver_identity); preparation declares inputs only",
+        "owner": "verifier actual resolver (bind_nonmember_resolver_identity); preparation supplies actual-resolution lock evidence",
         "evidence_scope": SCOPE_SOURCE,
         "required_profiles": ("offline-source", "current-advisories"),
     },
@@ -268,8 +274,130 @@ def run_surrealdb_provisioner(root: Path) -> dict:
     )
 
 
+RESOLVER_METADATA_TIMEOUT_SECONDS = 120
+
+
+def _resolve_standalone_workspace(root: Path, workspace_dir: Path, relative_manifest: str) -> dict:
+    """Run actual Cargo resolution for a standalone workspace without a lock.
+
+    Issue #3004 AUD-5885520490-d5: standalone lock/resolution evidence must
+    come from a real ``cargo metadata`` graph, never hand-authored locks.
+    This runs the verifier's own resolver command offline in the workspace
+    directory; on success Cargo itself materializes the adjacent
+    ``Cargo.lock`` (a git-ignored local artifact, never force-added) and
+    the graph digest is recorded. This module writes, copies, or invents no
+    lock bytes: an unresolvable workspace returns an honest missing record
+    so the verifier keeps those edges ``source_only_incomplete``.
+    """
+    adjacent_lock = (workspace_dir / "Cargo.lock").relative_to(root).as_posix()
+    cargo = shutil.which("cargo")
+    rustc = shutil.which("rustc")
+    if not cargo or not rustc:
+        return {
+            "manifest": relative_manifest,
+            "adjacent_lock": adjacent_lock,
+            "lock_status": STATUS_MISSING,
+            "resolution": "not_attempted",
+            "detail": "cargo and rustc are unavailable on PATH (TOOL_UNAVAILABLE): "
+            "standalone actual resolution cannot run; edges stay source_only_incomplete",
+        }
+    resolver, resolver_source = vdp._effective_cargo_resolver(root, workspace_dir)
+    if resolver is None:
+        return {
+            "manifest": relative_manifest,
+            "adjacent_lock": adjacent_lock,
+            "lock_status": STATUS_MISSING,
+            "resolution": "not_attempted",
+            "detail": f"effective Cargo resolver is unknown ({resolver_source}); "
+            "actual resolution cannot run and edges stay source_only_incomplete",
+        }
+    manifest_path = workspace_dir / "Cargo.toml"
+    # NOTE: invoke the PATH shim by name; resolving it can follow a rustup
+    # shim to rustup.exe, which then runs the toolchain manager, not cargo.
+    argv = [
+        cargo,
+        "metadata",
+        "--format-version",
+        "1",
+        "--offline",
+        "--all-features",
+        "--manifest-path",
+        str(manifest_path),
+    ]
+    result = vdp._run_resolver_command(argv, workspace_dir, RESOLVER_METADATA_TIMEOUT_SECONDS)
+    if not result.get("ok"):
+        error = result.get("error") or result.get("stderr", "").strip() or f"cargo metadata exited {result.get('returncode')}"
+        return {
+            "manifest": relative_manifest,
+            "adjacent_lock": adjacent_lock,
+            "lock_status": STATUS_MISSING,
+            "resolution": "attempted",
+            "detail": "actual offline resolution failed; edges stay source_only_incomplete: "
+            f"{str(error)[:600]}",
+        }
+    try:
+        metadata = json.loads(
+            result.get("stdout", ""),
+            object_pairs_hook=vdp._json_object_without_duplicate_keys,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        return {
+            "manifest": relative_manifest,
+            "adjacent_lock": adjacent_lock,
+            "lock_status": STATUS_MISSING,
+            "resolution": "attempted",
+            "detail": f"actual resolver output is malformed ({type(exc).__name__}); "
+            "edges stay source_only_incomplete",
+        }
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("version") != 1
+        or not isinstance(metadata.get("packages"), list)
+    ):
+        return {
+            "manifest": relative_manifest,
+            "adjacent_lock": adjacent_lock,
+            "lock_status": STATUS_MISSING,
+            "resolution": "attempted",
+            "detail": "actual resolver output lacks the version-1 package graph; "
+            "edges stay source_only_incomplete",
+        }
+    lock_path = workspace_dir / "Cargo.lock"
+    if not lock_path.is_file() or lock_path.is_symlink():
+        return {
+            "manifest": relative_manifest,
+            "adjacent_lock": adjacent_lock,
+            "lock_status": STATUS_MISSING,
+            "resolution": "attempted",
+            "detail": "actual resolution succeeded but materialized no adjacent Cargo.lock; "
+            "edges stay source_only_incomplete",
+        }
+    try:
+        lock_digest = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        return {
+            "manifest": relative_manifest,
+            "adjacent_lock": adjacent_lock,
+            "lock_status": STATUS_MISSING,
+            "resolution": "attempted",
+            "detail": f"materialized adjacent lock cannot be read: {exc}",
+        }
+    return {
+        "manifest": relative_manifest,
+        "adjacent_lock": adjacent_lock,
+        "lock_status": STATUS_READY,
+        "resolution": "actual",
+        "lock_sha256": lock_digest,
+        "metadata_sha256": hashlib.sha256(result.get("stdout", "").encode("utf-8")).hexdigest(),
+        "resolver_version": resolver,
+        "resolver_source": resolver_source,
+        "resolved_package_count": len(metadata["packages"]),
+        "toolchain_inputs": vdp._resolver_toolchain_inputs(root, workspace_dir),
+    }
+
+
 def collect_standalone_resolver_inputs(root: Path) -> dict:
-    """Declare standalone workspace adjacent-lock readiness; generates nothing."""
+    """Supply standalone lock evidence from actual resolution; invent nothing."""
     try:
         manifests = vdp._cargo_manifest_paths(root)
     except (OSError, ValueError) as exc:
@@ -315,25 +443,20 @@ def collect_standalone_resolver_inputs(root: Path) -> dict:
                     "manifest": relative_manifest,
                     "adjacent_lock": lock_path.relative_to(root).as_posix(),
                     "lock_status": STATUS_READY,
+                    "resolution": "adjacent",
                     "lock_sha256": digest,
                 }
             )
         else:
-            missing += 1
-            workspaces.append(
-                {
-                    "manifest": relative_manifest,
-                    "adjacent_lock": lock_path.relative_to(root).as_posix(),
-                    "lock_status": STATUS_MISSING,
-                    "detail": "no adjacent checked-in Cargo.lock; the verifier's actual resolver "
-                    "will keep this edge source_only_incomplete (preparation generates no lock)",
-                }
-            )
+            record = _resolve_standalone_workspace(root, workspace_dir, relative_manifest)
+            if record.get("lock_status") != STATUS_READY:
+                missing += 1
+            workspaces.append(record)
     status = STATUS_READY if missing == 0 else STATUS_MISSING
     detail = (
-        f"{len(workspaces)} standalone workspaces, all adjacent locks present"
+        f"{len(workspaces)} standalone workspaces with lock evidence from adjacent locks or actual resolution"
         if missing == 0
-        else f"{len(workspaces)} standalone workspaces, {missing} without an adjacent lock; "
+        else f"{len(workspaces)} standalone workspaces, {missing} without lock/resolution evidence; "
         "resolver joins for those edges stay source_only_incomplete"
     )
     return _record("standalone_resolver_inputs", status, detail, {"workspaces": workspaces})
@@ -524,28 +647,68 @@ def run_self_tests() -> int:
     check("installed observation is reported-only", installed_step["required_profiles"] == ())
     check("installed observation is installed scope", installed_step["evidence_scope"] == SCOPE_INSTALLED)
 
-    # Case 4: standalone discovery reports a missing adjacent lock and writes nothing.
+    # Case 4: an unresolvable lockless workspace stays honestly missing and
+    # invents no lock bytes.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "Cargo.toml").write_text('[workspace]\nresolver = "3"\n', encoding="utf-8")
+        broken = root / "crates" / "demo-unresolvable"
+        broken.mkdir(parents=True)
+        (broken / "Cargo.toml").write_text(
+            '[package]\nname = "demo-unresolvable"\nversion = "0.1.0"\nedition = "2021"\n'
+            '[workspace]\n[dependencies]\nnonexistent-crate-for-d5-probe = "99.99.99"\n',
+            encoding="utf-8",
+        )
+        record = collect_standalone_resolver_inputs(root)
+        check("unresolvable standalone is missing", record["status"] == STATUS_MISSING)
+        check("discovery names the standalone manifest", any(
+            entry.get("manifest") == "crates/demo-unresolvable/Cargo.toml"
+            for entry in record.get("workspaces", [])
+        ))
+        check("failed resolution invents no lock", not (broken / "Cargo.lock").exists())
+        check("failed resolution is never ready", all(
+            entry.get("lock_status") != STATUS_READY
+            for entry in record.get("workspaces", [])
+            if entry.get("manifest") == "crates/demo-unresolvable/Cargo.toml"
+        ))
+
+    # Case 5: a resolvable lockless workspace gains its lock from real cargo
+    # resolution when the toolchain is present (TOOL_UNAVAILABLE otherwise).
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "Cargo.toml").write_text('[workspace]\nresolver = "3"\n', encoding="utf-8")
         standalone = root / "crates" / "demo-standalone"
         standalone.mkdir(parents=True)
+        (standalone / "src").mkdir()
+        (standalone / "src" / "lib.rs").write_text("", encoding="utf-8")
         (standalone / "Cargo.toml").write_text(
             '[package]\nname = "demo-standalone"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n',
             encoding="utf-8",
         )
-        before = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
         record = collect_standalone_resolver_inputs(root)
-        after = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
-        check("missing adjacent lock is missing", record["status"] == STATUS_MISSING)
-        check("discovery names the standalone manifest", any(
-            entry.get("manifest") == "crates/demo-standalone/Cargo.toml"
-            for entry in record.get("workspaces", [])
-        ))
-        check("discovery generates no lock", before == after)
-        check("discovery creates no Cargo.lock", not (standalone / "Cargo.lock").exists())
+        entry = next(
+            (item for item in record.get("workspaces", [])
+             if item.get("manifest") == "crates/demo-standalone/Cargo.toml"),
+            {},
+        )
+        if shutil.which("cargo") and shutil.which("rustc"):
+            check("actual resolution is ready", record["status"] == STATUS_READY)
+            check("actual resolution evidence is marked", entry.get("resolution") == "actual")
+            check(
+                "resolved lock is digested",
+                isinstance(entry.get("lock_sha256"), str) and bool(_HEX64.fullmatch(entry["lock_sha256"])),
+            )
+            check(
+                "resolution graph is digested",
+                isinstance(entry.get("metadata_sha256"), str) and bool(_HEX64.fullmatch(entry["metadata_sha256"])),
+            )
+            check("resolved lock exists adjacent", (standalone / "Cargo.lock").is_file())
+        else:
+            check("absent toolchain is missing", record["status"] == STATUS_MISSING)
+            check("absent toolchain names TOOL_UNAVAILABLE", "TOOL_UNAVAILABLE" in entry.get("detail", ""))
+            check("absent toolchain invents no lock", not (standalone / "Cargo.lock").exists())
 
-    # Case 5: installed observation outside the root is reported, never copied.
+    # Case 6: installed observation outside the root is reported, never copied.
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         manifest_data = {
@@ -563,7 +726,7 @@ def run_self_tests() -> int:
         check("installed observation keeps installed scope", record["evidence_scope"] == SCOPE_INSTALLED)
         check("classification copies no workstation state", before == after)
 
-    # Case 6: manifest readiness logic names missing required inputs.
+    # Case 7: manifest readiness logic names missing required inputs.
     ready_records = [
         _record("scanner", STATUS_READY, "ok"),
         _record("surrealdb_provisioner", STATUS_READY, "ok"),
@@ -584,7 +747,7 @@ def run_self_tests() -> int:
         payload = json.dumps(manifest, indent=2)
         check("manifest is JSON round-trippable", json.loads(payload)["schema"] == PREPARATION_SCHEMA)
 
-    # Case 7: advisory expectation differs by profile without fetching.
+    # Case 8: advisory expectation differs by profile without fetching.
     offline = declare_advisory_expectation("offline-source")
     current = declare_advisory_expectation("current-advisories")
     check("offline claims no current coverage", offline["current_advisory_claim"] is False)
@@ -592,7 +755,7 @@ def run_self_tests() -> int:
 
     if failures:
         return 1
-    print("DEPENDENCY_POLICY_PREPARATION_SELF_TEST: PASS (7/7 cases verified)")
+    print("DEPENDENCY_POLICY_PREPARATION_SELF_TEST: PASS (8/8 cases verified)")
     return 0
 
 

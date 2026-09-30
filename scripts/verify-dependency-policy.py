@@ -735,6 +735,67 @@ def _run_resolver_command(argv: list[str], cwd: Path, timeout_seconds: int) -> d
     }
 
 
+def _consume_standalone_preparation_binding(root: Path, workspace_dir: Path, lockfile: str) -> dict:
+    """Bind one adjacent standalone lock to its preparation resolution record.
+
+    Issue #3004 AUD-5885520490-d5, consumption only: the preparation
+    entrypoint supplies standalone lock evidence from actual resolution and
+    records each adjacent lock digest. This read-only consumption binds
+    that record to the lock the resolver is about to use. A well-formed
+    recorded digest that differs from the current lock means the input was
+    substituted or hand-edited after preparation, so loading fails closed
+    (missing/substituted/digest-mismatched input stays failed). A missing
+    or unreadable preparation record is not a verdict by itself: the locked
+    offline resolver below still decides. Nothing is generated, repaired,
+    or bypassed here.
+    """
+    binding: dict = {"status": "unrecorded", "lockfile": lockfile}
+    try:
+        manifest_rel = (workspace_dir / "Cargo.toml").resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return binding
+    binding["manifest"] = manifest_rel
+    try:
+        lock_digest = sha256_file(root / Path(lockfile))
+    except OSError:
+        return binding
+    binding["adjacent_lock_sha256"] = lock_digest
+    try:
+        raw = (root / Path(PREPARATION_MANIFEST_DEFAULT)).read_text(encoding="utf-8")
+        preparation = json.loads(raw, object_pairs_hook=_json_object_without_duplicate_keys)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return binding
+    inputs = preparation.get("inputs") if isinstance(preparation, dict) else None
+    step = next(
+        (item for item in inputs if isinstance(item, dict) and item.get("input") == "standalone_resolver_inputs"),
+        None,
+    ) if isinstance(inputs, list) else None
+    entries = step.get("workspaces") if isinstance(step, dict) else None
+    entry = next(
+        (
+            item for item in entries
+            if isinstance(item, dict)
+            and item.get("manifest") == manifest_rel
+            and item.get("adjacent_lock") == lockfile
+        ),
+        None,
+    ) if isinstance(entries, list) else None
+    if not isinstance(entry, dict):
+        return binding
+    recorded = entry.get("lock_sha256")
+    if not isinstance(recorded, str) or not _HEX64.fullmatch(recorded):
+        return binding
+    if recorded.lower() != lock_digest.lower():
+        binding["status"] = "mismatched"
+        binding["recorded_lock_sha256"] = recorded.lower()
+        return binding
+    binding["status"] = "matched"
+    binding["resolution"] = entry.get("resolution")
+    if isinstance(entry.get("metadata_sha256"), str):
+        binding["metadata_sha256"] = entry["metadata_sha256"]
+    return binding
+
+
 def _load_nonmember_resolver_metadata(
     root: Path, workspace_dir: Path, lockfile: str
 ) -> tuple[dict, dict | None, str | None]:
@@ -794,6 +855,19 @@ def _load_nonmember_resolver_metadata(
     if not rustc_version.get("ok") or not rustc_version.get("stdout", "").strip():
         evidence["status"] = "rustc_version_failed"
         return evidence, None, "rustc --version --verbose did not return a successful tool identity"
+
+    preparation_binding = _consume_standalone_preparation_binding(root, workspace_dir, lockfile)
+    evidence["preparation_lock_binding"] = preparation_binding
+    if preparation_binding.get("status") == "mismatched":
+        evidence["status"] = "lock_substituted"
+        return (
+            evidence,
+            None,
+            "adjacent Cargo.lock does not match the preparation actual-resolution record "
+            f"(recorded {preparation_binding.get('recorded_lock_sha256')}, "
+            f"observed {preparation_binding.get('adjacent_lock_sha256')}); "
+            "a substituted or hand-edited lock stays failed",
+        )
 
     manifest = workspace_dir / "Cargo.toml"
     argv = [
