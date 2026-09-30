@@ -251,11 +251,23 @@ pub enum BrokerAdmissionRefusal {
     /// set granted by the redeemed Kernel-backed binding.
     #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
     HumanCapabilityNotGranted,
-    /// A state-changing request carries no exact Kernel-canonicalized
-    /// approval hash, carries a malformed one, or names a different hash
-    /// than the one already bound to the same operation.
+    /// A state-changing request carries no approval hash, or carries one that
+    /// is not an exact lowercase SHA-256 value.
     #[error("BROKER_APPROVAL_HASH_REQUIRED")]
     HumanApprovalRequired,
+    /// A state-changing request carried a well-formed approval hash that this
+    /// broker cannot prove is the approved one.
+    ///
+    /// I11.3 binds an approval to one exact Critical action hash, so the
+    /// receiving side has to compare the presented approval against a digest of
+    /// the action it is about to perform. That digest is the authority owner's
+    /// to mint (`eliot-authority` owns `ActionContract`, `ImpactClass` and
+    /// `ApprovalReference`), and a broker with no independently obtained digest
+    /// has no right-hand side for that comparison. Accepting the presented
+    /// string on its shape would compare the approval against itself, so the
+    /// request is refused here instead.
+    #[error("BROKER_APPROVAL_ACTION_DIGEST_UNVERIFIABLE")]
+    HumanApprovalActionDigestUnverifiable,
     /// A broker-generation cutover stopped because termination of the
     /// superseded generation's Job Object is not proven, so the candidate is
     /// not marked active and the transition requires reconciliation. The
@@ -312,6 +324,9 @@ impl BrokerAdmissionRefusal {
             Self::OperatorClientProcessForeign => "BROKER_OPERATOR_CLIENT_PROCESS_FOREIGN",
             Self::HumanPrincipalRequired => "BROKER_HUMAN_PRINCIPAL_REQUIRED",
             Self::HumanApprovalRequired => "BROKER_APPROVAL_HASH_REQUIRED",
+            Self::HumanApprovalActionDigestUnverifiable => {
+                "BROKER_APPROVAL_ACTION_DIGEST_UNVERIFIABLE"
+            }
             Self::CutoverRequiresReconciliation => "CUTOVER_REQUIRES_RECONCILIATION",
             Self::CutoverPreconditionUnmet => "CUTOVER_PRECONDITION_UNMET",
             Self::CutoverSessionGone => "CUTOVER_SESSION_GONE",
@@ -376,8 +391,13 @@ pub struct HumanStateAuthority {
     /// Requested capabilities; every entry must have been granted by the
     /// redeemed binding — a capability outside the grant is refused.
     pub capabilities: Vec<String>,
-    /// Exact Kernel-canonicalized approval hash (lowercase SHA-256) for the
-    /// critical action this request performs.
+    /// Approval hash (lowercase SHA-256) claimed for the critical action this
+    /// request performs.
+    ///
+    /// This is a *claim*, never a proof. It is admitted only by being compared
+    /// against an action digest this broker obtains independently of this
+    /// message; see [`BrokerComposition::admit_human_state_change`]. A value
+    /// that is only well-formed is refused, not admitted.
     pub approval_hash: String,
     /// Live Kernel session token this request is bound to.
     pub kernel_session_token: String,
@@ -1277,12 +1297,6 @@ pub struct BrokerComposition {
     /// never a local mint: a composition without it issues no session token,
     /// so no handoff is challengeable.
     kernel_authority: Option<KernelAuthorityPort>,
-    /// Exact approval hashes bound to broker state-changing operations,
-    /// keyed by operation identity (launch idempotency key or control
-    /// operation id). One operation owns exactly one approved hash: a
-    /// conflicting hash for the same operation is refused. Process-memory
-    /// only, alongside the session bindings above.
-    approval_bindings: BTreeMap<String, String>,
     /// Broker-retained normal Notify launch authority: the verified installed
     /// `eliot-notify.exe` reference resolved from the installer-published
     /// declaration at startup. This is what makes the notification adapter
@@ -1512,7 +1526,6 @@ impl BrokerComposition {
             identity_issuer: issuer,
             operator_session_bindings: BTreeMap::new(),
             kernel_authority,
-            approval_bindings: BTreeMap::new(),
             notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
                 reason: "NOT_STAGED",
             }),
@@ -2384,9 +2397,12 @@ impl BrokerComposition {
     /// * the presented role/capabilities must be covered by a redeemed
     ///   Kernel-backed binding for that live session (capability expansion
     ///   refused);
-    /// * the presented approval hash must be one exact lowercase SHA-256,
-    ///   and an operation owns exactly one hash: a conflicting hash for the
-    ///   same `operation_key` is refused.
+    /// * the presented approval hash must be one exact lowercase SHA-256 *and*
+    ///   must be provably the digest of the action this broker performs. A hash
+    ///   that is merely well-formed is refused: this broker holds no
+    ///   independently derived authority action digest, so it admits no
+    ///   Critical state change rather than admitting one on the strength of a
+    ///   64-character string.
     pub fn admit_human_state_change(
         &mut self,
         authority: Option<&HumanStateAuthority>,
@@ -2456,16 +2472,45 @@ impl BrokerComposition {
                 ),
             );
         }
-        if let Some(bound) = self.approval_bindings.get(operation_key)
-            && bound != &authority.approval_hash
-        {
-            return Err(BrokerAdmissionRefusal::HumanApprovalRequired.with_platform(
-                "state-changing request approval hash conflicts with the hash bound to this operation",
-            ));
-        }
-        self.approval_bindings
-            .insert(operation_key.to_owned(), authority.approval_hash.clone());
-        Ok(())
+        // Authenticity of the approval, which is the last thing still missing
+        // from this gate. Everything above proves *who* is asking; none of it
+        // proves *what was approved*. I11.3 gives the Approver exactly one
+        // thing to decide — one exact Critical action hash — so the receiving
+        // side has to compare the presented hash against a digest of the action
+        // it is about to perform, obtained without reference to the approval
+        // that travelled with the request.
+        //
+        // This broker holds no such digest and cannot mint one:
+        //
+        // * `ActionContract`, `ImpactClass` and `ApprovalReference` are owned
+        //   by `crates/governor/eliot-authority`, which is not a dependency of
+        //   this composition (`config/architecture-boundaries.toml` and
+        //   `bins/AGENTS.md` keep authority semantics out of a composition
+        //   binary), so the approved-action digest cannot be computed here.
+        // * Recomputing a digest from the request being admitted would compare
+        //   the approval against the very bytes it arrived with — the same
+        //   defect as a shape check, wearing a hash function — and the
+        //   `LaunchGrant.request_digest` that `authorize_launch` returns is
+        //   minted only once the launch is already being dispatched, and covers
+        //   the request rather than the A10.3 action, so it is neither
+        //   available at this gate nor the value I11.3 approves.
+        //
+        // With no right-hand side for the comparison, a well-formed 64-hex
+        // string is not an approval. The request is therefore refused by name
+        // here, which is the honest state: this broker cannot yet admit a
+        // Critical state change, and says so instead of admitting one.
+        //
+        // This refusal is strictly stronger than the per-operation immutability
+        // check it replaces. That check could only ever fire for a *second*,
+        // differing hash on an already-admitted operation, and it admitted the
+        // first one on shape alone; refusing every unverifiable hash admits
+        // strictly less, and the shape/identity refusals above it are
+        // untouched and still fire first, each with its own cause.
+        Err(
+            BrokerAdmissionRefusal::HumanApprovalActionDigestUnverifiable.with_platform(
+                "this broker holds no independently derived authority action digest, so the presented approval hash cannot be proven to be the approved one",
+            ),
+        )
     }
 
     /// The installation-approved Operator image from the retained protected
