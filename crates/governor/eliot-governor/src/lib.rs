@@ -71,6 +71,7 @@ pub use cue_composition::{
 // a composition descendant, because it needs no private composition field: it
 // derives identity from the Kernel-issued attempt and the admitted request
 // identity, and persists nothing.
+pub use composition::{CommittedCoordinationResult, CoordinationCommitError};
 pub use coordination_work_identity::{
     COORDINATION_RESULT_ARTIFACT_NAMESPACE, COORDINATION_RESULT_NAMESPACE,
     COORDINATION_WORK_IDENTITY_REVISION, COORDINATION_WORK_ITEM_NAMESPACE,
@@ -79,7 +80,6 @@ pub use coordination_work_identity::{
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
-pub use coordination_owner_commit::{CommittedCoordinationResult, CoordinationCommitError};
 // The coordination owner commit entry is reached from the daemon composition
 // root, which has no `eliot-coordination` dependency edge. Re-exporting the
 // exact owner request/response types keeps that dependency graph unchanged
