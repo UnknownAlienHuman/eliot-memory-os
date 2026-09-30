@@ -15,10 +15,11 @@ use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass,
-    RedbInstallationRegistry, RedbInstallationTransactionStore, WindowsInstallationCoordinator,
-    parse_installation_transaction_id, post_bootstrap_rejection_pending_ref,
-    require_published_source_bundle_journal, validate_installation_transaction_json,
+    InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass, ProfileRootAnchors,
+    ProfileSelectionInput, RedbInstallationRegistry, RedbInstallationTransactionStore,
+    WindowsInstallationCoordinator, parse_installation_transaction_id,
+    post_bootstrap_rejection_pending_ref, require_published_source_bundle_journal,
+    validate_installation_transaction_json,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_live_canary::{
@@ -285,6 +286,20 @@ enum InstallationCommand {
         #[arg(long)]
         transaction_id: String,
     },
+    /// Run an applied `PortableDev` profile in this foreground process.
+    ///
+    /// The current-user Host remains inside a kill-on-close Job owned by this
+    /// command. Ctrl+C closes the owner and terminates the contained tree.
+    /// This command reports `PENDING_RUNTIME` because process launch is not an
+    /// authenticated Host readiness receipt.
+    RunPortableDev {
+        /// Absolute path to an existing transaction redb file.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Stable transaction identity retained in the durable store.
+        #[arg(long)]
+        transaction_id: String,
+    },
     /// Read the existing approved-generation registry without changing it.
     #[command(alias = "open")]
     Status {
@@ -294,6 +309,46 @@ enum InstallationCommand {
         /// Bounded deadline in milliseconds from now (default 2000).
         #[arg(long, default_value = "2000")]
         deadline_ms: u64,
+    },
+    /// Resolve the I3.1 layout for one explicitly selected profile, read-only.
+    ///
+    /// Reports the selected profile, its four resolved root roles, its
+    /// supervision type, its enforced/unsupported guarantees, and the
+    /// structural proof that a non-service selection requires no SCM,
+    /// administrative authority or `ProgramData` anchor. Creates nothing, reserves
+    /// no service, and mutates nothing. An invalid profile, a missing or
+    /// ambiguous anchor, or a write into the versioned immutable binaries root
+    /// is a typed refusal.
+    ResolveProfile {
+        /// Explicit installation profile (`system_service`, `user_mode`, or `portable_dev`).
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        /// Absolute OS-validated profile anchor root: `%ProgramData%` for
+        /// `system_service`, `%LocalAppData%` for `user_mode`, and the
+        /// retained repository root for `portable_dev`.
+        #[arg(long, value_parser = absolute_path)]
+        profile_anchor_root: PathBuf,
+        /// Lowercase SHA-256 installation key; required for `system_service`
+        /// and `user_mode`, refused for `portable_dev`.
+        #[arg(long)]
+        installation_key: Option<String>,
+        /// Component name for the versioned immutable root of the Windows profiles.
+        #[arg(long)]
+        component: String,
+        /// Component version for the versioned immutable root of the Windows profiles.
+        #[arg(long)]
+        version: String,
+        /// Immutable-root generation for `portable_dev`; required only there.
+        #[arg(long)]
+        generation: Option<String>,
+        /// Absolute immutable source-bundle directory the plan would consume.
+        /// Checked against the versioned immutable binaries root.
+        #[arg(long, value_parser = absolute_path)]
+        source_root: PathBuf,
+        /// Absolute immutable staging destination the plan would use.
+        /// Checked against the versioned immutable binaries root.
+        #[arg(long, value_parser = absolute_path)]
+        staging_root: PathBuf,
     },
     /// Report the unsupported canary-removal seam without mutating the machine.
     RemoveCanary {
@@ -354,6 +409,12 @@ enum InstallationCommand {
         store: PathBuf,
         #[arg(long)]
         generation: String,
+        /// I3.1 versioned immutable-root component name.
+        #[arg(long)]
+        component: String,
+        /// I3.1 versioned immutable-root component version.
+        #[arg(long)]
+        version: String,
         #[arg(long)]
         installation: String,
         #[arg(long)]
@@ -2086,6 +2147,29 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             store,
             transaction_id,
         } => run_installation_effect(&store, &transaction_id, true),
+        InstallationCommand::RunPortableDev {
+            store,
+            transaction_id,
+        } => run_portable_dev_foreground(&store, &transaction_id),
+        InstallationCommand::ResolveProfile {
+            profile,
+            profile_anchor_root,
+            installation_key,
+            component,
+            version,
+            generation,
+            source_root,
+            staging_root,
+        } => run_installation_resolve_profile(ResolveProfileRequest {
+            profile,
+            profile_anchor_root,
+            installation_key,
+            component,
+            version,
+            generation,
+            source_root,
+            staging_root,
+        }),
         InstallationCommand::Status {
             host_state_root,
             deadline_ms,
@@ -2129,6 +2213,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             output,
             store,
             generation,
+            component,
+            version,
             installation,
             lineage_id,
             sequence,
@@ -2156,6 +2242,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             output,
             store,
             generation,
+            component,
+            version,
             installation,
             lineage_id,
             sequence,
@@ -2397,9 +2485,7 @@ fn write_generation_output_reconciliation(reconciliation: &GenerationOutputRecon
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_installation_generate(
     source_root: PathBuf,
-    profile: InstallationProfile,
-    profile_anchor_root: PathBuf,
-    installation_key: Option<String>,
+    profile_selection: ProfileSelectionInput,
     installation: String,
     lineage_id: String,
     sequence: u64,
@@ -2421,11 +2507,9 @@ fn run_installation_generate(
                 lineage_id: cli_handle(lineage_id, "lineage_id")?,
                 sequence,
             },
-            profile,
-            profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
-            installation_key: installation_key
-                .map(|value| cli_handle(value, "installation_key"))
-                .transpose()?,
+            profile: profile_selection.profile,
+            profile_anchor_root: profile_selection.profile_anchor_root.clone(),
+            installation_key: profile_selection.installation_key.clone(),
             generation: cli_handle(generation, "generation")?,
             source_root: cli_path_handle(&source_root, "source_root")?,
             staging_root: cli_path_handle(&staging_root, "staging_root")?,
@@ -2436,6 +2520,7 @@ fn run_installation_generate(
         output,
         store_path,
         source_publication,
+        &profile_selection,
         write_transaction_artifact,
     )
 }
@@ -2445,13 +2530,17 @@ fn run_installation_generate_with_output_writer<F>(
     output: PathBuf,
     store_path: PathBuf,
     source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
+    profile_selection: &ProfileSelectionInput,
     write_output: F,
 ) -> Result<InstallationGenerationOutcome>
 where
     F: FnOnce(&Path, &InstallationTransaction) -> Result<(), std::io::Error>,
 {
-    let transaction = match GenerationPackagePlanner::plan_with_source_publication_binding(
+    let transaction = match GenerationPackagePlanner::plan_with_published_profile_binding(
         input,
+        profile_selection,
+        &source_publication.profile_governed_roots,
+        source_publication.retained_profile_anchor,
         source_publication.source_identity,
         source_publication.files,
         source_publication.evidence_digest,
@@ -2505,6 +2594,11 @@ where
             reconciliation,
         ));
     }
+    // I3.1: report the selected profile, its resolved root roles, its
+    // supervision type and its enforced/unsupported guarantees. The value is
+    // rehydrated from the binding this transaction durably records, so the
+    // report is the recorded selection rather than a fresh resolution.
+    let profile_governance = installation_profile_governance_projection(&transaction);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -2514,6 +2608,7 @@ where
             "transaction_id": transaction.transaction_id,
             "generation": transaction.candidate_manifest.generation,
             "profile": transaction.profile,
+            "profile_governance": profile_governance,
             "effect_count": transaction.effect_progress().len(),
             "package_file_count": transaction
                 .installer_effects
@@ -2637,6 +2732,8 @@ fn run_installation_materialize_source_bundle(
     output: PathBuf,
     store: PathBuf,
     generation: String,
+    component: String,
+    version: String,
     installation: String,
     lineage_id: String,
     sequence: u64,
@@ -2650,6 +2747,17 @@ fn run_installation_materialize_source_bundle(
     agent_bridge_exe: Option<PathBuf>,
     agent_bridge_account: Option<String>,
 ) -> Result<i32> {
+    let profile_selection = profile_selection_input(ResolveProfileRequest {
+        profile,
+        profile_anchor_root: profile_anchor_root.clone(),
+        installation_key: installation_key.clone(),
+        component,
+        version,
+        generation: (profile == InstallationProfile::PortableDev).then(|| generation.clone()),
+        source_root: output_bundle.clone(),
+        staging_root: staging_root.clone(),
+    })?;
+    let profile_anchor_path = PathBuf::from(profile_selection.profile_anchor_root.as_str());
     let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
         eliot_host_exe: eliot_host,
         eliot_watchdog_exe: eliot_watchdog,
@@ -2673,17 +2781,26 @@ fn run_installation_materialize_source_bundle(
             lineage_id: cli_handle(lineage_id.clone(), "lineage_id")?,
             sequence,
         },
-        profile,
-        profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
-        installation_key: installation_key
-            .clone()
-            .map(|value| cli_handle(value, "installation_key"))
-            .transpose()?,
+        profile_selection: profile_selection.clone(),
         transaction_id: cli_handle(transaction_id.clone(), "transaction_id")?,
-        staging_root: cli_path_handle(&staging_root, "staging_root")?,
+        staging_root: profile_selection.staging_root.clone(),
     };
+    let (profile_anchor_identity, profile_anchor_handle) =
+        eliot_platform_windows::open_no_follow_directory(&profile_anchor_path)
+        .map_err(|error| {
+            anyhow::anyhow!("retain the selected profile anchor before source materialization: {error}")
+        })?;
+    verify_retained_profile_anchor(
+        &profile_anchor_path,
+        &profile_anchor_handle,
+        profile_anchor_identity,
+    )?;
     let receipt =
-        match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {
+        match source_bundle_materializer::materialize_canary_source_bundle_with_retained_profile_anchor(
+            &materialize_input,
+            &profile_anchor_handle,
+            profile_anchor_identity,
+        ) {
             Ok(source_bundle_materializer::CanarySourceBundleMaterializeOutcome::Published(
                 receipt,
             )) => receipt,
@@ -2692,6 +2809,18 @@ fn run_installation_materialize_source_bundle(
                     reconciliation,
                 ),
             ) => {
+                if reconciliation.selected_profile_anchor_identity != profile_anchor_identity
+                    || !eliot_platform_windows::windows_paths_equal(
+                        Path::new(&reconciliation.selected_profile_anchor_path),
+                        &profile_anchor_path,
+                    )
+                {
+                    write_installation_error(
+                        "SOURCE_BUNDLE_MATERIALIZATION_RECOVERY_REQUIRED",
+                        "publication reconciliation differs from the retained selected profile anchor; preserve the journal and reconcile without retry",
+                    );
+                    return Ok(UNKNOWN_OUTCOME_EXIT);
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
@@ -2718,14 +2847,37 @@ fn run_installation_materialize_source_bundle(
                 return Ok(INVALID_REQUEST_EXIT);
             }
         };
+    if receipt.selected_profile_anchor_identity != profile_anchor_identity
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&receipt.selected_profile_anchor_path),
+            &profile_anchor_path,
+        )
+    {
+        write_installation_error(
+            "SOURCE_BUNDLE_MATERIALIZATION_RECOVERY_REQUIRED",
+            "published source receipt differs from the retained selected profile anchor; preserve the publication journal and reconcile before retry",
+        );
+        return Ok(UNKNOWN_OUTCOME_EXIT);
+    }
+    if let Err(error) = verify_retained_profile_anchor(
+        &profile_anchor_path,
+        &profile_anchor_handle,
+        profile_anchor_identity,
+    ) {
+        write_installation_error(
+            "SOURCE_BUNDLE_MATERIALIZATION_RECOVERY_REQUIRED",
+            &format!(
+                "selected profile anchor identity changed after source publication: {error}"
+            ),
+        );
+        return Ok(UNKNOWN_OUTCOME_EXIT);
+    }
     let source_publication = receipt.planner_binding()?;
     let agent_bridge_source =
         source_bundle_materializer::bridge_source_plan_for_receipt(&materialize_input, &receipt)?;
     let generated = run_installation_generate(
         output_bundle,
-        profile,
-        profile_anchor_root,
-        installation_key,
+        profile_selection,
         installation,
         lineage_id,
         sequence,
@@ -2739,6 +2891,19 @@ fn run_installation_materialize_source_bundle(
         source_publication,
         agent_bridge_source,
     )?;
+    if let Err(error) = verify_retained_profile_anchor(
+        &profile_anchor_path,
+        &profile_anchor_handle,
+        profile_anchor_identity,
+    ) {
+        write_installation_error(
+            "INSTALLATION_GENERATION_RECOVERY_REQUIRED",
+            &format!(
+                "selected profile anchor identity changed after durable generation planning: {error}"
+            ),
+        );
+        return Ok(UNKNOWN_OUTCOME_EXIT);
+    }
     match generated {
         InstallationGenerationOutcome::Generated {
             transaction_id,
@@ -2785,6 +2950,24 @@ fn run_installation_create(_input: &Path, _store_path: &Path) -> i32 {
     INVALID_REQUEST_EXIT
 }
 
+fn verify_retained_profile_anchor(
+    expected_path: &Path,
+    retained_handle: &std::fs::File,
+    expected_identity: FileIdentity,
+) -> Result<()> {
+    let retained_identity =
+        eliot_platform_windows::file_identity_for_open_handle(retained_handle)
+            .map_err(|error| anyhow::anyhow!("inspect retained profile anchor handle: {error}"))?;
+    let (path_identity, path_handle) =
+        eliot_platform_windows::open_no_follow_directory(expected_path)
+            .map_err(|error| anyhow::anyhow!("reopen selected profile anchor without following reparse points: {error}"))?;
+    drop(path_handle);
+    if retained_identity != expected_identity || path_identity != expected_identity {
+        anyhow::bail!("selected profile anchor path no longer names the retained directory object");
+    }
+    Ok(())
+}
+
 fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> Result<i32> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
     if std::time::Instant::now() >= deadline {
@@ -2795,27 +2978,47 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    let runtime_health = match load_authenticated_kernel_runtime_health() {
-        Ok(runtime_health) => runtime_health,
-        Err(error) => {
-            let (code, detail) = match error {
-                AuthenticatedRuntimeHealthError::Unavailable(detail) => {
-                    ("KERNEL_RUNTIME_HEALTH_UNAVAILABLE", detail)
-                }
-                AuthenticatedRuntimeHealthError::Invalid(detail) => {
-                    ("KERNEL_RUNTIME_HEALTH_INVALID", detail)
-                }
-            };
-            write_runtime_status_error(code, &detail, false);
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    match eliot_runtime_status::collect_status_with_kernel_health(
-        host_state_root,
-        deadline,
-        &runtime_health,
-    ) {
-        Ok(report) => {
+    match eliot_runtime_status::collect_status(host_state_root, deadline) {
+        Ok(mut report) => {
+            if report
+                .active_profile_governed_roots
+                .as_ref()
+                .is_some_and(|roots| {
+                    roots.runtime_state_roots.profile == InstallationProfile::SystemService
+                })
+            {
+                let runtime_health = match load_authenticated_kernel_runtime_health() {
+                    Ok(runtime_health) => runtime_health,
+                    Err(error) => {
+                        let (code, detail) = match error {
+                            AuthenticatedRuntimeHealthError::Unavailable(detail) => {
+                                ("KERNEL_RUNTIME_HEALTH_UNAVAILABLE", detail)
+                            }
+                            AuthenticatedRuntimeHealthError::Invalid(detail) => {
+                                ("KERNEL_RUNTIME_HEALTH_INVALID", detail)
+                            }
+                        };
+                        write_runtime_status_error(code, &detail, false);
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                report.runtime_health = Some(
+                    eliot_runtime_status::project_runtime_health(&runtime_health)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                );
+            }
+            let active_profile_governance =
+                report.active_profile_governed_roots.as_ref().map(|roots| {
+                    let profile = roots.runtime_state_roots.profile;
+                    eliot_installation::ProfileGovernedRoots {
+                        profile,
+                        immutable_binaries: roots.immutable_binaries.clone(),
+                        durable_data: roots.durable_data.clone(),
+                        user_config: roots.user_config.clone(),
+                        user_cache: roots.user_cache.clone(),
+                    }
+                    .governance_report()
+                });
             let status_code = if report.status == "RUNTIME_LIVE" {
                 "RUNTIME_LIVE"
             } else {
@@ -2830,6 +3033,10 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
                     "status": status_code,
                     "host_state_root": report.host_state_root,
                     "active_generation": report.active_generation,
+                    "active_profile_governed_roots": report.active_profile_governed_roots,
+                    "active_profile_governance": active_profile_governance,
+                    "active_profile_root_binding": report.active_profile_root_binding,
+                    "active_profile_supervision": report.active_profile_supervision,
                     "last_known_good_generation": report.last_known_good_generation,
                     "generations": report.generations,
                     "host_journal": {
@@ -3113,6 +3320,741 @@ fn validate_installation_runtime_preflight(
     )
 }
 
+fn record_or_validate_profile_selection_receipt(
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+) -> std::result::Result<InstallationTransaction, InstallationError> {
+    if transaction.profile != InstallationProfile::UserMode
+        && transaction.profile != InstallationProfile::PortableDev
+    {
+        return Ok(transaction.clone());
+    }
+    let request = eliot_installation::profile_root_request_for_launch(
+        &transaction.candidate_manifest.runtime_launch,
+    )?;
+    let leases = eliot_platform_windows::profile_supervision::open_profile_root_leases(&request)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let current = leases.selection().clone();
+    validate_retained_profile_anchor_selection(transaction, &current)?;
+    if let Some(original) = transaction.profile_selection_receipt() {
+        let matches = eliot_installation::profile_selection_receipts_match_retained_roots(
+            original, &current,
+        )?;
+        if !matches {
+            return Err(InstallationError::IdentityConflict);
+        }
+        leases
+            .verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        return Ok(transaction.clone());
+    }
+    eliot_installation::verify_profile_effect_identities_before_selection(transaction)?;
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let recorded = RedbInstallationTransactionStore::record_profile_selection_receipt_at_exact_path(
+        store_path,
+        &transaction.transaction_id,
+        current,
+    )?;
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    if recorded.profile_selection_receipt().is_none() {
+        return Err(InstallationError::IncompleteObservation(
+            "profile root identities were not retained in the durable transaction".to_owned(),
+        ));
+    }
+    Ok(recorded)
+}
+
+fn validate_retained_profile_anchor_selection(
+    transaction: &InstallationTransaction,
+    selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+) -> std::result::Result<(), InstallationError> {
+    let retained = transaction.retained_profile_anchor().ok_or_else(|| {
+        InstallationError::MigrationRequired {
+            reason: "transaction has no source-publication-time profile anchor identity".to_owned(),
+        }
+    })?;
+    let expected_path = Path::new(retained.canonical_path.as_str());
+    let descriptor_anchor = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .profile_anchor_root
+            .as_str(),
+    );
+    let Some(observation) = selection
+        .roots
+        .iter()
+        .find(|root| root.role == "runtime_state_roots.profile_anchor_root")
+    else {
+        return Err(InstallationError::IncompleteObservation(
+            "live profile selection omitted the profile anchor root identity".to_owned(),
+        ));
+    };
+    if !eliot_platform_windows::windows_paths_equal(expected_path, descriptor_anchor)
+        || !eliot_platform_windows::windows_paths_equal(&observation.canonical_path, expected_path)
+        || observation.identity != retained.identity
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(())
+}
+
+fn revalidate_recorded_profile_selection_receipt(
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+) -> std::result::Result<InstallationTransaction, InstallationError> {
+    if uses_user_owned_supervision(transaction.profile)
+        && transaction.profile_selection_receipt().is_none()
+    {
+        return Err(InstallationError::IncompleteObservation(
+            "original current-user profile root selection receipt is missing".to_owned(),
+        ));
+    }
+    record_or_validate_profile_selection_receipt(store_path, transaction)
+}
+
+#[cfg(windows)]
+fn run_portable_dev_foreground(store_path: &Path, raw_transaction_id: &str) -> Result<i32> {
+    let transaction_id = match parse_installation_transaction_id(raw_transaction_id) {
+        Ok(transaction_id) => transaction_id,
+        Err(error) => {
+            write_installation_error("PORTABLE_DEV_RUN_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            write_installation_error("PORTABLE_DEV_RUN_UNAVAILABLE", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let Some(transaction) = store.load(&transaction_id)? else {
+        write_installation_error(
+            "PORTABLE_DEV_RUN_NOT_FOUND",
+            "transaction is not present in the exact supplied store",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    };
+    if transaction.profile != InstallationProfile::PortableDev
+        || transaction.stage() != InstallationStage::ActiveVerified
+        || transaction.effect_progress().iter().any(|progress| {
+            !matches!(
+                progress.state,
+                eliot_installation::InstallationEffectProgressState::Applied { .. }
+            )
+        })
+    {
+        write_installation_error(
+            "PORTABLE_DEV_RUN_NOT_READY",
+            "foreground supervision requires an ActiveVerified PortableDev transaction with every durable effect Applied",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    let transaction = match revalidate_recorded_profile_selection_receipt(store_path, &transaction)
+    {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            write_installation_error(
+                "PORTABLE_DEV_RUN_RECOVERY_REQUIRED",
+                &format!("retained PortableDev root selection changed: {error}"),
+            );
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+    };
+    let Some(selection) = transaction.profile_selection_receipt() else {
+        write_installation_error(
+            "PORTABLE_DEV_RUN_RECOVERY_REQUIRED",
+            "PortableDev original root selection receipt is missing",
+        );
+        return Ok(UNKNOWN_OUTCOME_EXIT);
+    };
+    let host = match eliot_host::ProfileSupervisorJob::launch(
+        &transaction.candidate_manifest.runtime_launch,
+        selection,
+    ) {
+        Ok(host) => host,
+        Err(error) => {
+            write_installation_error(
+                "PORTABLE_DEV_RUN_REJECTED",
+                &format!("contained Host launch was rejected: {error}"),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    print_portable_dev_foreground_state(
+        "PENDING_RUNTIME",
+        "foreground Host is contained; readiness was not inspected",
+        None,
+    )?;
+    run_portable_dev_host_until_exit(host)
+}
+
+#[cfg(windows)]
+fn run_portable_dev_host_until_exit(host: eliot_host::ProfileSupervisorJob) -> Result<i32> {
+    loop {
+        match host.observe() {
+            Ok(eliot_platform_windows::RunningJobObservation::Running { .. }) => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Ok(eliot_platform_windows::RunningJobObservation::Exited { exit_code }) => {
+                if let Err(error) = host.stop() {
+                    write_installation_error(
+                        "PORTABLE_DEV_RUN_RECOVERY_REQUIRED",
+                        &format!(
+                            "Host exited with code {exit_code}, but its contained Job could not be reaped: {error}"
+                        ),
+                    );
+                    return Ok(UNKNOWN_OUTCOME_EXIT);
+                }
+                print_portable_dev_foreground_state(
+                    "PENDING_RUNTIME",
+                    "foreground Host exited; authenticated readiness remains unproven",
+                    Some(exit_code),
+                )?;
+                return Ok(if exit_code == 0 { 0 } else { UNKNOWN_OUTCOME_EXIT });
+            }
+            Ok(eliot_platform_windows::RunningJobObservation::RootExited {
+                exit_code,
+                active_processes,
+            }) => {
+                if let Err(error) = host.stop() {
+                    write_installation_error(
+                        "PORTABLE_DEV_RUN_RECOVERY_REQUIRED",
+                        &format!(
+                            "Host root exited with code {exit_code} while {active_processes} Job members remained, and the Job could not be reaped: {error}"
+                        ),
+                    );
+                    return Ok(UNKNOWN_OUTCOME_EXIT);
+                }
+                print_portable_dev_foreground_state(
+                    "PENDING_RUNTIME",
+                    &format!(
+                        "Host root exited with {active_processes} contained process(es) remaining; the Job was stopped and reaped"
+                    ),
+                    Some(exit_code),
+                )?;
+                return Ok(UNKNOWN_OUTCOME_EXIT);
+            }
+            Err(error) => {
+                let cleanup = host.stop();
+                write_installation_error(
+                    "PORTABLE_DEV_RUN_RECOVERY_REQUIRED",
+                    &format!(
+                        "Host observation failed: {error}; bounded Job cleanup: {cleanup:?}"
+                    ),
+                );
+                return Ok(UNKNOWN_OUTCOME_EXIT);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn print_portable_dev_foreground_state(
+    status: &str,
+    reason: &str,
+    exit_code: Option<i32>,
+) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": status,
+            "runtime_supervision": "foreground_current_user_job",
+            "readiness": "not_inspected",
+            "reason": reason,
+            "exit_code": exit_code,
+        }))?
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn run_portable_dev_foreground(_store_path: &Path, _raw_transaction_id: &str) -> Result<i32> {
+    write_installation_error(
+        "PORTABLE_DEV_RUN_UNSUPPORTED",
+        "foreground PortableDev supervision requires Windows process containment",
+    );
+    Ok(INVALID_REQUEST_EXIT)
+}
+
+#[cfg(windows)]
+fn drive_user_owned_profile_phase_b(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction_id: &PlatformHandle,
+) -> std::result::Result<InstallationStepOutcome, InstallationError> {
+    let transaction = coordinator.store().load(transaction_id)?.ok_or_else(|| {
+        InstallationError::TransactionNotFound {
+            transaction_id: transaction_id.as_str().to_owned(),
+        }
+    })?;
+    let original_selection = transaction.profile_selection_receipt().ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "current-user Phase-B Host launch requires the durable original profile root selection"
+                .to_owned(),
+        )
+    })?;
+    let host = eliot_host::ProfileSupervisorJob::launch(
+        &transaction.candidate_manifest.runtime_launch,
+        original_selection,
+    )
+    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+
+    let phase_b = coordinator.drive_until_profile_phase_b(transaction_id);
+    let terminal_observation = if matches!(
+        &phase_b,
+        Ok(InstallationStepOutcome::Applied { .. })
+    ) {
+        observe_pending_profile_host_exit(&host).and_then(|()| {
+            verify_pending_profile_host_activation_terminal(
+                &host,
+                &transaction,
+                original_selection,
+            )
+        })
+    } else {
+        Ok(())
+    };
+    let stopped = host.stop().map_err(|_| InstallationError::UnknownOutcome {
+        stage: transaction.stage(),
+    })?;
+    drop(stopped);
+    terminal_observation?;
+    let phase_b = phase_b?;
+    if transaction.profile == InstallationProfile::UserMode
+        && matches!(phase_b, InstallationStepOutcome::Applied { .. })
+    {
+        finish_user_mode_task_activation(coordinator, transaction_id)
+    } else {
+        Ok(phase_b)
+    }
+}
+
+#[cfg(windows)]
+fn observe_pending_profile_host_exit(
+    host: &eliot_host::ProfileSupervisorJob,
+) -> std::result::Result<(), InstallationError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match host
+            .observe()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        {
+            eliot_platform_windows::RunningJobObservation::Exited { exit_code: 0 } => {
+                return Ok(());
+            }
+            eliot_platform_windows::RunningJobObservation::Exited { exit_code } => {
+                return Err(InstallationError::IncompleteObservation(format!(
+                    "pending current-user Host exited with code {exit_code}"
+                )));
+            }
+            eliot_platform_windows::RunningJobObservation::RootExited {
+                exit_code,
+                active_processes,
+            } => {
+                return Err(InstallationError::IncompleteObservation(format!(
+                    "pending current-user Host exited with code {exit_code} while {active_processes} Job members remained"
+                )));
+            }
+            eliot_platform_windows::RunningJobObservation::Running { .. }
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eliot_platform_windows::RunningJobObservation::Running { .. } => {
+                return Err(InstallationError::IncompleteObservation(
+                    "pending current-user Host did not exit after the Phase-B handoff".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn verify_pending_profile_host_activation_terminal(
+    host: &eliot_host::ProfileSupervisorJob,
+    transaction: &InstallationTransaction,
+    original_selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+) -> std::result::Result<(), InstallationError> {
+    let live_selection = host.profile_selection().map_err(|error| {
+        InstallationError::IncompleteObservation(format!(
+            "retained pending Host root leases could not be verified before terminal readback: {error}"
+        ))
+    })?;
+    if !eliot_installation::profile_selection_receipts_match_retained_roots(
+        original_selection,
+        live_selection,
+    )? {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let selected_host_root = live_selection
+        .roots
+        .iter()
+        .find(|root| root.role == "runtime_state_roots.host_state_root")
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "pending Host root lease receipt omitted the Host state root".to_owned(),
+            )
+        })?;
+    let host_state_root = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    let host_root = UserOwnedRootLease::open_existing(host_state_root).map_err(|error| {
+        InstallationError::IncompleteObservation(format!(
+            "current-user Host root could not be reopened for terminal readback: {error}"
+        ))
+    })?;
+    let canonical_root = host_root.canonical_path().map_err(|error| {
+        InstallationError::IncompleteObservation(format!(
+            "current-user Host root could not be canonicalized for terminal readback: {error}"
+        ))
+    })?;
+    if host_root.identity() != selected_host_root.identity
+        || !eliot_platform_windows::windows_paths_equal(
+            &canonical_root,
+            &selected_host_root.canonical_path,
+        )
+        || !eliot_platform_windows::windows_paths_equal(&canonical_root, host_state_root)
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    host_root
+        .verify_stable_identity()
+        .and_then(|()| host_root.verify_path_identity())
+        .map_err(|error| {
+            InstallationError::IncompleteObservation(format!(
+                "current-user Host root identity changed during terminal readback: {error}"
+            ))
+        })?;
+    let registry = RedbInstallationRegistry::inspect_existing_user_owned_at(
+        host_root,
+        transaction.profile,
+    )
+    .map_err(|error| {
+        InstallationError::IncompleteObservation(format!(
+            "current-user Host activation registry could not be read back: {error}"
+        ))
+    })?
+    .ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "pending Host exited successfully but its current-user activation registry is absent"
+                .to_owned(),
+        )
+    })?;
+    let receipt = registry
+        .read_optional_committed_activation_receipt(
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+        )
+        .map_err(|error| {
+            InstallationError::IncompleteObservation(format!(
+                "exact Host activation terminal readback failed: {error}"
+            ))
+        })?;
+    if receipt.is_none() {
+        return Err(InstallationError::IncompleteObservation(
+            "pending Host exited successfully without its exact committed activation terminal"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn finish_user_mode_task_activation(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction_id: &PlatformHandle,
+) -> std::result::Result<InstallationStepOutcome, InstallationError> {
+    let transaction = coordinator.store().load(transaction_id)?.ok_or_else(|| {
+        InstallationError::TransactionNotFound {
+            transaction_id: transaction_id.as_str().to_owned(),
+        }
+    })?;
+    if transaction.profile != InstallationProfile::UserMode {
+        return Err(InstallationError::ProfileViolation(
+            "current-user task activation is limited to UserMode".to_owned(),
+        ));
+    }
+    let (request, leases) = user_mode_task_request_for_transaction(&transaction)?;
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let registration_outcome = register_or_reconcile_user_mode_task(
+        coordinator,
+        transaction_id,
+        &request,
+    );
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let registration_outcome = registration_outcome?;
+    if !matches!(&registration_outcome, InstallationStepOutcome::Applied { .. }) {
+        return Ok(registration_outcome);
+    }
+    let registered = coordinator.store().load(transaction_id)?.ok_or_else(|| {
+        InstallationError::TransactionNotFound {
+            transaction_id: transaction_id.as_str().to_owned(),
+        }
+    })?;
+    if !user_mode_task_registration_is_durable(&registered, &request) {
+        return Err(InstallationError::IncompleteObservation(
+            "Task Scheduler registration returned Applied without the exact durable request and readback receipt"
+                .to_owned(),
+        ));
+    }
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let run_receipt = coordinator.run_current_user_task_once(transaction_id);
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let run_receipt = run_receipt?;
+    let durable = coordinator.store().load(transaction_id)?.ok_or_else(|| {
+        InstallationError::TransactionNotFound {
+            transaction_id: transaction_id.as_str().to_owned(),
+        }
+    })?;
+    let durable_run_receipt = durable
+        .installer_effects
+        .iter()
+        .zip(durable.effect_progress())
+        .any(|(effect, progress)| {
+            let registration = progress.current_user_task_receipt.as_ref();
+            let run_intent = progress.current_user_task_run_intent.as_ref();
+            matches!(
+                effect,
+                eliot_installation::InstallerEffectPlan::RegisterCurrentUserTask { .. }
+            ) && progress.current_user_task_request.as_ref() == Some(&request)
+                && registration.is_some_and(|registration| {
+                    registration.request == request
+                        && run_receipt.task_name == registration.task_name
+                        && run_receipt.sid == registration.sid
+                        && run_receipt.session_id != 0
+                        && run_intent.is_some_and(|intent| {
+                            intent.session_id == run_receipt.session_id
+                                && intent.session_id != 0
+                        })
+                        && run_receipt.task_xml_sha256 == registration.task_xml_sha256
+                        && run_receipt.engine_process_id != 0
+                })
+                && progress.current_user_task_run_receipt.as_ref() == Some(&run_receipt)
+        });
+    if !durable_run_receipt {
+        return Err(InstallationError::IncompleteObservation(
+            "Task Scheduler accepted a run but the exact run receipt was not durably read back"
+                .to_owned(),
+        ));
+    }
+    Ok(registration_outcome)
+}
+
+#[cfg(windows)]
+fn user_mode_task_request_for_transaction(
+    transaction: &InstallationTransaction,
+) -> std::result::Result<
+    (
+        eliot_platform_windows::profile_supervision::CurrentUserTaskRequest,
+        eliot_platform_windows::profile_supervision::ProfileRootLeaseSet,
+    ),
+    InstallationError,
+> {
+    let registration = transaction
+        .installer_effects
+        .iter()
+        .find_map(|effect| match effect {
+            eliot_installation::InstallerEffectPlan::RegisterCurrentUserTask {
+                registration, ..
+            } => Some(registration.as_ref()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "UserMode transaction has no typed current-user Task registration plan".to_owned(),
+            )
+        })?;
+    let phase_b_receipt = transaction
+        .effect_progress()
+        .iter()
+        .find_map(|progress| progress.phase_b_receipt.as_ref())
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "UserMode Task registration requires the exact committed Phase-B receipt"
+                    .to_owned(),
+            )
+        })?;
+    let launch = &transaction.candidate_manifest.runtime_launch;
+    let authority_generation = phase_b_receipt
+        .provisioned_supervision_authority
+        .authority_generation
+        .value();
+    if authority_generation != registration.authority_generation.value() {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let roots = eliot_installation::profile_root_request_for_live_launch(
+        launch,
+        &phase_b_receipt.authority_descriptor_digest,
+        authority_generation,
+    )?;
+    let leases = eliot_platform_windows::profile_supervision::open_profile_root_leases(&roots)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let original_selection = transaction.profile_selection_receipt().ok_or_else(|| {
+        InstallationError::MigrationRequired {
+            reason: "UserMode Task activation requires its original retained root selection"
+                .to_owned(),
+        }
+    })?;
+    if !eliot_installation::profile_selection_receipts_match_retained_roots(
+        original_selection,
+        leases.selection(),
+    )? {
+        return Err(InstallationError::IdentityConflict);
+    }
+    validate_retained_profile_anchor_selection(transaction, leases.selection())?;
+    let bootstrap_arguments = vec![
+        "--config-descriptor".to_owned(),
+        launch.authority_descriptor_path.as_str().to_owned(),
+        "--config-descriptor-sha256".to_owned(),
+        phase_b_receipt
+            .authority_descriptor_digest
+            .as_str()
+            .to_owned(),
+        "--installation-id".to_owned(),
+        launch.installation_epoch.installation.as_str().to_owned(),
+        "--tx-plan-generation".to_owned(),
+        authority_generation.to_string(),
+        "--host-state-root".to_owned(),
+        launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str()
+            .to_owned(),
+    ];
+    let request = eliot_installation::complete_user_mode_task_request(
+        registration,
+        roots,
+        bootstrap_arguments,
+    )?;
+    Ok((request, leases))
+}
+
+#[cfg(windows)]
+fn register_or_reconcile_user_mode_task(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction_id: &PlatformHandle,
+    request: &eliot_platform_windows::profile_supervision::CurrentUserTaskRequest,
+) -> std::result::Result<InstallationStepOutcome, InstallationError> {
+    let receipt = coordinator.register_or_reconcile_current_user_task(
+        transaction_id,
+        request,
+    )?;
+    if receipt.request != *request {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let durable = coordinator
+        .store()
+        .load(transaction_id)?
+        .ok_or_else(|| InstallationError::TransactionNotFound {
+            transaction_id: transaction_id.as_str().to_owned(),
+        })?;
+    let Some((progress, evidence)) = durable
+        .installer_effects
+        .iter()
+        .zip(durable.effect_progress())
+        .find_map(|(effect, progress)| {
+            matches!(
+                effect,
+                eliot_installation::InstallerEffectPlan::RegisterCurrentUserTask { .. }
+            )
+            .then_some((progress, match &progress.state {
+                eliot_installation::InstallationEffectProgressState::Applied {
+                    evidence, ..
+                } => Some(evidence),
+                _ => None,
+            }))
+        })
+    else {
+        return Err(InstallationError::IdentityConflict);
+    };
+    let Some(evidence) = evidence else {
+        return Err(InstallationError::IncompleteObservation(
+            "current-user Task adapter returned a receipt without an Applied durable effect".to_owned(),
+        ));
+    };
+    if progress.current_user_task_request.as_ref() != Some(request)
+        || progress.current_user_task_receipt.as_ref() != Some(&receipt)
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(InstallationStepOutcome::Applied {
+        stage: durable.stage(),
+        evidence_refs: evidence.clone(),
+    })
+}
+
+#[cfg(windows)]
+fn user_mode_task_registration_is_durable(
+    transaction: &InstallationTransaction,
+    request: &eliot_platform_windows::profile_supervision::CurrentUserTaskRequest,
+) -> bool {
+    transaction
+        .installer_effects
+        .iter()
+        .zip(transaction.effect_progress())
+        .any(|(effect, progress)| {
+            matches!(
+                effect,
+                eliot_installation::InstallerEffectPlan::RegisterCurrentUserTask { .. }
+            ) && matches!(
+                progress.state,
+                eliot_installation::InstallationEffectProgressState::Applied { .. }
+            ) && progress.current_user_task_request.as_ref() == Some(request)
+                && progress
+                    .current_user_task_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| &receipt.request == request)
+        })
+}
+
+#[cfg(not(windows))]
+fn finish_user_mode_task_activation(
+    _coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    _transaction_id: &PlatformHandle,
+) -> std::result::Result<InstallationStepOutcome, InstallationError> {
+    Err(InstallationError::Platform(
+        "current-user Task activation requires Windows Task Scheduler support".to_owned(),
+    ))
+}
+
+#[cfg(not(windows))]
+fn drive_user_owned_profile_phase_b(
+    _coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    _transaction_id: &PlatformHandle,
+) -> std::result::Result<InstallationStepOutcome, InstallationError> {
+    Err(InstallationError::Platform(
+        "current-user Host Phase-B bootstrap requires Windows process containment".to_owned(),
+    ))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the CLI keeps coordinator reopen, sealed readback and bounded outcome output in one auditable boundary"
@@ -3220,22 +4162,43 @@ fn run_installation_effect(
     ) {
         write_installation_error(
             "INSTALLATION_STATE_INVALID",
-            "SystemService Activating transaction is missing its durable activation projection intent",
+            "profile activation transaction is missing its durable activation projection intent",
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    let preflight_status = installation_preflight_status(preflight_transaction.stage(), recover);
+    if uses_user_owned_supervision(preflight_transaction.profile)
+        && preflight_transaction.stage() == InstallationStage::ActiveVerified
+        && let Err(error) =
+            revalidate_recorded_profile_selection_receipt(store_path, &preflight_transaction)
+    {
+        write_installation_error(
+            if recover {
+                "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
+            } else {
+                "INSTALLATION_APPLY_RECOVERY_REQUIRED"
+            },
+            &format!("current-user retained root selection revalidation failed: {error}"),
+        );
+        return Ok(UNKNOWN_OUTCOME_EXIT);
+    }
+    let preflight_status = if uses_user_owned_supervision(preflight_transaction.profile)
+        && preflight_transaction.stage() == InstallationStage::ActiveVerified
+    {
+        Some("PENDING_RUNTIME")
+    } else {
+        installation_preflight_status(preflight_transaction.stage(), recover)
+    };
     let should_query_host_terminal_now = should_query_host_terminal(
         preflight_transaction.profile,
         preflight_transaction.stage(),
         preflight_transaction.has_activation_projection_intent(),
     );
-    if let Some(status) = preflight_status.filter(|_| !should_query_host_terminal_now) {
-        let staging = InstallationStagingDisposition::not_attempted(if status == "ROLLED_BACK" {
-            "transaction is already rolled back; no recovery effect was attempted"
-        } else {
-            "transaction stage is terminal or incompatible; no effect was attempted"
-        });
+    if let Some(status) = preflight_status
+        .filter(|_| !should_query_host_terminal_now)
+    {
+        let staging = InstallationStagingDisposition::not_attempted(
+            installation_preflight_staging_reason(status, &preflight_transaction),
+        );
         print_transaction_projection(
             if recover {
                 "RECOVERY_RESULT"
@@ -3261,19 +4224,25 @@ fn run_installation_effect(
             preflight_transaction.profile,
             preflight_transaction.stage(),
             preflight_transaction.has_activation_projection_intent(),
-            || reconcile_host_activation_terminal(store_path, &preflight_transaction),
+            || {
+                reconcile_host_activation_terminal(
+                    store_path,
+                    &preflight_transaction,
+                    !recover,
+                )
+            },
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
                 write_installation_error(
                     if recover {
-                        "INSTALLATION_RECOVER_ERROR"
+                        "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
                     } else {
-                        "INSTALLATION_APPLY_ERROR"
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED"
                     },
                     &format!("Host activation terminal query failed: {error}"),
                 );
-                return Ok(INVALID_REQUEST_EXIT);
+                return Ok(UNKNOWN_OUTCOME_EXIT);
             }
         };
         if let Some(outcome) = host_terminal_outcome {
@@ -3307,11 +4276,43 @@ fn run_installation_effect(
                     return Ok(INVALID_REQUEST_EXIT);
                 }
             };
-            let staging = InstallationStagingDisposition::not_attempted(if recover {
-                "recovery reconciled the exact Host terminal; no rollback effect was attempted"
+            let user_owned_supervision_pending =
+                uses_user_owned_supervision(transaction.profile)
+                    && matches!(&outcome, InstallationStepOutcome::Applied { .. });
+            let terminal_status = match &outcome {
+                InstallationStepOutcome::RollbackRequired { .. } => "ROLLBACK_REQUIRED",
+                InstallationStepOutcome::Quarantined { .. } => "QUARANTINED",
+                InstallationStepOutcome::Rejected => "REJECTED",
+                InstallationStepOutcome::Applied { .. } if user_owned_supervision_pending => {
+                    "PENDING_RUNTIME"
+                }
+                InstallationStepOutcome::Applied { .. } => "ACTIVE_VERIFIED",
+            };
+            let staging = if user_owned_supervision_pending {
+                InstallationStagingDisposition {
+                    disposition: "PENDING_RUNTIME",
+                    reason: Some(
+                        installation_preflight_staging_reason(terminal_status, &transaction)
+                            .to_owned(),
+                    ),
+                    registry: None,
+                }
+            } else if matches!(
+                &outcome,
+                InstallationStepOutcome::RollbackRequired { .. }
+                    | InstallationStepOutcome::Quarantined { .. }
+                    | InstallationStepOutcome::Rejected
+            ) {
+                InstallationStagingDisposition::not_attempted(
+                    "Host terminal exists, but current-user task registration or run did not complete",
+                )
             } else {
-                "apply observed the exact Host terminal before projection; no effect was attempted"
-            });
+                InstallationStagingDisposition::not_attempted(if recover {
+                    "recovery reconciled the exact Host terminal; no rollback effect was attempted"
+                } else {
+                    "apply observed the exact Host terminal before projection; no effect was attempted"
+                })
+            };
             print_transaction_projection(
                 if recover {
                     "RECOVERY_RESULT"
@@ -3322,9 +4323,9 @@ fn run_installation_effect(
                 &transaction,
                 Some(&outcome),
                 Some(&staging),
-                Some("ACTIVE_VERIFIED"),
+                Some(terminal_status),
             )?;
-            return Ok(installation_command_exit_code("ACTIVE_VERIFIED"));
+            return Ok(installation_command_exit_code(terminal_status));
         }
     }
 
@@ -3333,11 +4334,9 @@ fn run_installation_effect(
     // what makes apply and recover response-loss safe without allowing either
     // path to resend an effect or enter rollback before the readback.
     if let Some(status) = preflight_status {
-        let staging = InstallationStagingDisposition::not_attempted(if status == "ROLLED_BACK" {
-            "transaction is already rolled back; no recovery effect was attempted"
-        } else {
-            "transaction stage is terminal or incompatible; no effect was attempted"
-        });
+        let staging = InstallationStagingDisposition::not_attempted(
+            installation_preflight_staging_reason(status, &preflight_transaction),
+        );
         print_transaction_projection(
             if recover {
                 "RECOVERY_RESULT"
@@ -3366,6 +4365,7 @@ fn run_installation_effect(
         }
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
+    let mut user_owned_profile_pending = false;
     let outcome = if recover {
         if preflight_transaction.has_activation_projection_intent() {
             rollback_with_activation_owner(
@@ -3522,30 +4522,201 @@ fn run_installation_effect(
             }
             outcome => outcome,
         }
+    } else if uses_user_owned_supervision(preflight_transaction.profile) {
+        if preflight_transaction.stage() == InstallationStage::ActiveVerified {
+            if let Err(error) = revalidate_recorded_profile_selection_receipt(
+                store_path,
+                &preflight_transaction,
+            ) {
+                write_installation_error(
+                    "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                    &format!("current-user retained root selection revalidation failed: {error}"),
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+            user_owned_profile_pending = true;
+            Err(InstallationError::IncompleteObservation(
+                "current-user Host readiness is not established; launch acceptance or ActiveVerified alone is insufficient"
+                    .to_owned(),
+            ))
+        } else {
+        match coordinator.drive_until_host_bootstrap(&transaction_id) {
+            Ok(InstallationStepOutcome::Applied { .. }) => {
+                let current = match coordinator.store().load(&transaction_id) {
+                    Ok(Some(transaction)) => transaction,
+                    Ok(None) => {
+                        write_installation_error(
+                            "INSTALLATION_STATE_UNAVAILABLE",
+                            "current-user bootstrap prefix applied but the transaction record is gone",
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!(
+                                "current-user bootstrap prefix applied but transaction readback failed: {error}"
+                            ),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                if let Err(error) = record_or_validate_profile_selection_receipt(
+                    store_path,
+                    &current,
+                ) {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        &format!(
+                            "current-user root/package prefix applied but its original retained root receipt could not be established: {error}"
+                        ),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                match coordinator.drive_until_host_bootstrap(&transaction_id) {
+                    Ok(InstallationStepOutcome::Applied { .. }) => {
+                let current = match coordinator.store().load(&transaction_id) {
+                    Ok(Some(transaction)) => transaction,
+                    Ok(None) => {
+                        write_installation_error(
+                            "INSTALLATION_STATE_UNAVAILABLE",
+                            "current-user pre-Phase-B prefix applied but the transaction record is gone",
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!(
+                                "current-user pre-Phase-B prefix applied but transaction readback failed: {error}"
+                            ),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let current = match revalidate_recorded_profile_selection_receipt(
+                    store_path,
+                    &current,
+                ) {
+                    Ok(transaction) => transaction,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!(
+                                "current-user retained root selection changed before pending projection: {error}"
+                            ),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let host_state_root = Path::new(
+                    current
+                        .candidate_manifest
+                        .runtime_launch
+                        .runtime_state_roots
+                        .host_state_root
+                        .as_str(),
+                );
+                let host_root = match UserOwnedRootLease::open_existing(host_state_root) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!("retained current-user Host root could not be reopened: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                match host_root.canonical_path() {
+                    Ok(path) if eliot_platform_windows::windows_paths_equal(&path, host_state_root) => {}
+                    Ok(_) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            "retained current-user Host root differs from the exact transaction binding",
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!("canonicalize retained current-user Host root: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                }
+                if let Err(error) = host_root.verify_stable_identity() {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        &format!("retained current-user Host root identity changed: {error}"),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                let registry = match RedbInstallationRegistry::open_user_owned_at(
+                    host_root,
+                    preflight_transaction.profile,
+                ) {
+                    Ok(registry) => registry,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!("current-user pending registry could not be opened: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let expected_revision = match registry.load() {
+                    Ok(registry) => registry.revision(),
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!("current-user pending registry preflight failed: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                if let Err(error) = coordinator.stage_bootstrap_pending_activation(
+                    &registry,
+                    &transaction_id,
+                    expected_revision,
+                ) {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        &format!("current-user pending registry projection failed: {error}"),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                drop(registry);
+                user_owned_profile_pending = true;
+                drive_user_owned_profile_phase_b(&mut coordinator, &transaction_id)
+                    }
+                    outcome => outcome,
+                }
+            }
+            outcome => outcome,
+        }
+        }
     } else {
         coordinator.drive_all_effects_until_blocked(&transaction_id)
     };
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
-            let code = match &error {
-                InstallationError::UnknownOutcome { .. } => {
-                    if recover {
-                        "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
-                    } else {
-                        "INSTALLATION_APPLY_RECOVERY_REQUIRED"
-                    }
-                }
-                _ => {
-                    if recover {
-                        "INSTALLATION_RECOVER_ERROR"
-                    } else {
-                        "INSTALLATION_APPLY_ERROR"
-                    }
-                }
+            let recovery_required = installation_error_requires_recovery(&error);
+            let code = if recovery_required && recover {
+                "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
+            } else if recovery_required {
+                "INSTALLATION_APPLY_RECOVERY_REQUIRED"
+            } else if recover {
+                "INSTALLATION_RECOVER_ERROR"
+            } else {
+                "INSTALLATION_APPLY_ERROR"
             };
             write_installation_error(code, &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
+            return Ok(if recovery_required {
+                UNKNOWN_OUTCOME_EXIT
+            } else {
+                INVALID_REQUEST_EXIT
+            });
         }
     };
     drop(coordinator);
@@ -3589,23 +4760,27 @@ fn run_installation_effect(
     ) {
         write_installation_error(
             "INSTALLATION_STATE_INVALID",
-            "SystemService Activating transaction is missing its durable activation projection intent",
+            "profile activation transaction is missing its durable activation projection intent",
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
     let host_terminal_outcome = match reconcile_host_activation_terminal_if_required(
-        transaction.profile,
-        transaction.stage(),
-        transaction.has_activation_projection_intent(),
-        || reconcile_host_activation_terminal(store_path, &transaction),
+            transaction.profile,
+            transaction.stage(),
+            transaction.has_activation_projection_intent(),
+            || reconcile_host_activation_terminal(store_path, &transaction, !recover),
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
             write_installation_error(
-                "INSTALLATION_STATE_INVALID",
+                if recover {
+                    "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
+                } else {
+                    "INSTALLATION_APPLY_RECOVERY_REQUIRED"
+                },
                 &format!("Host activation terminal reconciliation failed: {error}"),
             );
-            return Ok(INVALID_REQUEST_EXIT);
+            return Ok(UNKNOWN_OUTCOME_EXIT);
         }
     };
     let transaction = if host_terminal_outcome.is_some() {
@@ -3643,15 +4818,36 @@ fn run_installation_effect(
     // activation is pending and the next invocation will query-reconcile the
     // Host receipt rather than retrying materialization.
     let phase_b_pending = !recover
-        && transaction.profile == InstallationProfile::SystemService
-        && transaction.stage() == InstallationStage::Activating
-        && matches!(effective_outcome, InstallationStepOutcome::Rejected);
+        && ((transaction.stage() == InstallationStage::Activating
+            && transaction.profile == InstallationProfile::SystemService
+            && matches!(effective_outcome, InstallationStepOutcome::Rejected))
+            || (uses_user_owned_supervision(transaction.profile)
+                && user_owned_profile_pending
+                && matches!(
+                    transaction.stage(),
+                    InstallationStage::Activating | InstallationStage::ActiveVerified
+                )));
     let staging = if phase_b_pending {
         InstallationStagingDisposition {
             disposition: "PENDING_RUNTIME",
             reason: Some(
-                "Host Phase-B response is unresolved; activation remains fenced and the next command will query-reconcile the exact receipt"
+                match (transaction.profile, transaction.stage()) {
+                    (_, InstallationStage::ActiveVerified) => installation_preflight_staging_reason(
+                        "PENDING_RUNTIME",
+                        &transaction,
+                    )
                     .to_owned(),
+                    (InstallationProfile::UserMode, _) => {
+                        "UserMode pending registry projection is staged; Host Phase-B bootstrap and current-user task activation remain pending"
+                            .to_owned()
+                    }
+                    (InstallationProfile::PortableDev, _) => {
+                        "PortableDev pending registry projection is staged; Host Phase-B bootstrap and current-user process supervision remain pending"
+                            .to_owned()
+                    }
+                    _ => "Host Phase-B response is unresolved; activation remains fenced and the next command will query-reconcile the exact receipt"
+                        .to_owned(),
+                },
             ),
             registry: None,
         }
@@ -3727,7 +4923,11 @@ fn rollback_with_activation_owner(
 fn reconcile_host_activation_terminal(
     store_path: &Path,
     transaction: &InstallationTransaction,
+    complete_user_mode_task: bool,
 ) -> Result<Option<InstallationStepOutcome>, InstallationError> {
+    if uses_user_owned_supervision(transaction.profile) {
+        revalidate_recorded_profile_selection_receipt(store_path, transaction)?;
+    }
     let host_state_root = Path::new(
         transaction
             .candidate_manifest
@@ -3736,19 +4936,43 @@ fn reconcile_host_activation_terminal(
             .host_state_root
             .as_str(),
     );
-    let host_root = ProtectedRootLease::open_existing(host_state_root)
-        .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
-        return Ok(None);
+    let registry = match transaction.profile {
+        InstallationProfile::SystemService => {
+            let host_root = ProtectedRootLease::open_existing(host_state_root)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
+                return Ok(None);
+            };
+            registry
+        }
+        InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+            let host_root = UserOwnedRootLease::open_existing(host_state_root)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let canonical_root = host_root
+                .canonical_path()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            if !eliot_platform_windows::windows_paths_equal(&canonical_root, host_state_root) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            host_root
+                .verify_stable_identity()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let Some(registry) = RedbInstallationRegistry::inspect_existing_user_owned_at(
+                host_root,
+                transaction.profile,
+            )? else {
+                return Ok(None);
+            };
+            registry
+        }
     };
-    let receipt = match registry.read_committed_activation_receipt(
+    let receipt = registry.read_optional_committed_activation_receipt(
         &transaction.transaction_id,
         &transaction.installer_plan_digest,
         &transaction.candidate_manifest.generation,
-    ) {
-        Ok(receipt) => receipt,
-        Err(InstallationError::IncompleteObservation(_)) => return Ok(None),
-        Err(error) => return Err(error),
+    )?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
     };
     let evidence = vec![
         receipt.terminal_digest().clone(),
@@ -3756,9 +4980,81 @@ fn reconcile_host_activation_terminal(
     ];
     let store = RedbInstallationTransactionStore::open_existing_exact_path(store_path)?;
     let mut coordinator = WindowsInstallationCoordinator::new(store);
+    if transaction.profile == InstallationProfile::UserMode {
+        let durable = coordinator
+            .store()
+            .load(&transaction.transaction_id)?
+            .ok_or_else(|| InstallationError::TransactionNotFound {
+                transaction_id: transaction.transaction_id.as_str().to_owned(),
+            })?;
+        if !user_mode_task_run_receipt_is_durable(&durable) {
+            if !complete_user_mode_task {
+                // Recover mode is a read-only terminal query. Keep the exact
+                // Host commit visible as pending while Task receipts remain
+                // incomplete; never convert that live generation into a
+                // rollback attempt.
+                return Ok(Some(InstallationStepOutcome::Applied {
+                    stage: durable.stage(),
+                    evidence_refs: evidence,
+                }));
+            }
+            let task_outcome = finish_user_mode_task_activation(
+                &mut coordinator,
+                &transaction.transaction_id,
+            )?;
+            if !matches!(&task_outcome, InstallationStepOutcome::Applied { .. }) {
+                return Ok(Some(task_outcome));
+            }
+        }
+    }
     coordinator
         .reconcile_active_verified(receipt, evidence)
         .map(Some)
+}
+
+fn user_mode_task_run_receipt_is_durable(transaction: &InstallationTransaction) -> bool {
+    transaction
+        .installer_effects
+        .iter()
+        .zip(transaction.effect_progress())
+        .any(|(effect, progress)| {
+            let Some(request) = progress.current_user_task_request.as_ref() else {
+                return false;
+            };
+            let Some(registration) = progress.current_user_task_receipt.as_ref() else {
+                return false;
+            };
+            let Some(run_intent) = progress.current_user_task_run_intent.as_ref() else {
+                return false;
+            };
+            let Some(run) = progress.current_user_task_run_receipt.as_ref() else {
+                return false;
+            };
+            matches!(
+                effect,
+                eliot_installation::InstallerEffectPlan::RegisterCurrentUserTask { .. }
+            ) && matches!(
+                progress.state,
+                eliot_installation::InstallationEffectProgressState::Applied { .. }
+            ) && request == &registration.request
+                && run.task_name == registration.task_name
+                && run.sid == registration.sid
+                && run.session_id != 0
+                && run.session_id == run_intent.session_id
+                && run.task_xml_sha256 == registration.task_xml_sha256
+                && run.engine_process_id != 0
+        })
+}
+
+fn installation_error_requires_recovery(error: &InstallationError) -> bool {
+    matches!(
+        error,
+        InstallationError::UnknownOutcome { .. }
+            | InstallationError::RecoveryRequired { .. }
+            | InstallationError::IncompleteObservation(_)
+            | InstallationError::IdentityConflict
+            | InstallationError::MigrationRequired { .. }
+    )
 }
 
 #[derive(Debug)]
@@ -3875,7 +5171,10 @@ fn installation_command_status(
         }
         | InstallationStepOutcome::Quarantined { .. } => "QUARANTINED",
         InstallationStepOutcome::Applied { .. } if recover => "ERROR",
-        InstallationStepOutcome::Applied { .. } if !all_effects_applied => "ERROR",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::Activating,
+            ..
+        } if !recover && uses_user_owned_supervision(profile) => "PENDING_RUNTIME",
         InstallationStepOutcome::Applied {
             stage: InstallationStage::Activating,
             ..
@@ -3883,7 +5182,18 @@ fn installation_command_status(
         InstallationStepOutcome::Applied {
             stage: InstallationStage::ActiveVerified,
             ..
+        } if !recover && uses_user_owned_supervision(profile) && all_effects_applied => {
+            "ACTIVE_VERIFIED"
+        }
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::ActiveVerified,
+            ..
+        } if !recover && uses_user_owned_supervision(profile) => "PENDING_RUNTIME",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::ActiveVerified,
+            ..
         } if !recover && profile == InstallationProfile::SystemService => "ACTIVE_VERIFIED",
+        InstallationStepOutcome::Applied { .. } if !all_effects_applied => "ERROR",
         InstallationStepOutcome::Applied { .. }
             if !recover && profile == InstallationProfile::SystemService =>
         {
@@ -3920,7 +5230,12 @@ fn should_query_host_terminal(
     stage: InstallationStage,
     has_activation_projection_intent: bool,
 ) -> bool {
-    profile == InstallationProfile::SystemService
+    matches!(
+        profile,
+        InstallationProfile::SystemService
+            | InstallationProfile::UserMode
+            | InstallationProfile::PortableDev
+    )
         && has_activation_projection_intent
         && matches!(
             stage,
@@ -3928,12 +5243,63 @@ fn should_query_host_terminal(
         )
 }
 
+const fn uses_user_owned_supervision(profile: InstallationProfile) -> bool {
+    matches!(
+        profile,
+        InstallationProfile::UserMode | InstallationProfile::PortableDev
+    )
+}
+
+fn installation_preflight_staging_reason(
+    status: &str,
+    transaction: &InstallationTransaction,
+) -> &'static str {
+    if status == "ROLLED_BACK" {
+        return "transaction is already rolled back; no recovery effect was attempted";
+    }
+    if status == "PENDING_RUNTIME" {
+        return match transaction.profile {
+            InstallationProfile::UserMode
+                if transaction
+                    .effect_progress()
+                    .iter()
+                    .any(|progress| progress.current_user_task_run_receipt.is_some()) =>
+            {
+                "the exact current-user Task run receipt is durable; authenticated Host readiness was not inspected"
+            }
+            InstallationProfile::UserMode
+                if transaction
+                    .effect_progress()
+                    .iter()
+                    .any(|progress| progress.current_user_task_receipt.is_some()) =>
+            {
+                "Task registration readback is durable; its exact RunEx receipt or authenticated Host readiness remains pending"
+            }
+            InstallationProfile::UserMode => {
+                "UserMode Phase-B is committed, but current-user Task registration or run evidence remains pending"
+            }
+            InstallationProfile::PortableDev => {
+                "PortableDev is committed; use installation run-portable-dev to retain the foreground Host Job; authenticated readiness was not inspected"
+            }
+            InstallationProfile::SystemService => {
+                "Host runtime activation remains pending; no effect was attempted"
+            }
+        };
+    }
+    "transaction stage is terminal or incompatible; no effect was attempted"
+}
+
 fn activation_projection_state_is_invalid(
     profile: InstallationProfile,
     stage: InstallationStage,
     has_activation_projection_intent: bool,
 ) -> bool {
-    profile == InstallationProfile::SystemService
+    matches!(
+        profile,
+        InstallationProfile::SystemService
+            | InstallationProfile::UserMode
+            | InstallationProfile::PortableDev
+    )
         && stage == InstallationStage::Activating
         && !has_activation_projection_intent
 }
@@ -3954,6 +5320,274 @@ where
     }
 }
 
+/// Projects the recorded profile selection for a CLI response (I3.1).
+///
+/// The value is rehydrated from the binding the durable transaction actually
+/// records — the ORIGINAL recorded value, never a fresh resolution from
+/// today's environment — and reports the selected profile, its resolved root
+/// roles, its supervision type and its enforced/unsupported guarantees. A
+/// transaction with no recorded binding, or one whose recorded binding
+/// disagrees with its recorded profile or retained roots, reports a typed
+/// refusal rather than a freshly derived layout. No key, secret or credential
+/// value is ever included.
+fn installation_profile_governance_projection(
+    transaction: &InstallationTransaction,
+) -> serde_json::Value {
+    match transaction.rehydrate_profile_binding() {
+        Ok(resolution) => json!({
+            "state": "REHYDRATED",
+            "profile": resolution.governance.profile,
+            "supervision": resolution.governance.supervision,
+            "root_roles": resolution.governance.roots,
+            "enforced_guarantees": resolution.governance.enforced_guarantees,
+            "unsupported_guarantees": resolution.governance.unsupported_guarantees,
+            "requires_admin": resolution.governance.profile.requires_admin(),
+            "no_service_authority_proof": resolution.no_service_authority_proof.as_ref(),
+            "verified_root_roles": resolution
+                .no_service_authority_proof
+                .as_ref()
+                .map(|proof| proof.verified_root_roles),
+        }),
+        Err(error) => json!({
+            "state": "REHYDRATION_REFUSED",
+            "reason": error.to_string(),
+        }),
+    }
+}
+
+/// The raw CLI inputs of one read-only I3.1 profile resolution.
+///
+/// Every field is consumed once, in [`profile_selection_input`]; nothing here
+/// is defaulted from a process environment variable, the current directory, or
+/// today's ambient state.
+struct ResolveProfileRequest {
+    profile: InstallationProfile,
+    profile_anchor_root: PathBuf,
+    installation_key: Option<String>,
+    component: String,
+    version: String,
+    generation: Option<String>,
+    source_root: PathBuf,
+    staging_root: PathBuf,
+}
+
+/// Resolves the I3.1 layout for one explicitly selected profile, read-only.
+///
+/// This is the production caller of the existing selector. The anchors are
+/// proved by the Windows adapter — `%ProgramFiles%`, `%ProgramData%` and the
+/// current user's `%LocalAppData%` come from the OS known-folder lookups, and
+/// the repository contour for `portable_dev` is the caller-named retained
+/// anchor — so no root is inferred from a process environment variable, the
+/// current directory or ambient state. Nothing is created, reserved or
+/// mutated: an invalid profile, a missing or ambiguous anchor, a write into
+/// the versioned immutable binaries root, or a selection that cannot prove it
+/// depends on no service-only authority is a typed refusal.
+fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i32> {
+    let selection = match profile_selection_input(request) {
+        Ok(selection) => selection,
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_PROFILE_RESOLUTION_REJECTED",
+                &error.to_string(),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let resolution = match GenerationPackagePlanner::resolve_profile_selection(&selection) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_PROFILE_RESOLUTION_REJECTED",
+                &error.to_string(),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "PROFILE_RESOLVED",
+            "profile": resolution.governance.profile,
+            "supervision": resolution.governance.supervision,
+            "root_roles": resolution.governance.roots,
+            "enforced_guarantees": resolution.governance.enforced_guarantees,
+            "unsupported_guarantees": resolution.governance.unsupported_guarantees,
+            "requires_admin": resolution.governance.profile.requires_admin(),
+            "no_service_authority_proof": resolution.no_service_authority_proof.as_ref(),
+            "verified_root_roles": resolution
+                .no_service_authority_proof
+                .as_ref()
+                .map(|proof| proof.verified_root_roles),
+            "scope": INSTALLATION_SCOPE,
+            "mutated": false,
+        }))?
+    );
+    Ok(0)
+}
+
+/// Proves the complete explicit input set for one read-only resolution.
+///
+/// Path and key values are validated exactly as the planner's own CLI seam
+/// validates them, so a resolution can never be computed from a value the
+/// planner would refuse.
+fn profile_selection_input(
+    request: ResolveProfileRequest,
+) -> Result<ProfileSelectionInput, InstallationError> {
+    let ResolveProfileRequest {
+        profile,
+        profile_anchor_root,
+        installation_key,
+        component,
+        version,
+        generation,
+        source_root,
+        staging_root,
+    } = request;
+    let path_handle =
+        |path: PathBuf, field: &'static str| -> Result<PlatformHandle, InstallationError> {
+            cli_path_handle(&path, field).map_err(|error| InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: error.to_string(),
+            })
+        };
+    let source_root = path_handle(source_root, "source_root")?;
+    let staging_root = path_handle(staging_root, "staging_root")?;
+    let installation_key =
+        match installation_key {
+            None => None,
+            Some(value) => Some(PlatformHandle::new(value).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "installation_key".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?),
+        };
+    proved_profile_selection(
+        profile,
+        &profile_anchor_root,
+        installation_key,
+        component,
+        version,
+        generation,
+        source_root,
+        staging_root,
+    )
+}
+
+/// Proves the anchor set the I3.1 selector needs for one selected profile.
+///
+/// `system_service` needs `%ProgramFiles%` and `%ProgramData%`;
+/// `user_mode` and `portable_dev` need the current user's `%LocalAppData%`;
+/// `portable_dev` additionally needs the retained repository contour the
+/// caller named. The system-service-only protected `%ProgramData%` lookup is
+/// performed only for `system_service`; other profiles do not depend on that
+/// contour. The caller's named anchor is checked against the selected profile's
+/// OS-resolved anchor rather than trusted, so a caller cannot point a profile
+/// at a contour the OS does not resolve.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the proved selection carries its complete explicit input set"
+)]
+fn proved_profile_selection(
+    profile: InstallationProfile,
+    profile_anchor_root: &Path,
+    installation_key: Option<PlatformHandle>,
+    component: String,
+    version: String,
+    generation: Option<String>,
+    source_root: PlatformHandle,
+    staging_root: PlatformHandle,
+) -> Result<ProfileSelectionInput, InstallationError> {
+    let anchor_handle =
+        |path: &Path, field: &'static str| -> Result<PlatformHandle, InstallationError> {
+            if !path.is_absolute() {
+                return Err(InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: "profile anchor must be absolute".to_owned(),
+                });
+            }
+            PlatformHandle::new(path.to_string_lossy().into_owned()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: error.to_string(),
+                }
+            })
+        };
+    let local_app_data = eliot_platform_windows::current_user_local_app_data_root()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let local_app_data = anchor_handle(&local_app_data, "local_app_data")?;
+    let named_anchor = anchor_handle(profile_anchor_root, "profile_anchor_root")?;
+    let (anchors, runtime_anchor) = match profile {
+        InstallationProfile::SystemService => {
+            let program_data = eliot_platform_windows::protected_program_data_root()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let program_data = anchor_handle(&program_data, "program_data")?;
+            if !eliot_platform_windows::windows_paths_equal(
+                profile_anchor_root,
+                Path::new(program_data.as_str()),
+            ) {
+                return Err(InstallationError::ProfileViolation(
+                    "system_service profile_anchor_root must equal the OS-resolved ProgramData contour"
+                        .to_owned(),
+                ));
+            }
+            let program_files = eliot_platform_windows::program_files_root()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            (
+                ProfileRootAnchors {
+                    program_files: Some(anchor_handle(&program_files, "program_files")?),
+                    program_data: Some(program_data),
+                    local_app_data,
+                    repository_root: None,
+                },
+                named_anchor,
+            )
+        }
+        InstallationProfile::UserMode => {
+            if !eliot_platform_windows::windows_paths_equal(
+                profile_anchor_root,
+                Path::new(local_app_data.as_str()),
+            ) {
+                return Err(InstallationError::ProfileViolation(
+                    "user_mode profile_anchor_root must equal the OS-resolved current-user LocalAppData contour"
+                        .to_owned(),
+                ));
+            }
+            (
+                ProfileRootAnchors {
+                    program_files: None,
+                    program_data: None,
+                    local_app_data,
+                    repository_root: None,
+                },
+                named_anchor,
+            )
+        }
+        InstallationProfile::PortableDev => (
+            ProfileRootAnchors {
+                program_files: None,
+                program_data: None,
+                local_app_data,
+                repository_root: Some(named_anchor.clone()),
+            },
+            named_anchor,
+        ),
+    };
+    Ok(ProfileSelectionInput {
+        profile,
+        anchors,
+        profile_anchor_root: runtime_anchor,
+        installation_key,
+        component,
+        version,
+        generation,
+        source_root,
+        staging_root,
+    })
+}
+
 fn print_transaction_projection(
     status: &str,
     store_path: &Path,
@@ -3968,6 +5602,11 @@ fn print_transaction_projection(
         .or_else(|| outcome.map(installation_outcome_status))
         .unwrap_or(status);
     let completed = installation_projection_completed(transaction.stage());
+    // I3.1: the response shows the selected profile, its resolved root roles,
+    // its supervision type and its enforced/unsupported guarantees, taken from
+    // the binding the durable transaction actually records. Nothing here
+    // exposes a key.
+    let profile_governance = installation_profile_governance_projection(transaction);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -3980,6 +5619,7 @@ fn print_transaction_projection(
             "stage": transaction.stage(),
             "revision": transaction.revision(),
             "completed": completed,
+            "profile_governance": profile_governance,
             "outcome": outcome_value,
             "staging": staging.map(|value| {
                 json!({
@@ -4023,13 +5663,10 @@ fn installation_outcome_status(outcome: &InstallationStepOutcome) -> &'static st
 }
 
 fn installation_command_exit_code(status: &str) -> i32 {
-    if matches!(
-        status,
-        "EFFECTS_APPLIED" | "ROLLED_BACK" | "ACTIVE_VERIFIED"
-    ) {
-        0
-    } else {
-        INVALID_REQUEST_EXIT
+    match status {
+        "EFFECTS_APPLIED" | "ROLLED_BACK" | "ACTIVE_VERIFIED" => 0,
+        "PENDING_RUNTIME" => UNKNOWN_OUTCOME_EXIT,
+        _ => INVALID_REQUEST_EXIT,
     }
 }
 
@@ -5247,7 +6884,7 @@ mod tests {
             InstallationStage::RollbackRequired,
             true,
         ));
-        assert!(!should_query_host_terminal(
+        assert!(should_query_host_terminal(
             InstallationProfile::PortableDev,
             InstallationStage::RollbackRequired,
             true,

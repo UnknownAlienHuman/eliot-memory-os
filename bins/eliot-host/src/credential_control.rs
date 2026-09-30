@@ -1,4 +1,4 @@
-//! LocalService-only Store credential provisioning behind the Host owner epoch.
+//! Profile-bound Store credential provisioning behind the Host owner epoch.
 
 #![allow(
     clippy::doc_markdown,
@@ -22,19 +22,26 @@ use eliot_host_state::{HostInstallationEpoch, host_owner_epoch_digest};
 use eliot_installation::{
     CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
     HostCredentialControlOperation, HostCredentialControlRequest, HostCredentialControlResponse,
-    HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt, LOCAL_SERVICE_SID,
-    StoreCredentialAbsentSnapshot, credential_absent_response_digest,
+    HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt, InstallationProfile,
+    LOCAL_SERVICE_SID, RuntimeLaunchDescriptor, StoreCredentialAbsentSnapshot,
+    StoreCredentialProvider, StoreCredentialScope, credential_absent_response_digest,
     credential_control_response_frame, credential_deleted_response_digest,
-    credential_matching_response_digest, decode_credential_control_request_frame,
+    credential_matching_response_digest, current_user_credential_control_pipe,
+    decode_credential_control_request_frame,
 };
 use eliot_ipc::{NamedPipeServer, TransportLimits};
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    CredentialSecret, HostCredentialMutationCapability, InstallerRootObjectSnapshot,
-    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    WindowsInstallerRootPrimitive, observe_named_pipe_peer_process, protected_program_data_root,
+    CredentialSecret, CurrentUserStoreCredentialObservation,
+    CurrentUserStoreCredentialProvisionOutcome, HostCredentialMutationCapability,
+    InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
+    InstallerRootProfile,
+    WindowsCurrentUserStoreCredentialProvider, WindowsInstallerRootPrimitive,
+    current_process_named_pipe_expectation, is_process_builtin_administrator,
+    is_process_elevated, observe_named_pipe_peer_process, protected_program_data_root,
     windows_path_identity_digest, windows_paths_equal,
 };
+use eliot_platform_windows::profile_supervision::{ProfileSelection, ProfileSelectionReceipt};
 use tokio::sync::oneshot;
 
 use codec::{
@@ -220,7 +227,7 @@ pub struct HostPhaseBRequest {
     pub operation: HostCredentialControlOperation,
     /// Exact transaction-bound Phase-B handoff intent.
     pub intent: HostPhaseBMaterializationIntent,
-    /// Exact prior LocalService credential receipt admitted by the request.
+    /// Exact prior profile-bound credential receipt admitted by the request.
     pub credential_receipt: CredentialAccessReceipt,
     /// Provider-supplied final receipt for the finalize operation.
     pub final_receipt: Option<HostPhaseBMaterializationReceipt>,
@@ -248,21 +255,66 @@ trait CredentialBackend {
     ) -> Result<(), String>;
 }
 
-struct ProductionCredentialBackend(HostCredentialMutationCapability);
+enum ProductionCredentialBackend {
+    SystemService(HostCredentialMutationCapability),
+    CurrentUser {
+        provider: WindowsCurrentUserStoreCredentialProvider,
+        expected_owner_sid: PlatformHandle,
+    },
+}
 
 impl CredentialBackend for ProductionCredentialBackend {
     fn principal_sid(&self) -> Result<PlatformHandle, String> {
-        self.0.principal_sid().map_err(|error| error.to_string())
+        match self {
+            Self::SystemService(capability) => {
+                capability.principal_sid().map_err(|error| error.to_string())
+            }
+            Self::CurrentUser { provider, .. } => {
+                provider.principal_sid().map_err(|error| error.to_string())
+            }
+        }
     }
 
     fn read(&self, target: &PlatformHandle) -> Result<Option<CredentialSecret>, String> {
-        self.0
-            .read_optional(target)
-            .map_err(|error| error.to_string())
+        match self {
+            Self::SystemService(capability) => capability
+                .read_optional(target)
+                .map_err(|error| error.to_string()),
+            Self::CurrentUser {
+                provider,
+                expected_owner_sid,
+            } => {
+                let present = match provider
+                    .inspect(target, expected_owner_sid)
+                    .map_err(|error| error.to_string())?
+                {
+                    CurrentUserStoreCredentialObservation::Absent { owner_sid, target: read }
+                        if owner_sid == *expected_owner_sid && read == *target => return Ok(None),
+                    CurrentUserStoreCredentialObservation::Present { owner_sid, target: read }
+                        if owner_sid == *expected_owner_sid && read == *target => true,
+                    _ => return Err("current-user credential observation binding mismatch".to_owned()),
+                };
+                if present {
+                    provider
+                        .read(target, expected_owner_sid)
+                        .map(Some)
+                        .map_err(|error| error.to_string())
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     fn generate(&self) -> Result<CredentialSecret, String> {
-        self.0.generate_secret().map_err(|error| error.to_string())
+        match self {
+            Self::SystemService(capability) => {
+                capability.generate_secret().map_err(|error| error.to_string())
+            }
+            Self::CurrentUser { provider, .. } => {
+                provider.generate_secret().map_err(|error| error.to_string())
+            }
+        }
     }
 
     fn write_if_absent(
@@ -270,10 +322,35 @@ impl CredentialBackend for ProductionCredentialBackend {
         target: &PlatformHandle,
         bytes: Vec<u8>,
     ) -> Result<CredentialSecret, String> {
-        let secret = CredentialSecret::from_bytes(bytes).map_err(|error| error.to_string())?;
-        self.0
-            .write_if_absent(target, secret)
-            .map_err(|error| error.to_string())
+        let secret = CredentialSecret::from_bytes(bytes.clone()).map_err(|error| error.to_string())?;
+        match self {
+            Self::SystemService(capability) => capability
+                .write_if_absent(target, secret)
+                .map_err(|error| error.to_string()),
+            Self::CurrentUser {
+                provider,
+                expected_owner_sid,
+            } => {
+                match provider
+                    .write_exact_if_absent(target, expected_owner_sid, secret)
+                    .map_err(|error| error.to_string())?
+                {
+                    CurrentUserStoreCredentialProvisionOutcome::Created(receipt)
+                        if receipt.owner_sid == *expected_owner_sid && receipt.target == *target => {}
+                    CurrentUserStoreCredentialProvisionOutcome::Created(_)
+                    | CurrentUserStoreCredentialProvisionOutcome::Unknown { .. } => {
+                        return Err("current-user credential write outcome is not exact".to_owned());
+                    }
+                }
+                let readback = provider
+                    .read(target, expected_owner_sid)
+                    .map_err(|error| error.to_string())?;
+                if readback.expose() != bytes.as_slice() {
+                    return Err("current-user credential write readback mismatch".to_owned());
+                }
+                Ok(readback)
+            }
+        }
     }
 
     fn delete_if_matching(
@@ -282,9 +359,29 @@ impl CredentialBackend for ProductionCredentialBackend {
         expected_digest: &PlatformHandle,
         verify: &mut dyn FnMut(&CredentialSecret) -> bool,
     ) -> Result<(), String> {
-        self.0
-            .delete_if_matching(target, expected_digest, verify)
-            .map_err(|error| error.to_string())
+        match self {
+            Self::SystemService(capability) => capability
+                .delete_if_matching(target, expected_digest, verify)
+                .map_err(|error| error.to_string()),
+            Self::CurrentUser {
+                provider,
+                expected_owner_sid,
+            } => {
+                let Some(current) = CredentialBackend::read(self, target)? else {
+                    return provider
+                        .delete_if_digest(target, expected_owner_sid, expected_digest)
+                        .map_err(|error| error.to_string());
+                };
+                if handle_digest(current.expose())?.as_str() != expected_digest.as_str()
+                    || !verify(&current)
+                {
+                    return Err("current-user credential delete binding mismatch".to_owned());
+                }
+                provider
+                    .delete_if_digest(target, expected_owner_sid, expected_digest)
+                    .map_err(|error| error.to_string())
+            }
+        }
     }
 }
 
@@ -301,55 +398,199 @@ struct HostCredentialControlCore<B> {
     host_process_digest: PlatformHandle,
     host_process_image: PathBuf,
     root_spec: InstallerRootPrimitiveSpec,
+    profile: InstallationProfile,
+    expected_principal_sid: PlatformHandle,
+    expected_session_id: Option<u32>,
+    expected_transaction_id: PlatformHandle,
+    expected_plan_digest: PlatformHandle,
+    expected_host_executable: PlatformHandle,
+    expected_host_executable_sha256: PlatformHandle,
+    expected_store_target: PlatformHandle,
+    expected_generation: eliot_contracts::ResourceGeneration,
+    expected_scope: StoreCredentialScope,
+    pipe_name: String,
     primitive: WindowsInstallerRootPrimitive,
     backend: B,
 }
 
 impl HostCredentialControl {
-    /// Creates the handler after Host owner epoch acquisition.
-    pub(super) fn new(
+    /// Creates the handler from one validated profile launch and its retained
+    /// profile selection proof. `SystemService` uses the owner capability and
+    /// fixed administrator endpoint; UserMode and PortableDev use only the
+    /// exact selected current-user principal and profile-disjoint endpoint.
+    pub(super) fn new_for_profile(
         host_epoch: HostInstallationEpoch,
-        host_state_root: PathBuf,
-        capability: HostCredentialMutationCapability,
+        launch: &RuntimeLaunchDescriptor,
+        selected_roots: Option<ProfileSelectionReceipt>,
+        capability: Option<HostCredentialMutationCapability>,
+        expected_transaction_id: PlatformHandle,
+        expected_plan_digest: PlatformHandle,
         phase_b_queue: HostPhaseBRequestQueue,
     ) -> Result<Self, String> {
-        // F-LOG-HOST-2 (#893): credential acquire boundary. Requested here,
-        // acquired on success; failure stays under the outer
-        // `credential_control` terminal (`host-credential-control-failed` in
-        // `lib.rs`), so this boundary owns no terminal of its own.
         credential_control_observe("host.credential acquire requested");
-        let installation_root = host_state_root
-            .parent()
-            .ok_or_else(|| "host_state_root has no installation parent".to_owned())?
-            .to_path_buf();
-        let profile_anchor = protected_program_data_root().map_err(|error| error.to_string())?;
-        // Credential receipts and Phase-B materialization share the exact
-        // sequence-bound owner discriminator. A direct-child Host must win
-        // the durable recovery CAS before it can issue fresh credential
-        // authority; the old receipt is evidence only.
-        let host_epoch_digest =
-            host_owner_epoch_digest(&host_epoch).map_err(|error| error.to_string())?;
+        launch.validate().map_err(|error| error.to_string())?;
+        if expected_transaction_id.as_str().is_empty()
+            || expected_plan_digest.as_str().len() != 64
+            || !expected_plan_digest
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("selected credential transaction or plan digest is invalid".to_owned());
+        }
+        if host_epoch.installation != launch.installation_epoch.installation {
+            return Err("Host owner epoch installation does not match selected launch".to_owned());
+        }
+
+        let roots = &launch.runtime_state_roots;
+        if roots.profile != launch.profile {
+            return Err("runtime roots do not match selected launch profile".to_owned());
+        }
+        let root_profile = match launch.profile {
+            InstallationProfile::SystemService => InstallerRootProfile::SystemService,
+            InstallationProfile::UserMode => InstallerRootProfile::UserMode,
+            InstallationProfile::PortableDev => InstallerRootProfile::PortableDev,
+        };
+        let root_spec = InstallerRootPrimitiveSpec {
+            root: PathBuf::from(roots.host_state_root.as_str()),
+            installation_root: PathBuf::from(roots.installation_root.as_str()),
+            profile_anchor: PathBuf::from(roots.profile_anchor_root.as_str()),
+            profile: root_profile,
+        };
+
+        let (backend, expected_principal_sid, expected_session_id, pipe_name, expected_scope) =
+            match launch.profile {
+                InstallationProfile::SystemService => {
+                    if selected_roots.is_some() {
+                        return Err("SystemService credential control cannot use user roots".to_owned());
+                    }
+                    if !windows_paths_equal(
+                        &root_spec.profile_anchor,
+                        &protected_program_data_root().map_err(|error| error.to_string())?,
+                    ) {
+                        return Err("SystemService credential root must use ProgramData".to_owned());
+                    }
+                    let capability = capability.ok_or_else(|| {
+                        "SystemService credential control requires its owner capability".to_owned()
+                    })?;
+                    if capability
+                        .principal_sid()
+                        .map_err(|error| error.to_string())?
+                        .as_str()
+                        != LOCAL_SERVICE_SID
+                    {
+                        return Err("SystemService credential owner is not LocalService".to_owned());
+                    }
+                    (
+                        ProductionCredentialBackend::SystemService(capability),
+                        PlatformHandle::new(LOCAL_SERVICE_SID)
+                            .map_err(|error| error.to_string())?,
+                        None,
+                        HOST_CREDENTIAL_CONTROL_PIPE.to_owned(),
+                        StoreCredentialScope::LocalService,
+                    )
+                }
+                InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                    if capability.is_some() {
+                        return Err("current-user credential control cannot use a service capability".to_owned());
+                    }
+                    let selected = selected_roots.ok_or_else(|| {
+                        "current-user credential control requires retained profile roots".to_owned()
+                    })?;
+                    launch
+                        .profile_governed_roots
+                        .validate_profile_selection_receipt(launch, &selected)
+                        .map_err(|error| error.to_string())?;
+                    let selected_profile = match launch.profile {
+                        InstallationProfile::UserMode => ProfileSelection::UserMode,
+                        InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+                        InstallationProfile::SystemService => unreachable!(),
+                    };
+                    if selected.profile != selected_profile
+                        || selected.owner_sid == LOCAL_SERVICE_SID
+                    {
+                        return Err("selected credential principal is not a current user".to_owned());
+                    }
+                    let current = current_process_named_pipe_expectation()
+                        .map_err(|error| error.to_string())?;
+                    if current.expected_sid() != selected.owner_sid
+                        || current.expected_session_id() != selected.session_id
+                    {
+                        return Err("Host token SID/session differs from retained profile selection".to_owned());
+                    }
+                    if is_process_elevated().map_err(|error| error.to_string())? {
+                        return Err("current-user credential control refuses an elevated Host token".to_owned());
+                    }
+                    if is_process_builtin_administrator().map_err(|error| error.to_string())? {
+                        return Err("current-user credential control refuses an administrator Host token".to_owned());
+                    }
+                    let expected_principal_sid = PlatformHandle::new(selected.owner_sid.clone())
+                        .map_err(|error| error.to_string())?;
+                    let provider = WindowsCurrentUserStoreCredentialProvider::new();
+                    if provider
+                        .principal_sid()
+                        .map_err(|error| error.to_string())?
+                        != expected_principal_sid
+                    {
+                        return Err("current-user Store provider SID differs from profile selection".to_owned());
+                    }
+                    let pipe_name = current_user_credential_control_pipe(
+                        launch.profile,
+                        &launch.installation_epoch.installation,
+                        &expected_principal_sid,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    (
+                        ProductionCredentialBackend::CurrentUser {
+                            provider,
+                            expected_owner_sid: expected_principal_sid.clone(),
+                        },
+                        expected_principal_sid,
+                        Some(selected.session_id),
+                        pipe_name,
+                        StoreCredentialScope::CurrentUser,
+                    )
+                }
+            };
+
         let process = observe_named_pipe_peer_process(std::process::id())
             .map_err(|error| error.to_string())?;
-        let host_process_digest = handle_digest(process.identity().stable_key().as_bytes())?;
         let host_process_image = PathBuf::from(process.image_path());
-        // F-LOG-HOST-2 (#893): owner-epoch acquisition succeeded; the receipt
-        // below carries reference identities only, never secret values.
+        if !windows_paths_equal(
+            &host_process_image,
+            Path::new(launch.host_executable_path.as_str()),
+        ) {
+            return Err("live Host image path differs from the selected launch".to_owned());
+        }
+        let host_epoch_digest =
+            host_owner_epoch_digest(&host_epoch).map_err(|error| error.to_string())?;
+        let host_process_digest = handle_digest(process.identity().stable_key().as_bytes())?;
+        let expected_host_executable = launch.host_executable_path.clone();
+        let expected_host_executable_sha256 = launch.host_artifact_digest.clone();
+        let expected_store_target = launch.store_credential_target.clone();
+        let expected_generation = launch.authority_generation;
         credential_control_observe("host.credential acquired owner-epoch");
+
         Ok(Self {
             core: HostCredentialControlCore {
                 _host_epoch: host_epoch,
                 host_epoch_digest,
                 host_process_digest,
                 host_process_image,
-                root_spec: InstallerRootPrimitiveSpec {
-                    root: host_state_root,
-                    installation_root,
-                    profile_anchor,
-                    profile: InstallerRootProfile::SystemService,
-                },
+                root_spec,
+                profile: launch.profile,
+                expected_principal_sid,
+                expected_session_id,
+                expected_transaction_id,
+                expected_plan_digest,
+                expected_host_executable,
+                expected_host_executable_sha256,
+                expected_store_target,
+                expected_generation,
+                expected_scope,
+                pipe_name,
                 primitive: WindowsInstallerRootPrimitive::new(),
-                backend: ProductionCredentialBackend(capability),
+                backend,
             },
             phase_b_queue,
         })
@@ -417,7 +658,7 @@ impl HostCredentialControl {
             request,
             &self.core.host_epoch_digest,
         ));
-        if request.validate().is_err() {
+        if !self.core.admits_request(request) {
             credential_control_observe_bound(&CredentialObservation::for_request(
                 "host.credential phase-b enqueue validation unknown",
                 request,
@@ -488,9 +729,9 @@ impl HostCredentialControl {
         }
     }
 
-    /// Serves one bounded request through the existing authenticated EBP
-    /// named-pipe transport. The DACL and impersonated client token both
-    /// require enabled built-in Administrators membership.
+    /// Serves one bounded request through the authenticated EBP named-pipe
+    /// transport. SystemService requires built-in Administrators membership;
+    /// UserMode and PortableDev require the exact selected SID and session.
     ///
     /// # Errors
     ///
@@ -502,10 +743,23 @@ impl HostCredentialControl {
         // no second terminal.
         credential_control_observe("host.credential serve requested");
         let mut serve_terminal = CredentialTerminalGuard::armed("host-credential-serve-failed");
-        let installer =
-            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
-                .map_err(|error| error.to_string())?;
-        let mut server = NamedPipeServer::create(HOST_CREDENTIAL_CONTROL_PIPE, &installer)
+        let installer = match self.core.profile {
+            InstallationProfile::SystemService => {
+                eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
+                    .map_err(|error| error.to_string())?
+            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let session_id = self.core.expected_session_id.ok_or_else(|| {
+                    "current-user credential control has no selected session".to_owned()
+                })?;
+                eliot_platform_windows::NamedPipePeerExpectation::new(
+                    self.core.expected_principal_sid.as_str(),
+                    session_id,
+                )
+                .map_err(|error| error.to_string())?
+            }
+        };
+        let mut server = NamedPipeServer::create(self.core.pipe_name.as_str(), &installer)
             .map_err(|error| error.to_string())?;
         server
             .wait_for_authenticated_client(timeout, &installer)
@@ -537,24 +791,104 @@ impl HostCredentialControl {
 }
 
 impl<B: CredentialBackend> HostCredentialControlCore<B> {
-    fn handle(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
-        if request.validate().is_err()
-            || !windows_paths_equal(
-                Path::new(request.intent.provision.host_state_root.as_str()),
+    fn admits_request(&self, request: &HostCredentialControlRequest) -> bool {
+        let provision = &request.intent.provision;
+        request.validate().is_ok()
+            && request.intent.transaction_id == self.expected_transaction_id
+            && request.intent.installation_plan_digest == self.expected_plan_digest
+            && windows_paths_equal(
+                Path::new(provision.host_state_root.as_str()),
                 &self.root_spec.root,
             )
-            || !windows_paths_equal(
-                Path::new(request.intent.provision.expected_host_executable.as_str()),
+            && windows_paths_equal(
+                Path::new(provision.expected_host_executable.as_str()),
                 &self.host_process_image,
             )
-            || self
-                .backend
-                .principal_sid()
-                .ok()
-                .as_ref()
-                .map(PlatformHandle::as_str)
-                != Some(LOCAL_SERVICE_SID)
-        {
+            && windows_paths_equal(
+                Path::new(provision.expected_host_executable.as_str()),
+                Path::new(self.expected_host_executable.as_str()),
+            )
+            && provision.expected_host_executable_sha256 == self.expected_host_executable_sha256
+            && provision.target == self.expected_store_target
+            && provision.generation == self.expected_generation
+            && provision.provider == StoreCredentialProvider::WindowsCredentialManager
+            && provision.scope == self.expected_scope
+            && provision.expected_principal_sid == self.expected_principal_sid
+            && (match self.profile {
+                InstallationProfile::SystemService => {
+                    self.expected_scope == StoreCredentialScope::LocalService
+                        && self.expected_principal_sid.as_str() == LOCAL_SERVICE_SID
+                }
+                InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                    self.expected_scope == StoreCredentialScope::CurrentUser
+                        && self.expected_principal_sid.as_str() != LOCAL_SERVICE_SID
+                        && self.expected_session_id.is_some()
+                }
+            })
+            && self.backend.principal_sid().ok().as_ref() == Some(&self.expected_principal_sid)
+    }
+
+    fn read_marker(&self, path: &Path) -> Result<(InstallerRootObjectSnapshot, Vec<u8>), String> {
+        let readback = match self.profile {
+            InstallationProfile::SystemService => self.primitive.read_local_service_protected_file(
+                &self.root_spec,
+                path,
+                MARKER_LIMIT,
+            ),
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                self.primitive
+                    .read_protected_file(&self.root_spec, path, MARKER_LIMIT)
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        Ok((readback.object, readback.bytes))
+    }
+
+    fn create_marker<F>(
+        &self,
+        path: &Path,
+        build: F,
+    ) -> Result<InstallerRootObjectSnapshot, String>
+    where
+        F: FnOnce(&InstallerRootObjectSnapshot) -> Result<Vec<u8>, eliot_platform_windows::InstallerRootError>,
+    {
+        match self.profile {
+            InstallationProfile::SystemService => self
+                .primitive
+                .create_local_service_protected_file(&self.root_spec, path, build),
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => self
+                .primitive
+                .create_protected_file(&self.root_spec, path, build),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn rewrite_marker(
+        &self,
+        path: &Path,
+        expected: &InstallerRootObjectSnapshot,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let readback = match self.profile {
+            InstallationProfile::SystemService => self.primitive.rewrite_local_service_protected_file(
+                &self.root_spec,
+                path,
+                expected,
+                bytes,
+            ),
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => self
+                .primitive
+                .rewrite_protected_file(&self.root_spec, path, expected, bytes),
+        }
+        .map_err(|error| error.to_string())?;
+        if readback.object != *expected || readback.bytes.as_slice() != bytes {
+            return Err("credential marker rewrite readback mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    fn handle(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
+        if !self.admits_request(request) {
             // F-LOG-HOST-2 (#893): admission validation failed; the single
             // terminal for this Unknown stays with `handle`.
             credential_control_observe_bound(&CredentialObservation::for_request(
@@ -644,13 +978,9 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         ));
         let marker_path = marker_path(&self.root_spec.root, request);
         let key = request.ownership_key.as_slice();
-        let marker = match self.primitive.read_local_service_protected_file(
-            &self.root_spec,
-            &marker_path,
-            MARKER_LIMIT,
-        ) {
-            Ok(readback) => match decode_marker(request, key, &readback.object, &readback.bytes) {
-                Ok(marker) => (readback.object, marker),
+        let marker = match self.read_marker(&marker_path) {
+            Ok((object, bytes)) => match decode_marker(request, key, &object, &bytes) {
+                Ok(marker) => (object, marker),
                 Err(()) => return unknown(request, "credential-marker-mac"),
             },
             Err(_) => {
@@ -723,8 +1053,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 if target.is_some() {
                     return unknown(request, "credential-target-before-marker");
                 }
-                let created = self.primitive.create_local_service_protected_file(
-                    &self.root_spec,
+                let created = self.create_marker(
                     &marker_path,
                     |identity| marker_bytes(request, key, identity, MarkerPhase::Reserved, None),
                 );
@@ -732,20 +1061,16 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                     Ok(identity) => identity,
                     Err(_) => return unknown(request, "credential-marker-create"),
                 };
-                let readback = match self.primitive.read_local_service_protected_file(
-                    &self.root_spec,
-                    &marker_path,
-                    MARKER_LIMIT,
-                ) {
-                    Ok(value) if value.object == identity => value,
+                let readback = match self.read_marker(&marker_path) {
+                    Ok((object, bytes)) if object == identity => (object, bytes),
                     Ok(_) => return unknown(request, "credential-marker-created-identity"),
                     Err(_) => return unknown(request, "credential-marker-flush-readback"),
                 };
-                let marker = match decode_marker(request, key, &readback.object, &readback.bytes) {
+                let marker = match decode_marker(request, key, &readback.0, &readback.1) {
                     Ok(marker) => marker,
                     Err(()) => return unknown(request, "credential-marker-created-mac"),
                 };
-                (readback.object, marker)
+                (readback.0, marker)
             }
         };
         if request.expected_receipt.as_ref().is_some_and(|receipt| {
@@ -814,8 +1139,8 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 Ok(value) => value,
                 Err(_) => return unknown(request, "credential-envelope"),
             };
-            // The capability holds a protected Host-state interlock across
-            // the final absence check, CredWriteW and authoritative readback.
+            // The profile-bound provider holds its exact target interlock
+            // across the final absence check, write attempt and readback.
             let readback = match write_if_absent(
                 &self.backend,
                 &request.intent.provision.target,
@@ -852,16 +1177,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             Ok(value) => value,
             Err(_) => return unknown(request, "credential-final-marker"),
         };
-        if self
-            .primitive
-            .rewrite_local_service_protected_file(
-                &self.root_spec,
-                &marker_path,
-                &marker.0,
-                &final_bytes,
-            )
-            .is_err()
-        {
+        if self.rewrite_marker(&marker_path, &marker.0, &final_bytes).is_err() {
             return unknown(request, "credential-final-marker-write");
         }
         let response_digest = match credential_matching_response_digest(
@@ -912,19 +1228,15 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             &self.host_epoch_digest,
         ));
         let marker_path = marker_path(&self.root_spec.root, request);
-        let readback = match self.primitive.read_local_service_protected_file(
-            &self.root_spec,
-            &marker_path,
-            MARKER_LIMIT,
-        ) {
+        let readback = match self.read_marker(&marker_path) {
             Ok(value) => value,
             Err(_) => return unknown(request, "credential-delete-marker"),
         };
         if decode_marker(
             request,
             &request.ownership_key,
-            &readback.object,
-            &readback.bytes,
+            &readback.0,
+            &readback.1,
         )
         .is_err()
         {
@@ -933,7 +1245,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         let Some(expected_receipt) = request.expected_receipt.as_ref() else {
             return unknown(request, "credential-delete-receipt");
         };
-        if expected_receipt.marker != marker_identity(&readback.object)
+        if expected_receipt.marker != marker_identity(&readback.0)
             || expected_receipt.host_owner_epoch != self.host_epoch_digest
         {
             return unknown(request, "credential-delete-receipt-binding");
@@ -943,13 +1255,13 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             request,
             &request.ownership_key,
             &self.host_epoch_digest,
-            &readback.object,
+            &readback.0,
             expected_receipt,
         )
         .is_err()
             || self
                 .primitive
-                .delete_file(&marker_path, &readback.object)
+                .delete_file(&marker_path, &readback.0)
                 .is_err()
             || !matches!(path_absent(&marker_path), Ok(true))
         {
@@ -1112,6 +1424,7 @@ mod tests {
         StoreCredentialProvisionPlan {
             host_state_root: handle(r"C:\ProgramData\Eliot\host"),
             expected_host_executable: handle(r"C:\ProgramData\Eliot\eliot-host.exe"),
+            expected_host_executable_sha256: handle("d".repeat(64)),
             target: handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
             provider: StoreCredentialProvider::WindowsCredentialManager,
             scope: StoreCredentialScope::LocalService,

@@ -304,10 +304,15 @@ impl HostComposition {
             != self.host.installation
         {
             let reason = "pending activation installation epoch is stale";
+            #[cfg(not(test))]
+            let profile_selection = self.profile_selection_receipt.as_ref();
+            #[cfg(test)]
+            let profile_selection = None;
             persist_pending_recovery(
                 &self.registry_host_root.clone(),
                 &mut self.registry,
                 &host_capability,
+                profile_selection,
                 &pending,
                 reason,
             )?;
@@ -325,10 +330,15 @@ impl HostComposition {
             // and leaving an unclean Starting/Degraded journal that the next
             // Host open cannot legally reopen. No retry is issued here.
             let reason = error.to_string();
+            #[cfg(not(test))]
+            let profile_selection = self.profile_selection_receipt.as_ref();
+            #[cfg(test)]
+            let profile_selection = None;
             persist_pending_recovery(
                 &self.registry_host_root.clone(),
                 &mut self.registry,
                 &host_capability,
+                profile_selection,
                 &pending,
                 &reason,
             )?;
@@ -1791,10 +1801,15 @@ impl HostComposition {
                 && current.plan_digest == pending.plan_digest
                 && current.approval == pending.approval
         }) {
+            #[cfg(not(test))]
+            let profile_selection = self.profile_selection_receipt.as_ref();
+            #[cfg(test)]
+            let profile_selection = None;
             persist_pending_recovery(
                 &self.registry_host_root.clone(),
                 &mut self.registry,
                 host_capability,
+                profile_selection,
                 pending,
                 "activation commit outcome is unknown",
             )

@@ -795,7 +795,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
     drop(UserOwnedRootLease::open_existing(&portable)?);
     let portable_handle = handle(portable.to_string_lossy().into_owned());
     let runtime_state_roots = RuntimeStateRoots::derive_portable(portable_handle.clone())?;
-    let generation = handle("generation:liveness-store-split");
+    let generation = handle("generation-liveness-store-split");
     let kernel_digest = handle("a".repeat(64));
     let bridge_digest = handle("b".repeat(64));
     let provider_digest = handle("d".repeat(64));
@@ -811,8 +811,37 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
     let user_broker_bytes = b"approved-user-broker-fixture";
     std::fs::write(&user_broker_path, user_broker_bytes)?;
     let user_broker_digest = handle(format!("{:x}", Sha256::digest(user_broker_bytes)));
+    let profile_governed_roots = eliot_installation::InstallationRoots {
+        binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+        immutable_binaries: portable
+            .join("target")
+            .join("eliot-dev")
+            .join(generation.as_str())
+            .to_string_lossy()
+            .into_owned(),
+        durable_data: portable
+            .join(".eliot-dev")
+            .join("state")
+            .to_string_lossy()
+            .into_owned(),
+        user_config: portable
+            .join(".eliot-dev")
+            .join("config")
+            .to_string_lossy()
+            .into_owned(),
+        user_cache: portable
+            .join(".eliot-dev")
+            .join("cache")
+            .to_string_lossy()
+            .into_owned(),
+        runtime_state_roots: runtime_state_roots.clone(),
+    };
     let mut runtime_launch = RuntimeLaunchDescriptor {
         profile: InstallationProfile::PortableDev,
+        profile_component: handle("eliot"),
+        profile_version: handle("test-version"),
+        profile_installation_key: None,
+        profile_governed_roots,
         portable_root: Some(portable_handle.clone()),
         installation_epoch: InstallationEpoch {
             installation: handle("installation:liveness-store-split"),

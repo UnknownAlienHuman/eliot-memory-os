@@ -265,6 +265,77 @@ pub(crate) struct DirectoryPublicationContour {
     parent_identity: FileIdentity,
 }
 
+/// Retains the complete existing directory ancestry for a path-bound file
+/// operation. On Windows, each component is opened without following reparse
+/// points and without delete sharing, then kept alive until this value drops.
+pub struct RetainedDirectoryContour {
+    canonical_path: PathBuf,
+    identity: FileIdentity,
+    #[cfg(windows)]
+    contour: DirectoryPublicationContour,
+}
+
+impl RetainedDirectoryContour {
+    /// Opens and retains every existing component of one absolute directory
+    /// path using the same no-follow identity checks as owned directory
+    /// publication. Retained directory handles are read-only and deny delete
+    /// sharing, so the caller's existing file-create ACL remains authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for a missing, invalid, or reparse-point path, an
+    /// identity mismatch, provider I/O failure, or a non-Windows platform.
+    pub fn retain(path: &Path) -> Result<Self, DirectoryPublicationError> {
+        #[cfg(windows)]
+        {
+            validate_directory_publication_absolute(path)?;
+            let contour = retain_directory_contour(path, |component| {
+                open_publication_directory(component, false)
+            })?;
+            verify_directory_publication_contour(&contour)?;
+            Ok(Self {
+                canonical_path: contour.canonical_parent.clone(),
+                identity: contour.parent_identity,
+                contour,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Err(DirectoryPublicationError::UnsupportedPlatform)
+        }
+    }
+
+    /// Revalidates every retained ancestor path and object identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if any retained object no longer matches its
+    /// original path and identity, or on a non-Windows platform.
+    pub fn verify(&self) -> Result<(), DirectoryPublicationError> {
+        #[cfg(windows)]
+        {
+            verify_directory_publication_contour(&self.contour)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(DirectoryPublicationError::UnsupportedPlatform)
+        }
+    }
+
+    /// Canonical absolute path of the retained final directory component.
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    /// Stable identity of the retained final directory component.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn validate_directory_publication_absolute(
     path: &Path,
@@ -799,6 +870,17 @@ fn delete_created_directory_handle(file: &std::fs::File) -> Result<(), Directory
 pub(crate) fn retain_directory_publication_contour(
     parent: &Path,
 ) -> Result<DirectoryPublicationContour, DirectoryPublicationError> {
+    retain_directory_contour(parent, open_publication_directory_for_create)
+}
+
+#[cfg(windows)]
+fn retain_directory_contour<F>(
+    parent: &Path,
+    open_final_directory: F,
+) -> Result<DirectoryPublicationContour, DirectoryPublicationError>
+where
+    F: FnOnce(&Path) -> Result<std::fs::File, DirectoryPublicationError>,
+{
     let mut ancestors = parent
         .ancestors()
         .map(Path::to_path_buf)
@@ -826,16 +908,31 @@ pub(crate) fn retain_directory_publication_contour(
         .last()
         .map(|(path, _, _)| path.clone())
         .ok_or(DirectoryPublicationError::InvalidPath)?;
-    let parent_handle = open_publication_directory_for_create(&parent_path)?;
-    if let Some((_, _, handle)) = entries.last_mut() {
-        *handle = parent_handle;
-    }
-    let (canonical_parent, parent_identity, _) = entries
+    let parent_handle = open_final_directory(&parent_path)?;
+    let observed_parent_path = final_windows_path_from_handle(&parent_handle)
+        .map_err(|_| DirectoryPublicationError::Io)?;
+    let parent_identity =
+        file_identity_from_handle(&parent_handle).map_err(|_| DirectoryPublicationError::Io)?;
+    let (expected_path, expected_identity, _) = entries
         .last()
         .ok_or(DirectoryPublicationError::InvalidPath)?;
+    if !windows_paths_equal(&observed_parent_path, &parent_path)
+        || !windows_paths_equal(&observed_parent_path, expected_path)
+        || parent_identity != *expected_identity
+        || parent_identity.volume_serial_number == 0
+        || parent_identity.file_index == 0
+    {
+        return Err(DirectoryPublicationError::IdentityMismatch);
+    }
+    let (canonical_parent, retained_parent_identity, handle) = entries
+        .last_mut()
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    canonical_parent.clone_from(&observed_parent_path);
+    *retained_parent_identity = parent_identity;
+    *handle = parent_handle;
     Ok(DirectoryPublicationContour {
-        canonical_parent: canonical_parent.clone(),
-        parent_identity: *parent_identity,
+        canonical_parent: observed_parent_path,
+        parent_identity,
         entries,
     })
 }

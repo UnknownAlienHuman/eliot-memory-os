@@ -106,7 +106,7 @@ pub(crate) fn approved_locator(
 ) -> Result<PathBuf, HostError> {
     // WORK_UNIT_CASE: 978/1 — locator requested.
     launch_artifact_observe("host.launch-artifact locator requested");
-    if profile != InstallationProfile::PortableDev {
+    if profile == InstallationProfile::SystemService {
         let result =
             verify_approved_path(supplied, approved, "runtime.approved_locator").map_err(|error| {
                 // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
@@ -123,7 +123,7 @@ pub(crate) fn approved_locator(
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
         launch_artifact_observe("host.launch-artifact locator typed rejection");
         return Err(HostError::ProcessContour(
-            "portable locator must be absolute".to_owned(),
+            "current-user locator must be absolute".to_owned(),
         ));
     }
     let canonical_supplied = std::fs::canonicalize(supplied).map_err(|error| {
@@ -141,7 +141,7 @@ pub(crate) fn approved_locator(
         // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
         launch_artifact_observe("host.launch-artifact substitution preserved");
         return Err(HostError::ProcessContour(
-            "portable locator is not the approved canonical path".to_owned(),
+            "current-user locator is not the approved canonical path".to_owned(),
         ));
     }
     // The retained portable root lease and every child path must stay in the
@@ -157,11 +157,11 @@ pub(crate) fn approved_phase_b_destination_locator(
     supplied: &Path,
     approved: &PlatformHandle,
     profile: InstallationProfile,
-    portable_root: Option<&UserOwnedRootLease>,
+    user_owned_root: Option<&UserOwnedRootLease>,
 ) -> Result<PathBuf, HostError> {
     // WORK_UNIT_CASE: 978/1 — phase-b destination requested.
     launch_artifact_observe("host.launch-artifact phase-b destination requested");
-    if profile != InstallationProfile::PortableDev {
+    if profile == InstallationProfile::SystemService {
         let result = approved_locator(supplied, approved, profile);
         if result.is_ok() {
             // WORK_UNIT_CASE: 978/1 — phase-b destination admitted.
@@ -169,16 +169,16 @@ pub(crate) fn approved_phase_b_destination_locator(
         }
         return result;
     }
-    let root = portable_root.ok_or_else(|| {
+    let root = user_owned_root.ok_or_else(|| {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
         launch_artifact_observe("host.launch-artifact phase-b destination typed rejection");
-        HostError::ProcessContour("portable root lease is missing".to_owned())
+        HostError::ProcessContour("current-user root lease is missing".to_owned())
     })?;
     if !supplied.is_absolute() {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
         launch_artifact_observe("host.launch-artifact phase-b destination typed rejection");
         return Err(HostError::ProcessContour(
-            "portable Phase-B destination locator must be absolute".to_owned(),
+            "current-user Phase-B destination locator must be absolute".to_owned(),
         ));
     }
     let approved_path = Path::new(approved.as_str());
@@ -186,7 +186,7 @@ pub(crate) fn approved_phase_b_destination_locator(
         // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
         launch_artifact_observe("host.launch-artifact phase-b substitution preserved");
         return Err(HostError::ProcessContour(
-            "portable Phase-B destination locator is not the approved path".to_owned(),
+            "current-user Phase-B destination locator is not the approved path".to_owned(),
         ));
     }
     match std::fs::symlink_metadata(supplied) {
@@ -233,21 +233,19 @@ pub(crate) fn open_launch_lease(
     // WORK_UNIT_CASE: 978/1 — lease requested.
     launch_artifact_observe("host.launch-artifact lease requested");
     let result = match profile {
-        InstallationProfile::PortableDev => {
+        InstallationProfile::UserMode | InstallationProfile::PortableDev => {
             let root = root.ok_or_else(|| {
-                HostError::ProcessContour("portable root lease is missing".to_owned())
+                HostError::ProcessContour("current-user root lease is missing".to_owned())
             })?;
             Ok(LaunchLease::Portable(
                 UserOwnedPathLease::open_existing(root, path)
                     .map_err(|error| HostError::ProcessContour(error.to_string()))?,
             ))
         }
-        InstallationProfile::SystemService | InstallationProfile::UserMode => {
-            Ok(LaunchLease::Protected(
-                ProtectedPathLease::open_existing_absolute(path)
-                    .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            ))
-        }
+        InstallationProfile::SystemService => Ok(LaunchLease::Protected(
+            ProtectedPathLease::open_existing_absolute(path)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        )),
     };
     match &result {
         Ok(_) => {

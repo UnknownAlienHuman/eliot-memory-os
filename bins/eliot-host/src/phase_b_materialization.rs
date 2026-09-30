@@ -916,7 +916,14 @@ pub(super) fn rehydrate_agent_bridge_binding_from_pending(
         ));
     }
     let profile = launch.profile;
-    let portable_root = if profile == InstallationProfile::PortableDev {
+    let portable_root = if profile == InstallationProfile::UserMode {
+        Some(
+            UserOwnedRootLease::open_existing(Path::new(
+                launch.profile_governed_roots.user_config.as_str(),
+            ))
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+        )
+    } else if profile == InstallationProfile::PortableDev {
         Some(
             UserOwnedRootLease::open_existing(Path::new(
                 launch
