@@ -102,13 +102,14 @@ use crate::{
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerHeartbeat,
     UserBrokerRegistration, UserBrokerRegistrationReceipt, UserBrokerRegistrationSnapshot,
-    VersionedArtifactEntry, VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord,
-    WorkerReplayBegin, WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent,
-    WorkerReplayRequestDecision, WorkerReplayRequestRecord, WorkerReplayStreamRecord,
-    WriteIdempotencyRecoveryCursor, WriteIdempotencyRecoveryEntry, WriteIdempotencyRecoveryPage,
-    WriteReservationRecoveryCursor, WriteReservationRecoveryPage, WriterReservationToken,
-    is_replay_terminal_phase, parse_replay_stream_id, require_replay_claim_binding,
-    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
+    UserBrokerResourceSelection, UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry,
+    VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
+    WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
+    WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor,
+    WriteIdempotencyRecoveryEntry, WriteIdempotencyRecoveryPage, WriteReservationRecoveryCursor,
+    WriteReservationRecoveryPage, WriterReservationToken, is_replay_terminal_phase,
+    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
+    signed_terminal_supervision_lease_from_verified,
 };
 
 /// The versioned-artifact family rides the same ORS persistence codec as every
@@ -3516,6 +3517,21 @@ pub trait OperationalRecoveryStore: Send + Sync {
         fence: UserBrokerFence,
         expected: &UserBrokerRegistrationReceipt,
     ) -> Result<UserBrokerRegistrationSnapshot, OrsError>;
+    /// Commits one immutable Kernel-issued native resource selection under its
+    /// exact effect-operation identity. Exact replay returns the original
+    /// readback; changed content under that operation is rejected. ORS records
+    /// no semantic authority and does not mint the selection.
+    fn commit_user_broker_resource_selection(
+        &self,
+        selection: UserBrokerResourceSelection,
+    ) -> Result<UserBrokerResourceSelectionSnapshot, OrsError>;
+    /// Loads one exact owner-issued native resource selection by its effect
+    /// operation identity. The snapshot revalidates the typed selection and
+    /// store-issued receipt from the durable current row.
+    fn load_user_broker_resource_selection(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerResourceSelectionSnapshot>, OrsError>;
     fn commit_authority_snapshot(
         &self,
         snapshot: KernelAuthoritySnapshot,
@@ -27809,6 +27825,7 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: None,
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &key, &record)?;
         write.commit().map_err(storage)?;
@@ -27826,6 +27843,85 @@ impl RedbRecoveryStore {
         }
         UserBrokerRegistrationSnapshot::from_store(
             record.input.clone(),
+            record.phase,
+            record.operation_order,
+            Self::receipt_for(record)?,
+        )
+    }
+
+    fn user_broker_resource_selection_input(
+        selection: &UserBrokerResourceSelection,
+    ) -> Result<OperationalRecordInput, OrsError> {
+        selection.validate()?;
+        let record_id = selection.record_id()?;
+        let subject_id = selection.subject_id()?;
+        let payload_bytes = encode(selection)?.into_bytes();
+        let payload_length =
+            u64::try_from(payload_bytes.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        let payload_sha256 = crate::model::sha256_hex(&payload_bytes);
+        let authority_epoch = EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new(
+                    selection.selection.authority_epoch.lineage_id.as_str(),
+                )?,
+                epoch: selection.selection.authority_epoch.sequence.get(),
+            },
+            predecessor: None,
+        };
+        authority_epoch.validate()?;
+        let state_fence = StateFenceSnapshot::capture(
+            &selection.selection.state_fence,
+            authority_epoch.current.epoch,
+        )?;
+        state_fence.validate_against_epoch(&selection.selection.authority_epoch)?;
+        let created_at_ms =
+            i64::try_from(selection.selection.issued_at).map_err(|_| OrsError::InvalidField {
+                field: "user_broker_resource_selection_issued_at",
+                reason: "selection timestamp exceeds the ORS creation-time range",
+            })?;
+        let locator = PlatformHandle::new(format!(
+            "ors:user-broker-resource-selection:{}",
+            subject_id.as_str()
+        ))
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        OperationalRecordInput::immutable_locator(
+            OperationalRecordContext {
+                record_id,
+                subject_id,
+                authority_epoch,
+                state_fence,
+                created_at_ms,
+                cleanup_after_ms: None,
+            },
+            locator,
+            payload_sha256,
+            payload_length,
+        )
+    }
+
+    fn user_broker_resource_selection_snapshot(
+        record: &DurableOperationalRecord,
+    ) -> Result<UserBrokerResourceSelectionSnapshot, OrsError> {
+        let selection = record
+            .user_broker_resource_selection
+            .as_ref()
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "user_broker_resource_selection",
+                reason: "typed selection sidecar is missing".to_owned(),
+            })?;
+        if record.kind != OperationalKind::UserBrokerResourceSelection
+            || record.admission_reservation.is_some()
+            || record.generation_cutover.is_some()
+            || Self::user_broker_resource_selection_input(selection)? != record.input
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "user_broker_resource_selection",
+                reason: "operational kind, metadata, locator, or typed selection mismatch"
+                    .to_owned(),
+            });
+        }
+        UserBrokerResourceSelectionSnapshot::from_store(
+            selection.clone(),
             record.phase,
             record.operation_order,
             Self::receipt_for(record)?,
@@ -27929,10 +28025,95 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: None,
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &key, &record)?;
         write.commit().map_err(storage)?;
         Self::user_broker_snapshot(&record)
+    }
+
+    fn load_user_broker_resource_selection(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerResourceSelectionSnapshot>, OrsError> {
+        let key = Self::operational_key(OperationalKind::UserBrokerResourceSelection, subject_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        current
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: DurableOperationalRecord =
+                    decode_named(value.value(), "operational_current")?;
+                record.input.validate()?;
+                if record.kind != OperationalKind::UserBrokerResourceSelection
+                    || record.input.subject_id != *subject_id
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "user_broker_resource_selection",
+                        reason: "current row identity does not match its key".to_owned(),
+                    });
+                }
+                Self::user_broker_resource_selection_snapshot(&record)
+            })
+            .transpose()
+    }
+
+    fn commit_user_broker_resource_selection(
+        &self,
+        selection: UserBrokerResourceSelection,
+    ) -> Result<UserBrokerResourceSelectionSnapshot, OrsError> {
+        selection.validate()?;
+        let input = Self::user_broker_resource_selection_input(&selection)?;
+        let key = Self::operational_key(
+            OperationalKind::UserBrokerResourceSelection,
+            &input.subject_id,
+        );
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+            current
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableOperationalRecord>(value.value(), "operational_current")
+                })
+                .transpose()?
+        };
+        if let Some(existing) = existing {
+            existing.input.validate()?;
+            if existing.kind != OperationalKind::UserBrokerResourceSelection
+                || existing.input.subject_id != input.subject_id
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "user_broker_resource_selection",
+                    reason: "current row identity does not match its key".to_owned(),
+                });
+            }
+            let snapshot = Self::user_broker_resource_selection_snapshot(&existing)?;
+            if existing.phase == OperationalPhase::Active
+                && existing.input == input
+                && existing.user_broker_resource_selection.as_ref() == Some(&selection)
+            {
+                return Ok(snapshot);
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+
+        let durable = DurableOperationalRecord {
+            kind: OperationalKind::UserBrokerResourceSelection,
+            input,
+            phase: OperationalPhase::Active,
+            operation_order: Self::next_operational_order(&write)?,
+            terminal_receipt_id: None,
+            terminal_receipt_sha256: None,
+            admission_reservation: None,
+            generation_cutover: None,
+            user_broker_resource_selection: Some(selection),
+        };
+        Self::persist_operational_record(&write, &key, &durable)?;
+        write.commit().map_err(storage)?;
+        Self::user_broker_resource_selection_snapshot(&durable)
     }
 
     fn transition_existing_operational(
@@ -28217,6 +28398,7 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: Some(record),
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &key, &durable)?;
         write.commit().map_err(storage)?;
@@ -28374,6 +28556,7 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: Some(committed),
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &route_key, &durable)?;
         let removed = {
@@ -28956,6 +29139,7 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: None,
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &key, &durable)?;
         write.commit().map_err(storage)?;
@@ -30334,6 +30518,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: Some(record),
             generation_cutover: None,
+            user_broker_resource_selection: None,
         };
         Self::admission_reservation_snapshot(&durable)?;
         Self::persist_operational_record(&write, &key, &durable)?;
@@ -30491,6 +30676,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             false,
             OperationalPhase::Fenced,
         )
+    }
+
+    fn commit_user_broker_resource_selection(
+        &self,
+        selection: UserBrokerResourceSelection,
+    ) -> Result<UserBrokerResourceSelectionSnapshot, OrsError> {
+        RedbRecoveryStore::commit_user_broker_resource_selection(self, selection)
+    }
+
+    fn load_user_broker_resource_selection(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerResourceSelectionSnapshot>, OrsError> {
+        RedbRecoveryStore::load_user_broker_resource_selection(self, subject_id)
     }
 
     fn commit_authority_snapshot(
@@ -30715,6 +30914,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                     terminal_receipt_sha256: None,
                     admission_reservation: None,
                     generation_cutover: None,
+                    user_broker_resource_selection: None,
                 };
                 Self::persist_operational_record(&write, &key, &record)?;
                 write.commit().map_err(storage)?;

@@ -20,7 +20,8 @@ use eliot_runtime_contracts::{
     VerifiedSupervisionLeaseTerminalTransition,
 };
 use eliot_security_contracts::{
-    InfluenceState, InstructionTaint, PolicyFence, PrivacyClass, TransformationLineage,
+    InfluenceState, InstructionTaint, NativeResourceSelection, PolicyFence, PrivacyClass,
+    TransformationLineage,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -3024,6 +3025,86 @@ operational_input!(ActiveSessionBinding);
 operational_input!(SessionDetach);
 operational_input!(UserBrokerRegistration);
 operational_input!(UserBrokerFence);
+
+/// Exact Kernel-issued native resource selection retained as User Broker
+/// currentness evidence. The selection carries the candidate, operation,
+/// resource, registration, epoch, fence, and consumer generation bindings;
+/// the additional deadlines preserve the grant and its enclosing lease
+/// ceilings without deriving them from a later caller echo. Currentness must
+/// stop at the earliest of the selection, grant, launch lease, introduction,
+/// or registration expiry.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserBrokerResourceSelection {
+    /// Exact typed selection that was issued by Kernel for one candidate.
+    pub selection: NativeResourceSelection,
+    /// Expiration of the containing Kernel launch grant.
+    pub grant_expires_at: u64,
+    /// Expiration of the admitted launch operation lease.
+    pub launch_lease_expires_at: u64,
+    /// Expiration of the capability introduction that names this resource.
+    pub introduction_expires_at: u64,
+    /// Expiration of the authenticated User Broker registration.
+    pub registration_expires_at: u64,
+}
+
+impl UserBrokerResourceSelection {
+    /// Creates validated, owner-issued selection evidence with its exact
+    /// enclosing expiry limits.
+    pub fn new(
+        selection: NativeResourceSelection,
+        grant_expires_at: u64,
+        launch_lease_expires_at: u64,
+        introduction_expires_at: u64,
+        registration_expires_at: u64,
+    ) -> Result<Self, OrsError> {
+        let value = Self {
+            selection,
+            grant_expires_at,
+            launch_lease_expires_at,
+            introduction_expires_at,
+            registration_expires_at,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validates the nested selection and the exact grant/lease/registration
+    /// expiry inequalities enforced by the User Broker launch boundary.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        self.selection
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if self.grant_expires_at <= self.selection.issued_at
+            || self.grant_expires_at > self.launch_lease_expires_at
+            || self.grant_expires_at > self.introduction_expires_at
+            || self.grant_expires_at > self.registration_expires_at
+            || self.selection.expires_at < self.grant_expires_at
+            || self.selection.expires_at > self.registration_expires_at
+        {
+            return Err(OrsError::InvalidField {
+                field: "user_broker_resource_selection_expiry",
+                reason: "selection, grant, registration, launch, and introduction deadlines are inconsistent",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the Broker-owned candidate identity for this exact selected
+    /// resource. The resolver issues a fresh reference per retained selection.
+    pub fn record_id(&self) -> Result<OperationIdentity, OrsError> {
+        self.validate()?;
+        OpaqueLabel::new(self.selection.candidate_ref.clone())
+    }
+
+    /// Returns the exact effect operation identity that owns this selected
+    /// resource.
+    pub fn subject_id(&self) -> Result<OperationIdentity, OrsError> {
+        self.validate()?;
+        OpaqueLabel::new(self.selection.operation_ref.clone())
+    }
+}
+
 operational_input!(KernelAuthoritySnapshot);
 operational_input!(AuthorityRevocation);
 operational_input!(CapabilityGrantActivation);
@@ -3422,6 +3503,7 @@ operational_receipt!(GenerationTransitionReceipt);
 operational_receipt!(GenerationCutoverReceipt);
 operational_receipt!(SessionBindingReceipt);
 operational_receipt!(UserBrokerRegistrationReceipt);
+operational_receipt!(UserBrokerResourceSelectionReceipt);
 operational_receipt!(AuthoritySnapshotReceipt);
 operational_receipt!(AuthorityRevocationReceipt);
 operational_receipt!(AuthorityActivationReceipt);
