@@ -48,7 +48,10 @@ use eliot_coordination::{
     AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding,
     ReviewRecommendation,
 };
-use eliot_evaluation_contracts::HumanAttentionEvaluation;
+use eliot_evaluation_contracts::{
+    ComparisonBasis, HumanAttentionEvaluation, HumanAttentionMetric, HumanAttentionMetricGroup,
+    HumanAttentionMetricValue, ObservationWindowStatus,
+};
 use eliot_observation::ObservationJournal;
 use eliot_store_api::ScopeRevisionView;
 use eliot_task::TaskLifecycleOwner;
@@ -362,48 +365,172 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
 }
 
 /// One persisted Human-attention-evaluation revision as the `ControlBoard`
-/// read projection serves it (issue #1784 W5 readback half).
+/// read projection serves it (issue #1784 W5 readback half, W6 honest view).
 ///
-/// The row reproduces the persisted record's identity, window, validity, and
+/// The row reproduces the persisted record's identity, evaluator, scope,
+/// window, validity, comparison basis, limitations, and
 /// observed/unknown/not-applicable counts, and only the evidence references
 /// the record's own manifest binds. It carries no aggregate score, no
 /// superiority badge, no visibility or privacy fact, and no Problem,
 /// approval, or policy outcome: an evaluation result neither resolves a
-/// Problem nor grants an approval nor changes policy (I11.2), and a quieter
-/// profile is shown alongside its missed-risk, harm, and false-block/task
-/// costs rather than as an automatic positive (I11.7). A stale or invalidated
-/// revision is visibly unusable for current tuning through
-/// `unusable_for_current_tuning`; suppressing a notification never removes its
-/// persistent obligation, which lives with the notification owner, not here.
-/// Unknowns render as unknown counts from the read-back bytes — a prevented
-/// action with no observed harm is not a false alarm, and missing follow-up
-/// is not zero harm — because the persist leg re-proves the digest over the
-/// exact producer bytes instead of substituting defaults.
+/// Problem nor grants an approval nor changes policy (I11.2) — a separate
+/// authorized change may cite the evaluation identity and revision — and a
+/// quieter profile is shown alongside its missed-risk, harm, and
+/// false-block/task costs in `volume_vs_harm` rather than as an automatic
+/// positive (I11.7). A stale or invalidated revision is visibly unusable for
+/// current tuning through `unusable_for_current_tuning`; suppressing a
+/// notification never removes its persistent obligation, which lives with the
+/// notification owner, not here. Unknowns render as unknown counts from the
+/// read-back bytes — a prevented action with no observed harm is not a false
+/// alarm, and missing follow-up is not zero harm — because the persist leg
+/// re-proves the digest over the exact producer bytes instead of substituting
+/// defaults.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ControlBoardAttentionEvaluationRow {
     /// Evaluation identity this revision belongs to.
     pub evaluation_id: String,
     /// Monotonic revision within the evaluation, starting at one.
     pub revision: u64,
+    /// Record-bound evaluator principal, exactly as persisted. Descriptive
+    /// only: it confers no access and decides no role.
+    pub evaluator_principal_id: String,
+    /// Authorized scope references claimed by the record, exactly as
+    /// persisted. Withheld (empty) on the scope-withheld projection.
+    pub authorized_scope_refs: Vec<String>,
     /// Observation window the record binds.
     pub window_id: String,
+    /// Maturity of the bound observation window at persist time. An open or
+    /// inconclusive window means the observations are still incomplete; the
+    /// surface renders that alongside `validity` instead of tuning from it.
+    pub window_status: ObservationWindowStatus,
     /// Current-applicability verdict at the supplied observation instant.
     pub validity: AttentionEvaluationValidity,
+    /// Declared comparison basis: descriptive records carry no control, and
+    /// comparative conclusions stay conditional on the declared comparator.
+    pub comparison_basis: ComparisonBasis,
+    /// Comparator profile references the comparison basis rests on; empty for
+    /// descriptive records. Withheld (empty) on the scope-withheld
+    /// projection.
+    pub comparator_profile_refs: Vec<String>,
+    /// Why no comparison is available, present only when the basis declares
+    /// the comparison unavailable or not applicable.
+    pub comparison_reason: Option<String>,
+    /// Explicit uncertainty limitations carried by the persisted revision,
+    /// verbatim and in record order.
+    pub limitations: Vec<String>,
     /// Per-group observed/unknown/not-applicable counts; denominators for
     /// display, never ranking inputs.
     pub summary: AttentionUnknownSummary,
-    /// Manifest-bound evidence references, exactly as persisted.
+    /// Alert volume shown alongside missed-risk, harm, and false-block/task
+    /// costs. The two lists share one row so a quieter profile is never read
+    /// as superior on its own; there is no badge, score, or ranking.
+    pub volume_vs_harm: ControlBoardAttentionVolumeVsHarm,
+    /// Manifest-bound evidence references, exactly as persisted. Withheld
+    /// (empty) on the scope-withheld projection.
     pub evidence_refs: Vec<String>,
     /// True unless the revision is currently valid: expired and invalidated
     /// revisions are retained for history but unusable for current tuning.
     pub unusable_for_current_tuning: bool,
 }
 
+/// How one volume/cost metric reads on the board: an observed count, an
+/// explicit unknown, or an explicit not-applicable. An observed zero is an
+/// ordinary observed count and is distinct from both unknowns and
+/// not-applicables.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlBoardAttentionReadingStatus {
+    /// The persisted revision carries an observed value for this metric.
+    Observed,
+    /// The persisted revision marks this metric explicitly unknown; missing
+    /// follow-up stays here and is never zero-filled.
+    Unknown,
+    /// The persisted revision marks this metric explicitly not applicable.
+    NotApplicable,
+}
+
+/// One alert-volume or risk/harm/false-block cost reading for display.
+///
+/// `observed_count` carries the persisted count when the metric value is an
+/// observed number and is `None` otherwise — including for observed text on
+/// observation-unit metrics, which has no count form. The reading carries no
+/// score and supports no ranking.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardAttentionCostReading {
+    /// Typed metric this reading reproduces.
+    pub metric: HumanAttentionMetric,
+    /// Whether the persisted value is observed, unknown, or not applicable.
+    pub status: ControlBoardAttentionReadingStatus,
+    /// Persisted count for observed numbers; `None` for text, unknown, and
+    /// not-applicable values.
+    pub observed_count: Option<i64>,
+}
+
+/// Alert volume shown alongside missed-risk, harm, and false-block/task
+/// costs (issue #1784 item W6, I11.10).
+///
+/// `volume` carries the persisted notification-volume counts and `costs` the
+/// persisted missed-critical, harm, and false-block/task counts, each with
+/// its own observed/unknown/not-applicable status. A profile with fewer
+/// notifications but more missed critical harm, or stricter blocking with
+/// worse task outcomes, reads as costlier here — never as automatically
+/// superior — because both lists are always served together with no badge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardAttentionVolumeVsHarm {
+    /// Persisted alert-volume counts: deduplicated inbox items, delivery
+    /// attempts, and distinct risk events.
+    pub volume: Vec<ControlBoardAttentionCostReading>,
+    /// Persisted costs shown with the volume: missed critical risk events,
+    /// final harm events, benign false-block tasks, and abandoned-work tasks.
+    pub missed_risk_harm_and_false_block_costs: Vec<ControlBoardAttentionCostReading>,
+}
+
+/// Reads one count metric out of its I11.10 group for the volume-vs-harm
+/// bundle.
+///
+/// The record validator guarantees every required metric is present, so an
+/// absent metric fails closed rather than rendering a synthetic zero.
+fn volume_cost_reading(
+    group: &HumanAttentionMetricGroup,
+    metric: HumanAttentionMetric,
+) -> Result<ControlBoardAttentionCostReading, ControlBoardProjectionError> {
+    let observation = group
+        .metrics
+        .iter()
+        .find(|candidate| candidate.metric == metric)
+        .ok_or_else(|| {
+            ControlBoardProjectionError::Owner(format!(
+                "attention evaluation projection is missing required metric {metric:?}"
+            ))
+        })?;
+    let (status, observed_count) = match &observation.value {
+        HumanAttentionMetricValue::ObservedNumber { coefficient, .. } => {
+            (ControlBoardAttentionReadingStatus::Observed, Some(*coefficient))
+        }
+        HumanAttentionMetricValue::ObservedText { .. } => {
+            (ControlBoardAttentionReadingStatus::Observed, None)
+        }
+        HumanAttentionMetricValue::Unknown { .. } => {
+            (ControlBoardAttentionReadingStatus::Unknown, None)
+        }
+        HumanAttentionMetricValue::NotApplicable { .. } => {
+            (ControlBoardAttentionReadingStatus::NotApplicable, None)
+        }
+    };
+    Ok(ControlBoardAttentionCostReading {
+        metric,
+        status,
+        observed_count,
+    })
+}
+
 /// Projects one persisted evaluation revision into its board row.
 ///
 /// The record is re-validated structurally; validity is evaluated against the
 /// caller-supplied observation instant so unknown expiry timing never
-/// silently passes. The join invents no visibility, privacy, role, score, or
+/// silently passes. Identity, scope, window, limitations, comparison basis,
+/// counts, and the volume-vs-harm bundle are reproduced verbatim from the
+/// validated record; the join invents no visibility, privacy, role, score, or
 /// lifecycle fact.
 pub fn project_attention_evaluation_row(
     record: &HumanAttentionEvaluation,
@@ -414,17 +541,69 @@ pub fn project_attention_evaluation_row(
         .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
     let validity = attention_evaluation_validity(record, observed_now_ms);
     let unusable_for_current_tuning = validity != AttentionEvaluationValidity::Current;
+    let framing = &record.evaluator_scope_uncertainty_and_invalidation;
+    let volume = [
+        (
+            &record.notification_approval_and_telemetry_profile,
+            HumanAttentionMetric::DeduplicatedInboxItems,
+        ),
+        (
+            &record.notification_approval_and_telemetry_profile,
+            HumanAttentionMetric::DeliveryAttempts,
+        ),
+        (
+            &record.notification_approval_and_telemetry_profile,
+            HumanAttentionMetric::DistinctRiskEvents,
+        ),
+    ];
+    let costs = [
+        (
+            &record.missed_critical_and_false_critical_counts,
+            HumanAttentionMetric::MissedCriticalRiskEvents,
+        ),
+        (
+            &record.final_harm_and_residual_risk,
+            HumanAttentionMetric::FinalHarmEvents,
+        ),
+        (
+            &record.benign_false_blocks_and_abandoned_work,
+            HumanAttentionMetric::BenignFalseBlockTasks,
+        ),
+        (
+            &record.benign_false_blocks_and_abandoned_work,
+            HumanAttentionMetric::AbandonedWorkTasks,
+        ),
+    ];
+    let mut volume_readings = Vec::with_capacity(volume.len());
+    for (group, metric) in volume {
+        volume_readings.push(volume_cost_reading(group, metric)?);
+    }
+    let mut cost_readings = Vec::with_capacity(costs.len());
+    for (group, metric) in costs {
+        cost_readings.push(volume_cost_reading(group, metric)?);
+    }
     Ok(ControlBoardAttentionEvaluationRow {
         evaluation_id: record.evaluation_id.as_str().to_owned(),
         revision: record.revision,
+        evaluator_principal_id: framing.evaluator.principal_id.clone(),
+        authorized_scope_refs: framing.authorized_scope.authorized_scope_refs.clone(),
         window_id: record
             .observation_window
             .specification
             .window_id
             .as_str()
             .to_owned(),
+        window_status: record.observation_window.specification.status,
         validity,
+        comparison_basis: record.method.comparison_basis,
+        comparator_profile_refs: record.method.comparator_profile_refs.clone(),
+        comparison_reason: record.method.comparison_reason.clone(),
+        limitations: framing.uncertainty.limitations.clone(),
         summary: attention_unknown_summary(record),
+        volume_vs_harm: ControlBoardAttentionVolumeVsHarm {
+            volume: volume_readings,
+            missed_risk_harm_and_false_block_costs: cost_readings,
+        },
         evidence_refs: record
             .evidence_manifest
             .evidence_refs
@@ -433,6 +612,29 @@ pub fn project_attention_evaluation_row(
             .collect(),
         unusable_for_current_tuning,
     })
+}
+
+/// Projects one persisted evaluation revision with scope and evidence
+/// coordinates withheld (issue #1784 item W6 role filter).
+///
+/// The withheld row keeps the citable content — identity, revision,
+/// evaluator, window, validity, comparison basis and reason, limitations,
+/// counts, and the volume-vs-harm bundle — and empties exactly the
+/// coordinates that enable further expansion: authorized scope references,
+/// comparator profile references, and manifest-bound evidence references.
+/// The calling surface chooses this constructor for viewer roles it has not
+/// authorized for expansion; neither constructor grants access itself, and
+/// expansion still goes through [`expand_attention_evidence`] per call
+/// against the persisted manifest.
+pub fn project_attention_evaluation_row_with_scope_withheld(
+    record: &HumanAttentionEvaluation,
+    observed_now_ms: Option<i64>,
+) -> Result<ControlBoardAttentionEvaluationRow, ControlBoardProjectionError> {
+    let mut row = project_attention_evaluation_row(record, observed_now_ms)?;
+    row.authorized_scope_refs.clear();
+    row.comparator_profile_refs.clear();
+    row.evidence_refs.clear();
+    Ok(row)
 }
 
 /// Authorizes one evidence-expansion request against the persisted manifest.

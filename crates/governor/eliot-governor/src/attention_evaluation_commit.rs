@@ -60,7 +60,9 @@
 //! path — no UI database, no Notify-local ledger, no experience-bank
 //! aliasing. The derived identities, commitments, receipt checks, and
 //! readback verification in this module are the stable contract that Store leg
-//! must reuse byte-for-byte.
+//! must reuse byte-for-byte; [`seal_attention_evaluation_transition`] bundles
+//! those values with the requested operation coordinates into one seal so the
+//! binder consumes them unchanged instead of re-deriving them.
 //!
 //! Production caller status: the producer join
 //! ([`produce_and_commit_attention_evaluation`]) assembles caller-nominated
@@ -194,6 +196,60 @@ pub struct AttentionEvaluationCommitIdentity {
     pub evidence_commitment: String,
     /// Deterministic idempotency key for this revision bytes.
     pub idempotency_key: String,
+}
+
+/// Sealed prepared-transition inputs for one validated evaluation revision
+/// (issue #1784 item W5).
+///
+/// The Store-leg binder carries this seal into the existing prepared
+/// canonical transition byte-for-byte: [`AttentionEvaluationCommitIdentity`]
+/// already binds the operation identity, the immutable revision digest, the
+/// exact evidence commitment, and the idempotency key, and the predecessor
+/// link below binds the append-only history position. Same identity with
+/// identical bytes replays to the original receipt; the same identity with
+/// different bytes conflicts and commits nothing (see
+/// [`resolve_attention_lost_acknowledgement`]). The seal mints no authority
+/// and invents no store operation: the closed named Store operation for
+/// attention evaluations lands with the Store leg, which must consume these
+/// values unchanged rather than re-deriving them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttentionEvaluationPreparedSeal {
+    /// Which persist operation the sealed transition performs; there is no
+    /// delete variant, so history is never removed.
+    pub operation: AttentionEvaluationOperation,
+    /// Evaluation identity the sealed transition addresses.
+    pub evaluation_id: ContractId,
+    /// Revision the sealed transition persists.
+    pub revision: u64,
+    /// Derived operation, digest, commitment, and idempotency bindings.
+    pub identity: AttentionEvaluationCommitIdentity,
+    /// Predecessor link of the sealed revision; `None` only on creation.
+    pub predecessor: Option<HumanAttentionEvaluationRevisionRef>,
+}
+
+/// Seals the prepared-transition inputs for one validated operator request.
+///
+/// Runs the full fail-closed [`validate_attention_evaluation_request`] gate
+/// first — record validity, caller identity, revision/operation/predecessor
+/// agreement, operation-identity, evidence-commitment, idempotency, session,
+/// and evaluator-principal agreement — then bundles the derived bindings with
+/// the requested operation coordinates. Foreign evidence cannot reach the
+/// seal: the record validator refuses references absent from the evidence
+/// manifest before the commitment is bound.
+pub fn seal_attention_evaluation_transition(
+    record: &HumanAttentionEvaluation,
+    prior: Option<&HumanAttentionEvaluation>,
+    request: &AttentionEvaluationOperatorRequest,
+    identity: &RequestIdentity,
+) -> Result<AttentionEvaluationPreparedSeal, AttentionEvaluationCommitError> {
+    let commit = validate_attention_evaluation_request(record, prior, request, identity)?;
+    Ok(AttentionEvaluationPreparedSeal {
+        operation: request.operation,
+        evaluation_id: request.evaluation_id.clone(),
+        revision: request.expected_revision,
+        identity: commit,
+        predecessor: record.predecessor.clone(),
+    })
 }
 
 /// Current-applicability verdict for a persisted revision.
@@ -761,8 +817,10 @@ pub fn collect_attention_evidence_refs(record: &HumanAttentionEvaluation) -> Vec
 /// The record embeds every assembled group verbatim; `gaps` preserves the
 /// exact assembly gaps, so a non-empty gap list marks the record
 /// partial/inconclusive: unavailable evidence stays unknown with reasons,
-/// never synthetic zeros. `record_digest` is the immutable revision identity
-/// and `evidence_refs` the manifest-bound servable references. The output
+/// never synthetic zeros. `record_digest` is the immutable revision identity,
+/// `operation_id` and `idempotency_key` are the sealed transition coordinates
+/// the Store-leg binder carries into the prepared canonical transition, and
+/// `evidence_refs` the manifest-bound servable references. The output
 /// carries no score and supports no ranking.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttentionEvaluationProducedRecord {
@@ -770,6 +828,10 @@ pub struct AttentionEvaluationProducedRecord {
     pub record: HumanAttentionEvaluation,
     /// SHA-256 over the canonical bytes of the exact produced revision.
     pub record_digest: String,
+    /// Deterministic operation identity for the produced revision.
+    pub operation_id: OperationId,
+    /// Deterministic idempotency key for the exact produced revision bytes.
+    pub idempotency_key: String,
     /// Manifest-bound evidence references servable for the produced record.
     pub evidence_refs: Vec<ArtifactId>,
     /// Exact assembly gaps; non-empty marks the record partial/inconclusive.
@@ -937,12 +999,13 @@ pub fn produce_and_commit_attention_evaluation(
         expires_at,
         predecessor,
     };
-    validate_attention_evaluation_request(&record, prior, request, identity)?;
-    let record_digest = attention_record_digest(&record)?;
+    let seal = seal_attention_evaluation_transition(&record, prior, request, identity)?;
     let evidence_refs = collect_attention_evidence_refs(&record);
     Ok(AttentionEvaluationProducedRecord {
+        record_digest: seal.identity.record_digest.clone(),
+        operation_id: seal.identity.operation_id.clone(),
+        idempotency_key: seal.identity.idempotency_key.clone(),
         record,
-        record_digest,
         evidence_refs,
         gaps: assembled.gaps,
     })
