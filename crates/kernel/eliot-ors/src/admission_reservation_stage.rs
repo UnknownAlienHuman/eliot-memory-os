@@ -115,8 +115,12 @@ pub fn admission_reservation_identity(
     // recorded canonical JSON; it never recomputes a fence to trust it.
     input.claims.validate()?;
     input.authority_epoch.validate()?;
-    input.state_fence.validate_against_lineage(&input.authority_epoch)?;
-    if input.work_item_id.as_str().trim().is_empty() || input.proposed_attempt_id.as_str().trim().is_empty() {
+    input
+        .state_fence
+        .validate_against_lineage(&input.authority_epoch)?;
+    if input.work_item_id.as_str().trim().is_empty()
+        || input.proposed_attempt_id.as_str().trim().is_empty()
+    {
         return Err(OrsError::InvalidField {
             field: "admission_reservation.identity",
             reason: "work item and proposed attempt identities must be non-blank",
@@ -151,17 +155,16 @@ pub fn admission_reservation_identity(
 /// # Errors
 ///
 /// Returns [`OrsError::InvalidField`] when `reservation_id` is blank.
-pub fn stage_operation_identity(reservation_id: &OperationIdentity) -> Result<OperationIdentity, OrsError> {
+pub fn stage_operation_identity(
+    reservation_id: &OperationIdentity,
+) -> Result<OperationIdentity, OrsError> {
     if reservation_id.as_str().trim().is_empty() {
         return Err(OrsError::InvalidField {
             field: "admission_reservation.reservation_id",
             reason: "reservation identity must be non-blank",
         });
     }
-    OperationIdentity::new(format!(
-        "{}:stage",
-        reservation_id.as_str()
-    ))
+    OperationIdentity::new(format!("{}:stage", reservation_id.as_str()))
 }
 
 /// Derives the proposed-attempt identity for one reservation proposal.
@@ -262,7 +265,9 @@ pub fn verify_staged_claim_completeness(
             StagedClaimRole::StateFence => {
                 // By value against what the record holds, validated with the
                 // existing validator on the ORIGINAL recorded fence.
-                record.state_fence.validate_against_lineage(&record.authority_epoch)?;
+                record
+                    .state_fence
+                    .validate_against_lineage(&record.authority_epoch)?;
                 None
             }
             StagedClaimRole::AuthorityEpoch => {
@@ -366,7 +371,9 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
     // validators, by value, against the ORIGINAL recorded fence and epoch.
     request.claims.validate()?;
     request.authority_epoch.validate()?;
-    request.state_fence.validate_against_lineage(&request.authority_epoch)?;
+    request
+        .state_fence
+        .validate_against_lineage(&request.authority_epoch)?;
     if request.reservation_id.as_str().trim().is_empty()
         || request.work_item_id.as_str().trim().is_empty()
         || request.proposed_attempt_id.as_str().trim().is_empty()
@@ -399,7 +406,7 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
     candidate.validate()?;
     verify_staged_claim_completeness(&candidate)?;
 
-    let snapshot = store.stage_kernel_admission_reservation(AdmissionReservationStage {
+    let staged = store.stage_kernel_admission_reservation(AdmissionReservationStage {
         reservation_id: request.reservation_id.clone(),
         work_item_id: request.work_item_id.clone(),
         proposed_attempt_id: request.proposed_attempt_id.clone(),
@@ -410,6 +417,26 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         expires_at_ms: request.expires_at_ms,
         now_ms: request.now_unix_ms,
     })?;
+    // The store's own echoed row is compared against the candidate this function
+    // validated BEFORE the write, field by field. The store is a different owner
+    // from the validator, so this is a real cross-check rather than a
+    // self-comparison, and it is what makes "the claims were staged" mean "the
+    // claims the store holds are the claims that were checked" instead of merely
+    // "a write returned successfully".
+    if staged.record().claims != candidate.claims
+        || staged.record().state_fence != candidate.state_fence
+        || staged.record().authority_epoch != candidate.authority_epoch
+        || staged.record().state != candidate.state
+        || staged.record().work_item_id != candidate.work_item_id
+        || staged.record().proposed_attempt_id != candidate.proposed_attempt_id
+        || staged.record().operation_id != candidate.operation_id
+        || staged.record().expires_at_ms != candidate.expires_at_ms
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "admission_reservation",
+            reason: "the staged row does not carry the claims this call validated".to_owned(),
+        });
+    }
 
     // Durably read the SAME identity back. This is the A2 restart path: the
     // caller re-derives `reservation_id` and lands on the identical row, and
@@ -417,7 +444,7 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
     let readback = store
         .load_kernel_admission_reservation(&request.reservation_id)?
         .ok_or(OrsError::DuplicateConflict)?;
-    if readback.record().reservation_id != *request.reservation_id {
+    if readback.record().reservation_id != request.reservation_id {
         return Err(OrsError::IntegrityProblem {
             record_type: "admission_reservation",
             reason: "readback returned a different reservation identity".to_owned(),
