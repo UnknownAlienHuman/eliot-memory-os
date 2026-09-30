@@ -41,8 +41,11 @@
 //! own attempt count, settled state and execution projection against the
 //! canonical run's finished execution and `Fail` outcome, and records the
 //! verifier that repeated as `repeated-verifier-failure:<verifier>` among the
-//! record's own evidence references — the I12.24 evaluator-verdict trigger the
-//! daemon improvement intake reads through
+//! record's own evidence references — built by
+//! `eliot_learning_delta::repeated_verifier_failure_ref`, which sits beside the
+//! reader on the record type, so this seam neither spells the vocabulary nor
+//! reaches for the prefix. That handle is the I12.24 evaluator-verdict trigger
+//! the daemon improvement intake reads through
 //! `eliot_improvement::sourced_evidence_from_repeated_verifier_failure`. Both
 //! sides of that comparison are records this seam did not author together, and
 //! a repeat that cannot be proven records nothing.
@@ -89,9 +92,8 @@ use eliot_instrument_api::{ExecutionStatus, VerificationOutcome};
 use eliot_learning_contracts::{AgentAttemptId, CampaignId, OverlayId};
 use eliot_learning_delta::{
     AdmissionReceipt, AttemptCloseDisposition, ConsequentialBoundary, DeliveryRefusal,
-    LearningDeltaError, LifecycleActivity, REPEATED_VERIFIER_FAILURE_REF_PREFIX, RetryEquivalence,
-    RetryEquivalenceBasis, RetryReason, StoredLearningDelta, StoredRetryRelation,
-    derive_boundaries,
+    LearningDeltaError, LifecycleActivity, RetryEquivalence, RetryEquivalenceBasis, RetryReason,
+    StoredLearningDelta, StoredRetryRelation, derive_boundaries,
 };
 use eliot_store_api::{
     OrderingHeadExpectation, OrderingScopeId, RevisionHeadExpectation, RevisionKey, StoreError,
@@ -921,10 +923,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let mut observed_refs: BTreeSet<ArtifactId> =
             observed_evidence_refs(&fact)?.into_iter().collect();
         if let Some(verifier) = repeated_verifier_failure_verifier(job, &fact) {
-            observed_refs.insert(artifact_id(
-                &format!("{REPEATED_VERIFIER_FAILURE_REF_PREFIX}{verifier}"),
-                "repeated verifier failure marker",
-            )?);
+            observed_refs.insert(
+                eliot_learning_delta::repeated_verifier_failure_ref(&verifier).map_err(|error| {
+                    LearningClosureError::Canonical(format!(
+                        "repeated verifier failure marker is not a valid handle: {error}"
+                    ))
+                })?,
+            );
         }
         let evidence_refs: Vec<ArtifactId> = observed_refs.into_iter().collect();
         let identity = ClosureIdentityInput {

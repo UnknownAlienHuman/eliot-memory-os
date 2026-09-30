@@ -1341,7 +1341,7 @@ fn route_proposal(
 /// record `newest_observed_closure` read on THIS pass and carried on
 /// [`ImprovementArtifact::observed_closure`]. Its own accessor
 /// `StoredLearningDelta::lineage_ref`
-/// (`crates/smart/eliot-learning-delta/src/stored.rs:327`) returns the durable
+/// (`crates/smart/eliot-learning-delta/src/stored.rs:355`) returns the durable
 /// lineage handle and the canonical digest of exactly those bytes. So the handle
 /// IS the committed closure cell's identity and the digest IS the digest the
 /// owner recorded over it — neither is composed, formatted, or re-derived here,

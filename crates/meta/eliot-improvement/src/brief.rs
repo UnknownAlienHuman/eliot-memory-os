@@ -31,7 +31,7 @@
 //!   reading of the record's own public field is the whole observation.
 //! - `active_main_agent_or_human_ref` is the `actor_id` the closure owner
 //!   recorded for that attempt
-//!   (`crates/governor/eliot-governor/src/learning_closure.rs:925`) — the
+//!   (`crates/governor/eliot-governor/src/learning_closure.rs:940`) — the
 //!   identity that EXECUTED the consequential work, a principal rather than a
 //!   label. `ASSUMPTION:` that actor is the "active Main Agent or Human" of
 //!   I12.24:64, because it is the only principal the closure owner records and
