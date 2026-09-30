@@ -50,6 +50,14 @@
 //! ORS suspension ........... ORS owner (`suspended_recovery_entries`,
 //!                              persisted as suspended evidence, never
 //!                              runnable);
+//! Watchdog spool fence ..... #955 owner, archive side only
+//!                              (`suspended_watchdog_signal_entries`: the
+//!                              archive's mandatory unresolved critical
+//!                              signals are read and persisted as SUSPENDED
+//!                              forensic evidence, never as supervision and
+//!                              never as a reconciliation claim, so the
+//!                              `watchdog_signals` obligation stays
+//!                              unsatisfied);
 //! ```
 //!
 //! Effects whose bindings are absent refuse fail-closed with the exact
@@ -118,7 +126,7 @@ use eliot_backup::{
     RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation,
     RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WRITE_RECEIPT_RECORD_TYPE,
     WrappedKeyManifest, issue_restoration_receipts, suspended_recovery_entries,
-    verify_portable_key_material,
+    suspended_watchdog_signal_entries, verify_portable_key_material,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -1378,7 +1386,12 @@ impl KernelBackupRestore {
         receipt
             .validate()
             .map_err(KernelRestoreError::TargetFailed)?;
-        let suspended = suspended_entries(bundle)?;
+        // The caller's own classification is preserved: this site has always
+        // reported a bad ORS suspension as `ArchiveInvalid`, so the read of the
+        // archive's two mandatory fences keeps that class rather than widening
+        // to the generic target failure.
+        let suspended = historical_authority(bundle)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         let evidence = target_impl
             .final_evidence
             .clone()
@@ -1667,14 +1680,53 @@ fn require_operational_validation(evidence: &RestoreEvidence) -> Result<(), Kern
     Ok(())
 }
 
-fn suspended_entries(
+/// Reads BOTH mandatory recovery fences of the archive into the evidence's
+/// historical authority list.
+///
+/// This is the read of the archive's `watchdog_spool` member, which
+/// `BackupBundle::validate_class_requirements` makes mandatory for a
+/// `full_recovery` archive and which the finalize phase previously dropped
+/// unread: the published obligation was then one constant whether the fence
+/// named zero unreconciled critical Watchdog signals or a thousand. I05.13
+/// requires the receipt to carry them, so the member is now read here and each
+/// declared digest becomes one suspended `WatchdogSignal` historical entry.
+///
+/// Three properties are load-bearing and are what this function is for:
+///
+/// - **Nothing is activated.** Every entry is `suspended: true`, and
+///   `RestoreHistoricalAuthority::validate` refuses any entry that is not.
+///   I05.13 requires Watchdog operational snapshots to restore "only as
+///   forensic/suspended evidence and never as active supervision or
+///   authority"; a restore that reactivated Watchdog supervision would be worse
+///   than one that does not restore it.
+/// - **Nothing is reconciled.** Reading the fence is not the #955 owner's
+///   reconciliation, so the `watchdog_signals` obligation keeps its
+///   unsatisfied state below. Suspension is not resolution.
+/// - **Nothing is claimed beyond the archive.** The expected set is the
+///   archive's own declared list, because the archive is the only carrier of
+///   the fence. This is preservation evidence, not an independent completeness
+///   denominator.
+///
+/// A member the archive does not carry contributes nothing and asserts
+/// nothing: the obligation then reports the unbound-owner marker, exactly as it
+/// did before, and no evidence entry is invented for evidence that is absent.
+/// The `watchdog_signals` slot stays unsatisfied in BOTH cases, because the
+/// read is preservation and reconciliation is the owner's.
+fn historical_authority(
     bundle: &BackupBundle,
-) -> Result<Vec<RestoreHistoricalAuthority>, KernelRestoreError> {
-    match &bundle.ors_snapshot {
-        Some(snapshot) => suspended_recovery_entries(snapshot)
-            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string())),
-        None => Ok(Vec::new()),
+) -> Result<Vec<RestoreHistoricalAuthority>, BackupError> {
+    // The ORS half is the archive's own `suspended_recovery_entries` read, the
+    // one this site performed inline before the Watchdog half was added; the
+    // `BackupError` is what that call site already raised, so its typed
+    // classification is unchanged here.
+    let mut entries = match &bundle.ors_snapshot {
+        Some(snapshot) => suspended_recovery_entries(snapshot)?,
+        None => Vec::new(),
+    };
+    if let Some(fence) = bundle.watchdog_spool.as_ref() {
+        entries.extend(suspended_watchdog_signal_entries(fence)?);
     }
+    Ok(entries)
 }
 
 /// Requires the validation denominator for cutover qualification: every
@@ -1737,6 +1789,14 @@ fn require_cutover_obligations(
             owners::RECONCILIATION,
             true,
         ),
+        // Still unconditionally applicable, and that is now deliberate rather
+        // than a leftover. Reading the archive's fence — which the finalize
+        // phase does, and which the evidence's historical authority carries —
+        // RECONCILES nothing: reconciliation is the #955 owner's own decision
+        // and no Watchdog channel is bound in this composition. Excusing this
+        // slot on "the archive carried no fence" would let a restore qualify for
+        // cutover having consulted no Watchdog owner at all, which is the
+        // substitution this gate exists to refuse.
         (&obligations.watchdog_signals, owners::WATCHDOG, true),
         (
             &obligations.external_source_revalidation,
@@ -3294,7 +3354,35 @@ impl<'a> KernelRestoreTarget<'a> {
                 "kernel-restore:reconciliation-denominator-absent".to_owned(),
                 RestoreObligationState::Unknown,
             ),
-            watchdog_signals: missing(owners::WATCHDOG),
+            // The state stays `MissingCapability`, and that is the point of the
+            // read above rather than a leftover: reading the archive's fence
+            // RECONCILES nothing. Reconciliation is the #955 owner's decision
+            // and no Watchdog channel is bound here, so nothing in this
+            // composition can attest the signals were resolved, and I05.13 is
+            // explicit that suspension is not resolution. Marking this slot
+            // `Satisfied` on the strength of a member the restore merely read
+            // would publish exactly the false readiness the obligation
+            // vocabulary exists to prevent.
+            //
+            // What the read DOES change is the evidence: the published
+            // evidence_ref now names the fence this restore actually read, and
+            // its unresolved signals are carried as suspended historical
+            // entries. It was one constant before, byte-identical for a fence
+            // naming zero unreconciled critical signals and for one naming a
+            // thousand, so a reader could not tell a read archive from a
+            // dropped one.
+            watchdog_signals: Self::obligation(
+                owners::WATCHDOG,
+                match &bundle.watchdog_spool {
+                    Some(fence) => format!(
+                        "kernel-restore:watchdog-spool-read:{}:{}",
+                        fence.fence_id,
+                        fence.unresolved_signal_digests.len()
+                    ),
+                    None => format!("kernel-restore:unbound:{}", owners::WATCHDOG),
+                },
+                RestoreObligationState::MissingCapability,
+            ),
             external_source_revalidation: missing(owners::EXTERNAL_SOURCE),
             runtime_invalidation: missing(owners::RUNTIME),
             session_invalidation: missing(owners::SESSION),
@@ -3359,10 +3447,7 @@ impl<'a> KernelRestoreTarget<'a> {
             owner_epoch: None,
             reconciliation_denominator: None,
             operational_validation: None,
-            historical_authority: match &bundle.ors_snapshot {
-                Some(snapshot) => suspended_recovery_entries(snapshot)?,
-                None => Vec::new(),
-            },
+            historical_authority: historical_authority(bundle)?,
             archive_disposition: RestoreArchiveDisposition {
                 disposition: RestoreArchiveDispositionKind::Current,
                 compatibility_ref: "ecxf-1-current".to_owned(),

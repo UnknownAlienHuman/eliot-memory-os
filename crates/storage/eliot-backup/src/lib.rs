@@ -33,6 +33,7 @@ mod product_command;
 mod product_run;
 mod restore_journal_admission;
 mod restore_runner;
+mod watchdog_spool_restore;
 
 pub use ecxf_export::{
     CoherentSourceExport, EcxfExportReport, EcxfExportRequest, EcxfSourceStore, SealedBlobEntry,
@@ -67,6 +68,7 @@ pub use restore_journal_admission::{DurableJournalRecord, RestoreJournalAdmissio
 pub use restore_runner::{
     FileRestoreJournal, FileRestoreTarget, RunnerOutcome, execute_isolated_restore,
 };
+pub use watchdog_spool_restore::suspended_watchdog_signal_entries;
 
 /// Stable identity of the exchange-format contract.
 pub const CONTRACT_NAME: &str = "eliot.storage.backup";
