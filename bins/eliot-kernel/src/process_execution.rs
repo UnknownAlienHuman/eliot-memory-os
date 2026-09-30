@@ -44,9 +44,8 @@ use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation,
     KernelDispatchKey, OperationId, OriginChallenge, OriginChallengeRequest, OriginControlGrant,
     OriginControlOperation, OriginControlPresentation, OriginGrantEffectOutcome, PermitIssuance,
-    ProcessEvidence,
-    ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
-    ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
+    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError,
+    ProcessExecutor, ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
     ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SessionId,
     SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
@@ -2070,9 +2069,9 @@ impl ProcessExecutionGateway {
                 if let Some(granted) = grant {
                     if let Err(error) = self.record_origin_grant_effect(granted.request_nonce()) {
                         observe_process("kernel.process.cancel_unrecorded", "unknown");
-                        super::kernel_diagnostics::observe_terminal_error(
-                            process_terminal_code(&error),
-                        );
+                        super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
+                            &error,
+                        ));
                         return Err(error);
                     }
                 }
