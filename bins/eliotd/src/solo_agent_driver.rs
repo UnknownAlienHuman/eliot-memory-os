@@ -29,9 +29,9 @@
 //! | Port | Solo binding | Owner backing |
 //! |---|---|---|
 //! | `ModelRegistry` | [`SoloModelRegistryPort`] echoes the policy-staffed route | staffing receipt lanes plus the fabric evidence gate; never invents a route |
-//! | `AdmissionAuthority` | [`SoloAdmissionAuthorityPort`] coordinates reservation/admission records | frozen definition digest, staffing receipt, live fence/epoch; coordinates, never owns |
-//! | `ActivationAuthority` | [`SoloActivationAuthorityPort`] binds activation evidence | committed admission, attempt membership, live fence/epoch |
-//! | `DispatchEgress` | [`SoloDispatchEgressPort`] retains the intent plus the claim-compatible binding | activated intent, persisted dispatch record, worker-claim single-flight identity |
+//! | `AdmissionAuthority` | [`SoloAdmissionAuthorityPort`] honestly reports the missing owner binding | frozen definition digest, staffing receipt, live fence/epoch; coordinates, never owns |
+//! | `ActivationAuthority` | [`SoloActivationAuthorityPort`] honestly reports the missing owner binding | committed admission, attempt membership, live fence/epoch |
+//! | `DispatchEgress` | [`SoloDispatchEgressPort`] honestly reports the missing owner binding | activated intent, persisted dispatch record, worker-claim single-flight identity |
 //! | `PeerChannel` | production missing port, never called on this path | B-PEER #696 has no accepted revision; solo needs none |
 //! | `SwarmControl` | production missing port, never called on this path | B-SWARM #698 has no accepted revision; solo needs none |
 //!
@@ -53,8 +53,15 @@
 //! Kernel-minted reservation identities or Governor-minted admission
 //! identities, and the per-call checks below refuse anything that drifts
 //! from the verified material. The Kernel ORS solo-stage arm and the
-//! Governor solo-admission seal remain future owner legs; their absence is
-//! carried as documented follow-up, not as a silent substitution.
+//! Governor solo-admission seal remain future owner legs: until each lands,
+//! the matching solo port reports [`PortBindingState::Missing`] and every
+//! staging/commit/activation/emission attempt raises the typed
+//! [`FabricOperation`]-keyed missing-prerequisite residual before any
+//! dependent effect, exactly like the closed production ports in
+//! `bins/eliotd/src/lib.rs`. No local constant, trait presence,
+//! self-digest, or serialized `Verified` value establishes `Bound`, and no
+//! adapter mints owner evidence locally — a missing leg fails closed
+//! instead of fabricating a row or receipt to make the gate tautological.
 //!
 //! # Pollability and durability
 //!
@@ -71,13 +78,15 @@
 //! persisted under the daemon state root before `emit`; uncertain ownership
 //! is never released without an observed terminal disposition.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_bridge_core::ToolResultReceipt;
 use eliot_agent_coordinator::{
-    AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
+    CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
     load_runtime_scheduling_profile,
 };
 #[cfg(not(test))]
@@ -89,9 +98,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric, DispatchAck,
-    DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricSnapshot,
-    PortBindingState, Reservation, RouteRequirements, SwarmDefinition, VerifiedProviderMaterial,
-    daemon_coordinator_config,
+    DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricOperation, FabricPortId,
+    FabricSnapshot, PortBindingState, Reservation, RouteRequirements, SwarmDefinition,
+    VerifiedProviderMaterial, daemon_coordinator_config,
 };
 #[cfg(test)]
 use crate::agent_fabric::{FabricPorts, ModelRegistryPort};
@@ -109,12 +118,6 @@ pub const SOLO_RECIPE_ID: &str = "solo-verified-v1";
 /// Accepted-interface revision reported by the solo model registry adapter.
 #[cfg(test)]
 pub const SOLO_MODEL_REGISTRY_REVISION: &str = "solo-model-registry/v1";
-/// Accepted-interface revision reported by the solo admission adapter.
-pub const SOLO_ADMISSION_AUTHORITY_REVISION: &str = "solo-admission-authority/v1";
-/// Accepted-interface revision reported by the solo activation adapter.
-pub const SOLO_ACTIVATION_AUTHORITY_REVISION: &str = "solo-activation-authority/v1";
-/// Accepted-interface revision reported by the solo dispatch egress adapter.
-pub const SOLO_DISPATCH_EGRESS_REVISION: &str = "solo-dispatch-egress/v1";
 /// Subdirectory of the daemon state root holding solo dispatch projections.
 pub const SOLO_PROJECTION_DIR: &str = "solo-agent";
 /// Upper bound on one persisted solo projection file, in bytes.
@@ -388,17 +391,18 @@ impl ModelRegistryPort for SoloModelRegistryPort {
 
 /// Solo Governor admission authority adapter.
 ///
-/// Coordinates the staged reservation and committed admission records from
-/// the verified solo context: definition digest and work class from the
-/// frozen plan, capacity from the staffing receipt lane, fence/epoch
-/// re-queried live per call. Record identities are deterministic
-/// `solo-` derivations of the verified definition digest so exact replay
-/// rebuilds the same record instead of minting a second operation.
+/// Honest closed port: the Kernel ORS solo-stage arm and the Governor
+/// solo-admission seal do not exist yet, so no accepted interface revision
+/// is reported and no reservation or admission is minted here. Every call
+/// first revalidates the live fence/epoch against the verified context
+/// (a real Kernel owner read with typed stale failures), then raises the
+/// typed missing-prerequisite residual before staging any dependent effect.
+/// Reservation and admission stay with their owners (I10.15 one-owner
+/// rule); owner delegation lands with the Governor swarm-admission owner.
 #[derive(Clone)]
 pub struct SoloAdmissionAuthorityPort {
     context: Arc<SoloVerifiedContext>,
     kernel: Arc<DaemonKernelClient>,
-    staged: Arc<Mutex<BTreeMap<String, Reservation>>>,
 }
 
 impl SoloAdmissionAuthorityPort {
@@ -420,14 +424,6 @@ impl SoloAdmissionAuthorityPort {
         }
         Ok(())
     }
-
-    fn reservation_identity(definition_digest: &str) -> String {
-        format!("solo-reservation-{definition_digest}")
-    }
-
-    fn admission_identity(definition_digest: &str) -> String {
-        format!("solo-admission-{definition_digest}")
-    }
 }
 
 impl AdmissionAuthorityPort for SoloAdmissionAuthorityPort {
@@ -446,63 +442,51 @@ impl AdmissionAuthorityPort for SoloAdmissionAuthorityPort {
                 "solo reservation refuses a fence-moved definition".to_owned(),
             ));
         }
-        let reservation = Reservation {
-            reservation_id: Self::reservation_identity(&definition.definition_digest),
-            definition_id: definition.definition_id.clone(),
-            definition_digest: definition.definition_digest.clone(),
-            work_class: definition.work_class,
-            fence: definition.fence.clone(),
-        };
-        let mut guard = self
-            .staged
-            .lock()
-            .map_err(|_| FabricError::Contract("solo staged lock poisoned".to_owned()))?;
-        guard.insert(reservation.reservation_id.clone(), reservation.clone());
-        Ok(reservation)
+        // #1700 AUD1/AUD2: the Kernel ORS solo-stage arm does not exist, so
+        // no reservation is staged or stored here. The validated definition
+        // is retained by the caller for reevaluation after owner acceptance.
+        Err(crate::blocked_port(
+            FabricPortId::AdmissionAuthority,
+            FabricOperation::StageReservation,
+            definition.definition_id.as_str().to_owned(),
+            Some(definition.fence.clone()),
+            None,
+        ))
     }
 
     fn commit_admission(&self, reservation: &Reservation) -> Result<FabricAdmission, FabricError> {
         self.check_live()?;
-        let guard = self
-            .staged
-            .lock()
-            .map_err(|_| FabricError::Contract("solo staged lock poisoned".to_owned()))?;
-        let stored = guard.get(&reservation.reservation_id).ok_or_else(|| {
-            FabricError::StaleReservation(
-                "solo admission refuses an unstaged reservation".to_owned(),
-            )
-        })?;
-        if stored != reservation {
-            return Err(FabricError::ReceiptBinding(
-                "solo admission refuses a substituted reservation".to_owned(),
-            ));
-        }
-        let admission_id =
-            AdmissionId::new(Self::admission_identity(&reservation.definition_digest))?;
-        Ok(FabricAdmission {
-            admission_id,
-            definition_id: reservation.definition_id.clone(),
-            definition_digest: reservation.definition_digest.clone(),
-            work_class: reservation.work_class,
-            reservation_id: reservation.reservation_id.clone(),
-            fence: reservation.fence.clone(),
-            epoch: self.context.epoch.clone(),
-            attempt_ids: vec![self.context.attempt_id.clone()],
-        })
+        // #1700 AUD1/AUD2: the Governor solo-admission seal does not exist,
+        // so no admission is committed here. The retained reservation is
+        // named in the residual for reevaluation after owner acceptance.
+        Err(crate::blocked_port(
+            FabricPortId::AdmissionAuthority,
+            FabricOperation::CommitAdmission,
+            reservation.reservation_id.clone(),
+            Some(reservation.fence.clone()),
+            None,
+        ))
     }
 
     fn interface_binding(&self) -> PortBindingState {
-        PortBindingState::bound(SOLO_ADMISSION_AUTHORITY_REVISION.to_owned())
-            .unwrap_or(PortBindingState::Uncertain)
+        // #1700 AUD1: no owner receipt, registration revision, generation,
+        // fence, revocation cursor, or acceptance evidence exists for the
+        // missing solo legs, so no accepted revision is reported. A local
+        // constant or trait presence must never establish `Bound`.
+        PortBindingState::Missing
     }
 }
 
 /// Solo Kernel activation authority adapter.
 ///
-/// Binds activation evidence to the committed admission, the registered
-/// attempt, and the live fence/epoch. The activation digest deterministically
-/// binds admission, attempt, definition digest, fence, and epoch, so exact
-/// replay reproduces the same evidence instead of minting fresh authority.
+/// Honest closed port: the Kernel solo activation receipt does not exist
+/// yet, so no accepted interface revision is reported and no activation
+/// evidence is minted here. The presented admission and attempt are still
+/// validated against the verified context and the live fence/epoch (real
+/// owner reads with typed failures), then the call raises the typed
+/// missing-prerequisite residual. Activation stays with the Kernel owner
+/// (I10.15 one-owner rule); owner delegation lands with
+/// B-ACTIVATION-PROJECTION #839.
 #[derive(Clone)]
 pub struct SoloActivationAuthorityPort {
     context: Arc<SoloVerifiedContext>,
@@ -543,27 +527,23 @@ impl ActivationAuthorityPort for SoloActivationAuthorityPort {
                 "solo activation refuses a foreign attempt".to_owned(),
             ));
         }
-        let digest_input = serde_json::json!({
-            "admission_id": admission.admission_id.as_str(),
-            "attempt_id": attempt_id.as_str(),
-            "definition_digest": self.context.definition_digest,
-            "fence": self.context.fence,
-            "epoch": self.context.epoch,
-        });
-        let bytes = eliot_contracts::canonical_json_bytes(&digest_input)
-            .map_err(|error| contract(format!("solo activation digest bytes: {error}")))?;
-        Ok(ActivationEvidence {
-            admission_id: admission.admission_id.clone(),
-            attempt_id: attempt_id.clone(),
-            activation_digest: sha256_hex(&bytes),
-            fence: self.context.fence.clone(),
-            epoch: self.context.epoch.clone(),
-        })
+        // #1700 AUD1/AUD2: no Kernel activation receipt exists to mint
+        // evidence from; deterministic local computation is not owner
+        // authority. The validated admission/attempt is retained by the
+        // caller for reevaluation after owner acceptance.
+        Err(crate::blocked_port(
+            FabricPortId::ActivationAuthority,
+            FabricOperation::Activate,
+            attempt_id.as_str().to_owned(),
+            Some(admission.fence.clone()),
+            Some(admission.epoch.clone()),
+        ))
     }
 
     fn interface_binding(&self) -> PortBindingState {
-        PortBindingState::bound(SOLO_ACTIVATION_AUTHORITY_REVISION.to_owned())
-            .unwrap_or(PortBindingState::Uncertain)
+        // #1700 AUD1: the solo activation owner leg is absent; no accepted
+        // revision is reported and no local value establishes `Bound`.
+        PortBindingState::Missing
     }
 }
 
@@ -616,26 +596,21 @@ pub struct SoloDispatchRecord {
 
 /// Solo dispatch egress adapter.
 ///
-/// Retains the activated intent after the driver persisted the dispatch
-/// projection: re-emission of the same dispatch identity returns the same
-/// acknowledgement without a second effect, and an unknown identity refuses
-/// instead of launching blindly.
+/// Honest closed port: the real dispatch-egress retention receipt does not
+/// exist yet, so no accepted interface revision is reported and no
+/// acknowledgement is retained here. The presented intent is still validated
+/// against the verified context, the live fence/epoch, and the deterministic
+/// dispatch identity (real checks with typed failures), then the call raises
+/// the typed missing-prerequisite residual. Retention stays with the egress
+/// owner; owner delegation lands with the executor-daemon bind (#874).
 #[derive(Clone)]
 pub struct SoloDispatchEgressPort {
     context: Arc<SoloVerifiedContext>,
     kernel: Arc<DaemonKernelClient>,
-    emitted: Arc<Mutex<BTreeMap<String, DispatchAck>>>,
 }
 
 impl DispatchEgressPort for SoloDispatchEgressPort {
     fn emit(&self, intent: &DispatchIntent) -> Result<DispatchAck, FabricError> {
-        let mut guard = self
-            .emitted
-            .lock()
-            .map_err(|_| FabricError::Contract("solo emitted lock poisoned".to_owned()))?;
-        if let Some(ack) = guard.get(&intent.dispatch_id) {
-            return Ok(ack.clone());
-        }
         let live = self.kernel.kernel_fence();
         if !fences_match_exact(&live, &self.context.fence)
             || !fences_match_exact(&intent.fence, &self.context.fence)
@@ -668,17 +643,23 @@ impl DispatchEgressPort for SoloDispatchEgressPort {
                 "solo egress refuses a foreign dispatch identity".to_owned(),
             ));
         }
-        let ack = DispatchAck {
-            dispatch_id: intent.dispatch_id.clone(),
-            retained: true,
-        };
-        guard.insert(intent.dispatch_id.clone(), ack.clone());
-        Ok(ack)
+        // #1700 AUD1/AUD2: no egress retention receipt exists to store or
+        // return here; an in-memory ack is not retention. The validated
+        // intent is retained by the caller for reevaluation after owner
+        // acceptance.
+        Err(crate::blocked_port(
+            FabricPortId::DispatchEgress,
+            FabricOperation::Emit,
+            intent.dispatch_id.clone(),
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        ))
     }
 
     fn interface_binding(&self) -> PortBindingState {
-        PortBindingState::bound(SOLO_DISPATCH_EGRESS_REVISION.to_owned())
-            .unwrap_or(PortBindingState::Uncertain)
+        // #1700 AUD1: the solo egress owner leg is absent; no accepted
+        // revision is reported and no local value establishes `Bound`.
+        PortBindingState::Missing
     }
 }
 
@@ -824,6 +805,10 @@ impl SoloDriverState {
 /// `PeerChannel` and `SwarmControl` reuse the closed production ports (no
 /// accepted B-PEER/B-SWARM revision on this base); the solo driver never
 /// calls them, so solo work neither depends on nor fabricates peer success.
+/// The solo admission, activation, and egress adapters are likewise closed:
+/// with no Kernel ORS solo-stage arm, no Governor solo-admission seal, and
+/// no egress retention receipt, they report `Missing` and refuse with the
+/// typed residual instead of minting local authority.
 #[cfg(test)]
 fn solo_fabric_ports(
     context: SoloVerifiedContext,
@@ -838,7 +823,6 @@ fn solo_fabric_ports(
         admission_authority: Arc::new(SoloAdmissionAuthorityPort {
             context: Arc::clone(&context),
             kernel: Arc::clone(kernel),
-            staged: Arc::new(Mutex::new(BTreeMap::new())),
         }),
         activation_authority: Arc::new(SoloActivationAuthorityPort {
             context: Arc::clone(&context),
@@ -847,7 +831,6 @@ fn solo_fabric_ports(
         dispatch_egress: Arc::new(SoloDispatchEgressPort {
             context: Arc::clone(&context),
             kernel: Arc::clone(kernel),
-            emitted: Arc::new(Mutex::new(BTreeMap::new())),
         }),
     }
 }
@@ -1204,14 +1187,30 @@ pub async fn drive_solo_delegate_async(
         DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
     })?;
 
+    let material = intake.claimed.material();
     kernel
-        .verify_provider_binding_async(&intake.claimed.material())
+        .verify_provider_binding_async(&material)
         .await
         .map_err(|error| DaemonError::Kernel(error.to_string()))?;
 
-    Err(DaemonError::ProviderAdmission(FabricError::Contract(
-        "Kernel verified the claim binding, but the native-worker owner has no durable executable-binding digest for this claim; admitted provider capability and execution remain blocked"
-            .to_owned(),
+    // #1700 AUD4: the missing executable-binding owner is a missing owner
+    // prerequisite, not a generic contract string. The residual below names
+    // the exact interface (kernel activation authority), the blocked
+    // operation/work (launch activation of this operation), the live
+    // fence/epoch observed at the probe, the disposition, and the next
+    // permitted action, and it travels the real daemon response path as
+    // `DaemonError::ProviderAdmission`, consumable by status/recovery/UI
+    // code without string interpretation. The native-worker owner must
+    // persist and verify the executable join itself before this path can
+    // proceed (residual owner leg: the Kernel native-worker executable
+    // binding; no durable row exists on any owner today).
+    let live_fence = kernel.kernel_fence();
+    Err(DaemonError::ProviderAdmission(crate::blocked_port(
+        FabricPortId::ActivationAuthority,
+        FabricOperation::Activate,
+        material.operation_id.clone(),
+        Some(live_fence.clone()),
+        Some(live_fence.authority_epoch.clone()),
     )))
 }
 
