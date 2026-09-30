@@ -163,13 +163,6 @@ pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
     ControlBoardReviewBatch, ControlBoardReviewBatchObligation,
 };
-pub use human_attention_evaluation::{
-    BoundHumanAttentionEvidence, BoundHumanAttentionRead, HumanAttentionComparisonInput,
-    HumanAttentionEvaluationError, HumanAttentionEvidenceGap, HumanAttentionEvidenceRequest,
-    HumanAttentionMatchedComparison, HumanAttentionReadPresentation, HumanAttentionReadSlot,
-    NominatedHumanAttentionRead, RequestedHumanAttentionClaim, assemble_human_attention_claims,
-    assemble_human_attention_evidence,
-};
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
@@ -187,6 +180,13 @@ pub use eliot_ors::ScanDisclosureRecordOwner;
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
+pub use human_attention_evaluation::{
+    BoundHumanAttentionEvidence, BoundHumanAttentionRead, HumanAttentionComparisonInput,
+    HumanAttentionEvaluationError, HumanAttentionEvidenceGap, HumanAttentionEvidenceRequest,
+    HumanAttentionMatchedComparison, HumanAttentionReadPresentation, HumanAttentionReadSlot,
+    NominatedHumanAttentionRead, RequestedHumanAttentionClaim, assemble_human_attention_claims,
+    assemble_human_attention_evidence,
+};
 pub use learning_admission::{
     CrossTaskAdmissionError, CrossTaskAdmissionRecord, LEARNING_ADMISSION_CONTRACT,
     LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim, LearningAdmissionError,

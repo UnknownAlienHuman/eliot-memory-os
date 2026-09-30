@@ -39,7 +39,7 @@
 //! call on a synchronous control gate.
 //!
 //! The persistence, authorization and projection legs (record creation and
-//! correction, canonical transition and receipt, role-filtered ControlBoard
+//! correction, canonical transition and receipt, role-filtered `ControlBoard`
 //! view) are separate work owned by their own seams; the assembled
 //! [`BoundHumanAttentionEvidence`] and the derived claims are the exact inputs
 //! those legs consume.
@@ -291,8 +291,8 @@ pub enum HumanAttentionEvaluationError {
     /// A comparative conclusion drops a required caveat statement.
     #[error("comparative conclusion requires a non-blank {caveat} statement")]
     BlankCaveat {
-        /// Caveat whose statement is blank: selection_bias, censoring,
-        /// intervention_effect or alternative_explanation.
+        /// Caveat whose statement is blank: `selection_bias`, `censoring`,
+        /// `intervention_effect` or `alternative_explanation`.
         caveat: &'static str,
     },
     /// A claim rests on a metric the assembled record did not observe. An
@@ -584,9 +584,7 @@ fn validate_supporting_metrics(
             });
         }
         if !observed_metrics.contains(metric) {
-            return Err(HumanAttentionEvaluationError::UnknownMetricSupport {
-                metric: *metric,
-            });
+            return Err(HumanAttentionEvaluationError::UnknownMetricSupport { metric: *metric });
         }
     }
     Ok(())
@@ -682,7 +680,10 @@ fn validate_matched_profile(
     validate_caveat(&comparison.selection_bias, "selection_bias")?;
     validate_caveat(&comparison.censoring, "censoring")?;
     validate_caveat(&comparison.intervention_effect, "intervention_effect")?;
-    validate_caveat(&comparison.alternative_explanation, "alternative_explanation")?;
+    validate_caveat(
+        &comparison.alternative_explanation,
+        "alternative_explanation",
+    )?;
     Ok(())
 }
 
