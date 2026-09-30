@@ -1401,6 +1401,14 @@ pub struct TestJob {
     /// without a lane; it never selects fallback identity.
     #[serde(default)]
     pub work_envelope: Option<GovernedWorkEnvelope>,
+    /// Fixture namespace allocated for this work item at admission (issue
+    /// #1897, W4), derived by the retained envelope from the whole lane
+    /// tuple — work item, build mode, and normalized fingerprint — and never
+    /// from the worktree, the project id, the job id, or a counter. `None`
+    /// preserves the pre-lane authority for rows admitted without a lane; it
+    /// never selects a fallback namespace.
+    #[serde(default)]
+    pub fixture_namespace: Option<String>,
     /// Scheduling priority; larger values run first among ready heads.
     pub priority: i32,
     /// Declared job class. The class, not the raw `priority` integer, is the
@@ -2718,6 +2726,7 @@ impl VerificationReceipt {
             &job.target_roots,
             job.target_layout.as_ref(),
             job.work_envelope.as_ref(),
+            job.fixture_namespace.as_deref(),
         )?;
         let binding = self.binding();
         validate_receipt_binding(job, &binding)?;
@@ -4062,6 +4071,21 @@ impl TestdStore {
                 return Err(TestdError::InvalidBinding);
             }
         }
+        // Issue #1897 (W4): allocate the fixture namespace for this work item
+        // in the same admitting transaction that allocates and persists its
+        // envelope, and take it from the whole lane tuple through the
+        // envelope's own derivation. It is never taken from the worktree, the
+        // project id, the job id, or a counter, and it is allocated once per
+        // work item rather than derived on demand at each use, so a restart
+        // consumes the retained value instead of a replacement one.
+        let fixture_namespace = work_envelope
+            .as_ref()
+            .map(|envelope| {
+                envelope
+                    .fixture_namespace()
+                    .map_err(|error| TestdError::Contract(error.to_string()))
+            })
+            .transpose()?;
         // Issue #1897 (W1/W3/AUD4): an allocated lane is the ONE target-root
         // authority for this job. `TargetRoots` (issue #1806) and
         // `TargetLayoutBinding` are a second, competing derivation, so for an
@@ -4078,6 +4102,7 @@ impl TestdStore {
             &target_roots,
             target_layout.as_ref(),
             work_envelope.as_ref(),
+            fixture_namespace.as_deref(),
         )?;
         let digest = payload_digest(
             &invocation,
@@ -4087,6 +4112,7 @@ impl TestdStore {
             job_class,
             &resource_profile,
             work_envelope.as_ref(),
+            fixture_namespace.as_deref(),
         )?;
         let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
@@ -4188,6 +4214,7 @@ impl TestdStore {
             target_roots,
             target_layout,
             work_envelope,
+            fixture_namespace,
             priority,
             job_class,
             resource_profile,
@@ -4431,6 +4458,7 @@ impl TestdStore {
             &job.target_roots,
             job.target_layout.as_ref(),
             job.work_envelope.as_ref(),
+            job.fixture_namespace.as_deref(),
         )?;
         // Issue #1897 (W1/W5): requalify the retained envelope with its owner
         // before this attempt starts. The row just read is the durable
@@ -5036,6 +5064,13 @@ fn project_head_blocked<'a>(
 /// `cache_root == target_root` relation of
 /// [`TargetRoots::validate`] untouched and add no distinctness.
 ///
+/// It also binds the retained fixture namespace (issue #1897, W4) to the
+/// retained envelope BY CONTENT: the namespace the row carries must equal what
+/// its own envelope derives from the whole lane tuple, and a lane without a
+/// namespace is a namespace without a derivation. Presence is never enough, a
+/// mismatched namespace is never repaired, and no namespace is ever derived
+/// from the worktree, the project id, the job id, or a counter.
+///
 /// # Errors
 ///
 /// Returns the first [`TestdError`] the selected verification raises.
@@ -5043,8 +5078,9 @@ fn verify_job_lane(
     target_roots: &TargetRoots,
     layout: Option<&TargetLayoutBinding>,
     envelope: Option<&GovernedWorkEnvelope>,
+    fixture_namespace: Option<&str>,
 ) -> Result<(), TestdError> {
-    match (layout, envelope) {
+    let lane = match (layout, envelope) {
         (Some(layout), Some(envelope)) => {
             verify_envelope_layout_binding(target_roots, layout, envelope).map(|_| ())
         }
@@ -5066,9 +5102,34 @@ fn verify_job_lane(
             Ok(())
         }
         (None, None) => Ok(()),
+    };
+    lane?;
+    // The namespace is a derived half of the required tuple, not a name the
+    // row may choose: the envelope is its only source, so an enveloped job
+    // whose retained namespace is absent or different was not admitted under
+    // this lane and refuses, and a namespace retained without a lane has no
+    // derivation to agree with and also refuses.
+    match (envelope, fixture_namespace) {
+        (Some(envelope), Some(retained)) => {
+            let expected = envelope
+                .fixture_namespace()
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            if retained != expected.as_str() {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => return Err(TestdError::InvalidBinding),
+        (None, None) => {}
     }
+    Ok(())
 }
 
+// The admitted payload is the whole tuple this job row commits to, so every
+// element is a separate parameter rather than a struct that could be built
+// partially. That makes the arity exceed the lint default by one; the sibling
+// composition entrypoint in this workspace carries the same attribute for the
+// same reason.
+#[allow(clippy::too_many_arguments)]
 fn payload_digest(
     invocation: &InstrumentInvocation,
     process: &ProcessRequest,
@@ -5077,6 +5138,7 @@ fn payload_digest(
     job_class: JobClass,
     resource_profile: &TestResourceProfile,
     work_envelope: Option<&GovernedWorkEnvelope>,
+    fixture_namespace: Option<&str>,
 ) -> Result<String, TestdError> {
     let bytes = serde_json::to_vec(&(
         invocation,
@@ -5086,6 +5148,7 @@ fn payload_digest(
         job_class,
         resource_profile,
         work_envelope,
+        fixture_namespace,
     ))
     .map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
