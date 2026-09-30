@@ -232,7 +232,8 @@ pub use store_client::{
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::{
-    AcceptedReservedWrite, BorrowedCanonicalStoreClient, KernelStoreGateway, StagedReservedWriteError, StoreApplyRefusal,
+    AcceptedReservedWrite, BorrowedCanonicalStoreClient, KernelStoreGateway,
+    StagedReservedWriteError, StoreApplyRefusal,
 };
 // Issue #1681 W3: the named-read refusal leaves the Kernel with a typed
 // `StoreError` and nothing else. These two are the missing half the transport

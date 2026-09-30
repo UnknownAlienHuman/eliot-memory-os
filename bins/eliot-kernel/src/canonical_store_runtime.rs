@@ -46,13 +46,13 @@ use eliot_kernel_core::RouteScope;
 #[cfg(windows)]
 use eliot_kernel_service::{EbpCanonicalStoreClient, StoreClientError};
 #[cfg(windows)]
+use eliot_kernel_service::{RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER};
+#[cfg(windows)]
 use eliot_ors::{RecoveryPayload, ReservationState, StateFenceSnapshot};
 #[cfg(windows)]
 use eliot_platform_windows::ProtectedSecret;
 #[cfg(windows)]
 use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
-#[cfg(windows)]
-use eliot_kernel_service::{RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER};
 #[cfg(windows)]
 use std::fmt;
 
@@ -583,8 +583,7 @@ impl KernelComposition {
             .unprotect_secret(&protected)
             .map_err(|error| error.to_string())?;
         let operation: super::daemon_request_dispatch::StoreApplyOperation =
-            serde_json::from_slice(original_bytes.expose())
-                .map_err(|error| error.to_string())?;
+            serde_json::from_slice(original_bytes.expose()).map_err(|error| error.to_string())?;
         if canonical_json_bytes(&operation).map_err(|error| error.to_string())?
             != original_bytes.expose()
             || eliot_store_api::prepared_transition_digest(&operation.transition)

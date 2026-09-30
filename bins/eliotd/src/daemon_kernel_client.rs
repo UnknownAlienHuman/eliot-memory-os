@@ -1449,7 +1449,9 @@ pub fn parse_observe_submit_outcome(
         if submission.state != eliot_store_api::WriteSubmissionState::Staged
             || submission.canonical_receipt_ref.is_some()
         {
-            return Err("Kernel staged Observe answer is not a nonterminal staged submission".to_owned());
+            return Err(
+                "Kernel staged Observe answer is not a nonterminal staged submission".to_owned(),
+            );
         }
         return Ok(ObserveSubmitOutcome::Staged(Box::new(submission)));
     }
@@ -2844,7 +2846,10 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?
         {
-            WireOutcome::Known { value, recovery: None } => value,
+            WireOutcome::Known {
+                value,
+                recovery: None,
+            } => value,
             WireOutcome::AcceptedPending {
                 value,
                 recovery: None,
@@ -2855,8 +2860,7 @@ impl DaemonKernelClient {
             }),
             WireOutcome::Known { .. } => {
                 return Err(super::DaemonError::Kernel(
-                    "Kernel Observe result known response unexpectedly carries recovery"
-                        .to_owned(),
+                    "Kernel Observe result known response unexpectedly carries recovery".to_owned(),
                 ));
             }
             WireOutcome::AcceptedPending { .. } => {
