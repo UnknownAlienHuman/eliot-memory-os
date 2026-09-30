@@ -7280,37 +7280,48 @@ impl KernelStoreGateway {
     /// The store generation that currently owns the durable `canonical_store`
     /// capability route.
     ///
-    /// [`crate::active_canonical_store_generation`] reads the same ORS
-    /// `CUTOVER_OWNERSHIP` owner the `I5.11` stage-8 cutover commits through,
-    /// so the answer survives a restart and cannot be a composition-local flag.
-    /// A composition with no ORS handle, or a route no committed cutover has
-    /// ever switched, keeps the generation its own route was pinned to at
-    /// composition, which is the behaviour that existed before this gate and is
-    /// reachable only where no cutover could exist to contradict it.
+    /// [`crate::canonical_store_route_owner`] reads the same ORS owners the
+    /// `I5.11` stage-8 cutover commits through and the same record that names
+    /// the generation an un-cut-over route started at, so the answer survives a
+    /// restart and cannot be a composition-local flag. `None` therefore means
+    /// neither a committed cutover nor an established owner exists for this
+    /// scope, which is the state of a database this build has not composed yet;
+    /// a gateway built without the composition-retained ORS handle also answers
+    /// `None`, because it holds no handle to read either owner with. That is the
+    /// behaviour that existed before this gate, and it is reachable only from a
+    /// gateway no production composition builds: both production construction
+    /// sites — `KernelComposition`'s initial canonical-store connect
+    /// (`canonical_store_runtime.rs`) and `KernelComposition::rebind_store`
+    /// (`lib.rs`) — pass the retained ORS handle.
     fn active_store_generation(&self) -> Result<Option<ResourceGeneration>, StoreError> {
         let Some(commit_ors) = self.commit_ors.as_deref() else {
             return Ok(None);
         };
         // An unreadable durable route owner is unavailability, not a mismatch:
-        // the active generation is then unproven and nothing may be admitted on
-        // its behalf. `StoreError` has no refusal-with-reason variant, so the
-        // typed ORS class stops here rather than being re-invented.
-        crate::active_canonical_store_generation(commit_ors)
-            .map_err(|_error| StoreError::Unavailable)
+        // the owner is then unproven and nothing may be admitted on its behalf.
+        // `StoreError` has no refusal-with-reason variant, so the typed ORS
+        // class stops here rather than being re-invented.
+        crate::canonical_store_route_owner(commit_ors).map_err(|_error| StoreError::Unavailable)
     }
 
     /// Refuses any Store read or write unless this gateway's generation is the
-    /// durable `canonical_store` route's active generation.
+    /// durable `canonical_store` route's owner.
     ///
-    /// This is the `I5.11` stage-10 rollback window enforced from the Kernel
+    /// This is the `I5.11` stage-8/stage-10 gate enforced from the Kernel
     /// side. `self.route` is a composition-fixed snapshot of the generation this
     /// gateway was built for, so before this gate a completed stage-8 cutover
     /// changed nothing here: the incumbent kept serving reads and writes and the
-    /// candidate could not serve either. Resolving the active generation from
-    /// the durable cutover ownership table instead makes the governed Store path
-    /// follow the route, so from the commit onward the incumbent generation is
-    /// not the active one and every Store operation reaching this gateway —
-    /// fenced or unfenced, direct or through the borrowed client — is refused.
+    /// candidate could not serve either. Resolving the owner from the durable
+    /// cutover ownership table instead makes the governed Store path follow the
+    /// route, so from the commit onward the incumbent generation is not the
+    /// owner and every Store operation reaching this gateway — fenced or
+    /// unfenced, direct or through the borrowed client — is refused.
+    ///
+    /// The same comparison decides the pre-first-commit window, because the
+    /// owner read also returns the generation the route scope was established
+    /// at. An approved-but-uncommitted candidate bridge therefore reaches the
+    /// identical refusal here, at the same gate, for the same reason a cut-over
+    /// incumbent does: the durable owner does not name its generation.
     ///
     /// `I5.11` says "keep old store read-only for rollback window" and names no
     /// mechanism, and nothing in this process can fence another process's reader

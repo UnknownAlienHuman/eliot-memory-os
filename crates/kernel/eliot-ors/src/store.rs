@@ -441,6 +441,19 @@ impl OrsStoreIdentity {
 }
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
+/// Durable initial owner of one capability route scope (issue #1872; I5.11,
+/// I14.14).
+///
+/// One row per `CapabilityRouteScope` hash naming the generation that route
+/// scope started at, written once and never replaced in place. It is the record
+/// that makes "no committed cutover for this scope" mean "only the generation
+/// this row names" instead of "any generation", which is the state every
+/// installation is in before its first governed storage replacement. Owned by the
+/// same `RedbRecoveryStore` and written through the same `persistence_codec` as
+/// `CUTOVER_OWNERSHIP`; it is not a second route owner and it never claims to be
+/// a cutover.
+const CANONICAL_STORE_ROUTE_OWNERSHIP: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_canonical_store_route_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 /// Durable evaluated tool-exposure receipts, one per completed host-request
 /// operation (issue #1945, I7.24).
@@ -30058,6 +30071,99 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)?;
         let receipt = GenerationCutoverOwnershipReceipt::from_committed(&committed)?;
         Ok((committed, receipt))
+    }
+
+    /// Records the generation one capability route scope started at, once
+    /// (issue #1872; I5.11, I14.14).
+    ///
+    /// This is the family's only write path, and it is write-once by content
+    /// rather than by key alone: an identical row for a scope that already has
+    /// one is idempotent, while a *different* generation for the same scope is
+    /// refused. That refusal is the whole point — it is what makes a
+    /// configuration change or a restart unable to move a route scope that has
+    /// no committed cutover, because the only thing that can replace this row
+    /// is a committed `CUTOVER_OWNERSHIP` cutover for the same scope, which is
+    /// the `I5.11` stage-8 linearization point.
+    ///
+    /// The single write transaction is the durable linearization point: a crash
+    /// before it leaves the scope with no owner record and the caller re-offers
+    /// the identical row, a crash after it reconstructs the same owner. An
+    /// established owner is never silently upgraded in place.
+    pub fn commit_canonical_store_route_ownership(
+        &self,
+        record: &crate::CanonicalStoreRouteOwnership,
+    ) -> Result<crate::CanonicalStoreRouteOwnership, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let current = write
+                .open_table(CANONICAL_STORE_ROUTE_OWNERSHIP)
+                .map_err(storage)?;
+            if let Some(existing) = current
+                .get(record.route_scope_hash.as_str())
+                .map_err(storage)?
+            {
+                let stored: crate::CanonicalStoreRouteOwnership =
+                    decode_named(existing.value(), "canonical_store_route_ownership")?;
+                if stored.route_scope_hash != record.route_scope_hash {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "canonical_store_route_ownership",
+                        reason: "table key does not match the recorded route scope".to_owned(),
+                    });
+                }
+                if stored == *record {
+                    return Ok(stored);
+                }
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "canonical_store_route_ownership",
+                    reason: "an established capability route owner cannot be replaced except by a committed cutover for the same scope".to_owned(),
+                });
+            }
+        }
+        {
+            let mut current = write
+                .open_table(CANONICAL_STORE_ROUTE_OWNERSHIP)
+                .map_err(storage)?;
+            current
+                .insert(record.route_scope_hash.as_str(), encode(record)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(record.clone())
+    }
+
+    /// Loads the established owner of one capability route scope.
+    ///
+    /// The row is decoded through the existing ORS codec, revalidated, and
+    /// checked against its own canonical key, so a stored row that names another
+    /// scope is refused rather than reinterpreted. `Ok(None)` means no owner was
+    /// ever established for this scope; an ORS database written before the table
+    /// existed reports the absence through [`OrsError::Storage`], which the
+    /// caller reads as the same fact rather than as a fault.
+    pub fn load_canonical_store_route_ownership(
+        &self,
+        route_scope_hash: &str,
+    ) -> Result<Option<crate::CanonicalStoreRouteOwnership>, OrsError> {
+        crate::model::validate_digest(route_scope_hash, "canonical_store_route_scope_hash")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read
+            .open_table(CANONICAL_STORE_ROUTE_OWNERSHIP)
+            .map_err(storage)?;
+        current
+            .get(route_scope_hash)
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::CanonicalStoreRouteOwnership =
+                    decode_named(value.value(), "canonical_store_route_ownership")?;
+                if record.route_scope_hash != route_scope_hash {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "canonical_store_route_ownership",
+                        reason: "table key does not match the recorded route scope".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
     }
 
     /// Loads one ownership record by cutover identity.

@@ -19,6 +19,7 @@ use super::OperationalKind;
 use super::ScopeReservationHead;
 use crate::AuthorityHandoffRecord;
 use crate::CanonicalDisposition;
+use crate::CanonicalStoreRouteOwnership;
 use crate::EffectOperationLease;
 use crate::KernelExecutionManifest;
 use crate::KernelReconciliationItem;
@@ -895,6 +896,14 @@ impl PersistedValue for EffectOperationLease {
 
 impl PersistedValue for KernelExecutionManifest {
     const RECORD_TYPE: &'static str = "kernel_execution_manifest";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for CanonicalStoreRouteOwnership {
+    const RECORD_TYPE: &'static str = "canonical_store_route_ownership";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
