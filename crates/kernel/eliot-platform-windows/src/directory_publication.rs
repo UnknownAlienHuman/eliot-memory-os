@@ -927,7 +927,7 @@ where
     let (canonical_parent, retained_parent_identity, handle) = entries
         .last_mut()
         .ok_or(DirectoryPublicationError::InvalidPath)?;
-    *canonical_parent = observed_parent_path.clone();
+    canonical_parent.clone_from(&observed_parent_path);
     *retained_parent_identity = parent_identity;
     *handle = parent_handle;
     Ok(DirectoryPublicationContour {
