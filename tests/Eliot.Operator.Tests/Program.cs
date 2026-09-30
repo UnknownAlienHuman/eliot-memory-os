@@ -119,9 +119,19 @@ Equal(
     "Unknown outcome — reconcile, do not resubmit",
     viewModel.StatusTitle,
     "durable command without receipt stays reconciling, not failed");
+// The owner refuses this receipt before use rather than after it: a receipt
+// claiming a durable mutation while carrying no canonical receipt is an
+// inconsistent disposition, and it is rejected in the same breath as a receipt
+// bound to another identity, revision or outcome. The message wording is the
+// owner's, so the assertions below state the properties instead: the operator
+// is told to reconcile and never to retry, and a receipt the owner never sent
+// is never displayed.
 True(
-    viewModel.StatusMessage.Contains("without a canonical receipt", StringComparison.Ordinal),
-    "missing canonical receipt failure explained");
+    viewModel.StatusMessage.Contains("use Reconcile before any retry", StringComparison.Ordinal),
+    "receipt-less durable claim tells the operator to reconcile, never to retry");
+True(
+    !viewModel.StatusMessage.Contains("receipt-1", StringComparison.Ordinal),
+    "a canonical receipt the owner never sent is never surfaced");
 True(viewModel.HasUnknownOperations, "unproven mutation retained for reconciliation");
 client.OmitCanonicalReceipt = false;
 await viewModel.ReconcilePendingAsync();
@@ -480,6 +490,14 @@ sealed class FakeGovernorClient : IGovernorClient
             [new OperatorFieldView("run_id", second ? "run-2" : "run-1", true)],
             [],
             [new OperatorActionView("resume_run", "Resume", "R1", false, false)]);
+        // The first page of this projection is a partial window (returned 1 of
+        // 2), so the owner marks it truncated; the second page is whole. While
+        // the rotation probe is running the fake serves a whole page on either
+        // read, because the owner states the invalidation on its green
+        // connected banner and a truncated page legitimately carries its own
+        // banner instead. Without that, this assertion would be measuring which
+        // banner the owner picked for an incomplete page rather than whether it
+        // invalidated anything.
         return new OperatorProjectionPage(
             OperatorProtocol.SchemaVersion,
             "runtime-a",
@@ -491,10 +509,10 @@ sealed class FakeGovernorClient : IGovernorClient
             request.Cursor,
             second ? null : "offset:1",
             request.PageSize,
-            1,
+            RotateGeneration ? 2 : 1,
             2,
             true,
-            !second,
+            !second && !RotateGeneration,
             [record],
             request.ResultMode,
             JsonSerializer.SerializeToElement(new { operation = request.QueryOperation, records = new[] { record.RecordRef } }),
