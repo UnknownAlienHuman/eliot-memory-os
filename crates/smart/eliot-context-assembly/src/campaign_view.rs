@@ -122,9 +122,9 @@ pub fn check_campaign_view_for_assembly(
             )));
         }
     }
-    let context_recipe_digest = context_recipe_digest.ok_or_else(|| {
-        AssemblyError::Contract(ContextError::MissingField("campaign_view.context_recipe"))
-    })?;
+    let context_recipe_digest = context_recipe_digest.ok_or(AssemblyError::Contract(
+        ContextError::MissingField("campaign_view.context_recipe"),
+    ))?;
     if context_recipe_digest != context_recipe_body_digest {
         return Err(AssemblyError::Contract(ContextError::InvalidDigest(
             "campaign_view.context_recipe",
