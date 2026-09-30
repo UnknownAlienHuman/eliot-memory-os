@@ -110,9 +110,9 @@ use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
     KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, OrsRestoreJournalOwner,
     PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal,
-    backup_to_kernel, check_kernel_effect_fence, ors_to_backup, require_production_admitted,
-    sync_file, sync_parent_directory,
+    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, RetainedPhaseMaterial,
+    StagedCleanupOutcome, StagedCleanupRefusal, backup_to_kernel, check_kernel_effect_fence,
+    ors_to_backup, require_production_admitted, sync_file, sync_parent_directory,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -338,6 +338,16 @@ const PURGE_LEDGER_REVISION_SUBJECT: &str = "purge ledger revision";
 /// phase published nothing, while its presence is proof it published
 /// something.
 const ISOLATED_SKELETON_DIR: &str = "phase-receipts";
+/// The one file-name suffix [`KernelRestoreTarget::write_file`] gives a
+/// temporary it has not yet published.
+///
+/// It is the boundary between the two kinds of byte this owner handles:
+/// BEFORE the rename the file carries this suffix and is unpublished, so it is
+/// the only thing automatic cleanup may reap; AFTER the rename it is a member
+/// name that a phase receipt and the durable journal may both attest, and it
+/// carries no such suffix. Single-sourced so the writer and the cleanup
+/// predicate cannot disagree about which side of the rename a path is on.
+const TEMP_RESTORE_EXTENSION: &str = "tmp-restore";
 
 /// Checked accumulation for the derived staged-output denominators. Overflow
 /// refuses the archive through the named ceiling rather than wrapping a byte
@@ -431,8 +441,9 @@ fn staged_member_bytes(bundle: &BackupBundle) -> Result<usize, BackupError> {
 /// not is refused BEFORE the exceeding write instead of after it. The only
 /// archive that can meet the byte bound is one whose declared members plus this
 /// owner's own output exceed [`MAX_STAGED_OUTPUT_BYTES`]; that refusal is
-/// deliberate, and the failure path removes what this execution staged rather
-/// than leaving a half-written destination behind.
+/// deliberate, and the failure path reaps this execution's own unpublished
+/// temporaries rather than leaving a half-written temporary behind — published
+/// phase material is retained, not unlinked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StagedOutputBudget {
     members: usize,
@@ -928,12 +939,17 @@ impl KernelBackupRestore {
     /// Every staged write is admitted against the archive-derived
     /// [`StagedOutputBudget`] BEFORE it happens, so an archive that cannot
     /// fit the budget is refused rather than written past it. When the
-    /// journaled engine fails, the output this execution staged is removed by
-    /// a bounded, ownership-scoped cleanup (see
-    /// [`KernelRestoreTarget::cleanup_staged_output`]) and the typed cleanup
-    /// disposition is carried by the SAME primary failure: the cause is never
-    /// replaced, and a resume, a foreign admission, a destination that left
-    /// the isolated area, and every path this execution did not write are
+    /// journaled engine fails, the phase material this execution had already
+    /// PUBLISHED is RETAINED and reported through
+    /// [`KernelRestoreError::RetainedForResume`] — it is what the durable
+    /// journal and the per-phase receipts already attest, and unlinking it
+    /// would leave a resumable transaction describing history that does not
+    /// exist. The only automatic removal is a bounded, ownership-scoped reap of
+    /// the UNPUBLISHED temporaries this execution created
+    /// ([`KernelRestoreTarget::cleanup_staged_output`]), and the primary
+    /// `BackupError` is carried typed either way: the cause is never replaced,
+    /// and a resume, a foreign admission, a destination that left the
+    /// isolated area, and every path this execution did not create are
     /// preserved rather than removed.
     ///
     /// This entry holds no ORS owner handle, so it runs the same engine with
@@ -1064,8 +1080,12 @@ impl KernelBackupRestore {
             Ok(receipt) => receipt,
             Err(primary) => {
                 // The engine failed. The primary typed failure is what this
-                // owner returns, and the bounded cleanup of the output THIS
-                // execution staged is folded into it without replacing it.
+                // owner returns. Phase material this execution had already
+                // PUBLISHED is RETAINED, because the durable journal and the
+                // per-phase receipts already attest it and a resume of this
+                // same transaction is exactly what it makes possible; the
+                // bounded cleanup that runs beside it reaps only this
+                // operation's own UNPUBLISHED temporaries.
                 return Err(target_impl.refuse_with_staged_cleanup(
                     &destination,
                     &transaction.transaction_id,
@@ -1570,22 +1590,6 @@ enum PhaseMaterialState {
     Undecidable,
 }
 
-/// Bounded removal disposition for the output one restore execution staged.
-///
-/// A disposition, not an error: the primary engine failure is returned either
-/// way, so this only has to say what happened to the staged bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StagedCleanup {
-    /// This execution staged no removable file; nothing was removed and
-    /// nothing is owed.
-    NothingStaged,
-    /// Every removable file this execution staged was removed.
-    Removed,
-    /// Cleanup preserved what it could not attribute to this execution, for
-    /// the exact typed reason.
-    Refused(StagedCleanupRefusal),
-}
-
 /// Kernel restore target over the accepted effect seam.
 ///
 /// Every applicable phase re-checks the Kernel effect fence before touching
@@ -1598,8 +1602,10 @@ enum StagedCleanup {
 ///
 /// It also owns the two bounds the target is responsible for: every staged
 /// write is admitted against [`StagedOutputBudget`] BEFORE it happens, and the
-/// exact set of paths it wrote is retained so a failed execution can be
-/// cleaned up without touching anything it cannot prove is its own.
+/// exact set of paths it created is tracked — PUBLISHED ones separately from
+/// unpublished temporaries — so a failed execution cleans up only what it can
+/// prove is an unpublished temporary of its own, and reports the published
+/// material it retained for a resume rather than unlinking it.
 struct KernelRestoreTarget<'a> {
     root: PathBuf,
     /// Work root the destination was constructed under, re-checked at cleanup
@@ -1652,9 +1658,35 @@ struct KernelRestoreTarget<'a> {
     staged_members: usize,
     /// Bytes staged so far, against [`StagedOutputBudget::bytes`].
     staged_bytes: usize,
-    /// Exact paths this execution wrote, in write order, each under the
-    /// destination root. Nothing else is ever a cleanup candidate.
-    staged: Vec<PathBuf>,
+    /// Exact paths this execution PUBLISHED, in publication order, each under
+    /// the destination root and each WITHOUT the
+    /// [`TEMP_RESTORE_EXTENSION`] suffix.
+    ///
+    /// ## Not a deletion authorisation
+    ///
+    /// This list records that a path was written; it says nothing about
+    /// whether the path may be unlinked. A published member is named by the
+    /// phase that produced it, digested by that phase's receipt, and recorded
+    /// as applied by the durable journal, so removing one is destroying
+    /// material that durable state attests — which is why this field is never
+    /// consulted as a cleanup candidate set. It is kept because it is what
+    /// makes the published/unpublished boundary provable
+    /// ([`Self::is_owned_temporary`]) and because it is the denominator of the
+    /// [`RetainedPhaseMaterial`] reported on the engine-error path.
+    published: Vec<PathBuf>,
+    /// Exact operation-owned temporaries this execution created and had not
+    /// yet published, each under the destination root and each carrying the
+    /// [`TEMP_RESTORE_EXTENSION`] suffix.
+    ///
+    /// A path is pushed BEFORE its first byte is written, so a write, flush or
+    /// rename that fails still has a bounded cleanup account instead of
+    /// leaving an unowned file on disk. It is never removed from this list:
+    /// after a successful rename the path simply no longer exists, and
+    /// [`Self::cleanup_staged_output`] treats that absence as already
+    /// reclaimed. Distinct entries are bounded by
+    /// [`StagedOutputBudget::members`], because a member that is re-attempted
+    /// after a failure maps to the same temporary path.
+    staged_temporaries: Vec<PathBuf>,
 }
 
 impl<'a> KernelRestoreTarget<'a> {
@@ -1684,7 +1716,8 @@ impl<'a> KernelRestoreTarget<'a> {
             budget: StagedOutputBudget::derive(bundle)?,
             staged_members: 0,
             staged_bytes: 0,
-            staged: Vec::new(),
+            published: Vec::new(),
+            staged_temporaries: Vec::new(),
         })
     }
 
@@ -1849,8 +1882,10 @@ impl<'a> KernelRestoreTarget<'a> {
     /// reconciles against that same phase. No ORS transaction is held across
     /// any of this I/O, and no cross-store atomicity is claimed — the flushes
     /// bound the window, they do not close it. The staged counters and
-    /// [`Self::staged`] are committed only after both flushes, so a refusal
-    /// never accounts a file that was never published.
+    /// [`Self::published`] are committed only after both flushes, so a refusal
+    /// never accounts a file that was never published; the temporary IS tracked
+    /// before the write, so a refusal leaves a reaped temporary rather than an
+    /// unowned file.
     fn write_file(&mut self, relative: &str, bytes: &[u8]) -> Result<(), BackupError> {
         let members = self
             .staged_members
@@ -1886,7 +1921,16 @@ impl<'a> KernelRestoreTarget<'a> {
             std::fs::create_dir_all(parent)
                 .map_err(|error| BackupError::Target(error.to_string()))?;
         }
-        let tmp = path.with_extension("tmp-restore");
+        let tmp = path.with_extension(TEMP_RESTORE_EXTENSION);
+        // Track the operation-owned temporary BEFORE its first byte exists, so
+        // a write, flush or rename that fails below still has a bounded cleanup
+        // account instead of leaving a file no set knows about. The entry is
+        // idempotent per path: a member re-attempted after a failure maps to
+        // the same temporary, so the distinct-entry count stays bounded by the
+        // member ceiling the budget already admitted.
+        if !self.staged_temporaries.contains(&tmp) {
+            self.staged_temporaries.push(tmp.clone());
+        }
         std::fs::write(&tmp, bytes).map_err(|error| BackupError::Target(error.to_string()))?;
         // Flush the operation-owned temporary file BEFORE it is published.
         // Publishing first and flushing after would let a crash between the
@@ -1903,7 +1947,11 @@ impl<'a> KernelRestoreTarget<'a> {
         sync_parent_directory(path.parent().ok_or(BackupError::RestoreJournalCorrupt)?)?;
         self.staged_members = members;
         self.staged_bytes = staged_bytes;
-        self.staged.push(path);
+        // Publication, not a temporary any more: from here the durable journal may
+        // record this member as an applied phase and its receipt may attest
+        // these bytes, so it joins the retained set, and the temporary name
+        // stops naming anything on disk.
+        self.published.push(path);
         Ok(())
     }
 
@@ -1919,8 +1967,8 @@ impl<'a> KernelRestoreTarget<'a> {
     /// prefix component are all refused, and so is a path that names no segment
     /// at all. Refusal happens before any directory is created, before the
     /// staged-member and staged-byte counters are committed, and before any byte
-    /// is written — so a refused path is also absent from `self.staged`, and the
-    /// ownership-scoped cleanup can never be pointed at a path outside the
+    /// is written — so a refused path is also absent from `self.staged_temporaries`,
+    /// and the ownership-scoped cleanup can never be pointed at a path outside the
     /// isolated root.
     ///
     /// This is the same refusal the file-runner target enforces
@@ -1995,15 +2043,33 @@ impl<'a> KernelRestoreTarget<'a> {
         self.write_file(&relative, &bytes)
     }
 
-    /// Turns an engine failure plus the cleanup disposition into the refusal
-    /// this owner returns.
+    /// Turns an engine failure plus the two dispositions into the refusal this
+    /// owner returns.
     ///
-    /// The engine's typed failure is the cause and is never replaced. When the
-    /// cleanup removed everything, or had nothing removable to remove, the
-    /// refusal stays plain [`KernelRestoreError::TargetFailed`] — there is no
-    /// second fact to report. When the cleanup preserved what it could not
-    /// attribute, that exact typed reason travels with the SAME primary
-    /// failure, so nothing is lost and nothing is stringified.
+    /// The engine's typed failure is the cause and is never replaced.
+    ///
+    /// Two independent facts are reported, because they are independent:
+    ///
+    /// - what happened to the UNPUBLISHED temporaries this execution created,
+    ///   which is the only thing the automatic cleanup may touch; and
+    /// - what PUBLISHED phase material this execution left in place, which is
+    ///   retained, not unlinked, and is exactly what a resume of this
+    ///   transaction needs.
+    ///
+    /// When nothing was published there is no second fact about retained state
+    /// and the refusal stays plain [`KernelRestoreError::TargetFailed`] or
+    /// [`KernelRestoreError::StagedCleanupIncomplete`], matching the shapes
+    /// that already existed. When phase material WAS published, the caller gets
+    /// [`KernelRestoreError::RetainedForResume`] with the bounded
+    /// [`RetainedPhaseMaterial`] and the bounded [`StagedCleanupOutcome`] —
+    /// including when the cleanup itself was refused — so a caller can see
+    /// that the transaction's resumable state survived rather than infer it
+    /// from silence, and so the cleanup outcome is never dropped on the floor.
+    ///
+    /// Nothing here resets the journal to `Ready`, deletes a phase receipt, or
+    /// reapplies a completed phase. Rolling back published phase material is a
+    /// separate owner cleanup/compensation decision with its own recorded
+    /// outcome, not an automatic consequence of this failure.
     fn refuse_with_staged_cleanup(
         &self,
         destination: &KernelIsolatedDestination,
@@ -2011,24 +2077,48 @@ impl<'a> KernelRestoreTarget<'a> {
         target_id: &str,
         primary: BackupError,
     ) -> KernelRestoreError {
-        match self.cleanup_staged_output(destination, transaction_id, target_id) {
-            StagedCleanup::NothingStaged | StagedCleanup::Removed => {
-                KernelRestoreError::TargetFailed(primary)
-            }
-            StagedCleanup::Refused(cleanup) => {
-                KernelRestoreError::StagedCleanupIncomplete { primary, cleanup }
-            }
+        let cleanup = self.cleanup_staged_output(destination, transaction_id, target_id);
+        if self.published.is_empty() {
+            return match cleanup {
+                StagedCleanupOutcome::TemporariesPreserved(refusal) => {
+                    KernelRestoreError::StagedCleanupIncomplete { primary, cleanup: refusal }
+                }
+                StagedCleanupOutcome::NothingStaged | StagedCleanupOutcome::TemporariesRemoved => {
+                    KernelRestoreError::TargetFailed(primary)
+                }
+            };
+        }
+        KernelRestoreError::RetainedForResume {
+            primary,
+            retained: RetainedPhaseMaterial {
+                members: self.published.len(),
+                bytes: self.staged_bytes,
+            },
+            cleanup,
         }
     }
 
-    /// Bounded, ownership-scoped removal of the output THIS execution staged.
+    /// Bounded, ownership-scoped removal of the UNPUBLISHED temporaries THIS
+    /// execution created.
+    ///
+    /// Published phase material is never a candidate. It is the material the
+    /// durable journal and each phase receipt already attest, and unlinking it
+    /// here would leave a journal that records phases as applied over bytes
+    /// that no longer exist, with the receipt still on disk and the engine
+    /// advancing past those phases on the next resume of the same transaction
+    /// (A13.7 ARCH-RES-03; I14.21 — an unknown outcome preserves the
+    /// operation). So the candidate set is [`Self::staged_temporaries`] —
+    /// tracked before each write, filtered by
+    /// [`Self::is_owned_temporary`] — and nothing else.
     ///
     /// Ownership, in the order it is proved:
     ///
-    /// 1. candidates are the exact paths this execution wrote
-    ///    ([`Self::staged`]) minus the preserved observation classes, so a
-    ///    prior execution's staging, a pinned admission, and the reconcileable
-    ///    phase receipts are never candidates at all;
+    /// 1. candidates are the exact operation-owned temporaries this execution
+    ///    created ([`Self::staged_temporaries`]), each one additionally required
+    ///    to be an unpublished temporary this execution still owns
+    ///    ([`Self::is_owned_temporary`]). A published member, a prior
+    ///    execution's staging, a pinned admission and the reconcileable phase
+    ///    receipts are therefore never candidates at all;
     /// 2. a destination that was resumed rather than constructed fresh is
     ///    refused outright, because its contents are not provably ours;
     /// 3. the pinned destination admission is re-read through the same
@@ -2047,23 +2137,25 @@ impl<'a> KernelRestoreTarget<'a> {
     /// [`StagedOutputBudget::bytes`], the same ceiling that admitted them.
     /// Empty directories left behind are reclaimed with
     /// [`std::fs::remove_dir`], which cannot remove a non-empty directory, so
-    /// a directory this pass did not empty always survives.
+    /// a directory holding any published material always survives.
     fn cleanup_staged_output(
         &self,
         destination: &KernelIsolatedDestination,
         transaction_id: &str,
         target_id: &str,
-    ) -> StagedCleanup {
+    ) -> StagedCleanupOutcome {
         let candidates: Vec<&PathBuf> = self
-            .staged
+            .staged_temporaries
             .iter()
-            .filter(|path| !Self::is_preserved_observation(path, &self.root))
+            .filter(|path| self.is_owned_temporary(path.as_path()))
             .collect();
         if candidates.is_empty() {
-            return StagedCleanup::NothingStaged;
+            return StagedCleanupOutcome::NothingStaged;
         }
         if destination.is_resumed() {
-            return StagedCleanup::Refused(StagedCleanupRefusal::AdmittedResume);
+            return StagedCleanupOutcome::TemporariesPreserved(
+                StagedCleanupRefusal::AdmittedResume,
+            );
         }
         if KernelBackupRestore::refuse_foreign_destination(
             destination,
@@ -2074,27 +2166,41 @@ impl<'a> KernelRestoreTarget<'a> {
         )
         .is_err()
         {
-            return StagedCleanup::Refused(StagedCleanupRefusal::ForeignAdmission);
+            return StagedCleanupOutcome::TemporariesPreserved(
+                StagedCleanupRefusal::ForeignAdmission,
+            );
         }
         let isolated = self.work_root.join(".eliot").join(RESTORE_ISOLATED_AREA);
         let area = match std::fs::canonicalize(isolated.join(&self.label)) {
             Ok(area) => area,
-            // The isolated area is already gone, so none of the staged output
-            // this execution produced is still on disk.
+            // The isolated area is already gone, so none of this execution's
+            // temporaries is still on disk. Published material went with it,
+            // which is a fact about the destination, not a removal performed
+            // here.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return StagedCleanup::Removed;
+                return StagedCleanupOutcome::TemporariesRemoved;
             }
-            Err(_) => return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea),
+            Err(_) => {
+                return StagedCleanupOutcome::TemporariesPreserved(
+                    StagedCleanupRefusal::OutsideIsolatedArea,
+                );
+            }
         };
         let root = match std::fs::canonicalize(&self.root) {
             Ok(root) => root,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return StagedCleanup::Removed;
+                return StagedCleanupOutcome::TemporariesRemoved;
             }
-            Err(_) => return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea),
+            Err(_) => {
+                return StagedCleanupOutcome::TemporariesPreserved(
+                    StagedCleanupRefusal::OutsideIsolatedArea,
+                );
+            }
         };
         if !root.starts_with(&area) {
-            return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea);
+            return StagedCleanupOutcome::TemporariesPreserved(
+                StagedCleanupRefusal::OutsideIsolatedArea,
+            );
         }
         let mut refusal: Option<StagedCleanupRefusal> = None;
         let mut removed_bytes = 0usize;
@@ -2112,7 +2218,7 @@ impl<'a> KernelRestoreTarget<'a> {
                     continue;
                 }
             };
-            // A directory (or any non-file) at a staged path means the shape
+            // A directory (or any non-file) at a candidate path means the shape
             // this pass admitted is not the shape on disk, so it refuses rather
             // than recursing into it.
             if metadata.is_dir() {
@@ -2139,40 +2245,52 @@ impl<'a> KernelRestoreTarget<'a> {
         }
         Self::reclaim_empty_directories(&parents, &self.root);
         match refusal {
-            Some(refusal) => StagedCleanup::Refused(refusal),
-            None => StagedCleanup::Removed,
+            Some(refusal) => StagedCleanupOutcome::TemporariesPreserved(refusal),
+            None => StagedCleanupOutcome::TemporariesRemoved,
         }
     }
 
-    /// Whether a staged path is an observation or owner evidence rather than
-    /// derived payload, and is therefore never removed by cleanup.
+    /// Whether a path is an exact, still-owned, UNPUBLISHED temporary this
+    /// execution created — the only thing automatic cleanup may remove.
     ///
-    /// - `phase-receipts/**` is the per-phase observation the journal
-    ///   reconciles against and that the finalize obligation denominator
-    ///   digests; its absence is
-    ///   [`BackupError::RestoreJournalCorrupt`], which is a worse outcome
-    ///   than the staging left behind;
-    /// - [`DESTINATION_ADMISSION_FILE`] is Host-issued owner evidence (#958)
-    ///   pinned to this transaction, not a byte this execution produced;
-    /// - [`RESTORE_EVIDENCE_FILE`] is the finalize evidence a later resume
-    ///   re-reads and cutover qualification requires.
+    /// Four conditions, each decided from state this execution already holds,
+    /// so no directory scan, no receipt read and no journal read is added:
     ///
-    /// A path this execution never wrote is absent from [`Self::staged`] by
-    /// construction, so another execution's output is preserved without
-    /// needing to be recognised here.
-    fn is_preserved_observation(path: &Path, root: &Path) -> bool {
-        let Ok(relative) = path.strip_prefix(root) else {
-            return true;
-        };
-        let Some(std::path::Component::Normal(first)) = relative.components().next() else {
-            return true;
-        };
-        let Some(first) = first.to_str() else {
-            return true;
-        };
-        first == "phase-receipts"
-            || first == DESTINATION_ADMISSION_FILE
-            || first == RESTORE_EVIDENCE_FILE
+    /// 1. **operation-owned** — it is a path this execution tracked in
+    ///    [`Self::staged_temporaries`] before its first byte was written
+    ///    ([`Self::write_file`]), so it is accounted for even when the write,
+    ///    flush or rename that created it failed;
+    /// 2. **inside the destination** — it still sits under the destination
+    ///    root, which [`Self::cleanup_staged_output`] re-resolves against the
+    ///    isolated area before it removes anything;
+    /// 3. **unpublished** — it carries exactly the [`TEMP_RESTORE_EXTENSION`]
+    ///    suffix that [`Self::write_file`] attaches to a temporary and that no
+    ///    published member carries, so a name on the wrong side of the rename
+    ///    can never be reaped;
+    /// 4. **unreferenced by durable state** — it is not a member of
+    ///    [`Self::published`]. Every phase receipt this restore writes attests
+    ///    exactly one member of that set: [`Self::phase_receipt_path`] derives
+    ///    its name from the phase, and [`eliot_backup::RestoreAppliedEffect`]
+    ///    carries identity plus digests and no path at all. So a path outside
+    ///    the published set is named by no receipt and by no journal row.
+    ///
+    /// The mirror case is the one this predicate exists to prevent: a published
+    /// member whose receipt still attests it has to stay on disk, because
+    /// [`Self::check_attested_material`] refuses on the next resume over a
+    /// receipt whose bytes are gone or are different — and that refusal is the
+    /// correct outcome, not something for this cleanup to accommodate.
+    ///
+    /// Anything not positively established here returns `false`. When a path
+    /// cannot be classified as an unpublished temporary of this execution, the
+    /// default is PRESERVE.
+    fn is_owned_temporary(&self, path: &Path) -> bool {
+        path.starts_with(&self.root)
+            && path.extension() == Some(std::ffi::OsStr::new(TEMP_RESTORE_EXTENSION))
+            && self
+                .staged_temporaries
+                .iter()
+                .any(|tracked| tracked.as_path() == path)
+            && !self.published.iter().any(|member| member.as_path() == path)
     }
 
     /// Reclaims the directories this pass emptied, deepest first.

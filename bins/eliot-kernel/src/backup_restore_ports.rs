@@ -276,7 +276,7 @@ fn is_hex64(value: &str) -> bool {
 }
 
 /// Typed refusal reason for the bounded cleanup of one restore execution's
-/// staging (issue #960, W11/A18).
+/// UNPUBLISHED temporaries (issue #960, W11/A18).
 ///
 /// Every reason means the same thing operationally: this execution could not
 /// PROVE that a path is its own to remove, so it preserved what it could not
@@ -295,13 +295,13 @@ pub enum StagedCleanupRefusal {
     /// `<work_root>/.eliot/restore-isolated/<label>` once links are resolved,
     /// so no removal can be proven to stay in the isolated restore area.
     OutsideIsolatedArea,
-    /// A staged path is no longer a plain file under the destination root, so
-    /// removing it is not a bounded single-file unlink.
+    /// A candidate path is no longer a plain file under the destination root,
+    /// so removing it is not a bounded single-file unlink.
     PathNotOurs,
     /// The aggregate removal budget derived for this execution was reached;
-    /// the remaining staging is preserved.
+    /// the remaining temporaries are preserved.
     BudgetReached,
-    /// A staged path could not be unlinked; it is preserved.
+    /// A candidate path could not be unlinked; it is preserved.
     RemovalFailed,
 }
 
@@ -311,11 +311,91 @@ impl std::fmt::Display for StagedCleanupRefusal {
             Self::AdmittedResume => "destination is an admitted resume",
             Self::ForeignAdmission => "pinned destination admission is foreign",
             Self::OutsideIsolatedArea => "destination left the isolated restore area",
-            Self::PathNotOurs => "a staged path is not a plain file under the destination",
+            Self::PathNotOurs => "a candidate is not a plain file under the destination",
             Self::BudgetReached => "the derived removal budget was reached",
-            Self::RemovalFailed => "a staged path could not be removed",
+            Self::RemovalFailed => "a candidate could not be removed",
         };
         formatter.write_str(reason)
+    }
+}
+
+/// Bounded description of the phase material one failed restore execution
+/// RETAINED for a later resume of the same transaction.
+///
+/// This is a bounded reference, not a copy and not an inventory: it counts the
+/// members and bytes the execution had already published when the engine
+/// failed, which are the exact numbers the archive-derived staged-output
+/// budget accounted at write time. No directory scan runs to produce it,
+/// because a walk of the isolated area is unbounded work that this disposition
+/// must not add.
+///
+/// It is the disposition of THAT operation — what it published and did not
+/// unlink — not a fresh observation of the destination. That is deliberate: an
+/// operation cannot re-read the destination to describe its own cleanup
+/// without adding an unbounded walk, and the destination is separately
+/// validated by the gates on the path that produced this value.
+///
+/// ## Why retention is the default
+///
+/// A durable journal that records a phase applied, plus that phase's receipt
+/// on disk, is a resumable transaction. Unlinking the material those two
+/// attest, while leaving them in place, converts a resumable transaction into
+/// a journal that describes history that does not exist (A13.7 ARCH-RES-03 —
+/// recovery cannot resurrect invalid state). So the retained set is reported,
+/// never destroyed, and its only automatic reaping is the temporary files this
+/// execution created and never published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedPhaseMaterial {
+    /// Members this execution had published when the engine failed.
+    pub members: usize,
+    /// Aggregate bytes this execution had published when the engine failed,
+    /// counted at write time against the same ceiling that admitted them.
+    pub bytes: usize,
+}
+
+impl std::fmt::Display for RetainedPhaseMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} published members ({} bytes) retained for resume",
+            self.members, self.bytes
+        )
+    }
+}
+
+/// Bounded disposition of the automatic cleanup performed after a restore
+/// engine failure (issue #960, W13/A18).
+///
+/// The automatic set is exactly the operation-owned temporary files this
+/// execution created and never published. Published phase material is never a
+/// member of it; that material is reported through
+/// [`RetainedPhaseMaterial`] and is left in place for the same transaction to
+/// resume over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagedCleanupOutcome {
+    /// This execution left no unpublished temporary file; there was nothing to
+    /// remove and nothing is owed. Published phase material is still
+    /// retained.
+    NothingStaged,
+    /// Every unpublished temporary this execution created was removed.
+    TemporariesRemoved,
+    /// Cleanup preserved what it could not prove was an exact,
+    /// still-owned, unpublished temporary, for the exact typed reason.
+    TemporariesPreserved(StagedCleanupRefusal),
+}
+
+impl std::fmt::Display for StagedCleanupOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NothingStaged => formatter.write_str("no unpublished temporary was left staged"),
+            Self::TemporariesRemoved => {
+                formatter.write_str("every unpublished temporary was removed")
+            }
+            Self::TemporariesPreserved(refusal) => write!(
+                formatter,
+                "an unpublished temporary could not be proven removable ({refusal})"
+            ),
+        }
     }
 }
 
@@ -358,20 +438,47 @@ pub enum KernelRestoreError {
     /// The journaled restore engine reported a typed failure.
     TargetFailed(BackupError),
     /// The journaled engine reported a typed failure AND the bounded cleanup
-    /// of the staging this execution produced could not be completed.
+    /// of the unpublished temporaries this execution produced could not be
+    /// completed.
     ///
     /// The engine's own failure is preserved exactly as
     /// [`TargetFailed`](Self::TargetFailed) carries it, in `primary`; this
     /// variant only adds the typed cleanup disposition, so the cleanup
-    /// outcome is never a formatted string and never replaces the cause. A
-    /// cleanup that removes everything, or that had nothing to remove, stays
-    /// plain [`TargetFailed`](Self::TargetFailed): there is no second fact to
-    /// report and the absence of a change is the whole truth.
+    /// outcome is never a formatted string and never replaces the cause. It
+    /// carries no retained set: it is used when nothing was published, so
+    /// there is no resumable state to report.
     StagedCleanupIncomplete {
         /// The engine's typed failure, unchanged.
         primary: BackupError,
         /// Why the bounded cleanup preserved what it could not attribute.
         cleanup: StagedCleanupRefusal,
+    },
+    /// The journaled engine reported a typed failure and the phase material it
+    /// had already published was RETAINED for a resume of the same
+    /// transaction.
+    ///
+    /// The engine's own failure is preserved exactly in `primary`; it is never
+    /// replaced by the disposition, and the disposition is never a formatted
+    /// string. `retained` is the bounded reference to the bytes left in place,
+    /// and `cleanup` is the bounded disposition of the automatic cleanup,
+    /// whose set is the unpublished temporaries only.
+    ///
+    /// This variant exists because the two facts are independent and both
+    /// matter: the transaction failed, AND its resumable state survived. A
+    /// journal error, a rollback-required disposition or an unobserved effect
+    /// leaves the retained phases exactly as the durable journal and their
+    /// receipts describe them. Rolling them back is not this owner's call —
+    /// it is a separate owner cleanup/compensation decision with its own
+    /// recorded outcome (I14.21: an unknown outcome pauses the Ordering Scope
+    /// and preserves the operation; recovery is evidence-backed, never a blind
+    /// retry and never a destructive unlink of material the journal attests).
+    RetainedForResume {
+        /// The engine's typed failure, unchanged.
+        primary: BackupError,
+        /// The bounded reference to what was left in place.
+        retained: RetainedPhaseMaterial,
+        /// The bounded disposition of the automatic cleanup.
+        cleanup: StagedCleanupOutcome,
     },
 }
 
@@ -416,6 +523,14 @@ impl std::fmt::Display for KernelRestoreError {
             Self::StagedCleanupIncomplete { primary, cleanup } => write!(
                 formatter,
                 "restore staging cleanup refused ({cleanup}); primary failure preserved: {primary}"
+            ),
+            Self::RetainedForResume {
+                primary,
+                retained,
+                cleanup,
+            } => write!(
+                formatter,
+                "restore phase material retained ({retained}; {cleanup}); primary failure preserved: {primary}"
             ),
         }
     }
@@ -493,6 +608,11 @@ pub fn kernel_to_backup(error: KernelRestoreError) -> BackupError {
         // the engine's own typed failure, so the primary is returned rather
         // than re-wrapped into a string.
         KernelRestoreError::StagedCleanupIncomplete { primary, .. } => primary,
+        // Retention is likewise an owner-local disposition. What crosses the
+        // seam is still the engine's typed failure, and the retained bytes
+        // stay on disk whatever this mapping says, so no fact a caller of the
+        // accepted seam could act on differently is lost here.
+        KernelRestoreError::RetainedForResume { primary, .. } => primary,
         KernelRestoreError::CutoverNotAuthorized => BackupError::CutoverNotAuthorized,
         KernelRestoreError::DestinationInvalid(_)
         | KernelRestoreError::FenceMismatch(_)
