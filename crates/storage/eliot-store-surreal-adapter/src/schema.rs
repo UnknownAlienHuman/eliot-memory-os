@@ -89,6 +89,9 @@ pub(crate) mod table {
     /// closed. The digest IS the immutable revision identity: a new
     /// digest is a new row, never an in-place rewrite.
     pub(crate) const LEARNING_RECORD: &str = "learning_record";
+    /// Immutable campaign-owner source revisions and their exact current
+    /// heads. Created by the closed Orientation source-publication operation.
+    pub(crate) const CAMPAIGN_SOURCE: &str = "campaign_source";
 
     /// Every physical table *name* this single owner declares, in declaration
     /// order.
@@ -119,7 +122,7 @@ pub(crate) mod table {
     ///   `automation_continuation` are declared without generation DDL;
     ///   continuations create their schemaless table only during explicit
     ///   truncated-page issuance.
-    pub(crate) const ALL_TABLES: [&str; 25] = [
+    pub(crate) const ALL_TABLES: [&str; 26] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
@@ -145,6 +148,7 @@ pub(crate) mod table {
         EXPERIENCE_BANK,
         EXPERIENCE_FEEDBACK,
         LEARNING_RECORD,
+        CAMPAIGN_SOURCE,
     ];
 }
 
@@ -404,6 +408,12 @@ DEFINE FIELD record_digest ON learning_record TYPE string;
 DEFINE FIELD state_fence ON learning_record TYPE object;
 DEFINE FIELD scope_id ON learning_record TYPE string;
 DEFINE FIELD task_id ON learning_record TYPE option<string>;
+";
+
+/// Campaign owner source revision/head rows are created by the closed
+/// owner-source publication operation; this body has no migration identity.
+pub(crate) const ORIENTATION_OWNER_SOURCE_TABLES_DDL: &str = r"
+DEFINE TABLE IF NOT EXISTS campaign_source SCHEMALESS;
 ";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"

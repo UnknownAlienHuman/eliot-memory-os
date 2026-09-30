@@ -131,6 +131,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "module_registry_owner_cas_conflict",
     "swarm_owner_revision_conflict",
     "blackboard_item_revision_conflict",
+    "orientation_owner_source_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -556,6 +557,9 @@ fn build_apply_statements(
     // #1868 learning-record writes commit atomically beside the experience
     // rows under the same create-or-converge contract.
     append_learning_statements(&mut sql, &mut bindings, learning)?;
+    // Orientation owner records and all three source-head CAS operations
+    // share this canonical transaction with the receipt and outbox.
+    append_orientation_owner_source_statements(&mut sql, &mut bindings, transition)?;
     // #1773 capability-evidence rows commit atomically beside the learning
     // rows under the same fenced compare-and-set contract.
     append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
@@ -1156,6 +1160,27 @@ fn append_learning_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "learning binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends the exact Orientation owner-source revisions and predecessor-head
+/// CAS to the canonical transaction. This operation is candidate-only and
+/// does not interpret semantic content or grant authority.
+fn append_orientation_owner_source_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_orientation_sources::orientation_owner_source_write_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "Orientation source binding collided with a canonical binding".to_owned(),
             ));
         }
     }

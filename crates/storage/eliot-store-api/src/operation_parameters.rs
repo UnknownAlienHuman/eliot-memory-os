@@ -164,6 +164,8 @@ pub enum ParameterShape {
     /// Closed, owner-bound campaign source publications carried by an
     /// admitted owner transition for issue #1862.
     CampaignSourcePublications,
+    /// Exact three-row Orientation owner-source publication set.
+    OrientationOwnerSources,
     /// Closed content-addressed campaign view selector for issue #1862.
     CampaignViewLookup,
     /// Closed owner-separated swarm revision record and complete canonical bytes.
@@ -192,6 +194,7 @@ impl ParameterShape {
             Self::NotificationState => "eliot.notify.state.v1",
             Self::CampaignSourceLookup => "eliot.learning.campaign-source-lookup.v1",
             Self::CampaignSourcePublications => "eliot.learning.campaign-source-publications.v1",
+            Self::OrientationOwnerSources => "eliot.dreamer.orientation-owner-sources.v1",
             Self::CampaignViewLookup => "eliot.learning.campaign-view-lookup.v1",
             Self::SwarmOwnerRevision => "eliot.swarm.owner-revision.v1",
             Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
@@ -1056,6 +1059,22 @@ static COMMIT_LEARNING_PARAMETERS: [ParameterDeclaration; 7] = [
     },
 ];
 
+/// The Orientation source commit is one exact task identity plus its three
+/// native owner publications. The discriminator is independent of the
+/// existing 26-role task campaign matrix.
+static RECORD_ORIENTATION_OWNER_SOURCES_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "task_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "orientation_owner_sources",
+        shape: ParameterShape::OrientationOwnerSources,
+        required: true,
+    },
+];
+
 /// Shared closed selector for the learning-record range read (issue
 /// #1868): the required `max_records` bound as its decimal string, the
 /// optional closed `record_kind` filter, plus the optional opaque
@@ -1336,6 +1355,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
         NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
         NamedMutationOperation::RecordCapabilityEvidenceRecord => "RecordCapabilityEvidenceRecord",
+        NamedMutationOperation::RecordOrientationOwnerSources => "RecordOrientationOwnerSources",
     }
 }
 
@@ -1369,6 +1389,9 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordLearningRecord" => Some(NamedMutationOperation::RecordLearningRecord),
         b"RecordCapabilityEvidenceRecord" => {
             Some(NamedMutationOperation::RecordCapabilityEvidenceRecord)
+        }
+        b"RecordOrientationOwnerSources" => {
+            Some(NamedMutationOperation::RecordOrientationOwnerSources)
         }
         _ => None,
     }
@@ -1545,6 +1568,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordCapabilityEvidenceRecord => {
             &COMMIT_CAPABILITY_EVIDENCE_PARAMETERS
         }
+        NamedMutationOperation::RecordOrientationOwnerSources => {
+            &RECORD_ORIENTATION_OWNER_SOURCES_PARAMETERS
+        }
     }
 }
 
@@ -1627,6 +1653,7 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::NotificationState
         | ParameterShape::CampaignSourceLookup
         | ParameterShape::CampaignSourcePublications
+        | ParameterShape::OrientationOwnerSources
         | ParameterShape::CampaignViewLookup
         | ParameterShape::SwarmOwnerRevision
         | ParameterShape::BlackboardItemRevision
@@ -1774,6 +1801,7 @@ fn check_declared_shape(
             lookup.validate()
         }
         ParameterShape::CampaignSourcePublications => validate_campaign_source_publications(value),
+        ParameterShape::OrientationOwnerSources => validate_orientation_owner_sources(value),
         ParameterShape::CampaignViewLookup => {
             let lookup: crate::CampaignLearningStateViewLookup =
                 serde_json::from_value(value.clone())
@@ -1842,6 +1870,139 @@ fn validate_campaign_source_publications(value: &Value) -> Result<(), StoreError
         }
     }
     Ok(())
+}
+
+/// Validates the exact independent Orientation source denominator. Each
+/// publication retains its original owner record, publisher, source receipt,
+/// and expected/current head; this gate only checks closed role and identity
+/// joins and grants no authority.
+fn validate_orientation_owner_sources(value: &Value) -> Result<(), StoreError> {
+    use crate::{CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourcePublisher as P, CampaignSourceRole as R};
+
+    let publications: Vec<crate::CampaignSourcePublication> = serde_json::from_value(value.clone())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if publications.len() != 3 {
+        return Err(StoreError::InvalidField {
+            field: "orientation_owner_sources",
+            reason: "must contain exactly classification, admission, and cue-binding owner records",
+        });
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for publication in &publications {
+        publication.validate()?;
+        if !seen.insert(publication.record.role) {
+            return Err(StoreError::Duplicate {
+                field: "orientation_owner_sources.role",
+            });
+        }
+        let publisher_matches_role = matches!(
+            (publication.publisher, publication.record.role),
+            (P::OrientationClassification, R::OrientationClassification)
+                | (P::OrientationAdmission, R::OrientationAdmission)
+                | (P::OrientationCueBindings, R::OrientationCueBindings)
+        );
+        if !publisher_matches_role {
+            return Err(StoreError::InvalidField {
+                field: "orientation_owner_sources.publisher",
+                reason: "publication must use the exact publisher for its Orientation owner role",
+            });
+        }
+        match publication.record.role {
+            R::OrientationClassification => {
+                let body: crate::CampaignOwnerProjectionBody =
+                    serde_json::from_value(publication.record.document.body.clone())
+                        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                let target = body.projection.get("target").ok_or(StoreError::InvalidField {
+                    field: "orientation_owner_sources.classification.target",
+                    reason: "classification profile must retain its original target identity",
+                })?;
+                let target_id = target
+                    .get("target_id")
+                    .and_then(Value::as_str)
+                    .ok_or(StoreError::InvalidField {
+                        field: "orientation_owner_sources.classification.target_id",
+                        reason: "classification target id must be owner supplied",
+                    })?;
+                let target_revision = target
+                    .get("target_revision")
+                    .and_then(Value::as_str)
+                    .ok_or(StoreError::InvalidField {
+                        field: "orientation_owner_sources.classification.target_revision",
+                        reason: "classification target revision must be owner supplied",
+                    })?;
+                if !matches!(
+                    (&publication.record.record_id, &publication.record.revision),
+                    (CampaignOwnerRecordId::Artifact(id), CampaignOwnerRevision::ResourceSnapshot(revision))
+                        if id.as_str() == target_id && revision == target_revision
+                ) {
+                    return Err(StoreError::InvalidField {
+                        field: "orientation_owner_sources.classification.identity",
+                        reason: "campaign identity must match the original classification target",
+                    });
+                }
+            }
+            R::OrientationAdmission | R::OrientationCueBindings => {
+                if !matches!(
+                    (&publication.record.record_id, &publication.record.revision),
+                    (CampaignOwnerRecordId::Task(_), CampaignOwnerRevision::Task(_))
+                ) {
+                    return Err(StoreError::InvalidField {
+                        field: "orientation_owner_sources.task_identity",
+                        reason: "admission and cue-binding sources must use the original task revision identity",
+                    });
+                }
+            }
+            _ => {
+                return Err(StoreError::InvalidField {
+                    field: "orientation_owner_sources.role",
+                    reason: "only the three Orientation owner roles are admitted",
+                });
+            }
+        }
+    }
+    if seen.len() != 3
+        || !seen.contains(&R::OrientationClassification)
+        || !seen.contains(&R::OrientationAdmission)
+        || !seen.contains(&R::OrientationCueBindings)
+    {
+        return Err(StoreError::InvalidField {
+            field: "orientation_owner_sources.role",
+            reason: "all three independent Orientation owner roles are required",
+        });
+    }
+    Ok(())
+}
+
+/// Decodes and validates one exact `RecordOrientationOwnerSources` request.
+/// The returned publications are the original typed owner values, not a
+/// synthesized or normalized replacement.
+pub fn decode_orientation_owner_sources(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<(String, Vec<crate::CampaignSourcePublication>), StoreError> {
+    validate_typed_mutation_parameters(
+        NamedMutationOperation::RecordOrientationOwnerSources,
+        parameters,
+    )?;
+    let task_id = parameters
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "task_id must be a string",
+        })?;
+    eliot_contracts::TaskId::new(task_id).map_err(StoreError::Foundation)?;
+    let publications: Vec<crate::CampaignSourcePublication> = serde_json::from_value(
+        parameters
+            .get("orientation_owner_sources")
+            .cloned()
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "orientation_owner_sources is required",
+            })?,
+    )
+    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok((task_id.to_owned(), publications))
 }
 
 fn validate_instrument_registry_snapshot(value: &Value) -> Result<(), StoreError> {
