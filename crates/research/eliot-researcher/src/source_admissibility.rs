@@ -44,8 +44,9 @@ use eliot_research_exchange_api::{
     AllowedReferenceManifest, AnchorPrecision, DisclosureClass, LocatorClass, classify_locator,
 };
 
+use crate::admitted_excerpt::RetainedSourceRevision;
 use crate::evidence_portfolio::{SourceRecord, freeze, push_count, push_field, text};
-use crate::inquiry_governance::{InquiryError, InquiryProtocolProfile};
+use crate::inquiry_governance::{EvidenceFreeze, InquiryError, InquiryProtocolProfile};
 
 /// Taint carried by one proposed source.
 ///
@@ -422,6 +423,13 @@ impl SourceAdmissibilityRecord {
     /// resulting transition. It grants no canonical write, no finish and no
     /// influence over any other source.
     ///
+    /// This is the **first-freeze** producer: it carries no committed freeze,
+    /// because a source may be proposed to the Governor for admission before any
+    /// synthesis run has frozen anything. W2 needs the second producer —
+    /// [`Self::transition_request_committing_freeze`] — which is the only one
+    /// whose request may name a committed freeze, and which is what the live
+    /// `InquiryGovernance::record` path uses.
+    ///
     /// # Errors
     ///
     /// Returns the encoding refusal when the decision's own source record has no
@@ -441,11 +449,97 @@ impl SourceAdmissibilityRecord {
             admissibility_digest: self.digest.clone(),
             scope: self.scope.clone(),
             state_fence: self.state_fence.clone(),
+            freeze_commit: None,
             candidate_only: true,
             canonical_write_authorized: false,
             request_digest: String::new(),
         };
         request.request_digest = request.compute_digest()?;
+        Ok(request)
+    }
+
+    /// Builds the Governor-facing request that **commits an evidence freeze**,
+    /// bound to the retained original of this decision's own source.
+    ///
+    /// W2: "Resolve accepted sources through the governed source-admission
+    /// owner, retain their exact bytes or immutable accessible artifacts, and
+    /// commit the freeze before admitting synthesis." Both halves travel on the
+    /// request that already exists, so the commit is proven by the *existing*
+    /// owner's digest and re-proved by the *existing* owner's `validate_integrity`
+    /// rather than by a second freeze owner, a second digest domain or a parallel
+    /// validator:
+    ///
+    /// - `retained` must be a [`RetainedSourceRevision`] for **this** record's
+    ///   own handle whose retained bytes re-prove the record's own
+    ///   `content_digest`. The expected value is the governed source-admission
+    ///   owner's own field, not the retained bytes: a revision of the same source
+    ///   that re-proves itself but is a *different* revision is refused here, so
+    ///   the retained original and the admitted record cannot disagree.
+    /// - `freeze` must re-prove its own digest, must cover this record's handle in
+    ///   its **included** member set, and must not have excluded it. A freeze
+    ///   that never included the source, or that excluded it, cannot commit that
+    ///   source's admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::UnknownHandle`] when the retained revision is for
+    /// a different handle or its bytes do not reproduce this record's
+    /// `content_digest`, [`InquiryError::IntegrityMismatch`] when the retained
+    /// revision or the freeze does not re-prove its own commitment or when the
+    /// freeze does not include this source, and the encoding refusal when the
+    /// decision's own source record has no computable canonical commitment.
+    pub fn transition_request_committing_freeze(
+        &self,
+        retained: &RetainedSourceRevision,
+        freeze: &EvidenceFreeze,
+    ) -> Result<GovernorSourceTransitionRequest, InquiryError> {
+        retained
+            .verify_integrity()
+            .map_err(|_| InquiryError::IntegrityMismatch {
+                field: "source_transition_request.retained_revision",
+            })?;
+        if retained.source_handle != self.record.handle {
+            return Err(InquiryError::UnknownHandle {
+                field: "source_transition_request.retained_revision.source_handle",
+            });
+        }
+        if retained.content_digest != self.record.content_digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "source_transition_request.retained_revision.content_digest",
+            });
+        }
+        freeze.validate_integrity()?;
+        if !freeze.includes(&self.record.handle) {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "source_transition_request.committed_freeze",
+            });
+        }
+        let mut request = GovernorSourceTransitionRequest {
+            request_kind: GovernorSourceTransitionRequest::REQUEST_KIND.to_owned(),
+            inquiry_id: self.inquiry_id.clone(),
+            evidence_set_id: self.evidence_set_id.clone(),
+            profile_id: self.profile_id.clone(),
+            profile_revision: self.profile_revision,
+            profile_digest: self.profile_digest.clone(),
+            source_handle: self.record.handle.clone(),
+            source_record_digest: self.record.digest().map_err(InquiryError::from)?,
+            eligibility: self.eligibility,
+            admissibility_digest: self.digest.clone(),
+            scope: self.scope.clone(),
+            state_fence: self.state_fence.clone(),
+            freeze_commit: Some(FreezeCommitment {
+                freeze_id: freeze.freeze_id.clone(),
+                freeze_digest: freeze.digest.clone(),
+                retained_artifact_ref: retained.artifact_ref.clone(),
+                retained_content_digest: retained.content_digest.clone(),
+                retained_revision_digest: retained.digest.clone(),
+            }),
+            candidate_only: true,
+            canonical_write_authorized: false,
+            request_digest: String::new(),
+        };
+        request.request_digest = request.compute_digest()?;
+        request.validate_integrity()?;
         Ok(request)
     }
 
@@ -555,6 +649,72 @@ impl SourceAdmissibilityRecord {
     }
 }
 
+/// The retained-original and freeze commitment one Governor-facing request
+/// carries.
+///
+/// W2 requires the freeze to be **committed before** synthesis is admitted and the
+/// original to be **retained**, and it requires both to travel through the
+/// governed source-admission owner rather than through a second scheme. This type
+/// is that joint commitment and it is inside
+/// [`GovernorSourceTransitionRequest::request_digest`], so it is proven by the
+/// existing owner's own validator.
+///
+/// Every field is a value a different owner produced, which is the point: the
+/// freeze identity and its digest come from the freeze owner, the content digest
+/// and the retained revision digest come from the persistence owner, and the
+/// request that joins them is the admission owner's. Nothing here is recomputed
+/// from a sibling field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeCommitment {
+    /// Identity of the committed evidence freeze.
+    ///
+    /// Named alongside its digest because a freeze identity is what an
+    /// invalidation history addresses; a digest alone would leave the historical
+    /// freeze unnameable.
+    pub freeze_id: String,
+    /// Digest of the committed evidence freeze.
+    pub freeze_digest: String,
+    /// The immutable artifact reference the original was committed under.
+    ///
+    /// I21.8 accepts "their exact bytes **or** immutable accessible artifacts";
+    /// this is the second form, and it is what a reader returns to instead of
+    /// trusting the copy in hand.
+    pub retained_artifact_ref: String,
+    /// The admitted revision's own content digest, as the admitted record commits
+    /// it.
+    ///
+    /// This is the independent expected value: it originates from the
+    /// source-admission owner, not from the retained bytes, which is what makes
+    /// the pairing a check rather than a restatement.
+    pub retained_content_digest: String,
+    /// Digest of the retained-revision record over its own shape.
+    pub retained_revision_digest: String,
+}
+
+impl FreezeCommitment {
+    /// Wire line for a digest preimage, so the request's own preimage and any
+    /// reader of it cannot spell these fields differently.
+    fn push_into(&self, preimage: &mut String) {
+        push_field(preimage, "freeze_id", &self.freeze_id);
+        push_field(preimage, "committed_freeze_digest", &self.freeze_digest);
+        push_field(
+            preimage,
+            "retained_artifact_ref",
+            &self.retained_artifact_ref,
+        );
+        push_field(
+            preimage,
+            "retained_content_digest",
+            &self.retained_content_digest,
+        );
+        push_field(
+            preimage,
+            "retained_revision_digest",
+            &self.retained_revision_digest,
+        );
+    }
+}
+
 /// Governor-facing source transition request for one admissibility decision.
 ///
 /// The domain records the decision; the Governor applies it. The request carries
@@ -566,10 +726,10 @@ impl SourceAdmissibilityRecord {
 /// hands across, and it is the half of the pair that a Governor, a Kernel or a
 /// Store reads. Every identity in it — the inquiry, the evidence set, the
 /// profile revision, the source handle, the source record's own digest, the
-/// eligibility, the exact scope and the State Fence — is a *fact about a
-/// decision*, and a request whose fields were rewritten after it was built
-/// would carry those facts without carrying any trace of the rewrite. So the
-/// request commits to its own bytes.
+/// eligibility, the exact scope, the State Fence and the committed freeze with its
+/// retained original — is a *fact about a decision*, and a request whose fields
+/// were rewritten after it was built would carry those facts without carrying any
+/// trace of the rewrite. So the request commits to its own bytes.
 ///
 /// Without that commitment the acceptance requirement this record exists for is
 /// not reachable: "forged source eligibility … cannot change canonical state"
@@ -605,6 +765,19 @@ pub struct GovernorSourceTransitionRequest {
     pub scope: String,
     /// State Fence the decision was taken under.
     pub state_fence: StateFence,
+    /// The committed evidence freeze and the retained original of this source,
+    /// when the decision is being proposed under one.
+    ///
+    /// `None` is the first-freeze / pre-freeze proposal: a source may be proposed
+    /// for admission before any evidence revision exists. It is **not** a way to
+    /// skip the commitment on a request that ought to carry one — the only producer
+    /// that sets this is
+    /// [`SourceAdmissibilityRecord::transition_request_committing_freeze`], which
+    /// refuses a retained revision that is not this record's own revision and a
+    /// freeze that does not include this source. So a request that names a freeze
+    /// cannot name a foreign revision, and a request that names no freeze is
+    /// visibly one.
+    pub freeze_commit: Option<FreezeCommitment>,
     /// Always true: the decision stays candidate-only.
     pub candidate_only: bool,
     /// Always false: this domain never authorizes a canonical write.
@@ -620,12 +793,27 @@ impl GovernorSourceTransitionRequest {
 
     /// Declared identity domain of this request.
     ///
-    /// `v1` is the first spelling and the only one: the request committed to its
-    /// own bytes from the beginning, so there is no earlier domain to reject. It
-    /// is a named constant rather than an inline literal so a receiving
-    /// authority can name the domain it must accept instead of matching on a
-    /// string buried in a function body.
-    pub const REQUEST_DIGEST_DOMAIN: &'static str = "inquiry-source-admission-request/v1";
+    /// Bumped `v1` -> `v2` for `#1765`. The `v1` preimage named every field
+    /// except the committed-freeze and retained-original commitment, so a request
+    /// that carried a freeze naming a foreign retained revision rehashed to the
+    /// same digest as one that carried the admitted revision — the W2 acceptance
+    /// case would have been invisible to every reader of this digest. It is a
+    /// named constant rather than an inline literal so a receiving authority can
+    /// name the domain it must accept instead of matching on a string buried in a
+    /// function body.
+    pub const REQUEST_DIGEST_DOMAIN: &'static str = "inquiry-source-admission-request/v2";
+
+    /// Whether this request commits a freeze with the retained original bound to
+    /// it.
+    ///
+    /// W3's synthesis pack is built only over requests where this is `true`, so
+    /// the question "was the freeze committed before synthesis" is answerable
+    /// from the request itself rather than inferred from a caller having called
+    /// the right builder.
+    #[must_use]
+    pub fn commits_freeze(&self) -> bool {
+        self.freeze_commit.is_some()
+    }
 
     /// Canonical digest over the whole request shape.
     ///
@@ -667,6 +855,20 @@ impl GovernorSourceTransitionRequest {
             &self.admissibility_digest,
         );
         push_field(&mut preimage, "scope", &self.scope);
+        // The freeze commitment is inside the preimage as a **declared state**,
+        // not as a sentinel string: "no freeze was committed" and "a freeze was
+        // committed whose digest happens to be empty" must not be the same bytes,
+        // exactly the mistake the source-admissibility preimage records for
+        // `independence_root_declared`. When it is present, all five of its
+        // fields are enumerated through the one helper, so a new field on
+        // `FreezeCommitment` cannot be added without a line in this preimage.
+        match &self.freeze_commit {
+            Some(commitment) => {
+                push_field(&mut preimage, "freeze_commit_declared", "true");
+                commitment.push_into(&mut preimage);
+            }
+            None => push_field(&mut preimage, "freeze_commit_declared", "false"),
+        }
         let fence =
             canonical_json_bytes(&self.state_fence).map_err(|_| InquiryError::Unencodable {
                 field: "source_transition_request.state_fence",
@@ -715,6 +917,40 @@ impl GovernorSourceTransitionRequest {
                 field: "source_transition_request.request_digest",
             });
         }
+        // The commitment's own shape is re-proved here, not only inside the
+        // preimage. A digest proves the request was not edited after it was
+        // built; it does not prove the artifact reference is nameable or the
+        // digests it carries are digests at all. A request read back with a blank
+        // artifact ref would otherwise re-verify and would name no original for a
+        // reader to return to, which is the W2 defect in a different spelling.
+        if let Some(commitment) = &self.freeze_commit {
+            text(
+                &commitment.freeze_id,
+                "source_transition_request.freeze_commit.freeze_id",
+            )
+            .map_err(InquiryError::from)?;
+            text(
+                &commitment.retained_artifact_ref,
+                "source_transition_request.freeze_commit.retained_artifact_ref",
+            )
+            .map_err(InquiryError::from)?;
+            for (value, field) in [
+                (
+                    commitment.freeze_digest.as_str(),
+                    "source_transition_request.freeze_commit.freeze_digest",
+                ),
+                (
+                    commitment.retained_content_digest.as_str(),
+                    "source_transition_request.freeze_commit.retained_content_digest",
+                ),
+                (
+                    commitment.retained_revision_digest.as_str(),
+                    "source_transition_request.freeze_commit.retained_revision_digest",
+                ),
+            ] {
+                crate::evidence_portfolio::digest(value, field).map_err(InquiryError::from)?;
+            }
+        }
         Ok(())
     }
 }
@@ -736,7 +972,8 @@ impl std::fmt::Display for GovernorSourceTransitionRequest {
             formatter,
             "request_kind={} inquiry={} evidence_set={} profile={}@{} \
              source={} source_record={} admissibility={} eligibility={} \
-             scope={} request={} candidate_only={} canonical_write_authorized={}",
+             scope={} request={} freeze_committed={} candidate_only={} \
+             canonical_write_authorized={}",
             self.request_kind,
             self.inquiry_id,
             self.evidence_set_id,
@@ -748,6 +985,7 @@ impl std::fmt::Display for GovernorSourceTransitionRequest {
             self.eligibility.wire_name(),
             self.scope,
             self.request_digest,
+            self.commits_freeze(),
             self.candidate_only,
             self.canonical_write_authorized,
         )
