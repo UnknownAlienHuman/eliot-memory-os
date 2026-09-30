@@ -39,6 +39,7 @@ use crate::Request;
 use crate::Response;
 use crate::StoreComposition;
 use crate::StoreCompositionError;
+use crate::source_artifact_request_context::AdmittedStoreRequestContext;
 use crate::diagnostics::{
     BoundedEventLog, BridgeBoundary, BridgeIdentity, dispatch_boundary, emit_attempted,
     emit_dispatch_outcome, emit_received, operation_name, report_events,
@@ -550,6 +551,17 @@ fn project_compatibility_readiness(
 #[allow(async_fn_in_trait)]
 pub trait StoreDispatchBackend: Send + Sync {
     async fn dispatch_request(&self, request: Request) -> Response;
+
+    /// Dispatches a session-admitted request while retaining its original
+    /// transport identity for source-artifact owners. Existing backends keep
+    /// their closed legacy behavior until they implement the owner operation.
+    async fn dispatch_admitted_request(
+        &self,
+        _context: &AdmittedStoreRequestContext,
+        request: Request,
+    ) -> Response {
+        self.dispatch_request(request).await
+    }
 }
 
 pub async fn dispatch<B: StoreDispatchBackend + ?Sized>(backend: &B, request: Request) -> Response {
@@ -587,6 +599,32 @@ pub async fn dispatch_with_log<B: StoreDispatchBackend + ?Sized>(
     );
     emit_attempted(events, operation, &received_identity);
     let response = backend.dispatch_request(request).await;
+    let identity = received_identity.merge(&BridgeIdentity::from_response(&response));
+    emit_dispatch_outcome(events, boundary, operation, &identity, &response);
+    response
+}
+
+/// Dispatches an admitted request with the exact original request/session
+/// carrier retained through the owner boundary.
+pub async fn dispatch_admitted_with_log<B: StoreDispatchBackend + ?Sized>(
+    backend: &B,
+    context: &AdmittedStoreRequestContext,
+    request: Request,
+    events: &mut BoundedEventLog,
+) -> Response {
+    let operation = operation_name(&request);
+    let boundary = dispatch_boundary(&request);
+    let received_identity = BridgeIdentity::from_request(&request);
+    emit_received(
+        events,
+        BridgeBoundary::Dispatch,
+        operation,
+        &received_identity,
+    );
+    emit_attempted(events, operation, &received_identity);
+    let response = backend
+        .dispatch_admitted_request(context, request)
+        .await;
     let identity = received_identity.merge(&BridgeIdentity::from_response(&response));
     emit_dispatch_outcome(events, boundary, operation, &identity, &response);
     response
