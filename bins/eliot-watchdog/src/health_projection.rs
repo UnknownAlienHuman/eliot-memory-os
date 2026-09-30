@@ -70,13 +70,13 @@ use std::sync::Mutex;
 use eliot_contracts::sha256_hex;
 use eliot_watchdog_core::{
     BriefPersistence, ClockDomain, ContextQualityBounds, ContextQualityObservation, CountDelta,
-    CoverageRef, CoverageGapExplanation, EvidenceRef, ExpectedRevision, HealthAnalysisRequest,
+    CoverageGapExplanation, CoverageRef, EvidenceRef, ExpectedRevision, HealthAnalysisRequest,
     HealthDetection, HealthDiagnosticBrief, HealthEvidenceHandles, HealthNoSignalReason,
     HealthObservationPair, HealthOutputFamily, HealthSignalContext, MaintenanceDebtInput,
-    MemoryUtilityDeltas, ObservedTime, PolicyBound, ProhibitedEffectAttempt, ProhibitedEffectClass,
-    ProhibitedEffectDenial, ProfileRevision, RecordedValue, RiskRoute, Signal, SignalReferences,
-    SignalTarget, SourceEventRef, StateDeltaPresence, TimeUnit, compile_health_brief,
-    evaluate_agent_loop, evaluate_context_quality, evaluate_maintenance_debt,
+    MemoryUtilityDeltas, ObservedTime, PolicyBound, ProfileRevision, ProhibitedEffectAttempt,
+    ProhibitedEffectClass, ProhibitedEffectDenial, RecordedValue, RiskRoute, Signal,
+    SignalReferences, SignalTarget, SourceEventRef, StateDeltaPresence, TimeUnit,
+    compile_health_brief, evaluate_agent_loop, evaluate_context_quality, evaluate_maintenance_debt,
     evaluate_memory_utility, evaluate_observation_coverage, request_health_analysis,
 };
 
@@ -681,13 +681,12 @@ pub fn evaluate_interval_health(
     };
     // A newly accepted supervision heartbeat is the only event this owner
     // records that proves the supervised state moved.
-    let current_state_delta = if corpus.newest_heartbeat_sequence
-        > previous.corpus.newest_heartbeat_sequence
-    {
-        StateDeltaPresence::Present
-    } else {
-        StateDeltaPresence::Absent
-    };
+    let current_state_delta =
+        if corpus.newest_heartbeat_sequence > previous.corpus.newest_heartbeat_sequence {
+            StateDeltaPresence::Present
+        } else {
+            StateDeltaPresence::Absent
+        };
     let previous_state_delta = if previous.state_delta_present {
         StateDeltaPresence::Present
     } else {
@@ -722,13 +721,9 @@ pub fn evaluate_interval_health(
     if let Some(emission) = open_memory_utility(&previous, pair.clone(), corpus, &mut silent) {
         emissions.push(emission);
     }
-    if let Some(emission) = open_observation_coverage(
-        &previous,
-        pair.clone(),
-        &observation,
-        corpus,
-        &mut silent,
-    ) {
+    if let Some(emission) =
+        open_observation_coverage(&previous, pair.clone(), &observation, corpus, &mut silent)
+    {
         emissions.push(emission);
     }
     if let Some(emission) =
@@ -805,10 +800,7 @@ fn consider_diagnostic_brief(
     state: &mut HealthProjectionState,
     emissions: &[HealthSignalEmission],
 ) -> Option<HealthBriefEmission> {
-    let mut rules: Vec<&'static str> = emissions
-        .iter()
-        .map(|emission| emission.rule_id)
-        .collect();
+    let mut rules: Vec<&'static str> = emissions.iter().map(|emission| emission.rule_id).collect();
     rules.sort_unstable();
     rules.dedup();
     let persistent = rules
@@ -844,8 +836,11 @@ fn consider_diagnostic_brief(
         .iter()
         .find(|record| record.brief_id == brief.brief_id)
         .map_or(0, |record| record.requests);
-    let request =
-        request_health_analysis(&brief, RiskRoute::CheapDiagnosis, prior_ineffective_analyses);
+    let request = request_health_analysis(
+        &brief,
+        RiskRoute::CheapDiagnosis,
+        prior_ineffective_analyses,
+    );
     let subject = brief
         .signals
         .first()
@@ -1262,11 +1257,7 @@ fn open_maintenance_debt(
 fn declared_bound_evidence(name: &str, value: u64) -> EvidenceRef {
     EvidenceRef {
         evidence_id: sha256_hex(
-            encode_identity(&[
-                format!("watchdog_declared_{name}"),
-                value.to_string(),
-            ])
-            .as_bytes(),
+            encode_identity(&[format!("watchdog_declared_{name}"), value.to_string()]).as_bytes(),
         ),
     }
 }
