@@ -616,7 +616,6 @@ pub fn prepare_problem_owner_transition(
     manifest_digest: &OperationManifestDigest,
     request: &ProblemOwnerTransitionRequest<'_>,
 ) -> Result<PreparedProblemOwnerTransition, CompositionError> {
-    let identity = request.identity;
     let operation_id = &request.operation_id()?;
     // The transition commits under its own request identity, derived from the
     // caller's so each transition has its own idempotency key. It is produced
