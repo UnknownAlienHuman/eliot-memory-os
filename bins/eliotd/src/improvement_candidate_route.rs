@@ -209,13 +209,20 @@ pub fn check_improvement_handoff_identity(
 /// it before it builds anything, and the owner identities it then writes into
 /// its `ExperimentPlan`, `ActivationEvidence`, `ImprovementEvidenceView` and
 /// `RollbackContract` come from here rather than from a constant re-spelled at
-/// the field. The Governor crate then re-checks those very fields independently —
-/// `check_experiment_owner_routing` refuses an executor that is not the Testd
-/// owner, `check_evaluator_independence` refuses an evidence verifier that is not
-/// the planned one or that is the executor, the admission owner or the rollback
-/// owner (A14.6, A5.5), and `check_rollback_join` refuses a rollback owner that
-/// disagrees with the admission policy — so a map entry that ever resolved
-/// elsewhere would REFUSE the route rather than be recorded and discarded.
+/// the field. How far a Governor check re-derives those rows is a property of
+/// the pipeline's check ORDER, not of this map, so it is measured rather than
+/// assumed: `check_experiment_owner_routing` is the only one of the three
+/// positioned to run on this path, and it covers the two `ExperimentPlan` fields
+/// — executor against the Testd owner, evaluator against the Instrument
+/// verifier family (A14.6, A5.5). `check_evaluator_independence` and
+/// `check_rollback_join` sit behind `check_evaluation_shape`, which refuses this
+/// path's `NotExecuted` evidence before either is reached, and the proposal's
+/// unbound `closure_id` refuses at the proposal gate ahead of all three.
+/// Nor could the first check catch a divergent map row: `ExecuteExperiment` and
+/// `Evaluate` resolve to fixed pipeline constants that ignore this map's
+/// argument, and the `Rollback` row round-trips it, so it agrees with the policy
+/// by construction rather than by check. `improvement_candidate_dispatch`'s
+/// module documentation carries the full ordering and its consequence.
 ///
 /// `rollback_owner_id` is the map's only input because Rollback is the one
 /// operation with no fixed pipeline owner. On the live path the value passed is

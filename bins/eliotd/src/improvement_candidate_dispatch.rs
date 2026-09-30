@@ -46,11 +46,20 @@
 //! projection of [`eliot_maintenance::ImprovementOperation::owner`] — at the one
 //! point in [`dispatch_improvement_candidate_route`] where this daemon decides
 //! what it is routing. That is what makes the map load-bearing rather than
-//! decorative: `check_experiment_owner_routing`, `check_evaluator_independence`
-//! and `check_rollback_join` in the Governor crate all re-derive the same
-//! question from these fields, so a map entry that diverged from the pipeline's
-//! expectation becomes a typed [`PipelineError::UnboundRelation`] on the live
-//! route instead of a routing nobody notices.
+//! decorative: the routing is decided once, at one call site, and every field
+//! that names an owner reads the same row, so no record builder can disagree
+//! with another about who executes, evaluates or rolls back.
+//!
+//! What the map is NOT is a routing the Governor pipeline independently confirms,
+//! and the difference is stated here rather than left for a reader to assume.
+//! ONE check is even positioned to re-derive anything from these six fields —
+//! `check_experiment_owner_routing` — and it covers two of them, the
+//! `ExperimentPlan`'s executor and evaluator. The evaluator-independence and
+//! rollback-join checks sit BEHIND a refusal that this path hits first, and the
+//! rollback row round-trips the policy's own field, so its agreement is by
+//! construction rather than by a check. "Which owner rows are actually
+//! re-checked, and which are not" below gives the order and the consequence; it
+//! is the section to read before drawing any conclusion from this map.
 //!
 //! The map's single input is the rollback owner, and it is the same `G-19`
 //! admission policy record's own
@@ -68,12 +77,12 @@
 //! ([`improvement_operation_owners`]) at the start of
 //! [`dispatch_improvement_candidate_route`], so the executor and the evaluator
 //! are two rows of the same `ImprovementOperation::owner` projection rather than
-//! two constants this module spells beside each other. The Governor pipeline
-//! REQUIRES that routing (W5) — a plan routed to any other executor or evaluator
-//! is refused as unbound — so if the map ever resolved elsewhere the route
-//! REFUSES rather than recording a routing nothing checks. Declaring the routing
-//! is a statement about who would run and who would grade the bounded experiment;
-//! it is not a statement that either happened.
+//! two constants this module spells beside each other. They are also the only two
+//! of the six populated owner rows that a Governor check is positioned to
+//! re-derive, and even those two are reached only once the proposal-shape gate
+//! clears — see the section below before reading this as a checked routing.
+//! Declaring the routing is a statement about who would run and who would grade
+//! the bounded experiment; it is not a statement that either happened.
 //!
 //! The claim that something ran lives in
 //! [`ActivationEvidence::execution`], and this module sets it to its honest
@@ -83,6 +92,59 @@
 //! evidence cannot promote") and `I0.5` are honoured by that value, not worked
 //! around: nothing here substitutes a self-report, a model score, or an exit zero
 //! for a real run.
+//!
+//! # Which owner rows are actually re-checked, and which are not
+//!
+//! Stated by reading `join_improvement_inputs`
+//! (`crates/governor/eliot-maintenance/src/improvement_pipeline.rs:2562`) in
+//! order, because the ORDER is what decides which check runs at all:
+//!
+//! ```text
+//! 2565  proposal.validate()                 -> MissingField("closure_id") on this path
+//! 2566  check_operation_identities()
+//! 2567  check_experiment_shape()
+//! 2568  check_experiment_owner_routing()   -> positioned to run, but behind 2565
+//! 2569  check_evaluation_shape()            -> EvidenceNotExecuted on every live dispatch
+//! 2577  check_experiment_evaluation_join()  -> never reached
+//! 2583  check_admission_evidence_join()    -> never reached
+//! 2589  check_rollback_join()              -> never reached
+//! ```
+//!
+//! Three consequences. Each is something a reader auditing owner-routing safety
+//! needs, and none is a property this module's routing can supply:
+//!
+//! - **On the live path today, nothing in that list runs past 2565.**
+//!   [`ImprovementProposal::closure_id`] is left empty — no
+//!   `meta.learning.closure` record is reachable from this daemon — so
+//!   `validate` refuses with [`PipelineError::MissingField`] before any routing
+//!   question is asked. The routing half of this issue is therefore wired and
+//!   STATED, not currently exercised by a refusal.
+//! - **Only `check_experiment_owner_routing` covers any of the six fields, and
+//!   only two of them**: [`ExperimentPlan::testd_owner_id`] against `TESTD_OWNER`
+//!   and [`ExperimentPlan::evaluator_id`] against `VERIFIER_OWNER_FAMILY`. It
+//!   could not be made to fail by the map either, because
+//!   [`eliot_maintenance::ImprovementOperation::owner`] resolves
+//!   `ExecuteExperiment` and `Evaluate` to those two fixed pipeline constants and
+//!   ignores its argument. What that check holds is the FIELD this module wrote,
+//!   not a divergent row.
+//! - **`check_evaluator_independence` and `check_rollback_join` are real checks
+//!   this path never reaches.** The 2569 gate refuses every status but
+//!   `Executed`, and this module sets
+//!   [`ImprovementEvidenceExecution::NotExecuted`], so everything from 2577
+//!   onward is unreachable here. `ActivationEvidence::verifier_id`,
+//!   `ImprovementEvidenceView::verifier_id` and both `rollback_owner_id` fields
+//!   have NO independent live re-check. And the `Rollback` row could not have
+//!   been caught by one: `owner` returns its argument for `Rollback`, so the
+//!   map's output IS the map's input, and `check_rollback_join` would be
+//!   comparing a value against its own source.
+//!
+//! A0.3 asks for fail-closed behaviour where an error would be hidden control
+//! capture, and that is not what is in doubt here: the NEGATIVE half of this
+//! boundary is structural, because the pipeline refuses this path at 2565 and
+//! would refuse it again at 2569, and this module substitutes nothing for the
+//! run that never happened. What must not be overstated is the POSITIVE half —
+//! that a wrong owner row would be caught. It would not be. These rows are
+//! decided once, read once, and re-checked by nothing that runs.
 //!
 //! # The missing producer, named so the next owner does not re-derive it
 //!
@@ -402,17 +464,19 @@
 //! Kernel generation/canary paths" splits into a routing half and an execution
 //! half, and only the first is deliverable here.
 //!
-//! - **Routing is wired and load-bearing.** The executor, the evaluator and the
-//!   rollback owner are read from the single
-//!   [`eliot_maintenance::ImprovementOperation::owner`] projection, and the
-//!   Governor pipeline independently re-derives the same questions:
-//!   `check_experiment_owner_routing` refuses any executor other than
-//!   `testd-20` and any evaluator outside `instrument-verifier-20-1111`,
-//!   `check_evaluator_independence` refuses an evaluator that is the executor,
-//!   the admission owner or the rollback owner, and `check_rollback_join`
-//!   refuses a rollback owner that disagrees with the policy or the admission
-//!   evidence. A map row that diverged becomes a typed refusal on the live
-//!   route, so the routing is checked rather than documented.
+//! - **Routing is wired; it is re-derived by one gate, not by three.** The
+//!   executor, the evaluator and the rollback owner are read from the single
+//!   [`eliot_maintenance::ImprovementOperation::owner`] projection, and
+//!   `check_experiment_owner_routing` is the only Governor check positioned to
+//!   re-derive anything from those rows — it covers the two `ExperimentPlan`
+//!   fields, against `testd-20` and the `instrument-verifier-20-1111` family.
+//!   `check_evaluator_independence` and `check_rollback_join` sit behind
+//!   `check_evaluation_shape`, which refuses this path's `NotExecuted` evidence
+//!   before either is reached, and the proposal's unbound `closure_id` refuses
+//!   at the proposal gate ahead of all three. "Which owner rows are actually
+//!   re-checked, and which are not" above gives the order line by line. The
+//!   routing here is stated once and read once; it is not presently verified
+//!   twice, and this bullet does not claim it is.
 //! - **Execution is absent, and the absence is measured.** No experiment is
 //!   run, no executed evaluation exists, and no product pulse exists. The
 //!   counts and the exact missing producers are stated above. Filling them from
@@ -554,8 +618,11 @@ pub struct ImprovementRouteOutcome {
 /// [`improvement_operation_owners`] — the single projection of
 /// [`eliot_maintenance::ImprovementOperation::owner`]. Every owner field below is
 /// assigned from one of these three values, never from a constant re-spelled at
-/// the field, so the routing this daemon commits and the routing the Governor
-/// pipeline independently re-checks are one decision expressed once.
+/// the field, so the routing this daemon commits is one decision expressed once
+/// rather than six that could disagree with each other. How much of it a
+/// Governor check re-derives is a narrower question, measured by check order in
+/// the module documentation: exactly one of those checks is positioned to run,
+/// and it covers two of the six fields.
 ///
 /// A14.6 separates the production path, the measurement path and the
 /// optimization-feedback path; A5.5 adds that "a model evaluator is admissible
@@ -585,9 +652,17 @@ impl RouteOwners {
     /// `DaemonComposition::maintenance_improvement_admission_policy`, which
     /// forwards this daemon's own service identity to the `G-19` owner rather
     /// than accepting a caller's string. It is a real owner identity, not a
-    /// literal, and not a value invented at this call site: it is the very value
-    /// `check_rollback_join` in the Governor crate compares the rollback
-    /// contract and the admission evidence against.
+    /// literal, and not a value invented at this call site.
+    ///
+    /// It is also the map's ONLY input, which is what makes the `Rollback` row
+    /// a round trip rather than a corroboration:
+    /// `ImprovementOperation::owner` returns this argument unchanged for
+    /// `Rollback`, so `owners.rollback` below IS `policy.rollback_owner_id` and
+    /// cannot differ from it. That is a real property — there is no second
+    /// spelling to drift — and it is not the property
+    /// `check_rollback_join` would establish, because that check is not reached
+    /// on this path and would in any case be comparing a value against its own
+    /// source. See the module documentation.
     fn read(rollback_owner_id: &str) -> Result<Self, PipelineError> {
         let map = improvement_operation_owners(rollback_owner_id);
         Ok(Self {
@@ -1310,9 +1385,16 @@ fn route_rollback_contract(
         // The rollback owner, read from the map's own `Rollback` row. The map
         // resolves `Rollback` to the owner it was given, and the owner it was
         // given is the same `G-19` policy record's `rollback_owner_id` the
-        // request carries — so this value is the real rollback-contract owner
-        // that `check_rollback_join` compares this contract and the admission
-        // evidence against, not a copy that could drift from it.
+        // request carries. So this field is that value ROUND-TRIPPED rather than
+        // independently corroborated: `ImprovementOperation::owner` returns its
+        // argument for `Rollback`, which makes the map's output equal to the
+        // map's input. Its agreement with the policy is therefore true BY
+        // CONSTRUCTION, not by a check that could have caught a divergence —
+        // `check_rollback_join` is that check, it does not run on this path, and
+        // it could not have reported one here. The distinction is spelled out
+        // because "cannot drift because it is the same value" and "cannot drift
+        // because a check would catch it" are different guarantees, and only the
+        // first is true of this field.
         rollback_owner_id: owners.rollback.clone(),
         forward_repair_ref: String::new(),
         invalidation_set: vec![candidate.validity_scope.clone()],
@@ -1401,8 +1483,11 @@ fn route_admission_evidence(
         disable_ref: Some(route_deadline_ref(candidate)),
         reopen_ref: None,
         // The same map row the rollback contract above was read from, so the
-        // evidence and the contract name one owner. `check_rollback_join` refuses
-        // the pair if they ever disagree.
+        // evidence and the contract name one owner by construction: one read,
+        // two fields, equal because they are the same value.
+        // `check_rollback_join` is the check that would refuse a diverging
+        // pair. It does not run on this path, and a single read cannot diverge
+        // from itself. See the module documentation.
         rollback_owner_id: owners.rollback.clone(),
         expiry_ref: None,
         // The caller's own checked prior record, or the pipeline's own
