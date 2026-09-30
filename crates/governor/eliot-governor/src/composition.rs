@@ -9817,10 +9817,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Binds the feed to the live composition snapshot and fence at call
     /// time — never caller-supplied — and runs the full
     /// read→decode→restore→publish→readback exchange through
-    /// [`synchronize_owner_feed`]. The owning daemon runtime calls this
-    /// on provider-revision advance and on recovery; a stale trigger
-    /// refuses before any publish, and no owner state installs until
-    /// the Kernel readback proves the exact published bytes.
+    /// [`synchronize_owner_feed`]; a stale trigger refuses before any
+    /// publish, and no owner state installs until the Kernel readback
+    /// proves the exact published bytes.
+    ///
+    /// No production caller. The owning daemon runtime does not call this
+    /// method: on provider-revision advance and on recovery it captures its
+    /// own owner-feed plan and calls the free
+    /// [`synchronize_owner_feed_with_canonical_receipts`] directly (see
+    /// `bins/eliotd/src/owner_feed.rs`). This method is only a
+    /// bound-snapshot wrapper over that same free function and is
+    /// currently unreferenced. Whether it is wired or retired is an owner
+    /// decision; it must not be read as a live entry point.
     ///
     /// `operation` is the admitted revocation operation identity the
     /// underlying feed restores under; it is forwarded verbatim to
@@ -9854,8 +9862,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Synchronizes the Kernel P-07 owner with canonical second-phase links
     /// read from the durable ORS boundary. The legacy method above remains the
-    /// fail-closed empty-link entry point; a production caller that has read
-    /// completed links must use this method.
+    /// fail-closed empty-link entry point; a caller that has read completed
+    /// links must not use that legacy path.
+    ///
+    /// No production caller. The owning daemon runtime reads the completed
+    /// links itself, binds the captured plan, and calls the free
+    /// [`synchronize_owner_feed_with_canonical_receipts`] directly (see
+    /// `bins/eliotd/src/owner_feed.rs`) rather than this method. This method
+    /// is only a bound-snapshot wrapper over that same free function and is
+    /// currently unreferenced; whether it is wired or retired is an owner
+    /// decision.
     ///
     /// `operation` is the admitted revocation operation identity the
     /// underlying feed restores under; it is forwarded verbatim to
@@ -9898,6 +9914,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// plus owner quarantine evidence records read from the durable
     /// boundary. Absent evidence leaves the affected omissions explicitly
     /// unresolved; it is never reconstructed here.
+    ///
+    /// No production caller. The owning daemon runtime supplies no quarantine
+    /// evidence and calls the free
+    /// [`synchronize_owner_feed_with_canonical_receipts`] instead (see
+    /// `bins/eliotd/src/owner_feed.rs`), so this method is currently
+    /// unreferenced; whether it is wired or retired is an owner decision.
     ///
     /// `operation` is the admitted revocation operation identity the
     /// underlying feed restores under; it is forwarded verbatim to
