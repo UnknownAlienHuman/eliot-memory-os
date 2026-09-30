@@ -432,15 +432,16 @@ pub use reconciliation::{
 
 pub use publication::{
     AttentionPolicy, PublicationClass, PublicationDecision, PublicationIntent,
-    evaluate_publication_intent,
+    PublicationWithheldReason, evaluate_publication_intent,
 };
 
 pub use rules::{
     CompetentIntegrationCoverage, IntegrationGapEvaluation, IntegrationGapObservation,
-    IntegrationGapRule, IntegrationGapSensor, IntegrationGapSignalCandidate,
-    IntegrationGapSignalContext, IntegrationGapUnknown, ProviderAttemptIdentity,
-    ProviderEventIdentity, StateFenceProjection, evaluate_provider_host_event_gap,
-    provider_host_event_gap_rule,
+    IntegrationGapSensor, IntegrationGapSignalCandidate, IntegrationGapSignalContext,
+    IntegrationGapUnknown, PROVIDER_HOST_EVENT_GAP_RULE_ID, PROVIDER_HOST_EVENT_GAP_RULE_REVISION,
+    ProviderAttemptIdentity, ProviderEventIdentity, RuleImplementation, StateFenceProjection,
+    WATCHDOG_RULE_TABLE, WatchdogRule, covered_rule, evaluate_provider_host_event_gap,
+    find_watchdog_rule, watchdog_rule_table,
 };
 
 pub use health_detectors::{

@@ -9,22 +9,31 @@
 //! the latter.
 //!
 //! Determinism: the decision is a pure function of one immutable signal
-//! revision, one owner-issued [`AttentionPolicy`], and the distinct
+//! revision, one owner-issued [`AttentionPolicy`], the durable failure episode's
+//! own [`SourceEventAdmission`] for the presented source event, and the distinct
 //! evidence identities already counted for that signal under that policy
 //! revision. It reads no clock, opens no file, and mutates nothing.
 //!
-//! Repeated delivery cannot cross a threshold by itself. A signal revision
-//! whose evidence identities are all already counted returns
-//! [`PublicationDecision::RepeatedDelivery`], which advances nothing and
-//! mints nothing; only evidence that is not already counted contributes to the
-//! distinct count, so a retransmitted observation can never push a signal over
-//! its threshold.
+//! Repeated delivery cannot cross a threshold by itself, and the reason is the
+//! durable failure episode rather than the caller's bookkeeping. The caller must
+//! supply the [`SourceEventAdmission`] its episode already decided for the
+//! presented source event, and a decision that is not
+//! [`SourceEventAdmission::NewEvidence`] advances nothing and mints nothing no
+//! matter what evidence references the revision carries. A caller therefore
+//! cannot cross a threshold by passing an empty already-counted list: the
+//! episode's own admission is the sole answer to "did this delivery add
+//! independent evidence", and that answer is derived once, from the same
+//! accepted-event index the spool persists.
 //!
 //! Unsupported history is not a success default: a signal whose evidence
 //! references are unavailable returns
 //! [`PublicationDecision::EvidenceUnavailable`] with the recorded limitation
-//! instead of crossing on a count it cannot substantiate.
+//! instead of crossing on a count it cannot substantiate, and a delivery the
+//! episode withheld returns [`PublicationDecision::AdmissionWithheld`] carrying
+//! the exact refusal the episode reported instead of a repeated-delivery count
+//! that would misdescribe it.
 
+use crate::episode::SourceEventAdmission;
 use crate::rules::encode_identity;
 use crate::signals::{
     ObservedTime, RecordedValue, RuleRevision, Signal, SignalId, SignalReferences, SignalSeverity,
@@ -148,13 +157,45 @@ pub struct PublicationIntent {
     pub dedup_key: RecordedValue<String>,
 }
 
+/// Why the durable failure episode withheld a presented source event from the
+/// threshold decision.
+///
+/// This is the episode's own answer, passed through unchanged rather than
+/// re-derived: the publication decision never decides for itself whether a
+/// delivery was new, so it can never disagree with the ledger that persists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationWithheldReason {
+    /// The episode already accepted this exact event identity with this exact
+    /// payload digest. It is a retransmission: it advances no occurrence count
+    /// and refreshes no evidence time.
+    Retransmission,
+    /// The episode already accepted this event identity with a different
+    /// payload digest. Changed content under a known identity is a conflict,
+    /// not a delivery, and it is never counted as either.
+    ConflictingPayload {
+        /// The payload digest the episode already recorded for this identity.
+        recorded_payload_digest: String,
+    },
+}
+
 /// Deterministic result of evaluating one signal revision against one policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PublicationDecision {
-    /// The revision contributes no evidence that is not already counted, so it
-    /// is a repeated delivery. It advances nothing and mints nothing, which is
-    /// what keeps a retransmitted observation from crossing a threshold by
-    /// itself.
+    /// The durable episode withheld the presented source event, so this delivery
+    /// contributes no independent evidence whatever the revision's evidence
+    /// references say. Nothing advances and nothing is minted, and the episode's
+    /// own reason travels with the decision rather than being flattened into a
+    /// repeated-delivery count.
+    AdmissionWithheld {
+        /// Exactly what the failure episode decided about the presented event.
+        reason: PublicationWithheldReason,
+        /// Distinct evidence already counted for this signal and policy.
+        distinct_evidence_count: usize,
+    },
+    /// The episode admitted a genuinely new source event, but the revision
+    /// contributes no evidence identity the owner has not already counted — for
+    /// example a reference duplicated inside one revision. It advances nothing
+    /// and mints nothing.
     RepeatedDelivery {
         /// Distinct evidence already counted for this signal and policy.
         distinct_evidence_count: usize,
@@ -187,6 +228,16 @@ pub enum PublicationDecision {
 /// Decides whether one evidence-backed signal revision crosses the attention
 /// threshold its severity requires under `policy`.
 ///
+/// `admission` is the durable failure episode's own decision about the source
+/// event this delivery presents, produced by
+/// [`classify_source_event`](crate::classify_source_event) against the
+/// episode's retained accepted-event index. It is the sole gate on whether this
+/// delivery may add independent pressure: an admission that is not
+/// [`SourceEventAdmission::NewEvidence`] returns
+/// [`PublicationDecision::AdmissionWithheld`] before any count is taken, so a
+/// retransmission cannot cross a threshold and a changed payload under a known
+/// identity can neither be counted nor reported as a fresh delivery.
+///
 /// `counted_evidence` is the exact set of distinct evidence identities already
 /// counted for this signal under this policy revision, as the durable owner
 /// holds it. This function never extends that set itself; the owner persists
@@ -203,6 +254,7 @@ pub enum PublicationDecision {
 pub fn evaluate_publication_intent(
     signal: &Signal,
     policy: &AttentionPolicy,
+    admission: &SourceEventAdmission,
     counted_evidence: &[String],
 ) -> Result<PublicationDecision, SignalValidationError> {
     let revision = signal.revision();
@@ -217,10 +269,34 @@ pub fn evaluate_publication_intent(
             });
         }
     };
+    // The episode's own admission is consulted before anything is counted, so a
+    // delivery the ledger withheld contributes nothing regardless of what this
+    // revision happens to reference. Its reason travels through unchanged
+    // rather than being restated as a repeated delivery. The match is total over
+    // the admission enum, so a withheld delivery can never fall past this gate.
+    match admission {
+        SourceEventAdmission::NewEvidence { .. } => {}
+        SourceEventAdmission::Retransmission { .. } => {
+            return Ok(PublicationDecision::AdmissionWithheld {
+                reason: PublicationWithheldReason::Retransmission,
+                distinct_evidence_count: counted_evidence.len(),
+            });
+        }
+        SourceEventAdmission::ConflictingPayload {
+            recorded_payload_digest,
+        } => {
+            return Ok(PublicationDecision::AdmissionWithheld {
+                reason: PublicationWithheldReason::ConflictingPayload {
+                    recorded_payload_digest: recorded_payload_digest.clone(),
+                },
+                distinct_evidence_count: counted_evidence.len(),
+            });
+        }
+    }
     // Only evidence this revision adds counts. Identities the owner already
     // counted are skipped, and identities repeated inside one revision are
-    // collapsed, so neither a retransmitted observation nor a duplicated
-    // reference can raise the distinct count.
+    // collapsed, so a duplicated reference inside one revision cannot raise the
+    // distinct count either.
     let mut crossing_evidence: Vec<String> = Vec::new();
     for reference in references {
         if !crossing_evidence.contains(&reference.evidence_id)
