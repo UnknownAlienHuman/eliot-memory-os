@@ -215,12 +215,13 @@ fn request(
 }
 
 fn evidence() -> ConcurrentEvidence {
+    let state_fence = fence();
     ConcurrentEvidence {
         capability: CAPABILITY_RESERVED_WRITE,
         observed_generation: SchemaGeneration::v2(),
         expected_generation: SchemaGeneration::v2(),
-        state_fence: fence(),
-        kernel_generation: "kernel-993".to_owned(),
+        kernel_generation: state_fence.resource_generation.clone(),
+        state_fence,
     }
 }
 
