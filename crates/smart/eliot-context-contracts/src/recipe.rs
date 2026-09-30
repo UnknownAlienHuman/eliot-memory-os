@@ -1485,10 +1485,7 @@ impl RecipePolicyIdentity {
     /// ORIGINAL recorded values only; it derives no digest of its own.
     fn validate_identity(&self) -> Result<(), ContextError> {
         validate_text(self.policy_id.as_str(), "recipe_policy_identity.policy_id")?;
-        validate_digest(
-            &self.policy_sha256,
-            "recipe_policy_identity.policy_sha256",
-        )
+        validate_digest(&self.policy_sha256, "recipe_policy_identity.policy_sha256")
     }
 
     /// Check that this identity still names exactly this content.
