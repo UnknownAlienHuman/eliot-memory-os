@@ -350,6 +350,7 @@ fn closure(
                 invalidation_reason,
                 current_influence: InfluenceState::Revoked,
                 state_fence: fence,
+                commit_state_fence: fence,
                 revision,
                 bounds: RevocationClosureDigestBounds {
                     max_nodes: bounds.max_nodes,
@@ -379,6 +380,7 @@ fn closure(
         invalidation_reason,
         current_influence: InfluenceState::Revoked,
         state_fence: fence.clone(),
+        commit_state_fence: fence.clone(),
         revision,
         bounds,
         disposition,

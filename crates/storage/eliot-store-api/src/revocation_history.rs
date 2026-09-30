@@ -18,17 +18,19 @@
 //! Issue #2966, step 2: every recorded row declares the full versioned
 //! evidence coordinates its producer vouches for — the owner namespace, the
 //! traversal bounds the membership was proven under, the completeness
-//! disposition, the omissions, the terminal influence state, and the
-//! affected-member count and digest plus the canonical request hash. The
-//! decoding adapter carries these coordinates verbatim into the
-//! authority-specific evidence, and recovery recomputes and compares the
-//! content-addressed ones; nothing downstream mints them. A v1 payload
-//! carries no producer coordinates and is refused rather than reinterpreted.
+//! disposition, the omissions, the terminal influence state, the recorded
+//! commit fence/epoch, and the affected-member count and digest plus the
+//! canonical request hash. The decoding adapter carries these coordinates
+//! verbatim into the authority-specific evidence, and recovery recomputes and
+//! compares the content-addressed ones; nothing downstream mints them. A v1
+//! payload carries no producer coordinates and is refused rather than
+//! reinterpreted.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use eliot_contracts::StateFence;
 use eliot_security_contracts::{InfluenceState, RevocationReason};
 
 use crate::StoreError;
@@ -120,7 +122,8 @@ pub enum RecordedRevocationDisposition {
 /// affected order), the terminal invalidation reason, and the durable
 /// history revision the record was committed at — plus every coordinate the
 /// versioned authority evidence binds: the owner namespace the row was
-/// served under, the bounds the membership was proven under, the declared
+/// served under, the recorded commit fence/epoch the closure was committed
+/// under, the bounds the membership was proven under, the declared
 /// completeness disposition and omissions, the terminal influence state,
 /// and the affected-member count and digest plus the canonical request hash.
 /// All of them are producer declarations the decoding adapter carries
@@ -138,6 +141,15 @@ pub struct RecordedRevocation {
     pub invalidation_reason: RevocationReason,
     /// Durable history revision this record was committed at.
     pub revision: u64,
+    /// Fence/epoch the durable commit that produced this closure was committed
+    /// under, read out of that commit's own recorded authority binding.
+    ///
+    /// This is a RECORDED coordinate, not the serving read's fence: the durable
+    /// owner projects it from the immutable commit receipt it already holds, and
+    /// recovery compares it against its own live fence. A row that carried only
+    /// the read-time fence would bind the closure to whichever read projected
+    /// it and would compare a value with itself at restore.
+    pub commit_state_fence: StateFence,
     /// Declared graph/snapshot owner namespace this row was served under:
     /// the authority root that owns the committed closure.
     pub owner_namespace: String,
@@ -165,6 +177,12 @@ impl RecordedRevocation {
     /// carried for the authority decision and are never pre-refused here,
     /// so a producer-declared incompleteness or a tampered coordinate
     /// reaches recovery and refuses there, under its exact cause.
+    ///
+    /// The one coordinate this stage does check is the recorded commit fence:
+    /// it is re-derived from the ORIGINAL recorded value with the contract's own
+    /// [`StateFence::validate`], never recomputed from the serving read, so a
+    /// malformed commit coordinate refuses at the wire instead of reaching the
+    /// authority decision as a usable epoch.
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_reference(&self.closure_id, "closure_id")?;
         validate_reference(&self.root_ref, "root_ref")?;
@@ -183,6 +201,9 @@ impl RecordedRevocation {
                 reason: "must be non-zero",
             });
         }
+        self.commit_state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
         validate_reference(&self.owner_namespace, "owner_namespace")?;
         self.bounds.validate()?;
         for omission in &self.omissions {

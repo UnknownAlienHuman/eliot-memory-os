@@ -354,6 +354,12 @@ pub fn serve_authority_revocation_history(
         let omissions: Vec<String> = Vec::new();
         let closure_id = commit.operation_id.as_str().to_owned();
         let revision = commit.declaration.grant_graph_revision;
+        // #1142: the recorded commit coordinate comes from the immutable
+        // closure commit this loop already holds, never from `fence`. `fence`
+        // is the live dispatch fence of the READ, so hashing it bound the
+        // closure identity to whichever read projected it instead of to the
+        // epoch the revocation was actually committed at.
+        let commit_fence = &commit.authority.state_fence;
         let canonical_request_digest =
             revocation_closure_canonical_digest(&RevocationClosureDigestInput {
                 evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
@@ -364,6 +370,7 @@ pub fn serve_authority_revocation_history(
                 invalidation_reason: Some(RevocationReason::SourceRevoked),
                 current_influence: InfluenceState::Revoked,
                 state_fence: fence,
+                commit_state_fence: commit_fence,
                 revision,
                 bounds: RevocationClosureDigestBounds {
                     max_nodes: engine_bounds.max_nodes,
@@ -386,6 +393,7 @@ pub fn serve_authority_revocation_history(
             dependent_refs: dependents,
             invalidation_reason: RevocationReason::SourceRevoked,
             revision,
+            commit_state_fence: commit_fence.clone(),
             owner_namespace: root.to_owned(),
             bounds,
             disposition: RecordedRevocationDisposition::Complete,
