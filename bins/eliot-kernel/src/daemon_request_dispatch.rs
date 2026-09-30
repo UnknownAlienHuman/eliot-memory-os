@@ -4264,8 +4264,10 @@ impl KernelComposition {
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let receipt = host_request_route::host_request_receipt_from_payload(payload)?;
                 let record = self.rehydrate_host_request(&envelope, &receipt)?;
+                let stage = self.validated_original_staged_observe_submission(&record)?;
                 Ok(host_request_route::host_request_rehydrated_response(
                     &record,
+                    stage.as_ref(),
                 ))
             }
             "initialize_owner_revision" => {
