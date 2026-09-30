@@ -4753,7 +4753,11 @@ fn validate_observe_receipt_binding(
         .get("source_id")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(invalid)?;
-    let scope_ref = input.application_binding.scope_ref.as_ref().ok_or_else(invalid)?;
+    let scope_ref = input
+        .application_binding
+        .scope_ref
+        .as_ref()
+        .ok_or_else(invalid)?;
     let Some(work_scope) = record.scope_ref.as_ref() else {
         return Err(invalid());
     };
@@ -4763,13 +4767,14 @@ fn validate_observe_receipt_binding(
         .as_ref()
         .ok_or_else(invalid)?;
     write_binding.validate()?;
-    let binding_matches_original = write_binding_matches_token(write_binding, &original_reservation.token)
-        && write_binding.operation_id == record.operation_id
-        && write_binding.idempotency_key.as_str() == record.idempotency_key.as_str()
-        && write_binding.canonical_request_sha256 == receipt.canonical_request_hash
-        && write_binding.prepared_transition_sha256 == prepared_transition_sha256
-        && write_binding.operation_manifest_digest.as_str()
-            == receipt.operation_manifest_digest.as_str();
+    let binding_matches_original =
+        write_binding_matches_token(write_binding, &original_reservation.token)
+            && write_binding.operation_id == record.operation_id
+            && write_binding.idempotency_key.as_str() == record.idempotency_key.as_str()
+            && write_binding.canonical_request_sha256 == receipt.canonical_request_hash
+            && write_binding.prepared_transition_sha256 == prepared_transition_sha256
+            && write_binding.operation_manifest_digest.as_str()
+                == receipt.operation_manifest_digest.as_str();
     if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
         || receipt.operation_id.as_str() != record.operation_id.as_str()
         || receipt.idempotency_key != record.idempotency_key.as_str()
@@ -4804,8 +4809,7 @@ fn validate_observe_receipt_binding(
         || envelope.core.operation.idempotency_key != record.idempotency_key.as_str()
         || envelope.core.operation.state_fence != input.application_binding.state_fence
         || scope_ref != work_scope
-        || lineage.semantic_receipt_ref.as_deref()
-            != Some(envelope.identity.receipt_id.as_str())
+        || lineage.semantic_receipt_ref.as_deref() != Some(envelope.identity.receipt_id.as_str())
     {
         return Err(invalid());
     }
@@ -7940,7 +7944,11 @@ impl RedbRecoveryStore {
             let record: crate::HostRequestRecord = decode(value.value())?;
             record.validate()?;
             if key.value()
-                != format!("{}::{}", record.operation_id.as_str(), record.request_digest)
+                != format!(
+                    "{}::{}",
+                    record.operation_id.as_str(),
+                    record.request_digest
+                )
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "host_request",
@@ -10850,8 +10858,7 @@ impl RedbRecoveryStore {
             || current.phase != crate::HostRequestAttemptPhase::Claimed
             || !current.transport_observations.is_empty()
             || current.owner_readback.is_some()
-            || current.input_commitment_sha256.as_deref()
-                != Some(input.commitment_sha256.as_str())
+            || current.input_commitment_sha256.as_deref() != Some(input.commitment_sha256.as_str())
         {
             return Err(OrsError::InvalidTransition);
         }
@@ -11351,7 +11358,9 @@ impl RedbRecoveryStore {
             let payload = encode(&record)?;
             {
                 let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
-                table.insert(key.as_str(), payload.as_str()).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
             }
             write.commit().map_err(storage)?;
             return Ok(Some(record));
@@ -36048,8 +36057,7 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         &self,
         operation_id: &crate::OperationIdentity,
     ) -> Result<Option<ReservationRecord>, OrsError> {
-        self.store
-            .load_write_reservation_by_operation(operation_id)
+        self.store.load_write_reservation_by_operation(operation_id)
     }
 
     /// Retains one caller-reported missing-key/decryption-failure problem.
@@ -36689,18 +36697,12 @@ fn load_write_reservation_by_operation_in_read(
     let Some(reservation_id) = reservation_id else {
         return Ok(None);
     };
-    validate_write_reservation_operation_in_read(
-        &read,
-        operation_id.as_str(),
-        &reservation_id,
-    )?;
+    validate_write_reservation_operation_in_read(&read, operation_id.as_str(), &reservation_id)?;
     let reservation_id = OperationIdentity::new(reservation_id)?;
     let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
     let record = RedbRecoveryStore::load_record(&reservations, &reservation_id)?;
     drop(reservations);
-    if record.token.operation_id != *operation_id
-        || record.token.reservation_id != reservation_id
-    {
+    if record.token.operation_id != *operation_id || record.token.reservation_id != reservation_id {
         return Err(OrsError::IntegrityProblem {
             record_type: "reservation_operation_index",
             reason: "operation index differs from the primary reservation".to_owned(),

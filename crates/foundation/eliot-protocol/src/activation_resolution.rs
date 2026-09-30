@@ -12,9 +12,7 @@ use eliot_contracts::{StateFence, canonical_json_bytes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    AgentActivationResolutionTicket, AgentBridgePeerAdmissionReceipt, ProtocolError,
-};
+use crate::{AgentActivationResolutionTicket, AgentBridgePeerAdmissionReceipt, ProtocolError};
 
 pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-result";
@@ -411,16 +409,13 @@ impl AgentActivationObservationPolicyReadback {
         })
     }
 
-    pub fn application_identity(
-        &self,
-    ) -> Result<(&str, &str, Option<&str>), ProtocolError> {
+    pub fn application_identity(&self) -> Result<(&str, &str, Option<&str>), ProtocolError> {
         let origin = self.origin.as_object().ok_or(ProtocolError::InvalidField {
             field: "agent_activation_observation_policy_readback.origin",
             reason: "application-session origin must be an object",
         })?;
         if origin.len() != 4
-            || origin.get("kind").and_then(serde_json::Value::as_str)
-                != Some("APPLICATION_SESSION")
+            || origin.get("kind").and_then(serde_json::Value::as_str) != Some("APPLICATION_SESSION")
         {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_observation_policy_readback.origin.kind",
@@ -496,13 +491,13 @@ impl AgentActivationObservationHostPolicyReadback {
                 reason: "does not bind the exact owner projection value",
             });
         }
-        let origin = self
-            .owner_projection_value
-            .get("origin")
-            .ok_or(ProtocolError::InvalidField {
-                field: "agent_activation_observation_host_policy_readback.origin",
-                reason: "host-origin policy projection is required",
-            })?;
+        let origin =
+            self.owner_projection_value
+                .get("origin")
+                .ok_or(ProtocolError::InvalidField {
+                    field: "agent_activation_observation_host_policy_readback.origin",
+                    reason: "host-origin policy projection is required",
+                })?;
         if origin.get("kind").and_then(serde_json::Value::as_str) != Some("HOST_PEER")
             || origin.get("domain").and_then(serde_json::Value::as_str) != Some("AGENT_BRIDGE")
         {
@@ -511,19 +506,22 @@ impl AgentActivationObservationHostPolicyReadback {
                 reason: "must identify the exact AgentBridge host-origin domain",
             });
         }
-        let receipt_value = origin
-            .get("peer_admission_receipt")
-            .ok_or(ProtocolError::InvalidField {
+        let receipt_value = origin.get("peer_admission_receipt").ok_or(
+            ProtocolError::InvalidField {
                 field: "agent_activation_observation_host_policy_readback.peer_admission_receipt",
                 reason: "full original peer admission receipt is required",
-            })?;
-        let receipt: AgentBridgePeerAdmissionReceipt = serde_json::from_value(receipt_value.clone())
-            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+            },
+        )?;
+        let receipt: AgentBridgePeerAdmissionReceipt =
+            serde_json::from_value(receipt_value.clone())
+                .map_err(|error| ProtocolError::Json(error.to_string()))?;
         receipt.validate()?;
-        if self.owner_projection_value.get("state_fence") != Some(&serde_json::to_value(
-            &receipt.state_fence,
-        )
-        .map_err(|error| ProtocolError::Json(error.to_string()))?) {
+        if self.owner_projection_value.get("state_fence")
+            != Some(
+                &serde_json::to_value(&receipt.state_fence)
+                    .map_err(|error| ProtocolError::Json(error.to_string()))?,
+            )
+        {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_observation_host_policy_readback.state_fence",
                 reason: "must equal the full original peer receipt fence",
@@ -545,8 +543,9 @@ impl AgentActivationObservationHostPolicyReadback {
                 field: "agent_activation_observation_host_policy_readback.peer_admission_receipt",
                 reason: "full original peer admission receipt is required",
             })?;
-        let receipt: AgentBridgePeerAdmissionReceipt = serde_json::from_value(receipt_value.clone())
-            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let receipt: AgentBridgePeerAdmissionReceipt =
+            serde_json::from_value(receipt_value.clone())
+                .map_err(|error| ProtocolError::Json(error.to_string()))?;
         if receipt.receipt_sha256 != ticket.peer_admission_receipt_sha256
             || ticket.peer_admission_receipt.as_ref() != Some(&receipt)
             || receipt.state_fence != ticket.state_fence
@@ -563,15 +562,15 @@ impl AgentActivationObservationHostPolicyReadback {
 impl AgentActivationObservationPolicyReadback {
     /// Returns the exact Governor-owned value and digest after checking that
     /// the typed protocol mirror has not drifted from that projection.
-    pub fn validated_owner_projection(
-        &self,
-    ) -> Result<(&serde_json::Value, &str), ProtocolError> {
-        let mut mirrored = serde_json::to_value(self)
-            .map_err(|error| ProtocolError::Json(error.to_string()))?;
-        let object = mirrored.as_object_mut().ok_or(ProtocolError::InvalidField {
-            field: "agent_activation_observation_policy_readback.owner_projection",
-            reason: "typed owner projection must serialize as an object",
-        })?;
+    pub fn validated_owner_projection(&self) -> Result<(&serde_json::Value, &str), ProtocolError> {
+        let mut mirrored =
+            serde_json::to_value(self).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let object = mirrored
+            .as_object_mut()
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_observation_policy_readback.owner_projection",
+                reason: "typed owner projection must serialize as an object",
+            })?;
         object.remove("owner_projection_value");
         object.remove("owner_projection_sha256");
         if mirrored != self.owner_projection_value {
@@ -783,10 +782,7 @@ impl AgentActivationOwnerReadback {
         mut self,
         observation_policy: AgentActivationObservationPolicyReadback,
     ) -> Result<Self, ProtocolError> {
-        observation_policy.validate_against(
-            &self.evidence.binding,
-            &self.evidence.state_fence,
-        )?;
+        observation_policy.validate_against(&self.evidence.binding, &self.evidence.state_fence)?;
         self.observation_policy = Some(observation_policy);
         self.readback_sha256.clear();
         self.readback_sha256 = self.compute_digest()?;
@@ -818,10 +814,8 @@ impl AgentActivationOwnerReadback {
             kernel_owner.validate()?;
         }
         if let Some(observation_policy) = &self.observation_policy {
-            observation_policy.validate_against(
-                &self.evidence.binding,
-                &self.evidence.state_fence,
-            )?;
+            observation_policy
+                .validate_against(&self.evidence.binding, &self.evidence.state_fence)?;
         }
         lowercase_sha256(
             &self.readback_sha256,
