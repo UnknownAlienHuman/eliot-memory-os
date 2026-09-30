@@ -830,8 +830,9 @@ pub const LSP_RETAINED_OBSERVATION_SCHEMA_VERSION: u16 = 1;
 
 /// Exact source-owner facts attached to a retained observation receipt.
 /// Git scope is a source observation, not Kernel candidate admission;
-/// optional `CandidateIdentity`/`BuildFingerprint` values are retained only when
-/// their owning admission path supplied them.
+/// optional `CandidateIdentity`/`BuildFingerprint` values are correlation data
+/// only. This serialized projection does not authenticate candidate admission
+/// or establish immutable source-artifact ownership.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LspSourceBindingV1 {
@@ -841,9 +842,9 @@ pub struct LspSourceBindingV1 {
     pub source_scope_at_dispatch: Option<GovernedGitScope>,
     /// Independent source scope after process reconciliation.
     pub source_scope_after_run: Option<GovernedGitScope>,
-    /// Existing admitted candidate identity before launch, when supplied.
+    /// Candidate identity projection before launch, when supplied.
     pub candidate_identity_at_dispatch: Option<CandidateIdentity>,
-    /// Existing full build fingerprint before launch, when supplied.
+    /// Build fingerprint projection before launch, when supplied.
     pub build_fingerprint_at_dispatch: Option<BuildFingerprint>,
     /// Independently resolved candidate identity after run, when supplied.
     pub candidate_identity_after_run: Option<CandidateIdentity>,
@@ -1180,7 +1181,8 @@ pub struct RetainedLspObservationV1 {
 
 /// Independently supplied current expectations at a result-adoption boundary.
 /// Values must come from current task/source/executable owners, never from the
-/// retained envelope being checked.
+/// retained envelope being checked. They support exact comparison but do not
+/// replace original process or immutable source-artifact owner readback.
 pub struct CurrentLspAdoptionContext<'a> {
     /// Current source candidate selected by the task.
     pub source_candidate: &'a SourceCandidate,
@@ -1202,9 +1204,6 @@ pub struct CurrentLspAdoptionContext<'a> {
     pub registry_entry: &'a RegistryEntry,
     /// Current complete admitted instrument spec/parser identity.
     pub instrument_spec: &'a InstrumentSpec,
-    /// Independently retained original `ProcessStartReceipt`. Current
-    /// freshness is unavailable without this owner comparison.
-    pub expected_process_start: Option<&'a ProcessStartReceipt>,
 }
 
 /// Lookup outcome classified from an observation receipt (I10.8.6).
@@ -2101,14 +2100,42 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         })
     }
 
+    /// Reconciles the process through its original owner and captures one
+    /// immutable observation. The operation id is read only from the
+    /// non-serializable launch handle; caller-supplied or deserialized process
+    /// evidence is never used as the capture authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retain_reconciled_result(
+        &self,
+        started: &LspStartedInvocation,
+        raw_outputs: Vec<LspRawOutput>,
+        source_scope_after_run: Option<&GovernedGitScope>,
+        candidate_identity_after_run: Option<&CandidateIdentity>,
+        build_fingerprint_after_run: Option<&BuildFingerprint>,
+        invoked_at_unix_ms: u64,
+    ) -> Result<RetainedLspObservationV1, BridgeError> {
+        let operation = started.process_start.operation_id().clone();
+        let process_evidence = self.reconcile(&operation).await?;
+        validate_process_owner_readback(started, &process_evidence)?;
+        self.retain_result(
+            started,
+            process_evidence,
+            raw_outputs,
+            source_scope_after_run,
+            candidate_identity_after_run,
+            build_fingerprint_after_run,
+            invoked_at_unix_ms,
+        )
+    }
+
     /// Captures one reconciled analyzer invocation into its immutable
     /// retained observation. The bridge validates original raw artifacts and
     /// derives the only normalized result; callers cannot supply typed
     /// observations or receipts.
     #[allow(clippy::too_many_arguments)]
-    pub fn retain_result(
+    fn retain_result(
         &self,
-        started: LspStartedInvocation,
+        started: &LspStartedInvocation,
         process_evidence: ProcessEvidence,
         raw_outputs: Vec<LspRawOutput>,
         source_scope_after_run: Option<&GovernedGitScope>,
@@ -2180,51 +2207,60 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
             .source_candidate
             .reference_with_source_binding(&source_binding)?;
         result.receipt_mut().source_binding = Some(source_binding);
-        if capture_source_is_current(
-            started.source_scope_at_dispatch.as_ref(),
-            source_scope_after_run,
-            started.candidate_identity.as_ref(),
-            started.build_fingerprint.as_ref(),
-            candidate_identity_after_run,
-            build_fingerprint_after_run,
-        ) && source_artifact_can_claim_current(&started.operation)
-            && process_succeeded(process_completed, exit_code)
-            && !process_truncated
-            && matches!(&result.receipt().disposition, FailureDisposition::Success)
-        {
-            result.receipt_mut().freshness = Freshness::Current;
-        }
-        let LspStartedInvocation {
-            process_start: _,
-            instrument_invocation,
-            source_candidate,
-            source_scope_at_dispatch: _,
-            candidate_identity: _,
-            build_fingerprint: _,
-            config,
-            operation,
-            process_intent,
-            invocation_digest,
-            resolved_executable,
-            instrument_spec,
-            registry_identity,
-        } = started;
         Ok(RetainedLspObservationV1 {
             schema_version: LSP_RETAINED_OBSERVATION_SCHEMA_VERSION,
             receipt_kind: LSP_TOOL_OBSERVATION_RECEIPT_KIND.to_owned(),
-            operation,
-            config,
-            source_candidate,
-            instrument_invocation,
-            process_intent,
-            invocation_digest,
-            resolved_executable,
-            instrument_spec,
-            registry_identity,
+            operation: started.operation.clone(),
+            config: started.config.clone(),
+            source_candidate: started.source_candidate.clone(),
+            instrument_invocation: started.instrument_invocation.clone(),
+            process_intent: started.process_intent.clone(),
+            invocation_digest: started.invocation_digest.clone(),
+            resolved_executable: started.resolved_executable.clone(),
+            instrument_spec: started.instrument_spec.clone(),
+            registry_identity: started.registry_identity.clone(),
             process_evidence,
             raw_outputs,
             result,
         })
+    }
+
+    /// Reads one received immutable observation back against the original
+    /// process owner. The private start handle supplies the original
+    /// operation, full process binding, and invocation identity; a serialized
+    /// receipt in `record` cannot stand in for that handle. Source freshness
+    /// remains Stale until a current immutable source-artifact join is also
+    /// read back from its owner.
+    pub async fn adopt_received_result_from_owner(
+        &self,
+        record: RetainedLspObservationV1,
+        started: &LspStartedInvocation,
+        current: &CurrentLspAdoptionContext<'_>,
+    ) -> Result<NormalizedResult, BridgeError> {
+        validate_retained_record_matches_started(&record, started)?;
+        let operation = started.process_start.operation_id().clone();
+        let process_evidence = self.reconcile(&operation).await?;
+        validate_process_owner_readback(started, &process_evidence)?;
+        if record.process_evidence != process_evidence {
+            return Err(BridgeError::InconsistentBinding(
+                "received process evidence differs from original process-owner readback"
+                    .to_owned(),
+            ));
+        }
+
+        let owner_checked_current = CurrentLspAdoptionContext {
+            source_candidate: current.source_candidate,
+            source_scope: current.source_scope,
+            candidate_identity: current.candidate_identity,
+            build_fingerprint: current.build_fingerprint,
+            config: current.config,
+            operation: current.operation,
+            instrument_invocation: current.instrument_invocation,
+            resolved_executable: current.resolved_executable,
+            registry_entry: current.registry_entry,
+            instrument_spec: current.instrument_spec,
+        };
+        adopt_received_result(record, &owner_checked_current)
     }
 
     /// Validates and starts one exact analyzer invocation.
@@ -2335,10 +2371,10 @@ pub fn adopt_retained_observation(
     Ok(result)
 }
 
-/// Adopts one retained result against independently supplied current task,
-/// source, executable, registry, and parser expectations. A changed or
-/// unavailable source, executable, or profile keeps the normalized result
-/// useful as historical evidence but lowers freshness to Stale.
+/// Compares one retained result with current task, source, executable,
+/// registry, and parser expectations. The record remains Stale because those
+/// values cannot replace original process-owner reconciliation and an
+/// immutable source-artifact readback.
 pub fn adopt_received_result(
     record: RetainedLspObservationV1,
     current: &CurrentLspAdoptionContext<'_>,
@@ -2384,26 +2420,19 @@ pub fn adopt_received_result(
         .receipt()
         .source_binding
         .as_ref()
-        .is_some_and(|binding| {
-            source_binding_matches_current(binding, current)
-                && process_start_matches_expected(
-                    &binding.process_start,
-                    current.expected_process_start,
-                )
-        });
-
+        .is_some_and(|binding| source_binding_matches_current(binding, current));
     let mut result = record.result;
-    if executable_matches
-        && profile_matches
-        && source_matches
-        && bridge_result_is_current_candidate(&result)
-    {
-        result.receipt_mut().freshness = Freshness::Current;
-    } else {
-        result.receipt_mut().freshness = Freshness::Stale {
-            reason: "current source, executable, or admitted profile no longer matches the captured invocation".to_owned(),
-        };
-    }
+    result.receipt_mut().freshness = Freshness::Stale {
+        reason: if !executable_matches || !profile_matches {
+            "current executable or admitted profile differs from the captured invocation"
+                .to_owned()
+        } else if !source_matches {
+            "current source or admitted candidate identity differs from the captured invocation"
+                .to_owned()
+        } else {
+            "current source has no owner-read immutable source-artifact join".to_owned()
+        },
+    };
     Ok(result)
 }
 
@@ -2859,6 +2888,57 @@ fn validate_process_source_binding(
     Ok(())
 }
 
+fn validate_process_owner_readback(
+    started: &LspStartedInvocation,
+    evidence: &ProcessEvidence,
+) -> Result<(), BridgeError> {
+    started
+        .process_start
+        .validate()
+        .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+    evidence
+        .validate()
+        .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+    if evidence.binding() != started.process_start.binding()
+        || evidence.operation_id() != started.process_start.operation_id()
+        || evidence.request_digest() != started.invocation_digest
+        || started.process_start.request_digest() != started.invocation_digest
+        || started.process_start.operation_id() != started.process_intent.operation_id()
+        || started.process_start.accepted_generation().get()
+            != started.process_intent.generation().get()
+    {
+        return Err(BridgeError::ReceiptMismatch);
+    }
+    Ok(())
+}
+
+fn validate_retained_record_matches_started(
+    record: &RetainedLspObservationV1,
+    started: &LspStartedInvocation,
+) -> Result<(), BridgeError> {
+    if record.instrument_invocation != started.instrument_invocation
+        || record.source_candidate != started.source_candidate
+        || record.process_intent != started.process_intent
+        || record.invocation_digest != started.invocation_digest
+        || record.config != started.config
+        || record.operation != started.operation
+        || record.resolved_executable != started.resolved_executable
+        || record.instrument_spec != started.instrument_spec
+        || record.registry_identity != started.registry_identity
+        || record.process_evidence.binding() != started.process_start.binding()
+        || record.process_evidence.operation_id() != started.process_start.operation_id()
+        || record.process_evidence.request_digest() != started.invocation_digest
+        || started.process_start.request_digest() != started.invocation_digest
+        || started.process_start.accepted_generation().get()
+            != started.process_intent.generation().get()
+    {
+        return Err(BridgeError::InconsistentBinding(
+            "received observation differs from the original private launch handle".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_git_scope(scope: &GovernedGitScope) -> Result<(), BridgeError> {
     if scope.branch.trim().is_empty()
         || scope.branch.chars().any(char::is_control)
@@ -2949,19 +3029,6 @@ fn process_start_binding(
         operation_id: start.operation_id().as_str().to_owned(),
         request_digest: start.request_digest().to_owned(),
         accepted_generation: start.accepted_generation().get(),
-    })
-}
-
-fn process_start_matches_expected(
-    captured: &LspProcessStartBindingV1,
-    expected: Option<&ProcessStartReceipt>,
-) -> bool {
-    expected.is_some_and(|start| {
-        start.validate().is_ok()
-            && captured.schema_version == 1
-            && captured.operation_id == start.operation_id().as_str()
-            && captured.request_digest == start.request_digest()
-            && captured.accepted_generation == start.accepted_generation().get()
     })
 }
 
@@ -3462,14 +3529,6 @@ fn source_binding_matches_current(
                 .value()
         && binding.process_working_directory == current.source_candidate.workspace_root;
     scopes_match && identities_match && request_matches
-}
-
-fn bridge_result_is_current_candidate(result: &NormalizedResult) -> bool {
-    matches!(
-        result,
-        NormalizedResult::Diagnostics { .. } | NormalizedResult::Version { .. }
-    ) && matches!(&result.receipt().disposition, FailureDisposition::Success)
-        && !result.receipt().output_handles.is_empty()
 }
 
 fn source_artifact_can_claim_current(operation: &SemanticOperation) -> bool {

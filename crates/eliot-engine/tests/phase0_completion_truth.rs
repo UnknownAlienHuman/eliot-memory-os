@@ -319,6 +319,7 @@ fn accepted_candidate_evidence(
         work_item_id,
         base_commit: "phase0-base".to_owned(),
         worktree_head: Some("phase0-head".to_owned()),
+        source_snapshot: None,
         diff_hash: "phase0-diff-hash".to_owned(),
         diff_ref: format!("candidate-diff:{candidate_diff_id}"),
         changed_files: vec![changed_file.to_owned()],
