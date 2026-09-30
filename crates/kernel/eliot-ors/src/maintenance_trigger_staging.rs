@@ -415,6 +415,40 @@ fn bind_obligation_reference(
     Ok(())
 }
 
+/// Proves one staged trigger envelope is durably retained before intake ack.
+///
+/// Reads the envelope the intake record's delivery obligation names back
+/// through the existing owner and binds its identity and payload digest to
+/// the presented reference and hash. A missing envelope means the
+/// obligation names nothing durable — an inaccessible source reference is
+/// not a complete durable payload — and an identity or digest mismatch
+/// means the staged bytes are not the claimed content, so changed content
+/// conflicts instead of replaying. Any failure is a typed [`OrsError`]
+/// with no receipt: the producer keeps its retry identity (trigger
+/// identity, operation hash, source cursor) and its cursor must not
+/// advance. This proves staging only; ledger admission stays with the
+/// Kernel delivery ledger, which indexes delivery metadata alone.
+pub fn prove_maintenance_trigger_staging(
+    store: &impl OperationalRecoveryStore,
+    envelope_reference: &str,
+    payload_hash: &str,
+) -> Result<(), OrsError> {
+    let operation_id = OpaqueLabel::new(envelope_reference)?;
+    let staged = store
+        .get_envelope(&operation_id)?
+        .ok_or(OrsError::IntegrityProblem {
+            record_type: "maintenance_trigger_staging",
+            reason: "trigger delivery obligation names no staged envelope".to_owned(),
+        })?;
+    staged.validate()?;
+    if staged.operation_or_checkpoint_id.as_str() != envelope_reference
+        || staged.payload_sha256.as_str() != payload_hash
+    {
+        return Err(OrsError::PayloadIntegrityMismatch);
+    }
+    Ok(())
+}
+
 /// Derives the deterministic inbox item identity for one trigger.
 ///
 /// The same trigger identity always addresses the same inbox row, so an
