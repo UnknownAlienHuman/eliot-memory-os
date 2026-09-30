@@ -1194,21 +1194,16 @@ impl PresentationEchoAdmission {
     fn reject_liveness(
         &mut self,
         reason: impl Into<String>,
-    ) -> Result<
-        eliot_native_worker_core::AdmissionLivenessOutcome,
-        eliot_native_worker_core::ProviderFailure,
-    > {
+    ) -> eliot_native_worker_core::AdmissionLivenessOutcome {
         if let Ok(mut sealed) = self.sealed.lock() {
             *sealed = None;
         }
         if let Ok(mut binding) = self.lifecycle_binding.lock() {
             *binding = None;
         }
-        Ok(
-            eliot_native_worker_core::AdmissionLivenessOutcome::Rejected {
-                reason: reason.into(),
-            },
-        )
+        eliot_native_worker_core::AdmissionLivenessOutcome::Rejected {
+            reason: reason.into(),
+        }
     }
 
     /// Returns the exact admission facts this port returned, if it admitted.
@@ -1220,26 +1215,12 @@ impl PresentationEchoAdmission {
     pub fn sealed_admission(&self) -> Option<CapabilityAdmissionFacts> {
         self.sealed.lock().ok().and_then(|guard| guard.clone())
     }
-}
 
-impl Default for PresentationEchoAdmission {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmission {
-    fn admit(
+    fn clear_retained_admission(
         &mut self,
-        request: &eliot_native_worker_core::CapabilityAdmissionRequest,
-    ) -> Result<
-        eliot_native_worker_core::CapabilityAdmissionOutcome,
-        eliot_native_worker_core::ProviderFailure,
-    > {
-        use eliot_native_worker_core::{
-            AuthorityEnvelope, CapabilityAdmissionOutcome, NativeLifecycleBinding,
-            NativeWorkerExecutableExpectation, ProviderFailure,
-        };
+    ) -> Result<(), eliot_native_worker_core::ProviderFailure> {
+        use eliot_native_worker_core::ProviderFailure;
+
         *self.lifecycle_binding.lock().map_err(|_| {
             ProviderFailure::new(
                 "presentation-echo-admission",
@@ -1252,6 +1233,90 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
                 "admission observation lock poisoned",
             )
         })? = None;
+        Ok(())
+    }
+}
+
+impl Default for PresentationEchoAdmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn lifecycle_binding_and_join(
+    claim: &eliot_native_worker_core::NativeWorkerClaim,
+) -> Result<
+    (
+        eliot_native_worker_core::NativeLifecycleBinding,
+        &eliot_native_worker_core::NativeWorkerExecutableBinding,
+    ),
+    eliot_native_worker_core::ProviderFailure,
+> {
+    use eliot_native_worker_core::{NativeLifecycleBinding, ProviderFailure};
+
+    let lifecycle_binding = NativeLifecycleBinding {
+        claim_id: claim.claim_id.clone(),
+        attempt_id: claim.attempt_id.clone(),
+        operation_id: claim.operation_id.clone(),
+        worker_generation: claim.worker_generation,
+        route_class: claim.route_class.clone(),
+        predecessor_revision: claim.predecessor_revision.clone(),
+        authority_epoch: claim.authority_epoch.clone(),
+        state_fence: claim.state_fence.clone(),
+    };
+    let join = claim.executable_binding.as_ref().ok_or_else(|| {
+        ProviderFailure::new(
+            "presentation-echo-admission",
+            "admitted claim carries no executable join",
+        )
+    })?;
+    Ok((lifecycle_binding, join))
+}
+
+fn owner_bound_expiration(
+    claim: &eliot_native_worker_core::NativeWorkerClaim,
+    join: &eliot_native_worker_core::NativeWorkerExecutableBinding,
+    registration_lease_expires_at_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Result<u64, eliot_native_worker_core::ProviderFailure> {
+    use eliot_native_worker_core::ProviderFailure;
+
+    let expires_at = now_unix_ms
+        .saturating_add(60_000)
+        .min(claim.deadline_unix_ms)
+        .min(join.expires_at_unix_ms)
+        .min(registration_lease_expires_at_unix_ms);
+    if expires_at <= now_unix_ms {
+        return Err(ProviderFailure::new(
+            "presentation-echo-admission",
+            "the admitted claim has no remaining owner-bound lease window",
+        ));
+    }
+    Ok(expires_at)
+}
+
+fn admission_observation_time() -> Result<u64, eliot_native_worker_core::ProviderFailure> {
+    crate::dispatch_authority::now_unix_ms().map_err(|error| {
+        eliot_native_worker_core::ProviderFailure::new(
+            "presentation-echo-admission",
+            error.to_string(),
+        )
+    })
+}
+
+impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmission {
+    fn admit(
+        &mut self,
+        request: &eliot_native_worker_core::CapabilityAdmissionRequest,
+    ) -> Result<
+        eliot_native_worker_core::CapabilityAdmissionOutcome,
+        eliot_native_worker_core::ProviderFailure,
+    > {
+        use eliot_native_worker_core::{
+            AuthorityEnvelope, CapabilityAdmissionOutcome, NativeWorkerExecutableExpectation,
+            ProviderFailure,
+        };
+        self.clear_retained_admission()?;
         let presented = request.claim().ok_or_else(|| {
             ProviderFailure::new(
                 "presentation-echo-admission",
@@ -1262,25 +1327,8 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
             ProviderFailure::new("presentation-echo-admission", error.to_string())
         })?;
         let claim = presented.claim();
-        let lifecycle_binding = NativeLifecycleBinding {
-            claim_id: claim.claim_id.clone(),
-            attempt_id: claim.attempt_id.clone(),
-            operation_id: claim.operation_id.clone(),
-            worker_generation: claim.worker_generation,
-            route_class: claim.route_class.clone(),
-            predecessor_revision: claim.predecessor_revision.clone(),
-            authority_epoch: claim.authority_epoch.clone(),
-            state_fence: claim.state_fence.clone(),
-        };
-        let join = claim.executable_binding.as_ref().ok_or_else(|| {
-            ProviderFailure::new(
-                "presentation-echo-admission",
-                "admitted claim carries no executable join",
-            )
-        })?;
-        let now = crate::dispatch_authority::now_unix_ms().map_err(|error| {
-            ProviderFailure::new("presentation-echo-admission", error.to_string())
-        })?;
+        let (lifecycle_binding, join) = lifecycle_binding_and_join(claim)?;
+        let now = admission_observation_time()?;
         let digest = claim.binding_digest.clone();
         let epoch_value = serde_json::to_value(&claim.authority_epoch).map_err(|error| {
             ProviderFailure::new("presentation-echo-admission", error.to_string())
@@ -1311,20 +1359,12 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
         authority.validate().map_err(|error| {
             ProviderFailure::new("presentation-echo-admission", error.to_string())
         })?;
-        // The local grant may not outlive any owner-presented boundary. The
-        // cap is the earliest of the claim deadline, executable binding,
-        // registration lease, and the short in-process observation window.
-        let expires_at = now
-            .saturating_add(60_000)
-            .min(claim.deadline_unix_ms)
-            .min(join.expires_at_unix_ms)
-            .min(presented.registration().lease_expires_at_unix_ms);
-        if expires_at <= now {
-            return Err(ProviderFailure::new(
-                "presentation-echo-admission",
-                "the admitted claim has no remaining owner-bound lease window",
-            ));
-        }
+        let expires_at = owner_bound_expiration(
+            claim,
+            join,
+            presented.registration().lease_expires_at_unix_ms,
+            now,
+        )?;
         let facts = CapabilityAdmissionFacts::new(
             format!("native-worker-admission-{digest}"),
             "1",
@@ -1384,11 +1424,11 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
         };
         let sealed = match sealed_read {
             Ok(Some(sealed)) => sealed,
-            Ok(None) => return self.reject_liveness("no retained admission to revalidate"),
+            Ok(None) => return Ok(self.reject_liveness("no retained admission to revalidate")),
             Err(()) => {
-                return self.reject_liveness(
+                return Ok(self.reject_liveness(
                     "retained admission lock poisoned; Kernel liveness was not established",
-                );
+                ));
             }
         };
         let lifecycle_binding_read = {
@@ -1399,11 +1439,13 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
         };
         let lifecycle_binding = match lifecycle_binding_read {
             Ok(Some(lifecycle_binding)) => lifecycle_binding,
-            Ok(None) => return self.reject_liveness("no retained claim identity to revalidate"),
+            Ok(None) => {
+                return Ok(self.reject_liveness("no retained claim identity to revalidate"));
+            }
             Err(()) => {
-                return self.reject_liveness(
+                return Ok(self.reject_liveness(
                     "retained claim identity lock poisoned; Kernel liveness was not established",
-                );
+                ));
             }
         };
         if request.admission_id() != sealed.admission_id()
@@ -1416,39 +1458,38 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
             || lifecycle_binding.authority_epoch != sealed.authority().epoch
             || lifecycle_binding.state_fence != sealed.authority().state_fence
         {
-            return self.reject_liveness(
+            return Ok(self.reject_liveness(
                 "liveness request does not match the retained claim and admission",
-            );
+            ));
         }
 
         let observed_at = match crate::dispatch_authority::now_unix_ms() {
             Ok(observed_at) if observed_at < sealed.expires_at_unix_ms() => observed_at,
             Ok(_) => {
-                return self.reject_liveness(
+                return Ok(self.reject_liveness(
                     "retained owner-bound lease expired before liveness revalidation",
-                );
+                ));
             }
-            Err(error) => return self.reject_liveness(error.to_string()),
+            Err(error) => return Ok(self.reject_liveness(error.to_string())),
         };
 
         if let Some(owner_liveness) = &self.owner_liveness {
             static NEXT_HEARTBEAT_SEQUENCE: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(1);
-            let sequence = match NEXT_HEARTBEAT_SEQUENCE.fetch_update(
+            let Ok(sequence) = NEXT_HEARTBEAT_SEQUENCE.fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |next| next.checked_add(1),
-            ) {
-                Ok(sequence) => sequence,
-                Err(_) => {
-                    return self.reject_liveness("Kernel liveness identity sequence is exhausted");
-                }
+            ) else {
+                return Ok(
+                    self.reject_liveness("Kernel liveness identity sequence is exhausted"),
+                );
             };
             let heartbeat_id = match NativeHeartbeatId::new(format!(
                 "native-worker-heartbeat-{observed_at}-{sequence}"
             )) {
                 Ok(heartbeat_id) => heartbeat_id,
-                Err(error) => return self.reject_liveness(error.to_string()),
+                Err(error) => return Ok(self.reject_liveness(error.to_string())),
             };
             let heartbeat = NativeHeartbeatEnvelope {
                 heartbeat_id,
@@ -1456,12 +1497,14 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
                 observed_at_unix_ms: observed_at,
             };
             if let Err(error) = owner_liveness.submit_heartbeat(&heartbeat) {
-                return self.reject_liveness(format!(
+                return Ok(self.reject_liveness(format!(
                     "Kernel refused exact native-worker liveness: {error}"
-                ));
+                )));
             }
         } else {
-            return self.reject_liveness("authenticated Kernel liveness transport is missing");
+            return Ok(
+                self.reject_liveness("authenticated Kernel liveness transport is missing"),
+            );
         }
 
         Ok(AdmissionLivenessOutcome::Live(AdmissionLivenessFacts::new(
