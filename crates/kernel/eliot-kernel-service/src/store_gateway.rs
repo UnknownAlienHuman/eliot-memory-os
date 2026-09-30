@@ -5693,7 +5693,13 @@ impl KernelStoreGateway {
         revision: &UserAutomationRevision,
         publication: &UserAutomationWakeHorizonPublication,
         runtime: Option<&R>,
-    ) -> Result<(Option<UserAutomationRuntimeObligation>, UserAutomationHorizonPhase), String>
+    ) -> Result<
+        (
+            Option<UserAutomationRuntimeObligation>,
+            UserAutomationHorizonPhase,
+        ),
+        String,
+    >
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
@@ -5708,8 +5714,9 @@ impl KernelStoreGateway {
         // this principal and fence. A revision that a concurrent pause,
         // remove, or superseding edit already moved is not published from a
         // stale commit: that leg owns the wake disposition instead.
-        if let Err((kind, reason)) =
-            self.revalidate_horizon_owner(sealed, revision, publication).await
+        if let Err((kind, reason)) = self
+            .revalidate_horizon_owner(sealed, revision, publication)
+            .await
         {
             return Ok((
                 None,
@@ -5846,7 +5853,13 @@ impl KernelStoreGateway {
         resolution: &UserAutomationDueWakeResolution,
         publication: &UserAutomationWakeHorizonPublication,
         runtime: &R,
-    ) -> Result<(Option<UserAutomationRuntimeObligation>, UserAutomationHorizonPhase), String>
+    ) -> Result<
+        (
+            Option<UserAutomationRuntimeObligation>,
+            UserAutomationHorizonPhase,
+        ),
+        String,
+    >
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
