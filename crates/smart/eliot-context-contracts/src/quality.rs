@@ -195,13 +195,178 @@ pub struct QualityDimensionResult {
     pub binding: ContextBinding,
 }
 
+/// One recorded owner dependency whose change invalidates a recorded grade.
+///
+/// Every variant names ONE existing owner record and names the recorded field
+/// of THAT record which is compared, on the graded side and on the current
+/// side. No variant introduces a revision, a counter or a registry: each one
+/// reads a value the packet already carries, and each side of the comparison
+/// is read from a different record. Nothing is recomputed and re-compared
+/// against a string this module made up.
+///
+/// | Reason | Graded under | Now carries |
+/// |---|---|---|
+/// | `Route` | [`QualityOutputBinding::route_id`] | [`crate::SerializedContextMeasurement::route_id`] |
+/// | `GoverningInstruction` | [`QualityOutputBinding::recipe_digest`] | `Recipe::decision.recipe_revision` (the governing policy revision) |
+/// | `Source` | [`QualityOutputBinding::evidence_revisions`] | `Measurement::sources` (each admitted `SourceSnapshot`) |
+/// | `Task` | [`ContextBinding::task_id`] | the same field on the observed binding |
+/// | `Verifier` | [`QualityDimensionResult::rule_revision`] | `Measurement::verifier_rule_revisions` for that dimension |
+///
+/// The three identity reasons are bound to already-existing check points,
+/// which is why the route/serializer identity of a card is now compared with
+/// the route identity of the packet it graded rather than only bounded:
+///
+/// * `Route` — [`crate::SerializedContextMeasurement::validate`] already
+///   reads `route_id`, but nothing read it from the *card*. Now it does.
+/// * `GoverningInstruction` — [`ContextRecipe::decision`] already carries the
+///   governing policy revision and was already required to agree with the
+///   binding, but the card never named it. Now it does, so a card graded
+///   under an earlier governing revision is detected rather than accepted.
+/// * `Source` / `Verifier` — the measurement is the record that already owns
+///   the route identity, and it now records which source snapshots that route
+///   served from and which verifier revision was in force per dimension.
+/// * `Task` — the route is not task-bound by its own recorded policy, so this
+///   one is bound to the card's own `ContextBinding`, which is compared
+///   re-observation by re-evaluation rather than by a route-level check.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QualityInvalidationReason {
+    /// The packet is compiled for a different route than the grade was taken
+    /// under.
+    Route,
+    /// The governing policy revision under which the packet was compiled
+    /// differs from the one the grade was taken under.
+    GoverningInstruction,
+    /// The route no longer reads the source revision the grade was read from.
+    Source,
+    /// The task identity differs between the graded binding and the observed
+    /// one.
+    Task,
+    /// The verifier contract revision in force for the dimension differs from
+    /// the one that produced this grade.
+    Verifier,
+}
+
+impl QualityInvalidationReason {
+    /// The five invalidation reasons, in canonical order.
+    ///
+    /// This constant is the independent denominator of the invalidation rule:
+    /// it is declared here, not supplied by the caller whose reasons are being
+    /// checked, so a caller cannot narrow the rule by evaluating fewer of them.
+    pub const INVALIDATION_REASONS: [Self; 5] = [
+        Self::Route,
+        Self::GoverningInstruction,
+        Self::Source,
+        Self::Task,
+        Self::Verifier,
+    ];
+
+    /// The wire spelling of this reason, used in the retained handle so a
+    /// reader can name the reason without the enum.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Route => "ROUTE",
+            Self::GoverningInstruction => "GOVERNING_INSTRUCTION",
+            Self::Source => "SOURCE",
+            Self::Task => "TASK",
+            Self::Verifier => "VERIFIER",
+        }
+    }
+}
+
+/// One observed invalidation: which recorded owner dependency differs, the
+/// recorded value the grade was taken under, and the recorded value it now
+/// carries.
+///
+/// Both sides are values the owners already hold, read from two different
+/// records. This type stores the observation; it never decides it. The
+/// decision is made once, by the owner of the records being compared — see
+/// [`crate::SerializedContextMeasurement::recorded_invalidation`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QualityInvalidation {
+    /// Which recorded owner dependency changed.
+    pub reason: QualityInvalidationReason,
+    /// The dimension whose recorded grade the change invalidates.
+    pub dimension: QualityDimension,
+    /// The recorded owner value the grade was taken under.
+    pub graded_value: String,
+    /// The recorded owner value it now carries.
+    pub current_value: String,
+}
+
+impl QualityInvalidation {
+    /// Validate that this names a real reason, a real dimension and a real
+    /// recorded difference.
+    fn validate(&self) -> Result<(), ContextError> {
+        if !QualityInvalidationReason::INVALIDATION_REASONS.contains(&self.reason) {
+            return Err(ContextError::InvalidField("quality.invalidation.reason"));
+        }
+        if !QUALITY_DIMENSIONS.contains(&self.dimension) {
+            return Err(ContextError::InvalidField("quality.invalidation.dimension"));
+        }
+        crate::validate_text(&self.graded_value, "quality.invalidation.graded_value")?;
+        crate::validate_text(&self.current_value, "quality.invalidation.current_value")?;
+        // An invalidation that records no difference is not an observation. It
+        // is refused rather than retained, so a card cannot carry an
+        // invalidation that re-checks to nothing.
+        if self.graded_value == self.current_value {
+            return Err(ContextError::InvalidField("quality.invalidation.values"));
+        }
+        Ok(())
+    }
+
+    /// The handle recorded on the result this came from.
+    ///
+    /// It is derived from the two recorded values, so re-deriving it from the
+    /// records that produced it yields the same handle and a different pair of
+    /// values cannot reuse it.
+    fn handle(&self) -> Result<ArtifactId, ContextError> {
+        self.validate()?;
+        ArtifactId::new(format!(
+            "quality-invalidation:{}:{}:{}:{}",
+            self.reason.as_str(),
+            self.dimension.as_str(),
+            self.graded_value,
+            self.current_value
+        ))
+        .map_err(|_| ContextError::InvalidField("quality.invalidation.handle"))
+    }
+}
+
+impl QualityDimension {
+    /// The wire spelling of this dimension, used in the retained handle so a
+    /// reader can name the dimension without the enum.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptanceDecisionCoverage => "ACCEPTANCE_DECISION_COVERAGE",
+            Self::CausalOperationalSufficiency => "CAUSAL_OPERATIONAL_SUFFICIENCY",
+            Self::ExactAnchorProvenanceCoverage => "EXACT_ANCHOR_PROVENANCE_COVERAGE",
+            Self::FreshnessStateFenceCoherence => "FRESHNESS_STATE_FENCE_COHERENCE",
+            Self::RivalsConflictsUnknownsVisibility => "RIVALS_CONFLICTS_UNKNOWNS_VISIBILITY",
+            Self::NegativeMemoryInvariantCoverage => "NEGATIVE_MEMORY_INVARIANT_COVERAGE",
+            Self::VerifierActionReadiness => "VERIFIER_ACTION_READINESS",
+            Self::RouteAccessibilityLayoutRisk => "ROUTE_ACCESSIBILITY_LAYOUT_RISK",
+            Self::InstructionSufficiency => "INSTRUCTION_SUFFICIENCY",
+            Self::PayloadHandleReconstructionCost => "PAYLOAD_HANDLE_RECONSTRUCTION_COST",
+            Self::KnownOmissionsExpansionPaths => "KNOWN_OMISSIONS_EXPANSION_PATHS",
+            Self::TelemetryMeasurementCostCoverage => "TELEMETRY_MEASUREMENT_COST_COVERAGE",
+        }
+    }
+}
+
 impl QualityDimensionResult {
     /// Whether this result is a current observed pass.
     ///
     /// A result that carries an invalidation handle has been invalidated by a
-    /// route, governing-instruction, source, task or verifier change, so it is a
-    /// historical grade and never a current one. The record itself stays on the
-    /// card, so the evidence it was read from is still retained and visible.
+    /// route, governing-instruction, source, task or verifier change, so it is
+    /// a historical grade and never a current one. The record itself stays on
+    /// the card, so the evidence it was read from is still retained and
+    /// visible.
     #[must_use]
     pub fn is_current_pass(&self) -> bool {
         self.invalidation.is_none() && self.state.is_pass()
@@ -618,6 +783,62 @@ impl QualityScorecard {
             .results
             .iter()
             .all(QualityDimensionResult::is_current_pass))
+    }
+
+    /// Mark every recorded grade named by `observed`, and return those exact
+    /// results.
+    ///
+    /// This is the only place the five [`QualityInvalidationReason`]
+    /// dependencies are turned into a recorded handle, and it is reached
+    /// through [`crate::SerializedContextMeasurement::reevaluate_against`], the
+    /// measurement owner, so both sides of every comparison are that owner's
+    /// recorded values and nothing is recomputed here.
+    ///
+    /// `None` is returned when the card is already untouched by `observed`: the
+    /// card is then left exactly as it was, so a re-evaluation that finds
+    /// nothing new never rewrites history. A result that already carries an
+    /// invalidation keeps the first handle, because a second, later
+    /// observation is not a second reason to discard evidence the card already
+    /// explains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if the card does not validate, or if an
+    /// invalidation naming a dimension this card does not carry was supplied,
+    /// so an invalidation can never be recorded against a result that is not
+    /// there.
+    pub(crate) fn mark_invalidated(
+        &mut self,
+        observed: &[QualityInvalidation],
+    ) -> Result<Option<Vec<QualityDimensionResult>>, ContextError> {
+        self.validate()?;
+        for invalidation in observed {
+            invalidation.validate()?;
+        }
+        let mut invalidated = Vec::new();
+        for invalidation in observed {
+            let Some(result) = self
+                .results
+                .iter_mut()
+                .find(|result| result.dimension == invalidation.dimension)
+            else {
+                return Err(ContextError::InvalidField(
+                    "quality.invalidation.dimension",
+                ));
+            };
+            if result.invalidation.is_some() {
+                continue;
+            }
+            result.invalidation = Some(invalidation.handle()?);
+            invalidated.push(result.clone());
+        }
+        if invalidated.is_empty() {
+            return Ok(None);
+        }
+        // The card is read back through its own validation, so a stored
+        // invalidation can never leave the card in a state its owner rejects.
+        self.validate()?;
+        Ok(Some(invalidated))
     }
 
     /// Check suitability for one requested dependent decision or effect.
