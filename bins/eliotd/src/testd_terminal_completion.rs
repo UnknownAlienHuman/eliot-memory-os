@@ -583,8 +583,7 @@ pub async fn commit_testd_terminal_owner_fact(
     let evidence_leg = {
         let mut guard = composition.lock().await;
         guard.accept_testd_terminal_owner_fact(fact)?;
-        guard
-            .refresh_testd_terminal_owner()?;
+        guard.refresh_testd_terminal_owner()?;
         let task_id = TaskId::new(plan.finish_draft.task_id.clone()).map_err(|error| {
             completion_error(format!("finish draft names an invalid task: {error}"))
         })?;

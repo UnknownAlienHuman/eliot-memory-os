@@ -2795,8 +2795,10 @@ pub enum AcceptanceDenominatorError {
     /// Reported item by item, never as a count alone, so the mismatch names
     /// exactly which obligations each side claims.
     #[error(
-        "the canonical plan declares {plan_only} acceptance item(s) the contract owner does not \
-         require, and omits {owner_only} obligation(s) it does"
+        "the canonical plan declares {} acceptance item(s) the contract owner does not \
+         require, and omits {} obligation(s) it does",
+        plan_only.len(),
+        owner_only.len()
     )]
     PlanDisagreesWithContract {
         /// Obligations the plan declares that the contract owner does not require.

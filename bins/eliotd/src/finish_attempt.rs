@@ -81,11 +81,9 @@ fn finish_rejection_cause(error: &FinishAttemptError) -> (AgentResponseDispositi
         // `DECISION_CONTEXT_INCOMPLETE` refusal as a rehydrated owner state that
         // does not validate — never a degraded success and never the plan's own
         // list.
-        FinishAttemptError::AcceptanceDenominator(_) => (
-            AgentResponseDisposition::Failed,
-            "DECISION_CONTEXT_INCOMPLETE",
-        ),
-        FinishAttemptError::Finish(_) | FinishAttemptError::Serialization(_) => (
+        FinishAttemptError::AcceptanceDenominator(_)
+        | FinishAttemptError::Finish(_)
+        | FinishAttemptError::Serialization(_) => (
             AgentResponseDisposition::Failed,
             "DECISION_CONTEXT_INCOMPLETE",
         ),

@@ -26,8 +26,7 @@ use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationManifestDigest, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
     ScopeId, SecurityContext, StoreFailure, TaskContractAcceptanceSet, TransitionClass,
-    WriteReceipt, WriteReceiptStatus, generated_operation_manifests,
-    operation_manifest_set_digest,
+    WriteReceipt, WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
 };
 use eliot_task::{TaskCommand, TaskLifecycleOwner, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -38,9 +37,9 @@ use thiserror::Error;
 
 use crate::{
     AcceptanceDenominatorError, CanonicalAdmissionOwner, CanonicalAdmissionSnapshot,
-    CanonicalFinishEvidence, CanonicalPlanBinding, CanonicalVerifierExecutionFact, CompositionError,
-    GovernorOwners, KernelPortError, KernelTransitionPort, acceptance_coverage_from_verifier_fact,
-    evaluate_testd_verification_current,
+    CanonicalFinishEvidence, CanonicalPlanBinding, CanonicalVerifierExecutionFact,
+    CompositionError, GovernorOwners, KernelPortError, KernelTransitionPort,
+    acceptance_coverage_from_verifier_fact, evaluate_testd_verification_current,
 };
 
 /// The Governor's own canonical store scope identity.
@@ -702,7 +701,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     /// Rehydrates the contract owner's exact `TaskContract` acceptance-item
     /// enumeration for one finish candidate (issue #1741, I7.9).
     ///
-    /// I7.9 requires the Finish service to rehydrate the current TaskContract
+    /// I7.9 requires the Finish service to rehydrate the current `TaskContract`
     /// and its acceptance items. The canonical plan enumerates the obligations a
     /// plan *declares*, and the task-selection evidence carries an acceptance
     /// identity that is caller-stated at intake (or `sha256_hex` over the task
@@ -1107,13 +1106,8 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical task does not match the current canonical plan".to_owned(),
             )));
         }
-        let produced = self.produce_finish_evidence(
-            &task_id,
-            task,
-            &fence,
-            &plan,
-            contract_acceptance_set,
-        )?;
+        let produced =
+            self.produce_finish_evidence(&task_id, task, &fence, &plan, contract_acceptance_set)?;
         if self
             .canonical
             .read_finish_evidence(&fence)

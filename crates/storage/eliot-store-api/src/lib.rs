@@ -3867,10 +3867,7 @@ impl TaskContractAcceptanceSet {
     /// obligations exist, never whether any of them is satisfied.
     #[must_use]
     pub fn item_ids(&self) -> BTreeSet<String> {
-        self.items
-            .iter()
-            .map(|item| item.item_id.clone())
-            .collect()
+        self.items.iter().map(|item| item.item_id.clone()).collect()
     }
 
     /// Validates the closed owner payload: the exact task id and a non-zero
@@ -3949,9 +3946,7 @@ pub fn task_contract_acceptance_read_request(
             reason: "must be a non-zero task revision",
         });
     }
-    state_fence
-        .validate()
-        .map_err(StoreError::Foundation)?;
+    state_fence.validate().map_err(StoreError::Foundation)?;
     let parameters = BTreeMap::from([
         (
             "task_id".to_owned(),
