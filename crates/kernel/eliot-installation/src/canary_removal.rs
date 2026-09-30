@@ -545,8 +545,12 @@ impl CanaryRemovalPlan {
         {
             return Err(InstallationError::IdentityConflict);
         }
+        // The removal identity is a pure function of the original installed
+        // transaction and the target generation, so a plan whose identity was
+        // derived from different inputs is a conflict; the matching identity
+        // is the honest one by construction.
         if self.removal_transaction_id
-            == canary_removal_operation_id(&self.install_transaction_id, &self.generation)?
+            != canary_removal_operation_id(&self.install_transaction_id, &self.generation)?
         {
             return Err(InstallationError::IdentityConflict);
         }
