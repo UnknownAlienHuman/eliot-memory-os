@@ -1233,9 +1233,11 @@ fn check_verified_binds_intake(
         || material.worker_generation != claimed.worker_generation
         || !fences_match_exact(&material.presented_fence, &claimed.presented_fence)
     {
-        return Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(
-            "owner-verified binding does not bind this solo intake".to_owned(),
-        )));
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "owner-verified binding does not bind this solo intake".to_owned(),
+            ),
+        ));
     }
     Ok(())
 }
@@ -1292,9 +1294,11 @@ fn check_dispatch_record(
         || record.executable_digest != material.executable_digest
         || record.worker_generation != material.worker_generation
     {
-        return Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(
-            "solo dispatch record does not bind the consumed material".to_owned(),
-        )));
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo dispatch record does not bind the consumed material".to_owned(),
+            ),
+        ));
     }
     if record.deadline_unix_ms == 0 || record.deadline_unix_ms <= crate::unix_ms() {
         return Err(DaemonError::ProviderAdmission(FabricError::Contract(
