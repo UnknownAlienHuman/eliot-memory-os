@@ -3342,6 +3342,21 @@ impl UserAutomationQuery {
     }
 }
 
+/// The only disposition spellings a [`UserAutomationOperation::DecideImprovementBrief`]
+/// may carry.
+///
+/// These are exactly the four dispositions I12.24:65 names for the decision
+/// owner - "decision owner selects reject / investigate / work item /
+/// experiment" - written in the `snake_case` serde spelling the improvement
+/// owner's `OwnerDecisionKind` uses. They are spelled as literals here because
+/// `eliot-kernel-core` has no `eliot-improvement` dependency edge and this
+/// crate must not acquire one: naming that Meta-owned enum on the Kernel
+/// operation boundary would pull project semantics into a crate that only
+/// validates authenticated shapes. The wire vocabulary is the contract here;
+/// the owner's enum stays its typed reading on the far side, and no fifth
+/// spelling is admissible from either side.
+const IMPROVEMENT_BRIEF_DECISIONS: [&str; 4] = ["reject", "investigate", "work_item", "experiment"];
+
 /// Closed Human/operator operation vocabulary for the UserAutomation surface.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -3419,6 +3434,31 @@ pub enum UserAutomationOperation {
         /// Stable automation identity.
         automation_id: String,
     },
+    /// Select a disposition for an owner-actionable improvement brief.
+    ///
+    /// This is the I12.24:65 decision-owner selection, "decision owner selects
+    /// reject / investigate / work item / experiment", issued by the
+    /// authenticated principal carried by [`UserAutomationOperatorIntent`]
+    /// (A12.2). It selects a disposition; it does not perform one.
+    ///
+    /// `reject` and `investigate` are the non-mutating dispositions and
+    /// authorize no change to anything. I12.24:3 states that ELIOT "never
+    /// silently rewrites code, policy or memory authority", and I12.24:82 makes
+    /// the advisory class "default; changes nothing until owner acts", so
+    /// recording either disposition is a record and no effect. `work_item` and
+    /// `experiment` are the mutable dispositions and are admitted here so the
+    /// Kernel dispatch owner has one closed vocabulary rather than a second
+    /// one; they reach effect only through the normal work-item/canary/rollback
+    /// flow of I12.24:90-91, never through this shape.
+    DecideImprovementBrief {
+        /// Stable brief identity of the brief being decided.
+        brief_id: String,
+        /// Selected disposition: `reject`, `investigate`, `work_item`, or
+        /// `experiment`.
+        decision: String,
+        /// Owner's own note on the disposition.
+        note: String,
+    },
 }
 
 impl UserAutomationOperation {
@@ -3459,6 +3499,24 @@ impl UserAutomationOperation {
                 text(automation_id, "operation.automation_id")?;
                 text(automation_revision, "operation.automation_revision")?;
                 text(nonce, "operation.nonce")
+            }
+            Self::DecideImprovementBrief {
+                brief_id,
+                decision,
+                note,
+            } => {
+                text(brief_id, "operation.brief_id")?;
+                text(decision, "operation.decision")?;
+                // The owner's own record constructor is the authority on the
+                // note: `record_owner_decision` refuses a blank one, because
+                // I12.24:74 makes "what remains unknown" a required part of
+                // what the owner decides on. A blank note is therefore refused
+                // here too rather than accepted and dropped later.
+                text(note, "operation.note")?;
+                if !IMPROVEMENT_BRIEF_DECISIONS.contains(&decision.as_str()) {
+                    return Err(UserAutomationError::Invalid("operation.decision"));
+                }
+                Ok(())
             }
         }
     }

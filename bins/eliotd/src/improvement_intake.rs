@@ -25,6 +25,18 @@ pub enum IntakeBridgeError {
 /// `reject` and `investigate` authorize no change; `work_item` and
 /// `experiment` route into the normal work-item/canary/rollback flow through
 /// the owning lanes. Recording itself mutates nothing.
+///
+/// # `owner` is the CALLER's claim, and this function proves nothing about it
+///
+/// [`record_owner_decision`] is a pure record constructor: it checks that
+/// `owner` is non-empty and copies it verbatim. It cannot tell a real principal
+/// from a fabricated one, so the value's integrity is entirely the caller's,
+/// and A12.02:3 — "Identity is not a model's self-declared string" — is
+/// discharged by the call site, not here. The single production caller,
+/// [`crate::improvement_intake_dispatch::assemble_improvement_artifact`],
+/// records the DAEMON's own triage under its own service identity and says so
+/// in the note; it does not name an owner that did not select the disposition,
+/// and it documents there why no owner's selection reaches this process today.
 pub fn record_brief_decision(
     brief: &ImprovementBrief,
     owner: &str,

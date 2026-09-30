@@ -7452,7 +7452,16 @@ fn schedule_horizon_trigger(
         | UserAutomationOperation::Pause { .. }
         | UserAutomationOperation::RunNow { .. }
         | UserAutomationOperation::Remove { .. }
-        | UserAutomationOperation::InspectLastFailure { .. } => None,
+        | UserAutomationOperation::InspectLastFailure { .. }
+        // A committed recurring wake horizon belongs to a committed AUTOMATION
+        // configuration revision, and the closed reason above names the
+        // revision transition that produced it. I12.24:65's decision-owner
+        // selection names no revision and schedules nothing: it records one
+        // disposition against one brief, and I12.24:82 makes the advisory class
+        // "default; changes nothing until owner acts", so there is no recurring
+        // schedule for it to own. `None` is the honest answer, and naming it
+        // here keeps the exclusion exhaustive rather than silent.
+        | UserAutomationOperation::DecideImprovementBrief { .. } => None,
     }
 }
 
