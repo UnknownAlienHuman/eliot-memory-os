@@ -24,7 +24,7 @@ use eliot_host::{
 };
 use eliot_host_state::HostState;
 #[cfg(windows)]
-use eliot_host_state::{ActivationState, WakeDisposition};
+use eliot_host_state::{ActivationState, ServiceSafetyClass, WakeDisposition};
 #[cfg(windows)]
 use eliot_installation::InstallationProfile;
 #[cfg(windows)]
@@ -2177,11 +2177,34 @@ impl HostIdleDrainSupervisor {
                 }
             }
             Ok(DrainWakeOutcome::QueueNextGeneration) => {
-                let _ = writeln!(
-                    io::stderr().lock(),
-                    "eliot-host: observable use arrived after DrainCommitRecord and was queued as the next activation generation"
-                );
-                Ok(DrainWakeOutcome::QueueNextGeneration)
+                // AUD6: the queued `Pending` intent is read back as the full
+                // owner-bound demand and observably published to the
+                // stopped-installation demand-start owner. A journal that
+                // dropped the just-queued demand fails the trigger instead
+                // of reporting a queued next generation nothing can fire;
+                // the cross-process scheduler arm itself is STITCH work (see
+                // `HostComposition::next_generation_wake_handoff`).
+                match host.next_generation_wake_handoff() {
+                    Ok(Some(demand)) => {
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: observable use arrived after DrainCommitRecord and was queued as the next activation generation; demand-start handoff retained: required={} safety={} schedule=earliest-deadline-expiry stitch=task-scheduler-host-wake",
+                            demand.required_capabilities.len(),
+                            match demand.safety_class {
+                                ServiceSafetyClass::ServiceSafe => "service-safe",
+                                ServiceSafetyClass::UserSessionRequired => {
+                                    "user-session-required"
+                                }
+                            },
+                        );
+                        Ok(DrainWakeOutcome::QueueNextGeneration)
+                    }
+                    Ok(None) => Err(HostError::OwnerLeaseRecovery(
+                        "queued next-generation wake demand is absent from the durable journal; the demand-start owner has nothing to fire"
+                            .to_owned(),
+                    )),
+                    Err(error) => Err(error),
+                }
             }
             Ok(DrainWakeOutcome::ReplayAlreadyConsumed) => {
                 // A delayed trigger of an already-consumed attempt is neither

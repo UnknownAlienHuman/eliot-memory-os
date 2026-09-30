@@ -114,6 +114,115 @@ pub const CAPABILITY_CANONICAL_STORE: &str = "canonical-store";
 /// Watchdog service to keep sensing.
 pub const CAPABILITY_INDEPENDENT_SUPERVISION: &str = "independent-supervision";
 
+/// I1.5 post-commit next-generation wake schedule policy.
+///
+/// A trigger queued after `DrainCommitRecord` is demand for a generation that
+/// does not exist yet, so its `WakeIntent` carries a real schedule the
+/// stopped-installation demand-start owner fires against (I1.5 "Background
+/// wake": a bounded maintenance command only from an admitted
+/// `WakeIntent`/policy, with budget, deadline and revalidation):
+///
+/// * `earliest_start` is the queue instant. The demand already arrived, so the
+///   next generation is eligible as soon as the committed generation's
+///   authority is fenced and its process descendants are terminated or
+///   reconciled — never before.
+/// * `deadline` is one I1.5 idle grace later ("DEFAULT idle grace is five
+///   minutes", a Config Default). A next generation that has not started by
+///   then is late: the installation would otherwise have gone idle again
+///   under the same grace.
+/// * `expiry` bounds the stale horizon. An intent no generation claimed by
+///   then is stale demand and must `EXPIRE` rather than execute (I1.5: stale
+///   intents are cancelled rather than executed because they were once
+///   queued), surfacing as the deduplicated manual entrypoint I1.5 requires
+///   when scheduling is unavailable instead of silently abandoned
+///   maintenance.
+///
+/// [`HostComposition::revalidate_pending_wakes`] consumes this schedule: it
+/// moves a past-expiry intent to `Expired` and leaves a not-yet-due intent
+/// `Pending`, for owner-spelled markers only. Any other wake family keeps its
+/// own policy untouched.
+pub const NEXT_GENERATION_WAKE_DEADLINE_MS: u64 = 5 * 60 * 1_000;
+/// Stale horizon of a post-commit next-generation `WakeIntent` in
+/// milliseconds. See the schedule policy on
+/// [`NEXT_GENERATION_WAKE_DEADLINE_MS`].
+pub const NEXT_GENERATION_WAKE_EXPIRY_MS: u64 = 60 * 60 * 1_000;
+
+/// Maintenance family spelling of a post-commit next-generation `WakeIntent`.
+///
+/// This exact spelling is the owner boundary: only wakes queued by the
+/// post-commit path carry it, so schedule enforcement and the demand-start
+/// handoff never reinterpret another wake family's records.
+pub const NEXT_GENERATION_WAKE_MAINTENANCE_FAMILY: &str = "demand-start-reconciliation";
+
+/// Marker prefixes of the post-commit next-generation wake schedule.
+///
+/// The markers stay opaque [`PlatformHandle`] strings (the journal never
+/// parses them), but their millisecond suffix is the policy above, so the
+/// demand-start owner and [`HostComposition::revalidate_pending_wakes`] can
+/// consume the same durable values the queue path wrote.
+const NEXT_GENERATION_WAKE_EARLIEST_PREFIX: &str = "wake-earliest:";
+/// See [`NEXT_GENERATION_WAKE_EARLIEST_PREFIX`].
+const NEXT_GENERATION_WAKE_DEADLINE_PREFIX: &str = "wake-deadline:";
+/// See [`NEXT_GENERATION_WAKE_EARLIEST_PREFIX`].
+const NEXT_GENERATION_WAKE_EXPIRY_PREFIX: &str = "wake-expiry:";
+
+/// Schedule verdict of one retained wake against the post-commit
+/// next-generation wake policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NextGenerationWakeSchedule {
+    /// The wake carries no schedule this owner wrote (another wake family or
+    /// an unparseable marker): the existing claim rule applies unchanged.
+    NoOwnerPolicy,
+    /// The demand already arrived but its earliest start is still in the
+    /// future: the intent stays `PENDING` with no row written.
+    NotDue,
+    /// The intent is due: the existing fence/capability claim rule decides.
+    Due,
+    /// The stale horizon passed: the intent must `EXPIRE` rather than execute.
+    Expired,
+}
+
+/// Reads one retained wake's schedule verdict without touching the journal.
+///
+/// Only wakes in [`NEXT_GENERATION_WAKE_MAINTENANCE_FAMILY`] with fully
+/// parseable owner-spelled millisecond markers receive a schedule verdict;
+/// every other wake — including the `UserAutomation` horizon family, whose
+/// markers name occurrence keys rather than instants — answers
+/// [`NextGenerationWakeSchedule::NoOwnerPolicy`] so its own policy stays
+/// untouched. A past expiry outranks a future earliest start: stale demand
+/// expires even when its window reads inconsistent.
+fn next_generation_wake_schedule_state(
+    wake: &WakeRecord,
+    now_ms: u64,
+) -> NextGenerationWakeSchedule {
+    if wake.maintenance_family.as_str() != NEXT_GENERATION_WAKE_MAINTENANCE_FAMILY {
+        return NextGenerationWakeSchedule::NoOwnerPolicy;
+    }
+    let Some(expiry_ms) = wake
+        .expiry
+        .as_str()
+        .strip_prefix(NEXT_GENERATION_WAKE_EXPIRY_PREFIX)
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+    else {
+        return NextGenerationWakeSchedule::NoOwnerPolicy;
+    };
+    if now_ms > expiry_ms {
+        return NextGenerationWakeSchedule::Expired;
+    }
+    let Some(earliest_ms) = wake
+        .earliest_start
+        .as_str()
+        .strip_prefix(NEXT_GENERATION_WAKE_EARLIEST_PREFIX)
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+    else {
+        return NextGenerationWakeSchedule::NoOwnerPolicy;
+    };
+    if now_ms < earliest_ms {
+        return NextGenerationWakeSchedule::NotDue;
+    }
+    NextGenerationWakeSchedule::Due
+}
+
 /// One I1.5 observable-use trigger class.
 ///
 /// The vocabulary is closed and frozen: it is the durable `trigger_class`
@@ -1105,6 +1214,36 @@ impl HostComposition {
         }))
     }
 
+    /// Returns the durable post-commit next-generation wake demand for the
+    /// stopped-installation demand-start owner.
+    ///
+    /// This is the owner handoff the post-commit path was missing: the full
+    /// retained [`WakeRecord`] — identity, required capabilities, schedule
+    /// window, safety class and fences — read back from the journal, never
+    /// reconstructed, so the owner fires only what the journal retains. Only
+    /// wakes queued by the post-commit path (see
+    /// [`NEXT_GENERATION_WAKE_MAINTENANCE_FAMILY`]) still `Pending` are
+    /// eligible; other wake families are never reinterpreted as
+    /// next-generation demand. The cross-process arm itself — the
+    /// installer-admitted Task Scheduler Host-wake registration firing
+    /// `StartService(eliot-host)`, consumed on startup as `ScheduledWake` —
+    /// is STITCH work outside this path scope: no general Host-wake
+    /// scheduler publisher exists in-tree (the only Task Scheduler route is
+    /// the fixed watchdog-fallback task, which cannot be reused for Host
+    /// wake), and this module creates no second scheduler or authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state cannot be read.
+    pub fn next_generation_wake_handoff(&self) -> Result<Option<WakeRecord>, HostError> {
+        let state = self.snapshot()?;
+        Ok(state.wakes.iter().find_map(|wake| {
+            (wake.intent.state == WakeIntentState::Pending
+                && wake.maintenance_family.as_str() == NEXT_GENERATION_WAKE_MAINTENANCE_FAMILY)
+                .then(|| wake.clone())
+        }))
+    }
+
     /// Returns the capability set this activation generation durably requires.
     ///
     /// I1.5 "start only the remaining capabilities required by the admitted
@@ -1135,10 +1274,17 @@ impl HostComposition {
     /// `CLAIMED`; anything else is `CANCELLED` rather than executed because it
     /// was once queued.
     ///
+    /// I1.5 background-wake schedule: a post-commit next-generation intent
+    /// additionally carries the queue path's earliest/deadline/expiry markers.
+    /// A past-expiry intent becomes `EXPIRED` (a legal journal edge) instead
+    /// of claimed or cancelled, and a not-yet-due intent is left `PENDING`
+    /// with no row written. Wakes outside this owner's maintenance family
+    /// keep their existing claim rule untouched.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the durable state cannot be read or the journal
-    /// rejects a transition.
+    /// Returns an error when the durable state cannot be read, the wall clock
+    /// cannot be read, or the journal rejects a transition.
     pub fn revalidate_pending_wakes(
         &mut self,
         activation: &EliotActivationRecord,
@@ -1160,8 +1306,38 @@ impl HostComposition {
             .iter()
             .map(|capability| (*capability).to_owned())
             .collect::<Vec<_>>();
+        // I1.5 background-wake schedule: the durable earliest/deadline/expiry
+        // markers the post-commit queue path wrote are consumed here, on the
+        // only path that may move a `PENDING` intent forward. The clock is
+        // read once for the whole pass; an unreadable clock fails the pass
+        // closed rather than claiming under an unproven schedule.
+        let now_ms = unix_millis()?;
         let mut claimed = 0_usize;
         for wake in pending {
+            match next_generation_wake_schedule_state(&wake, now_ms) {
+                NextGenerationWakeSchedule::NoOwnerPolicy => {}
+                NextGenerationWakeSchedule::NotDue => {
+                    // Eligible only once the committed generation's authority
+                    // is fenced. A `Pending -> Pending` edge does not exist,
+                    // so leaving the record untouched is the only honest
+                    // wait: no row is written for a demand whose time has not
+                    // come.
+                    continue;
+                }
+                NextGenerationWakeSchedule::Expired => {
+                    // Stale demand never executes because it was once queued:
+                    // `Pending -> Expired` is a legal journal edge, and the
+                    // obligation surfaces as the manual entrypoint rather
+                    // than a wake nothing may still claim.
+                    let mut next = wake.clone();
+                    next.operation = operation("host-wake-expiry")?;
+                    next.reason_evidence_refs.push(evidence.clone());
+                    next.intent.state = WakeIntentState::Expired;
+                    self.append_record(HostStateRecord::Wake(next))?;
+                    continue;
+                }
+                NextGenerationWakeSchedule::Due => {}
+            }
             let same_generation =
                 wake.fence.activation_generation == activation.fence.activation_generation;
             let same_authority = wake
@@ -1259,6 +1435,15 @@ impl HostComposition {
             .validate()
             .map_err(|error| HostError::Platform(error.to_string()))?;
         let now_ms = unix_millis()?;
+        // I1.5 background-wake schedule: the demand already arrived, so the
+        // intent is eligible as soon as the committed generation's authority
+        // is fenced (`earliest_start` is now); it is due within one idle
+        // grace (`deadline`) and stale past the bounded horizon (`expiry`),
+        // after which revalidation expires it instead of executing it.
+        // Saturating arithmetic keeps a far-future clock from wrapping the
+        // window into the past.
+        let deadline_ms = now_ms.saturating_add(NEXT_GENERATION_WAKE_DEADLINE_MS);
+        let expiry_ms = now_ms.saturating_add(NEXT_GENERATION_WAKE_EXPIRY_MS);
         let mut required_capabilities = Vec::with_capacity(trigger.requested_capabilities().len());
         for capability in trigger.requested_capabilities() {
             required_capabilities.push(
@@ -1282,14 +1467,18 @@ impl HostComposition {
             wake_id: wake_id.clone(),
             intent,
             reason_evidence_refs: vec![evidence.clone(), trigger_class],
-            earliest_start: PlatformHandle::new(format!("wake-earliest:{now_ms}"))
-                .map_err(|error| HostError::Platform(error.to_string()))?,
-            deadline: PlatformHandle::new(format!("wake-deadline:{now_ms}"))
-                .map_err(|error| HostError::Platform(error.to_string()))?,
-            expiry: PlatformHandle::new(format!("wake-expiry:{now_ms}"))
+            earliest_start: PlatformHandle::new(format!(
+                "{NEXT_GENERATION_WAKE_EARLIEST_PREFIX}{now_ms}"
+            ))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+            deadline: PlatformHandle::new(format!(
+                "{NEXT_GENERATION_WAKE_DEADLINE_PREFIX}{deadline_ms}"
+            ))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+            expiry: PlatformHandle::new(format!("{NEXT_GENERATION_WAKE_EXPIRY_PREFIX}{expiry_ms}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?,
             required_capabilities,
-            maintenance_family: PlatformHandle::new("demand-start-reconciliation")
+            maintenance_family: PlatformHandle::new(NEXT_GENERATION_WAKE_MAINTENANCE_FAMILY)
                 .map_err(|error| HostError::Platform(error.to_string()))?,
             safety_class: ServiceSafetyClass::ServiceSafe,
             state_fence_revalidation_ref,
