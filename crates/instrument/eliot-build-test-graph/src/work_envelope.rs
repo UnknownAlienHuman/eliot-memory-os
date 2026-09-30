@@ -27,7 +27,7 @@
 //!   input to real resource identity, not a recorded label: two lanes holding
 //!   different namespaces cannot touch one directory. That one method is the
 //!   workspace's ONLY composition of the pair — the Kernel-issued process
-//!   environment and the TestD owner's re-derivation of it both read it, which
+//!   environment and the `TestD` owner's re-derivation of it both read it, which
 //!   is what lets the two invocation digests this lane is gated on stay equal,
 //!   and it refuses a root that is not this lane's own directory under the
 //!   admitted fixture root rather than accepting any path whose last segment
@@ -632,7 +632,7 @@ impl GovernedWorkEnvelope {
     /// This is the workspace's ONLY composition of the pair. The Kernel-issued
     /// process environment
     /// ([`eliot_testd_core::TestdProcessToolIntent::validate_for_roots`]) and
-    /// the TestD owner's re-derivation of that same environment both read it
+    /// the `TestD` owner's re-derivation of that same environment both read it
     /// from the one retained envelope, so neither side adds these keys to its
     /// own map and the two invocation digests this lane is gated on stay
     /// comparable. The root it emits is required to be this lane's own

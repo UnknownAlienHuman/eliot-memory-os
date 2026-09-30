@@ -2101,12 +2101,12 @@ fn derive_dispatch_process_intent(
     // back to itself, refuses the launch rather than handing the child a
     // namespace that no longer names an exclusively-owned directory.
     for (key, value) in &fixture_environment {
-        if key == eliot_testd_core::FIXTURE_ROOT_ENV {
-            if std::fs::canonicalize(value).ok().as_deref() != Some(Path::new(value)) {
-                return Err(TestdError::Contract(
-                    "governed fixture root is not canonical".to_owned(),
-                ));
-            }
+        if key == eliot_testd_core::FIXTURE_ROOT_ENV
+            && std::fs::canonicalize(value).ok().as_deref() != Some(Path::new(value))
+        {
+            return Err(TestdError::Contract(
+                "governed fixture root is not canonical".to_owned(),
+            ));
         }
     }
     let tool_environment = bind_tool_environment_to_roots(
