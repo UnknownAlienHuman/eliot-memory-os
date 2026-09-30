@@ -309,7 +309,7 @@ pub enum KernelPortError {
     /// The owner could not prove a task selection for this request.
     #[error("task selection is required")]
     TaskSelectionRequired,
-    /// The selected task does not govern the observed WorkScope.
+    /// The selected task does not govern the observed `WorkScope`.
     #[error("task scope is incompatible")]
     TaskScopeIncompatible,
 }
@@ -1084,7 +1084,7 @@ pub struct ReadOwnerSnapshot {
     pub revision: u64,
 }
 
-fn is_sha256(value: &str) -> bool {
+pub(crate) fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -6972,6 +6972,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &self.owners.canonical,
             self.owners.policy.as_ref(),
             self.owners.work_scope.as_ref(),
+            Some(&self.owners.session),
             self.kernel.as_ref(),
             self.readiness,
         )
@@ -7025,11 +7026,63 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "Observe owner read is not at the exact retained request fence".to_owned(),
             ));
         }
-        if authenticated_principal_ref.trim().is_empty()
-            || authenticated_principal_ref.chars().any(char::is_control)
+        let session_id = identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .ok_or_else(|| {
+                CompositionError::Provider(
+                    "authenticated Observe request has no session binding".to_owned(),
+                )
+            })?;
+        let session_task_ref = self
+            .owners
+            .session
+            .session(session_id)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Session owner has no admitted Observe session".to_owned(),
+                )
+            })?
+            .task_scope
+            .clone();
+        if identity.request.metadata.task_id.is_some() {
+            return Err(CompositionError::Kernel(
+                KernelPortError::TaskSelectionRequired,
+            ));
+        }
+        self.observation_capture_owner_binding_for_refs(
+            authenticated_principal_ref,
+            session_id,
+            request_fence,
+            session_task_ref.as_deref(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Reads the request owner projection with task applicability from the
+    /// exact original validated `TaskSelectionAdmissionBinding`.
+    pub fn observation_capture_owner_binding_for_request_with_selection(
+        &self,
+        identity: &RequestIdentity,
+        authenticated_principal_ref: &str,
+        selection: &TaskSelectionAdmissionBinding,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        identity.validate().map_err(|error| {
+            CompositionError::Provider(format!("Observe request identity is invalid: {error}"))
+        })?;
+        let request_fence = &identity.request.metadata.state_fence;
+        if request_fence != &self.snapshot.state_fence()
+            || request_fence != &self.recovery.state_fence
         {
             return Err(CompositionError::Provider(
-                "authenticated Observe principal is invalid".to_owned(),
+                "Observe owner read is not at the exact retained request fence".to_owned(),
             ));
         }
         let session_id = identity
@@ -7042,15 +7095,161 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     "authenticated Observe request has no session binding".to_owned(),
                 )
             })?;
-        let session = self.owners.session.session(session_id).ok_or_else(|| {
-            CompositionError::Recovery("Session owner has no admitted Observe session".to_owned())
+        let session_task_ref = self
+            .owners
+            .session
+            .session(session_id)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Session owner has no admitted Observe session".to_owned(),
+                )
+            })?
+            .task_scope
+            .clone();
+        let request_task_ref = identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(TaskId::as_str);
+        self.observation_capture_owner_binding_for_refs(
+            authenticated_principal_ref,
+            session_id,
+            request_fence,
+            session_task_ref.as_deref(),
+            Some(selection),
+            request_task_ref,
+            None,
+        )
+    }
+
+    /// Reads observation policy and WorkScope from the exact current activated
+    /// binding. The outer activation evidence remains the source for its task,
+    /// work unit, and plan; task applicability for capture is explicitly None
+    /// until an original TaskSelectionEvidence is supplied.
+    pub fn observation_capture_owner_binding_for_activation(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        self.observation_capture_owner_binding_for_activation_inner(activation, None)
+    }
+
+    /// Reads the current Observation policy and WorkScope for an authenticated
+    /// cold capture identified by its original principal, semantic Session,
+    /// and StateFence. No RequestIdentity or task identity is synthesized;
+    /// task applicability remains None unless a separate validated task
+    /// selection is supplied through the task-bound API.
+    pub fn observation_capture_owner_binding_for_principal_session(
+        &self,
+        authenticated_principal_ref: &str,
+        session_id: &SessionId,
+        state_fence: &StateFence,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        if state_fence != &self.snapshot.state_fence()
+            || state_fence != &self.recovery.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "Observe owner read is not at the exact retained StateFence".to_owned(),
+            ));
+        }
+        let session_task_ref = self
+            .owners
+            .session
+            .session(session_id)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Session owner has no admitted Observe session".to_owned(),
+                )
+            })?
+            .task_scope
+            .clone();
+        self.observation_capture_owner_binding_for_refs(
+            authenticated_principal_ref,
+            session_id,
+            state_fence,
+            session_task_ref.as_deref(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn observation_capture_owner_binding_for_activation_inner(
+        &self,
+        activation: &GovernorActivationSnapshot,
+        task_selection: Option<&TaskSelectionAdmissionBinding>,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = &activation.state_fence;
+        if activation.owner_revision == 0
+            || activation.principal_id.trim().is_empty()
+            || activation.session_id.trim().is_empty()
+            || activation.task_id.as_str().trim().is_empty()
+            || activation.work_scope_id.trim().is_empty()
+            || activation.task_revision == 0
+            || fence != &self.snapshot.state_fence()
+            || fence != &self.recovery.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "activated Observe owner binding is invalid or stale".to_owned(),
+            ));
+        }
+        let session_id = SessionId::new(activation.session_id.clone()).map_err(|error| {
+            CompositionError::Provider(format!("activated Observe session is invalid: {error}"))
         })?;
+        self.observation_capture_owner_binding_for_refs(
+            &activation.principal_id,
+            &session_id,
+            fence,
+            Some(activation.task_id.as_str()),
+            task_selection,
+            task_selection.map(|_| activation.task_id.as_str()),
+            Some(&activation.work_scope_id),
+        )
+    }
+
+    /// Reads an activated owner projection with task applicability only when
+    /// the caller supplies the original validated selection binding.
+    pub fn observation_capture_owner_binding_for_activation_with_selection(
+        &self,
+        activation: &GovernorActivationSnapshot,
+        selection: &TaskSelectionAdmissionBinding,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        self.observation_capture_owner_binding_for_activation_inner(activation, Some(selection))
+    }
+
+    fn observation_capture_owner_binding_for_refs(
+        &self,
+        authenticated_principal_ref: &str,
+        session_id: &SessionId,
+        request_fence: &StateFence,
+        session_task_ref: Option<&str>,
+        task_selection: Option<&TaskSelectionAdmissionBinding>,
+        expected_task_ref: Option<&str>,
+        expected_scope_ref: Option<&str>,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        if authenticated_principal_ref.trim().is_empty()
+            || authenticated_principal_ref.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Provider(
+                "authenticated Observe principal is invalid".to_owned(),
+            ));
+        }
+        let session = self
+            .owners
+            .session
+            .session(session_id)
+            .ok_or_else(|| CompositionError::Recovery("Session owner has no admitted Observe session".to_owned()))?;
         if session.session_id != *session_id
             || session.status != SessionState::Active
             || session.state_fence != *request_fence
-            || !session
-                .authority_epoch
-                .is_same_authority(&request_fence.authority_epoch)
+            || !session.authority_epoch.is_same_authority(&request_fence.authority_epoch)
+            || session.task_scope.as_deref() != session_task_ref
         {
             return Err(CompositionError::Provider(
                 "Observe session owner binding is not current at the request fence".to_owned(),
@@ -7075,18 +7274,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "authenticated Observe principal does not match the Session owner actor".to_owned(),
             ));
         }
-        if session.task_scope.as_deref()
-            != identity
-                .request
-                .metadata
-                .task_id
-                .as_ref()
-                .map(TaskId::as_str)
-        {
-            return Err(CompositionError::Provider(
-                "authenticated Observe task does not match the Session owner task".to_owned(),
-            ));
-        }
         let policy = self.current_observation_ingress_policy_at_retained_fence()?;
         let policy_read = self.recovery.policy_read.as_ref().ok_or_else(|| {
             CompositionError::Recovery(
@@ -7105,12 +7292,37 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let work_scope_read = self.recovery.owner_read(RecoveryOwner::WorkScope)?;
         if work_scope_read.state_fence != *request_fence
             || work_scope_read.revision != work_scope.owner_revision
+            || expected_scope_ref.is_some_and(|scope_ref| {
+                scope_ref != work_scope.binding.scope.scope_ref
+            })
             || !is_sha256(&work_scope_read.value_digest)
         {
             return Err(CompositionError::Recovery(
                 "WorkScope named-read source does not match its current owner projection"
                     .to_owned(),
             ));
+        }
+        if let Some(selection) = task_selection {
+            let evidence = selection.evidence();
+            evidence
+                .validate()
+                .map_err(|error| CompositionError::from(error))?;
+            if expected_task_ref != Some(selection.task_ref())
+                || selection.task_ref() != evidence.task_ref
+                || selection.session_ref() != session_id.as_str()
+                || selection.principal_ref() != authenticated_principal_ref
+                || selection.state_fence() != request_fence
+                || selection.work_scope() != &work_scope
+                || evidence.work_scope_ref != work_scope.binding.scope.scope_ref
+                || evidence.task_revision != selection.task_revision()
+                || evidence.acceptance_digest != selection.acceptance_digest()
+                || request_fence.task_revision.map(TaskRevision::value)
+                    != Some(selection.task_revision())
+            {
+                return Err(CompositionError::Kernel(
+                    KernelPortError::TaskScopeIncompatible,
+                ));
+            }
         }
         let policy_value = serde_json::to_value(policy.policy)
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
@@ -7119,13 +7331,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             wire_version: 1,
             authenticated_principal_ref: authenticated_principal_ref.to_owned(),
             authenticated_session_ref: session_id.as_str().to_owned(),
-            authenticated_task_ref: identity
-                .request
-                .metadata
-                .task_id
-                .as_ref()
-                .map(TaskId::as_str)
-                .map(str::to_owned),
+            authenticated_task_ref: task_selection
+                .map(|selection| selection.evidence().task_ref.clone()),
             authenticated_scope_ref: work_scope.binding.scope.scope_ref.clone(),
             state_fence: request_fence.clone(),
             policy_owner_revision: policy.policy_revision,
