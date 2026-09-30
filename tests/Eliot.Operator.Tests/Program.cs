@@ -559,4 +559,28 @@ sealed class FakeGovernorClient : IGovernorClient
             outcome = "typed_user_automation_operation_admitted"
         }));
     }
+
+    public string? LastBrokerOperationId { get; private set; }
+    public string? LastBrokerApprovalHash { get; private set; }
+
+    /// This fake has no User Broker transport and no redeemed binding, so it
+    /// cannot serve the one state-changing leg a redeemed connection carries.
+    /// It answers with the SAME typed admission refusal the production client
+    /// raises when no redemption completed on the connection — a proven
+    /// never-sent outcome — rather than fabricating a cancellation receipt no
+    /// owner ever issued. The supplied values are recorded so a caller can see
+    /// exactly what the view model presented.
+    public Task<JsonElement> CancelBrokerOperationAsync(
+        string operationId,
+        string approvalHash,
+        CancellationToken cancellationToken = default)
+    {
+        LastBrokerOperationId = operationId;
+        LastBrokerApprovalHash = approvalHash;
+        throw new OperatorNotAttemptedException(
+            operationId,
+            "broker_cancel",
+            OperatorFaultReason.HandshakeRefused,
+            OperatorExchangeStages.Admission);
+    }
 }

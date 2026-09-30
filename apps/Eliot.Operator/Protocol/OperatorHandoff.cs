@@ -91,6 +91,26 @@ public sealed record OperatorRoleBinding(
     public bool GrantsCommands => Grants(OperatorCapabilityNames.OperatorCommand);
 }
 
+/// The owner refused a User Broker request on its own stable refusal code.
+///
+/// This is a [`OperatorRestartRequiredException`] because that is what a
+/// refused broker exchange means for this client: the owner closes the pipe
+/// after its one state-changing leg, so the authority the connection carried
+/// is gone with it and only a fresh owner-issued handoff restores one. The
+/// owner's exact stable code travels on the fault, so the refusal is never
+/// flattened into a generic handshake error and the Operator banner can name
+/// what the owner actually refused.
+///
+/// The owner's free-text `detail` is deliberately NOT carried here. It is
+/// owner prose rather than a closed code, so it never reaches a banner, a log
+/// or a diagnostic; only the stable code crosses this boundary.
+public sealed class OperatorBrokerRefusedException(string code) : OperatorRestartRequiredException(code)
+{
+    /// The owner's own stable refusal code, verbatim (for example the broker's
+    /// `HUMAN_APPROVAL_REQUIRED` or `HUMAN_CAPABILITY_NOT_GRANTED`).
+    public string BrokerCode { get; } = code;
+}
+
 /// One owner-issued, single-use, expiring, generation-bound Operator handoff.
 ///
 /// The owner issues exactly six wire fields

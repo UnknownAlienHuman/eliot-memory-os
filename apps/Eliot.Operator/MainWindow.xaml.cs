@@ -113,6 +113,12 @@ public sealed partial class MainWindow : Window
         RenderGraph();
     }
 
+    private async void CancelBrokerOperation_OnClick(object sender, RoutedEventArgs e)
+    {
+        await ViewModel.CancelBrokerOperationAsync();
+        RenderGraph();
+    }
+
     private async void ExecuteQuery_OnClick(object sender, RoutedEventArgs e)
     {
         await RefreshProjectionAsync();

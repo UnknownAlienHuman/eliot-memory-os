@@ -584,9 +584,18 @@ internal static class BrokerPipeClient
                 OperatorProtocol.MaxControlDepth,
                 OperatorProtocol.MaxControlTokens,
                 "broker_error");
-            _ = RequiredString(root, "code", "broker_error");
+            // The owner's own stable refusal code is carried on the fault
+            // rather than folded into a handshake code: a broker that refuses
+            // THIS request for THIS reason (an approval it will not accept, a
+            // capability it never granted, a session token it no longer
+            // honours) is a materially different fact for the Operator than a
+            // refused handshake, and flattening the two would tell the
+            // operator to restart for a condition a restart does not fix.
+            // The owner's free-text `detail` stays unread: it is owner prose,
+            // not a closed code, and must never reach a banner or a log.
+            var code = RequiredString(root, "code", "broker_error");
             _ = RequiredString(root, "detail", "broker_error");
-            throw new OperatorRestartRequiredException(OperatorFaultReason.HandshakeRefused);
+            throw new OperatorBrokerRefusedException(code);
         }
         if (!string.Equals(status, expectedStatus, StringComparison.Ordinal))
         {

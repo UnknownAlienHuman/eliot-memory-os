@@ -315,6 +315,16 @@
                             <Button Content="Submit typed action" Click="ExecuteAction_OnClick"
                                     IsEnabled="{Binding CanIssueCommands}"
                                     AutomationProperties.Name="Submit selected typed action through Governor" />
+                            <TextBlock Text="Broker-owned operation stop" FontWeight="SemiBold" Margin="0,10,0,0" />
+                            <TextBlock Text="Stops one broker-owned operation on the redeemed User Broker connection under the admitted Human principal. The exact approval hash an Approver issued for that exact action is required; it is never derived here, and the broker refuses the request at admission when it does not accept it."
+                                       TextWrapping="Wrap" FontSize="12" Opacity="0.85" />
+                            <TextBox Header="Broker operation identity" Text="{Binding BrokerOperationId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     AutomationProperties.Name="Broker-owned operation identity to stop" />
+                            <TextBox Header="Exact approval hash for this action" Text="{Binding ActionInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     AutomationProperties.Name="Exact approval hash issued for this exact action" />
+                            <Button Content="Stop broker operation" Click="CancelBrokerOperation_OnClick"
+                                    IsEnabled="{Binding CanIssueCommands}"
+                                    AutomationProperties.Name="Stop the named broker-owned operation through the User Broker" />
                             <StackPanel x:Name="UnknownOutcomePanel" Spacing="6" Visibility="Collapsed">
                                 <TextBlock Text="Unknown outcome: a mutation may have executed. Reconciling reuses the same operation identity; it never creates a second mutation."
                                            TextWrapping="Wrap" FontSize="12" Opacity="0.85" />

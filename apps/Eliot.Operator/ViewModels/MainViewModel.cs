@@ -85,6 +85,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _userAutomationPreviousRevisionJson = "{}";
     private string _userAutomationOperation = "list";
     private bool _includeRetired;
+    private string _brokerOperationId = string.Empty;
     private string? _graphSelectedRef;
     private int _graphDepth = 1;
     private string _resultPayloadText = string.Empty;
@@ -221,6 +222,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string UserAutomationPreviousRevisionJson { get => _userAutomationPreviousRevisionJson; set => Set(ref _userAutomationPreviousRevisionJson, BoundInput(value)); }
     public string UserAutomationOperation { get => _userAutomationOperation; set => Set(ref _userAutomationOperation, BoundInput(value)); }
     public bool IncludeRetired { get => _includeRetired; set => Set(ref _includeRetired, value); }
+    /// The broker-owned operation this process would stop. It is operator
+    /// input, so it is bounded like every other retained buffer and is never
+    /// derived from a projection row: the broker owns the identity of its own
+    /// operation and the Operator only names which one it means.
+    public string BrokerOperationId
+    {
+        get => _brokerOperationId;
+        set => Set(ref _brokerOperationId, BoundInput(value).Trim());
+    }
     public int GraphDepth { get => _graphDepth; set => Set(ref _graphDepth, Math.Clamp(value, 1, 3)); }
     public string ResultPayloadText { get => _resultPayloadText; private set => Set(ref _resultPayloadText, value); }
     public string ResultSummary { get => _resultSummary; private set => Set(ref _resultSummary, value); }
@@ -604,6 +614,170 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// schedule authority, provider credentials, or Store receipt fields.
     /// Create/edit inputs may omit the normalization receipt; the Store owner
     /// compiles the schedule and issues that evidence before persistence.
+    /// The UI label for the broker-owned cancellation this view model issues.
+    /// It is not a Governor tool: the request never reaches `CallToolAsync` or
+    /// the compatibility adapter, so no route is added there. It names the
+    /// operation in typed faults and banners only.
+    private const string BrokerCancelAction = "broker_cancel";
+
+    /// Sends the delegated-Operator "stop" for one broker-owned operation, on
+    /// the User Broker connection this process redeemed, presenting the
+    /// broker-admitted Human authority for it (I11.3 delegated Operator).
+    ///
+    /// This is the only state-change leg that does NOT travel the Governor
+    /// pipe, and it is deliberately not routed through `SubmitIntentAsync`:
+    /// that path journals the request for same-identity reconciliation, and
+    /// this request cannot be reconciled. The owner serves it once and closes
+    /// the connection, so there is no second send to reconcile against and no
+    /// second identity to mint. It is therefore sent under the operator's
+    /// chosen operation identity exactly once, and any outcome other than the
+    /// owner's own cancellation receipt is reported as unproven — never
+    /// resubmitted, never compacted into a journal record, and never
+    /// re-sent under a fresh identity.
+    ///
+    /// The approval hash is the ONE field the operator supplies and this view
+    /// model does not: no component in the tree mints a Critical-action hash,
+    /// so the client refuses to derive one, and this view model never
+    /// substitutes a value of its own. The operator pastes the exact hash the
+    /// Approver issued for that exact action. Because no such hash can be
+    /// produced today, the honest runtime outcome is that the broker REFUSES
+    /// this request at admission — which is the property the issue asks to be
+    /// provable: a really-sent, really-refused state change, refused before
+    /// any state change, with every other authority field already proved.
+    public async Task CancelBrokerOperationAsync()
+    {
+        if (IsBusy)
+        {
+            SetBanner(
+                "Stop not sent — request in progress",
+                "Wait for the current request to finish before stopping a broker operation.",
+                OperatorBannerSeverity.Informational);
+            return;
+        }
+        if (!RequireCommandCapability(BrokerCancelAction))
+        {
+            return;
+        }
+        // The exact approval hash an Approver issued for this exact action. It
+        // is required, bounded, and never derived: an empty one is a local
+        // refusal with nothing journaled and nothing sent, which is strictly
+        // better than the owner receiving a well-shaped value that no Approver
+        // ever approved.
+        var approvalHash = ActionInput.Trim();
+        try
+        {
+            OperatorIdentityFields.RequireText(approvalHash, "approval_hash");
+        }
+        catch (InvalidOperationException)
+        {
+            SetBanner(
+                "Stop not sent — approval hash required",
+                $"{BrokerCancelAction}: an exact approval hash issued for this exact action is required and is not derived here; "
+                + "no component in the tree mints one, so nothing was sent and nothing was journaled.",
+                OperatorBannerSeverity.Warning);
+            return;
+        }
+        var operationId = BrokerOperationId.Trim();
+        try
+        {
+            OperatorIdentityFields.RequireText(operationId, "operation_id");
+        }
+        catch (InvalidOperationException)
+        {
+            SetBanner(
+                "Stop not sent — operation identity required",
+                $"{BrokerCancelAction}: name the broker-owned operation to stop; nothing was sent.",
+                OperatorBannerSeverity.Warning);
+            return;
+        }
+
+        IsBusy = true;
+        NotifyCounts();
+        try
+        {
+            // One send on the redeemed connection. The client reads every
+            // authority field from the binding the broker admitted on that
+            // same connection and admits the request against the live process
+            // identity before any byte is written.
+            var receipt = await _client.CancelBrokerOperationAsync(
+                operationId,
+                approvalHash,
+                _requestCancellation?.Token ?? CancellationToken.None);
+            ShowBrokerCancellationResult(operationId, receipt);
+        }
+        catch (OperatorNotAttemptedException notSent)
+        {
+            // Proven never sent. No broker-owned operation was touched, so
+            // there is nothing to reconcile and nothing was journaled.
+            SetBanner(
+                "Stop not sent",
+                $"{BrokerCancelAction}: {operationId} was not attempted; it failed at stage {notSent.Stage} ({notSent.Message}). "
+                + "No broker state change is possible for this attempt.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorBrokerRefusedException refused)
+        {
+            // The owner received the request and REFUSED it on its own stable
+            // code, before any state change. That is the owner's decision, not
+            // a local failure, so it is reported as a refusal with the owner's
+            // exact code and never softened into "not attempted" or a
+            // success. The broker closes the pipe after this leg, so the
+            // admitted authority is gone with it and only a fresh
+            // owner-issued handoff restores one.
+            SetBanner(
+                "Stop refused by the User Broker",
+                $"{BrokerCancelAction}: {operationId} was refused at admission with broker code {refused.BrokerCode}; "
+                + "no state change was made. The connection is released with the answer, so a further stop needs a fresh broker-issued handoff.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorRestartRequiredException restart)
+        {
+            SetBanner(
+                "Restart required",
+                $"{BrokerCancelAction}: {operationId} — {restart.Message} {OperatorHandoff.ReacquisitionRequirement}",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorUnknownOutcomeException unknown)
+        {
+            // The owner may have admitted and executed before the connection
+            // went away. The leg is served once, so there is no same-identity
+            // resend: the exact operation must be reconciled through the
+            // owner's own route after a fresh handoff, never re-sent here.
+            SetBanner(
+                "Stop outcome unproven — reconcile, do not resubmit",
+                $"{BrokerCancelAction}: {unknown.OperationId} may have executed at stage {unknown.Stage} ({unknown.Message}); "
+                + "this leg is served once, so obtain a fresh broker handoff and reconcile the exact operation rather than resubmitting.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (Exception error)
+        {
+            SetBanner(
+                "Stop outcome unproven",
+                $"{BrokerCancelAction}: {operationId} did not prove an owner outcome ({OperatorFaultReason.ForException(error)}); "
+                + "this leg is served once, so reconcile the exact operation through the owner after a fresh handoff rather than resubmitting.",
+                OperatorBannerSeverity.Warning);
+        }
+        finally
+        {
+            IsBusy = false;
+            NotifyCounts();
+        }
+    }
+
+    /// Reports the owner's own cancellation receipt for a broker-owned
+    /// operation. The receipt is shown as the owner answered it and is bounded
+    /// before it is retained, and it is never turned into a journal record:
+    /// this leg is served once, so there is nothing to reconcile afterwards.
+    private void ShowBrokerCancellationResult(string operationId, JsonElement receipt)
+    {
+        ResultPayloadText = OperatorProjectionGuard.BoundRetainedResult(receipt) ?? string.Empty;
+        ResultSummary = $"User Broker accepted the delegated-Operator stop for {operationId}.";
+        SetBanner(
+            "Broker operation stopped",
+            $"{BrokerCancelAction}: {operationId} was cancelled by the User Broker under the admitted Human principal.",
+            OperatorBannerSeverity.Success);
+    }
+
     public async Task RunUserAutomationAsync()
     {
         // A create or edit needs a caller-supplied schedule revision. The

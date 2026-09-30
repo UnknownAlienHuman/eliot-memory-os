@@ -55,4 +55,30 @@ public interface IGovernorClient
     Task<JsonElement> UserAutomationAsync(
         UserAutomationOperatorRequest request,
         CancellationToken cancellationToken = default);
+
+    /// Sends the ONE state-changing request a redeemed User Broker connection
+    /// still serves: cancellation of one broker-owned operation, on the SAME
+    /// authenticated connection the redemption vouched for, so the broker
+    /// admits it against the peer it observed rather than a presented tuple.
+    ///
+    /// Every authority field — principal, session, role, exact capability set
+    /// and Kernel session token — is read from the broker-admitted binding of
+    /// that connection, never from the caller, and the client admits the
+    /// request against the live process identity before any byte is written.
+    /// Only `approvalHash` crosses this boundary, because it is the one field
+    /// no local observation can produce: the caller presents the exact
+    /// Kernel-canonicalized hash an Approver issued for that exact action, and
+    /// this client never mints, defaults, substitutes or derives one. A caller
+    /// that has no such hash must not invent a well-shaped value: the owner
+    /// admits the request through its own exact approval check, so a
+    /// fabricated hash would bind a false approval to the operation key.
+    ///
+    /// The request is therefore NOT retryable under a second identity: the
+    /// owner serves this leg once and the connection is released with the
+    /// answer, so a caller that loses the outcome must surface it as unknown
+    /// and reconcile through the owner's own route rather than resending.
+    Task<JsonElement> CancelBrokerOperationAsync(
+        string operationId,
+        string approvalHash,
+        CancellationToken cancellationToken = default);
 }

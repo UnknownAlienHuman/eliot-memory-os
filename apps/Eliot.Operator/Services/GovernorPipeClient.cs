@@ -315,19 +315,26 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// fresh pipe. That connection is released the moment the broker
     /// answers, because the owner serves this leg once and closes.
     ///
-    /// No approval hash reaches the UI today, so no caller can supply one and
-    /// this method has no production caller yet: there is no Critical-action
-    /// producer anywhere in the repository, the broker challenge and
-    /// redemption echo carry no hash, and the Store's `canonical_request_hash`
-    /// in user-automation receipts is that other operation's content hash —
-    /// a shape-only correlator, not a Critical-action approval for this one.
-    /// Presenting any UI-chosen 64-hex value instead would pass the broker's
-    /// shape check and bind a false approval to the operation key, which the
-    /// broker then keeps against conflicting hashes, so the client refuses to
-    /// mint one. This is a truthful BLOCKED-BY on the approval-hash producer,
-    /// not a defect in the transport below: the connection is held, the leg
-    /// is reachable, and every authority field except the hash is already
-    /// proved here and again by the broker.
+    /// The approval hash is a required caller argument and is never derived
+    /// here: there is no Critical-action producer anywhere in the repository,
+    /// the broker challenge and redemption echo carry no hash, and the Store's
+    /// `canonical_request_hash` in user-automation receipts is that other
+    /// operation's content hash — a shape-only correlator, not a
+    /// Critical-action approval for this one. Presenting a UI-chosen 64-hex
+    /// value instead would pass the broker's shape check and bind a false
+    /// approval to the operation key, which the broker then keeps against
+    /// conflicting hashes, so the client refuses to mint one.
+    ///
+    /// The Operator's real "stop broker operation" control calls this method
+    /// (`MainViewModel.CancelBrokerOperationAsync`); it asks the operator for
+    /// the exact hash the Approver issued. Because no such hash can be produced
+    /// in this tree today, the honest runtime outcome is that the broker
+    /// REFUSES this request at admission — which is the provable property the
+    /// issue asks for, and is reported as a refusal carrying the owner's own
+    /// stable code, never as a success and never softened into "not
+    /// attempted". The owner ruling on which component mints the canonical
+    /// hash is the only thing that can make this leg succeed, and it is
+    /// outside this client.
     public async Task<JsonElement> CancelBrokerOperationAsync(
         string operationId,
         string approvalHash,
