@@ -124,6 +124,15 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     // touching the pipe again, and the client holds no credential, endpoint or
     // nonce that could bypass it.
     private int _bindingLost;
+    // The broker-ADMITTED Human binding the live connection was redeemed for,
+    // held in process memory only and bound to that connection's lifecycle.
+    // It is set exactly once per establishment, from the redemption the broker
+    // vouched for, and it dies with the connection: every abort, every proven
+    // binding loss and every new establishment clears it first, so a stale
+    // token, a rotated registration or a restarted process can never revive
+    // it. It is never written to an envelope, a file, a log or a banner;
+    // state-changing sends gate on it, and only on it, before any byte.
+    private RedeemedOperatorBinding? _retainedBinding;
 
     /// Refuses new work once the session binding is proven lost. A fresh
     /// broker handoff arrives only with a fresh process, never in-process.
@@ -135,12 +144,78 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         }
     }
 
+    /// Admits one state-changing request against the broker-redeemed Human
+    /// binding of THIS connection, before any application byte is written.
+    ///
+    /// The binding is the broker's authenticated echo of the OS-observed pipe
+    /// peer, proved equal to this process's observed identity at redemption
+    /// and re-proved here against the live identity: an omitted principal (no
+    /// redemption completed on this connection), a process/session identity
+    /// the binding no longer describes, or a capability the admitted role was
+    /// never granted is refused here, at admission, never after a partial
+    /// write. A mismatch discards the retained binding first, so the next
+    /// attempt cannot inherit it. An unobservable live identity is the same
+    /// refusal: nothing may be claimed on unproven identity.
+    ///
+    /// This gate never authorizes: it only refuses. A request that passes it
+    /// still succeeds solely through the owner's typed admission, and the
+    /// broker's exact role/capability equality and Kernel-canonicalized
+    /// approval-hash checks apply wherever the authority is presented. The
+    /// capability test here is a presence pre-check against the exact
+    /// admitted set, never a second admission and never a subset widening of
+    /// the broker's own equality check.
+    private void RequireRetainedHumanBinding(string operationId, string tool, string requiredCapability)
+    {
+        var retained = _retainedBinding;
+        if (retained is null)
+        {
+            // No broker redemption completed on this connection, so the
+            // request carries no admitted Human principal. The broker
+            // handshake that would have produced one never finished.
+            throw new OperatorNotAttemptedException(
+                operationId, tool, OperatorFaultReason.HandshakeRefused, OperatorExchangeStages.Admission);
+        }
+        OperatorProcessIdentity current;
+        try
+        {
+            current = OperatorProcessIdentityProvider.Current;
+        }
+        catch (OperatorProcessIdentityException)
+        {
+            _retainedBinding = null;
+            throw new OperatorNotAttemptedException(
+                operationId, tool, OperatorFaultReason.ProcessIdentityUnproven, OperatorExchangeStages.Admission);
+        }
+        if (!retained.DescribesProcess(current, Environment.ProcessId))
+        {
+            // The retained authority no longer describes this process. It is
+            // discarded before the refusal so no later send can inherit it;
+            // only a fresh broker redemption under the live identity restores
+            // authority. Identity comparison is ordinal and exact; the
+            // invalidation names which axis diverged.
+            _retainedBinding = null;
+            throw new OperatorHandoffRefusedException(
+                retained.ClientProcessId != Environment.ProcessId
+                    ? OperatorHandoffInvalidation.ProcessMismatch
+                    : OperatorHandoffInvalidation.SessionMismatch,
+                retained.BrokerEpoch);
+        }
+        if (!retained.Grant.Grants(requiredCapability))
+        {
+            throw new OperatorNotAttemptedException(
+                operationId, tool, OperatorFaultReason.AccessDenied, OperatorExchangeStages.Admission);
+        }
+    }
+
     /// Marks the session binding terminally lost and reports the typed
     /// restart-required disposition. Every site that proves the binding is
-    /// gone funnels through here so the latch cannot be skipped.
+    /// gone funnels through here so the latch cannot be skipped. The redeemed
+    /// authority dies with the binding it was admitted under: keeping it would
+    /// let a later connection inherit a token its own redemption never earned.
     private OperatorRestartRequiredException BindingLost(string reason)
     {
         Interlocked.Exchange(ref _bindingLost, 1);
+        _retainedBinding = null;
         return new OperatorRestartRequiredException(reason);
     }
 
@@ -170,8 +245,16 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         var operationId = envelope.OperationId;
         await ValidateContractAsync(budget).ConfigureAwait(false);
         // One send; a lost response reconciles the same identity through
-        // ReconcileAsync, never a second logical mutation.
-        return await CallToolAsync<JsonElement>(LegacyOperatorAdapter.ToolCommand, envelope, operationId, budget).ConfigureAwait(false);
+        // ReconcileAsync, never a second logical mutation. The mutation is
+        // admitted against the broker-redeemed Human binding inside the
+        // exchange, before any application byte is written.
+        return await CallToolAsync<JsonElement>(
+            LegacyOperatorAdapter.ToolCommand,
+            envelope,
+            operationId,
+            budget,
+            requiredHumanCapability: OperatorCapabilityNames.OperatorCommand,
+            operationId: operationId).ConfigureAwait(false);
     }
 
     public async Task<JsonElement> ReconcileAsync(JsonElement commandEnvelope, CancellationToken cancellationToken = default)
@@ -180,8 +263,16 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         var operationId = RequireOperationId(commandEnvelope);
         await ValidateContractAsync(budget).ConfigureAwait(false);
         // The exact retained envelope bytes travel again under the same
-        // operation identity; only the transport correlation id is new.
-        return await CallToolAsync<JsonElement>(LegacyOperatorAdapter.ToolCommand, commandEnvelope, operationId, budget).ConfigureAwait(false);
+        // operation identity; only the transport correlation id is new. The
+        // resend is a mutation, so it is admitted against the broker-redeemed
+        // Human binding inside the exchange, before any application byte.
+        return await CallToolAsync<JsonElement>(
+            LegacyOperatorAdapter.ToolCommand,
+            commandEnvelope,
+            operationId,
+            budget,
+            requiredHumanCapability: OperatorCapabilityNames.OperatorCommand,
+            operationId: operationId).ConfigureAwait(false);
     }
 
     public async Task<JsonElement> UserAutomationAsync(
@@ -197,8 +288,17 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         // Kernel/Host authenticates this route and supplies RequestMetadata,
         // principal, State Fence and OperationIdentity. Reusing the generic
         // task-scoped operator-command envelope would discard that contract.
+        // Only an effect is admitted against the broker-redeemed Human
+        // binding: a read executes inside existing authority and carries no
+        // such requirement.
+        var requiresAuthority = request.Operation.IsEffect() ? OperatorCapabilityNames.OperatorCommand : null;
         return await CallToolAsync<JsonElement>(
-            UserAutomationContract.Route, request, $"automation:{request.IdempotencyKey}", budget).ConfigureAwait(false);
+            UserAutomationContract.Route,
+            request,
+            $"automation:{request.IdempotencyKey}",
+            budget,
+            requiredHumanCapability: requiresAuthority,
+            operationId: request.IdempotencyKey).ConfigureAwait(false);
     }
 
     public async Task<OperatorProjectionPage> QueryAsync(
@@ -292,12 +392,19 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// the owner, the outcome is reported as unknown under the SAME operation
     /// identity, because a failed write may be partial and pipe closure is
     /// neither rollback nor server-side cancellation.
+    ///
+    /// A non-null `requiredHumanCapability` marks a state-changing request:
+    /// after establishment and before any application byte, the exchange is
+    /// admitted against the broker-redeemed Human binding of this connection.
+    /// Reads pass null and are unaffected.
     private async Task<T> CallToolAsync<T>(
         string tool,
         object arguments,
         string operationScope,
         OperationBudget budget,
-        string stage = OperatorExchangeStages.Exchange)
+        string stage = OperatorExchangeStages.Exchange,
+        string? requiredHumanCapability = null,
+        string? operationId = null)
     {
         if (!LegacyOperatorAdapter.IsAdmittedTool(tool))
         {
@@ -368,6 +475,14 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             {
                 throw new OperatorUnknownOutcomeException(
                     operationScope, tool, OperatorFaultReason.ForException(error), OperatorExchangeStages.Establishment);
+            }
+
+            if (requiredHumanCapability is not null)
+            {
+                // The connection is established and no application byte has
+                // been written: the one place a state-changing request can be
+                // refused before any state change. Reads never reach here.
+                RequireRetainedHumanBinding(operationId ?? operationScope, tool, requiredHumanCapability);
             }
 
             var state = new ExchangeState();
@@ -547,6 +662,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         var pipeName = handoff.Endpoint.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase);
         // Single use: the nonce is spent now, not after a successful connect.
         handoff.Consume(DateTimeOffset.UtcNow);
+        // A new establishment never inherits the previous connection's
+        // redeemed authority. Only the redemption below may set it; every
+        // failure path after this point therefore leaves nothing revivable,
+        // and a restart (a new process) starts from nothing as well.
+        _retainedBinding = null;
 
         using var establishment = budget.OpenWindow(establishmentAllowance, OperatorExchangeStages.Establishment);
         // Exactly one Governor connection is ever built here, and it is built
@@ -562,8 +682,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             // Broker challenge and redemption share this establishment window
             // and finish before the Governor pipe is connected, so this client
             // never opens, publishes or holds a Governor transport it has not
-            // yet been vouched for.
-            await BrokerPipeClient.RedeemOperatorHandoffAsync(
+            // yet been vouched for. The admitted binding is retained in
+            // process memory only, bound to the connection built below, and
+            // cleared with it: it never reaches an envelope, a file, a log
+            // or a banner.
+            _retainedBinding = await BrokerPipeClient.RedeemOperatorHandoffAsync(
                 handoff.Endpoint,
                 clientIdentity,
                 establishment.Token).ConfigureAwait(false);
@@ -840,8 +963,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     {
         connection.Handoff?.Invalidate(invalidation);
         // Detach only this connection: a replacement established later is a
-        // different object and is never touched by this cleanup.
+        // different object and is never touched by this cleanup. The redeemed
+        // authority dies with the connection it was bound to, so an aborted
+        // transport can never lend its token to a later one.
         Interlocked.CompareExchange(ref _connection, null, connection);
+        _retainedBinding = null;
         var aborted = connection.Abort();
         var allowance = TimeSpan.FromSeconds(TeardownAllowanceSeconds);
         var (completed, pending) = await connection.DisposeStreamsAsync(allowance).ConfigureAwait(false);
