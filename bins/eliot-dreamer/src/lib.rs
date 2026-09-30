@@ -165,9 +165,13 @@ pub trait CurationCarrierSource {
 /// Governor injection point for the Orientation production supply (CC-004).
 ///
 /// The CC-002 model-route request/outcome are produced in-binary by the model
-/// stage, but the canonical projection set and every mandatory stage record are
-/// Governor-published values that this binary neither retrieves nor recomputes.
-/// They arrive over [`OrientationSupply`]; without a supplied channel the
+/// stage, and the grounding request, grounded draft, receipt-bound v1 draft,
+/// and validated grounding candidate are produced in-binary by this crate's
+/// own grounding and validation stages; none of those travels this channel.
+/// What arrives over [`OrientationSupply`] is what a Governor/canonical owner
+/// publishes and this binary must neither retrieve nor recompute: the canonical
+/// projection set, the Current Epistemic Position handles, and the owner record
+/// set of every remaining mandatory stage. Without a supplied channel the
 /// production carrier stays refused rather than filling a member locally.
 ///
 /// The returned supply borrows the source (`'s`), so the caller must consume it
@@ -280,8 +284,10 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
     /// Wires a Governor-injected Orientation supply source into the port.
     ///
     /// The Governor calls this after `connect()`; `submit` resolves the CC-004
-    /// projection set and the mandatory stage-owner records through this source
-    /// for admitted Orientation jobs only. Other classes never consult it.
+    /// projection set, the Current Epistemic Position handles, and the
+    /// owner record set of every mandatory stage this binary does not produce
+    /// itself through this source for admitted Orientation jobs only. Other
+    /// classes never consult it.
     #[must_use]
     pub fn with_orientation_source(self, source: &'a dyn OrientationSupplySource) -> Self {
         Self {
@@ -589,6 +595,11 @@ fn dispatch_admission_with(
 /// wired A-31 path. Extracted as a free function so the chain is
 /// unit-provable without a live Kernel transport (`submit` adds only the
 /// claim check before it and the live view after it).
+///
+/// The grounding request and the validation receipt the model, grounding, and
+/// validation stages produced here are the records the Orientation carrier
+/// joins as `PipelineOrientationRecords`, so the pulse never asks the Governor
+/// channel for a value this pipeline had already committed.
 fn run_admitted_pipeline(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
@@ -621,7 +632,10 @@ fn run_admitted_pipeline(
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
     let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
-    let grounded = grounding_stage::ground_admitted_draft(grounding_request)?;
+    // The grounding owner takes its request by value; the same admitted request
+    // is retained here so the Orientation carrier joins the exact one this
+    // stage ran under instead of rebuilding a lookalike.
+    let grounded = grounding_stage::ground_admitted_draft(grounding_request.clone())?;
     // Non-Curation classes pass the screen through with no binding to carry:
     // the resolve above already proved the pass-through.
     let screen_binding = None;
@@ -635,14 +649,15 @@ fn run_admitted_pipeline(
     dispatch_stage::dispatch_admitted(
         admission,
         job,
-        screen_binding,
-        None,
         dispatch_stage::OwnerCarriers {
             curation: None,
             orientation: orientation_supply,
+            screen: screen_binding,
+            curation_protection: None,
         },
         job.job_class,
         Some(&validated),
+        dispatch_stage::PipelineOrientationRecords::new(&grounding_request, &validated),
     )
 }
 
