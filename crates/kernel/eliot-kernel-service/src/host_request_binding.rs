@@ -53,10 +53,11 @@ use eliot_contracts::{
 use eliot_mcp::{
     ApplicationRequest, ClientCapabilities, HostCancellationPortOutcome, HostCancellationRequest,
     HostCorrelationId, HostInvocationPortOutcome, HostInvocationRequest, HostObservedContext,
-    HostOperationHandle, KernelGovernorPort, KernelHostRequestPort, MAX_HOST_DEADLINE_PREFERENCE_MS,
-    McpCore, McpProtocolVersion, McpResponse, NoProviderPort, PortFailure, QueryInput, QueryIntent,
-    QueryMode, RequestSecurityContext, ResponseKind, ToolRequest, TransportProfile,
-    TransportRequestContext, plan_evidence_pack_query, project_evidence_pack_projection,
+    HostOperationHandle, KernelGovernorPort, KernelHostRequestPort,
+    MAX_HOST_DEADLINE_PREFERENCE_MS, McpCore, McpProtocolVersion, McpResponse, NoProviderPort,
+    PortFailure, QueryInput, QueryIntent, QueryMode, RequestSecurityContext, ResponseKind,
+    ToolRequest, TransportProfile, TransportRequestContext, plan_evidence_pack_query,
+    project_evidence_pack_projection,
 };
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
@@ -1024,9 +1025,7 @@ impl KernelHostRequestBinder<'_, NoProviderPort> {
         let owner = NoProviderPort;
         let mut binder = Self::new(session, &owner, store);
         match binder.invoke_admitted(service, envelope, peer_receipt, None, &request) {
-            Ok(HostInvocationPortOutcome::Responded { .. }) => {
-                HostBinderLegDisposition::Dispatched
-            }
+            Ok(HostInvocationPortOutcome::Responded { .. }) => HostBinderLegDisposition::Dispatched,
             Ok(HostInvocationPortOutcome::Accepted { .. }) => HostBinderLegDisposition::OwnerGap,
             Err(PortFailure::PlanGap { .. }) => HostBinderLegDisposition::OwnerGap,
             Err(_) => HostBinderLegDisposition::Rejected,

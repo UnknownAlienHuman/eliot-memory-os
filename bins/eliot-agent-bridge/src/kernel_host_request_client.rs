@@ -746,10 +746,7 @@ impl KernelHostRequestClient {
         let Ok(owner) = self.shared.try_borrow() else {
             return false;
         };
-        owner
-            .replay_cache
-            .values()
-            .any(|entry| entry.owner_settled)
+        owner.replay_cache.values().any(|entry| entry.owner_settled)
     }
 
     /// Captures owner-verified source-result and attach facts for a resource

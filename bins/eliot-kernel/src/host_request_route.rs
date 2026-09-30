@@ -1108,8 +1108,7 @@ impl KernelComposition {
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        let (receipt, mut record) =
-            self.admit_host_request_envelope_under_transition(envelope)?;
+        let (receipt, mut record) = self.admit_host_request_envelope_under_transition(envelope)?;
         // Issue #77 W2: Kernel-owned bind/dispatch leg over the admitted
         // envelope. The binder mints and validates the Kernel-owned
         // RequestIdentity, authority epoch, admitted operation identity,
