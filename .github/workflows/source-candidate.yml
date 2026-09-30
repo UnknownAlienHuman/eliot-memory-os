@@ -69,77 +69,85 @@ jobs:
           # included. scripts/verify-github-workflows.py rejects a key that
           # drops one (GWF-020) or whose manifest globs miss a member root
           # (GWF-021).
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/source-candidate.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml', 'workspace/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
+          # The profile dimension now hashes scripts/verify.ps1 as well as this
+          # workflow: the gate list and the profile admission this lane runs
+          # live in that owner, so a change to either is a change to what this
+          # cached entry was produced by. Before #1914 W4 the key bound only
+          # this file, which meant a change to the executed gate set left the
+          # key identical.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', 'scripts/verify.ps1', '.github/workflows/source-candidate.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml', 'workspace/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
 
-      - name: Formatting
-        run: cargo fmt --all -- --check
-
-      - name: Workspace all-target check
-        run: cargo check --workspace --all-targets --locked
-
-      - name: Workspace all-target Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Workspace tests with nonzero execution safeguard
+      # Issue #1914 W4 (I18.21:11, "no CI-only hidden verifier command list").
+      # This workflow used to carry its own cargo/dotnet command list: a
+      # `workflow_dispatch` of it ran fmt, check, clippy, test-with-safeguard,
+      # build, locked Operator restore/build and the executed Operator harness
+      # from these `run:` lines, in an order and under a command set no
+      # versioned profile revision covered, and it emitted no shared-schema
+      # evidence at all. That is precisely the CI-only verifier command list
+      # I18.21 forbids, and it is why a successful run here could not be
+      # compared with a local run.
+      #
+      # It is now a thin invoker. This file names no verifier command, no stage,
+      # no toolchain flag and no order: it selects one closed profile, exactly
+      # as ci.yml and integration.yml already do, and the one ordered
+      # gate-definition owner (scripts/verify.ps1) performs the minimal
+      # verifier/runner bootstrap build (I18.21:14) and then resolves its
+      # closed profile alias through the same shared resolver every other lane
+      # reaches. `Review` is the profile selected here because it is the
+      # repository's documented manual source/release profile and it is already
+      # what integration.yml dispatches; the all-target test run under the
+      # nonzero-execution safeguard, the all-target build, and the locked
+      # Operator restore/build that this file used to run itself are Review
+      # stages in that owner now, unchanged.
+      #
+      # The locked NuGet inputs this lane depends on are restored by the owner
+      # with `--locked-mode` against apps/Eliot.Operator/Eliot.Operator.csproj
+      # and tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj
+      # packages.lock.json files; this file asserts that binding rather than
+      # restating the command, so a reviewer reads the guarantee in one place
+      # (the owner) instead of in a second copy of the gate order.
+      - name: Run the governed source-candidate verification profile
         shell: pwsh
-        run: |
-          $testListOutput = @(& cargo test --workspace --all-targets --locked -- --list 2>&1)
-          if ($LASTEXITCODE -ne 0) {
-            throw "TEST_LIST_FAILURE: cargo test -- --list exited $LASTEXITCODE"
-          }
+        run: pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
 
-          $testOutput = @(& cargo test --workspace --all-targets --locked 2>&1)
-          if ($LASTEXITCODE -ne 0) {
-            throw "TEST_EXECUTION_FAILURE: cargo test exited $LASTEXITCODE"
-          }
-
-          $listedTests = @(
-            $testListOutput |
-              ForEach-Object { "$_" } |
-              Where-Object { $_ -match '^\s*.+:\s+test\s*$' }
-          ).Count
-          $executedTests = 0
-          foreach ($line in $testOutput) {
-            $text = "$line"
-            if ($text -match 'test result: .*?(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;\s+(\d+) measured;') {
-              $executedTests += [int]$Matches[1] + [int]$Matches[2]
-            }
-          }
-
-          Write-Host "TEST_EVIDENCE: listed=$listedTests executed=$executedTests"
-          if ($listedTests -eq 0 -or $executedTests -eq 0) {
-            throw "TEST_CONTRACT_FAILURE: expected nonzero listed and executed tests"
-          }
-
-      - name: Workspace all-target build
-        run: cargo build --workspace --all-targets --locked
-
-      - name: Restore locked NuGet inputs and build Eliot.Operator
-        shell: pwsh
-        run: |
-          dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode
-          dotnet restore tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj --locked-mode
-          dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore
-
+      # RESIDUAL, NAMED NOT HIDDEN (issue #1914 W4). The Operator harness
+      # execution below is the one source-candidate verifier command no profile
+      # revision covers. It cannot move into the profile owner because
+      # scripts/verify-github-workflows.py:982-990 (GWF-006) and
+      # .github/workflows/repository-policy.yml:439-441 both forbid the
+      # test-executing `dotnet` subcommands anywhere in scripts/verify.ps1's
+      # bytes, and that file is also the compile-only MergeCompile owner; both
+      # checkers are outside this issue's mutable path scope. It stays here,
+      # named and visible, and this issue's coverage of the lane is PARTIAL
+      # until a profile-scoped spelling of that prohibition or a governed
+      # Operator-harness stage exists. Deleting it would have dropped real
+      # coverage, and keeping it silent is exactly the failure mode I18.21:11
+      # forbids.
       - name: Execute Eliot.Operator test harness
         shell: pwsh
         run: |
           dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore
 
+      # The dependency-policy artifacts this run binds by digest below are
+      # generated by the profile above — its offline-source dependency-policy
+      # gate writes them to the same `.eliot/dependency-policy-artifacts/`
+      # paths the release builder and `just dependency-policy-artifacts` use.
+      # This step therefore only REPORTS the artifact receipt the owner
+      # produced; it invokes no verifier of its own. The verifier's exit already
+      # failed the profile above if it failed, and a missing artifact is reported
+      # as missing here and refused by the binding step below, never restated as
+      # a pass.
       - name: Dependency policy evidence
         shell: pwsh
         run: |
-          python scripts/verify-dependency-policy.py --root . --profile offline-source --sbom-out .eliot/dependency-policy-artifacts/sbom.json --license-report-out .eliot/dependency-policy-artifacts/licenses.json --advisory-report-out .eliot/dependency-policy-artifacts/advisories.json
-          $depExit = $LASTEXITCODE
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Dependency policy evidence'
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('- verifier exit: ' + $depExit)
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- verifier: the governed Review profile above (scripts/verify.ps1 -Profile Review); offline-source dependency-policy gate wrote these artifacts'
           if (Test-Path .eliot/dependency-policy-artifacts/sbom.json) {
             $sbom = Get-Content .eliot/dependency-policy-artifacts/sbom.json -Raw | ConvertFrom-Json
             Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('- receipt status: ' + $sbom.status + '; ceiling: ' + $sbom.proof_ceiling + '; digest: ' + $sbom.receipt_digest)
           } else {
-            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- receipt artifact missing: verifier did not produce output'
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- receipt artifact missing: the profile did not produce the offline-source artifacts'
           }
-          exit $depExit
 
       # Issue #1923 (I18.44), artifact-to-release-hash binding. The three
       # dependency-policy artifacts are generated by the owner above, but
@@ -309,9 +317,15 @@ jobs:
           if ($derivedActions.Count -eq 0) { throw 'GITHUB_WORKFLOWS_MANIFEST_REJECTED: derived record holds no action identities for source-candidate.yml' }
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Actions: " + ($derivedActions -join ', '))
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: pinned rust-toolchain.toml identity shown via rustup show active-toolchain (no latest installer)"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Cargo: --locked workspace check/clippy/test/build with nonzero listed and executed tests"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- NuGet: locked-mode restore of Eliot.Operator and Eliot.Operator.Tests packages.lock.json files"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Operator tests: executed Eliot.Operator.Tests (exit 0)"
+          # The gate list is no longer restated here. It is the one ordered
+          # gate-definition owner's (scripts/verify.ps1 -Profile Review),
+          # executed above, and this workflow selects that profile exactly as
+          # ci.yml and integration.yml do. Recording the same stages here as
+          # prose would be the second copy of an order the owner already fixes,
+          # which is the thing issue #1914 W4 removed from this file.
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate order: not restated in this file (issue #1914 W4); the single executed gate list and the single executed profile admission are the shared owner's, recorded in its VERIFY_GATE and VERIFY_PROFILE_* lines"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Profile: Review (sole gate-definition owner scripts/verify.ps1, closed Review profile); the versioned verification route is named only by its closed profile alias, resolved by the shared owner through eliot-profile-resolver, never as a command list"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Operator harness: executed by the step above; this workflow's remaining steps add no cargo or dotnet verifier command"
           # Issue #1923 (I18.44): the two records selected above are carried
           # into the release evidence itself, not left in the step log. A
           # per-artifact sha256 that is never restated next to the run manifest
