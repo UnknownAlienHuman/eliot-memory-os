@@ -1137,13 +1137,50 @@ impl DaemonComposition {
             eliot_workscope::RequestedEffect::CanonicalWrite,
         )
         .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
-        let admission = crate::task_binding_admission::admit_canonical_write(
-            envelope.operation_id.as_str().to_owned(),
-            &identity.request.metadata,
-            &envelope,
-            readiness.receipt,
-            readiness.fence,
-        )?;
+        let admission = if crate::task_binding_admission::envelope_is_task_relative(&envelope) {
+            // Issue #1746 (W4/A2): a task-relative write is admitted only
+            // against the live Governor-resolved activation, never on the
+            // caller-presented receipt alone. The lease key terms come from
+            // the presented readiness lease, but the snapshot comes from the
+            // Governor owner (`current_task_selection` reads the RETAINED
+            // terminal for that key and joins it to the unique live
+            // activation: principal, session, task, revision, and `WorkScope`
+            // at the live fence), so a structurally valid receipt naming
+            // another task, a moved revision/digest, another scope, or
+            // another fence fails closed with `TASK_SCOPE_INCOMPATIBLE`
+            // before any admission runs. Absent/ambiguous/exploratory/stale
+            // selections fall through to the cold candidate, the bounded
+            // intake answer, or the typed error inside; no task is created,
+            // none is chosen, and no cold capture is retroactively attached.
+            // A write with no retained terminal for its lease key fails
+            // closed here: re-resolve through the owner onboarding route.
+            // Captures and non-task-relative writes stay on the receipt-only
+            // leg below so permitted raw capture remains cold (issue #1746,
+            // A3) without a retained terminal.
+            let (activation, _) = self.governor.current_task_selection(
+                readiness.now,
+                readiness.lease.lineage_candidate_ref.as_str(),
+                readiness.lease.workspace_instance_candidate_ref.as_str(),
+                readiness.lease.privacy_class,
+                readiness.lease.governing_source_generation,
+            )?;
+            crate::task_binding_admission::admit_canonical_write_with_activation(
+                envelope.operation_id.as_str().to_owned(),
+                &identity.request.metadata,
+                &envelope,
+                readiness.receipt,
+                readiness.fence,
+                activation.as_ref(),
+            )?
+        } else {
+            crate::task_binding_admission::admit_canonical_write(
+                envelope.operation_id.as_str().to_owned(),
+                &identity.request.metadata,
+                &envelope,
+                readiness.receipt,
+                readiness.fence,
+            )?
+        };
         // Issue #1929: the durable retention of a cold unbound capture is NOT
         // this log line, and not this daemon. `ColdUnbound` here records only
         // the admission decision. The retention owner is the store, which
@@ -1165,6 +1202,37 @@ impl DaemonComposition {
                 reason_ref = %candidate.reason_ref,
                 "cold unbound observation candidate admitted at the daemon edge: durably retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
             );
+        }
+        // Issue #1746 (W6/A5): revalidate the sealed dispatch identity at the
+        // effect gate against the live owner fence before any scope-sensitive
+        // trigger or commit. `admit_canonical_write` admits against the
+        // caller-presented readiness fence (bootstrap time, I7.8 step 4);
+        // between that admission and this dispatch the generation may have
+        // moved, and "`MATCHED` is required again after any generation change
+        // that can alter the real target of the task" (I4.2.1). The ORIGINAL
+        // evidence is re-validated with the existing
+        // `TaskSelectionEvidence::validate`, contamination still refuses, and
+        // the presented fence must still match the live Governor
+        // kernel-snapshot fence exactly. A mismatch fails closed with
+        // `TASK_SCOPE_INCOMPATIBLE` for conflict/rebind: the old operation is
+        // never rewritten to a new task under its identity, never duplicated,
+        // and already-possible effects keep their original identity for
+        // reconciliation. Task/scope/revision moves are additionally covered
+        // at this same gate by the retained-binding
+        // `check_canonical_write_work_scope` check and the #1742
+        // `commit_canonical_with_readiness` material gate below. Cold/unbound
+        // and non-task-relative admissions carry no sealed identity and pass
+        // through untouched.
+        if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) = &admission
+        {
+            let live_fence = self.governor.kernel_snapshot().state_fence();
+            crate::task_binding_admission::revalidate_task_bound_for_effect(
+                &binding.evidence,
+                Some(binding.admitted_task_ref.as_str()),
+                binding.scope_ref.as_str(),
+                &binding.presented_fence,
+                &live_fence,
+            )?;
         }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
         // any commit. The caller must supply the actual observed `WorkScope` and
