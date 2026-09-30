@@ -598,6 +598,20 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             // remaining time and not a fresh per-call window. The preceding
             // broker redemption already proved the local SID, session, process
             // and exact granted role/capability set.
+            //
+            // The handoff nonce is deliberately ABSENT from this handshake.
+            // `Consume` above spent it locally and the broker redemption spent
+            // it at the owner: `eliot_user_broker_core::OperatorHandoffLedger::
+            // consume` refuses a row whose `consumed` flag is already set, and
+            // the broker's `redeem_operator_handoff` refuses any binding whose
+            // row is already `redeemed`. A single-use credential therefore
+            // carries no meaning on any leg after its redemption, and writing
+            // it here would re-present a spent nonce as if it still
+            // authenticated this connection - exactly the reuse
+            // OperatorHandoff.ReacquisitionRequirement forbids. Continuity on
+            // this leg comes from the broker's own vouched redemption above and
+            // from the epoch/session/role the owner already checked, never from
+            // the consumed nonce.
             establishment.ThrowIfExpired();
             await streams.Writer.WriteLineAsync(JsonSerializer.Serialize(new
             {
@@ -605,7 +619,6 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 protocol_version = OperatorProtocol.IpcProtocolVersion,
                 broker_epoch = handoff.Endpoint.BrokerEpoch,
                 interactive_session_id = handoff.Endpoint.InteractiveSessionId,
-                handoff_nonce = handoff.Endpoint.HandoffNonce,
                 windows_user_sid = clientIdentity.UserSid,
                 operator_process_generation = clientIdentity.ProcessGeneration,
                 operator_artifact_fingerprint = clientIdentity.ArtifactFingerprint,
