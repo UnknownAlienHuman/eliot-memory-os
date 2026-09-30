@@ -7151,7 +7151,7 @@ fn transient_not_before(result: &AgentActivationResolutionResult) -> Option<u64>
     }
 }
 
-fn unix_ms(now: SystemTime) -> Result<u64, String> {
+pub(crate) fn unix_ms(now: SystemTime) -> Result<u64, String> {
     let elapsed = now
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("daemon activation clock precedes Unix epoch: {error}"))?;

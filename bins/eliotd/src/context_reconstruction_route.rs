@@ -379,16 +379,17 @@ pub async fn serve_context_reconstruction(
         let holder = eliot_authority::PrincipalRef::new(owner_session.kernel_principal.clone())
             .map_err(crate::CapturedLspAdoptionError::from)?;
         let mut composition = composition.lock().await;
+        let read_context = crate::CapturedLspReadContext {
+            envelope: envelope.clone(),
+            attempt: attempt.clone(),
+            request_metadata: ctx,
+            holder,
+            task_frame_readback,
+            causal_binding: first_causal,
+            now: eliot_authority::LogicalTime::new(crate::unix_ms()),
+        };
         composition.consume_captured_lsp_payloads(
-            crate::CapturedLspReadContext {
-                envelope: envelope.clone(),
-                attempt: attempt.clone(),
-                request_metadata: ctx,
-                holder,
-                task_frame_readback,
-                causal_binding: first_causal,
-                now: eliot_authority::LogicalTime::new(crate::unix_ms()),
-            },
+            &read_context,
             captured
                 .into_iter()
                 .map(|payload| (payload.reference, payload.task_binding))
