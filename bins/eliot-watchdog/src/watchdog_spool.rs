@@ -2196,7 +2196,7 @@ impl WatchdogSpool {
             stale_records,
             deferred_gap_reasons,
             newest_heartbeat_sequence,
-            newest_payload_class,
+            newest_payload_class: newest_payload_class.clone(),
             evidence_id: sha256_hex(
                 encode_identity(&[
                     "watchdog_health_corpus".to_owned(),
