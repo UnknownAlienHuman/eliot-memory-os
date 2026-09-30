@@ -154,6 +154,55 @@ jobs:
             }
             Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Preparation manifest: $preparationManifest (per-input and per-standalone-workspace detail; ignored local input, never a PASS receipt)"
           }
+          # Surreal provisioning receipt binding (issue #3004, audit 5887267578):
+          # the owner above materialized the Surreal inputs through
+          # scripts/provision-surrealdb-release.py, which records per-artifact
+          # digests plus cold/warm (fetched/reused) provenance in its receipt.
+          # This step binds that receipt to the run by recomputing its digest
+          # over the exact bytes on disk - never by quoting the receipt's own
+          # digest - and reports every record identity plus the pinned scanner
+          # identity carried into provisioning. A missing or malformed receipt
+          # is reported, never a pass: the read-only offline gate below owns
+          # the verdict and fails closed on the same inputs.
+          $surrealReceipt = '.eliot/dependency-policy/surrealdb/provisioning-receipt.json'
+          if (-not (Test-Path -LiteralPath $surrealReceipt -PathType Leaf)) {
+            Write-Host 'PROVISION_RECEIPT_BINDING: absent=.eliot/dependency-policy/surrealdb/provisioning-receipt.json'
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Surreal provisioning receipt absent (no provisioned material on this runner); the read-only offline gate below reports the same inputs and owns the verdict'
+          } else {
+            $surrealReceiptHash = ((Get-FileHash -LiteralPath $surrealReceipt -Algorithm SHA256).Hash).ToLowerInvariant()
+            $surrealReceiptRaw = Get-Content -LiteralPath $surrealReceipt -Raw
+            $surrealProvisioning = $null
+            try { $surrealProvisioning = $surrealReceiptRaw | ConvertFrom-Json } catch { $surrealProvisioning = $null }
+            if ($null -eq $surrealProvisioning) {
+              Write-Host "PROVISION_RECEIPT_BINDING: malformed=$surrealReceipt sha256=$surrealReceiptHash"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Surreal provisioning receipt malformed sha256=$surrealReceiptHash; the read-only offline gate below keeps the failed result failed"
+            } else {
+              Write-Host "PROVISION_RECEIPT_BINDING: sha256=$surrealReceiptHash complete=$($surrealProvisioning.complete)"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Surreal provisioning receipt sha256=$surrealReceiptHash complete=$($surrealProvisioning.complete) (digest recomputed over the exact bytes on disk, never quoted)"
+              $surrealBoundary = $surrealProvisioning.boundary
+              if ($null -ne $surrealBoundary -and $null -ne $surrealBoundary.approved_baseline -and $null -ne $surrealBoundary.proposed_candidate) {
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Surreal boundary: approved baseline " + [string]$surrealBoundary.approved_baseline.version + " (" + [string]$surrealBoundary.approved_baseline.source_tag + ") vs proposed candidate " + [string]$surrealBoundary.proposed_candidate.version + " (" + [string]$surrealBoundary.proposed_candidate.source_tag + "); candidate installation approval " + [string]$surrealBoundary.candidate_installation_approval)
+              }
+              if ($null -eq $surrealProvisioning.records) {
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Surreal provisioning receipt has no records array; the read-only offline gate below owns the verdict'
+              } else {
+                foreach ($surrealRecord in @($surrealProvisioning.records)) {
+                  $surrealSubject = [string]$surrealRecord.subject
+                  if ([string]::IsNullOrWhiteSpace($surrealSubject)) { $surrealSubject = '(unnamed)' }
+                  $surrealRecordLine = "Surreal input " + $surrealSubject + ": sha256=" + ([string]$surrealRecord.sha256).ToLowerInvariant() + " bytes=" + [string]$surrealRecord.bytes + " reused=" + [string]$surrealRecord.reused
+                  Write-Host ("PROVISION_RECEIPT_INPUT: " + $surrealRecordLine)
+                  Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- " + $surrealRecordLine)
+                }
+              }
+              $surrealMissing = @($surrealProvisioning.missing_inputs | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+              if ($surrealMissing.Count -eq 0) {
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Surreal missing inputs: none'
+              } else {
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Surreal missing inputs: " + ($surrealMissing -join ', ') + " (stay missing; the offline gate owns the verdict)")
+              }
+            }
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Invoke+prefetch scanner identity carried into provisioning: $($scanner.tool) $($scanner.version) sha256=$($scanner.observed_sha256) from $($scanner.release_asset) (exact pinned identity, never latest)"
           cargo fetch --locked
           $rootFetchExit = $LASTEXITCODE
           Write-Host "PREPARE_ROOT_FETCH_LOCKED: exit=$rootFetchExit"

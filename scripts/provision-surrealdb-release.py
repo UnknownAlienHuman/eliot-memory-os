@@ -7,6 +7,12 @@ Historical OSV bytes must be restored from the pinned snapshot, not a live query
 The selected-candidate OSV response is fetched on every invocation so a release
 receipt can bind a fresh query to its exact response bytes. The verifier checks
 the PE, source-tree, tag, and advisory bindings.
+
+A cold runner materializes every actually-provisionable input from real
+downloads first and reports unrestorable inputs as missing (nonzero exit); a
+warm replay reuses digest-verified material offline. The receipt carries the
+missing set and the approved-baseline/proposed-candidate boundary explicitly.
+The candidate is never installed: any other approval state refuses to run.
 """
 
 from __future__ import annotations
@@ -405,75 +411,102 @@ def main() -> int:
     require_canonical(surreal["release_source"], f"{OFFICIAL_REPOSITORY}/releases/tag/{old_tag}", "installed release_source")
     require_canonical(surreal["release_asset"], f"{OFFICIAL_REPOSITORY}/releases/download/{old_tag}/surreal-{old_tag}.windows-amd64.exe", "installed release_asset")
 
-    # Validate the immutable historical input before network or write effects.
-    # Candidate advisories below remain a separate, explicitly fresh query.
-    response_bytes = read_historical_advisory(root, surreal, args.historical_osv_response)
+    # Baseline/candidate approval boundary (external audit 5887267578): the
+    # candidate is approved for project-local provisioning only. Any other
+    # approval or provisioning state refuses to run instead of silently
+    # switching the decision, and this provisioner never installs anything.
+    if candidate.get("installation_approval") != "not-issued":
+        raise RuntimeError(
+            "patched candidate installation_approval is not 'not-issued': "
+            "this provisioner only materializes project-local evidence and "
+            "never installs a candidate"
+        )
+    if candidate.get("status") != "project_local_artifact_required" or candidate.get("provisioning") != "project_local_provisioner":
+        raise RuntimeError(
+            "patched candidate is not in the project-local-provisioner state: "
+            "refusing to provision outside the approved baseline boundary"
+        )
 
-    fetch_to(
-        candidate["artifact_path"],
-        candidate_asset,
-        f"surrealdb.release-asset.{candidate_tag}",
-        candidate["sha256"],
-        candidate["artifact_size"],
-    )
-    fetch_to(
-        candidate["source_archive_path"],
-        f"{OFFICIAL_REPOSITORY}/archive/refs/tags/{candidate_tag}.tar.gz",
-        f"surrealdb.source-archive.{candidate_tag}",
-        candidate["source_archive_sha256"],
-    )
-    fetch_to(
-        candidate["release_metadata_path"],
-        url_for_release(candidate_tag),
-        f"surrealdb.release-metadata.{candidate_tag}",
-        accept="application/vnd.github+json",
-    )
-    fetch_to(
-        candidate["source_tag_ref_path"],
-        url_for_tag(candidate_tag),
-        f"surrealdb.tag-ref.{candidate_tag}",
-        accept="application/vnd.github+json",
-    )
-    fetch_to(
-        evidence["source_archive_path"],
-        f"{OFFICIAL_REPOSITORY}/archive/refs/tags/{old_tag}.tar.gz",
-        f"surrealdb.source-archive.{old_tag}",
-        evidence["source_archive_sha256"],
-    )
-    fetch_to(
-        evidence["source_tag_ref_path"],
-        url_for_tag(old_tag),
-        f"surrealdb.tag-ref.{old_tag}",
-        accept="application/vnd.github+json",
-    )
+    # Cold-runner repair: materialize every actually-provisionable input from
+    # real downloads first, then report unrestorable inputs as missing. A cold
+    # runner therefore leaves digest-pinned actual material for the warm replay
+    # (which reuses it offline through the digest-checked reuse path above)
+    # instead of aborting empty-handed before any effect. Missing stays
+    # missing, the exit stays nonzero while anything is missing, and nothing
+    # is synthesized. Candidate advisories remain a separate, explicitly
+    # fresh live query.
+    failures: list[str] = []
+
+    def record_missing(subject: str, exc: BaseException) -> None:
+        failures.append(subject)
+        print(f"PROVISION_INPUT: {subject} status=missing scope=source detail={str(exc)[:300]}")
+
+    def record_ready(subject: str, record: dict) -> None:
+        print(
+            f"PROVISION_INPUT: {subject} status=ready scope=source "
+            f"sha256={record['sha256']} bytes={record['bytes']} reused={record['reused']}"
+        )
+
+    def fetch_step(raw_path: object, url: str, subject: str, expected: str | None = None, expected_bytes: int | None = None, accept: str = "application/octet-stream") -> None:
+        before = len(records)
+        try:
+            fetch_to(raw_path, url, subject, expected, expected_bytes, accept=accept)
+        except (RuntimeError, OSError) as exc:
+            record_missing(subject, exc)
+        else:
+            record_ready(subject, records[before])
+
+    fetch_step(candidate["artifact_path"], candidate_asset, f"surrealdb.release-asset.{candidate_tag}", candidate["sha256"], candidate["artifact_size"])
+    fetch_step(candidate["source_archive_path"], f"{OFFICIAL_REPOSITORY}/archive/refs/tags/{candidate_tag}.tar.gz", f"surrealdb.source-archive.{candidate_tag}", candidate["source_archive_sha256"])
+    fetch_step(candidate["release_metadata_path"], url_for_release(candidate_tag), f"surrealdb.release-metadata.{candidate_tag}", accept="application/vnd.github+json")
+    fetch_step(candidate["source_tag_ref_path"], url_for_tag(candidate_tag), f"surrealdb.tag-ref.{candidate_tag}", accept="application/vnd.github+json")
+    fetch_step(evidence["source_archive_path"], f"{OFFICIAL_REPOSITORY}/archive/refs/tags/{old_tag}.tar.gz", f"surrealdb.source-archive.{old_tag}", evidence["source_archive_sha256"])
+    fetch_step(evidence["source_tag_ref_path"], url_for_tag(old_tag), f"surrealdb.tag-ref.{old_tag}", accept="application/vnd.github+json")
 
     query = json.loads(surreal["advisory_query"])
     query_bytes = (json.dumps(query, separators=(",", ":"), ensure_ascii=False) + "\r\n").encode("utf-8")
-    query_record = materialize(root, surreal["advisory_query_path"], query_bytes, surreal["advisory_query_sha256"])
-    records.append({
-        "subject": "osv.query.surrealdb",
-        "url": OSV_ENDPOINT,
-        "request": True,
-        "reused": query_record["reused"],
-        "expected_sha256": surreal["advisory_query_sha256"].lower(),
-        "expected_bytes": None,
-        **query_record,
-    })
-    response_record = materialize(
-        root,
-        surreal["advisory_response_path"],
-        response_bytes,
-        surreal["advisory_response_digest"],
-        replace_existing=True,
-    )
-    records.append({
-        "subject": "osv.response.surrealdb",
-        "url": OSV_ENDPOINT,
-        "request": False,
-        "expected_sha256": str(surreal["advisory_response_digest"]).lower(),
-        "expected_bytes": None,
-        **response_record,
-    })
+    try:
+        query_record = materialize(root, surreal["advisory_query_path"], query_bytes, surreal["advisory_query_sha256"])
+    except (RuntimeError, OSError) as exc:
+        record_missing("osv.query.surrealdb", exc)
+    else:
+        records.append({
+            "subject": "osv.query.surrealdb",
+            "url": OSV_ENDPOINT,
+            "request": True,
+            "reused": query_record["reused"],
+            "expected_sha256": surreal["advisory_query_sha256"].lower(),
+            "expected_bytes": None,
+            **query_record,
+        })
+        record_ready("osv.query.surrealdb", query_record)
+
+    response_bytes: bytes | None = None
+    try:
+        response_bytes = read_historical_advisory(root, surreal, args.historical_osv_response)
+    except (RuntimeError, OSError) as exc:
+        record_missing("osv.response.surrealdb", exc)
+    if response_bytes is not None:
+        try:
+            response_record = materialize(
+                root,
+                surreal["advisory_response_path"],
+                response_bytes,
+                surreal["advisory_response_digest"],
+                replace_existing=True,
+            )
+        except (RuntimeError, OSError) as exc:
+            record_missing("osv.response.surrealdb", exc)
+        else:
+            records.append({
+                "subject": "osv.response.surrealdb",
+                "url": OSV_ENDPOINT,
+                "request": False,
+                "expected_sha256": str(surreal["advisory_response_digest"]).lower(),
+                "expected_bytes": None,
+                **response_record,
+            })
+            record_ready("osv.response.surrealdb", response_record)
 
     candidate_query = {
         "package": {
@@ -486,76 +519,100 @@ def main() -> int:
         json.dumps(candidate_query, separators=(",", ":"), ensure_ascii=False) + "\r\n"
     ).encode("utf-8")
     candidate_query_expected_sha256 = sha256_bytes(candidate_query_bytes)
-    candidate_query_record = materialize(
-        root,
-        candidate["advisory_query_path"],
-        candidate_query_bytes,
-        candidate_query_expected_sha256,
-        replace_existing=True,
-    )
-    records.append({
-        "subject": f"osv.query.surrealdb.release-candidate.{candidate_tag}",
-        "url": OSV_ENDPOINT,
-        "request": True,
-        "expected_sha256": candidate_query_expected_sha256,
-        "expected_bytes": candidate_query_record["bytes"],
-        **candidate_query_record,
-    })
-
-    candidate_response_bytes = fetch(
-        OSV_ENDPOINT,
-        data=candidate_query_bytes,
-        accept="application/json",
-    )
     try:
-        candidate_response_data = json.loads(candidate_response_bytes.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"candidate OSV response is not valid JSON: {exc}") from exc
-    if not isinstance(candidate_response_data, dict):
-        raise RuntimeError("candidate OSV response must be a JSON object")
-    unexpected_response_fields = set(candidate_response_data) - {"vulns", "next_page_token"}
-    if unexpected_response_fields:
-        raise RuntimeError(
-            "candidate OSV response contains unsupported fields: "
-            + ", ".join(sorted(str(field) for field in unexpected_response_fields))
+        candidate_query_record = materialize(
+            root,
+            candidate["advisory_query_path"],
+            candidate_query_bytes,
+            candidate_query_expected_sha256,
+            replace_existing=True,
         )
-    candidate_vulnerabilities = candidate_response_data.get("vulns", [])
-    if not isinstance(candidate_vulnerabilities, list):
-        raise RuntimeError("candidate OSV response vulns field must be an array when present")
-    if "next_page_token" in candidate_response_data:
-        next_page_token = candidate_response_data["next_page_token"]
-        if not isinstance(next_page_token, str):
-            raise RuntimeError("candidate OSV response next_page_token must be a string when present")
-        if next_page_token:
-            raise RuntimeError("candidate OSV response is paginated and cannot establish a complete advisory result")
-    candidate_retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    candidate_response_record = materialize(
-        root,
-        candidate["advisory_response_path"],
-        candidate_response_bytes,
-        replace_existing=True,
-    )
-    records.append({
-        "subject": f"osv.response.surrealdb.release-candidate.{candidate_tag}",
-        "url": OSV_ENDPOINT,
-        "request": False,
-        "fetched": True,
-        "retrieved_at_utc": candidate_retrieved_at,
-        "expected_sha256": None,
-        "expected_bytes": None,
-        **candidate_response_record,
-    })
+    except (RuntimeError, OSError) as exc:
+        record_missing(f"osv.query.surrealdb.release-candidate.{candidate_tag}", exc)
+    else:
+        records.append({
+            "subject": f"osv.query.surrealdb.release-candidate.{candidate_tag}",
+            "url": OSV_ENDPOINT,
+            "request": True,
+            "expected_sha256": candidate_query_expected_sha256,
+            "expected_bytes": candidate_query_record["bytes"],
+            **candidate_query_record,
+        })
+        record_ready(f"osv.query.surrealdb.release-candidate.{candidate_tag}", candidate_query_record)
 
-    receipt = {
-        "schema": "eliot.surrealdb-project-local-provisioning.v2",
-        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "repository": OFFICIAL_REPOSITORY,
-        "shared_installation_touched": False,
-        "records": records,
-    }
-    receipt_payload = (json.dumps(receipt, indent=2) + "\n").encode("utf-8")
-    materialize(root, ".eliot/dependency-policy/surrealdb/provisioning-receipt.json", receipt_payload, replace_existing=True)
-    print(json.dumps(receipt, indent=2))
+    try:
+        candidate_response_bytes = fetch(
+            OSV_ENDPOINT,
+            data=candidate_query_bytes,
+            accept="application/json",
+        )
+        try:
+            candidate_response_data = json.loads(candidate_response_bytes.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"candidate OSV response is not valid JSON: {exc}") from exc
+        if not isinstance(candidate_response_data, dict):
+            raise RuntimeError("candidate OSV response must be a JSON object")
+        unexpected_response_fields = set(candidate_response_data) - {"vulns", "next_page_token"}
+        if unexpected_response_fields:
+            raise RuntimeError(
+                "candidate OSV response contains unsupported fields: "
+                + ", ".join(sorted(str(field) for field in unexpected_response_fields))
+            )
+        candidate_vulnerabilities = candidate_response_data.get("vulns", [])
+        if not isinstance(candidate_vulnerabilities, list):
+            raise RuntimeError("candidate OSV response vulns field must be an array when present")
+        if "next_page_token" in candidate_response_data:
+            next_page_token = candidate_response_data["next_page_token"]
+            if not isinstance(next_page_token, str):
+                raise RuntimeError("candidate OSV response next_page_token must be a string when present")
+            if next_page_token:
+                raise RuntimeError("candidate OSV response is paginated and cannot establish a complete advisory result")
+        candidate_retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        candidate_response_record = materialize(
+            root,
+            candidate["advisory_response_path"],
+            candidate_response_bytes,
+            replace_existing=True,
+        )
+    except (RuntimeError, OSError) as exc:
+        record_missing(f"osv.response.surrealdb.release-candidate.{candidate_tag}", exc)
+    else:
+        records.append({
+            "subject": f"osv.response.surrealdb.release-candidate.{candidate_tag}",
+            "url": OSV_ENDPOINT,
+            "request": False,
+            "fetched": True,
+            "retrieved_at_utc": candidate_retrieved_at,
+            "expected_sha256": None,
+            "expected_bytes": None,
+            **candidate_response_record,
+        })
+        record_ready(f"osv.response.surrealdb.release-candidate.{candidate_tag}", candidate_response_record)
+
+    missing = sorted(set(failures))
+    if records:
+        receipt = {
+            "schema": "eliot.surrealdb-project-local-provisioning.v2",
+            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "repository": OFFICIAL_REPOSITORY,
+            "shared_installation_touched": False,
+            "complete": not missing,
+            "missing_inputs": missing,
+            "boundary": {
+                "approved_baseline": {"version": old_version, "source_tag": old_tag},
+                "proposed_candidate": {"version": candidate_version, "source_tag": candidate_tag},
+                "candidate_installation_approval": candidate.get("installation_approval"),
+                "candidate_provisioning": candidate.get("provisioning"),
+            },
+            "records": records,
+        }
+        receipt_payload = (json.dumps(receipt, indent=2) + "\n").encode("utf-8")
+        materialize(root, ".eliot/dependency-policy/surrealdb/provisioning-receipt.json", receipt_payload, replace_existing=True)
+        print(json.dumps(receipt, indent=2))
+    if missing:
+        print(f"PROVISION_SURREALDB_INPUTS: INCOMPLETE (missing={missing}); inputs stay missing, nothing fabricated")
+        return 1
+    print(f"PROVISION_SURREALDB_INPUTS: READY ({len(records)} records from actual material)")
     return 0
 
 
