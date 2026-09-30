@@ -7474,30 +7474,6 @@ const UNREACHED_WAKE_OWNER_REASON: &str = "no authenticated UserAutomation runti
 
 /// Projects a horizon that the schedule owner did not fully acknowledge.
 ///
-/// Builds the phase a wake-horizon publication reports when its owner effect
-/// could not be retained at all.
-///
-/// The horizon keeps its exact requested and remaining sets and the replay
-/// handle, so a caller that retained nothing still learns which occurrences were
-/// outstanding and under which identity it may ask again. Nothing is issued and
-/// no receipt is substituted for the missing record: the obligation is a
-/// precondition of the owner effect, not a receipt for it.
-fn unretained_wake_horizon_phase(
-    publication: &UserAutomationWakeHorizonPublication,
-    requested_occurrence_ids: &[String],
-    retry_handle: &str,
-    error: String,
-) -> UserAutomationHorizonPhase {
-    let reason = unretained_horizon_reason(&publication.automation_revision, error);
-    unreached_horizon_phase(
-        publication,
-        requested_occurrence_ids,
-        retry_handle.to_owned(),
-        UnreachedHorizonKind::Unavailable,
-        &reason,
-    )
-}
-
 /// The exact requested and remaining occurrence sets and the replay handle are
 /// always retained. A failure answer never reports an empty remainder: an empty
 /// set would claim that nothing is outstanding, which is exactly the answer this
@@ -7527,6 +7503,30 @@ fn unreached_horizon_phase(
         retry_handle,
         outcome,
     }
+}
+
+/// Builds the phase a wake-horizon publication reports when its owner effect
+/// could not be retained at all.
+///
+/// The horizon keeps its exact requested and remaining sets and the replay
+/// handle, so a caller that retained nothing still learns which occurrences were
+/// outstanding and under which identity it may ask again. Nothing is issued and
+/// no receipt is substituted for the missing record: the obligation is a
+/// precondition of the owner effect, not a receipt for it.
+fn unretained_wake_horizon_phase(
+    publication: &UserAutomationWakeHorizonPublication,
+    requested_occurrence_ids: &[String],
+    retry_handle: &str,
+    error: String,
+) -> UserAutomationHorizonPhase {
+    let reason = unretained_horizon_reason(&publication.automation_revision, error);
+    unreached_horizon_phase(
+        publication,
+        requested_occurrence_ids,
+        retry_handle.to_owned(),
+        UnreachedHorizonKind::Unavailable,
+        &reason,
+    )
 }
 
 /// Completes the retirement handoff for `Pause`.

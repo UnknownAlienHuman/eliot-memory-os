@@ -1,4 +1,4 @@
-//! Production execution joins for the Kernel-owned UserAutomation service.
+//! Production execution joins for the Kernel-owned `UserAutomation` service.
 //!
 //! The service owns the causal ordering at the boundary: authenticate and
 //! validate the owner-issued projection, run the model-free Kernel preflight,
