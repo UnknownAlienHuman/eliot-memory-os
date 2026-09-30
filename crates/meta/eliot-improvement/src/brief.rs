@@ -47,6 +47,23 @@
 //! brief must not reach an owner as though a boundary had been observed when
 //! none was.
 //!
+//! # BYTES ARE NOT AN OBSERVATION
+//!
+//! Private fields are not a seal. `Deserialize` is a public trait impl and does
+//! not go through them, so a caller could write two arbitrary non-empty strings
+//! into any wire format and rebuild a `SafeBoundary` that
+//! [`brief_at_safe_boundary`] accepts — the same gate the public fields used to
+//! pass, reached by a different route, and reachable without the
+//! [`eliot_governor`] edge this constructor needs. `SafeBoundary` therefore
+//! carries a provenance marker that only [`SafeBoundary::from_observed_closure`]
+//! sets and `Deserialize` skips, so a boundary rebuilt from bytes cannot
+//! satisfy [`SafeBoundary::validate`]: I12.24:64 asks for a brief at a boundary
+//! an owner actually closed, and a re-serialized pair of strings is not one.
+//! `Serialize` is retained, so the two observed values still round-trip into the
+//! durable learning record next to the brief. What does not round-trip is the
+//! fact of the observation, which is a fact about this process rather than about
+//! bytes.
+//!
 //! # The brief's `proposed_owner` and its boundary are ONE principal
 //!
 //! I12.24:64 sends the brief "to active Main Agent or Human at a safe
@@ -150,15 +167,16 @@ impl OwnerDecision {
 
 /// Safe-boundary gate: an active Main Agent or Human plus a boundary ref.
 ///
-/// # The fields are private, and that is the gate
+/// # The fields are private, and that is not by itself the gate
 ///
 /// Both fields were public `String`s checked only for non-emptiness, so
 /// `format!("owner:{OWNER}")` satisfied the gate on its own — a check reading a
 /// literal. They are private now and [`Self::from_observed_closure`] is the
-/// only constructor, so both values must come from a record the Governor's
-/// learning-closure owner actually committed. `Serialize`/`Deserialize` are
-/// retained so the two observed values still round-trip into the durable
-/// learning record next to the brief.
+/// only constructor. Private alone still left a second route, because
+/// `Deserialize` is a public trait impl that ignores privacy: the provenance
+/// marker below closes it. `Serialize`/`Deserialize` are retained so the two
+/// observed values still round-trip into the durable learning record next to the
+/// brief.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SafeBoundary {
     /// Identity that executed the observed consequential attempt
@@ -167,6 +185,16 @@ pub struct SafeBoundary {
     /// Derived consequential boundary the closure recorded
     /// (`StoredLearningDelta::consequential_boundary`).
     boundary_ref: String,
+    /// Provenance of the observation itself, not a boundary attribute.
+    ///
+    /// `true` only on a value [`Self::from_observed_closure`] read from a
+    /// committed closure record. `#[serde(skip)]` means the field is neither
+    /// written nor read by `Serialize`/`Deserialize`, so a boundary rebuilt from
+    /// bytes always arrives unmarked and is refused by [`Self::validate`] — the
+    /// observation is a fact about this process and cannot be re-established
+    /// from the two strings it produced.
+    #[serde(skip)]
+    observed: bool,
 }
 
 impl SafeBoundary {
@@ -185,8 +213,12 @@ impl SafeBoundary {
     /// record per consequential closure
     /// (`crates/governor/eliot-governor/src/learning_closure.rs:293-303`), so
     /// the last element is the newest owner-observed consequential boundary
-    /// this process holds. Both values on the result are that record's own
-    /// fields; neither is formatted, defaulted or synthesized here.
+    /// this process holds. Both boundary values on the result are that record's
+    /// own fields; neither is formatted, defaulted or synthesized here. The
+    /// provenance marker records that THIS constructor ran, not a third observed
+    /// value: it is the one thing about a boundary that cannot arrive from
+    /// outside this module, which is what makes [`Self::validate`] a gate rather
+    /// than a shape check.
     ///
     /// # Errors
     ///
@@ -207,6 +239,7 @@ impl SafeBoundary {
         let boundary = Self {
             active_main_agent_or_human_ref: record.actor_id.clone(),
             boundary_ref: record.consequential_boundary.as_str().to_owned(),
+            observed: true,
         };
         boundary.validate()?;
         Ok(boundary)
@@ -233,15 +266,20 @@ impl SafeBoundary {
         &self.boundary_ref
     }
 
-    /// Rejects a boundary that names no principal or no derived boundary.
+    /// Rejects a boundary that was not observed, or names no principal and no
+    /// derived boundary.
     ///
-    /// This is a shape check over values [`Self::from_observed_closure`] read
-    /// from a committed record. It cannot be satisfied by a formatted constant
-    /// because the struct has no public constructor; it is kept because a
-    /// deserialized boundary reaches the same gate through
-    /// [`brief_at_safe_boundary`].
+    /// The provenance requirement is what seals the gate. Private fields stop a
+    /// Rust caller from spelling the struct, but `Deserialize` is a public trait
+    /// impl that never reads them, so two arbitrary non-empty strings rebuilt
+    /// from any wire format would otherwise pass this check and reach
+    /// [`brief_at_safe_boundary`] as though a closure had been observed — the
+    /// literal-shaped gate this module exists to remove, one serde route away.
+    /// The empty-shape check remains because the observed record's own fields
+    /// are what the other half reads.
     pub fn validate(&self) -> Result<(), ImprovementError> {
-        if self.active_main_agent_or_human_ref.trim().is_empty()
+        if !self.observed
+            || self.active_main_agent_or_human_ref.trim().is_empty()
             || self.boundary_ref.trim().is_empty()
         {
             return Err(ImprovementError::UnsafeBoundary);
