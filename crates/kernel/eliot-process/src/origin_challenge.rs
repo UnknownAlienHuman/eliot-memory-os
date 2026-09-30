@@ -945,6 +945,10 @@ impl OriginChallengeAuthority {
             || entry.physical_digest != challenge.physical_digest
             || entry.installation_id != challenge.installation_id
             || entry.generation != challenge.generation
+            // The fence is compared against the live issuance record, not
+            // only the caller-serialized request binding checked below, so a
+            // serialized fence alone never suffices.
+            || !fences_match_exact(&entry.state_fence, &challenge.state_fence)
             || entry.operation != challenge.operation
             || entry.issued_at_unix_ms != challenge.issued_at_unix_ms
             || entry.expires_at_unix_ms != challenge.expires_at_unix_ms
