@@ -80,6 +80,8 @@ use eliot_agent_coordinator::{
     AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
     load_runtime_scheduling_profile,
 };
+#[cfg(not(test))]
+use eliot_agent_coordinator::{AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial};
 use eliot_contracts::{fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +94,8 @@ use crate::agent_fabric::{
 #[cfg(test)]
 use crate::agent_fabric::{FabricPorts, ModelRegistryPort};
 use crate::daemon_kernel_client::DaemonKernelClient;
+#[cfg(not(test))]
+use crate::semantic_revision_store::SemanticRevisionStore;
 use crate::staffing_policy::{
     StaffingPlanReceipt, plan_coordinator_staffing, verify_receipt_digest,
 };
@@ -1690,6 +1694,78 @@ fn restore_solo_fabric(
     Ok(fabric)
 }
 
+/// Builds the restore-time admitted provider capability from the durable
+/// projection's claimed halves plus freshly resolved session halves.
+///
+/// Production mirror of the session-bound resolution the test seam performs
+/// through the composition's verified-material resolution plus the
+/// material-to-capability builder: the claimed halves ride from the
+/// digest-bound persisted projection (never invented here), while the live
+/// fence and the validated session binding are the daemon's current
+/// authenticated-session observations passed in by the caller. The Governor
+/// expectation travels from the projection and is judged for currency
+/// against the live fence by the same authority rule, so a projection
+/// restored under a moved epoch refuses instead of resuming effect
+/// authority. Revocation is observed per proof, never at construction, so a
+/// revoked projection still builds and the coordinator's event replay
+/// refuses it without mutation.
+///
+/// # Errors
+///
+/// Returns the session-currency rejection or the coordinator owner rejection
+/// unchanged.
+#[cfg(not(test))]
+fn build_solo_restore_capability(
+    material: VerifiedProviderMaterial,
+    live_fence: eliot_contracts::StateFence,
+    session_binding: String,
+) -> Result<AdmittedProviderCapability, FabricError> {
+    if !material
+        .expectation
+        .live_authority_epoch
+        .is_same_authority(&live_fence.authority_epoch)
+    {
+        return Err(FabricError::StaleEpoch(
+            "provider expectation epoch is not current under the live Kernel session".to_owned(),
+        ));
+    }
+    let presented = PresentedClaimMaterial::new(
+        material.claim_id,
+        material.attempt_id,
+        material.operation_id,
+        material.binding_digest,
+        material.executable_digest,
+        material.route_revision,
+        material.capacity_revision,
+        material.worker_generation,
+        material.presented_fence,
+    )?;
+    let currentness = OwnerCurrentness::new(material.expectation, live_fence, session_binding)?;
+    Ok(AdmittedProviderCapability::new(
+        material.identity,
+        presented,
+        currentness,
+        material.health,
+        material.minimum_event_sequence,
+    )?)
+}
+
+/// Rebuilds the solo ports plus a restored fabric from a persisted projection.
+///
+/// Production restore (issue #1108 A12): the digest-bound projection supplies
+/// the claimed halves, the daemon supplies the live session halves (a fresh
+/// fence plus the validated session binding, by the same rule as the
+/// session-bound resolution), the closed production ports bind no test fake,
+/// and the coordinator replays every snapshot event through the fresh owner
+/// verifier, so stale, revoked, foreign, or conflicting evidence fails
+/// closed instead of resuming effect authority. The restored fabric carries
+/// the recorded dispatch intent, which is the independent expected set the
+/// tool-result ingest leg binds its receipt against before anything is
+/// observed.
+///
+/// Every solo leg reaches `AgentFabric::observe_tool_result` through this
+/// restore in a non-test build; without a validated session, a current
+/// fence, or a coherent capability it returns the typed refusal unchanged.
 #[cfg(not(test))]
 /// Synchronous production restore stays fail-closed (issue #1108 A8).
 ///
@@ -1702,14 +1778,63 @@ fn restore_solo_fabric(
 /// this path. The async restore path is `restore_solo_fabric_async`,
 /// reached from the async fair-pull recovery poll.
 fn restore_solo_fabric(
-    _composition: &DaemonComposition,
-    _kernel: &Arc<DaemonKernelClient>,
-    _projection: &SoloPersistedAttempt,
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    projection: &SoloPersistedAttempt,
 ) -> Result<AgentFabric, DaemonError> {
-    Err(DaemonError::Kernel(
-        "solo restore is blocked until Kernel retains an independently owner-verified executable-binding digest"
-            .to_owned(),
-    ))
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    let definition = projection
+        .snapshot
+        .definitions
+        .values()
+        .find(|definition| definition.definition_digest == projection.plan_digest)
+        .ok_or_else(|| {
+            DaemonError::ProviderAdmission(FabricError::BrokenOwnershipLink(
+                "solo restore finds no definition binding the frozen plan digest".to_owned(),
+            ))
+        })?;
+    let live_fence = kernel.kernel_fence();
+    if !fences_match_exact(&live_fence, &definition.fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo restore refuses a fence-moved definition".to_owned(),
+        )));
+    }
+    let session_binding = composition.owner_session_binding().ok_or_else(|| {
+        DaemonError::Kernel(
+            "daemon has no validated Kernel session binding; verified provider admission stays plan-only"
+                .to_owned(),
+        )
+    })?;
+    let capability =
+        build_solo_restore_capability(projection.claimed.material(), live_fence, session_binding)
+            .map_err(DaemonError::ProviderAdmission)?;
+    let config = daemon_coordinator_config()?;
+    let ports = composition.production_fabric_ports()?;
+    let store = SemanticRevisionStore::new(composition.state_root());
+    let mut fabric = AgentFabric::restore_with_admitted_provider(
+        projection.snapshot.clone(),
+        config,
+        ports,
+        Some(&store),
+        capability,
+    )
+    .map_err(DaemonError::ProviderAdmission)?;
+    // Same durable carrier as the drive path, so a revision published after
+    // restore is committed before it is reported current exactly as before.
+    fabric.attach_semantic_revision_store(composition.state_root());
+    // Reconcile the unknown: an emitted dispatch with no ingested result
+    // cannot relaunch and cannot release; its outcome stays unknown until
+    // the worker observation arrives through the ingest leg.
+    if projection.emitted && projection.result_digest.is_none() {
+        let attempt = AttemptId::new(projection.attempt_id.clone())
+            .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+        if fabric.attempt_of(&attempt) == Some(crate::agent_fabric::AttemptLifecycle::Dispatched) {
+            fabric.mark_unknown_outcome(&attempt)?;
+        }
+    }
+    Ok(fabric)
 }
 
 /// Restores the solo fabric through the verified async seam (issue #1108
@@ -1828,22 +1953,16 @@ fn load_scheduling_profile(
 /// Reachable in a non-test build: [`solo_ingest_result`] and
 /// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
 /// are not `cfg(test)`-gated, so this join is compiled and callable in
-/// production. The fabric it drives is restored through the verified seam
-/// (issue #1108): [`restore_solo_fabric`] binds the frozen plan digest,
-/// re-resolves live owner evidence over the closed production ports, and
-/// reconciles an emitted-but-unresulted dispatch to unknown instead of
-/// relaunching; missing, stale, or revoked evidence refuses typed before any
-/// effect. New production work now constructs through the async seam on the
-/// runtime queue-poll path
-/// ([`drive_solo_delegate_verified_async`] over
-/// [`DaemonComposition::agent_fabric_new_verified_async`] with the driver's
-/// claimed halves) and fails closed one hop later: the admitted-route gate
-/// refuses with the typed missing-prerequisite residual until B-MOD #694
-/// binds an accepted registry revision, and execution still waits on the
-/// native-worker executable-binding owner (issue #1678). The join is placed
-/// on the release path because that is where I14.8 says the wake happens,
-/// not on a site that would be reachable only by pulling over an empty
-/// plan-only coordinator.
+/// production. The restore leg is production now (issue #1108 A12): the
+/// fabric above is already a restored verified fabric, so this pull runs
+/// over live admitted capacity. The remaining documented residual is not
+/// this issue's: `drive_solo_delegate_async` still refuses before any fabric
+/// effect until the Kernel native-worker owner retains an independently
+/// owner-verified executable-binding digest (issue #1678), so no production
+/// build yet drives a fresh admitted projection to pull over. The join is
+/// placed on the release path because that is where I14.8 says the wake
+/// happens, not on a site that would be reachable only by pulling over an
+/// empty plan-only coordinator.
 fn drive_fair_pull_after_release(
     composition: &DaemonComposition,
     fabric: &mut AgentFabric,
@@ -1916,13 +2035,12 @@ pub enum FairPullRecovery {
 /// Reachable in a non-test build: this is not `cfg(test)`-gated, and its
 /// production caller is `daemon_runtime::maybe_start_fair_pull_recovery`, which
 /// runs it on the daemon's existing `ACTIVATION_POLL_INTERVAL` cadence. The
-/// poll restores through the verified seam (issue #1108): missing, stale, or
-/// revoked evidence reports its typed refusal and stays blocked, and an
-/// emitted-but-unresulted dispatch reconciles to unknown instead of
-/// relaunching. New projections construct through the async seam on the
-/// queue-poll path ([`drive_solo_delegate_verified_async`]) but refuse at
-/// the admitted-route gate until B-MOD #694 binds — so the poll only ever
-/// drives a previously admitted projection, never a fresh one.
+/// restore leg is production now (issue #1108 A12): the poll restores the
+/// verified fabric from the digest-bound projection and drives it, reporting
+/// the typed owner refusal unchanged when the session, fence, or capability
+/// is not current. The remaining documented residual is the fresh-drive leg:
+/// `drive_solo_delegate_async` still refuses before any fabric effect until
+/// the Kernel native-worker owner and the G-11 admission owner (#1678) land.
 ///
 /// The Kernel handle is used only for the restore's live owner-evidence
 /// re-resolution that the restore seam already performs (the async verified
@@ -2199,6 +2317,45 @@ pub fn solo_ingest_tool_result(
     // command. The candidate result is already durable above.
     drive_fair_pull_after_release(composition, &mut fabric, &mut projection)?;
     solo_status(composition, operation_id)
+}
+
+/// Ingests one bridge-projected tool result as attempt evidence (issue #1108,
+/// A12).
+///
+/// Production composition caller over [`solo_ingest_tool_result`]: the
+/// bridge owner's projected receipt travels the same validated
+/// dispatch-bound path as the free function, and its typed outcome is
+/// returned unchanged — never discarded into `Ok`. This mirrors the
+/// existing [`DaemonComposition::solo_ingest_result`] wrapper for the
+/// string-digest leg; it lives in the driver module because the
+/// composition root surface is outside this slice's paths.
+///
+/// Reachable in a non-test build: neither this method nor the free
+/// function is `cfg`-gated, so the call compiles and runs in production.
+/// The restore leg is production now: the free function restores the
+/// verified fabric from the digest-bound projection over the live
+/// authenticated session and carries the bridge receipt to
+/// [`crate::provider_capability::observe_tool_result`] through the recorded
+/// dispatch intent, failing closed with the typed owner refusal when the
+/// session, fence, or capability is not current.
+/// The remaining stitch (STITCH) is the transport leg that delivers a
+/// bridge-projected [`ToolResultReceipt`] to this caller: no in-tree
+/// producer hands one here yet.
+///
+/// # Errors
+///
+/// Returns the readiness or ingestion rejection unchanged.
+impl DaemonComposition {
+    pub fn solo_ingest_tool_result(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        operation_id: &str,
+        worker_id: &str,
+        receipt: &ToolResultReceipt,
+        observed_via: &str,
+    ) -> Result<SoloAttemptStatus, DaemonError> {
+        solo_ingest_tool_result(self, kernel, operation_id, worker_id, receipt, observed_via)
+    }
 }
 
 /// Restores the durable projection after a restart without relaunching.

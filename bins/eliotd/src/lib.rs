@@ -3781,6 +3781,20 @@ impl DaemonComposition {
         Ok(material)
     }
 
+    /// Returns the validated Kernel session binding held by the composition,
+    /// if any (issue #1108 A12).
+    ///
+    /// Production solo-restore seam: the restore resolves the owner session
+    /// half over the live authenticated session by the same rule as the
+    /// session-bound resolution above, without a re-handshake and without
+    /// touching the retained facts. `None` (no validated handshake yet)
+    /// fails the restore closed; the daemon stays plan-only.
+    pub fn owner_session_binding(&self) -> Option<String> {
+        self.owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned())
+    }
+
     /// Borrows the daemon-held Governor capability admission view (#1957).
     ///
     /// Post-`start` attach-style accessor, mirroring
