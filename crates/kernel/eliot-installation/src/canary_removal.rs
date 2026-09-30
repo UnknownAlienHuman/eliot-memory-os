@@ -1176,17 +1176,23 @@ where
     if install.candidate_manifest.generation != *generation {
         return Err(InstallationError::IdentityConflict);
     }
-    if install.stage() != InstallationStage::Completed {
-        return Err(InstallationError::IncompleteObservation(format!(
-            "canary removal requires a completed installation transaction, observed {:?}",
-            install.stage()
-        )));
-    }
+    // The pending-activation refusal runs before the stage gate on purpose: a
+    // pre-activation install with a held intent and no receipt yet passes
+    // `install.validate()` (the intent is legal while activating) and must
+    // meet this precise refusal instead of the generic stage message. Once
+    // the receipt exists the check evaluates false and planning falls
+    // through to the stage gate below.
     if install.has_pending_activation_projection_intent() {
         return Err(InstallationError::IncompleteObservation(
             "the activation owner still holds this transaction's pending activation intent"
                 .to_owned(),
         ));
+    }
+    if install.stage() != InstallationStage::ActiveVerified {
+        return Err(InstallationError::IncompleteObservation(format!(
+            "canary removal requires an active-verified installation transaction, observed {:?}",
+            install.stage()
+        )));
     }
     // A held intent together with the committed activation receipt is retained
     // historical provenance, not a pending projection: the install history
@@ -2071,7 +2077,7 @@ where
 }
 
 /// Revalidates the durable fence before any destructive action: the exact
-/// installed transaction and its completed stage, the re-observed drain
+/// installed transaction and its active-verified finished stage, the re-observed drain
 /// evidence (applied effects, no pending external change, no held activation
 /// intent), the current registry revision, the target's still-retired
 /// position, any pending activation, and the required re-observed
@@ -2111,7 +2117,7 @@ where
     {
         return Err(InstallationError::IdentityConflict);
     }
-    if install.stage() != InstallationStage::Completed {
+    if install.stage() != InstallationStage::ActiveVerified {
         return Err(InstallationError::IdentityConflict);
     }
     // Quiesce is re-observed at fence time, not just at plan time: the drain
