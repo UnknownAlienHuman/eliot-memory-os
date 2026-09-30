@@ -98,6 +98,7 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CanonicalRequestView, CanonicalRestoreBatch, CanonicalStoreClient, CanonicalValidationSnapshot,
     NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingHeadReadback,
     OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
@@ -961,6 +962,14 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
     ) -> Result<Vec<OrderingHead>, StoreError> {
         self.require_active_generation()?;
         self.gateway.store.ordering_heads(scopes).await
+    }
+
+    async fn ordering_head_readbacks(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        self.require_active_generation()?;
+        self.gateway.store.ordering_head_readbacks(scopes).await
     }
 
     async fn execute_named(
