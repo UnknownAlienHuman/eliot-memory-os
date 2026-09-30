@@ -287,32 +287,68 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("783/18", "#783", "crates/eliot-app/src/mcp_stdio/task_handlers.rs", "estimated_tokens: 431"),
     ("783/19", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "&& intent.cost_or_token_units == 0)"),
     ("783/20", "#783", "crates/eliot-app/src/mcp_stdio/operator.rs", ", score.context_cost, false),"),
-    ("783/21", "#783", "crates/eliot-app/src/commands/data_and_memory.rs", "estimated_context_cost: 128"),
-    ("783/22", "#783", "crates/eliot-app/src/mcp_stdio/skill.rs", "estimated_context_cost: 128"),
+    # #880 (d330a5bff) replaced the caller-declared `estimated_context_cost: 128`
+    # literal with the measured Skill bytes travelling with the request. The
+    # requirement -- the caller must supply a real measurement, never a
+    # fabricated constant -- survives, so the seam is re-frozen on the
+    # `measured_skills` binding the caller now makes, not deleted.
+    ("783/21", "#783", "crates/eliot-app/src/commands/data_and_memory.rs", "measured_skills: Some(vec![skill]),"),
+    ("783/22", "#783", "crates/eliot-app/src/mcp_stdio/skill.rs", "measured_skills: Some(vec![skill]),"),
     # #878 engine Context / packet-quality / Host seam
-    ("878/10", "#878", "crates/eliot-engine/src/context.rs", "Ok(serde_json::to_vec(supplement)?.len().div_ceil(4))"),
+    # The four `div_ceil(4)` heuristics below were re-frozen by #880 onto the
+    # canonical #704 STU measurement they now read. Each requirement survives:
+    # the seam is still "the consumer binds a real serialized-context
+    # measurement here", only the fabricated local ratio is gone.
+    ("878/10", "#878", "crates/eliot-engine/src/context.rs", "canonical_stu_for_byte_len(serialized.len())"),
     ("878/11", "#878", "crates/eliot-engine/src/context.rs", "fn estimate_tokens(packet: &ContextPacketL3)"),
     ("878/12", "#878", "crates/eliot-engine/src/context.rs", "estimate_tokens(packet)?);"),
-    ("878/13", "#878", "crates/eliot-engine/src/context.rs", "serde_json::to_vec(packet)?.len().div_ceil(4)"),
+    # #880 replaced the local `len().div_ceil(4)` with the canonical #704
+    # measurement for the serialized packet; the binding requirement remains.
+    # (context.rs:3123-3125)
+    ("878/13", "#878", "crates/eliot-engine/src/context.rs", "canonical_measurement_for_payload(&packet_bytes)?"),
     ("878/14", "#878", "crates/eliot-engine/src/context_contracts.rs", "pub estimated_tokens: usize,"),
-    ("878/15", "#878", "crates/eliot-engine/src/context/packet_quality.rs", "estimated_tokens: structured_bytes.div_ceil(4)"),
-    ("878/16", "#878", "crates/eliot-engine/src/host.rs", "pub estimated_tokens: usize,"),
-    ("878/17", "#878", "crates/eliot-engine/src/host.rs", "let estimated_tokens = body.chars().count().div_ceil(4)"),
-    ("878/18", "#878", "crates/eliot-engine/src/host.rs", "if description.chars().count().div_ceil(4) > 25"),
+    # #880 replaced `estimated_tokens: structured_bytes.div_ceil(4)` with the
+    # canonical #704 STU read off the measured payload; same binding, no local
+    # ratio. (packet_quality.rs:177-182)
+    ("878/15", "#878", "crates/eliot-engine/src/context/packet_quality.rs", "canonical_measurement_for_payload(&serialized)"),
+    # #880 replaced the two `pub estimated_tokens` listing fields and the
+    # `body.chars().count().div_ceil(4)` bind with the canonical #704 envelope
+    # measurement (`exact_text_measurement` -> StuEstimate). The combined
+    # listing budget keeps its threshold of 100, now on `listing_stu_estimate`;
+    # the description budget keeps 25. (host.rs:64-76, 191-205, 283-288)
+    ("878/16", "#878", "crates/eliot-engine/src/host.rs", "listing_utf8_bytes"),
+    ("878/17", "#878", "crates/eliot-engine/src/host.rs", "exact_text_measurement(body.as_bytes())?"),
+    ("878/18", "#878", "crates/eliot-engine/src/host.rs", "exact_text_measurement(description.as_bytes())?"),
     ("878/19", "#878", "crates/eliot-engine/src/host.rs", "pub listing_characters: usize,"),
-    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "if descriptions.div_ceil(4) > 100"),
+    # The combined-listing budget gate (`if listing_stu_estimate.value > 100`)
+    # reads the canonical #704 measurement frozen here, on the same
+    # `serialized_listing` it measured before #880. (host.rs:283-290)
+    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "exact_text_measurement(&serialized_listing)?"),
     # #880 engine Skill / memory seam
-    ("880/10", "#880", "crates/eliot-engine/src/skill.rs", "fn estimated_skill_context_cost(skill: &SkillCardV2) -> u64"),
-    ("880/11", "#880", "crates/eliot-engine/src/skill.rs", "pub estimated_context_cost: u64,"),
-    ("880/12", "#880", "crates/eliot-engine/src/skill.rs", "context_cost: Some(estimated_skill_context_cost(skill))"),
-    ("880/13", "#880", "crates/eliot-engine/src/skill_curator.rs", "fn estimated_skill_context_cost(skill: &SkillCardV2) -> u64"),
-    ("880/14", "#880", "crates/eliot-engine/src/skill_curator.rs", "let cost = i64::try_from(estimated_skill_context_cost(skill)).unwrap_or(i64::MAX);"),
+    # #880 replaced the fabricated `estimated_skill_context_cost` /4 helper with
+    # `measure_skill_context_envelope`, a real #704 serialized-envelope
+    # measurement, and derived the cost from it. The requirement -- a measured
+    # cost, not a local ratio -- survives; only the estimator moved.
+    ("880/10", "#880", "crates/eliot-engine/src/skill.rs", "measure_skill_context_envelope(skill)"),
+    ("880/11", "#880", "crates/eliot-engine/src/skill.rs", "pub(crate) fn estimated_context_cost(&self) -> u64"),
+    ("880/12", "#880", "crates/eliot-engine/src/skill.rs", "context_cost: measurement"),
+    # The curator's measured-cost helper now derives its cost from the canonical
+    # #704 envelope measurement call frozen here. (skill_curator.rs:657-661)
+    ("880/13", "#880", "crates/eliot-engine/src/skill_curator.rs", "measure_skill_context_envelope(skill)"),
+    ("880/14", "#880", "crates/eliot-engine/src/skill_curator.rs", "fn expected_context_delta(action: SkillCurationAction, skill: &SkillCardV2) -> i64"),
     ("880/15", "#880", "crates/eliot-engine/src/skill_curator.rs", "context_cost_delta_tokens: expected_context_delta(action, skill)"),
-    ("880/16", "#880", "crates/eliot-engine/src/skill_curator.rs", "estimated_skill_context_cost(skill) >= 180"),
-    ("880/17", "#880", "crates/eliot-engine/src/memory_distillation.rs", ".saturating_add(record.serialized_bytes.div_ceil(1024).max(1))"),
+    # Threshold 180 is unchanged; the cost it compares is now the measured
+    # estimate read here, and unknown evidence never opens a proposal.
+    # (skill_curator.rs:663-667)
+    ("880/16", "#880", "crates/eliot-engine/src/skill_curator.rs", "measurement.estimated_context_cost()"),
+    # #880 dropped the invented minimum-one KiB estimate; zero bytes is now
+    # zero. The requirement (real byte accounting) survives. (memory_distillation.rs:52)
+    ("880/17", "#880", "crates/eliot-engine/src/memory_distillation.rs", ".saturating_add(record.serialized_bytes.div_ceil(1024));"),
     ("880/18", "#880", "crates/eliot-engine/src/memory_distillation.rs", "MemoryUtilitySignalKind::ContextTokenCost => {"),
-    ("880/19", "#880", "crates/eliot-engine/src/memory_distillation.rs", "-i64::try_from(item.token_units.saturating_mul(4))"),
-    ("880/20", "#880", "crates/eliot-engine/src/memory_distillation.rs", "active_bytes = active_bytes.saturating_add(item.token_units.saturating_mul(4))"),
+    # #880 replaced the local `* 4` ratio with the exact inverse of the #704
+    # STU(bytes) = ceil(bytes/3) unit. (memory_distillation.rs:207, 866-867)
+    ("880/19", "#880", "crates/eliot-engine/src/memory_distillation.rs", "canonical_bytes_for_measured_units(item.token_units)"),
+    ("880/20", "#880", "crates/eliot-engine/src/memory_distillation.rs", "active_bytes.saturating_add(canonical_bytes_for_measured_units(item.token_units))"),
     ("880/21", "#880", "crates/eliot-engine/src/memory_lifecycle.rs", "pub context_cost_tokens: u64,"),
     ("880/22", "#880", "crates/eliot-engine/src/memory_lifecycle.rs", "context_cost_tokens: 64"),
 )
@@ -355,7 +391,12 @@ EXCLUSION_CASES: tuple[tuple[str, str, str, str], ...] = (
      "log-detail truncation bound; no byte/char/token/STU semantic"),
     ("exc/5", "crates/eliot-engine/src/host.rs", "let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()",
      "nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens"),
-    ("exc/6", "crates/eliot-engine/src/host.rs", "descriptions += description.chars().count()",
+    # #880 (d330a5bff) hoisted the character count into a named local so the
+    # description length could also feed the canonical #704 measurement. The
+    # exclusion is unchanged: this is still a summed character count reported
+    # only as listing_characters, never divided or relabelled as tokens.
+    # (host.rs:185-186)
+    ("exc/6", "crates/eliot-engine/src/host.rs", "descriptions += description_characters;",
      "summed description character count reported only as listing_characters; never divided or relabelled as tokens"),
 )
 
@@ -618,7 +659,17 @@ ESTIMATOR_HELPER_RE = re.compile(
 )
 ESTIMATOR_CALL_RE = re.compile(
     r"\b(?:estimate_tokens|estimate_stu|estimated_skill_context_cost|"
-    r"measure_serialized_context|measure_exact_utf8|expected_context_delta)\s*\("
+    r"measure_serialized_context|measure_exact_utf8|expected_context_delta|"
+    # #880 (d330a5bff) migrated the engine consumers off the fabricated local
+    # `/4` and caller-declared-constant estimators onto the canonical #704
+    # measurement entry points. These are the same "call into a declared
+    # estimator" shape as the names above, so they join this arm rather than
+    # opening a new class. This admits only canonical #704 measurement calls;
+    # it deliberately adds no non-context counter name (see the cost_or_token
+    # rows, which stay admitted only by MEASURED_FIELD and are not a claim that
+    # those fields are serialized-context measurements).
+    r"measure_skill_context_envelope|canonical_measurement_for_payload|"
+    r"canonical_stu_for_byte_len|canonical_bytes_for_measured_units)\s*\("
 )
 BYTE_RATIO = re.compile(r"div_ceil\(\s*4\s*\)")
 MEASURED_FIELD = re.compile(
@@ -626,7 +677,14 @@ MEASURED_FIELD = re.compile(
     r"estimated_skill_context_cost|context_cost|token_units|serialized_bytes|"
     r"listing_characters|cost_or_token_units|cost_or_token_budget|"
     r"context_cost_delta_tokens|description_ul_tokens|combined_ul_tokens|"
-    r"mandatory_floor_tokens|section_tokens|expected_context_delta)\b"
+    # #880 (d330a5bff) replaced the caller-declared `estimated_context_cost: 128`
+    # literals at the two app Skill-influence call sites with `measured_skills`,
+    # the field that carries the caller's real serialized Skill bytes into the
+    # canonical #704 measurement. Same measured-binding shape as the names
+    # above, so it belongs in this arm rather than a new class. This admits
+    # only this one canonical name and changes no other classification.
+    r"mandatory_floor_tokens|section_tokens|expected_context_delta|"
+    r"measured_skills)\b"
 )
 TOLERATED_LITERAL = re.compile(r"^\s*\(?\s*(?:pub\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*[\"']")
 
@@ -1029,7 +1087,7 @@ def classify_context_measurement(
             "test-only",
             f"test marker or measured test scope in scanned slice; no shipped measurement ({signal!r})",
         )
-    if "stu_for_bytes" in signal or signal == "StuEstimate":
+    if "stu_for_bytes" in signal or signal in ("StuEstimate", "listing_stu_estimate"):
         return (
             "normative-stu-estimate",
             f"normative STU signal {signal!r}: ceil(bytes/3) estimate, never proves fit",
@@ -1046,7 +1104,17 @@ def classify_context_measurement(
         "final_bytes",
         "utf8_bytes",
         "ExactUtf8",
-    ):
+        # #880 (d330a5bff) added the canonical host listing byte count; it is
+        # the exact UTF-8 byte counterpart of `rendered_utf8_bytes`.
+        "listing_utf8_bytes",
+    ) or "exact_text_measurement" in signal:
+        # `exact_text_measurement` is matched as a SUBSTRING, not by equality:
+        # #880's host consumer calls it as a full expression
+        # (`exact_text_measurement(body.as_bytes())?`), so the signal recorded
+        # for that row is the whole call, not the bare identifier. It is the
+        # engine wrapper over #704's exact envelope validator and returns the
+        # exact byte length, StuEstimate and content digest, so it belongs with
+        # the exact-envelope signals -- NOT with the unvalidated-ratio class.
         return (
             "exact-utf8-envelope",
             f"exact envelope signal {signal!r}: final UTF-8 bytes and digest binding",
