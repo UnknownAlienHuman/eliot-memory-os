@@ -12,7 +12,9 @@ use eliot_contracts::{StateFence, canonical_json_bytes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentActivationResolutionTicket, ProtocolError};
+use crate::{
+    AgentActivationResolutionTicket, AgentBridgePeerAdmissionReceipt, ProtocolError,
+};
 
 pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-result";
