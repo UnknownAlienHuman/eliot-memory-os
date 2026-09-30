@@ -111,6 +111,9 @@ use eliot_types::{
     WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
     WorktreeLease, WorktreeLeaseId, WorktreeLeaseRequest, WorktreeLeaseRequestId, WriteId,
 };
+// Issue #1897: the engine patch/verifier lane's governed producer, used by the
+// CLI patch-apply and verifier-run routes in `commands/execution.rs`.
+use crate::verifier_lane::governed_verifier_lane;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt::Write as FmtWrite;

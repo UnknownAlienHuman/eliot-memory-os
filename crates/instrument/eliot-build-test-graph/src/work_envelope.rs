@@ -132,7 +132,7 @@ pub enum BuildMode {
     ///   not be read as cross-worktree target reuse.
     /// * Sccache — NOT held. This crate configures no compiler cache daemon and
     ///   owns no separate exact-fingerprint shared cache root. `CARGO_HOME` is
-    ///   bound to the same lane root as `CARGO_TARGET_DIR`, which is the TestD
+    ///   bound to the same lane root as `CARGO_TARGET_DIR`, which is the `TestD`
     ///   `TargetRoots` policy (`cache_root == target_root`) and is not a shared
     ///   cache, so no caller may read this variant as evidence that
     ///   cross-checkout reuse exists.
@@ -635,11 +635,7 @@ impl GovernedWorkEnvelope {
     /// is invalid.
     pub fn fixture_namespace(&self) -> Result<String, WorkEnvelopeError> {
         self.validate()?;
-        fixture_namespace_of(
-            &self.work_item_id,
-            self.build_mode,
-            &self.fingerprint,
-        )
+        fixture_namespace_of(&self.work_item_id, self.build_mode, &self.fingerprint)
     }
 
     /// The physical directory this work item's fixture state lives under.
@@ -685,10 +681,7 @@ impl GovernedWorkEnvelope {
                 FIXTURE_ROOT_ENV.to_owned(),
                 path_text(&self.derive_fixture_root()?),
             ),
-            (
-                FIXTURE_NAMESPACE_ENV.to_owned(),
-                self.fixture_namespace()?,
-            ),
+            (FIXTURE_NAMESPACE_ENV.to_owned(), self.fixture_namespace()?),
         ])
     }
 

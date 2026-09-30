@@ -1080,7 +1080,20 @@ pub async fn run_patch_apply(config_path: &Path, lease_id: &str, diff_path: &Pat
     let input = load_patch_cli_input(&root, lease_id, diff_path)?;
     let repo_root = patch_repo_root(&input.lease)?;
     let runner = PatchRunner::new(&repo_root, Some(&blob_store));
-    let verifier = VerifierHarness::new(&repo_root, Some(&blob_store));
+    // Issue #1897 (W1/W3, AUD #5910637761 defect 1): a Cargo verifier
+    // requirement is a mutating build, so it runs in a MEASURED governed lane
+    // instead of the shared repository `target/` directory. The lane is derived
+    // from this work item's own identity, its real checkout, its real manifest,
+    // and a live lease from the existing allocator, so a harness without one
+    // fails closed rather than building in the shared fallback.
+    let lane = governed_verifier_lane(
+        &input.request.patch_request_id.to_string(),
+        &input.request.project_id.to_string(),
+        &repo_root,
+        &input.verifier_plan,
+    )?;
+    let verifier =
+        VerifierHarness::new(&repo_root, Some(&blob_store)).with_governed_lane(&lane);
     let incident_lockdown_active = IncidentService::new(&root).lockdown_active()?;
     let (mut patch_run, mut verifier_runs) = runner
         .apply(
@@ -1126,7 +1139,18 @@ pub async fn run_verifier_run(config_path: &Path, plan_ref: &str) -> Result<()> 
         .clone()
         .context("latest ActionLease does not contain a VerifierPlan")?;
     let repo_root = patch_repo_root(&latest)?;
-    let harness = VerifierHarness::new(repo_root, Some(&blob_store));
+    // Issue #1897 (W1/W3, AUD #5910637761 defect 1): the standalone verifier
+    // route is the same governed mutating build as the patch lane, so it
+    // derives the same MEASURED lane from the lease it verifies under rather
+    // than launching into the shared repository `target/` directory.
+    let lane = governed_verifier_lane(
+        &latest.lease_id.to_string(),
+        &latest.project_id.to_string(),
+        &repo_root,
+        &plan,
+    )?;
+    let harness =
+        VerifierHarness::new(repo_root, Some(&blob_store)).with_governed_lane(&lane);
     let mut verifier_runs = harness
         .run_plan(latest.project_id, latest.task_id, latest.agent_id, &plan)
         .await?;

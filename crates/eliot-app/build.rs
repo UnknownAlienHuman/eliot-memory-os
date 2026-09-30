@@ -30,6 +30,18 @@ fn main() {
         "git source commit must be a 40-character hexadecimal object id"
     );
     println!("cargo:rustc-env=ELIOT_BUILD_SOURCE_COMMIT={source_commit}");
+    // Issue #1897: the governed engine verifier lane's `BuildFingerprint.target`
+    // must be the real compilation target, not a literal. Cargo exports `TARGET`
+    // to build scripts, so the value is observed rather than invented.
+    let target = match std::env::var("TARGET") {
+        Ok(target) => target,
+        Err(error) => panic!("Cargo does not export TARGET to build scripts: {error}"),
+    };
+    assert!(
+        !target.trim().is_empty(),
+        "Cargo exported an empty compilation target"
+    );
+    println!("cargo:rustc-env=ELIOT_BUILD_TARGET={target}");
     println!(
         "cargo:rerun-if-changed={}",
         workspace.join(".git/HEAD").display()

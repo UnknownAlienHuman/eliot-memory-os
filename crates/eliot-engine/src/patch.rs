@@ -447,6 +447,13 @@ impl<'a> VerifierHarness<'a> {
     /// [`GovernedWorkEnvelope::admit`] before the first launch, so a lane with
     /// no declared claim, an unleased claim, or a lease held by another work
     /// item cannot execute.
+    ///
+    /// Every product caller builds the envelope from the work item it already
+    /// holds — that item's own identity, its real canonical checkout, the
+    /// SHA-256 of that checkout's real manifest, and a live
+    /// `eliot_testd_core::ResourceLeaseAllocator` grant — so the governed lane
+    /// is measured rather than a named constant. A caller that installs no lane
+    /// keeps the fail-closed refusal described on the `lane` field.
     #[must_use]
     pub fn with_governed_lane(mut self, lane: &GovernedWorkEnvelope) -> Self {
         self.lane = Some(lane.clone());
@@ -576,7 +583,8 @@ impl<'a> VerifierHarness<'a> {
                 started_at,
             ));
         };
-        lane.admit().map_err(|error| EngineError::WriteRejected(error.to_string()))?;
+        lane.admit()
+            .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
         let cargo_environment = lane
             .cargo_environment()
             .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
@@ -1401,7 +1409,15 @@ where
                 .to_owned(),
         ));
     }
-    spawn_bounded_command(program, args, cwd, timeout_seconds, blob_store, cargo_environment).await
+    spawn_bounded_command(
+        program,
+        args,
+        cwd,
+        timeout_seconds,
+        blob_store,
+        cargo_environment,
+    )
+    .await
 }
 
 async fn spawn_bounded_command<S>(
