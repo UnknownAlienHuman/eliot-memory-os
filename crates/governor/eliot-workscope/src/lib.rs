@@ -1290,6 +1290,46 @@ impl OnboardingReadinessReceipt {
         self.state_fence
             .validate()
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
+        self.validate_task_binding()?;
+        if self.limiting_integration_evidence.is_empty()
+            || self.limiting_integration_evidence.len() > 8
+        {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "limiting_integration_evidence",
+            });
+        }
+        for evidence in &self.limiting_integration_evidence {
+            text(evidence, "limiting_integration_evidence")?;
+        }
+        if self.missing_inputs.len() > 32 {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "missing_inputs",
+            });
+        }
+        for missing in &self.missing_inputs {
+            text(missing, "missing_inputs")?;
+        }
+        Self::check_refs(&self.discovered_source_refs, "discovered_source_refs", 32)?;
+        Self::check_refs(&self.admitted_source_refs, "admitted_source_refs", 32)?;
+        Self::check_refs(&self.conflicting_source_refs, "conflicting_source_refs", 32)?;
+        Self::check_refs(&self.unavailable_source_refs, "unavailable_source_refs", 32)?;
+        Self::check_store_seed_maintenance(self)?;
+        counter(self.expiry_tick, "expiry_tick")?;
+        Ok(())
+    }
+
+    /// Validates the task-binding state of one receipt.
+    ///
+    /// Split from [`Self::validate`] so the receipt validator stays within its
+    /// line budget; the `Current` arm carries the owner-proven selection
+    /// source/evidence refs the promoting owner admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any binding reference is blank, a revision is
+    /// zero, a digest has the wrong shape, or a bounded collection leaves its
+    /// range.
+    fn validate_task_binding(&self) -> Result<(), WorkScopeError> {
         match &self.task_binding {
             TaskBindingState::None_ => Ok(()),
             TaskBindingState::Exploratory {
@@ -1333,32 +1373,7 @@ impl OnboardingReadinessReceipt {
                 text(task_ref, "task_ref")?;
                 counter(*task_revision, "task_revision")
             }
-        }?;
-        if self.limiting_integration_evidence.is_empty()
-            || self.limiting_integration_evidence.len() > 8
-        {
-            return Err(WorkScopeError::EmptyCollection {
-                field: "limiting_integration_evidence",
-            });
         }
-        for evidence in &self.limiting_integration_evidence {
-            text(evidence, "limiting_integration_evidence")?;
-        }
-        if self.missing_inputs.len() > 32 {
-            return Err(WorkScopeError::EmptyCollection {
-                field: "missing_inputs",
-            });
-        }
-        for missing in &self.missing_inputs {
-            text(missing, "missing_inputs")?;
-        }
-        Self::check_refs(&self.discovered_source_refs, "discovered_source_refs", 32)?;
-        Self::check_refs(&self.admitted_source_refs, "admitted_source_refs", 32)?;
-        Self::check_refs(&self.conflicting_source_refs, "conflicting_source_refs", 32)?;
-        Self::check_refs(&self.unavailable_source_refs, "unavailable_source_refs", 32)?;
-        Self::check_store_seed_maintenance(self)?;
-        counter(self.expiry_tick, "expiry_tick")?;
-        Ok(())
     }
 
     /// Validates the store, seed, and maintenance views of one receipt.
