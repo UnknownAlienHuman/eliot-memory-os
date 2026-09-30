@@ -1059,7 +1059,7 @@ impl FinishEvidence {
 
 /// One required acceptance obligation in the admitted finish denominator.
 ///
-/// The identity is the TaskContract acceptance identity, never a verifier
+/// The identity is the `TaskContract` acceptance identity, never a verifier
 /// test id. Many acceptance items may map to many tests, one item may map
 /// to no test at all, and the coverage join matches rows by this identity
 /// only, so the selected test inventory can never substitute for the
@@ -1067,7 +1067,7 @@ impl FinishEvidence {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequiredAcceptanceItem {
-    /// TaskContract acceptance item identity.
+    /// `TaskContract` acceptance item identity.
     pub item_id: String,
     /// Whether the item requires an executed verifier run. A `false` value
     /// marks a non-test obligation that executed verifier runs alone cannot
@@ -1109,7 +1109,10 @@ impl AdmittedAcceptanceDenominator {
                 reason: "must be non-zero",
             });
         }
-        digest(&self.acceptance_digest, "finish.denominator.acceptance_digest")?;
+        digest(
+            &self.acceptance_digest,
+            "finish.denominator.acceptance_digest",
+        )?;
         if self.items.is_empty() {
             return Err(CanonicalError::Empty {
                 field: "finish.denominator.items",
