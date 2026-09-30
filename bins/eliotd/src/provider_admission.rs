@@ -65,10 +65,11 @@ impl ProviderAdmission {
     /// [`DaemonKernelClient::owner_session_facts`](crate::daemon_kernel_client::DaemonKernelClient::owner_session_facts)
     /// and `live_fence` from
     /// [`DaemonKernelClient::kernel_fence`](crate::daemon_kernel_client::DaemonKernelClient::kernel_fence),
-    /// both re-queried for this exact construction. Caller-supplied
-    /// `live_fence` / `session_binding` halves in `material` are replaced
-    /// unconditionally; the presented halves and the Governor expectation
-    /// travel through untouched for the coherence gates downstream to judge.
+    /// both re-queried for this exact construction. The caller-supplied
+    /// `live_fence` half is replaced unconditionally and no session proof
+    /// string is retained anywhere; the presented halves and the Governor
+    /// expectation travel through untouched for the coherence gates downstream
+    /// to judge.
     ///
     /// # Errors
     ///
@@ -117,9 +118,6 @@ impl ProviderAdmission {
             ));
         }
         material.live_fence = live_fence;
-        owner
-            .session_binding()
-            .clone_into(&mut material.session_binding);
         Ok(Self { material })
     }
 
