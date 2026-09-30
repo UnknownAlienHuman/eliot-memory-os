@@ -441,11 +441,8 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 return Ok(unobserved());
             };
             let hint_id = change_monitor::filesystem_hint_id(&artifact, &previous);
-            let (change_id, transition_digest) = change_monitor::material_transition_ids(
-                &hint_id,
-                Some(previous.as_str()),
-                None,
-            );
+            let (change_id, transition_digest) =
+                change_monitor::material_transition_ids(&hint_id, Some(previous.as_str()), None);
             let already_observed = change_monitor::deletion_observations_for(resource.as_str())
                 .iter()
                 .any(|observation| {
@@ -664,56 +661,55 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 git: None,
             }
         } else {
-            let (Some(after_first), Some(after_reread)) = (
-                receipt.after_first_digest,
-                receipt.after_reread_digest,
-            ) else {
+            let (Some(after_first), Some(after_reread)) =
+                (receipt.after_first_digest, receipt.after_reread_digest)
+            else {
                 observe_process("kernel.process.effect_observed", "unobserved");
                 return Ok(());
             };
             if after_first == after_reread && after_first != before_digest {
-            let (_, transition) = change_monitor::material_transition_ids(
-                &operation,
-                Some(before_digest.as_str()),
-                Some(after_first.as_str()),
-            );
-            let change = change_monitor::GovernedToolChange {
-                change_id: operation.clone(),
-                resource: baseline.resource.clone(),
-                path: baseline.lane_path.clone(),
-                before_path: None,
-                before_revision: Some(before_digest.clone()),
-                before_bytes: baseline.before_bytes,
-                after_revision: Some(after_first.clone()),
-                after_bytes: receipt.after_bytes,
-                session: baseline.binding.session_id.as_str().to_owned(),
-                action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
-                operation: operation.clone(),
-                attempt_receipt: baseline.effect_digest,
-                diff_handle: transition.clone(),
-                fence_generation: receipt.terminal_fence.generation().get(),
-                fence_invalidated: receipt.terminal_fence != baseline.capture_fence,
-            };
-            match change_monitor::record_governed_tool_change(&change) {
-                Ok(_) => {
-                    recorded_transition = Some(transition);
-                    observe_process("kernel.process.effect_observed", "recorded");
-                }
-                Err(_) => {
-                    observe_process("kernel.process.effect_observed", "refused");
+                let (_, transition) = change_monitor::material_transition_ids(
+                    &operation,
+                    Some(before_digest.as_str()),
+                    Some(after_first.as_str()),
+                );
+                let change = change_monitor::GovernedToolChange {
+                    change_id: operation.clone(),
+                    resource: baseline.resource.clone(),
+                    path: baseline.lane_path.clone(),
+                    before_path: None,
+                    before_revision: Some(before_digest.clone()),
+                    before_bytes: baseline.before_bytes,
+                    after_revision: Some(after_first.clone()),
+                    after_bytes: receipt.after_bytes,
+                    session: baseline.binding.session_id.as_str().to_owned(),
+                    action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
+                    operation: operation.clone(),
+                    attempt_receipt: baseline.effect_digest,
+                    diff_handle: transition.clone(),
+                    fence_generation: receipt.terminal_fence.generation().get(),
+                    fence_invalidated: receipt.terminal_fence != baseline.capture_fence,
+                };
+                match change_monitor::record_governed_tool_change(&change) {
+                    Ok(_) => {
+                        recorded_transition = Some(transition);
+                        observe_process("kernel.process.effect_observed", "recorded");
+                    }
+                    Err(_) => {
+                        observe_process("kernel.process.effect_observed", "refused");
+                    }
                 }
             }
-        }
-        change_monitor::HintVerification {
-            before_digest: Some(before_digest),
-            first_read: change_monitor::ContentRead::Present {
-                sha256: after_first,
-            },
-            reread: change_monitor::ContentRead::Present {
-                sha256: after_reread,
-            },
-            git: None,
-        }
+            change_monitor::HintVerification {
+                before_digest: Some(before_digest),
+                first_read: change_monitor::ContentRead::Present {
+                    sha256: after_first,
+                },
+                reread: change_monitor::ContentRead::Present {
+                    sha256: after_reread,
+                },
+                git: None,
+            }
         };
         match change_monitor::confirm_hint(&hint_id, &verification) {
             Ok(change_monitor::HintConfirmation::VerifiedImmaterial) => {
