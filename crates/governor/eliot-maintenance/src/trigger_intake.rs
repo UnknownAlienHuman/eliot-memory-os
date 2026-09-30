@@ -12,30 +12,28 @@
 //! keep intake, claims, receipts, and startup delivery.
 //!
 //! The derivation is pure and deterministic: the same validated input always
-//! yields the same trigger identity and operation hash, so an exact
-//! identity/hash replay converges on the same staging result while changed
-//! content under the same identity conflicts downstream. Only complete durable
+//! yields the same intake statement, so an exact identity/hash replay
+//! converges on the same staging result while changed content under the same
+//! identity conflicts downstream. The wire `operation_hash` is attested, never
+//! minted here: the source owner hashes its exact producer operation bytes and
+//! this derivation carries that digest verbatim after checking its shape, so
+//! the staged, recorded, claimed, and receipted hash stay one value from
+//! intake to acknowledgement. Only complete durable
 //! payloads are representable: a retained canonical source reference the ORS
 //! owner can resolve, or the complete opaque input bytes. An in-memory
 //! pointer, an ephemeral file, or an inaccessible source reference cannot be
 //! constructed here — empty bytes and blank references are rejected — and
 //! resolvability of a retained reference is proven by the ORS owner's
 //! read-back, not by this module. Semantic payload bytes stay opaque: they
-//! are hashed for identity binding and never parsed.
+//! are hashed for the derivation-local payload binding and never parsed.
 //!
 //! Every failure is a typed [`MaintenanceError`]; the producer keeps its
 //! retry identity (trigger identity, operation hash, source cursor) on all of
 //! them, and no acknowledgement may be emitted from an error.
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use serde_json::Value;
+use eliot_contracts::sha256_hex;
 
 use super::{MaintenanceError, MaintenanceTriggerInput};
-
-/// Stable domain label bound into the operation projection digest.
-const TRIGGER_INTAKE_DIGEST_DOMAIN: &str = "eliot.maintenance.trigger-intake";
-/// Current revision of the operation projection digest.
-const TRIGGER_INTAKE_DIGEST_VERSION: u32 = 1;
 
 /// Stable source event identity attested by the trigger's source owner.
 ///
@@ -73,15 +71,23 @@ pub enum TriggerIntakePosition {
     },
 }
 
-/// Producer operation that yielded the trigger, without its content hash.
+/// Producer operation that yielded the trigger.
 ///
 /// The operation label names the source owner's operation (for example the
-/// Watchdog problem opening or the scheduler wake occurrence); the content
-/// hash is derived, never caller-supplied, so replays converge.
+/// Watchdog problem opening or the scheduler wake occurrence). The operation
+/// hash is attested by the source owner — the lowercase SHA-256 of its exact
+/// producer operation bytes — and is carried verbatim after a shape check, so
+/// it equals the wire record, staging request, claim, and receipt hash for
+/// this trigger. This derivation never recomputes it from other fields: a
+/// second digest under the same name would fork the replay/conflict identity
+/// the whole chain compares.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TriggerIntakeOperation {
     /// Producer operation name; nonblank.
     pub operation_label: String,
+    /// Lowercase SHA-256 of the exact producer operation bytes, attested by
+    /// the source owner.
+    pub operation_hash: String,
     /// Stable source event identity attested by the source owner.
     pub source_event: TriggerIntakeSourceEvent,
     /// Durable source position paired with the producer generation.
@@ -188,18 +194,22 @@ pub struct TriggerIntakeRequest {
 
 /// One derived persist-before-ack intake statement.
 ///
-/// The daemon caller maps these fields onto the step-1 wire record and the
-/// ORS staging request: stable source event/trigger identity, generation and
-/// cursor-or-occurrence position, operation label and content hash, opaque
-/// family/scope references, evidence locators, privacy/visibility references,
-/// creation/applicability expiry, and the protected-routing classification.
-/// The semantic payload stays opaque; only digests travel here besides the
-/// complete bytes themselves.
+/// The daemon caller copies these fields verbatim onto the step-1 wire record
+/// and the ORS staging request: stable source event/trigger identity,
+/// generation and cursor-or-occurrence position, the source-attested operation
+/// label and content hash, opaque family/scope references, evidence locators,
+/// privacy/visibility references, creation/applicability expiry, and the
+/// protected-routing classification. `operation_hash` is the attested
+/// producer-bytes digest, identical to the wire value — it is never
+/// recomputed here. `payload_binding` is derivation-local convergence
+/// evidence, not the staged envelope hash: the semantic payload stays opaque
+/// and only digests travel here besides the complete bytes themselves.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceTriggerIntake {
     /// Stable trigger identity from the source owner; never reinvented.
     pub trigger_id: String,
-    /// Lowercase SHA-256 over the canonical operation projection.
+    /// Lowercase SHA-256 of the exact producer operation bytes, carried
+    /// verbatim from the source-attested operation.
     pub operation_hash: String,
     /// Producer operation name.
     pub operation_label: String,
@@ -238,12 +248,14 @@ pub struct MaintenanceTriggerIntake {
 ///
 /// Reuses [`MaintenanceTriggerInput::validate`] for the trigger identity,
 /// scope, evidence, and expiry dimensions, then binds the source-attested
-/// operation, the complete durable payload, the carried classes, the routing
-/// classification, and the applicability window into one deterministic
-/// statement. The operation hash digests the canonical projection of every
-/// bound field, so exact replays converge and changed content conflicts. Any
-/// failure returns a typed [`MaintenanceError`] with no statement: the
-/// producer keeps its retry identity and its cursor must not advance.
+/// operation (including its verbatim operation hash), the complete durable
+/// payload, the carried classes, the routing classification, and the
+/// applicability window into one deterministic statement. Exact replays carry
+/// the same attested hash and payload binding and converge downstream, while
+/// changed content arrives under a different attested hash or binding and
+/// conflicts instead of replaying. Any failure returns a typed
+/// [`MaintenanceError`] with no statement: the producer keeps its retry
+/// identity and its cursor must not advance.
 pub fn derive_trigger_intake(
     request: &TriggerIntakeRequest,
 ) -> Result<MaintenanceTriggerIntake, MaintenanceError> {
@@ -255,12 +267,10 @@ pub fn derive_trigger_intake(
     validate_routing(&request.routing)?;
 
     let payload_binding = payload_binding(&request.payload);
-    let operation_hash = operation_digest(request, &payload_binding)
-        .map_err(|_| MaintenanceError::InvalidField("operation"))?;
 
     Ok(MaintenanceTriggerIntake {
         trigger_id: request.input.trigger_id.clone(),
-        operation_hash,
+        operation_hash: request.operation.operation_hash.clone(),
         operation_label: request.operation.operation_label.clone(),
         source_event: request.operation.source_event.clone(),
         source_position: request.operation.source_position.clone(),
@@ -279,6 +289,10 @@ pub fn derive_trigger_intake(
 
 fn validate_operation(operation: &TriggerIntakeOperation) -> Result<(), MaintenanceError> {
     require_text(&operation.operation_label, "operation")?;
+    // The hash is attested by the source owner that holds the exact producer
+    // operation bytes; this derivation checks its shape and binds it into the
+    // statement verbatim, so the whole chain compares one hash value.
+    require_digest(&operation.operation_hash, "operation.operation_hash")?;
     require_text(
         &operation.source_event.producer_id,
         "source_event.producer_id",
@@ -366,7 +380,9 @@ fn validate_routing(routing: &TriggerIntakeRouting) -> Result<(), MaintenanceErr
 /// Opaque bytes digest directly; a retained reference digests as the
 /// attested reference string whose resolution the ORS owner proves. Either
 /// way a content change changes the binding, so it cannot replay as the
-/// same intake.
+/// same intake. This binding is derivation-local replay evidence: it is not
+/// the staged envelope hash the ORS owner issues at staging time, and the
+/// daemon caller must not copy it into the wire `payload_hash`.
 fn payload_binding(payload: &TriggerIntakePayload) -> String {
     match payload {
         TriggerIntakePayload::RetainedCanonicalSource { source_reference } => {
@@ -374,59 +390,6 @@ fn payload_binding(payload: &TriggerIntakePayload) -> String {
         }
         TriggerIntakePayload::CompleteOpaqueInput { payload_bytes } => sha256_hex(payload_bytes),
     }
-}
-
-/// Digests the canonical projection of every bound intake field.
-///
-/// The projection carries the stable source event/trigger identity, the
-/// generation and cursor-or-occurrence position, the operation label, the
-/// opaque family/scope references, the evidence locators, the
-/// privacy/visibility references, the creation/applicability window, the
-/// routing classification, and the payload binding. Canonical JSON keeps
-/// field order deterministic so exact replays hash identically.
-fn operation_digest(
-    request: &TriggerIntakeRequest,
-    payload_binding: &str,
-) -> Result<String, serde_json::Error> {
-    let position = match &request.operation.source_position {
-        TriggerIntakePosition::Cursor { value } => Value::from(format!("CURSOR:{value}")),
-        TriggerIntakePosition::AcceptedOccurrence { occurrence_id } => {
-            Value::from(format!("OCCURRENCE:{occurrence_id}"))
-        }
-    };
-    let routing = match &request.routing {
-        TriggerIntakeRouting::Ordinary => Value::from("ORDINARY"),
-        TriggerIntakeRouting::Protected {
-            owner_id,
-            route,
-            key_id,
-            grant_digest,
-        } => Value::from(format!(
-            "PROTECTED:{owner_id}:{route}:{key_id}:{grant_digest}:{trigger_id}",
-            trigger_id = request.input.trigger_id
-        )),
-    };
-    let projection = serde_json::json!({
-        "domain": TRIGGER_INTAKE_DIGEST_DOMAIN,
-        "version": TRIGGER_INTAKE_DIGEST_VERSION,
-        "trigger_id": request.input.trigger_id,
-        "operation_label": request.operation.operation_label,
-        "producer_id": request.operation.source_event.producer_id,
-        "producer_generation": request.operation.source_event.producer_generation,
-        "stream_id": request.operation.source_event.stream_id,
-        "event_id": request.operation.source_event.event_id,
-        "source_position": position,
-        "family_ref": request.input.family.to_string(),
-        "scope_ref": request.input.scope_ref,
-        "evidence_locators": request.input.evidence_refs,
-        "privacy_class_reference": request.classes.privacy_class_reference,
-        "visibility_reference": request.classes.visibility_reference,
-        "created_at_ms": request.window.created_at_ms,
-        "applicable_until_ms": request.window.applicable_until_ms,
-        "routing": routing,
-        "payload_binding": payload_binding,
-    });
-    Ok(sha256_hex(&canonical_json_bytes(&projection)?))
 }
 
 fn require_text(value: &str, field: &'static str) -> Result<(), MaintenanceError> {
