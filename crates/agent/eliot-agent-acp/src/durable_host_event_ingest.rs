@@ -766,12 +766,11 @@ fn check_execution_unit_observation_applicability(
             Err(IngestError::InvalidInput("binding/lineage"))
         }
         ProviderObservationLineage::ExecutionUnitObservation(lineage) => {
-            if let Some(observation) = physical_observation {
-                if observation.event_cursor != lineage.cursor
-                    || observation.event_sequence != lineage.sequence
-                {
-                    return Err(IngestError::Contract(ContractError::BindingMismatch));
-                }
+            if let Some(observation) = physical_observation
+                && (observation.event_cursor != lineage.cursor
+                    || observation.event_sequence != lineage.sequence)
+            {
+                return Err(IngestError::Contract(ContractError::BindingMismatch));
             }
             Ok(())
         }
