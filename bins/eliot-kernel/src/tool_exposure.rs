@@ -14,7 +14,11 @@
 use eliot_contracts::sha256_hex;
 use eliot_receipts::{
     LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest,
-    tool_exposure::{AttemptEvidence, detect_repeat_without_progress_with_evidence},
+    tool_exposure::{
+        AttemptEvidence, ExposureIdentities, ExposureReplaySignal, OwnerStageFact,
+        ToolExposureHistoryEntry, ToolExposureReceiptV2, detect_exposure_replay,
+        detect_repeat_without_progress_with_evidence, EXPOSURE_HISTORY_VERSION,
+    },
 };
 
 use super::host_request_route::LocalReadAdmission;
@@ -276,4 +280,177 @@ pub(crate) fn staged_repeat_without_progress<'a>(
         let previous = build_tool_call_request(envelope, tool, &admission)?;
         detect_repeat_without_progress_with_evidence(&previous, &unobserved, current, &unobserved)
     })
+}
+
+/// Names the admission-owner evidence behind one dispatch-seam eligibility fact.
+///
+/// The reference names the accepted admission kind (and the admitted campaign
+/// task identity for packet methods), never caller tool text. It is the owner
+/// source reference the supplied eligible/selected facts bind, so unknown
+/// coverage stays `None` elsewhere instead of being inferred from this seam.
+fn admission_source(admission: &LocalReadAdmission) -> String {
+    match admission {
+        LocalReadAdmission::Query(_) => "local-read-admission:query".to_owned(),
+        LocalReadAdmission::Skill => "local-read-admission:skill".to_owned(),
+        LocalReadAdmission::CampaignPacket {
+            task_id,
+            task_revision,
+            ..
+        } => format!("local-read-admission:campaign-packet:{task_id}:{task_revision}"),
+    }
+}
+
+/// Populates the dispatch-seam-owned stages of one orthogonal exposure history.
+///
+/// Only the stages this boundary observes are supplied: eligibility and
+/// selection hold because the authorized request was presented for dispatch
+/// and admitted through the existing admission owner
+/// ([`super::host_request_route::check_local_read_admission`]). Registration
+/// and advertisement stay explicitly unresolved — the Tool Definition and
+/// publish seams populate them, and an admitted name never proves
+/// registration. Call, transport, delivery, retry, use, and terminal stages
+/// stay explicitly unresolved: the execution, transport, bridge/host
+/// projection, and verifier owners populate them, never this seam. Unknown
+/// coverage is recorded as `None`, never coerced to `false` and never
+/// inferred from a neighbouring stage, so every applicable I7.24 field is
+/// supplied or explicitly unresolved, never omitted to obtain a
+/// valid-looking record.
+///
+/// The tool definition identity and route fingerprint come from the accepted
+/// admission exactly as they do for [`build_tool_call_request`]. The Tool
+/// Definition version arrives from its owner through the caller and is
+/// validated here, never invented: a seam that never mints a version binds
+/// the supplied one. Turn, run, and attempt identities likewise arrive from
+/// their owners; the surface identity defaults to the admission-derived
+/// route fingerprint when the caller supplies none, so every entry joins a
+/// revision lineage.
+///
+/// Pure and total: reads only, never stages, never executes, never persists.
+///
+/// # Errors
+///
+/// Returns [`eliot_receipts::ToolExposureError`] when the tool value carries
+/// no admitted name, when an owner-supplied reference is blank or carries
+/// control characters, or when the populated entry is inconsistent.
+pub(crate) fn admission_exposure_history(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    tool: &serde_json::Value,
+    admission: &LocalReadAdmission,
+    definition_version: &str,
+    mut identities: ExposureIdentities,
+) -> Result<ToolExposureHistoryEntry, eliot_receipts::ToolExposureError> {
+    let name = tool
+        .as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.tool_definition",
+            reason: "admitted tool carries no versioned definition identity",
+        })?;
+    let route = route_fingerprint(envelope, admission);
+    if identities.surface_ref.is_none() {
+        identities.surface_ref = Some(route.clone());
+    }
+    let owner_source = admission_source(admission);
+    let entry = ToolExposureHistoryEntry {
+        schema_version: EXPOSURE_HISTORY_VERSION,
+        tool_definition: name.to_owned(),
+        definition_version: definition_version.to_owned(),
+        route_fingerprint: Some(route),
+        identities,
+        registered: OwnerStageFact::unresolved(),
+        advertised_to_route: OwnerStageFact::unresolved(),
+        eligible_under_scope_policy_and_grant: OwnerStageFact::supplied(
+            true,
+            owner_source.clone(),
+        )?,
+        selected_by_planner_or_model: OwnerStageFact::supplied(true, owner_source)?,
+        called: OwnerStageFact::unresolved(),
+        transport_completed: OwnerStageFact::unresolved(),
+        result_delivery: None,
+        delivery_source_ref: None,
+        expanded_or_retried: OwnerStageFact::unresolved(),
+        observably_used_in_decision_action_or_verifier: OwnerStageFact::unresolved(),
+        terminal_task_or_product_outcome_ref: None,
+    };
+    entry.validate()?;
+    Ok(entry)
+}
+
+/// What the Kernel dispatch seam does with a repeated exposure revision.
+///
+/// The classifier evidence is bound, never by existence: a receipt identity
+/// proves nothing until its recorded content is compared with this operation.
+/// Digests are validated on the recorded original through the existing
+/// [`ToolExposureReceiptV2::validate`], never recomputed here.
+pub(crate) enum ExposureRevisionDisposition<'a> {
+    /// Same receipt identity with identical recorded evidence: a replayed
+    /// publication or result redelivery, not new work. The caller reconciles
+    /// the recorded original event — executes nothing again and records no
+    /// new use — so the replay produces neither duplicate execution nor
+    /// false usage evidence.
+    ReconcileRecordedOriginal {
+        /// The recorded original revision to reconcile, not rewrite.
+        recorded: &'a ToolExposureReceiptV2,
+    },
+    /// New receipt identity linked through the recorded
+    /// `prior_delivery_receipt_id` to the recorded prior while retaining the
+    /// same produced result digest: a later authorized expansion delivery of
+    /// the same result. The linked revision persists through the existing
+    /// observation/receipt path alongside the recorded prior; the original
+    /// truncation is preserved, never rewritten.
+    PersistLinkedRevision {
+        /// The linked revision to persist, never a rewrite of the prior.
+        revision: &'a ToolExposureReceiptV2,
+    },
+    /// Not a replay pair; the revision routes to its stage owners.
+    NotAReplayPair,
+}
+
+/// Disposes a repeated exposure revision against its recorded original.
+///
+/// Both revisions validate as recorded first through the existing
+/// [`detect_exposure_replay`]: the original recorded digest values are
+/// checked, never recomputed, and recorded content decides. A conflicting
+/// same-identity revision fails with the classifier's typed error so it can
+/// never validate as a quiet rewrite; the caller persists a linked revision
+/// through the existing observation/receipt path instead.
+///
+/// Pure and total: classifies only, never stages, never executes, never
+/// persists, never records use. Observable use still requires its public
+/// action/decision/verifier link at the use owner; hidden reasoning is not
+/// requested and a replayed delivery is not use.
+///
+/// STITCH(host_request_route): the owning seam persists the returned
+/// revision — [`ExposureRevisionDisposition::PersistLinkedRevision`] through
+/// the existing observation/receipt path (the `eliot.observe` capture seam
+/// at `admit_and_queue_observe_submit`, or the bridge/host projection that
+/// owns the delivered representation), and reconciles
+/// [`ExposureRevisionDisposition::ReconcileRecordedOriginal`] against the
+/// recorded original event. This module performs no durable write because no
+/// durable V2-receipt owner exists on main at this seam: the reachable
+/// durable seams are typed for `HostRequestAttempt`/bridge-event rows and
+/// private to `host_request_route`, and this seam mints no receipt
+/// identities, opens no second store, and performs no blocking attach. Until
+/// the owning seam carries the write, a returned linked revision stays a
+/// visible pending obligation — never coerced into executed or used.
+///
+/// # Errors
+///
+/// Returns [`eliot_receipts::ToolExposureError`] when either revision is
+/// inconsistent, or when one receipt identity carries conflicting recorded
+/// evidence.
+pub(crate) fn dispose_exposure_revision<'a>(
+    recorded: &'a ToolExposureReceiptV2,
+    current: &'a ToolExposureReceiptV2,
+) -> Result<ExposureRevisionDisposition<'a>, eliot_receipts::ToolExposureError> {
+    match detect_exposure_replay(recorded, current)? {
+        Some(ExposureReplaySignal::IdempotentReplay) => {
+            Ok(ExposureRevisionDisposition::ReconcileRecordedOriginal { recorded })
+        }
+        Some(ExposureReplaySignal::LinkedExpansion) => {
+            Ok(ExposureRevisionDisposition::PersistLinkedRevision { revision: current })
+        }
+        None => Ok(ExposureRevisionDisposition::NotAReplayPair),
+    }
 }
