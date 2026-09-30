@@ -2851,6 +2851,9 @@ struct BridgeEventPrivacyAuthorization {
     scope: String,
     policy_revision: u64,
     declared_class: Option<String>,
+    scope_ref: String,
+    source_class: Option<String>,
+    recipient_grant: Vec<String>,
 }
 
 /// Resolved I7.23 disclosure staging for canonical envelope bytes.
@@ -11129,23 +11132,51 @@ impl RedbRecoveryStore {
     // Bridge-event disclosure gate (I7.23 owner authorization before
     // persistence) and handoff reader used by the stage entry below.
     /// Derives the privacy owner's scope for one bridge event: the owner
-    /// namespace this store binds for the event's stream, which is the scope
-    /// a disclosure verdict is authorized within (issue #1934, I7.23).
+    /// namespace this store binds for the event's stream, further bound to
+    /// the Governor-resolved `work_scope_id`, which is the scope a disclosure
+    /// verdict is authorized within (issue #1934, I7.23).
     ///
     /// The Kernel resolves the verdict before it can stage anything, so it
-    /// needs the same namespace the stage entry will persist — otherwise the
-    /// verdict's scope and the row's scope could drift. This exposes the
-    /// EXISTING digest rather than introducing a second namespace scheme, so
-    /// the comparison the stage entry performs
-    /// ([`Self::bridge_event_privacy_staging`]) is against the identical value
-    /// it records as `admitted_scope`.
+    /// needs the same scope the stage entry will enforce — otherwise the
+    /// verdict's scope and the row's scope could drift, and two events
+    /// identical except for their scope would authorize identically. This
+    /// builds on the EXISTING namespace digest rather than introducing a
+    /// second namespace scheme, so the comparison the stage entry performs
+    /// ([`Self::bridge_event_privacy_staging`]) is against the identical
+    /// value it records as `admitted_scope`.
     pub fn bridge_event_privacy_scope(
         authority_lineage: &str,
         principal: &str,
         producer_id: &str,
         stream_id: &str,
+        work_scope_id: &str,
     ) -> Result<String, OrsError> {
-        Self::bridge_stream_owner_digest(authority_lineage, principal, producer_id, stream_id)
+        let namespace =
+            Self::bridge_stream_owner_digest(authority_lineage, principal, producer_id, stream_id)?;
+        Self::bridge_event_privacy_scope_for(&namespace, work_scope_id)
+    }
+
+    /// Binds an already-derived owner namespace to one Governor-resolved
+    /// scope: the privacy scope the stage entry enforces for a presented
+    /// verdict (issue #1934, I7.23).
+    ///
+    /// The namespace stays the stream owner record the write path binds; the
+    /// scope reference commits that namespace to the scope the verdict was
+    /// decided in. A verdict authorized for another scope names another
+    /// digest and never matches the namespace this entry is about to bind.
+    fn bridge_event_privacy_scope_for(
+        namespace: &str,
+        work_scope_id: &str,
+    ) -> Result<String, OrsError> {
+        crate::model::validate_digest(namespace, "privacy_authorization.scope_namespace")?;
+        if work_scope_id.trim().is_empty() || work_scope_id.chars().any(char::is_control) {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization.scope_ref",
+                reason: "privacy owner verdict must name the scope it was decided in",
+            });
+        }
+        let text = format!("{namespace}::{work_scope_id}");
+        Ok(crate::model::sha256_hex(text.as_bytes()))
     }
 
     /// Reads the privacy owner's disclosure verdict over exactly these
@@ -11161,14 +11192,20 @@ impl RedbRecoveryStore {
     /// provider restriction never entered the decision. Repeating that scan
     /// before staging proved agreement with the heuristic, not authorization.
     ///
-    /// Disclosure is now resolved by the actual privacy owner and arrives as
+    /// Disclosure is now resolved by the actual privacy owner — the
+    /// `WorkScope` policy owner through
+    /// `eliot_workscope::resolve_bridge_ingest_disclosure` — and arrives as
     /// the decision object the stage entry re-verifies
     /// (`privacy_disposition` plus `redacted_classes` and `redaction_reason`)
     /// together with the owner authorization this owner binds to the exact
     /// source bytes, the scope, and the policy revision
     /// (`privacy_authorization`: `verdict`, `source_sha256`, `scope`,
-    /// `policy_revision`). A caller that cannot present an owner verdict for
-    /// these exact bytes gets a rejected disposition, never an inferred
+    /// `policy_revision`, plus the decided evidence `scope_ref`,
+    /// `source_class`, and `recipient_grant`). A presented verdict is
+    /// accepted only when it equals the owner rule's verdict for the staged
+    /// evidence and names the owner's current policy revision; anything else
+    /// — including a caller that cannot present an owner verdict for these
+    /// exact bytes — gets a rejected disposition, never an inferred
     /// `allowed`. The conservative deny scan still runs inside the stage entry
     /// and can only push an admitted payload to the redacted path.
     pub fn bridge_event_privacy_decision(
@@ -11178,7 +11215,8 @@ impl RedbRecoveryStore {
         let source = crate::model::sha256_hex(envelope_bytes);
         let grant = Self::presented_privacy_authorization(authorization, &source)
             .ok()
-            .flatten();
+            .flatten()
+            .filter(|grant| Self::check_bridge_event_owner_verdict(grant).is_ok());
         let (scan_hit, scan_classes) = Self::privacy_deny_scan(envelope_bytes);
         let (redacted, classes, reason) = match grant {
             Some(_) if scan_hit => {
@@ -11463,13 +11501,18 @@ impl RedbRecoveryStore {
     /// #1934).
     ///
     /// A presented owner verdict must bind exactly the canonical envelope
-    /// bytes, its scope, and policy revision; where this owner is binding a
-    /// stream namespace, the verdict's scope must equal that namespace. Only
-    /// an admitted verdict over a clean deny scan stages original bytes.
-    /// Rejection, absent authorization, and a deny-scan hit stage the
-    /// deterministic redacted projection plus its receipt. The scan can deny,
-    /// and its silence can never allow. A mismatch fails closed instead of
-    /// persisting a disputed form.
+    /// bytes, its scope, and policy revision — and it must equal the verdict
+    /// the `WorkScope` privacy owner decides for the staged evidence at the
+    /// owner's current policy revision
+    /// ([`Self::check_bridge_event_owner_verdict`]): a self-asserted
+    /// disposition the owner rule would not decide fails here, before any
+    /// durable write. Where this owner is binding a stream namespace, the
+    /// verdict's scope must equal that namespace bound to the staged scope
+    /// reference. Only an admitted verdict over a clean deny scan stages
+    /// original bytes. Rejection, absent authorization, and a deny-scan hit
+    /// stage the deterministic redacted projection plus its receipt. The scan
+    /// can deny, and its silence can never allow. A mismatch fails closed
+    /// instead of persisting a disputed form.
     ///
     /// `enforced_scope` is the namespace this owner is binding. The legacy
     /// ownerless entry passes `None`; when a verdict exists, its own scope is
@@ -11487,14 +11530,22 @@ impl RedbRecoveryStore {
             staged.get("privacy_authorization"),
             &transport_hash,
         )?;
+        if let Some(grant) = &grant {
+            Self::check_bridge_event_owner_verdict(grant)?;
+        }
         let (scan_hit, scan_classes) = Self::privacy_deny_scan(envelope_bytes);
         let (denied, classes, reason, admitted_source, scope, policy_revision) = match grant {
             Some(grant) => {
-                if enforced_scope.is_some_and(|scope| grant.scope != scope) {
-                    return Err(OrsError::InvalidField {
-                        field: "privacy_authorization",
-                        reason: "bridge event privacy owner verdict must bind the admitted scope",
-                    });
+                if let Some(namespace) = enforced_scope {
+                    let expected =
+                        Self::bridge_event_privacy_scope_for(namespace, &grant.scope_ref)?;
+                    if grant.scope != expected {
+                        return Err(OrsError::InvalidField {
+                            field: "privacy_authorization",
+                            reason:
+                                "bridge event privacy owner verdict must bind the admitted scope",
+                        });
+                    }
                 }
                 let denied = grant.verdict != BRIDGE_EVENT_PRIVACY_ADMISSION || scan_hit;
                 let (classes, reason) = if denied && !scan_classes.is_empty() {
@@ -11583,13 +11634,18 @@ impl RedbRecoveryStore {
     }
 
     /// Parses the privacy owner's presented authorization for one event
-    /// (issue #1934) and checks that it is bound to these exact source bytes.
+    /// (issue #1934) and checks that it is bound to these exact source bytes,
+    /// this scope, and the owner's current policy revision.
     ///
     /// `Ok(None)` means the owner presented no authorization at all, which the
     /// stage entry treats as "not permitted" — never as an implicit
     /// admission. A presented authorization naming a different source digest
     /// is an `Err`: a verdict reached about other bytes cannot authorize
-    /// these.
+    /// these. A verdict decided under another policy revision is an `Err` as
+    /// well: only the owner's current rule revision authorizes persistence.
+    /// The decided evidence (`scope_ref`, `source_class`, `recipient_grant`)
+    /// is required so the stage entry can re-resolve the owner verdict for
+    /// the staged bytes instead of trusting the presented disposition.
     fn presented_privacy_authorization(
         authorization: Option<&serde_json::Value>,
         transport_hash: &str,
@@ -11618,10 +11674,10 @@ impl RedbRecoveryStore {
                 field: "privacy_authorization.policy_revision",
                 reason: "privacy owner verdict must name the policy revision it was decided at",
             })?;
-        if policy_revision == 0 {
+        if policy_revision != eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION {
             return Err(OrsError::InvalidField {
                 field: "privacy_authorization.policy_revision",
-                reason: "privacy owner policy revision must be nonzero",
+                reason: "privacy owner verdict must name the owner's current policy revision",
             });
         }
         let declared_class = match value.get("declared_class") {
@@ -11641,12 +11697,75 @@ impl RedbRecoveryStore {
                 reason: "only a rejected verdict may declare an out-of-scope class",
             });
         }
+        let scope_ref = bridge_text(value, "scope_ref")?;
+        let source_class = match value.get("source_class") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(class) => {
+                let class = class.as_str().ok_or(OrsError::InvalidField {
+                    field: "privacy_authorization.source_class",
+                    reason: "proven source class must be text",
+                })?;
+                crate::model::validate_text(class, "privacy_authorization.source_class")?;
+                Some(class.to_owned())
+            }
+        };
+        let recipient_grant = value
+            .get("recipient_grant")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(OrsError::InvalidField {
+                field: "privacy_authorization.recipient_grant",
+                reason: "privacy owner verdict must carry the decided recipient grant",
+            })?;
+        let mut grant = Vec::with_capacity(recipient_grant.len());
+        for class in recipient_grant {
+            let class = class.as_str().ok_or(OrsError::InvalidField {
+                field: "privacy_authorization.recipient_grant",
+                reason: "recipient grant classes must be text",
+            })?;
+            crate::model::validate_text(class, "privacy_authorization.recipient_grant")?;
+            grant.push(class.to_owned());
+        }
         Ok(Some(BridgeEventPrivacyAuthorization {
             verdict,
             scope,
             policy_revision,
             declared_class,
+            scope_ref,
+            source_class,
+            recipient_grant: grant,
         }))
+    }
+
+    /// Re-resolves the `WorkScope` privacy owner's verdict for the staged
+    /// evidence and requires the presented verdict to equal it (issue #1934).
+    ///
+    /// This is the re-verification that keeps a self-asserted disposition out
+    /// of durable state: the owner rule runs again over the staged scope
+    /// reference, source class, and recipient grant, and the presented
+    /// `verdict` and `declared_class` must match what the owner decides for
+    /// that evidence. A mismatch fails closed before any durable write; the
+    /// conservative deny scan still applies separately and can only deny.
+    fn check_bridge_event_owner_verdict(
+        grant: &BridgeEventPrivacyAuthorization,
+    ) -> Result<(), OrsError> {
+        let expected = eliot_workscope::resolve_bridge_ingest_disclosure(
+            &grant.scope_ref,
+            grant.source_class.as_deref(),
+            &grant.recipient_grant,
+        )
+        .map_err(|_| OrsError::InvalidField {
+            field: "privacy_authorization",
+            reason: "privacy owner rejected the staged verdict evidence",
+        })?;
+        if grant.verdict != expected.verdict()
+            || grant.declared_class.as_deref() != expected.declared_class()
+        {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization",
+                reason: "presented verdict does not match the owner rule for the staged evidence",
+            });
+        }
+        Ok(())
     }
 
     /// Loads one staged bridge-event row inside a write transaction without
