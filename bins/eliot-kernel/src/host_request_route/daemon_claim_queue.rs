@@ -34,6 +34,17 @@ use crate::{
     unix_ms,
 };
 
+/// The exact authority and execution materials returned with a claimed Task
+/// Controller pair. Kept as one narrow alias so the claim endpoint's contract
+/// stays readable without changing the wire tuple consumed by its caller.
+type TaskControllerClaimedPair = (
+    HostRequestEnvelope,
+    serde_json::Value,
+    TaskControllerInvocation,
+    TaskControllerAttempt,
+    String,
+);
+
 use super::{
     DaemonReadQueue, ExpiredClaimObservation, ExpiryRetireLane, HostRequestOperationRef,
     LOCAL_READ_ENQUEUE_SALT, LocalReadAdmission, LocalReadAttemptState, LocalReadSubmitDisposition,
@@ -371,16 +382,7 @@ impl KernelComposition {
     pub(crate) fn claim_task_controller_pair(
         &self,
         session: &Session,
-    ) -> Result<
-        Option<(
-            HostRequestEnvelope,
-            serde_json::Value,
-            TaskControllerInvocation,
-            TaskControllerAttempt,
-            String,
-        )>,
-        TransportError,
-    > {
+    ) -> Result<Option<TaskControllerClaimedPair>, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         let admission_owner = self
             .agent_activation_pending
@@ -1062,13 +1064,15 @@ fn task_controller_stale_attempt(
                 .as_deref()
                 .ok_or(TransportError::SessionFenced)
                 .ok()?
-        || body.attempt.session_id
-            != envelope
-                .identity
-                .session_id
-                .as_deref()
-                .ok_or(TransportError::SessionFenced)
-                .ok()?
+        || body.attempt.session_id.as_deref()
+            != Some(
+                envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)
+                    .ok()?,
+            )
         || body.attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
         || body.attempt.state_fence != envelope.state_fence
         || !body
