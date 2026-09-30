@@ -45,6 +45,12 @@ pub enum SecurityContractError {
     },
     #[error("security indicator evidence does not establish its own class: {field}")]
     IndicatorEvidenceUnproven { field: &'static str },
+    #[error("high impact is claimed without an independent deterministic rule binding: {field}")]
+    IndicatorImpactUnproven { field: &'static str },
+    #[error(
+        "release does not rest on fresh discriminating evidence under a new profile: {field}"
+    )]
+    IndicatorReleaseNotAdmissible { field: &'static str },
     #[error("revoked influence is still marked active")]
     RevokedInfluenceActive,
     #[error("revoked influence has no invalidation reason")]

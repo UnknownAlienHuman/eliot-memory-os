@@ -9,6 +9,7 @@
 mod injection_indicators;
 mod native_resource_lease;
 mod native_resource_selection;
+mod notification_intents;
 mod revocation_digest;
 mod surface_types;
 mod validation;
@@ -20,6 +21,11 @@ pub use injection_indicators::{
     PersistenceRequest, ProposedSourceRestriction, RecordedIndicatorObservation,
     RepeatedLineageEvidence, RetainedExternalEvidence, SummaryAuthorityEvidence,
     ToolDefinitionChangeEvidence, ToolDefinitionDelta, UndeclaredEffectEvidence,
+};
+pub use notification_intents::{
+    AuthorizedSecurityRelease, SecurityNotification, SecurityNotificationHistory,
+    SecurityNotificationImpact, SecurityPromotionReviewInput, SecurityPublication,
+    SecurityReassessment,
 };
 pub use native_resource_lease::{
     NATIVE_RESOURCE_LEASE_VERSION, NativeResourceLease, NativeResourceLeaseBinding,

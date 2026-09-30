@@ -643,6 +643,48 @@ impl SourceSecurityAssessment {
             state_fence: state_fence.clone(),
         })
     }
+
+    /// Notifies the named decision owner of one retained indicator record.
+    ///
+    /// This is the entry a producer or the Governor calls: the notification is
+    /// built from this assessment's own source revision and scope and from the
+    /// named owner's own reference, so neither can be restated by the caller.
+    /// The impact is the record's own resolution through the finite
+    /// indicator-to-source map, and the promotion-gate input is produced from
+    /// that resolution alone, so a model-proposed record, a suspected pattern
+    /// and an incomplete comparison all notify as recorded evidence.
+    ///
+    /// `owner_ref` is the name the Problem owner already holds for the record's
+    /// route — the Task Controller for a task issue, the System Owner/Recovery
+    /// Principal for security and integrity — reached through
+    /// `eliot_problem::OwnerRoute::for_class` and the lease owner that issues
+    /// the name. This contract requires the name to be present and does not
+    /// mint one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assessment or the retained record is malformed,
+    /// when the fence in force is not this assessment's, or when the resolution
+    /// would produce a restriction with no usable release condition.
+    pub fn notification(
+        &self,
+        record: &crate::RecordedIndicatorObservation,
+        owner_ref: &str,
+        profile_revision: &str,
+        state_fence: &StateFence,
+    ) -> Result<crate::SecurityNotification, crate::SecurityContractError> {
+        if self.source_assurance.state_fence != *state_fence {
+            return Err(crate::SecurityContractError::FenceMismatch);
+        }
+        crate::SecurityNotification::from_record(
+            &self.source,
+            &self.source.scope,
+            record,
+            owner_ref,
+            profile_revision,
+            state_fence,
+        )
+    }
 }
 
 /// Integrity of the source snapshot.

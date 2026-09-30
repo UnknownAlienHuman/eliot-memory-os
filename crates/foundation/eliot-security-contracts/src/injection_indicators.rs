@@ -476,7 +476,10 @@ impl IndicatorEvidence {
     }
 
     /// The retained references this record cites, sorted and de-duplicated.
-    fn cited_refs(&self) -> Vec<String> {
+    ///
+    /// The notification owner names exactly these handles, so this is the one
+    /// place the set is derived; a caller cannot state a different one.
+    pub fn cited_refs(&self) -> Vec<String> {
         let mut refs = match self {
             // One shared payload shape, so the retained-material classes cite
             // through a single arm.
