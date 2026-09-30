@@ -28,7 +28,8 @@ use eliot_store_api::{
 };
 use tracing::Instrument as _;
 
-use super::{DaemonKernelClient, KernelClientError, WireOutcome, kernel_port_error, kind_value};
+use crate::daemon_kernel_client::{DaemonKernelClient, KernelClientError, WireOutcome};
+use super::{kernel_port_error, kind_value};
 
 struct OwnerSelectionContext<'a> {
     request_identity: (&'a str, &'a str, &'a str, &'a str),
