@@ -1442,16 +1442,20 @@ fn load_scheduling_profile(
 /// Reachable in a non-test build: [`solo_ingest_result`] and
 /// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
 /// are not `cfg(test)`-gated, so this join is compiled and callable in
-/// production. It is one documented fail-closed hop short of live work today,
-/// and that hop is not this issue's: in a non-test build
-/// `restore_solo_fabric` refuses with "solo restore is blocked until Kernel
-/// retains an independently owner-verified executable-binding digest", and
-/// `drive_solo_delegate_async` refuses before any fabric effect, so no
-/// production build yet holds an admitted coordinator projection to pull over.
-/// The two residuals above are the Kernel native-worker owner and the G-11
-/// admission owner (issue #1678). The join is placed on the release path
-/// because that is where I14.8 says the wake happens, not on a site that would
-/// be reachable only by pulling over an empty plan-only coordinator.
+/// production. The fabric it drives is restored through the verified seam
+/// (issue #1108): [`restore_solo_fabric`] binds the frozen plan digest,
+/// re-resolves live owner evidence over the closed production ports, and
+/// reconciles an emitted-but-unresulted dispatch to unknown instead of
+/// relaunching; missing, stale, or revoked evidence refuses typed before any
+/// effect. New production work stays one documented fail-closed hop short of
+/// live admission, and that hop is not this issue's:
+/// `drive_solo_delegate_async` refuses before any fabric effect until the
+/// native-worker owner persists the executable-binding digest, so no
+/// production build yet creates an admitted coordinator projection to pull
+/// over. That residual is the Kernel native-worker owner (issue #1678). The
+/// join is placed on the release path because that is where I14.8 says the
+/// wake happens, not on a site that would be reachable only by pulling over
+/// an empty plan-only coordinator.
 fn drive_fair_pull_after_release(
     composition: &DaemonComposition,
     fabric: &mut AgentFabric,
@@ -1524,14 +1528,17 @@ pub enum FairPullRecovery {
 /// Reachable in a non-test build: this is not `cfg(test)`-gated, and its
 /// production caller is `daemon_runtime::maybe_start_fair_pull_recovery`, which
 /// runs it on the daemon's existing `ACTIVATION_POLL_INTERVAL` cadence. The
-/// same fail-closed residual as the release arm applies and is not worked
-/// around here: a non-test `restore_solo_fabric` refuses, so the poll reports
-/// that typed refusal until the Kernel native-worker owner and the G-11
-/// admission owner (#1678) land. Both arms go live together, at the same owner.
+/// poll restores through the verified seam (issue #1108): missing, stale, or
+/// revoked evidence reports its typed refusal and stays blocked, and an
+/// emitted-but-unresulted dispatch reconciles to unknown instead of
+/// relaunching. No new production projection is created here — that residual
+/// (the Kernel native-worker executable-binding owner, #1678) still refuses
+/// at `drive_solo_delegate_async` — so the poll only ever drives a previously
+/// admitted projection.
 ///
-/// The Kernel handle is used only for the restore's live-fence revalidation
-/// that [`restore_solo_fabric`] already performs; this poll performs no
-/// authenticated Kernel request of its own and adds none.
+/// The Kernel handle is used only for the restore's live owner-evidence
+/// re-resolution that [`restore_solo_fabric`] already performs; this poll
+/// performs no authenticated Kernel request of its own and adds none.
 ///
 /// # Errors
 ///
