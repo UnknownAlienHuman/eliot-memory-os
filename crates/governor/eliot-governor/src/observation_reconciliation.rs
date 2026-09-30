@@ -1471,11 +1471,12 @@ pub struct WatchdogAdmittedEntry {
 ///   supervision evidence, explicitly not health truth) via
 ///   `ObservationSubmission { capture_route: WatchdogSpool }`.
 /// - Gap/Recovery becomes a lowered-coverage candidate (`CoverageGap` with
-///   `DegradeDependentGuarantees`) plus a scratch `Signal
-///   { disposition: ProblemCandidate }` and a scratch `Problem`
-///   `Open -> Triaged` legality check. Severity is fixed `Info`; disposition
-///   is fixed `ProblemCandidate`; the transition is fixed to `Triaged` —
-///   never `Incident`, never from model prose.
+///   `DegradeDependentGuarantees`) plus an admitted `Signal
+///   { disposition: ProblemCandidate }`. Severity is fixed `Info`, disposition
+///   is fixed `ProblemCandidate`, and attribution stays `Suspected` — never
+///   `Incident`, never a canonical `Problem`/`Incident` write, never from model
+///   prose. The watchdog supplies the observation; promotion stays with the
+///   authority that actually holds a `PromotionAuthority`.
 /// - Idempotent replay on the same batch id/digest returns the same receipts
 ///   with no second observation per spool sequence (per-entry operation
 ///   `{base}/watchdog-{sequence}` plus per-entry idempotency

@@ -57,7 +57,7 @@ pub enum OwnerRoute {
     SystemOwnerRecoveryPrincipal,
     /// Architecture gaps go to the Architecture Owner.
     ArchitectureOwner,
-    /// Verifier/evidence gaps go to the WorkScope Owner or Task Controller.
+    /// Verifier/evidence gaps go to the `WorkScope` Owner or Task Controller.
     WorkScopeOwnerOrTaskController,
     /// Module health goes to the module owner or Doctor.
     ModuleOwnerOrDoctor,
@@ -485,21 +485,29 @@ impl UnassignedOwnership {
                 reason: "must be non-zero",
             });
         }
-        match (&self.lost_lease, self.reason) {
-            (Some(identity), OwnerLossReason::LegacyRecordWithoutLease) => {
-                return Err(ProblemError::InvalidField {
-                    field: "lost_lease",
-                    reason: "a legacy record without a lease cannot name a lost lease",
-                });
+        match self.reason {
+            // A legacy record never carried a lease, so naming one contradicts
+            // the reason rather than describing a loss. The presence is itself
+            // the finding, so it is asserted explicitly here rather than
+            // ignored: an unexamined identity in this position would mean a
+            // record could both deny ever having a lease and cite one.
+            OwnerLossReason::LegacyRecordWithoutLease => {
+                if self.lost_lease.is_some() {
+                    return Err(ProblemError::InvalidField {
+                        field: "lost_lease",
+                        reason: "a legacy record without a lease cannot name a lost lease",
+                    });
+                }
             }
-            (None, OwnerLossReason::LegacyRecordWithoutLease) => {}
-            (None, _) => {
-                return Err(ProblemError::InvalidField {
-                    field: "lost_lease",
-                    reason: "an owner loss must name the exact lease it observed dead",
-                });
-            }
-            (Some(identity), _) => {
+            // Every other loss is an observed event and must name the exact
+            // lease identity it saw dead, with evidence pointing at it.
+            _ => {
+                let Some(identity) = &self.lost_lease else {
+                    return Err(ProblemError::InvalidField {
+                        field: "lost_lease",
+                        reason: "an owner loss must name the exact lease it observed dead",
+                    });
+                };
                 identity.validate()?;
                 crate::nonempty(&self.loss_evidence, "loss_evidence")?;
             }

@@ -1157,10 +1157,10 @@ impl Problem {
         if self.ownership.is_assigned() {
             return Err(ProblemError::OwnerLeaseMismatch);
         }
-        if let Ownership::Unassigned(unassigned) = &self.ownership {
-            if unassigned.reason == OwnerLossReason::LegacyRecordWithoutLease {
-                return Ok(unassigned.obligation.clone());
-            }
+        if let Ownership::Unassigned(unassigned) = &self.ownership
+            && unassigned.reason == OwnerLossReason::LegacyRecordWithoutLease
+        {
+            return Ok(unassigned.obligation.clone());
         }
         let revision = next_revision(self.revision)?;
         let route = self.default_owner_route();
