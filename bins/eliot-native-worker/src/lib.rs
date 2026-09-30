@@ -18,7 +18,8 @@ use eliot_native_worker_core::{
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
 use eliot_protocol::{
-    EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
+    EncodingProfile, Frame, FrameKind, MessageType, NativeWorkerOperationV1, ProtocolPayload,
+    ProtocolVersion,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -79,14 +80,28 @@ struct WorkerResponseContext {
     trace_context: BTreeMap<String, String>,
 }
 
-impl From<&WorkerFrame> for WorkerResponseContext {
-    fn from(request: &WorkerFrame) -> Self {
-        Self {
+impl TryFrom<&Frame> for WorkerResponseContext {
+    type Error = NativeWorkerError;
+
+    fn try_from(request: &Frame) -> Result<Self, Self::Error> {
+        let request_id = request
+            .request_id
+            .clone()
+            .ok_or(WorkerError::InvalidFrame("request_id"))?;
+        Ok(Self {
             connection_id: request.connection_id.clone(),
-            request_id: request.request_id.clone(),
+            request_id,
             trace_context: request.trace_context.clone(),
-        }
+        })
     }
+}
+
+fn is_native_worker_shutdown(frame: &Frame) -> bool {
+    matches!(
+        &frame.payload,
+        ProtocolPayload::NativeWorkerFrameV1(payload)
+            if payload.operation == NativeWorkerOperationV1::Shutdown
+    )
 }
 
 /// Errors at the process composition boundary.
@@ -206,17 +221,28 @@ where
             .map_err(NativeWorkerError::from)
     }
 
+    /// Handles one canonical EBP frame through the generated core projection.
+    pub async fn handle_ebp_frame(
+        &mut self,
+        frame: Frame,
+    ) -> Result<Vec<WorkerEventEnvelope>, NativeWorkerError> {
+        self.core
+            .handle_ebp_frame(frame)
+            .await
+            .map_err(NativeWorkerError::from)
+    }
+
     /// Returns the logical lifecycle owned by the worker protocol.
     #[must_use]
     pub const fn lifecycle(&self) -> WorkerLifecycle {
         self.core.lifecycle()
     }
 
-    /// Serves length-delimited JSON frames after the caller has completed start.
+    /// Serves length-delimited EBP frames after the caller has completed start.
     ///
     /// The blocking stdin read runs on a dedicated reader thread that drains
     /// the OS pipe promptly into a bounded channel, while this loop handles
-    /// frames (including `Cancel`/`Heartbeat` bodies through the core) and
+    /// canonical EBP frames (including `Cancel`/`Heartbeat` operations) and
     /// writes responses. A slow `Execute` handler therefore cannot starve a
     /// concurrent cancellation or heartbeat observation: the reader keeps
     /// buffering while the handler runs, and cancel/heartbeat frames are
@@ -225,7 +251,7 @@ where
     /// by this contour.
     pub async fn serve_stdio(&mut self) -> Result<(), NativeWorkerError> {
         let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<Result<Option<WorkerFrame>, NativeWorkerError>>(64);
+            std::sync::mpsc::sync_channel::<Result<Option<Frame>, NativeWorkerError>>(64);
         std::thread::spawn(move || {
             loop {
                 let frame = read_frame();
@@ -252,13 +278,10 @@ where
     }
 
     /// Handles one frame and writes its response, returning true on shutdown.
-    async fn serve_frame(&mut self, frame: WorkerFrame) -> Result<bool, NativeWorkerError> {
-        let shutdown = matches!(
-            &frame.body,
-            eliot_native_worker_core::WorkerFrameBody::Shutdown
-        );
-        let response_context = WorkerResponseContext::from(&frame);
-        let events = self.handle(frame).await?;
+    async fn serve_frame(&mut self, frame: Frame) -> Result<bool, NativeWorkerError> {
+        let shutdown = is_native_worker_shutdown(&frame);
+        let response_context = WorkerResponseContext::try_from(&frame)?;
+        let events = self.handle_ebp_frame(frame).await?;
         let response_wire =
             encode_worker_response_frame(response_context, &WorkerResponse { events })?;
         write_frame(&response_wire)?;
@@ -280,12 +303,9 @@ where
         let Some(frame) = read_frame_from(reader)? else {
             return Ok(true);
         };
-        let shutdown = matches!(
-            &frame.body,
-            eliot_native_worker_core::WorkerFrameBody::Shutdown
-        );
-        let response_context = WorkerResponseContext::from(&frame);
-        let events = self.handle(frame).await?;
+        let shutdown = is_native_worker_shutdown(&frame);
+        let response_context = WorkerResponseContext::try_from(&frame)?;
+        let events = self.handle_ebp_frame(frame).await?;
         let response_wire =
             encode_worker_response_frame(response_context, &WorkerResponse { events })?;
         write_frame_to(&response_wire, writer)?;
@@ -2630,12 +2650,12 @@ fn write_frame(wire: &[u8]) -> Result<(), NativeWorkerError> {
     write_frame_to(wire, &mut output)
 }
 
-fn read_frame() -> Result<Option<WorkerFrame>, NativeWorkerError> {
+fn read_frame() -> Result<Option<Frame>, NativeWorkerError> {
     let mut input = io::stdin().lock();
     read_frame_from(&mut input)
 }
 
-fn read_frame_from<R: Read>(reader: &mut R) -> Result<Option<WorkerFrame>, NativeWorkerError> {
+fn read_frame_from<R: Read>(reader: &mut R) -> Result<Option<Frame>, NativeWorkerError> {
     let mut prefix = [0_u8; 4];
     loop {
         match reader.read(&mut prefix[..1]) {
@@ -2670,8 +2690,7 @@ fn read_frame_from<R: Read>(reader: &mut R) -> Result<Option<WorkerFrame>, Nativ
     wire.extend_from_slice(&prefix);
     wire.resize(4 + body_len, 0);
     reader.read_exact(&mut wire[4..])?;
-    let frame = decode_frame(&wire, TransportLimits::default())?;
-    Ok(Some(WorkerFrame::from_ebp_frame(frame)?))
+    Ok(Some(decode_frame(&wire, TransportLimits::default())?))
 }
 
 fn write_frame_to<W: Write>(wire: &[u8], writer: &mut W) -> Result<(), NativeWorkerError> {

@@ -584,6 +584,7 @@ mod tests {
         ProviderFailure, WorkerCore, WorkerEventEnvelope, WorkerFrame, WorkerFrameBody,
         WorkerHello, WorkerLifecycle,
     };
+    use eliot_protocol::{Frame, ProtocolPayload};
     use eliot_process::SessionId as ProcessSessionId;
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
@@ -1279,7 +1280,7 @@ mod tests {
         eliot_native_worker::ReconcileSubmission::new("reconcile-1".to_owned(), claim.clone(), None)
     }
 
-    fn health_frame() -> WorkerFrame {
+    fn health_frame() -> Frame {
         let lease: WorkLeaseId = load(serde_json::from_value(
             serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
         ));
@@ -1297,23 +1298,22 @@ mod tests {
             producer_generation: 1,
             body: WorkerFrameBody::Health,
         }
+        .to_ebp_frame()
+        .unwrap_or_else(|error| panic!("worker frame encodes as EBP: {error:?}"))
     }
 
-    fn encode_frame(frame: &WorkerFrame) -> Vec<u8> {
-        let body = serde_json::to_vec(frame).expect("frame");
-        let mut out = u32::try_from(body.len())
-            .expect("len")
-            .to_le_bytes()
-            .to_vec();
-        out.extend_from_slice(&body);
-        out
+    fn encode_frame(frame: &Frame) -> Vec<u8> {
+        eliot_ipc::encode_frame(frame, eliot_ipc::TransportLimits::default())
+            .unwrap_or_else(|error| panic!("EBP frame encodes: {error:?}"))
     }
 
     fn decode_response(bytes: &[u8]) -> eliot_native_worker::WorkerResponse {
-        let (prefix, body) = bytes.split_at(4);
-        let length = u32::from_le_bytes(prefix.try_into().expect("prefix")) as usize;
-        assert_eq!(length, body.len());
-        serde_json::from_slice(body).expect("response")
+        let frame = eliot_ipc::decode_frame(bytes, eliot_ipc::TransportLimits::default())
+            .unwrap_or_else(|error| panic!("EBP response decodes: {error:?}"));
+        let ProtocolPayload::Json(payload) = frame.payload else {
+            panic!("worker response uses the JSON response payload");
+        };
+        serde_json::from_value(payload).expect("response")
     }
 
     type SliceDWorker = NativeWorker<
@@ -2292,7 +2292,9 @@ mod tests {
             admission_revision: "1".to_owned(),
             producer_generation: 1,
             body: WorkerFrameBody::Health,
-        };
+        }
+        .to_ebp_frame()
+        .unwrap_or_else(|error| panic!("worker frame encodes as EBP: {error:?}"));
         let mut reader = Cursor::new(encode_frame(&frame));
         let mut writer = Vec::new();
         let fence_json = serde_json::to_value(&material.hello.state_fence)
