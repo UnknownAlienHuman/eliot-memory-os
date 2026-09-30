@@ -322,7 +322,7 @@ pub fn admit_context_traced_with_headroom(
 pub(crate) fn run_with_headroom(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
-    units: Option<&UnitGroupBinding>,
+    units: Option<&UnitGroupBinding<'_>>,
 ) -> Result<HeadroomAdmissionOutcome, ContextError> {
     // The refusal names an existing owner record, never a minted placeholder:
     // the recipe's own invalidation identity when it declared one, otherwise
@@ -403,6 +403,15 @@ pub(crate) fn run_with_headroom(
 /// kind off a content string, and a candidate the metadata does not describe is
 /// never admitted as a whole unit.
 ///
+/// The same owner evidence also carries the whole-unit section budgets of that
+/// exact approved revision, and they are checked against the admitted set once
+/// the one selection is finished: every budgeted role must retain both its
+/// declared exact required identities and its independent minimum whole-unit
+/// count. Membership and count are two independent checks inside the budget's
+/// own `validate_admitted_section`; neither is derived from the other here. Only
+/// the `Complete` outcome is checked, because an `Incomplete` decision already
+/// carries the exact gaps that a hard error would only erase.
+///
 /// The same decision also runs the I12.13 headroom rule before optional filling.
 /// This entry receives validated owner evidence only, performs no I/O, and
 /// contacts no owner.
@@ -426,7 +435,7 @@ pub fn admit_context_traced_with_boundaries(
 fn admit_context_inner_with_boundaries(
     input: &AdmissionInput,
     headroom: Option<&HeadroomContext<'_>>,
-    units: Option<&UnitGroupBinding>,
+    units: Option<&UnitGroupBinding<'_>>,
 ) -> Result<AdmissionResult, ContextError> {
     // I12.26 stale-projection fence arm, enforced before exact cue firing: a
     // candidate closure compiled under another fence must refresh the packet
@@ -516,6 +525,36 @@ fn admit_context_inner_with_boundaries(
         required_cost,
         optional_cost,
         fixed,
+    })
+    .and_then(|result| {
+        // I12.13 "Bind indivisible groups", second half. The group binding above
+        // proves that every indivisible unit was admitted or omitted whole; it
+        // says nothing about whether the decision kept the WHOLE-UNIT floor the
+        // approved revision declares for each semantic role. That is a separate
+        // check against a separate owner record, and it runs here: after exactly
+        // one selection, against the admitted set that selection produced, on the
+        // `Complete` arm only.
+        //
+        // Only the `Complete` arm is checked. An `Incomplete` outcome already
+        // carries the exact required-reference omissions this check would name
+        // (`MissingFloor`, `WholeUnitRequired`), and re-reporting them as a hard
+        // `Err` would erase the typed gaps that let the caller reopen with a
+        // narrower view instead. An incomplete decision is already blocked.
+        //
+        // The budgets are the ones the caller bound into the same
+        // `UnitGroupContext` as the unit/member metadata, so this is checked
+        // against the revision this decision actually admitted under and never
+        // against a re-read or a default.
+        let Some(units) = units else {
+            return Ok(result);
+        };
+        let ContextOutcome::Complete(admitted) = &result.outcome else {
+            return Ok(result);
+        };
+        for budget in units.section_budgets {
+            budget.validate_admitted_section(admitted)?;
+        }
+        Ok(result)
     })
 }
 
@@ -1147,7 +1186,7 @@ struct OptionalSelectionInput<'a> {
     admitted: &'a mut BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
     fixed: u64,
     required_cost: u64,
-    units: Option<&'a UnitGroupBinding>,
+    units: Option<&'a UnitGroupBinding<'a>>,
 }
 
 enum OptionalDecision {
@@ -1242,7 +1281,7 @@ struct OptionalSelection<'a> {
     admitted: &'a mut BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
     available: u64,
     optional_cost: u64,
-    units: Option<&'a UnitGroupBinding>,
+    units: Option<&'a UnitGroupBinding<'a>>,
 }
 
 impl OptionalSelection<'_> {
@@ -1363,7 +1402,7 @@ fn prepare_floor(
         eliot_contracts::ArtifactId,
         &eliot_context_contracts::SuppliedOmissionBinding,
     >,
-    units: Option<&UnitGroupBinding>,
+    units: Option<&UnitGroupBinding<'_>>,
 ) -> Result<Result<BTreeSet<eliot_contracts::ArtifactId>, DecisionContextIncomplete>, ContextError>
 {
     let mut floor_ids = floor_closure(input, candidates)?;

@@ -22,6 +22,14 @@
 //!    allowed disposition: a typed incomplete result on the required path and a
 //!    truthful omission on the optional path.
 //!
+//! 3. **Whole-unit floor.** Binding a group whole is necessary and not
+//!    sufficient: the approved recipe revision also declares, per semantic role,
+//!    which exact identities must survive and how many whole units must remain.
+//!    Those budgets travel in the same [`UnitGroupContext`] as the unit/member
+//!    metadata — one resolution, one revision — and are checked against the
+//!    admitted set by `ContextSectionBudget::validate_admitted_section` once the
+//!    one selection has finished.
+//!
 //! The unit kind, the declared denominator, the membership and the completeness
 //! of a candidate are read from the owner's envelope. `AtomRepresentation::Whole`
 //! is a content tag and is never evidence of any of them.
@@ -37,7 +45,7 @@ use eliot_context_contracts::{
     AdmissionInput, AtomRepresentation, BoundaryCompleteness, BoundaryDenominator,
     BoundaryDisposition, BoundaryMemberReference, BoundaryMetadataEnvelope, BoundaryMetadataSet,
     BoundaryPrecision, BoundaryUnitKind, BoundaryValidationLimits, ContextCandidate, ContextError,
-    RepresentationKind,
+    ContextSectionBudget, RepresentationKind,
 };
 use eliot_contracts::ArtifactId;
 
@@ -59,6 +67,21 @@ pub struct UnitGroupContext<'a> {
     pub boundaries: &'a BoundaryMetadataSet,
     /// The bounds this projection site validates that metadata under.
     pub limits: &'a BoundaryValidationLimits,
+    /// The whole-unit budgets of the exact approved recipe revision this
+    /// decision admits under.
+    ///
+    /// These are the `section_budgets` of the SAME
+    /// `ApprovedRecipeCatalogue::resolve` the caller already performed for the
+    /// floor and the unit/member metadata above, so they describe one recipe
+    /// revision rather than two. They are borrowed, never re-read and never
+    /// defaulted: a caller that cannot name the revision's budgets has no
+    /// group-binding decision to make and is refused here rather than admitted
+    /// against an unbounded section.
+    ///
+    /// I12.13 "a count is not membership": these are what
+    /// [`ContextSectionBudget::validate_admitted_section`] checks against the
+    /// observed admitted set once, after selection, on the complete arm only.
+    pub section_budgets: &'a [ContextSectionBudget],
 }
 
 /// What one candidate's own envelope establishes about its whole unit.
@@ -74,9 +97,11 @@ struct AtomUnit {
     expansion_refs: BTreeSet<ArtifactId>,
 }
 
-/// The owner's unit/member metadata, joined to this input's candidates.
-pub(crate) struct UnitGroupBinding {
+/// The owner's unit/member metadata, joined to this input's candidates, and the
+/// whole-unit budgets of the approved revision they were issued under.
+pub(crate) struct UnitGroupBinding<'a> {
     units: BTreeMap<ArtifactId, AtomUnit>,
+    pub(crate) section_budgets: &'a [ContextSectionBudget],
 }
 
 /// Whether this unit kind may not be split across records.
@@ -87,7 +112,7 @@ const fn is_indivisible(kind: BoundaryUnitKind) -> bool {
     )
 }
 
-impl UnitGroupBinding {
+impl<'ctx> UnitGroupBinding<'ctx> {
     /// Validate the owner-issued metadata and join it to this input.
     ///
     /// Every comparison is against something this decision did not choose. The
@@ -101,9 +126,16 @@ impl UnitGroupBinding {
     /// prevent.
     pub(crate) fn bind(
         input: &AdmissionInput,
-        context: &UnitGroupContext<'_>,
-    ) -> Result<Self, ContextError> {
+        context: &'ctx UnitGroupContext<'ctx>,
+    ) -> Result<UnitGroupBinding<'ctx>, ContextError> {
         context.boundaries.validate(context.limits)?;
+        // A revision with no section budget would make the whole-unit floor check
+        // below vacuous, so the evidence is refused rather than accepted empty.
+        // The approved policy already requires a non-empty set, but this cell
+        // reads the slice directly and must not inherit that invariant silently.
+        if context.section_budgets.is_empty() {
+            return Err(ContextError::MissingField("unit_group.section_budgets"));
+        }
 
         let mut envelopes: BTreeMap<&ArtifactId, &BoundaryMetadataEnvelope> = BTreeMap::new();
         for unit in &context.boundaries.units {
@@ -177,7 +209,10 @@ impl UnitGroupBinding {
                 },
             );
         }
-        Ok(Self { units })
+        Ok(Self {
+            units,
+            section_budgets: context.section_budgets,
+        })
     }
 
     /// Whether the candidate's own representation may be admitted at all.
