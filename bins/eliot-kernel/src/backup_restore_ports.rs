@@ -402,6 +402,20 @@ pub enum KernelRestoreError {
     JournalBindingConflict,
     /// The isolated destination is invalid or escapes the work root.
     DestinationInvalid(String),
+    /// The recovery import's target is not an owner-admitted isolated
+    /// destination of THIS operation (issue #955, A11).
+    ///
+    /// This is deliberately not [`DestinationInvalid`](Self::DestinationInvalid)
+    /// and not [`TargetFailed`](Self::TargetFailed): a caller deciding whether
+    /// to clear the isolated area, re-run the command, or escalate to the
+    /// destination owner is deciding on different facts in the three cases and
+    /// must be able to tell them apart. A destination that is malformed or
+    /// escapes the work root is `DestinationInvalid`; a destination whose bytes
+    /// are simply not this operation's to write into is this refusal; an engine
+    /// failure that already ran is `TargetFailed`. It is raised before any
+    /// destination byte is staged and never downgraded to a no-op, an in-memory
+    /// substitute, or a formatted string.
+    DestinationNotAdmitted,
     /// The Kernel fence does not admit this archive.
     FenceMismatch(String),
     /// The archive or its class denominator is invalid.
@@ -454,6 +468,10 @@ impl std::fmt::Display for KernelRestoreError {
             Self::DestinationInvalid(detail) => {
                 write!(formatter, "isolated destination invalid: {detail}")
             }
+            Self::DestinationNotAdmitted => write!(
+                formatter,
+                "recovery import target is not an owner-admitted isolated destination of this operation"
+            ),
             Self::FenceMismatch(detail) => {
                 write!(formatter, "kernel fence does not admit archive: {detail}")
             }
@@ -553,6 +571,7 @@ pub fn kernel_to_backup(error: KernelRestoreError) -> BackupError {
         KernelRestoreError::StagedCleanupIncomplete { primary, .. } => primary,
         KernelRestoreError::CutoverNotAuthorized => BackupError::CutoverNotAuthorized,
         KernelRestoreError::DestinationInvalid(_)
+        | KernelRestoreError::DestinationNotAdmitted
         | KernelRestoreError::FenceMismatch(_)
         | KernelRestoreError::ArchiveInvalid(_)
         | KernelRestoreError::CapabilityMissing { .. }
