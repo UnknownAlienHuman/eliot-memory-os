@@ -575,12 +575,7 @@ pub fn convert_v1_row(
     normalized: Option<&NormalizedCue>,
 ) -> Result<V1RowMigration, FacadeError> {
     row.validate_for_conversion()?;
-    let parsed = crate::legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
-    if &parsed != row {
-        return Err(FacadeError::ResponseIdentityMismatch {
-            what: "migration.row_payload",
-        });
-    }
+    crate::bind_v1_row_payload(legacy_row_id, row, legacy_bytes)?;
     if is_blank_or_control(legacy_row_id) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",
