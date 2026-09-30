@@ -88,13 +88,13 @@ use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
     AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
     ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
-    HeadroomAllocationLedger, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
-    QualityRefusal, QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement,
-    SuppliedOmissionBinding, canonical_render_serializer,
+HeadroomAllocationLedger, HeadroomDimension, MeasurementCompositionProfile,
+    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding, canonical_render_serializer,
 };
 use eliot_contracts::{
-    ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-    sha256_hex,
+    ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
+    SourceId, StateFence, sha256_hex,
 };
 use eliot_governor::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs,
@@ -102,11 +102,14 @@ use eliot_governor::{
     ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY,
     ROLE_TASK_FRAME, SevenRoleInputs,
 };
+use eliot_kernel_core::module::control_reserve_front_door::ControlReleaseEvidence;
+use eliot_kernel_core::{ControlPermit, FRONT_DOOR_OWNER, FrontDoor};
 use eliot_learning_contracts::CampaignLearningStateView;
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
 };
 use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService};
+use eliot_runtime_contracts::{CapacityBottleneck, CapacityPermitBinding, frozen_bottleneck_owner_map};
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignSourceRevisionLookup, CanonicalReadClient,
     EVIDENCE_PACK_MAX_RECORDS, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation, NamedReadRequest,
@@ -1406,6 +1409,385 @@ pub enum PacketCompositionError {
     /// terminated through its issuer rather than stranded.
     #[error("packet headroom handoff refused: {0}")]
     HeadroomHandoff(Box<HeadroomHandoffRefusal>),
+    /// The live resource owner could not be joined for this compilation's
+    /// downstream headroom, so the headroom evidence this caller presented is
+    /// not proof that anything was reserved.
+    ///
+    /// #1869: a [`DownstreamHeadroomResult`] that passes shape validation is a
+    /// plain-data record. Only the owner's own non-clone permit handle is a
+    /// reservation, so this compilation requires the owner join to have been
+    /// acquired from the live owner ([`PacketHeadroomJoin::acquire`]) and to
+    /// still be live. A refusal here is the fail-closed answer: the attempted
+    /// recipe, the exact dimension, the bottleneck the frozen owner map requires
+    /// and the consulted owner's own refusal cross this boundary together, and
+    /// no admitted set and no Active View exist for the attempt.
+    ///
+    /// Any capacity the owner did issue is returned to it before this refusal
+    /// is raised, so this boundary never strands a reservation either.
+    #[error(
+        "packet headroom owner join refused for attempted recipe {attempted_recipe_digest}: {refusal}"
+    )]
+    HeadroomJoinRefused {
+        /// Canonical digest of the recipe this compilation actually attempted.
+        attempted_recipe_digest: String,
+        /// The typed owner-join refusal naming the exact dimension and owner.
+        refusal: Box<PacketHeadroomJoinRefusal>,
+    },
+    /// This compilation carries learning-marked or ticketed input, and no
+    /// single admission entry applies both the governed learning checks and the
+    /// headroom check before one selection.
+    ///
+    /// #1869: the reservation-aware entry this caller otherwise uses applies
+    /// `check_headroom` and reaches the selector without
+    /// `refuse_ungoverned_learning`, `check_governed_carriage` or
+    /// `screen_admission_input_learning`, and the learning-only entry reaches
+    /// the selector with headroom `None`. An [`AdmissionInput`] is ordinary
+    /// data, not a proof that the live learning checks ran. Calling the two
+    /// existing selecting entries in sequence and comparing their outputs after
+    /// admission is exactly what the audit forbids, so this caller refuses
+    /// rather than picking a path that drops a guarantee. Marks and tickets are
+    /// never stripped or reclassified to make the ordinary path apply.
+    #[error("packet admission needs the composed learning-and-headroom entry: {0}")]
+    ComposedAdmissionEntryMissing(&'static str),
+}
+
+/// Why the live resource-owner join for one packet's headroom was refused.
+///
+/// Every variant names the exact dimension it is about, so a reader never has
+/// to infer which reservation was missing from a collapsed message. The
+/// variants are the join's own outcomes: they are produced by the owner's port
+/// and by the comparison of owner-minted evidence, never by re-deriving a
+/// decision this composition could have made itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PacketHeadroomJoinRefusal {
+    /// The demanded dimension has no bottleneck row in the frozen owner map, so
+    /// no live owner exists that could ever reserve it on this route.
+    NoFrozenOwner {
+        /// The demanded dimension.
+        dimension: HeadroomDimension,
+    },
+    /// The consulted owner refused the demand through its own port.
+    OwnerRefused {
+        /// The demanded dimension.
+        dimension: HeadroomDimension,
+        /// The bottleneck the demand submitted, which is the frozen owner
+        /// map's row for this dimension.
+        bottleneck: CapacityBottleneck,
+        /// The owner's own typed refusal, rendered verbatim.
+        reason: String,
+    },
+    /// The consulted owner issued a permit, but not for the bottleneck this
+    /// dimension requires.
+    ///
+    /// This is the exact shape of a demanded dimension that has a frozen owner
+    /// row but no live owner behind it: the permit that was issued names a
+    /// different bottleneck, so it is not a reservation for this dimension. The
+    /// issued permit is returned to its owner before this refusal is raised.
+    NotIssuableByOwner {
+        /// The demanded dimension.
+        dimension: HeadroomDimension,
+        /// The bottleneck the frozen owner map binds this dimension to.
+        required_bottleneck: CapacityBottleneck,
+        /// The runtime owner the frozen map names for `required_bottleneck`.
+        required_owner: &'static str,
+        /// The runtime owner that was actually consulted.
+        consulted_owner: &'static str,
+        /// The bottleneck that owner actually issued, which is never the
+        /// required one on this route.
+        issued_bottleneck: CapacityBottleneck,
+    },
+    /// The presented result claims a reservation this join does not hold a live
+    /// owner permit for, or names a permit the owner did not mint.
+    ///
+    /// This is the refusal a shape-valid [`DownstreamHeadroomResult`] earns
+    /// when no live owner reserved anything for the dimension: the result's own
+    /// `Granted` binding is compared against the owner-minted binding this join
+    /// holds, and a result that does not match it is not accepted as proof.
+    UnprovenReservation {
+        /// The demanded dimension.
+        dimension: HeadroomDimension,
+    },
+    /// A reservation this join holds is no longer live at the owner.
+    NotLive {
+        /// The demanded dimension.
+        dimension: HeadroomDimension,
+        /// Which liveness property the owner no longer satisfies.
+        reason: &'static str,
+    },
+}
+
+impl std::fmt::Display for PacketHeadroomJoinRefusal {
+    /// Renders the exact dimension and owner fact, never a collapsed verdict.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoFrozenOwner { dimension } => write!(
+                formatter,
+                "no frozen owner row for dimension {}",
+                dimension.as_contract_str()
+            ),
+            Self::OwnerRefused {
+                dimension,
+                bottleneck,
+                reason,
+            } => write!(
+                formatter,
+                "owner refused {} on {}: {reason}",
+                dimension.as_contract_str(),
+                bottleneck.as_contract_str()
+            ),
+            Self::NotIssuableByOwner {
+                dimension,
+                required_bottleneck,
+                required_owner,
+                consulted_owner,
+                issued_bottleneck,
+            } => write!(
+                formatter,
+                "no live owner for {}: requires {} ({required_owner}), consulted {consulted_owner} issued {}",
+                dimension.as_contract_str(),
+                required_bottleneck.as_contract_str(),
+                issued_bottleneck.as_contract_str()
+            ),
+            Self::UnprovenReservation { dimension } => write!(
+                formatter,
+                "no live owner permit proves the reservation for {}",
+                dimension.as_contract_str()
+            ),
+            Self::NotLive { dimension, reason } => {
+                write!(formatter, "{reason} for {}", dimension.as_contract_str())
+            }
+        }
+    }
+}
+
+/// The live resource-owner join for one packet compilation's headroom.
+///
+/// #1869: this is the acquisition/revalidation/release join the headroom
+/// evidence was always supposed to sit inside. It holds the resource owner's
+/// own non-clone permit handles — the only thing that is actually a
+/// reservation — for the whole selection, so a [`DownstreamHeadroomResult`]
+/// cannot stand in for an owner that reserved nothing.
+///
+/// The owner is the existing Kernel resource/lease owner and the port is its
+/// own existing issuance entrypoint
+/// (`FrontDoor::issue_permit`);
+/// no second owner, no local counter and no in-memory stand-in is introduced
+/// here. The three phases are separate and each is reached exactly once per
+/// compilation:
+///
+/// - **acquisition** — [`Self::acquire`] asks the owner for one permit per
+///   demanded dimension and refuses the moment the owner's own answer is not a
+///   reservation of that dimension;
+/// - **revalidation** — [`Self::prove`] and [`Self::revalidate`] re-read the
+///   owner before the selection and again across it, so owner-issued evidence
+///   that no longer matches the held permit, or that the owner has since
+///   fenced, refuses;
+/// - **release** — [`Self::release`] hands each held slot back through the
+///   owner's own release path, and dropping this value without releasing is the
+///   owner's own drop backstop. Cancellation and release therefore stay the
+///   resource owner's responsibility; this composition never re-decides whether
+///   a release closed a permit.
+pub struct PacketHeadroomJoin<'a> {
+    /// The live owner this join was acquired from.
+    owner: &'a FrontDoor,
+    /// One held, non-clone owner permit per demanded dimension.
+    leases: Vec<PacketHeadroomLease>,
+}
+
+/// One demanded dimension's held owner reservation.
+struct PacketHeadroomLease {
+    /// The dimension this reservation covers.
+    dimension: HeadroomDimension,
+    /// The owner's non-clone permit handle. Holding it is the reservation: the
+    /// owner returns the slot on release or drop, and it cannot be duplicated.
+    permit: ControlPermit,
+    /// The binding the owner minted for `permit`, verbatim.
+    binding: CapacityPermitBinding,
+}
+
+impl<'a> PacketHeadroomJoin<'a> {
+    /// **Acquisition.** Ask the live owner for one reservation per demanded
+    /// dimension, before any optional filling or selection happens.
+    ///
+    /// The owner is asked through its own issuance port with the demand's own
+    /// `CapacityRequest`, so the operation identity, capacity class, unit,
+    /// amount, requester generation, Authority Epoch and profile revision are
+    /// the ones the owner validates — none of them is restated here.
+    /// `owner_generation` is the issuing owner's generation: the owner holds no
+    /// generation counter, so it arrives with the call exactly as its own
+    /// issuance entrypoint requires.
+    ///
+    /// A demand whose dimension has no frozen owner row, an owner refusal, and
+    /// a permit issued for a bottleneck other than the demanded dimension are
+    /// three distinct refusals. In the last case the issued permit is handed
+    /// straight back to its owner before the refusal is raised, so a mismatch
+    /// never strands capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacketHeadroomJoinRefusal`] naming the exact dimension. The
+    /// owner is never bypassed and no default is filled: a dimension with no
+    /// live owner behind it is refused, not admitted without a reservation.
+    pub fn acquire(
+        owner: &'a FrontDoor,
+        owner_generation: ResourceGeneration,
+        request: &DownstreamHeadroomRequest,
+        now_ms: u64,
+    ) -> Result<Self, PacketHeadroomJoinRefusal> {
+        let mut leases = Vec::with_capacity(request.demands.len());
+        for demand in &request.demands {
+            let (Some(required_bottleneck), Some(required_owner)) = (
+                demand.dimension.owner_bottleneck(),
+                frozen_owner_for(demand.dimension),
+            ) else {
+                return Err(PacketHeadroomJoinRefusal::NoFrozenOwner {
+                    dimension: demand.dimension,
+                });
+            };
+            // The owner's issuance port takes its clock as a signed reading; a
+            // clock this compilation cannot represent is refused against this
+            // exact demand rather than wrapped into a negative one.
+            let issued_at = i64::try_from(now_ms).map_err(|_| {
+                PacketHeadroomJoinRefusal::OwnerRefused {
+                    dimension: demand.dimension,
+                    bottleneck: required_bottleneck,
+                    reason: String::from("observed clock does not fit the owner issuance clock"),
+                }
+            })?;
+            let (permit, binding) = owner
+                .issue_permit(&demand.request, owner_generation, issued_at)
+                .map_err(|error| PacketHeadroomJoinRefusal::OwnerRefused {
+                    dimension: demand.dimension,
+                    bottleneck: required_bottleneck,
+                    reason: error.to_string(),
+                })?;
+            if binding.bottleneck != required_bottleneck {
+                // The owner granted a slot, but not in this dimension's frozen
+                // bottleneck, so it is not a reservation for this dimension.
+                // The slot goes back to the owner that issued it; the owner
+                // stays the only party that can release it.
+                drop(permit);
+                return Err(PacketHeadroomJoinRefusal::NotIssuableByOwner {
+                    dimension: demand.dimension,
+                    required_bottleneck,
+                    required_owner,
+                    consulted_owner: FRONT_DOOR_OWNER,
+                    issued_bottleneck: binding.bottleneck,
+                });
+            }
+            leases.push(PacketHeadroomLease {
+                dimension: demand.dimension,
+                permit,
+                binding,
+            });
+        }
+        Ok(Self { owner, leases })
+    }
+
+    /// **Revalidation, before the selection.** Refuse any reservation this join
+    /// cannot tie to a permit the owner minted and still holds.
+    ///
+    /// This is the step a shape-valid [`DownstreamHeadroomResult`] cannot pass
+    /// on its own: for every demanded dimension the result's own `Granted`
+    /// binding is compared against the owner-minted binding this join holds,
+    /// and a result that names no reservation, or a reservation the owner did
+    /// not mint for this demand, is refused. The result is a record; only the
+    /// held permit is the reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacketHeadroomJoinRefusal::UnprovenReservation`] naming the
+    /// exact dimension.
+    pub fn prove(
+        &self,
+        request: &DownstreamHeadroomRequest,
+        result: &DownstreamHeadroomResult,
+    ) -> Result<(), PacketHeadroomJoinRefusal> {
+        for demand in &request.demands {
+            let Some(lease) = self.lease(demand.dimension) else {
+                return Err(PacketHeadroomJoinRefusal::UnprovenReservation {
+                    dimension: demand.dimension,
+                });
+            };
+            if result.reservation(demand.dimension) != Some(&lease.binding) {
+                return Err(PacketHeadroomJoinRefusal::UnprovenReservation {
+                    dimension: demand.dimension,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// **Revalidation, across the selection.** Re-read the live owner after the
+    /// admitted set exists and before the packet is published.
+    ///
+    /// Liveness is read from the owner, not from the record: every held permit
+    /// must still carry the owner's current epoch, the owner's own minted
+    /// binding must carry the same epoch sequence, and the reservation must
+    /// still be inside its own expiry at `now_ms`. A second clock reading is
+    /// supplied by the caller for this step so it is an observation taken after
+    /// the selection rather than a restatement of the one taken before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacketHeadroomJoinRefusal::NotLive`] naming the exact
+    /// dimension and which liveness property the owner no longer satisfies.
+    pub fn revalidate(&self, now_ms: u64) -> Result<(), PacketHeadroomJoinRefusal> {
+        let live_epoch = self.owner.epoch().value();
+        for lease in &self.leases {
+            if lease.permit.epoch().value() != live_epoch
+                || lease.binding.authority_epoch_ref.sequence.get() != live_epoch
+            {
+                return Err(PacketHeadroomJoinRefusal::NotLive {
+                    dimension: lease.dimension,
+                    reason: "owner epoch advanced after the reservation was acquired",
+                });
+            }
+            if now_ms >= lease.binding.expires_at_ms {
+                return Err(PacketHeadroomJoinRefusal::NotLive {
+                    dimension: lease.dimension,
+                    reason: "owner reservation is no longer inside its expiry",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// **Release.** Hand every held slot back through the owner's own release
+    /// path and return the owner's own evidence for each one.
+    ///
+    /// The evidence is the owner's record of what it released, so this
+    /// composition never restates it and never decides whether a release closed
+    /// a permit. Dropping the join without calling this is not a leak: each
+    /// permit's own drop is the owner's backstop.
+    #[must_use]
+    pub fn release(self) -> Vec<ControlReleaseEvidence> {
+        self.leases
+            .into_iter()
+            .map(|lease| lease.permit.release())
+            .collect()
+    }
+
+    /// The held reservation for one dimension, if the join acquired one.
+    fn lease(&self, dimension: HeadroomDimension) -> Option<&PacketHeadroomLease> {
+        self.leases
+            .iter()
+            .find(|lease| lease.dimension == dimension)
+    }
+}
+
+/// Returns the runtime owner the frozen owner map names for one demanded
+/// dimension.
+///
+/// The map is read, never restated: a dimension whose bottleneck has no frozen
+/// row has no owner this join could reach, and is refused as such rather than
+/// resolved to a default owner.
+fn frozen_owner_for(dimension: HeadroomDimension) -> Option<&'static str> {
+    let bottleneck = dimension.owner_bottleneck()?;
+    frozen_bottleneck_owner_map()
+        .into_iter()
+        .find(|row| row.bottleneck == bottleneck)
+        .map(|row| row.owner)
 }
 
 /// Owner-supplied admission closure for one packet compilation.
@@ -1753,7 +2135,18 @@ impl KernelContextReadClient {
     /// validated evidence. Admission runs under that reservation, and the
     /// assembled output is rechecked against it before the packet is
     /// action-ready.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// #1869 resource-owner join: `headroom_join` is the live owner join
+    /// acquired by the caller through
+    /// [`PacketHeadroomJoin::acquire`], and it is taken **by value** so this
+    /// composition owns the held owner permits for the whole selection and
+    /// hands them back on every path. The owner-issued `headroom_result` is no
+    /// longer accepted as proof on its own: it is proved against the held
+    /// permits before the selection and the permits are revalidated against the
+    /// live owner across it. `headroom_recheck_now_ms` is a second clock reading
+    /// taken after the selection, so the revalidation is an observation rather
+    /// than a restatement of the pre-selection one.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
         request: &CandidateRequest,
@@ -1762,10 +2155,12 @@ impl KernelContextReadClient {
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
         floor: &SafetyFloorIdentity,
+        headroom_join: PacketHeadroomJoin<'_>,
         headroom_request: &DownstreamHeadroomRequest,
         headroom_result: &DownstreamHeadroomResult,
         headroom_ledger: &HeadroomAllocationLedger,
         observed_now_ms: u64,
+        headroom_recheck_now_ms: u64,
         admission_parts: impl FnOnce(
             &ContextCandidateSetResult,
         ) -> Result<PacketAdmissionParts, PacketCompositionError>,
@@ -1783,6 +2178,17 @@ impl KernelContextReadClient {
         // the caller, which submitted them through the Kernel resource/lease
         // owner. This composition performs no capacity IO and contacts no
         // owner; it only hands the validated evidence to the compiler below.
+        //
+        // #1869: the caller's answer is a record, not a reservation. Before any
+        // candidate is selected it is proved against the owner permits this
+        // compilation holds, so a shape-valid result that names no live owner
+        // reservation is refused here rather than admitted under.
+        headroom_join
+            .prove(headroom_request, headroom_result)
+            .map_err(|refusal| PacketCompositionError::HeadroomJoinRefused {
+                attempted_recipe_digest: recipe.recipe_sha256.clone(),
+                refusal: Box::new(refusal),
+            })?;
         let headroom = HeadroomContext {
             request: headroom_request,
             result: headroom_result,
@@ -1869,6 +2275,15 @@ impl KernelContextReadClient {
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         let (admitted, delivery) = admit_packet_candidates(&input, &headroom)?;
+        // The selection happened under the reservation. Re-read the live owner
+        // now, with the second clock reading, so a reservation the owner has
+        // since fenced or expired cannot carry the assembled packet.
+        headroom_join
+            .revalidate(headroom_recheck_now_ms)
+            .map_err(|refusal| PacketCompositionError::HeadroomJoinRefused {
+                attempted_recipe_digest: recipe.recipe_sha256.clone(),
+                refusal: Box::new(refusal),
+            })?;
         Self::require_campaign_view_for_assembly(
             &admitted,
             campaign_view,
@@ -1885,6 +2300,13 @@ impl KernelContextReadClient {
             .verify_boundaries()
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
         recheck_packet_headroom(&assembled, recipe, &headroom)?;
+        // Release through the owner's own port. The evidence is DISCARDED here
+        // for the same pre-existing reason the Context-side release
+        // instructions are: no production caller of this composition consumes a
+        // release record yet. Discarding the record does not discard the
+        // release — the owner's own release path has already returned every
+        // slot — and the capacity is returned through its issuer either way.
+        let _released_by_owner = headroom_join.release();
         Ok((assembled, delivery))
     }
 }
@@ -2064,6 +2486,14 @@ fn composition_failure(
 /// carrying the attempted recipe and binding, so no admitted set and no
 /// nominally complete view exist for a dependent operation to observe.
 ///
+/// #1869: the path this function takes is chosen from owner-derived evidence
+/// about which policies apply, never assumed. For input with no learning marks
+/// and no tickets the learning refusal is vacuous and the reservation-aware
+/// entry is the correct guarded path. For learning-marked or ticketed input it
+/// is not, and [`require_composed_learning_guard`] refuses before any selection
+/// runs instead of admitting under an entry that skips the live learning
+/// checks.
+///
 /// I12.26: the returned [`MaterialRankTraceDelivery`] is the delivery
 /// acceptance record for this packet. It carries one handle-bound
 /// [`eliot_context_admission::MaterialRankTrace`] per evaluated material with
@@ -2075,6 +2505,7 @@ fn admit_packet_candidates(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
 ) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
+    require_composed_learning_guard(input)?;
     let (result, traces) = match admit_context_traced_with_headroom(input, headroom)
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?
     {
@@ -2095,6 +2526,53 @@ fn admit_packet_candidates(
         }
     };
     Ok((admitted, delivery))
+}
+
+/// Refuses learning-marked or ticketed input before any selection runs.
+///
+/// #1869 (audit item 3): the caller must choose the admission entry that
+/// applies BOTH the governed learning checks and the headroom check before one
+/// selection. Two entries exist and neither does that:
+///
+/// - the reservation-aware traced entry applies `check_headroom` and then
+///   reaches the selector directly, so it applies none of
+///   `refuse_ungoverned_learning`, `check_governed_carriage` or
+///   `screen_admission_input_learning`;
+/// - the governed learning entry applies the carriage check and the per-mark
+///   screen and then reaches the selector with headroom `None`.
+///
+/// An [`AdmissionInput`] is ordinary data, not a proof that the live learning
+/// checks already ran, so for learning-marked or ticketed input neither entry
+/// preserves both guarantees. Calling the two selecting entries in sequence and
+/// comparing their outputs after admission is exactly what the audit forbids,
+/// and no entry is written here in their place, so this caller refuses. The
+/// selection below is reached only for input on which the learning policy does
+/// not apply, where the reservation-aware entry is the correct guarded path and
+/// the learning refusal is vacuous.
+///
+/// The evidence is owner-derived: the marks ride on the candidate atoms the
+/// candidate owner itself constructed, and the tickets ride on the admission
+/// input this composition built from that set. Nothing is read from a request
+/// envelope, and no mark or ticket is stripped, cleared or reclassified to make
+/// the ordinary path apply.
+///
+/// # Errors
+///
+/// Returns [`PacketCompositionError::ComposedAdmissionEntryMissing`] when the
+/// learning policy applies and no composed entry exists for it.
+fn require_composed_learning_guard(input: &AdmissionInput) -> Result<(), PacketCompositionError> {
+    let learning_applies = !input.learning_tickets.is_empty()
+        || input
+            .candidates
+            .candidates
+            .iter()
+            .any(|candidate| candidate.learning.is_some());
+    if learning_applies {
+        return Err(PacketCompositionError::ComposedAdmissionEntryMissing(
+            "learning-marked or ticketed input needs one entry that runs check_governed_carriage, screen_admission_input_learning and check_headroom before a single selection; neither existing entry preserves both guarantees",
+        ));
+    }
+    Ok(())
 }
 
 /// Binds one per-material rank-trace delivery record to the assembled packet.
