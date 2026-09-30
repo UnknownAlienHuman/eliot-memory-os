@@ -6469,18 +6469,41 @@ impl HostComposition {
             }
             // Named owner refusal, not a blanket error, and PRE-EFFECT: this
             // arm refuses before `prepare_backup_destination` is entered.
-            // Preparing needs an owner-issued isolated-restore staging parent,
-            // and retained Host state has none: every root `RuntimeStateRoots`
-            // derives (host/kernel/store/watchdog) lives under the installation
-            // root, which IS the preparation source, and
-            // `admit_staging_parent` refuses any staging parent nested under
-            // the source. The missing owner is the installation root contract,
-            // which must derive a destination parent outside the source
-            // installation root. No destination is created, so a refusal here
-            // still means no effect.
+            //
+            // It is no longer refused for want of a destination parent. The
+            // isolated-restore staging parent is now owner-issued:
+            // `RuntimeStateRoots::isolated_restore_root`
+            // (`crates/kernel/eliot-installation/src/runtime_root_contract.rs`)
+            // declares it one leaf below the profile root, as a SIBLING of
+            // `installations` and of the installer's package staging root, so it
+            // is outside the source installation and is not a second owner of
+            // `<profile_root>\packages`. The installer creates it as one admitted
+            // leaf of that same owner's root hierarchy, so it exists before any
+            // preparation may name it, and
+            // `backup_preparation::resolve_owner_staging_parent` reads it from
+            // the manifest-bound owner record while
+            // `DelegatedPreparation::prepare` refuses any presented parent that
+            // is not that exact root. `admit_staging_parent` keeps refusing a
+            // parent that is or is nested under the source, and still proves the
+            // admitted one through the protected-root owner.
+            //
+            // The remaining absent owner is the CALLER, not a path, and it is a
+            // different obligation from A2's destination allocation:
+            // `prepare_backup_destination` takes a `BackupCallerAuth` whose two
+            // digests are documented as owner-issued, and no owner reachable
+            // from this composition produces one — `BackupCallerAuth::authenticate`
+            // is the standing always-refuse stub and
+            // `authenticate_for_owner` grants nothing from those two values.
+            // The second question is a frozen `#954` interface decision, not a
+            // wiring gap: `BackupOwnerOutcome` says a produced destination
+            // "travels as a bounded immutable handle, never as a path, a URL, or
+            // an inline body", and the accepted owner-method table carries no
+            // path at all.
+            //
+            // No destination is created, so a refusal here still means no effect.
             BackupDispatchTarget::Prepare => Err(BackupDispatchRefusal::new(
                 operation,
-                "no owner-issued isolated-restore staging parent exists in retained Host state: every derived runtime root is the preparation source, and a staging parent nested under the source is refused",
+                "preparation is admitted up to its destination parent, which the installation root contract now declares outside the source; what is still absent is an owner-issued caller credential, and how a prepared destination may be named across this seam is a frozen #954 interface decision",
             )),
             // Named owner refusal, also PRE-EFFECT: it refuses before
             // `backup_dispatch_cutover` is entered. A cutover needs a separately
