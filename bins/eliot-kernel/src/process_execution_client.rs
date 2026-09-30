@@ -123,26 +123,6 @@ pub fn process_execution_client(
     session: &Session,
     session_binding: &ProcessSessionBinding,
 ) -> Result<KernelProcessExecutionClient, ProcessExecutionRejection> {
-    let (owner, gateway) = authenticated_process_route(kernel, session, session_binding)?;
-    let starter: Arc<dyn ProcessStarter> = Arc::new(GatewayProcessStarter {
-        kernel: Arc::clone(kernel),
-        gateway: Arc::clone(&gateway),
-        owner: owner.clone(),
-    });
-    let operations: Arc<dyn ProcessOperationPort> =
-        Arc::new(GatewayOperationPort { gateway, owner });
-    Ok(KernelProcessExecutionClient::new(starter, operations))
-}
-
-/// Resolves the original authenticated P-03 owner/gateway pair for one
-/// session-bound route. Identity-aware source adapters use this only for the
-/// same eager readiness checks; their requests still delegate through
-/// `KernelComposition::execute_current_source_process_request`.
-pub(crate) fn authenticated_process_route(
-    kernel: &Arc<KernelComposition>,
-    session: &Session,
-    session_binding: &ProcessSessionBinding,
-) -> Result<(ProcessOwnerBinding, Arc<ProcessExecutionGateway>), ProcessExecutionRejection> {
     let Ok((owner, expected_session_binding)) = caller_binding(session) else {
         return Err(ProcessExecutionRejection {
             code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
@@ -161,7 +141,15 @@ pub(crate) fn authenticated_process_route(
             detail: "external process authority key, snapshot, replay, and evidence bindings are required".to_owned(),
         });
     };
-    Ok((owner, Arc::clone(gateway)))
+    let gateway = Arc::clone(gateway);
+    let starter: Arc<dyn ProcessStarter> = Arc::new(GatewayProcessStarter {
+        kernel: Arc::clone(kernel),
+        gateway: Arc::clone(&gateway),
+        owner: owner.clone(),
+    });
+    let operations: Arc<dyn ProcessOperationPort> =
+        Arc::new(GatewayOperationPort { gateway, owner });
+    Ok(KernelProcessExecutionClient::new(starter, operations))
 }
 
 /// Starts one already-built admission bound to an admitted native-worker claim.
