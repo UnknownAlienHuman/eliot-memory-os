@@ -643,7 +643,8 @@ fn check_attention_command(
         }
         Some(_) => {
             return Err(owner_refused(
-                "attention evaluation invalidation reason requires the invalidate action".to_owned(),
+                "attention evaluation invalidation reason requires the invalidate action"
+                    .to_owned(),
             ));
         }
         None if is_invalidate => {
@@ -772,7 +773,9 @@ fn check_attention_record_binding(
         ));
     }
     let record_bytes = canonical_json_bytes(record).map_err(|error| {
-        owner_refused(format!("cannot canonicalize attention evaluation record: {error}"))
+        owner_refused(format!(
+            "cannot canonicalize attention evaluation record: {error}"
+        ))
     })?;
     if sha256_hex(&record_bytes) != params.record_digest {
         return Err(owner_refused(
