@@ -35,11 +35,9 @@ eliot-artifact.workspace = true
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
-eliot-git-bridge.workspace = true
 eliot-installation.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
-eliot-lsp-bridge = { path = "../../crates/bridges/eliot-lsp-bridge", version = "0.1.0" }
 eliot-ipc.workspace = true
 # Path edge (issue #1842, I16.3/I16.9): eliot-observability is a workspace
 # member but has no [workspace.dependencies] entry, so a path+version edge

@@ -3,13 +3,11 @@
 use crate::{
     AsyncProcessRunner, BridgeError, GitProcessProfile, ProcessOutcome, ProcessRunner, RepoRoot,
 };
+use eliot_platform_windows::OwnedDirectoryPublication;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static INDEX_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Typed failures while capturing or revalidating an immutable source tree.
 #[derive(Debug)]
@@ -265,7 +263,7 @@ fn prepare_snapshot_capture(
     let index = OwnedGitIndex::create()?;
     let profile = GitProcessProfile::isolated_index(index.index_path()).map_err(|detail| {
         GitSnapshotError::IndexDirectory {
-            path: index.directory.clone(),
+            path: index.owner.temporary_path().to_path_buf(),
             detail,
         }
     })?;
@@ -288,19 +286,7 @@ fn capture_once(
         &["rev-parse", "--show-toplevel"],
         &[],
     )?;
-    let git_root = parse_line(&resolved.stdout, "workspace root")?;
-    let git_root = fs::canonicalize(PathBuf::from(git_root)).map_err(|error| {
-        GitSnapshotError::InvalidGitOutput {
-            operation: "workspace root",
-            detail: format!("Git root could not be resolved: {error}"),
-        }
-    })?;
-    if git_root != workspace_root {
-        return Err(GitSnapshotError::WorkspaceRootMismatch {
-            selected: workspace_root,
-            resolved: git_root,
-        });
-    }
+    validate_resolved_workspace(&resolved, &workspace_root)?;
 
     run_git(
         runner,
@@ -400,19 +386,7 @@ async fn capture_once_async(
         &[],
     )
     .await?;
-    let git_root = parse_line(&resolved.stdout, "workspace root")?;
-    let git_root = fs::canonicalize(PathBuf::from(git_root)).map_err(|error| {
-        GitSnapshotError::InvalidGitOutput {
-            operation: "workspace root",
-            detail: format!("Git root could not be resolved: {error}"),
-        }
-    })?;
-    if git_root != workspace_root {
-        return Err(GitSnapshotError::WorkspaceRootMismatch {
-            selected: workspace_root,
-            resolved: git_root,
-        });
-    }
+    validate_resolved_workspace(&resolved, &workspace_root)?;
 
     run_git_async(
         runner,
@@ -502,47 +476,44 @@ async fn capture_once_async(
 }
 
 struct OwnedGitIndex {
-    directory: PathBuf,
+    owner: OwnedDirectoryPublication,
 }
 
 impl OwnedGitIndex {
     fn create() -> Result<Self, GitSnapshotError> {
-        let temp_root = std::env::temp_dir();
-        for _ in 0..64 {
-            let sequence = INDEX_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let directory =
-                temp_root.join(format!("eliot-git-index-{}-{sequence}", std::process::id()));
-            match fs::create_dir(&directory) {
-                Ok(()) => return Ok(Self { directory }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(GitSnapshotError::IndexDirectory {
-                        path: directory,
-                        detail: error.to_string(),
-                    });
-                }
+        let destination = std::env::temp_dir().join("eliot-git-index");
+        let owner = OwnedDirectoryPublication::create(&destination).map_err(|error| {
+            GitSnapshotError::IndexDirectory {
+                path: destination,
+                detail: error.to_string(),
             }
-        }
-        Err(GitSnapshotError::IndexDirectory {
-            path: temp_root,
-            detail: "no unique operation-owned index directory was available".to_owned(),
-        })
+        })?;
+        Ok(Self { owner })
     }
 
     fn index_path(&self) -> PathBuf {
-        self.directory.join("index")
+        self.owner.temporary_path().join("index")
     }
 }
 
-impl Drop for OwnedGitIndex {
-    fn drop(&mut self) {
-        let Ok(metadata) = fs::symlink_metadata(&self.directory) else {
-            return;
-        };
-        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            let _ = fs::remove_dir_all(&self.directory);
+fn validate_resolved_workspace(
+    resolved: &ProcessOutcome,
+    workspace_root: &Path,
+) -> Result<(), GitSnapshotError> {
+    let git_root = parse_line(&resolved.stdout, "workspace root")?;
+    let git_root = fs::canonicalize(PathBuf::from(git_root)).map_err(|error| {
+        GitSnapshotError::InvalidGitOutput {
+            operation: "workspace root",
+            detail: format!("Git root could not be resolved: {error}"),
         }
+    })?;
+    if git_root != workspace_root {
+        return Err(GitSnapshotError::WorkspaceRootMismatch {
+            selected: workspace_root.to_path_buf(),
+            resolved: git_root,
+        });
     }
+    Ok(())
 }
 
 struct SourceBlob {
