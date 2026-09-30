@@ -3200,9 +3200,9 @@ impl AgentFabric {
         attempt_id: &AttemptId,
         receipt: &ToolResultReceipt,
     ) -> Result<(), FabricError> {
-        receipt.check_complete_evidence().map_err(|error| {
-            FabricError::Contract(format!("tool-result receipt: {error}"))
-        })?;
+        receipt
+            .check_complete_evidence()
+            .map_err(|error| FabricError::Contract(format!("tool-result receipt: {error}")))?;
         validate_text(receipt.result_digest(), "result_digest")?;
         let key = attempt_id.as_str().to_owned();
         if let Some(stored) = self.tool_result_receipts.get(&key) {
