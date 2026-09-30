@@ -390,25 +390,25 @@ fn check_revision_linkage(
             }
             Ok(())
         }
-        (AttentionEvaluationOperation::Create, Some(_)) => {
-            Err(AttentionEvaluationCommitError::Revision(
-                "creation takes no prior revision".to_owned(),
-            ))
-        }
-        (AttentionEvaluationOperation::Correct, Some(prior))
-        | (AttentionEvaluationOperation::Invalidate, Some(prior)) => {
+        (AttentionEvaluationOperation::Create, Some(_)) => Err(
+            AttentionEvaluationCommitError::Revision("creation takes no prior revision".to_owned()),
+        ),
+        (
+            AttentionEvaluationOperation::Correct | AttentionEvaluationOperation::Invalidate,
+            Some(prior),
+        ) => {
             check_linked_successor(record, prior)?;
             if operation == AttentionEvaluationOperation::Invalidate {
                 check_invalidation_preserves_history(record, prior)?;
             }
             Ok(())
         }
-        (AttentionEvaluationOperation::Correct, None)
-        | (AttentionEvaluationOperation::Invalidate, None) => {
-            Err(AttentionEvaluationCommitError::Revision(
-                "correction and invalidation require the presented prior revision".to_owned(),
-            ))
-        }
+        (
+            AttentionEvaluationOperation::Correct | AttentionEvaluationOperation::Invalidate,
+            None,
+        ) => Err(AttentionEvaluationCommitError::Revision(
+            "correction and invalidation require the presented prior revision".to_owned(),
+        )),
     }
 }
 
@@ -460,13 +460,15 @@ fn check_invalidation_preserves_history(
     }
     let mut expected = prior.clone();
     expected.revision = record.revision;
-    expected.predecessor = record.predecessor.clone();
+    expected.predecessor.clone_from(&record.predecessor);
     expected
         .evaluator_scope_uncertainty_and_invalidation
-        .invalidation = record
-        .evaluator_scope_uncertainty_and_invalidation
         .invalidation
-        .clone();
+        .clone_from(
+            &record
+                .evaluator_scope_uncertainty_and_invalidation
+                .invalidation,
+        );
     if expected != *record {
         return Err(AttentionEvaluationCommitError::Revision(
             "invalidation must preserve the invalidated revision bytes apart from the statement"
@@ -584,8 +586,7 @@ pub fn attention_evaluation_validity(
             affected_scope_refs: invalidation.affected_scope_refs.clone(),
         };
     }
-    if let (Some(expires_ms), Some(now_ms)) =
-        (record.expires_at.known_time_ms, observed_now_ms)
+    if let (Some(expires_ms), Some(now_ms)) = (record.expires_at.known_time_ms, observed_now_ms)
         && now_ms >= expires_ms
     {
         return AttentionEvaluationValidity::Expired;
@@ -603,9 +604,8 @@ pub fn verify_attention_evaluation_readback(
     record_json: &str,
     expected_digest: &str,
 ) -> Result<HumanAttentionEvaluation, AttentionEvaluationCommitError> {
-    let record: HumanAttentionEvaluation = serde_json::from_str(record_json).map_err(|error| {
-        AttentionEvaluationCommitError::Serialization(error.to_string())
-    })?;
+    let record: HumanAttentionEvaluation = serde_json::from_str(record_json)
+        .map_err(|error| AttentionEvaluationCommitError::Serialization(error.to_string()))?;
     record
         .validate()
         .map_err(|error| AttentionEvaluationCommitError::Record(error.to_string()))?;
@@ -725,8 +725,6 @@ pub fn check_attention_commit_receipt(
 /// Only references listed in the record's own evidence manifest are servable;
 /// anything else is a foreign expansion and fails. The check is re-evaluated
 /// per call against the presented record, never cached into a wider grant.
-pub fn collect_attention_evidence_refs(
-    record: &HumanAttentionEvaluation,
-) -> Vec<ArtifactId> {
+pub fn collect_attention_evidence_refs(record: &HumanAttentionEvaluation) -> Vec<ArtifactId> {
     record.evidence_manifest.evidence_refs.clone()
 }

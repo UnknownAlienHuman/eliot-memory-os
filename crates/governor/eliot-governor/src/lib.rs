@@ -51,10 +51,11 @@ pub use attention_evaluation_commit::{
     AttentionEvaluationCommitIdentity, AttentionEvaluationOperation,
     AttentionEvaluationOperatorRequest, AttentionEvaluationValidity, AttentionMetricGroupStatus,
     AttentionUnknownSummary, attention_evaluation_idempotency_key,
-    attention_evaluation_operation_id, attention_evaluation_validity, attention_evidence_commitment,
-    attention_record_digest, attention_unknown_summary, check_attention_commit_receipt,
-    collect_attention_evidence_refs, resolve_attention_lost_acknowledgement,
-    validate_attention_evaluation_request, verify_attention_evaluation_readback,
+    attention_evaluation_operation_id, attention_evaluation_validity,
+    attention_evidence_commitment, attention_record_digest, attention_unknown_summary,
+    check_attention_commit_receipt, collect_attention_evidence_refs,
+    resolve_attention_lost_acknowledgement, validate_attention_evaluation_request,
+    verify_attention_evaluation_readback,
 };
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
