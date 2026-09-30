@@ -4,10 +4,14 @@
 //! owner references; this module does not interpret policy or issue canonical
 //! work-admission authority.
 //!
-//! The read-only launch prerequisite at the end of this module is the one
-//! narrow verification surface over that state. It grants nothing itself: it
-//! re-derives the current disposition and issues a sealed active typestate that
-//! only this module can construct.
+//! The read-only launch prerequisite at the end of this module is the narrow
+//! verification surface over that state. It has two owner read paths and one
+//! sealed result: the launch-prerequisite verifier, which re-derives the
+//! current disposition for a launch decision, and the stable-identity active
+//! read, which binds an already-loaded snapshot to its reservation identity
+//! and returns the same sealed active typestate. Both grant nothing
+//! themselves: they re-derive the current disposition and issue a sealed
+//! active typestate that only this module can construct.
 
 use serde::{Deserialize, Serialize};
 
@@ -783,18 +787,24 @@ pub enum AdmissionReservationLaunchPrerequisite {
 /// Sealed active launch prerequisite.
 ///
 /// This is the only value a launch consumer may treat as active reservation
-/// authority. It is produced exclusively by
-/// [`verify_admission_reservation_launch_prerequisite`]: its authorising fields
-/// are private, it has no public constructor, and it deliberately has no
-/// `Deserialize` implementation, so an ordinary caller can neither assemble an
-/// accepted "active" typestate from public fields nor recover one from
-/// serialized bytes. The verifier is the single issuance point, and it issues
-/// only after the durable record, the epoch, the State Fence and the work and
-/// attempt identities have all been checked.
+/// authority. It is produced exclusively by the two owner read paths in this
+/// module — [`verify_admission_reservation_launch_prerequisite`], which
+/// re-derives the launch disposition, and [`ActiveAdmissionReservation::read_active`],
+/// which binds an already-loaded snapshot to its stable reservation identity:
+/// its authorising fields are private, it has no public constructor, and it
+/// deliberately has no `Deserialize` implementation, so an ordinary caller can
+/// neither assemble an accepted "active" typestate from public fields nor
+/// recover one from serialized bytes. Both issuance paths live in this owner
+/// module and both issue only after the durable record, its lifecycle state,
+/// its stable identity and both owner receipt references have been checked.
 ///
-/// #1701 obtains one by calling the verifier with the reservation snapshot it
-/// read back from ORS, plus its own current Authority Epoch lineage, State
-/// Fence, work-item and proposed-attempt identities, and current time.
+/// #1701 obtains one either by calling the verifier with the reservation
+/// snapshot it read back from ORS, plus its own current Authority Epoch
+/// lineage, State Fence, work-item and proposed-attempt identities, and
+/// current time — or, when it already holds the snapshot loaded by stable
+/// identity through the store owner's `load_kernel_admission_reservation`,
+/// by calling [`ActiveAdmissionReservation::read_active`] with that snapshot
+/// and the expected reservation identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActiveAdmissionReservation {
     reservation: AdmissionReservationRecord,
@@ -802,7 +812,8 @@ pub struct ActiveAdmissionReservation {
 }
 
 impl ActiveAdmissionReservation {
-    /// Issues the sealed prerequisite. Only this module's verifier may call it.
+    /// Issues the sealed prerequisite. Only this module's two owner read paths
+    /// may call it.
     const fn verified(
         reservation: AdmissionReservationRecord,
         receipt: OperationalMutationReceipt,
@@ -811,6 +822,64 @@ impl ActiveAdmissionReservation {
             reservation,
             receipt,
         }
+    }
+
+    /// Reads back owner-verifiable active evidence for one stable reservation
+    /// identity (#1678 REQ7: one owner-verifiable launch prerequisite).
+    ///
+    /// The caller first loads the reservation through the store owner's
+    /// `load_kernel_admission_reservation` under the stable identity it wants
+    /// evidence for, then binds that loaded snapshot here. The bind is by
+    /// value against the row's own `reservation_id`, so a snapshot loaded
+    /// under a different identity can never be served as this reservation's
+    /// active authority — I14.21 recovery resumes the same identity and never
+    /// creates a second reservation, and this read refuses to cross one.
+    ///
+    /// The check is a pure read. It provisions nothing, launches nothing,
+    /// mutates no durable state, and changes no lifecycle position: it
+    /// re-validates the durable row, binds it to the expected stable
+    /// identity, and requires the `Active` lifecycle position with both owner
+    /// receipt references present. An `Active` row missing either the
+    /// canonical-admission receipt or the ORS-activation receipt fails typed,
+    /// as does any staged, released, expired or reconciling row supplied as
+    /// active authority (I14.20: `ACTIVE` requires the exact canonical
+    /// admission receipt). The returned value carries the reservation/attempt
+    /// identities, the retained canonical operation/idempotency identities,
+    /// the epoch/fence lineage and both receipt references for
+    /// launch/admission consumers (#1701); wiring it into launch itself is
+    /// outside this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::ReservationNotFound`] when the loaded row names a
+    /// different stable reservation identity than the caller asked for;
+    /// [`OrsError::InvalidTransition`] when the row is not `Active` or an
+    /// `Active` row carries no canonical-admission or activation receipt; and
+    /// whatever [`AdmissionReservationRecord::validate`] reports —
+    /// [`OrsError::ReconciliationMismatch`] when the retained canonical
+    /// commit names a different receipt than the slot the activation gate
+    /// reads — when the durable row itself is malformed.
+    pub fn read_active(
+        snapshot: &AdmissionReservationSnapshot,
+        expected_reservation_id: &OperationIdentity,
+    ) -> Result<Self, OrsError> {
+        let record = snapshot.record();
+        record.validate()?;
+        if &record.reservation_id != expected_reservation_id {
+            return Err(OrsError::ReservationNotFound);
+        }
+        if record.state != AdmissionReservationState::Active {
+            return Err(OrsError::InvalidTransition);
+        }
+        if record.canonical_admission_receipt.is_none()
+            || record.activation_receipt.is_none()
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        Ok(Self::verified(
+            record.clone(),
+            snapshot.receipt().clone(),
+        ))
     }
 
     /// Exact active reservation record the verifier accepted.
@@ -829,8 +898,8 @@ impl ActiveAdmissionReservation {
     ///
     /// Returns [`OrsError::InvalidTransition`] when the sealed value does not
     /// carry an activation receipt. That cannot happen for a value issued by
-    /// the verifier; the check stays a typed refusal so no consumer can read the
-    /// absence as a panic it is entitled to trust.
+    /// either owner read path; the check stays a typed refusal so no consumer
+    /// can read the absence as a panic it is entitled to trust.
     pub fn activation_receipt(&self) -> Result<&ReceiptIdentity, OrsError> {
         self.reservation
             .activation_receipt
@@ -848,6 +917,26 @@ impl ActiveAdmissionReservation {
     pub fn canonical_admission_receipt(&self) -> Result<&ReceiptIdentity, OrsError> {
         self.reservation
             .canonical_admission_receipt
+            .as_ref()
+            .ok_or(OrsError::InvalidTransition)
+    }
+
+    /// Retained canonical `ADMITTED` commit and launch-outbox intent bound by
+    /// the sealed record: the canonical operation/idempotency identities, the
+    /// admission and mutation-plan digests, the owner commit marker and the
+    /// launch-outbox operation/item identities the activation was admitted
+    /// against (I14.6: the canonical half of the `AdmissionReservation` saga).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::InvalidTransition`] when the sealed value does not
+    /// carry the retained commit, for the same reason as
+    /// [`Self::activation_receipt`].
+    pub fn canonical_admission(
+        &self,
+    ) -> Result<&AdmissionReservationCanonicalAdmission, OrsError> {
+        self.reservation
+            .canonical_admission
             .as_ref()
             .ok_or(OrsError::InvalidTransition)
     }
