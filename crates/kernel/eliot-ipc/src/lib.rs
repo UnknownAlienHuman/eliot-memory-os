@@ -17,11 +17,15 @@ use eliot_protocol::{
 use eliot_runtime_contracts::{HealthDimension, ModuleGeneration, ModuleGenerationState};
 use thiserror::Error;
 
+mod control_reserve;
 mod frame_codec;
 mod host_conformance;
 mod role_lease;
 mod session_lifecycle;
 
+pub use control_reserve::{
+    IPC_PIPE_BYTES_BOTTLENECK, IpcPermit, IpcPermitOperation, IpcReserve, IpcReserveError,
+};
 pub use frame_codec::{FrameDecoder, decode_frame, encode_frame};
 pub use host_conformance::{
     AdmissionCoverage, AttemptGate, AttemptPhase, AttemptRouteOutcome, CapabilityEvidence,
