@@ -2182,15 +2182,16 @@ impl BridgeEventCompactedRange {
             }
         } else {
             crate::model::validate_digest(&self.predecessor_commitment, "predecessor_commitment")?;
-            let next = self.predecessor_end_sequence.checked_add(1).ok_or(
-                OrsError::IntegrityProblem {
-                    record_type: "bridge_event_compacted_range",
-                    reason: "a compacted range predecessor must leave room for its extension"
-                        .to_owned(),
-                },
-            )?;
-            let chained = next == self.start_sequence
-                && self.predecessor_end_sequence < self.end_sequence;
+            let next =
+                self.predecessor_end_sequence
+                    .checked_add(1)
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_compacted_range",
+                        reason: "a compacted range predecessor must leave room for its extension"
+                            .to_owned(),
+                    })?;
+            let chained =
+                next == self.start_sequence && self.predecessor_end_sequence < self.end_sequence;
             if !chained {
                 return Err(OrsError::InvalidField {
                     field: "predecessor_end_sequence",
@@ -19866,14 +19867,18 @@ impl RedbRecoveryStore {
         if start_sequence <= stored.end_sequence {
             return Err(OrsError::DuplicateConflict);
         }
-        let next = stored.end_sequence.checked_add(1).ok_or(OrsError::IntegrityProblem {
-            record_type: "bridge_event_compacted_range",
-            reason: "certified compacted frontier leaves no room for an extension".to_owned(),
-        })?;
+        let next = stored
+            .end_sequence
+            .checked_add(1)
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "bridge_event_compacted_range",
+                reason: "certified compacted frontier leaves no room for an extension".to_owned(),
+            })?;
         if start_sequence != next {
             return Err(OrsError::IntegrityProblem {
                 record_type: "bridge_event_compacted_range",
-                reason: "compacted range extension must continue its certified predecessor".to_owned(),
+                reason: "compacted range extension must continue its certified predecessor"
+                    .to_owned(),
             });
         }
         let range = BridgeEventCompactedRange {
