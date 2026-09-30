@@ -381,6 +381,10 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
             JobOperation::Submit { submission } => Some(submission.semantic_input.clone()),
             _ => None,
         },
+        semantic_input_bytes: match &request.operation {
+            JobOperation::Submit { submission } => submission.semantic_input_bytes.clone(),
+            _ => None,
+        },
         revision: 1,
         state: JobState::Queued,
         disposition: None,
@@ -409,6 +413,7 @@ fn submission() -> eliot_protocol::JobSubmission {
         attempt_id: ArtifactId::new("attempt").expect("attempt"),
         work_scope: scope.clone(),
         semantic_input: content_ref("input"),
+        semantic_input_bytes: None,
         output_contract: content_ref("output"),
         admission: AdmissionRef {
             authority: AuthorityBinding {
@@ -2770,7 +2775,7 @@ fn contract_has_no_smart_provider_store_or_finish_implementation() {
     );
     assert_eq!(
         eliot_protocol::DURABLE_JOB_CONTRACT_VERSION,
-        ContractVersion::new(1, 0, 0)
+        ContractVersion::new(1, 2, 0)
     );
     assert_eq!(
         eliot_protocol::DURABLE_JOB_CANONICAL_ENCODING,

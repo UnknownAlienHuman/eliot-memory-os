@@ -150,7 +150,7 @@ impl std::fmt::Display for DreamerMaterialError {
                 f.write_str("the durable Dreamer owner has no retained semantic input reference")
             }
             Self::SemanticInputStale => {
-                f.write_str("the durable Dreamer semantic input reference is stale or malformed")
+                f.write_str("the durable Dreamer semantic input reference or bytes are stale")
             }
             Self::Gate(detail) => write!(f, "dreamer launch gate failed: {detail}"),
             Self::Io(detail) => write!(f, "dreamer material file failed: {detail}"),
@@ -186,6 +186,10 @@ pub struct DreamerDispatchedEnvelope {
     /// semantic claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_input: Option<OpaqueContentRef>,
+    /// Original inline bytes supplied with the opaque reference, when present.
+    /// Kernel carries these bytes without interpreting their meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -223,6 +227,9 @@ pub struct ValidatedDreamerMaterial {
     /// Absence is explicit for legacy material; the child must not synthesize
     /// a ready input from it.
     pub semantic_input: Option<OpaqueContentRef>,
+    /// Original inline bytes mechanically bound to `semantic_input`, when
+    /// supplied by the durable owner.
+    pub semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job.
     pub scope_id: String,
     /// Fence the ledger bound to this job.
@@ -303,6 +310,10 @@ pub struct DreamerLaunchRecord {
     /// It participates in single-flight equality so a retry cannot replace
     /// the source under the same job/attempt/fence lineage.
     pub semantic_input: OpaqueContentRef,
+    /// Original inline bytes retained by the Store owner, when available.
+    /// They participate in single-flight equality and are never interpreted
+    /// by Kernel.
+    pub semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job.
     pub scope_id: String,
     /// Fence the ledger bound to this job.
@@ -664,6 +675,15 @@ pub(crate) fn validate_dreamer_material(
             .validate("semantic_input.sha256")
             .map_err(|_| DreamerMaterialError::SemanticInputStale)?;
     }
+    if let Some(bytes) = &envelope.semantic_input_bytes {
+        let semantic_input = envelope
+            .semantic_input
+            .as_ref()
+            .ok_or(DreamerMaterialError::SemanticInputUnavailable)?;
+        semantic_input
+            .validate_semantic_input_bytes(bytes)
+            .map_err(|_| DreamerMaterialError::SemanticInputStale)?;
+    }
     envelope
         .fence
         .validate()
@@ -706,6 +726,7 @@ pub(crate) fn validate_dreamer_material(
         attempt_id: envelope.attempt_id.clone(),
         revision: envelope.revision,
         semantic_input: envelope.semantic_input.clone(),
+        semantic_input_bytes: envelope.semantic_input_bytes.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -737,6 +758,7 @@ pub(crate) fn reserve_dreamer_launch(
         if existing.attempt_id == record.attempt_id
             && existing.revision == record.revision
             && existing.semantic_input == record.semantic_input
+            && existing.semantic_input_bytes == record.semantic_input_bytes
             && existing.scope_id == record.scope_id
             && existing.fence == record.fence
             && existing.executable_sha256 == record.executable_sha256
@@ -1027,6 +1049,7 @@ mod dreamer_dispatch_launch_tests {
             attempt_id: "attempt-t12-09-01".to_owned(),
             revision: 1,
             semantic_input: None,
+            semantic_input_bytes: None,
             scope_id: "scope-t12-09".to_owned(),
             fence: test_fence(),
             epoch: epoch.clone(),
@@ -1122,6 +1145,7 @@ mod dreamer_dispatch_launch_tests {
             attempt_id: "attempt-lineage-01".to_owned(),
             revision: 1,
             semantic_input: test_semantic_input(),
+            semantic_input_bytes: None,
             scope_id: "scope-lineage".to_owned(),
             fence: fence.clone(),
             executable_sha256: "ef".repeat(32),

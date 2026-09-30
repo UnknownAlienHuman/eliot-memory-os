@@ -1422,6 +1422,8 @@ mod gateway_cases {
             "attempt_id": submission.attempt_id,
             "scope": serde_json::to_value(&submission.work_scope).expect("scope"),
             "semantic_input": serde_json::to_value(&submission.semantic_input).expect("semantic input"),
+            "semantic_input_bytes": serde_json::to_value(&submission.semantic_input_bytes)
+                .expect("semantic input bytes"),
             "revision": 1u64,
             "state": "QUEUED",
             "disposition": "COMMITTED",
