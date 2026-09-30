@@ -434,6 +434,15 @@ impl WatchdogComposition {
         let task_kernel = Arc::clone(&kernel);
         // Reconciliation is a separate bounded side task: authenticated IPC
         // waits and durable receipt writes cannot lengthen a heartbeat tick.
+        //
+        // One permit bounds *both* intent classes. The escalation intents and the
+        // Signal-linked publication intents travel the same admitted route over
+        // the same durable submit-once ledger, so letting a pass of one run
+        // concurrently with a pass of the other would mean two owners mutating
+        // that one ledger from two in-flight transports. A single in-flight
+        // reconciliation keeps the background work bounded and the ledger
+        // single-writer; the next live tick retries whatever either class left
+        // pending.
         let intent_reconciliation_slot = Arc::new(tokio::sync::Semaphore::new(1));
         let task_intent_reconciliation_slot = Arc::clone(&intent_reconciliation_slot);
         // I8.2 (#1755 W1/W5): one coverage cell per composition, shared with
@@ -705,6 +714,60 @@ impl WatchdogComposition {
                                                 event = "watchdog.intent_reconciliation_skipped",
                                                 error = %error,
                                                 "Watchdog intent reconciliation did not receive a verified Kernel acknowledgement"
+                                            ),
+                                        }
+                                        drop(permit);
+                                    });
+                                }
+                                // The retained Signal-linked publication intents
+                                // are presented on the same admitted lease and
+                                // through the same admitted route, in the same
+                                // bounded background slot. Sharing the slot is
+                                // what keeps background work bounded: one
+                                // in-flight pass at a time, and the next live
+                                // tick retries whatever a failed or unknown
+                                // transport outcome left pending. A publication
+                                // intent authorizes nothing here — the route
+                                // records a bounded pending projection and the
+                                // canonical Problem/attention/Incident decision
+                                // stays with the owner that already owns it.
+                                if let Ok(permit) = Arc::clone(&intent_reconciliation_slot)
+                                    .try_acquire_owned()
+                                {
+                                    let reconcile_kernel = Arc::clone(&kernel);
+                                    let verified_lease = admission.lease().clone();
+                                    tokio::spawn(async move {
+                                        match reconcile_kernel
+                                            .reconcile_publications(verified_lease)
+                                            .await
+                                        {
+                                            Ok(crate::WatchdogPublicationReconciliation::NothingPending) => {}
+                                            Ok(crate::WatchdogPublicationReconciliation::Reconciled {
+                                                first_sequence,
+                                                recorded,
+                                                already_acknowledged,
+                                            }) => tracing::info!(
+                                                event = "watchdog.publication_reconciliation_recorded",
+                                                first_sequence,
+                                                recorded,
+                                                already_acknowledged,
+                                                canonical_decision = "pending_governor_decision",
+                                                "the admitted owner recorded Watchdog publication intents; no canonical Problem or Incident was decided"
+                                            ),
+                                            Ok(crate::WatchdogPublicationReconciliation::Blocked {
+                                                pending_sequence,
+                                                reason,
+                                                ..
+                                            }) => tracing::warn!(
+                                                event = "watchdog.publication_reconciliation_blocked",
+                                                pending_sequence,
+                                                reason = ?reason,
+                                                "a retained Watchdog publication intent is outside the current bounded export window and stays pending"
+                                            ),
+                                            Err(error) => tracing::debug!(
+                                                event = "watchdog.publication_reconciliation_skipped",
+                                                error = %error,
+                                                "Watchdog publication reconciliation did not receive an acknowledged outcome; the retained intents stay pending"
                                             ),
                                         }
                                         drop(permit);

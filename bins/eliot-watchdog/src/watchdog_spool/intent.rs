@@ -665,6 +665,14 @@ impl WatchdogIntentClass {
             | WatchdogSpoolPayload::Recovery { .. } => Err(SpoolError::Corrupt(
                 "watchdog spool record is not an intent payload".to_owned(),
             )),
+            // A publication intent is a distinct spool-local class with its own
+            // record shape and its own durable threshold state, and it is not an
+            // escalation intent. It is named here rather than folded into a
+            // wildcard so the two can never be presented under one another's
+            // label, and the publication owner keeps its own predicate.
+            WatchdogSpoolPayload::PublicationIntent { .. } => Err(SpoolError::Corrupt(
+                "a publication intent is not an escalation intent".to_owned(),
+            )),
         }
     }
 }
@@ -1860,9 +1868,15 @@ pub(crate) fn check_stored_intent_payload(
     payload: &WatchdogSpoolPayload,
 ) -> Result<(), SpoolError> {
     match payload {
+        // Heartbeat, gap and recovery payloads are not intents at all. A
+        // publication record is not an escalation intent either and is
+        // revalidated by its own owner, so it passes through this check untouched
+        // rather than being re-derived here: two owners re-deriving one record's
+        // canonical form is how the two could come to disagree about it.
         WatchdogSpoolPayload::Heartbeat { .. }
         | WatchdogSpoolPayload::Gap { .. }
-        | WatchdogSpoolPayload::Recovery { .. } => Ok(()),
+        | WatchdogSpoolPayload::Recovery { .. }
+        | WatchdogSpoolPayload::PublicationIntent { .. } => Ok(()),
         WatchdogSpoolPayload::ProblemIntent {
             service,
             evidence_refs,

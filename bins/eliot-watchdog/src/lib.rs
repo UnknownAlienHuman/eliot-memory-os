@@ -105,8 +105,10 @@ pub(crate) use watchdog_spool::episode;
 pub use watchdog_spool::export_driver::{
     KernelFrontDoorWatchdogIntentSink, WatchdogEntryView, WatchdogExportSink,
     WatchdogIntentAcknowledgement, WatchdogIntentExportBatch, WatchdogIntentReconciliation,
-    WatchdogIntentSink, WatchdogIntentWindowBlock, export_once, reconcile_watchdog_intents,
-    watchdog_entry_views, watchog_entry_views,
+    WatchdogIntentSink, WatchdogIntentWindowBlock, WatchdogPublicationExportBatch,
+    WatchdogPublicationReconciliation, export_once, publication_submission,
+    reconcile_watchdog_intents, reconcile_watchdog_publications, watchdog_entry_views,
+    watchog_entry_views,
 };
 pub(crate) use watchdog_spool::intent::{
     GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
@@ -115,6 +117,7 @@ pub(crate) use watchdog_spool::intent::{
 pub use watchdog_spool::intent::{
     IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentClass,
 };
+pub(crate) use watchdog_spool::publication;
 pub use watchdog_spool::{
     CaptureFenceParams, SpoolAppendOutcome, SpoolCoverageDenominator, SpoolFenceEntryKind,
     SpoolImportReplayDisposition, SpoolImportReplayLedger, SpoolMarkerDetail, SpoolObservedDigest,
@@ -918,6 +921,28 @@ impl IndependentKernelSensor {
         )
     }
 
+    /// Returns the bounded oldest window of retained Signal-linked publication
+    /// intents the admitted owner has not yet acknowledged, with each exact
+    /// original record and the digests the export batch binds.
+    ///
+    /// Read-only, and deliberately parallel to
+    /// [`Self::pending_watchdog_intents`]: both read the same retained spool and
+    /// the same submit-once ledger, and both treat an empty window as "nothing is
+    /// outstanding" rather than as "something was decided". Neither window is
+    /// evidence that the admitted owner acted on anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained spool or its receipt ledger fails
+    /// validation, or a stored publication record is not canonical.
+    pub(crate) fn pending_watchdog_publications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<publication::PendingPublication>, SpoolError> {
+        self.spool
+            .pending_watchdog_publications(limit, &self.epoch_lineage)
+    }
+
     /// Persists the durable submit-once receipt for one reconciled intent.
     ///
     /// This is the exactly-once boundary of fenced-Kernel reconciliation: the
@@ -925,8 +950,11 @@ impl IndependentKernelSensor {
     /// the same retained sequence observes the existing receipt instead of
     /// submitting again. The receipt is Watchdog-owned durable state, so the
     /// entry stays inside this crate: only
-    /// [`reconcile_watchdog_intents`](crate::reconcile_watchdog_intents), which
-    /// builds the receipt from a real fenced acknowledgement, may write it.
+    /// [`reconcile_watchdog_intents`](crate::reconcile_watchdog_intents) and
+    /// [`reconcile_watchdog_publications`](crate::reconcile_watchdog_publications),
+    /// each of which builds the receipt from a real acknowledged route response,
+    /// may write it. Sharing one ledger across both intent classes is what makes
+    /// a single lost acknowledgement resumable for either of them.
     ///
     /// # Errors
     ///
@@ -1215,6 +1243,37 @@ impl IndependentKernelSensor {
     /// Non-fatal by construction: a refusal is an observation outcome, and an
     /// observation problem never turns into a supervision failure. The original
     /// `KernelWatchdogError` is returned unchanged whatever happens here.
+    /// Builds the publication request this observation may be decided under.
+    ///
+    /// Both facts are owner-issued: the lineage is this sensor's own bound
+    /// installation and generation, and the coverage identity is derived from the
+    /// verified lease the sensor is actually supervising. Nothing here is
+    /// caller-chosen, and an identity this owner cannot name fails closed rather
+    /// than becoming an empty reference inside a Signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the installation identity, the
+    /// generation, or the derived coverage identity is unusable.
+    fn publication_request(
+        &self,
+        lease: &VerifiedSupervisionLease,
+        generation: u64,
+        observed_at_ms: u64,
+    ) -> Result<publication::PublicationRequest, SpoolError> {
+        publication::PublicationLineage::new(
+            self.installation_id.clone(),
+            self.watchdog_generation,
+            generation,
+        )
+        .and_then(|lineage| {
+            publication::PublicationRequest::new(
+                lineage,
+                supervision_coverage_identity(lease, observed_at_ms),
+            )
+        })
+    }
+
     fn observe_supervision_rejection_episode(
         &self,
         lease: &VerifiedSupervisionLease,
@@ -1270,74 +1329,41 @@ impl IndependentKernelSensor {
             },
             failure_class,
         };
-        let outcome = self
-            .spool
-            .observe_signal_episode(episode::SignalEpisodeObservation {
+        // The publication request binds any appended intent to this owner's own
+        // identities and names the coverage this observation genuinely has.
+        // Neither value is caller-chosen: the lineage comes from the sensor's
+        // bound installation and generation, and the coverage identity is derived
+        // from the verified lease this sensor is supervising. An identity this
+        // owner cannot name is not a publication decision worth making, so this
+        // leg reports the refusal and leaves the observation an observation.
+        let publication_request = match self.publication_request(lease, generation, observed_at_ms)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.signal_publication_unavailable",
+                    observation = "skipped",
+                    reason_code = crate::diagnostics::spool_error_observation(&error),
+                    "this rejection is recorded as a failure episode but publishes no attention intent"
+                );
+                return;
+            }
+        };
+        let outcome = self.spool.observe_signal_episode(
+            episode::SignalEpisodeObservation {
                 identity,
                 source_event,
-                // A recurrence is a genuinely new source event; a retransmission
-                // is not, so this condition can never reopen on re-delivery.
+                // A recurrence is a genuinely new source event; a
+                // retransmission is not, so this condition can never reopen
+                // on re-delivery.
                 reopen_condition: ReopenCondition::RecurrenceWithNewSourceEvent,
                 observed_at_ms,
                 producer_generation: self.watchdog_generation,
                 record_reason: reason,
-            });
-        match outcome {
-            Ok(episode::SignalEpisodeOutcome::Accepted {
-                revision,
-                independent_occurrences,
-                record,
-                reopened,
-            }) => tracing::warn!(
-                event = "watchdog.signal_episode_accepted",
-                observation = "accepted",
-                revision = revision,
-                independent_occurrences = independent_occurrences,
-                sequence = record.sequence,
-                record_digest = record.record_digest.as_str(),
-                reopened = reopened,
-                "a genuinely new source event advanced one durable failure episode and appended its record"
-            ),
-            Ok(episode::SignalEpisodeOutcome::Reused {
-                revision,
-                independent_occurrences,
-                record,
-                evidence_observed_at_ms,
-            }) => tracing::debug!(
-                event = "watchdog.signal_episode_reused",
-                observation = "retransmission",
-                revision = revision,
-                independent_occurrences = independent_occurrences,
-                sequence = record.sequence,
-                record_digest = record.record_digest.as_str(),
-                evidence_observed_at_ms = evidence_observed_at_ms,
-                "a retransmitted source event reused the revision this episode already accepted"
-            ),
-            Ok(episode::SignalEpisodeOutcome::Refused(refusal)) => {
-                tracing::warn!(
-                    event = "watchdog.signal_episode_refused",
-                    observation = "refused",
-                    reason_code = match refusal {
-                        episode::SignalEpisodeRefusal::ConflictingSourceEventPayload { .. } => {
-                            "CONFLICTING_SOURCE_EVENT_PAYLOAD"
-                        }
-                        episode::SignalEpisodeRefusal::SourceEventHistoryFull { .. } => {
-                            "SOURCE_EVENT_HISTORY_FULL"
-                        }
-                        episode::SignalEpisodeRefusal::ReopenHistoryFull { .. } => {
-                            "REOPEN_HISTORY_FULL"
-                        }
-                    },
-                    "one offered observation was refused; nothing was written and no new episode opened"
-                );
-            }
-            Err(error) => tracing::debug!(
-                event = "watchdog.signal_episode_failed",
-                observation = "fenced",
-                reason_code = crate::diagnostics::spool_error_observation(&error),
-                "watchdog could not record the failure episode; the observation stays an observation"
-            ),
-        }
+            },
+            publication_request,
+        );
+        report_signal_episode_outcome(outcome);
     }
 
     /// Closes every open failure episode after a live, verified supervision
@@ -1436,6 +1462,190 @@ impl KernelWatchdogPort for IndependentKernelSensor {
             corpus,
         })
     }
+
+    /// Starts one bounded owner-spool pass that presents the retained
+    /// Signal-linked publication intents to the admitted owner.
+    ///
+    /// This is the export half of the Watchdog's Problem/attention route, and it
+    /// shares the admitted route, the derived idempotency key and the durable
+    /// submit-once ledger with the escalation reconciliation above. Presenting a
+    /// publication intent authorizes nothing and decides nothing: the admitted
+    /// owner records a bounded pending projection, and the canonical
+    /// Problem/attention/Incident transition remains that owner's.
+    ///
+    /// Implementations without the Watchdog-owned spool fail closed; they never
+    /// synthesize an acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained spool or receipt ledger fails
+    /// validation, no verified supervision lease was admitted, a submission
+    /// cannot be proved against its own retained bytes, the route cannot
+    /// acknowledge, or a receipt cannot be persisted.
+    fn reconcile_publications(
+        self: Arc<Self>,
+        lease: VerifiedSupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<WatchdogPublicationReconciliation, SpoolError>> + Send>>
+    {
+        Box::pin(async move {
+            let sink = KernelFrontDoorWatchdogIntentSink::new(lease);
+            tokio::task::spawn_blocking(move || reconcile_watchdog_publications(&self, &sink))
+                .await
+                .map_err(|error| {
+                    SpoolError::Corrupt(format!(
+                        "Kernel publication reconciliation worker failed: {error}"
+                    ))
+                })?
+        })
+    }
+}
+
+/// Derives the owner-issued coverage identity one supervision observation has.
+///
+/// Coverage is a claim about *who observed*, and this owner can make exactly one
+/// kind of it: it verified this exact signed supervision lease's bytes, under
+/// this exact kernel epoch and Watchdog epoch, and observed the admission path
+/// reject it. The identity binds all four owner-issued facts, so coverage for one
+/// lease under one epoch pair can never be presented as coverage for another.
+///
+/// It is deliberately **not** a claim that the observation was *sufficient*. The
+/// separate coverage axis of the Signal still records what it cannot see — the
+/// publication projection states attribution and expected revisions as explicit
+/// limitations — so naming the observer cannot decay into a completeness claim.
+fn supervision_coverage_identity(lease: &VerifiedSupervisionLease, observed_at_ms: u64) -> String {
+    format!(
+        "watchdog-supervision-coverage-v1\0{}\0{}\0{}\0{}\0{observed_at_ms}",
+        lease.lease().lease_id,
+        lease.lease().kernel_epoch.lineage_id,
+        lease.lease().kernel_epoch.sequence.get(),
+        lease.lease().watchdog_epoch.value(),
+    )
+}
+
+/// Projects one resolved failure-episode outcome onto its log line.
+///
+/// Reporting is deliberately non-fatal in every arm: a refusal, a reuse and a
+/// spool fault are all observations about the Watchdog's own state, and none of
+/// them is a reason to escalate the supervision failure that started here. The
+/// original `KernelWatchdogError` is unaffected by whatever this prints.
+fn report_signal_episode_outcome(outcome: Result<episode::SignalEpisodeOutcome, SpoolError>) {
+    match outcome {
+        Ok(episode::SignalEpisodeOutcome::Accepted {
+            revision,
+            independent_occurrences,
+            record,
+            reopened,
+            publication,
+        }) => report_accepted_signal_episode(
+            revision,
+            independent_occurrences,
+            &record,
+            reopened,
+            &publication,
+        ),
+        Ok(episode::SignalEpisodeOutcome::Reused {
+            revision,
+            independent_occurrences,
+            record,
+            evidence_observed_at_ms,
+            publication,
+        }) => tracing::debug!(
+            event = "watchdog.signal_episode_reused",
+            observation = "retransmission",
+            revision = revision,
+            independent_occurrences = independent_occurrences,
+            sequence = record.sequence,
+            record_digest = record.record_digest.as_str(),
+            evidence_observed_at_ms = evidence_observed_at_ms,
+            publication = publication_report_code(&publication),
+            "a retransmitted source event reused the revision this episode already accepted and added no threshold pressure"
+        ),
+        Ok(episode::SignalEpisodeOutcome::Refused(refusal)) => {
+            tracing::warn!(
+                event = "watchdog.signal_episode_refused",
+                observation = "refused",
+                reason_code = match refusal {
+                    episode::SignalEpisodeRefusal::ConflictingSourceEventPayload { .. } => {
+                        "CONFLICTING_SOURCE_EVENT_PAYLOAD"
+                    }
+                    episode::SignalEpisodeRefusal::SourceEventHistoryFull { .. } => {
+                        "SOURCE_EVENT_HISTORY_FULL"
+                    }
+                    episode::SignalEpisodeRefusal::ReopenHistoryFull { .. } =>
+                        "REOPEN_HISTORY_FULL",
+                },
+                "one offered observation was refused; nothing was written and no new episode opened"
+            );
+        }
+        Err(error) => tracing::debug!(
+            event = "watchdog.signal_episode_failed",
+            observation = "fenced",
+            reason_code = crate::diagnostics::spool_error_observation(&error),
+            "watchdog could not record the failure episode; the observation stays an observation"
+        ),
+    }
+}
+
+/// Projects one accepted failure-episode observation onto its log line.
+///
+/// The publication decision is reported as a bounded label on the *same*
+/// accepted observation, because it was taken inside the same owner
+/// transaction: a crossed threshold is durable evidence that an intent now
+/// exists in this owner's retained spool, not a separate claim about anything
+/// canonical. A crossing therefore gets its own event name, so a reader can tell
+/// "the Watchdog raised attention" apart from "the Watchdog recorded an
+/// observation" without parsing prose.
+fn report_accepted_signal_episode(
+    revision: u64,
+    independent_occurrences: u32,
+    record: &episode::StoredSignalRecordRef,
+    reopened: bool,
+    publication: &episode::SignalEpisodePublicationReport,
+) {
+    match publication {
+        episode::SignalEpisodePublicationReport::Published {
+            intent_id,
+            sequence,
+        } => tracing::warn!(
+            event = "watchdog.signal_publication_intent_committed",
+            observation = "published",
+            revision = revision,
+            independent_occurrences = independent_occurrences,
+            sequence = record.sequence,
+            record_digest = record.record_digest.as_str(),
+            reopened = reopened,
+            intent_id = intent_id.as_str(),
+            publication_sequence = sequence,
+            "an evidence-backed attention threshold was crossed; one linked publication intent is durable and pending"
+        ),
+        other => tracing::warn!(
+            event = "watchdog.signal_episode_accepted",
+            observation = "accepted",
+            revision = revision,
+            independent_occurrences = independent_occurrences,
+            sequence = record.sequence,
+            record_digest = record.record_digest.as_str(),
+            reopened = reopened,
+            publication = publication_report_code(other),
+            "a genuinely new source event advanced one durable failure episode and appended its record"
+        ),
+    }
+}
+
+/// Projects one publication report onto its closed log code.
+///
+/// Exhaustive with no wildcard, so a report variant this owner adds fails the
+/// build here rather than being logged under a code that reads as a different
+/// decision.
+fn publication_report_code(report: &episode::SignalEpisodePublicationReport) -> &'static str {
+    match report {
+        episode::SignalEpisodePublicationReport::Published { .. } => "PUBLISHED",
+        episode::SignalEpisodePublicationReport::AlreadyPublished { .. } => "ALREADY_PUBLISHED",
+        episode::SignalEpisodePublicationReport::BelowThreshold { .. } => "BELOW_THRESHOLD",
+        episode::SignalEpisodePublicationReport::Withheld { .. } => "ADMISSION_WITHHELD",
+        episode::SignalEpisodePublicationReport::EvidenceUnavailable => "EVIDENCE_UNAVAILABLE",
+        episode::SignalEpisodePublicationReport::NotAttention => "NOT_ATTENTION",
+    }
 }
 
 /// Closed observation-source label for an admission-reload rejection.
@@ -1522,6 +1732,28 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
         Box::pin(async {
             Err(SpoolError::Corrupt(
                 "KernelWatchdogPort has no Watchdog intent spool owner".to_owned(),
+            ))
+        })
+    }
+
+    /// Starts one bounded pass that presents the retained Signal-linked
+    /// publication intents to the admitted owner.
+    ///
+    /// Implementations which do not own a durable observation spool fail closed
+    /// by default; they never synthesize an acknowledgement and never claim a
+    /// publication was delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this port owns no Watchdog spool.
+    fn reconcile_publications(
+        self: Arc<Self>,
+        _lease: VerifiedSupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<WatchdogPublicationReconciliation, SpoolError>> + Send>>
+    {
+        Box::pin(async {
+            Err(SpoolError::Corrupt(
+                "KernelWatchdogPort has no Watchdog publication spool owner".to_owned(),
             ))
         })
     }

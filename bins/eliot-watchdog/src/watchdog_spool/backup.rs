@@ -201,6 +201,9 @@ pub enum SpoolFenceEntryKind {
     ProblemIntent,
     /// Spool-local incident intent awaiting Governor reconciliation.
     IncidentIntent,
+    /// Spool-local Signal-linked publication intent awaiting the admitted
+    /// owner's decision.
+    PublicationIntent,
 }
 
 impl SpoolFenceEntryKind {
@@ -213,6 +216,7 @@ impl SpoolFenceEntryKind {
             Self::Recovery => "recovery",
             Self::ProblemIntent => "problem_intent",
             Self::IncidentIntent => "incident_intent",
+            Self::PublicationIntent => "publication_intent",
         }
     }
 
@@ -230,6 +234,7 @@ impl SpoolFenceEntryKind {
             WatchdogSpoolPayload::Recovery { .. } => Self::Recovery,
             WatchdogSpoolPayload::ProblemIntent { .. } => Self::ProblemIntent,
             WatchdogSpoolPayload::IncidentIntent { .. } => Self::IncidentIntent,
+            WatchdogSpoolPayload::PublicationIntent { .. } => Self::PublicationIntent,
         }
     }
 
@@ -237,12 +242,19 @@ impl SpoolFenceEntryKind {
     ///
     /// Any `Gap`, `Recovery`, or unreconciled intent in scope marks the fence
     /// denominator incomplete; such records are never dropped and no pre-gap
-    /// entry is fabricated.
+    /// entry is fabricated. A publication intent is included on the same
+    /// footing: it reports attention that was raised and is not yet dispositioned
+    /// by the admitted owner, so a snapshot that contains one is not a complete
+    /// account of what the Watchdog observed and asked for.
     #[must_use]
     pub const fn marks_incomplete(self) -> bool {
         match self {
             Self::Heartbeat => false,
-            Self::Gap | Self::Recovery | Self::ProblemIntent | Self::IncidentIntent => true,
+            Self::Gap
+            | Self::Recovery
+            | Self::ProblemIntent
+            | Self::IncidentIntent
+            | Self::PublicationIntent => true,
         }
     }
 }
@@ -297,6 +309,38 @@ pub enum SpoolMarkerDetail {
         /// Exact observed Governor-unavailability reason that opened the
         /// episode, preserved verbatim from the retained record.
         governor_unavailable_reason: GapRecoveryReason,
+    },
+    /// Spool-local Signal-linked publication intent with the exact evidence the
+    /// attention threshold was decided on.
+    ///
+    /// It carries the crossing evidence digests, the exact Signal identity and
+    /// revision, the owner-issued policy identity and revision the threshold was
+    /// compared under, the observation class, and the exact observed subject,
+    /// scope and generation. All of it is preserved rather than summarised
+    /// because this is the record that states *why* the Watchdog raised
+    /// attention: reducing it to a count would present a threshold decision with
+    /// no evidence behind it, which is the one thing the decision exists to
+    /// prevent. The class has no Incident-declaring variant, so a snapshot can
+    /// never present this record as a canonical Incident.
+    Publication {
+        /// Bounded evidence digests this revision contributed to the crossing.
+        crossing_evidence: Vec<String>,
+        /// Identity of the Signal this intent is linked to.
+        signal_id: String,
+        /// Exact immutable Signal revision the threshold was decided from.
+        signal_revision: u64,
+        /// Owner-issued policy identity the threshold was decided under.
+        policy_id: String,
+        /// Immutable policy revision the threshold was compared against.
+        policy_revision: u64,
+        /// Watchdog-owned observation class of the retained record.
+        class: super::publication::WatchdogPublicationClass,
+        /// Exact observed subject identity.
+        subject_id: String,
+        /// Exact observed scope identity.
+        scope_id: String,
+        /// Observed generation of the subject in this scope.
+        generation: u64,
     },
 }
 
@@ -1016,7 +1060,8 @@ fn entry_service(payload: &WatchdogSpoolPayload) -> &str {
         | WatchdogSpoolPayload::Gap { service, .. }
         | WatchdogSpoolPayload::Recovery { service, .. }
         | WatchdogSpoolPayload::ProblemIntent { service, .. }
-        | WatchdogSpoolPayload::IncidentIntent { service, .. } => service,
+        | WatchdogSpoolPayload::IncidentIntent { service, .. }
+        | WatchdogSpoolPayload::PublicationIntent { service, .. } => service,
     }
 }
 
@@ -1024,26 +1069,69 @@ fn entry_service(payload: &WatchdogSpoolPayload) -> &str {
 ///
 /// The rules are exactly the ones [`marker_detail`] applied at capture, so a
 /// marker that passes here carries the same shapes the retained record did.
-/// `Gap` markers hold a closed reason enum and `Intent` markers hold
-/// enum-scoped lineage, so the recovery arm is the only one with free-form text
-/// and a digest field to re-check.
+/// `Gap` markers hold a closed reason enum, and `Intent` and `Publication`
+/// markers hold enum-scoped classes plus digest and identity fields, so the
+/// recovery arm is the only one with unbounded free-form text.
 ///
 /// # Errors
 ///
 /// Returns [`SpoolError::Corrupt`] when a recovery reason is blank or
-/// oversized, or a corrupt digest is neither lowercase SHA-256 nor the
-/// preserved `"missing"` literal.
+/// oversized, a corrupt digest is neither lowercase SHA-256 nor the preserved
+/// `"missing"` literal, a publication marker carries an empty or oversized
+/// evidence list or a malformed evidence digest, or a publication identity is
+/// blank or oversized.
 fn check_marker_detail(marker: &SpoolMarkerDetail) -> Result<(), SpoolError> {
-    if let SpoolMarkerDetail::Recovery {
-        reason,
-        corrupt_digest,
-        ..
-    } = marker
-    {
-        check_text(reason, "recovery reason", BACKUP_REASON_MAX_BYTES)?;
-        if corrupt_digest != MISSING_DIGEST_LITERAL {
-            check_digest(corrupt_digest, "recovery corrupt_digest")?;
+    match marker {
+        SpoolMarkerDetail::Recovery {
+            reason,
+            corrupt_digest,
+            ..
+        } => {
+            check_text(reason, "recovery reason", BACKUP_REASON_MAX_BYTES)?;
+            if corrupt_digest != MISSING_DIGEST_LITERAL {
+                check_digest(corrupt_digest, "recovery corrupt_digest")?;
+            }
         }
+        SpoolMarkerDetail::Publication {
+            crossing_evidence,
+            signal_id,
+            policy_id,
+            subject_id,
+            scope_id,
+            signal_revision,
+            policy_revision,
+            generation,
+            ..
+        } => {
+            // A publication marker that lost its evidence, or that names an
+            // uninitialized revision, would present a threshold decision with
+            // nothing behind it. Both are refused here rather than redacted,
+            // because a snapshot that cannot state why attention was raised
+            // cannot honestly claim complete coverage either.
+            if crossing_evidence.is_empty() {
+                return Err(SpoolError::Corrupt(
+                    "watchdog spool publication marker carries no crossing evidence".to_owned(),
+                ));
+            }
+            for evidence in crossing_evidence {
+                check_digest(evidence, "publication crossing evidence")?;
+            }
+            for identity in [
+                ("signal_id", signal_id.as_str()),
+                ("policy_id", policy_id.as_str()),
+                ("subject_id", subject_id.as_str()),
+                ("scope_id", scope_id.as_str()),
+            ] {
+                check_text(identity.1, identity.0, BACKUP_REASON_MAX_BYTES)?;
+            }
+            if *signal_revision == 0 || *policy_revision == 0 || *generation == 0 {
+                return Err(SpoolError::Corrupt(
+                    "watchdog spool publication marker carries an uninitialized revision or generation"
+                        .to_owned(),
+                ));
+            }
+        }
+        SpoolMarkerDetail::Gap { .. } | SpoolMarkerDetail::Intent { .. } => {}
     }
     Ok(())
 }
@@ -1140,6 +1228,28 @@ fn marker_detail(payload: &WatchdogSpoolPayload) -> Result<Option<SpoolMarkerDet
             lineage_generation: *lineage_generation,
             lineage_epoch: *lineage_epoch,
             governor_unavailable_reason: *governor_unavailable_reason,
+        }),
+        WatchdogSpoolPayload::PublicationIntent {
+            crossing_evidence,
+            signal_id,
+            signal_revision,
+            policy_id,
+            policy_revision,
+            class,
+            subject_id,
+            scope_id,
+            generation,
+            ..
+        } => Some(SpoolMarkerDetail::Publication {
+            crossing_evidence: crossing_evidence.clone(),
+            signal_id: signal_id.clone(),
+            signal_revision: *signal_revision,
+            policy_id: policy_id.clone(),
+            policy_revision: *policy_revision,
+            class: *class,
+            subject_id: subject_id.clone(),
+            scope_id: scope_id.clone(),
+            generation: *generation,
         }),
     };
     if let Some(detail) = detail.as_ref() {

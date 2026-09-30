@@ -45,6 +45,20 @@ pub mod export_driver;
 /// `watchdog-spool-batch-v1` intent route, and are never removed by compaction
 /// so the original Watchdog record stays linked to the Governor's decision.
 pub(crate) mod intent;
+/// Spool-local Signal-linked publication intents (I8.1, I8.9, I13.7) and the
+/// Watchdog-owned durable threshold state that decides and dedupes them.
+///
+/// One publication intent is appended per crossed, evidence-backed attention
+/// threshold, inside the **same owner transaction** as the failure-episode record
+/// and the evidence advance that decided it, so a crossing cannot exist without
+/// its evidence and a replay cannot mint a second intent. The shared
+/// owner-neutral export classes stay unextended for the same reason the
+/// escalation intents do: they are consumed exhaustively by lanes this one does
+/// not own, so a publication record persists as a codec variant and travels
+/// inside its export window under the existing `Recovery` class. Compaction
+/// never removes one, so the original Watchdog record stays linked to whatever
+/// the admitted owner later decides.
+pub(crate) mod publication;
 
 pub use backup::{
     CaptureFenceParams, SpoolCoverageDenominator, SpoolFenceEntryKind,
@@ -934,156 +948,184 @@ impl WatchdogSpool {
     /// Returns [`SpoolError`] when the retained spool, header, or high-water
     /// fails validation, the sequence is exhausted or drifts, or the record
     /// cannot be encoded.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "bounded spool retention, pressure marking, and high-water updates stay one atomic redb transaction"
-    )]
     fn append_in_transaction(
         write: &WriteTransaction,
         observed_at_ms: u64,
         payload: WatchdogSpoolPayload,
     ) -> Result<(SpoolAppendOutcome, WatchdogSpoolEntry), SpoolError> {
-        let mut table = write
-            .open_table(SPOOL_TABLE)
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
-        let mut high_water_table = write.open_table(SPOOL_HIGH_WATER_TABLE).map_err(|error| {
-            SpoolError::Corrupt(format!(
-                "high-water metadata is unavailable; sequence continuity cannot be proven: {error}"
-            ))
+        append_in_transaction_on(write, observed_at_ms, payload)
+    }
+}
+
+/// Appends one payload inside an already-open write transaction.
+///
+/// This is [`WatchdogSpool::append_in_transaction`] as a free function over the
+/// transaction rather than over the spool handle. A sibling owner that already
+/// holds the one write transaction it needs — the publication owner, which
+/// commits an appended publication record, the evidence advance that decided it
+/// and the advanced episode row as one durability point — must append *on that
+/// transaction*. Routing it through a handle method would either open a second
+/// writer or force the sibling to stop using the transaction it is already in,
+/// and both would break the atomicity the deduplication guarantee depends on.
+/// The retained-state access is read from the same handle the caller already
+/// holds, so the append still validates against the real retained spool rather
+/// than a stale copy.
+///
+/// # Errors
+///
+/// Returns [`SpoolError`] when the retained spool, header, or high-water fails
+/// validation, the sequence is exhausted or drifts, or the record cannot be
+/// encoded. Nothing is committed here: the caller owns the transaction.
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded spool retention, pressure marking, and high-water updates stay one atomic redb transaction"
+)]
+pub(crate) fn append_in_transaction_on(
+    write: &WriteTransaction,
+    observed_at_ms: u64,
+    payload: WatchdogSpoolPayload,
+) -> Result<(SpoolAppendOutcome, WatchdogSpoolEntry), SpoolError> {
+    let mut table = write
+        .open_table(SPOOL_TABLE)
+        .map_err(|error| SpoolError::Database(error.to_string()))?;
+    let mut high_water_table = write.open_table(SPOOL_HIGH_WATER_TABLE).map_err(|error| {
+        SpoolError::Corrupt(format!(
+            "high-water metadata is unavailable; sequence continuity cannot be proven: {error}"
+        ))
+    })?;
+    let header_bytes = table
+        .get(SPOOL_HEADER_KEY)
+        .map_err(|error| SpoolError::Database(error.to_string()))?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| SpoolError::Corrupt("spool header is missing".to_owned()))?;
+    let mut header = decode_header(&header_bytes)?;
+    let entries = collect_entries(&table)?;
+    validate_header(&header, &entries)?;
+    let high_water = high_water_table
+        .get(SPOOL_HIGH_WATER_KEY)
+        .map_err(|error| SpoolError::Database(error.to_string()))?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            SpoolError::Corrupt(
+                "high-water metadata is missing; sequence continuity cannot be proven".to_owned(),
+            )
         })?;
-        let header_bytes = table
-            .get(SPOOL_HEADER_KEY)
-            .map_err(|error| SpoolError::Database(error.to_string()))?
-            .map(|value| value.value().to_vec())
-            .ok_or_else(|| SpoolError::Corrupt("spool header is missing".to_owned()))?;
-        let mut header = decode_header(&header_bytes)?;
-        let entries = collect_entries(&table)?;
-        validate_header(&header, &entries)?;
-        let high_water = high_water_table
-            .get(SPOOL_HIGH_WATER_KEY)
-            .map_err(|error| SpoolError::Database(error.to_string()))?
-            .map(|value| value.value().to_vec())
-            .ok_or_else(|| {
-                SpoolError::Corrupt(
-                    "high-water metadata is missing; sequence continuity cannot be proven"
-                        .to_owned(),
-                )
-            })?;
-        let high_water = decode_high_water(&high_water)?;
-        validate_high_water(&header, &entries, high_water)?;
-        let sequence = high_water
-            .checked_add(1)
-            .ok_or_else(|| SpoolError::Corrupt("spool sequence exhausted".to_owned()))?;
-        if sequence != header.next_sequence {
-            return Err(SpoolError::Corrupt(
-                "spool header next sequence does not match high-water metadata".to_owned(),
-            ));
-        }
-        let entry = WatchdogSpoolEntry {
+    let high_water = decode_high_water(&high_water)?;
+    validate_high_water(&header, &entries, high_water)?;
+    let sequence = high_water
+        .checked_add(1)
+        .ok_or_else(|| SpoolError::Corrupt("spool sequence exhausted".to_owned()))?;
+    if sequence != header.next_sequence {
+        return Err(SpoolError::Corrupt(
+            "spool header next sequence does not match high-water metadata".to_owned(),
+        ));
+    }
+    let entry = WatchdogSpoolEntry {
+        schema_version: SPOOL_SCHEMA_VERSION,
+        sequence,
+        observed_at_ms,
+        payload: payload.clone(),
+    };
+    let initial_bytes = encode_entry(&entry)?;
+    let pressure = header.record_count >= SPOOL_MAX_RECORDS
+        || header.bytes.saturating_add(initial_bytes.len() as u64) > SPOOL_MAX_BYTES;
+    let (encoded_entries, created_entry) = if pressure {
+        let marker = WatchdogSpoolEntry {
             schema_version: SPOOL_SCHEMA_VERSION,
             sequence,
             observed_at_ms,
-            payload: payload.clone(),
+            payload: WatchdogSpoolPayload::Gap {
+                service: SERVICE_NAME.to_owned(),
+                reason: crate::GapRecoveryReason::SpoolPressure,
+                coverage_claimed: false,
+            },
         };
-        let initial_bytes = encode_entry(&entry)?;
-        let pressure = header.record_count >= SPOOL_MAX_RECORDS
-            || header.bytes.saturating_add(initial_bytes.len() as u64) > SPOOL_MAX_BYTES;
-        let (encoded_entries, created_entry) = if pressure {
-            let marker = WatchdogSpoolEntry {
-                schema_version: SPOOL_SCHEMA_VERSION,
-                sequence,
-                observed_at_ms,
-                payload: WatchdogSpoolPayload::Gap {
-                    service: SERVICE_NAME.to_owned(),
-                    reason: crate::GapRecoveryReason::SpoolPressure,
-                    coverage_claimed: false,
-                },
-            };
-            let entry_sequence = sequence
-                .checked_add(1)
-                .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
-            let entry = WatchdogSpoolEntry {
-                schema_version: SPOOL_SCHEMA_VERSION,
-                sequence: entry_sequence,
-                observed_at_ms,
-                payload,
-            };
-            let created = entry.clone();
-            (
-                vec![
-                    (sequence, encode_entry(&marker)?),
-                    (entry_sequence, encode_entry(&entry)?),
-                ],
-                created,
-            )
-        } else {
-            (vec![(sequence, initial_bytes)], entry)
-        };
-        let total_bytes = encoded_entries
-            .iter()
-            .map(|(_, bytes)| bytes.len() as u64)
-            .sum::<u64>();
-        let mut evicted_records = 0;
-        while header.record_count + encoded_entries.len() as u64 > SPOOL_MAX_RECORDS
-            || header.bytes.saturating_add(total_bytes) > SPOOL_MAX_BYTES
-        {
-            if header.record_count == 0 {
-                break;
-            }
-            let old_sequence = header.first_sequence;
-            let old = table
-                .remove(old_sequence)
-                .map_err(|error| SpoolError::Database(error.to_string()))?
-                .ok_or_else(|| SpoolError::Corrupt("retention record is missing".to_owned()))?;
-            header.bytes = header
-                .bytes
-                .checked_sub(old.value().len() as u64)
-                .ok_or_else(|| SpoolError::Corrupt("spool byte counter underflow".to_owned()))?;
-            header.first_sequence = old_sequence
-                .checked_add(1)
-                .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
-            header.record_count -= 1;
-            evicted_records += 1;
-        }
-        for (sequence, bytes) in &encoded_entries {
-            table
-                .insert(*sequence, bytes.as_slice())
-                .map_err(|error| SpoolError::Database(error.to_string()))?;
-            if header.record_count == 0 {
-                header.first_sequence = *sequence;
-            }
-            header.record_count += 1;
-            header.bytes = header
-                .bytes
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| SpoolError::Corrupt("spool byte counter overflow".to_owned()))?;
-        }
-        header.schema_version = SPOOL_SCHEMA_VERSION;
-        let last_sequence = encoded_entries
-            .last()
-            .map(|(sequence, _)| *sequence)
-            .ok_or_else(|| SpoolError::Corrupt("spool append produced no records".to_owned()))?;
-        header.next_sequence = last_sequence
+        let entry_sequence = sequence
             .checked_add(1)
             .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
-        let header_bytes = encode_header(&header)?;
-        table
-            .insert(SPOOL_HEADER_KEY, header_bytes.as_slice())
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
-        let high_water_bytes = encode_high_water(last_sequence)?;
-        high_water_table
-            .insert(SPOOL_HIGH_WATER_KEY, high_water_bytes.as_slice())
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
-        drop(table);
-        drop(high_water_table);
-        let outcome = if pressure {
-            SpoolAppendOutcome::Pressure { evicted_records }
-        } else {
-            SpoolAppendOutcome::Stored
+        let entry = WatchdogSpoolEntry {
+            schema_version: SPOOL_SCHEMA_VERSION,
+            sequence: entry_sequence,
+            observed_at_ms,
+            payload,
         };
-        Ok((outcome, created_entry))
+        let created = entry.clone();
+        (
+            vec![
+                (sequence, encode_entry(&marker)?),
+                (entry_sequence, encode_entry(&entry)?),
+            ],
+            created,
+        )
+    } else {
+        (vec![(sequence, initial_bytes)], entry)
+    };
+    let total_bytes = encoded_entries
+        .iter()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum::<u64>();
+    let mut evicted_records = 0;
+    while header.record_count + encoded_entries.len() as u64 > SPOOL_MAX_RECORDS
+        || header.bytes.saturating_add(total_bytes) > SPOOL_MAX_BYTES
+    {
+        if header.record_count == 0 {
+            break;
+        }
+        let old_sequence = header.first_sequence;
+        let old = table
+            .remove(old_sequence)
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+            .ok_or_else(|| SpoolError::Corrupt("retention record is missing".to_owned()))?;
+        header.bytes = header
+            .bytes
+            .checked_sub(old.value().len() as u64)
+            .ok_or_else(|| SpoolError::Corrupt("spool byte counter underflow".to_owned()))?;
+        header.first_sequence = old_sequence
+            .checked_add(1)
+            .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
+        header.record_count -= 1;
+        evicted_records += 1;
     }
+    for (sequence, bytes) in &encoded_entries {
+        table
+            .insert(*sequence, bytes.as_slice())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        if header.record_count == 0 {
+            header.first_sequence = *sequence;
+        }
+        header.record_count += 1;
+        header.bytes = header
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| SpoolError::Corrupt("spool byte counter overflow".to_owned()))?;
+    }
+    header.schema_version = SPOOL_SCHEMA_VERSION;
+    let last_sequence = encoded_entries
+        .last()
+        .map(|(sequence, _)| *sequence)
+        .ok_or_else(|| SpoolError::Corrupt("spool append produced no records".to_owned()))?;
+    header.next_sequence = last_sequence
+        .checked_add(1)
+        .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
+    let header_bytes = encode_header(&header)?;
+    table
+        .insert(SPOOL_HEADER_KEY, header_bytes.as_slice())
+        .map_err(|error| SpoolError::Database(error.to_string()))?;
+    let high_water_bytes = encode_high_water(last_sequence)?;
+    high_water_table
+        .insert(SPOOL_HIGH_WATER_KEY, high_water_bytes.as_slice())
+        .map_err(|error| SpoolError::Database(error.to_string()))?;
+    drop(table);
+    drop(high_water_table);
+    let outcome = if pressure {
+        SpoolAppendOutcome::Pressure { evicted_records }
+    } else {
+        SpoolAppendOutcome::Stored
+    };
+    Ok((outcome, created_entry))
+}
 
+impl WatchdogSpool {
     /// Reads the durable high-water sequence without mutating any spool state.
     ///
     /// # Errors
@@ -1458,6 +1500,68 @@ impl WatchdogSpool {
         Ok(pending)
     }
 
+    /// Returns a bounded window of retained Signal-linked publication records
+    /// that the admitted owner has not yet acknowledged, oldest first.
+    ///
+    /// Read-only: nothing is submitted, signed, or removed here. Each entry
+    /// carries the exact original record plus the record and payload digests the
+    /// export batch binds and the stable intent identity the core derived, so a
+    /// lost acknowledgement resumes under the same identity and a replay cannot
+    /// present a second intent for the same crossing.
+    ///
+    /// An empty result means every retained publication record has already left
+    /// this owner's spool. It is *not* a claim that the admitted owner decided
+    /// anything: acknowledgement is not a canonical transition, and this owner
+    /// holds no evidence that a publication was ever acted on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the retained spool, header, or high-water
+    /// fails validation, the window bound is zero or above the shared ceiling,
+    /// or a stored publication record is not canonical.
+    pub(crate) fn pending_watchdog_publications(
+        &self,
+        limit: usize,
+        epoch_lineage: &eliot_contracts::EpochLineageId,
+    ) -> Result<Vec<publication::PendingPublication>, SpoolError> {
+        if limit == 0 || limit > intent::INTENT_RECONCILIATION_MAX_SUBMISSIONS {
+            return Err(SpoolError::Corrupt(
+                "watchdog publication reconciliation window is outside its bounded range"
+                    .to_owned(),
+            ));
+        }
+        let (entries, _high_water, _cursor) = self.read_export_snapshot()?;
+        // The same submit-once ledger the escalation intents use, read as the
+        // set of sequences the admitted owner has already acknowledged. Sharing
+        // it is what makes one lost acknowledgement resumable across both intent
+        // classes over one route, instead of leaving a publication record with
+        // no record that it was ever taken.
+        let acknowledged = self.read_intent_receipt_sequences()?;
+        let mut pending = Vec::new();
+        for entry in &entries {
+            if pending.len() >= limit {
+                break;
+            }
+            if !publication::is_publication_payload(&entry.payload)
+                || acknowledged.contains(&entry.sequence)
+            {
+                continue;
+            }
+            let raw = encode_entry(entry)?;
+            let (payload_digest, record_digest) = export_record_digests(entry, &raw);
+            pending.push(publication::PendingPublication {
+                record: entry.clone(),
+                publication_class: publication::WatchdogPublicationClass::of_payload(
+                    &entry.payload,
+                )?,
+                record_digest,
+                payload_digest,
+                epoch_lineage: epoch_lineage.clone(),
+            });
+        }
+        Ok(pending)
+    }
+
     /// Persists the durable submit-once receipt for one reconciled intent.
     ///
     /// This is the exactly-once boundary of fenced-Kernel reconciliation, and
@@ -1607,8 +1711,9 @@ impl WatchdogSpool {
     }
 
     /// Resolves one observed failure against its durable failure episode and
-    /// persists the deduplication state in the same owner transaction as the
-    /// record one accepted revision produced.
+    /// persists the deduplication state — and, when an owner-issued attention
+    /// threshold is crossed, exactly one linked publication intent about the
+    /// Signal that episode just accepted — in the same owner transaction.
     ///
     /// The episode key is derived in the owner-neutral core from the
     /// observation's own rule revision, scope, subject, generation and
@@ -1652,6 +1757,7 @@ impl WatchdogSpool {
     pub(crate) fn observe_signal_episode(
         &self,
         observation: episode::SignalEpisodeObservation,
+        publication_request: publication::PublicationRequest,
     ) -> Result<episode::SignalEpisodeOutcome, SpoolError> {
         // The observation is owned exactly once and decomposed here, so each
         // owner-supplied fact below is read from the value this function
@@ -1704,7 +1810,7 @@ impl WatchdogSpool {
             }
         };
         let admission = state.classify(&source_event)?;
-        let (outcome, emission) = Self::resolve_signal_episode_admission(
+        let resolution = Self::resolve_signal_episode_admission(
             &write,
             state,
             &admission,
@@ -1713,26 +1819,156 @@ impl WatchdogSpool {
             producer_generation,
             record_reason,
         )?;
-        let Some(state) = emission else {
-            // Retransmission and refusal wrote nothing; dropping the
-            // uncommitted transaction is the durable outcome, and reporting it
-            // is not a lost record.
-            drop(write);
-            return Ok(outcome);
+        // The publication request is taken apart here and only its two
+        // owner-issued parts are carried into the decision below, so the
+        // accepted path consumes what it uses and the two arms stay independent
+        // of how the caller happened to bundle them.
+        let publication::PublicationRequest {
+            lineage: publication_lineage,
+            coverage_id: publication_coverage_id,
+        } = publication_request;
+        let (accepted, state) = match resolution {
+            episode::AdmissionResolution::Accepted { accepted, state } => (accepted, state),
+            episode::AdmissionResolution::Reused { accepted, state } => {
+                // The publication decision is consulted on the *unadvanced* row
+                // and with the same admission that classified this event, so the
+                // episode's durable index — not this owner's bookkeeping — is what
+                // refuses the delivery and what names the record a restart reuses.
+                // It appends nothing in this arm: a withheld admission cannot
+                // cross a threshold, and the arm asserts that.
+                let (publication_outcome, _publication_state) =
+                    publication::resolve_publication_intent(
+                        &write,
+                        ledger_key.as_str(),
+                        &state,
+                        &admission,
+                        &source_event,
+                        &publication_lineage,
+                        publication_coverage_id.as_str(),
+                    )?;
+                debug_assert!(
+                    !matches!(
+                        publication_outcome,
+                        publication::PublicationOutcome::Published(_)
+                    ),
+                    "a retransmission cannot cross a publication threshold"
+                );
+                drop(write);
+                return Ok(Self::report_reused(accepted, &publication_outcome));
+            }
+            episode::AdmissionResolution::Refused(refusal) => {
+                // A refused delivery wrote nothing and published nothing. The
+                // refusal travels unchanged rather than being restated as a
+                // repeated delivery, and the episode keeps whatever it already
+                // had: refusing is not closing.
+                drop(write);
+                return Ok(episode::SignalEpisodeOutcome::Refused(refusal));
+            }
         };
+        // The publication decision runs on the *advanced* episode row and the
+        // *same* admission that just classified this event, inside the same open
+        // transaction. That is what makes a crossing impossible without its
+        // evidence record, and makes a replay impossible to mint a second
+        // intent: the episode's durable index, not this owner's bookkeeping, is
+        // the sole gate on whether this delivery may add independent pressure.
+        let (publication_outcome, publication_state) = publication::resolve_publication_intent(
+            &write,
+            ledger_key.as_str(),
+            &state,
+            &admission,
+            &source_event,
+            &publication_lineage,
+            publication_coverage_id.as_str(),
+        )?;
         episode::write_episode(&write, ledger_key.as_str(), &state)?;
+        if let Some(publication_state) = publication_state.as_ref() {
+            episode::write_publication_state(&write, ledger_key.as_str(), publication_state)?;
+        }
         match write.commit() {
-            Ok(()) => Ok(outcome),
-            Err(error) => {
-                // The commit outcome is uncertain. Reconcile this exact source
-                // event by its own identity before deciding, so the caller is
-                // never handed a second record for an event that already has
-                // one.
-                match self.reconcile_accepted_signal_event(ledger_key.as_str(), &source_event) {
-                    Some(reconciled) => Ok(reconciled),
-                    None => Err(SpoolError::Database(error.to_string())),
+            Ok(()) => Ok(episode::SignalEpisodeOutcome::accepted(
+                accepted,
+                Self::publication_report(&publication_outcome),
+            )),
+            // The commit outcome is uncertain. Reconcile this exact source event
+            // by its own identity before deciding, so the caller is never handed
+            // a second record for an event that already has one.
+            Err(error) => self
+                .reconcile_accepted_signal_event(ledger_key.as_str(), &source_event)
+                .ok_or(SpoolError::Database(error.to_string())),
+        }
+    }
+
+    /// Projects one publication decision onto the closed observation label the
+    /// episode outcome reports.
+    ///
+    /// The caller reads this as a bounded label rather than as the record
+    /// reference, because the exact record is already in the durable publication
+    /// row and in the retained spool: reporting a second copy of that identity
+    /// here would create a second place the record's identity is stated, and the
+    /// two could then disagree.
+    fn publication_report(
+        outcome: &publication::PublicationOutcome,
+    ) -> episode::SignalEpisodePublicationReport {
+        match outcome {
+            publication::PublicationOutcome::Published(reference) => {
+                episode::SignalEpisodePublicationReport::Published {
+                    intent_id: reference.intent_id.clone(),
+                    sequence: reference.sequence,
                 }
             }
+            publication::PublicationOutcome::AlreadyPublished(reference) => {
+                episode::SignalEpisodePublicationReport::AlreadyPublished {
+                    intent_id: reference.intent_id.clone(),
+                }
+            }
+            publication::PublicationOutcome::BelowThreshold {
+                distinct_evidence_count,
+                required,
+            } => episode::SignalEpisodePublicationReport::BelowThreshold {
+                distinct_evidence_count: *distinct_evidence_count,
+                required: *required,
+            },
+            publication::PublicationOutcome::AdmissionWithheld { reason } => {
+                episode::SignalEpisodePublicationReport::Withheld {
+                    reason: match reason {
+                        publication::withheld::Reason::Retransmission => "RETRANSMISSION",
+                        publication::withheld::Reason::ConflictingPayload { .. } => {
+                            "CONFLICTING_SOURCE_EVENT_PAYLOAD"
+                        }
+                    },
+                }
+            }
+            publication::PublicationOutcome::EvidenceUnavailable { .. } => {
+                episode::SignalEpisodePublicationReport::EvidenceUnavailable
+            }
+            publication::PublicationOutcome::NotAttention { .. } => {
+                episode::SignalEpisodePublicationReport::NotAttention
+            }
+        }
+    }
+
+    /// Assembles the reused outcome, reporting what the publication owner
+    /// decided about the same withheld delivery.
+    ///
+    /// The report is attached rather than discarded so a caller can see that a
+    /// retransmission reached the threshold decision and was refused *there*,
+    /// rather than never being offered to it. That distinction is what separates
+    /// "this delivery added no pressure" from "this observation was not
+    /// considered", and the second would be a silent gap.
+    fn report_reused(
+        accepted: episode::AcceptedSignalEpisode,
+        publication_outcome: &publication::PublicationOutcome,
+    ) -> episode::SignalEpisodeOutcome {
+        // The evidence time travels unchanged: it is the time the episode's
+        // newest accepted event was observed, not a reading of the clock taken
+        // now, which is what keeps a stale failure from looking fresh because it
+        // was observed again.
+        episode::SignalEpisodeOutcome::Reused {
+            revision: accepted.revision,
+            independent_occurrences: accepted.independent_occurrences,
+            evidence_observed_at_ms: accepted.evidence_observed_at_ms,
+            record: accepted.record,
+            publication: Self::publication_report(publication_outcome),
         }
     }
 
@@ -1765,6 +2001,12 @@ impl WatchdogSpool {
             independent_occurrences: progress.independent_occurrences,
             evidence_observed_at_ms: progress.evidence_observed_at_ms,
             record,
+            // Reached only after an uncertain commit, so the report is the
+            // withheld-decision shape: an uncertain commit is reconciled by the
+            // episode's own index, never by publishing.
+            publication: episode::SignalEpisodePublicationReport::Withheld {
+                reason: "RETRANSMISSION",
+            },
         })
     }
 
@@ -1779,12 +2021,15 @@ impl WatchdogSpool {
     /// still happens before the episode row naming that record is accepted, so
     /// no side effect moves relative to a `?` or to the caller's `commit()`.
     ///
-    /// The returned pair carries the advanced row when this admission wrote
-    /// something and `None` when it wrote nothing. A retransmission and a
-    /// refusal advance no occurrence count, no evidence time and no accepted
-    /// revision, so handing their caller a row to write would offer exactly the
-    /// write the deduplication guarantee forbids: the caller drops its
-    /// uncommitted transaction instead.
+    /// The returned resolution carries the advanced row when this admission wrote
+    /// something, and carries no writable row when it wrote nothing. A
+    /// retransmission and a refusal advance no occurrence count, no evidence time
+    /// and no accepted revision, so handing their caller a row to write would
+    /// offer exactly the write the deduplication guarantee forbids: the caller
+    /// drops its uncommitted transaction instead. A retransmission still hands
+    /// back the *unchanged* row, so the caller can consult the publication
+    /// decision against the same durable index that recognised it without opening
+    /// a second read of a row that may be mid-write elsewhere.
     ///
     /// # Errors
     ///
@@ -1800,13 +2045,7 @@ impl WatchdogSpool {
         observed_at_ms: u64,
         producer_generation: u64,
         record_reason: crate::GapRecoveryReason,
-    ) -> Result<
-        (
-            episode::SignalEpisodeOutcome,
-            Option<episode::StoredSignalEpisode>,
-        ),
-        SpoolError,
-    > {
+    ) -> Result<episode::AdmissionResolution, SpoolError> {
         match admission {
             eliot_watchdog_core::SourceEventAdmission::Retransmission { .. } => {
                 // Already accepted under the same identity and digest: reuse
@@ -1814,68 +2053,68 @@ impl WatchdogSpool {
                 // uncommitted transaction is dropped without a write.
                 let (revision, record) = state.accepted()?;
                 let progress = state.progress();
-                Ok((
-                    episode::SignalEpisodeOutcome::Reused {
+                Ok(episode::AdmissionResolution::Reused {
+                    accepted: episode::AcceptedSignalEpisode {
                         revision,
                         independent_occurrences: progress.independent_occurrences,
                         evidence_observed_at_ms: progress.evidence_observed_at_ms,
                         record,
+                        // A retransmission is recognised against the episode that
+                        // already accepted it, so it reopens nothing.
+                        reopened: false,
                     },
-                    None,
-                ))
+                    state,
+                })
             }
             eliot_watchdog_core::SourceEventAdmission::ConflictingPayload {
                 recorded_payload_digest,
-            } => Ok((
-                episode::SignalEpisodeOutcome::Refused(
-                    episode::SignalEpisodeRefusal::ConflictingSourceEventPayload {
-                        event_id: source_event.event_id.clone(),
-                        recorded_payload_digest: recorded_payload_digest.clone(),
-                    },
-                ),
-                None,
+            } => Ok(episode::AdmissionResolution::Refused(
+                episode::SignalEpisodeRefusal::ConflictingSourceEventPayload {
+                    event_id: source_event.event_id.clone(),
+                    recorded_payload_digest: recorded_payload_digest.clone(),
+                },
             )),
             eliot_watchdog_core::SourceEventAdmission::NewEvidence { .. } => {
                 if let Some(refusal) = state.bound_refusal(admission) {
-                    Ok((episode::SignalEpisodeOutcome::Refused(refusal), None))
-                } else {
-                    let payload = WatchdogSpoolPayload::Gap {
-                        service: SERVICE_NAME.to_owned(),
-                        reason: record_reason,
-                        coverage_claimed: false,
-                    };
-                    let (_appended, created) =
-                        Self::append_in_transaction(write, observed_at_ms, payload)?;
-                    // The identity of the record this transaction just created,
-                    // bound the way an export batch binds it. A
-                    // retention-pressure gap record written ahead of it can
-                    // never be mistaken for this observation, and an interleaved
-                    // append can never substitute another entry's sequence.
-                    let raw = encode_entry(&created)?;
-                    let (_payload_digest, record_digest) = export_record_digests(&created, &raw);
-                    let record = episode::StoredSignalRecordRef {
-                        sequence: created.sequence,
-                        record_digest,
-                        observed_at_ms: created.observed_at_ms,
-                    };
-                    let reopened = state.accept(
-                        source_event,
-                        observed_at_ms,
-                        producer_generation,
-                        admission,
-                        record.clone(),
-                    )?;
-                    let progress = state.progress();
-                    Ok((
-                        episode::SignalEpisodeOutcome::Accepted {
-                            revision: progress.revision,
-                            independent_occurrences: progress.independent_occurrences,
-                            record,
-                            reopened,
-                        },
-                        Some(state),
-                    ))
+                    return Ok(episode::AdmissionResolution::Refused(refusal));
                 }
+                let payload = WatchdogSpoolPayload::Gap {
+                    service: SERVICE_NAME.to_owned(),
+                    reason: record_reason,
+                    coverage_claimed: false,
+                };
+                let (_appended, created) =
+                    Self::append_in_transaction(write, observed_at_ms, payload)?;
+                // The identity of the record this transaction just created, bound
+                // the way an export batch binds it. A retention-pressure gap
+                // record written ahead of it can never be mistaken for this
+                // observation, and an interleaved append can never substitute
+                // another entry's sequence.
+                let raw = encode_entry(&created)?;
+                let (_payload_digest, record_digest) = export_record_digests(&created, &raw);
+                let record = episode::StoredSignalRecordRef {
+                    sequence: created.sequence,
+                    record_digest,
+                    observed_at_ms: created.observed_at_ms,
+                };
+                let reopened = state.accept(
+                    source_event,
+                    observed_at_ms,
+                    producer_generation,
+                    admission,
+                    record.clone(),
+                )?;
+                let progress = state.progress();
+                Ok(episode::AdmissionResolution::Accepted {
+                    accepted: episode::AcceptedSignalEpisode {
+                        revision: progress.revision,
+                        independent_occurrences: progress.independent_occurrences,
+                        evidence_observed_at_ms: progress.evidence_observed_at_ms,
+                        record,
+                        reopened,
+                    },
+                    state,
+                })
             }
         }
     }
@@ -3090,7 +3329,8 @@ fn export_payload_kind(payload: &WatchdogSpoolPayload) -> WatchdogSpoolPayloadKi
         WatchdogSpoolPayload::Gap { .. } => WatchdogSpoolPayloadKind::Gap,
         WatchdogSpoolPayload::Recovery { .. }
         | WatchdogSpoolPayload::ProblemIntent { .. }
-        | WatchdogSpoolPayload::IncidentIntent { .. } => WatchdogSpoolPayloadKind::Recovery,
+        | WatchdogSpoolPayload::IncidentIntent { .. }
+        | WatchdogSpoolPayload::PublicationIntent { .. } => WatchdogSpoolPayloadKind::Recovery,
     }
 }
 
@@ -3423,6 +3663,7 @@ fn compaction_plan(entries: &[WatchdogSpoolEntry], acknowledged: u64) -> Vec<u64
         .iter()
         .filter(|entry| entry.sequence <= acknowledged)
         .filter(|entry| !intent::is_intent_payload(&entry.payload))
+        .filter(|entry| !publication::is_publication_payload(&entry.payload))
         .filter(|entry| {
             matches!(
                 export_payload_kind(&entry.payload),

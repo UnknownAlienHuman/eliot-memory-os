@@ -301,6 +301,55 @@ pub(crate) enum SignalEpisodeRefusal {
     },
 }
 
+/// Bounded report of what the publication owner decided about the Signal this
+/// accepted revision produced.
+///
+/// It is a *label*, deliberately not the record's identity. The exact committed
+/// record lives in the durable publication row and in the retained spool, and
+/// reporting a second copy of that identity here would create a second place it
+/// is stated — one the two could then disagree about. Every variant is an
+/// observation about the Watchdog's own decision: none of them is a canonical
+/// Problem, a canonical Incident, a delivery, or a resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SignalEpisodePublicationReport {
+    /// Exactly one publication intent was appended in the same transaction as
+    /// this accepted revision, and it is now durable beside it.
+    Published {
+        /// Stable intent identity the crossing was decided under.
+        intent_id: String,
+        /// Retained spool sequence of the exact committed record.
+        sequence: u64,
+    },
+    /// The episode already published an intent under this policy revision, so
+    /// this delivery reused that record instead of appending a second one. This
+    /// is the arm a replay, a duplicate tick and a restart reach.
+    AlreadyPublished {
+        /// Stable intent identity of the record that already exists.
+        intent_id: String,
+    },
+    /// Distinct evidence is accumulating but has not reached this severity's
+    /// threshold. Nothing was appended.
+    BelowThreshold {
+        /// Distinct evidence counted for this episode so far.
+        distinct_evidence_count: usize,
+        /// The threshold this severity requires.
+        required: usize,
+    },
+    /// The episode's durable index withheld this delivery, so it contributed no
+    /// independent evidence and nothing was appended.
+    Withheld {
+        /// Closed code of the episode's own refusal.
+        reason: &'static str,
+    },
+    /// The projected revision records no usable evidence references, so no
+    /// threshold could be substantiated. The limitation travelled with the
+    /// decision instead of a count it cannot support.
+    EvidenceUnavailable,
+    /// The projected severity does not request attention, so no publication
+    /// intent is derivable from it at any evidence count.
+    NotAttention,
+}
+
 /// Resolved outcome of one offered observation against the retained spool.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SignalEpisodeOutcome {
@@ -316,6 +365,9 @@ pub(crate) enum SignalEpisodeOutcome {
         record: StoredSignalRecordRef,
         /// Whether this acceptance reopened a previously closed episode.
         reopened: bool,
+        /// What the publication owner decided about this revision's Signal, in
+        /// the same owner transaction that accepted it.
+        publication: SignalEpisodePublicationReport,
     },
     /// The offered observation was a retransmission of an already accepted
     /// source event identity. Nothing was written and no record was appended;
@@ -332,6 +384,14 @@ pub(crate) enum SignalEpisodeOutcome {
         evidence_observed_at_ms: u64,
         /// The exact retained record the accepted revision produced.
         record: StoredSignalRecordRef,
+        /// What the publication owner decided about this same withheld delivery.
+        ///
+        /// Reported rather than discarded so a caller can see that the delivery
+        /// reached the threshold decision and was refused *there*, instead of
+        /// never being offered to it. That distinction is the difference between
+        /// "this delivery added no pressure" and "this observation was not
+        /// considered", and the second would be a silent supervision gap.
+        publication: SignalEpisodePublicationReport,
     },
     /// The offered observation was refused; nothing was written.
     Refused(SignalEpisodeRefusal),
@@ -431,6 +491,97 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), SpoolError> {
         )));
     }
     Ok(())
+}
+
+/// The facts one genuinely new source event was accepted on.
+///
+/// It is separate from [`SignalEpisodeOutcome::Accepted`] rather than built
+/// inside it, because the publication decision needs the *advanced* episode row
+/// before the outcome can be assembled: the threshold is decided from the Signal
+/// the accepted event actually produced, not from a revision restated by the
+/// accepting step. The owner transaction that holds the advanced row is
+/// therefore the one place the outcome is built, and this value is the only
+/// thing the accepting step hands it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcceptedSignalEpisode {
+    /// The accepted Signal revision.
+    pub(crate) revision: u64,
+    /// Independent occurrences of the current instance after this one.
+    pub(crate) independent_occurrences: u32,
+    /// Evidence time of the newest **accepted** source event. Reported
+    /// unchanged by a retransmission and never refreshed by one, so a stale
+    /// failure cannot be made to look fresh by re-observing it.
+    pub(crate) evidence_observed_at_ms: u64,
+    /// The exact retained record this revision produced.
+    pub(crate) record: StoredSignalRecordRef,
+    /// Whether this acceptance reopened a previously closed episode.
+    ///
+    /// Always `false` for a reused revision, which by definition did not reopen
+    /// anything: a retransmission is recognised against the episode that already
+    /// accepted it.
+    pub(crate) reopened: bool,
+}
+
+/// How one classified admission resolved, before the publication decision runs.
+///
+/// This is the accepting step's own result and nothing more. It is deliberately
+/// not [`SignalEpisodeOutcome`], because the publication decision has to read
+/// the *advanced* episode row a genuinely new event produced before the outcome
+/// can be reported. Handing the accepting step's result back as the caller's
+/// outcome would either force the report to be built before the decision or leave
+/// a second place the record's identity is stated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionResolution {
+    /// A genuinely new source event was accepted, and the advanced row the
+    /// acceptance produced is handed back so the publication decision can be
+    /// taken from the Signal this event actually justified.
+    Accepted {
+        /// The facts this acceptance produced.
+        accepted: AcceptedSignalEpisode,
+        /// The advanced episode row, in the same uncommitted transaction as the
+        /// record it names.
+        state: StoredSignalEpisode,
+    },
+    /// The offered event was a retransmission. Nothing was written; the accepted
+    /// facts are reported unchanged so the caller can assemble the reused
+    /// outcome.
+    Reused {
+        /// The facts this episode already accepted.
+        accepted: AcceptedSignalEpisode,
+        /// The unchanged episode row. Handed back so the owner transaction can
+        /// still consult the publication decision against the same durable index
+        /// that recognised the retransmission, without opening a second read.
+        state: StoredSignalEpisode,
+    },
+    /// The offered event was refused. Nothing was written and no record was
+    /// appended.
+    Refused(SignalEpisodeRefusal),
+}
+
+impl SignalEpisodeOutcome {
+    /// Assembles the accepted outcome from the facts the accepting step produced
+    /// and the publication report the same transaction decided.
+    ///
+    /// The report is a separate field rather than a new outcome variant because
+    /// the episode's acceptance and the publication decision are two independent
+    /// axes (I8.9): an observation is accepted for deduplication whether or not
+    /// it crossed an attention threshold, and a crossing is reported for an
+    /// observation that was genuinely accepted. Folding them into one enum would
+    /// make one axis a function of the other, which is exactly what the separate
+    /// durable rows beside them exist to prevent.
+    #[must_use]
+    pub(crate) fn accepted(
+        accepted: AcceptedSignalEpisode,
+        publication: SignalEpisodePublicationReport,
+    ) -> Self {
+        Self::Accepted {
+            revision: accepted.revision,
+            independent_occurrences: accepted.independent_occurrences,
+            record: accepted.record,
+            reopened: accepted.reopened,
+            publication,
+        }
+    }
 }
 
 impl StoredSignalEpisode {
@@ -837,6 +988,108 @@ impl StoredSignalEpisode {
             evidence_observed_at_ms: self.evidence_observed_at_ms,
         }
     }
+
+    /// Returns the read-only projection a sibling owner reads this row through.
+    ///
+    /// The projection exposes exactly the owner-issued facts and standing a
+    /// sibling owner needs in order to project an immutable observation revision
+    /// from *this* durable row — the publication owner in [`super::publication`].
+    /// Going through named accessors rather than into this row's private fields
+    /// is what keeps the two owners' reads in one place: the values are the same
+    /// ones this row independently stores and re-derives on every validation, so
+    /// a projection built from them cannot state an identity the row does not
+    /// hold. Every accessor is a plain read and cannot mutate the row.
+    #[must_use]
+    pub(crate) const fn projection(&self) -> StoredSignalEpisodeProjection<'_> {
+        StoredSignalEpisodeProjection { episode: self }
+    }
+}
+
+/// Read-only projection of one stored episode's owner-issued identity and
+/// standing.
+pub(crate) struct StoredSignalEpisodeProjection<'a> {
+    episode: &'a StoredSignalEpisode,
+}
+
+impl StoredSignalEpisodeProjection<'_> {
+    /// Returns the core-derived episode key, which is also this episode's Signal
+    /// identity and its deduplication key.
+    #[must_use]
+    pub(crate) const fn episode_key(&self) -> &str {
+        self.episode.episode_key.as_str()
+    }
+
+    /// Returns the rule identity this episode is keyed on.
+    #[must_use]
+    pub(crate) const fn rule_id(&self) -> &str {
+        self.episode.rule_id.as_str()
+    }
+
+    /// Returns the immutable rule revision this episode is keyed on.
+    #[must_use]
+    pub(crate) const fn rule_revision(&self) -> u64 {
+        self.episode.rule_revision
+    }
+
+    /// Returns the exact observed subject identity.
+    #[must_use]
+    pub(crate) const fn subject_id(&self) -> &str {
+        self.episode.subject_id.as_str()
+    }
+
+    /// Returns the exact observed scope identity.
+    #[must_use]
+    pub(crate) const fn scope_id(&self) -> &str {
+        self.episode.scope_id.as_str()
+    }
+
+    /// Returns the observed generation of the subject in this scope.
+    #[must_use]
+    pub(crate) const fn generation(&self) -> u64 {
+        self.episode.generation
+    }
+
+    /// Returns the discriminating failure class this episode is keyed on.
+    ///
+    /// The stored code is read back through the same closed parser this row's
+    /// own validation used, so a projection states exactly the class the row
+    /// validated rather than a copy that could drift from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the stored code names no class this
+    /// owner writes.
+    pub(crate) fn failure_class(&self) -> Result<FailureClass, SpoolError> {
+        FailureClass::from_code(&self.episode.failure_class).map_err(|_| {
+            SpoolError::Corrupt(
+                "watchdog signal episode failure class is not a stored class".to_owned(),
+            )
+        })
+    }
+
+    /// Returns the accepted revision of the currently open instance.
+    #[must_use]
+    pub(crate) const fn revision(&self) -> u64 {
+        self.episode.accepted_revision
+    }
+
+    /// Returns the evidence time of the newest **accepted** source event. A
+    /// retransmission never refreshes it, so this is the observation's own
+    /// recorded time and never a later clock reading.
+    #[must_use]
+    pub(crate) const fn evidence_observed_at_ms(&self) -> u64 {
+        self.episode.evidence_observed_at_ms
+    }
+
+    /// Returns this episode's own stored reopen condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the stored code names no condition
+    /// this owner writes.
+    pub(crate) fn reopen_condition(&self) -> Result<ReopenCondition, SpoolError> {
+        stored_reopen_condition(&self.episode.reopen_condition)
+    }
 }
 
 /// Per-episode table inside the same `watchdog.redb` file as the records it
@@ -849,6 +1102,19 @@ impl StoredSignalEpisode {
 /// acknowledgement-driven compaction the way an ordinary record can.
 pub(crate) const SIGNAL_EPISODE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_watchdog_spool_signal_episode_v1");
+
+/// Per-episode publication state, in the same `watchdog.redb` file and the same
+/// owner transaction as the episode row beside it.
+///
+/// It is a separate table rather than more fields on the episode row because the
+/// two rows answer different questions and I8.9 requires their axes to stay
+/// independent: the episode row answers "has this exact event already been
+/// accepted", and this one answers "which evidence has already been counted, and
+/// which intent did it already produce". A single row would make one axis a
+/// function of the other. They are written together, in one transaction, so the
+/// separation never becomes a window in which one is advanced without the other.
+pub(crate) const SIGNAL_PUBLICATION_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("eliot_watchdog_spool_signal_publication_v1");
 
 /// Derives the ledger key one episode row is filed under.
 ///
@@ -929,6 +1195,74 @@ pub(crate) fn write_episode(
         .map_err(|error| SpoolError::Serialization(error.to_string()))?;
     let mut table = write
         .open_table(SIGNAL_EPISODE_TABLE)
+        .map_err(|error| SpoolError::Database(error.to_string()))?;
+    table
+        .insert(ledger_key, bytes.as_slice())
+        .map_err(|error| SpoolError::Database(error.to_string()))?;
+    drop(table);
+    Ok(())
+}
+
+/// Reads and validates one stored publication row from a caller's already-open
+/// publication table.
+///
+/// Same shape and same reason as [`read_episode`]: the table is opened by the
+/// caller inside whichever transaction it already holds, and a missing row
+/// reports `None` for an episode that has published nothing. A present row is
+/// decoded strictly and validated against the ledger key it was read under, so
+/// a row that fails any of that fails closed — an unreadable publication state
+/// must never be treated as a fresh one, or a restart would republish a crossing
+/// the episode already published.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Corrupt`] when the stored row does not decode, is not
+/// canonical, or does not match the ledger key it was read under, and
+/// [`SpoolError::Database`] when the table cannot be read.
+pub(crate) fn read_publication_state<T>(
+    table: &T,
+    ledger_key: &str,
+) -> Result<Option<super::publication::PublicationState>, SpoolError>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    let Some(value) = table
+        .get(ledger_key)
+        .map_err(|error| SpoolError::Database(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let state: super::publication::PublicationState = serde_json::from_slice(value.value())
+        .map_err(|error| {
+            SpoolError::Corrupt(format!(
+                "watchdog publication state row is invalid: {error}"
+            ))
+        })?;
+    state.validate(ledger_key)?;
+    Ok(Some(state))
+}
+
+/// Persists one validated publication row inside a caller's write transaction.
+///
+/// It never opens a transaction of its own, so the caller can commit the
+/// appended publication record, this row, the advanced episode row and the
+/// spool's own high-water update as one atomic change.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Corrupt`] when the row is not canonical, and
+/// [`SpoolError::Database`] or [`SpoolError::Serialization`] when the row cannot
+/// be written.
+pub(crate) fn write_publication_state(
+    write: &WriteTransaction,
+    ledger_key: &str,
+    state: &super::publication::PublicationState,
+) -> Result<(), SpoolError> {
+    state.validate(ledger_key)?;
+    let bytes =
+        serde_json::to_vec(state).map_err(|error| SpoolError::Serialization(error.to_string()))?;
+    let mut table = write
+        .open_table(SIGNAL_PUBLICATION_TABLE)
         .map_err(|error| SpoolError::Database(error.to_string()))?;
     table
         .insert(ledger_key, bytes.as_slice())

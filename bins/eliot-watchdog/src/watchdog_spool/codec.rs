@@ -85,6 +85,48 @@ pub enum WatchdogSpoolPayload {
         lineage_epoch: u64,
         governor_unavailable_reason: GapRecoveryReason,
     },
+    /// Watchdog-owned Signal-linked publication intent (I8.1, I8.9, I13.7).
+    ///
+    /// One record per crossed, evidence-backed attention threshold, appended in
+    /// the same owner transaction as the failure-episode record and the evidence
+    /// advance that decided it. It is an observation about one immutable Signal
+    /// revision: it declares no canonical Problem, no canonical Incident, no
+    /// authorization and no resolution.
+    ///
+    /// Exported under the existing gap-like `Recovery` class — see
+    /// `super::publication` for why the shared owner-neutral payload kinds are
+    /// deliberately not extended.
+    ///
+    /// `class` has no Incident-declaring variant, so an `incident_candidate`
+    /// severity can only ever produce a *candidate* attention intent here.
+    /// `crossing_evidence` carries the exact distinct evidence identities this
+    /// revision contributed, so a retransmitted event — which contributes none —
+    /// is visible in the record itself. `distinct_evidence_count` is the total
+    /// compared against the owner-issued policy threshold, under `policy_id` and
+    /// `policy_revision`, so the record always states the policy it was decided
+    /// under. `intent_id` is the stable identity a lost acknowledgement resumes
+    /// under instead of minting a second intent.
+    PublicationIntent {
+        service: String,
+        intent_id: String,
+        signal_id: String,
+        signal_revision: u64,
+        rule_id: String,
+        rule_revision: u64,
+        policy_id: String,
+        policy_revision: u64,
+        class: super::publication::WatchdogPublicationClass,
+        subject_id: String,
+        scope_id: String,
+        generation: u64,
+        observed_at_ms: u64,
+        crossing_evidence: Vec<String>,
+        distinct_evidence_count: u32,
+        dedup_key: String,
+        lineage_installation_id: String,
+        lineage_generation: u64,
+        lineage_epoch: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -114,6 +156,7 @@ pub(crate) fn encode_entry(entry: &WatchdogSpoolEntry) -> Result<Vec<u8>, SpoolE
         ));
     }
     super::intent::check_stored_intent_payload(entry.observed_at_ms, &entry.payload)?;
+    super::publication::check_stored_publication_payload(entry.observed_at_ms, &entry.payload)?;
     Ok(bytes)
 }
 
@@ -161,6 +204,7 @@ pub(crate) fn decode_entry(sequence: u64, bytes: &[u8]) -> Result<WatchdogSpoolE
         )));
     }
     super::intent::check_stored_intent_payload(entry.observed_at_ms, &entry.payload)?;
+    super::publication::check_stored_publication_payload(entry.observed_at_ms, &entry.payload)?;
     Ok(entry)
 }
 
