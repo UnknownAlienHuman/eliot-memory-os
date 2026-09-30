@@ -140,7 +140,7 @@ pub use kernel_build_contract::{
     AuthorityDescriptorContour, AuthorityPreparationError, EliotdReceiptRootBinding,
     KernelBuildError,
 };
-pub use kernel_config::KernelConfig;
+pub use kernel_config::{KernelConfig, KernelStartupMode};
 pub(crate) use process_execution::{
     CanonicalStoreAttachmentTransaction, KernelPathAdmission, ProcessExecutionGateway,
     ProcessPathProof,

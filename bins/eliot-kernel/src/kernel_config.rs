@@ -28,6 +28,39 @@ use eliot_observability_runtime::RuntimeProfile;
 use eliot_platform_windows::FileIdentity;
 use eliot_runtime_contracts::RestartPolicyV1;
 
+/// Construction mode selected before the Kernel composition opens any
+/// mutable resource (I14.16, issue #1953).
+///
+/// `Active` is the existing behavior: the full authority-bearing capability
+/// set the Host injected (Store bootstrap, daemon launch, bridge admission,
+/// lease authority, process authority) is admitted and validated.
+///
+/// `ShadowCandidate` is the restricted I14.16 step-2/3 posture: the startup
+/// selects only immutable/read-only snapshot access plus the Host-injected
+/// candidate pipe, and refuses every authority-bearing input before any ORS
+/// open, migration, or durable session state exists. The same
+/// [`KernelService`](eliot_kernel_service::KernelService) lifecycle owner
+/// carries the composition afterwards — there is no second Kernel service
+/// implementation — and Host drives it from `Cold` through `Reconciling` to
+/// `ShadowNoAuthority` through the existing transition boundary once the
+/// candidate is reconciled, so the activation flow needs no new edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelStartupMode {
+    /// Normal authority-bearing construction.
+    Active,
+    /// I14.16 shadow candidate: snapshot inspection and compatibility
+    /// checks only, zero durable authority mutations.
+    ShadowCandidate,
+}
+
+impl KernelStartupMode {
+    /// Returns whether this mode is the restricted shadow-candidate posture.
+    #[must_use]
+    pub const fn is_shadow_candidate(self) -> bool {
+        matches!(self, Self::ShadowCandidate)
+    }
+}
+
 /// Explicit construction input for the Kernel process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelConfig {
@@ -147,6 +180,11 @@ pub struct KernelConfig {
     /// this requirement.
     #[cfg(windows)]
     pub(super) require_descriptor_supervision_authority: bool,
+    /// Construction mode selected before any mutable resource opens (I14.16,
+    /// issue #1953). `Active` admits the injected authority-bearing inputs;
+    /// `ShadowCandidate` restricts the composition to immutable snapshot
+    /// access plus the candidate pipe and refuses the rest before any effect.
+    pub startup_mode: KernelStartupMode,
 }
 
 impl KernelConfig {
@@ -186,7 +224,26 @@ impl KernelConfig {
             audit_fallback_profile: None,
             #[cfg(windows)]
             require_descriptor_supervision_authority: false,
+            startup_mode: KernelStartupMode::Active,
         }
+    }
+
+    /// Selects the I14.16 shadow-candidate construction mode (issue #1953).
+    ///
+    /// The mode itself performs no work: the composition constructors refuse
+    /// every authority-bearing input while it is selected, before any mutable
+    /// resource opens. Unselected compositions keep the existing `Active`
+    /// behavior exactly.
+    #[must_use]
+    pub fn with_shadow_candidate(mut self) -> Self {
+        // F-LOG-KERNEL-2 (#899): mode-selection observation only; the mode is
+        // retained verbatim and enforced by composition assembly.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.config.shadow_candidate_selected",
+        );
+        self.startup_mode = KernelStartupMode::ShadowCandidate;
+        self
     }
 
     /// Injects the Host-approved canonical-store bootstrap requirement.
