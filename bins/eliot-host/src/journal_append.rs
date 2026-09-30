@@ -4,6 +4,10 @@ pub(super) use readiness_append::{
     append_authenticated_kernel_readiness, append_authenticated_kernel_readiness_with_heartbeat,
 };
 
+use super::activation_lifecycle::{
+    CAPABILITY_CANONICAL_STORE, CAPABILITY_INDEPENDENT_SUPERVISION, CAPABILITY_RUNTIME_SUPERVISION,
+    requires_capability,
+};
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
@@ -669,6 +673,65 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     Ok(())
 }
 
+/// Ordered Host stop branches for one committed drain generation (I14.23,
+/// I1.5 idle-drain steps 5-8; #1682 admitted dependency graph as the Host
+/// owns it).
+///
+/// The set is derived from the generation's durable `requested_capabilities` —
+/// the same admitted set that gated the contour start in
+/// `start_manifest_contour` — never from registration order or a fixed pair.
+/// `runtime-supervision` maps to the Kernel branch and `canonical-store` to
+/// the canonical-store branch, in the order the Host stop applies them: the
+/// store bridge stops before the Kernel branch is retired, and I14.23 stops
+/// the store only when the commit snapshot proves no canonical-data lease
+/// remains outside it. `independent-supervision` contributes no Host stop
+/// branch: the Watchdog is an SCM-owned sibling, and Host never stops it
+/// merely because one module drains while its own obligations remain (I1.5
+/// step 7: Watchdog persists cursors and stops through SCM when no
+/// `SupervisionLease` remains).
+///
+/// An unknown capability or an empty admitted set fails closed: unknown work
+/// is retained as a visible recovery obligation, never silently omitted from
+/// the stop set, and an empty list is not proof of zero obligations.
+fn drain_commit_stop_branches(
+    activation: &EliotActivationRecord,
+) -> Result<Vec<PlatformHandle>, HostError> {
+    const KNOWN_CAPABILITIES: [&str; 3] = [
+        CAPABILITY_RUNTIME_SUPERVISION,
+        CAPABILITY_CANONICAL_STORE,
+        CAPABILITY_INDEPENDENT_SUPERVISION,
+    ];
+    let required = &activation.requested_capabilities;
+    if required.is_empty() {
+        return Err(HostError::RecoveryRequired(
+            "drain commit has no admitted capability set; refusing to linearize a stop set for a generation that proves no admitted work"
+                .to_owned(),
+        ));
+    }
+    for capability in required {
+        if !KNOWN_CAPABILITIES.contains(&capability.as_str()) {
+            return Err(HostError::RecoveryRequired(format!(
+                "drain commit names an admitted capability with no Host stop branch: {capability}; reconcile the generation before linearizing its stop set",
+                capability = capability.as_str()
+            )));
+        }
+    }
+    let mut branches = Vec::new();
+    if requires_capability(required, CAPABILITY_CANONICAL_STORE) {
+        branches.push(
+            PlatformHandle::new("canonical-store-branch")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        );
+    }
+    if requires_capability(required, CAPABILITY_RUNTIME_SUPERVISION) {
+        branches.push(
+            PlatformHandle::new("kernel-branch")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        );
+    }
+    Ok(branches)
+}
+
 /// Builds the I1.5 `DrainCommit` linearization record for Host stop,
 /// carrying the Kernel lease/receipt snapshot observed in the journal into
 /// `lease_and_pending_operation_snapshot`.
@@ -680,6 +743,13 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
 /// when the journal proves no lease or pending operation remains; callers
 /// must not substitute a placeholder. The `drain_generation` correlation
 /// binds this commit to the `Requested`/`Draining` records that precede it.
+///
+/// The committed `wake_during_drain_disposition` is `QueueNextGeneration`
+/// because the record is written at the linearization point itself: a wake
+/// before it cancels the drain through `note_observable_use`/`CancelDrain`
+/// after readiness revalidation, while a wake after it can only queue the
+/// next activation generation and never revives the fenced handles/leases.
+/// The stop-branch set comes from [`drain_commit_stop_branches`].
 pub(super) fn drain_commit_record_for_stop(
     snapshot: &HostState,
     activation: &EliotActivationRecord,
@@ -716,12 +786,7 @@ pub(super) fn drain_commit_record_for_stop(
         last_admission_closed_at: fresh_identity("host-admission-closed-at")?,
         lease_and_pending_operation_snapshot: lease_and_pending,
         authority_epochs_fenced: vec![activation.lineage.kernel_epoch.clone()],
-        processes_modules_and_store_branches_to_stop: vec![
-            PlatformHandle::new("canonical-store-branch")
-                .map_err(|error| HostError::Platform(error.to_string()))?,
-            PlatformHandle::new("kernel-branch")
-                .map_err(|error| HostError::Platform(error.to_string()))?,
-        ],
+        processes_modules_and_store_branches_to_stop: drain_commit_stop_branches(activation)?,
         wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
         irreversible_stage: PlatformHandle::new("authority-fenced")
             .map_err(|error| HostError::Platform(error.to_string()))?,
