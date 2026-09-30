@@ -864,7 +864,16 @@ impl SkillCatalogue {
 
     /// Installs one validated entry. Structural validation plus the tool
     /// owner's existence check both run: unknown tool references fail closed
-    /// here, never at first activation.
+    /// here, never at first activation. Admission also binds the promotion
+    /// gate (`I7.13`, issue #1882 W2/A2/A4): a `Current` entry carrying no
+    /// bound promotion evidence never passed promotion validation, so it is
+    /// unvalidated and is refused here — the same rule `is_usable`,
+    /// `activation_display`, and `HotsetDeliveryReceipt::issue` enforce. A
+    /// dependency-changed entry marked stale therefore cannot re-enter as
+    /// generally delivered through a wholesale reinstall: the only paths back
+    /// are governed revalidation to `Provisional`
+    /// (`revalidate_stale_to_provisional`) or promotion with
+    /// route-proportional evidence (`promote`/`promote_gated`).
     pub fn insert(
         &mut self,
         entry: SkillCatalogueEntry,
@@ -872,6 +881,12 @@ impl SkillCatalogue {
     ) -> Result<(), SkillError> {
         entry.validate()?;
         entry.body.validate_tools(tools)?;
+        if entry.status == SkillStatus::Current && entry.promotion_evidence.is_none() {
+            return Err(SkillError::InvalidField {
+                field: "entry.promotion_evidence",
+                reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
+            });
+        }
         self.entries.insert(entry.index.skill_id.clone(), entry);
         Ok(())
     }
