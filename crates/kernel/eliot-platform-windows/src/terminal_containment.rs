@@ -186,7 +186,8 @@ pub enum TerminalContainmentUnresolved {
     ForeignRecord,
     /// The retained record version is not the current fixed version.
     UnsupportedVersion,
-    /// A length, binding, or reserved field does not match the fixed encoding.
+    /// A length, binding, padding, or reserved field does not match the fixed
+    /// encoding.
     MalformedField,
     /// The record is a valid current fixed record, but it is not bound to the
     /// exact operation whose evidence was requested. An unbound record and a
@@ -387,9 +388,13 @@ pub fn submit_terminal_containment(
 
 /// Validates one retained record against the exact fixed encoding.
 ///
-/// A missing, short, foreign, stale-version, or malformed record stays
-/// [`TerminalContainmentUnresolved`] and is never a completed cleanup. When the
-/// record validates, its operation identity is bound to the exact preparation
+/// A missing, short, foreign, stale-version, malformed, or torn record stays
+/// [`TerminalContainmentUnresolved`] and is never a completed cleanup. The
+/// documented layout fixes both identity fields as NUL-padded fixed-width
+/// storage, so padding past the declared length is part of the integrity
+/// check: a torn or foreign record with nonzero padding is unresolved even
+/// when its magic, version, and length fields are intact. When the record
+/// validates, its operation identity is bound to the exact preparation
 /// that produced it; an unbound record is reported explicitly.
 pub fn validate_terminal_containment_readback(bytes: &[u8]) -> TerminalContainmentReadback {
     use TerminalContainmentUnresolved::{
@@ -418,6 +423,21 @@ pub fn validate_terminal_containment_readback(bytes: &[u8]) -> TerminalContainme
     if bytes[OFFSET_RESERVED] != 0
         || usize::from(site_len) > TERMINAL_CONTAINMENT_SITE_MAX_BYTES
         || usize::from(detail_len) > TERMINAL_CONTAINMENT_DETAIL_MAX_BYTES
+    {
+        return TerminalContainmentReadback::Unresolved(MalformedField);
+    }
+    // Both lengths are already proven to fit their fixed fields, so these
+    // padding slices are total and this check cannot panic. The encoder
+    // always starts from a zeroed record, so nonzero padding is a torn or
+    // foreign record, never a completed cleanup.
+    let site_content_end = OFFSET_SITE + usize::from(site_len);
+    let detail_content_end = OFFSET_DETAIL + usize::from(detail_len);
+    if bytes[site_content_end..OFFSET_DETAIL]
+        .iter()
+        .any(|byte| *byte != 0)
+        || bytes[detail_content_end..OFFSET_OPERATION_DIGEST]
+            .iter()
+            .any(|byte| *byte != 0)
     {
         return TerminalContainmentReadback::Unresolved(MalformedField);
     }
