@@ -86,6 +86,7 @@ use eliot_host_state::{
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::{LeaseState, RuntimeLease, WakeIntent, WakeIntentState};
+use serde::Serialize;
 
 use super::watchdog_publication::live_supervision_obligation;
 use super::{
@@ -281,7 +282,15 @@ impl IdleLeaseCensus {
 /// receives an activation result bound to the current Host/Kernel/Watchdog
 /// generations." Every field is a projection of one durable journal snapshot;
 /// nothing here is inferred from a live process, a pipe or a heartbeat.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Wire projection: every field already carries the owner's `Serialize`
+/// implementation, so this struct derives `Serialize` and can be placed on
+/// the runtime-control wire without a second spelling. STITCH: the
+/// `HostRuntimeControlResponse` member that carries it lives in
+/// `crates/kernel/eliot-host-service/src/runtime_control.rs`, outside this
+/// Host lifecycle file, and the emission point is the `envelope.respond`
+/// call in the runtime-control service loop; both belong to the owning lane.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActivationAdmission {
     /// Durable activation identity of the joined generation.
     pub activation_id: PlatformHandle,
@@ -464,6 +473,17 @@ impl HostComposition {
     /// readiness path in the same observation window. Anything other than an
     /// authenticated [`HostBranchDisposition::Healthy`] leaves the activation
     /// `Draining`: a cancelled drain never re-promotes readiness on its own.
+    ///
+    /// Reachability contract (STITCH, not redefined here): the sole production
+    /// caller is `HostIdleDrainSupervisor::observe_readiness`, which forwards
+    /// only [`HostBranchDisposition::Healthy`], and the sole production
+    /// producer of [`HostBranchDisposition::Healthy`] is the readiness gate
+    /// behind the exact-current-`Active` activation check in
+    /// `HostComposition::reconcile_branch_readiness_at`. A `Draining`
+    /// generation with a `Cancelled` drain therefore needs those two
+    /// out-of-file gates to admit its revalidation path before this resume
+    /// can run; this function itself already accepts exactly that proof and
+    /// performs the single `Active` transition through the journal owner.
     ///
     /// # Errors
     ///
@@ -1230,6 +1250,12 @@ const RUNTIME_LEASE_VALIDITY_MS: u64 = 60_000;
 /// can reactivate a terminal
 /// revision: revision chaining through the owner `transition_to` legality is
 /// the writer lane's own commit rule.
+///
+/// STITCH: the `Active` to `Reconciling` row producer has no call site yet;
+/// it belongs beside the existing `Revoked`/`Expired`/`Superseded` arms in
+/// the Kernel writer lane (`bins/eliot-kernel/src/control_plane.rs`), the
+/// only lane that re-records rows through the ORS owner. This file holds
+/// references, never rows, so it cannot produce that transition.
 ///
 /// # Errors
 ///
