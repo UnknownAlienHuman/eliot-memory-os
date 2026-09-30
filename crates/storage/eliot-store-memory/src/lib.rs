@@ -390,6 +390,7 @@ impl MemoryStore {
         // the learning legs and before the receipt is built, so the row, the
         // receipt, and the outbox intents still commit atomically below.
         dispatch_apply_capability_evidence(&mut state, &transition, &mut plan)?;
+        dispatch_apply_module_registry_snapshot(&mut state, &transition)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
@@ -729,6 +730,97 @@ fn dispatch_apply_finish_evidence(
     let record = RecoveryRecord {
         namespace: CANONICAL_OWNER_NAMESPACE.to_owned(),
         key: CANONICAL_OWNER_KEY.to_owned(),
+        state_fence: transition.state_fence.clone(),
+        revision,
+        schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+        value_digest: sha256_hex(&payload),
+        payload,
+    };
+    record.validate()?;
+    state.recovery_records.insert(key, record);
+    Ok(())
+}
+
+const MODULE_REGISTRY_OWNER_NAMESPACE: &str = "owner";
+const MODULE_REGISTRY_OWNER_KEY: &str = "module_registry";
+
+/// Applies the Governor-produced Module Catalog snapshot under the same lock
+/// as its canonical write receipt. The memory backend mirrors the durable
+/// `owner/module_registry` fenced revision CAS and keeps snapshot meaning with
+/// the Governor.
+fn dispatch_apply_module_registry_snapshot(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation == NamedMutationOperation::RecordModuleCatalogSnapshot
+    }) else {
+        return Ok(());
+    };
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let expected_revision = text_param("expected_module_registry_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "expected_module_registry_revision must be a decimal revision",
+        })?;
+    if expected_revision == 0 {
+        return Err(StoreError::InvalidField {
+            field: "module_registry.owner_revision",
+            reason: "the genesis owner record must already exist",
+        });
+    }
+    let snapshot_json = text_param("snapshot_json")?;
+    if snapshot_json.is_empty() {
+        return Err(StoreError::Empty {
+            field: "module_registry.snapshot_json",
+        });
+    }
+    if snapshot_json.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+
+    let key = RecoveryRecordKey::new(
+        MODULE_REGISTRY_OWNER_NAMESPACE,
+        MODULE_REGISTRY_OWNER_KEY,
+    )?;
+    let Some(existing) = state.recovery_records.get(&key) else {
+        return Err(StoreError::RevisionConflict);
+    };
+    if existing.namespace != MODULE_REGISTRY_OWNER_NAMESPACE
+        || existing.key != MODULE_REGISTRY_OWNER_KEY
+        || existing.schema != OWNER_SNAPSHOT_SCHEMA
+    {
+        return Err(StoreError::RevisionConflict);
+    }
+    if existing.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if existing.revision != expected_revision {
+        return Err(StoreError::RevisionConflict);
+    }
+    let revision = expected_revision
+        .checked_add(1)
+        .ok_or(StoreError::InvalidField {
+            field: "module_registry.owner_revision",
+            reason: "revision overflow",
+        })?;
+    let payload = snapshot_json.as_bytes().to_vec();
+    let record = RecoveryRecord {
+        namespace: MODULE_REGISTRY_OWNER_NAMESPACE.to_owned(),
+        key: MODULE_REGISTRY_OWNER_KEY.to_owned(),
         state_fence: transition.state_fence.clone(),
         revision,
         schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
@@ -3556,6 +3648,7 @@ fn validate_transaction_state(
                 command.operation,
                 NamedMutationOperation::RecordFinishDecision
                     | NamedMutationOperation::RecordFinishEvidence
+                    | NamedMutationOperation::RecordModuleCatalogSnapshot
                     | NamedMutationOperation::ApplySwarmOwnerRevisions
             )
         })

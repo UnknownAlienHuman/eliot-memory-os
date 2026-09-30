@@ -3783,6 +3783,11 @@ pub enum NamedMutationOperation {
     /// through the same fenced `RecoverySchema` transition. The store treats
     /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
     RecordFinishEvidence,
+    /// Persists the Governor-owned Module Catalog snapshot through the
+    /// fenced `RecoverySchema` transition. The store treats the snapshot as
+    /// opaque bytes and only arbitrates the fixed `owner/module_registry`
+    /// revision. Admission currentness remains a Governor readback decision.
+    RecordModuleCatalogSnapshot,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -3903,6 +3908,7 @@ impl NamedMutationOperation {
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
+            | Self::RecordModuleCatalogSnapshot
             | Self::RecordAuthorityRevocation => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,
