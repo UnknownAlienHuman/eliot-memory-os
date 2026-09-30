@@ -905,6 +905,16 @@ impl ShutdownDrainCoordinator {
             pending: state.pending.iter().cloned().collect(),
             fenced_activation_generations: state.fenced_activation_generations.clone(),
         };
+        // The write path is held to the same contract the recovery read path
+        // enforces: a candidate the next process's `load` would refuse is
+        // never written, so a reported success always names resumable durable
+        // state instead of bricking the next resume.
+        if let Err(reason) = validate_durable_state(&durable) {
+            observe_shutdown("kernel.shutdown.persist_failed", "rejected");
+            return Err(format!(
+                "shutdown state candidate fails recovery validation: {reason}"
+            ));
+        }
         let payload = match serde_json::to_vec(&durable) {
             Ok(payload) => payload,
             Err(error) => {
@@ -912,6 +922,13 @@ impl ShutdownDrainCoordinator {
                 return Err(format!("shutdown state serialization failed: {error}"));
             }
         };
+        // The bounded reader refuses files past `DRAIN_STATE_MAX_BYTES`; the
+        // writer refuses to produce one, so no successful persist can brick
+        // the next load through size alone.
+        if payload.len() as u64 > DRAIN_STATE_MAX_BYTES {
+            observe_shutdown("kernel.shutdown.persist_failed", "rejected");
+            return Err("shutdown state payload exceeds the bounded decode limit".to_owned());
+        }
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         if let Err(error) = fs::create_dir_all(parent) {
             observe_shutdown("kernel.shutdown.persist_failed", "rejected");

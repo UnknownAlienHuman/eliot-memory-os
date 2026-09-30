@@ -4551,6 +4551,32 @@ impl KernelComposition {
         }
         coordinator.observe_published_state();
         process_result?;
+        // #1686 (I14.23): the emergency/incomplete path still stops the
+        // executor/runtime above, but its process result must not read as
+        // graceful success. A retained drain halt reaches the requesting
+        // owner as a typed failure; the Incomplete terminal above already
+        // retains the exact residuals for recovery.
+        Self::drain_process_outcome(&drain, runtime_outcome)
+    }
+
+    /// Maps the retained drain outcome to the process result the requesting
+    /// owner observes (#1686, I14.23). A halted drain is a typed failure even
+    /// though the executor/runtime above already stopped; a completed drain
+    /// returns the runtime outcome unchanged.
+    fn drain_process_outcome(
+        drain: &Result<DrainCommitDecision, DrainHalt>,
+        runtime_outcome: ShutdownOutcome,
+    ) -> Result<ShutdownOutcome, ProcessExecutionError> {
+        if let Err(halt) = drain {
+            if halt.pending.is_empty() {
+                return Err(ProcessExecutionError::Unavailable(halt.reason.to_owned()));
+            }
+            return Err(ProcessExecutionError::Unavailable(format!(
+                "{}: {}",
+                halt.reason,
+                halt.pending.join(", ")
+            )));
+        }
         Ok(runtime_outcome)
     }
 
@@ -4566,10 +4592,79 @@ impl KernelComposition {
         coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,
     ) -> Result<DrainCommitDecision, DrainHalt> {
         let generation = coordinator.drain_generation();
+        // Maps one coordinator refusal to the halt the incomplete-shutdown
+        // terminal retains (#1686, I14.23). Known coordinator literals are
+        // kept verbatim as the halt reason; dynamic refusal detail (phase
+        // names, counts, io errors) is classified by its stable shape and the
+        // complete text is retained in the halt pending set, so no refusal is
+        // substituted or dropped on the way to the requesting owner.
+        let refusal_halt = |reason: String, mut pending: Vec<String>| -> DrainHalt {
+            let verbatim: Option<&'static str> = match reason.as_str() {
+                "no shutdown requested" => Some("no shutdown requested"),
+                "drain generation already terminated" => {
+                    Some("drain generation already terminated")
+                }
+                "pre-commit phase after drain linearization" => {
+                    Some("pre-commit phase after drain linearization")
+                }
+                "intentional publication before drain linearization" => {
+                    Some("intentional publication before drain linearization")
+                }
+                "phase evidence cannot be rewritten" => Some("phase evidence cannot be rewritten"),
+                "drain cancelled by pre-linearization wake" => {
+                    Some("drain cancelled by pre-linearization wake")
+                }
+                "drain decision conflicts with linearized commit" => {
+                    Some("drain decision conflicts with linearized commit")
+                }
+                "drain decision carries a foreign generation" => {
+                    Some("drain decision carries a foreign generation")
+                }
+                "drain decision generation is empty" => Some("drain decision generation is empty"),
+                "drain decision carries unreconciled pending snapshot" => {
+                    Some("drain decision carries unreconciled pending snapshot")
+                }
+                "drain decision names no fenced authority epoch" => {
+                    Some("drain decision names no fenced authority epoch")
+                }
+                "drain decision names a blank branch to stop" => {
+                    Some("drain decision names a blank branch to stop")
+                }
+                "drain decision records a no-drain wake disposition" => {
+                    Some("drain decision records a no-drain wake disposition")
+                }
+                "drain decision names no irreversible stage" => {
+                    Some("drain decision names no irreversible stage")
+                }
+                "drain decision names no recovery owner" => {
+                    Some("drain decision names no recovery owner")
+                }
+                "shutdown state payload exceeds the bounded decode limit" => {
+                    Some("shutdown state payload exceeds the bounded decode limit")
+                }
+                _ => None,
+            };
+            if let Some(kept) = verbatim {
+                return DrainHalt::with_pending(kept, pending);
+            }
+            let class: &'static str = if reason.starts_with("shutdown state ") {
+                "shutdown-state-persist-failed"
+            } else if reason.starts_with("phase ") && reason.contains(" missing before ") {
+                "drain-phase-order-unproven"
+            } else if reason.ends_with(" pending receipts unresolved") {
+                "drain-pending-unresolved"
+            } else if reason.starts_with("fenced activation generation is invalid: ") {
+                "fenced-activation-generation-invalid"
+            } else {
+                "coordinator-refusal-unclassified"
+            };
+            pending.push(reason);
+            DrainHalt::with_pending(class, pending)
+        };
         let record = |phase: ShutdownPhase, evidence: String| {
             coordinator
                 .record_phase(phase, evidence)
-                .map_err(|_| DrainHalt::new("phase-record-rejected"))
+                .map_err(|reason| refusal_halt(reason, Vec::new()))
         };
 
         // AdmissionsClosed: the service gate closes normal admission; the
@@ -4823,9 +4918,9 @@ impl KernelComposition {
         if coordinator.cancelled_by_wake() {
             return Err(DrainHalt::new("drain-cancelled-by-wake"));
         }
-        coordinator.commit_drain(decision.clone()).map_err(|_| {
-            DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
-        })?;
+        coordinator
+            .commit_drain(decision.clone())
+            .map_err(|reason| refusal_halt(reason, coordinator.pending_receipts()))?;
         // Issue #1837 / I14.23 W1: durable audit evidence for the drain commit,
         // read back from the coordinator *after* the linearization is durable
         // so the record carries the boundary that was actually persisted rather
