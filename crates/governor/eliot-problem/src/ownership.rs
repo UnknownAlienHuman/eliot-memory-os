@@ -57,7 +57,7 @@ pub enum OwnerRoute {
     SystemOwnerRecoveryPrincipal,
     /// Architecture gaps go to the Architecture Owner.
     ArchitectureOwner,
-    /// Verifier/evidence gaps go to the WorkScope Owner or Task Controller.
+    /// Verifier/evidence gaps go to the `WorkScope` Owner or Task Controller.
     WorkScopeOwnerOrTaskController,
     /// Module health goes to the module owner or Doctor.
     ModuleOwnerOrDoctor,
@@ -320,7 +320,9 @@ impl AuthenticatedOwnerLease {
         issuer: &dyn OwnerLeaseIssuer,
     ) -> Result<Self, ProblemError> {
         let expected = grant.expected_commitment()?;
-        let held = issuer.commitment_for(grant).ok_or(ProblemError::OwnerLeaseMismatch)?;
+        let held = issuer
+            .commitment_for(grant)
+            .ok_or(ProblemError::OwnerLeaseMismatch)?;
         if held != expected {
             return Err(ProblemError::OwnerLeaseMismatch);
         }
@@ -486,7 +488,7 @@ impl UnassignedOwnership {
             });
         }
         match (&self.lost_lease, self.reason) {
-            (Some(identity), OwnerLossReason::LegacyRecordWithoutLease) => {
+            (Some(_), OwnerLossReason::LegacyRecordWithoutLease) => {
                 return Err(ProblemError::InvalidField {
                     field: "lost_lease",
                     reason: "a legacy record without a lease cannot name a lost lease",
