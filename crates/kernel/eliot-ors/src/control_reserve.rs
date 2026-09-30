@@ -54,8 +54,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
-    CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
+    CapacityBottleneck, CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
     EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
     I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
     I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
@@ -850,18 +850,18 @@ fn owner_capacity_row(
     };
     let normal_limit = limit("ors_reserve.normal_limit", normal_capacity)?;
     let protected_limit = limit("ors_reserve.protected_limit", protected_capacity)?;
-    let physical_total = normal_capacity
-        .checked_add(protected_capacity)
-        .ok_or(OrsReserveError::InvalidField {
-            field: "ors_reserve.physical_total_limit",
-            reason: "disjoint partition capacities overflow the physical total",
-        })?;
-    let physical_total_limit = NonZeroU64::new(physical_total).ok_or(
-        OrsReserveError::InvalidField {
+    let physical_total =
+        normal_capacity
+            .checked_add(protected_capacity)
+            .ok_or(OrsReserveError::InvalidField {
+                field: "ors_reserve.physical_total_limit",
+                reason: "disjoint partition capacities overflow the physical total",
+            })?;
+    let physical_total_limit =
+        NonZeroU64::new(physical_total).ok_or(OrsReserveError::InvalidField {
             field: "ors_reserve.physical_total_limit",
             reason: "physical total must be greater than zero",
-        },
-    )?;
+        })?;
     let row = BottleneckCapacityProfile {
         bottleneck,
         coverage_state: BottleneckCoverageState::Claimed,

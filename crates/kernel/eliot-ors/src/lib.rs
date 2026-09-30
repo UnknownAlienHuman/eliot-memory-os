@@ -48,8 +48,8 @@ pub use backup_snapshot::{
     RowFamilyDisposition, RowFamilyKind, RowPayloadState, StoredEffectClass,
 };
 pub use control_reserve::{
-    ORS_DURABLE_BYTES_BOTTLENECK, ORS_TRANSACTION_BOTTLENECK, OrsDimension, OrsOwnerEvidenceContext,
-    OrsPermit, OrsPermitOperation, OrsReserve, OrsReserveError,
+    ORS_DURABLE_BYTES_BOTTLENECK, ORS_TRANSACTION_BOTTLENECK, OrsDimension,
+    OrsOwnerEvidenceContext, OrsPermit, OrsPermitOperation, OrsReserve, OrsReserveError,
 };
 pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
