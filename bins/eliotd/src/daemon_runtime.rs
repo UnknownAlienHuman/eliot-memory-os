@@ -2473,6 +2473,12 @@ async fn publish_maintenance_source_results(
                         "the retained durable job revision is unavailable, so its owed observation is unverified"
                             .to_owned(),
                     ),
+                    eliot_maintenance::OutstandingOutcome::NoResultDeclared { job_ref } => (
+                        job_ref,
+                        String::new(),
+                        "the declared job has reached no result-bearing state, so it owes no outcome observation yet"
+                            .to_owned(),
+                    ),
                 };
                 tracing::warn!(
                     target: "eliotd::diagnostics",

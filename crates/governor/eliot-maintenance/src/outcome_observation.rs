@@ -138,13 +138,6 @@ pub enum MaintenanceOutcomeDisposition {
     /// against a plausible outcome and never back-filled with one written
     /// after the fact.
     ObservationOwed(OutstandingOutcomeObligation),
-    /// The declared job has no retained revision in the set that was read
-    /// back. Unavailable, not observed: an unreadable job is never counted as
-    /// an admitted outcome.
-    RevisionUnavailable {
-        /// The durable job identity the expected set declared.
-        job_ref: String,
-    },
 }
 
 /// One job identity the maintenance owner declares owes an outcome
@@ -173,15 +166,24 @@ pub struct ObservedOutcomeObservation {
 
 /// One declared job that is not fully observed.
 ///
-/// Both arms are outstanding work on the observation path, and neither is a
-/// reconciled result: one is an explicit obligation over work that really
-/// happened, the other is a revision that could not be read at all.
+/// Each arm is outstanding on the observation path, and none of them is a
+/// reconciled result. One is an explicit obligation over work that really
+/// happened, one is a revision that could not be read at all, and one is a
+/// declared job that has not reached a result state — its owed outcome does not
+/// exist yet rather than having been lost.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OutstandingOutcome {
     /// The job performed work and no observation was admitted for it.
     ObservationOwed(OutstandingOutcomeObligation),
     /// The declared job has no retained revision in the set that was read.
     RevisionUnavailable {
+        /// The durable job identity the expected set declared.
+        job_ref: String,
+    },
+    /// The declared job is retained but has reached no result-bearing state, so
+    /// it owes no outcome yet. Kept distinct from an admitted observation and
+    /// from a lost one.
+    NoResultDeclared {
         /// The durable job identity the expected set declared.
         job_ref: String,
     },
@@ -315,7 +317,7 @@ pub fn outcome_observation_coverage(
             }),
             Some(job) => match outcome_observation_disposition(job, admitted)? {
                 MaintenanceOutcomeDisposition::NoResultDeclared => {
-                    coverage.outstanding.push(OutstandingOutcome::RevisionUnavailable {
+                    coverage.outstanding.push(OutstandingOutcome::NoResultDeclared {
                         job_ref: entry.job_id.clone(),
                     });
                 }
@@ -329,11 +331,6 @@ pub fn outcome_observation_coverage(
                 }),
                 MaintenanceOutcomeDisposition::ObservationOwed(obligation) => {
                     coverage.outstanding.push(OutstandingOutcome::ObservationOwed(obligation));
-                }
-                MaintenanceOutcomeDisposition::RevisionUnavailable { job_ref } => {
-                    coverage.outstanding.push(OutstandingOutcome::RevisionUnavailable {
-                        job_ref,
-                    });
                 }
             },
         }

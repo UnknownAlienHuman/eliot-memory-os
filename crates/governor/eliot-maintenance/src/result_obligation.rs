@@ -285,7 +285,11 @@ pub(crate) const fn result_outcome(
 /// A pure function of the source event and its revisions: the job identity, the
 /// lifecycle state and the attempt ordinal. Retry time is deliberately absent, so
 /// republishing the same source result republishes the same identity.
-pub(crate) fn publication_id_for(job_id: &str, state: MaintenanceJobState, attempts: u32) -> String {
+pub(crate) fn publication_id_for(
+    job_id: &str,
+    state: MaintenanceJobState,
+    attempts: u32,
+) -> String {
     format!("maintenance-result:{job_id}:{state}:{attempts}")
 }
 
