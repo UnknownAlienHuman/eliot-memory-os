@@ -5142,7 +5142,10 @@ mod tests {
             panic!("first successful response must carry the bootstrap")
         };
         assert!(
-            !bootstrap.governance.limiting_integration_evidence.is_empty(),
+            !bootstrap
+                .governance
+                .limiting_integration_evidence
+                .is_empty(),
             "bootstrap must carry limiting integration evidence"
         );
         let mut second = Response::Forwarded {
