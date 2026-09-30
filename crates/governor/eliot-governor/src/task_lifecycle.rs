@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{
-    OperationId, RequestMetadata, StateFence, TaskId, TaskRevision, canonical_json_bytes,
+    OperationId, RequestMetadata, SessionId, StateFence, TaskId, TaskRevision, canonical_json_bytes,
     sha256_hex,
 };
 use eliot_learning_contracts::{
@@ -781,14 +781,14 @@ fn bind_task_selection_to_envelope(
         .metadata
         .session_id
         .as_ref()
-        .map(|id| id.as_str())
+        .map(SessionId::as_str)
         != Some(selection.session_ref())
         || identity
             .request
             .metadata
             .task_id
             .as_ref()
-            .map(|id| id.as_str())
+            .map(TaskId::as_str)
             != Some(record.task_id.as_str())
         || selection.task_ref() != record.task_id.as_str()
         || evidence.task_ref != record.task_id.as_str()
@@ -807,7 +807,9 @@ fn bind_task_selection_to_envelope(
     let operation = envelope
         .semantic_commands
         .first_mut()
-        .ok_or_else(|| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))?;
+        .ok_or(TaskLifecycleError::Owner(TaskError::InvalidField(
+            "task_envelope",
+        )))?;
     let parameters = &mut operation.parameters;
     parameters.insert(
         "task_selection_evidence_json".to_owned(),
