@@ -19,7 +19,8 @@ use eliot_ors::{
 use eliot_process::{
     DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority, DispatchValidationContext,
     KernelDispatchKey, OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest,
-    OriginControlGrant, OriginControlPresentation, OriginGrantEffectOutcome, PermitIssuance,
+    OriginChallengeReplayEntry, OriginControlGrant, OriginControlPresentation,
+    OriginGrantEffectOutcome, PermitIssuance,
     ProcessExecutionAdmissionRequest, ProcessIntent, ProcessOwnerBinding, ProcessRequest,
     ProcessStartReceipt, RecoveryCapability, SuspendedProcessIdentity, ValidatedDispatch,
 };
@@ -337,6 +338,26 @@ impl ProcessDispatchAuthorityController {
         self.ensure_binding(binding)?;
         self.origin_authority
             .grant_effect_outcome(request_nonce)
+            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))
+    }
+
+    /// Reads the original admitted target/operation for one decided origin
+    /// challenge nonce without touching authority state (issue #1775 A-crash).
+    ///
+    /// The reconciliation query path: after crash or lost response the effect
+    /// boundary reads the durable issuance record — installation, operation,
+    /// generation, fence, window and effect outcome — and reconciles the
+    /// original target/operation instead of minting a fresh nonce to repeat
+    /// an unknown effect. A proven remaining action needs a separately
+    /// admitted new proof through [`Self::decide_origin_control`].
+    pub fn origin_grant_reconciliation_source(
+        &self,
+        request_nonce: &str,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<OriginChallengeReplayEntry> {
+        self.ensure_binding(binding)?;
+        self.origin_authority
+            .grant_reconciliation_source(request_nonce)
             .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))
     }
 

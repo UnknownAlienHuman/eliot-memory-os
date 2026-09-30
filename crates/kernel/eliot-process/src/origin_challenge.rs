@@ -742,6 +742,23 @@ pub struct OriginChallengeReplayEntry {
 }
 
 impl OriginChallengeReplayEntry {
+    /// Returns the admitted operation class of the original challenge.
+    ///
+    /// The reconciliation query path reads this to bind a separately
+    /// admitted new proof to the same operation the consumed one-shot funded —
+    /// never a fresh nonce for an unknown effect.
+    pub fn operation(&self) -> OriginControlOperation {
+        self.operation
+    }
+
+    /// Returns the durable one-shot effect outcome for the original nonce.
+    ///
+    /// `Unknown` means the funded effect is unproven: the caller returns
+    /// reconciliation-required instead of re-executing.
+    pub fn effect_outcome(&self) -> OriginGrantEffectOutcome {
+        self.effect
+    }
+
     fn validate(&self) -> Result<(), ContractError> {
         validate_token("request_nonce", self.nonce.clone(), MAX_NONCE_LEN)?;
         validate_origin_digest(self.origin_digest.clone())?;
@@ -1195,6 +1212,52 @@ impl OriginChallengeAuthority {
             });
         }
         Ok(entry.effect)
+    }
+
+    /// Reads the original admitted target/operation for one decided challenge
+    /// nonce without consuming anything or minting a fresh proof.
+    ///
+    /// The reconciliation query half of [`Self::record_grant_effect`]: after
+    /// crash or lost response the caller reads the durable issuance record —
+    /// installation, operation, generation, fence, window and effect outcome —
+    /// through the validated [`OriginChallengeReplayEntry`] and reconciles
+    /// the original target/operation through the retained owner binding and
+    /// handles. A proven remaining action needs a separately admitted new
+    /// proof through [`Self::decide`]; this read never mints one, so an
+    /// unknown effect is never repeated under a fresh nonce. Unknown and
+    /// never-decided nonces fail with the existing typed nonce failures.
+    pub fn grant_reconciliation_source(
+        &self,
+        request_nonce: &str,
+    ) -> Result<OriginChallengeReplayEntry, ContractError> {
+        let entry = self
+            .issued
+            .get(request_nonce)
+            .ok_or(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "unknown challenge nonce",
+            })?;
+        if !self.consumed_nonces.contains(request_nonce) {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "challenge was never decided",
+            });
+        }
+        let replay = OriginChallengeReplayEntry {
+            nonce: request_nonce.to_owned(),
+            origin_digest: entry.origin_digest.clone(),
+            physical_digest: entry.physical_digest.clone(),
+            installation_id: entry.installation_id.clone(),
+            generation: entry.generation,
+            state_fence: entry.state_fence.clone(),
+            operation: entry.operation,
+            issued_at_unix_ms: entry.issued_at_unix_ms,
+            expires_at_unix_ms: entry.expires_at_unix_ms,
+            effect: entry.effect,
+            revoked: entry.revoked,
+        };
+        replay.validate()?;
+        Ok(replay)
     }
 
     /// Returns how many challenges were consumed by decisions.
