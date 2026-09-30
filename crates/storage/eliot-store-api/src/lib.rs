@@ -228,9 +228,9 @@ pub use named_mutation_receipt::{
 };
 
 pub use swarm_owner_revisions::{
-    SwarmOwnerRevision, SwarmOwnerRevisionBatch, SwarmSemanticOwnerKind,
+    SwarmOwnerAuthorization, SwarmOwnerRevision, SwarmOwnerRevisionBatch, SwarmSemanticOwnerKind,
     decode_swarm_owner_revisions, swarm_owner_revisions_request,
-    validate_swarm_owner_revision_transition,
+    validate_swarm_owner_revision_authorization, validate_swarm_owner_revision_transition,
 };
 
 pub use wire::{

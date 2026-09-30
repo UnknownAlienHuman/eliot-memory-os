@@ -1,10 +1,16 @@
 //! Closed Store wire contract for owner-separated swarm revision persistence.
 //!
-//! `ApplySwarmOwnerRevisions` is an unactivated Store contract. The catalogue
-//! keeps it unsupported until Governor owner-specific authorization evidence
-//! is carried and verified at this boundary. Its closed envelope binds full
-//! canonical owner-record bytes to SHA-256; it does not decide semantic rights
-//! or ORS activation.
+//! `ApplySwarmOwnerRevisions` is an ACTIVATED Store contract (issue #1702).
+//! It is admitted only when the owner-specific authorization evidence travels
+//! with the write: [`SwarmOwnerAuthorization`] is carried inside
+//! [`SwarmOwnerRevision`] and verified at this boundary against BOTH the
+//! record's own owner lease and the authenticated identity the Kernel bound to
+//! the transition. A caller-supplied role/lease label is therefore not a label
+//! the record may assert about itself — it is compared with the owner field the
+//! record itself carries and with the transition the Store is executing.
+//!
+//! The closed envelope binds full canonical owner-record bytes to SHA-256; it
+//! does not decide semantic rights or ORS activation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -95,12 +101,114 @@ impl SwarmSemanticOwnerKind {
     }
 }
 
+/// Owner-specific authorization evidence carried WITH the owner revision
+/// (issue #1702 W3, I10.15 "each definition revision is authored only by the
+/// Task Controller").
+///
+/// Why this exists rather than trusting the record: a valid payload digest
+/// proves the bytes are intact, never that their author held authority. Before
+/// this field the only lease evidence in the envelope was the `controller` /
+/// `coordinator` object INSIDE the record being committed, so the author
+/// effectively appointed itself. This struct makes the claim a separate,
+/// comparable datum, and
+/// [`validate_swarm_owner_revision_transition`] together with
+/// [`validate_swarm_owner_revision_authorization`] checks it against three
+/// independent things:
+///
+/// 1. the revision's own declared owner kind, so a coordinator's evidence
+///    cannot open a definition's stream;
+/// 2. the owner lease the RECORD ITSELF carries (`controller` /
+///    `coordinator`), so a record cannot claim a holder or epoch its own owner
+///    fields do not carry; and
+/// 3. the authenticated request source the Store is executing for
+///    ([`crate::RequestMeta::source_id`]), so a caller cannot relabel its own
+///    role or present a foreign principal.
+///
+/// The Governor admission record carries no lease of its own — I10.15 gives
+/// `SwarmPlanAdmission` a policy/capability/fence and a receipt, not a lease —
+/// so for that owner the evidence is bound to the authenticated request alone.
+/// That asymmetry is stated rather than papered over with an invented Governor
+/// lease type.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmOwnerAuthorization {
+    /// Semantic owner the presenting principal is claiming to be.
+    ///
+    /// Never taken on trust: [`SwarmOwnerRevision::validate`] requires it to
+    /// equal the revision's own `owner_kind`, so a caller may not present a
+    /// coordinator's evidence on a definition's stream.
+    pub owner_kind: SwarmSemanticOwnerKind,
+    /// Authenticated presenting source identity, as bound by the Kernel on
+    /// `RequestMeta::source_id` for the request being executed.
+    pub presenter: String,
+    /// Owner lease epoch the presenter claims.
+    ///
+    /// For the definition and execution owners this must equal the record's own
+    /// `controller.epoch` / `coordinator.epoch`. It is the owner's own tenure
+    /// counter, deliberately NOT the transition's authority epoch: those are
+    /// different quantities and requiring them to be numerically equal would
+    /// reject valid writes as soon as the two counters diverged.
+    pub epoch: u64,
+}
+
+impl SwarmOwnerAuthorization {
+    /// Validates the closed shape of the presented evidence.
+    fn validate(&self) -> Result<(), StoreError> {
+        validate_text(&self.presenter, "swarm.authorization.presenter")?;
+        if self.epoch == 0 {
+            return Err(StoreError::InvalidField {
+                field: "swarm.authorization.epoch",
+                reason: "owner epoch is never zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Reads the `(holder, epoch)` pair out of a record's own owner lease object.
+///
+/// Returns an error rather than a default: a record whose lease is absent or
+/// whose epoch is not an integer cannot supply authorization evidence, and
+/// quietly falling back to the transition's epoch would let any presenter pass.
+fn read_lease(
+    object: &serde_json::Map<String, Value>,
+    lease_field: &'static str,
+) -> Result<(String, u64), StoreError> {
+    let lease =
+        object
+            .get(lease_field)
+            .and_then(Value::as_object)
+            .ok_or(StoreError::InvalidField {
+                field: "swarm.record_json",
+                reason: lease_field,
+            })?;
+    let holder = lease
+        .get("holder")
+        .and_then(Value::as_str)
+        .filter(|holder| !holder.trim().is_empty())
+        .ok_or(StoreError::InvalidField {
+            field: "swarm.record_json",
+            reason: lease_field,
+        })?;
+    let epoch = lease
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch != 0)
+        .ok_or(StoreError::InvalidField {
+            field: "swarm.record_json",
+            reason: lease_field,
+        })?;
+    Ok((holder.to_owned(), epoch))
+}
+
 /// Full immutable record bytes and owner-revision compare-and-set metadata.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwarmOwnerRevision {
     /// Semantic owner fixed by record kind: definition, admission or execution.
     pub owner_kind: SwarmSemanticOwnerKind,
+    /// Owner-specific authorization evidence verified at this boundary.
+    pub authorization: SwarmOwnerAuthorization,
     /// Stable ID of the definition, admission or execution object.
     pub owner_id: String,
     /// Monotonic Store-owned revision for this semantic object.
@@ -117,8 +225,25 @@ impl SwarmOwnerRevision {
     /// Validates identity, owner-specific record shape, CAS progression and bytes.
     pub fn validate(&self) -> Result<(), StoreError> {
         self.validate_revision_identity()?;
+        self.validate_authorization()?;
         let value = self.canonical_record_value()?;
         self.validate_owner_record(&value)
+    }
+
+    /// Requires the presented authorization to name this revision's own owner.
+    ///
+    /// A cross-owner presentation is refused here, before any record is read:
+    /// coordinator evidence cannot open a definition stream, and a definition
+    /// record cannot be committed as if the Governor had written it.
+    fn validate_authorization(&self) -> Result<(), StoreError> {
+        self.authorization.validate()?;
+        if self.authorization.owner_kind != self.owner_kind {
+            return Err(StoreError::InvalidField {
+                field: "swarm.authorization.owner_kind",
+                reason: "presented authorization names another semantic owner",
+            });
+        }
+        Ok(())
     }
 
     fn validate_revision_identity(&self) -> Result<(), StoreError> {
@@ -191,7 +316,50 @@ impl SwarmOwnerRevision {
             SwarmSemanticOwnerKind::Governor => validate_admission_record(object)?,
             SwarmSemanticOwnerKind::AgentCoordinator => validate_execution_record(object)?,
         }
+        self.validate_authorized_lease(object)?;
         validate_fence(object.get("state_fence"))?;
+        Ok(())
+    }
+
+    /// Binds the presented authorization to the owner lease the RECORD itself
+    /// carries (issue #1702 W3/A3).
+    ///
+    /// For the definition and execution owners the record names its own lease
+    /// (`controller` / `coordinator`). Requiring the authorization's presenter
+    /// and epoch to equal that lease is what makes the evidence mean something:
+    /// a coordinator presenting its own lease cannot open a definition stream
+    /// even though both records are individually well-formed, and a record
+    /// cannot claim an epoch its owner fields do not carry.
+    ///
+    /// The Governor admission record carries no lease (I10.15 gives it a
+    /// policy/capability/fence and a receipt, not a lease), so there is no
+    /// owner lease here to compare. That case is NOT skipped silently: it is
+    /// covered by [`validate_swarm_owner_revision_authorization`], which binds
+    /// the Governor evidence to the authenticated request source. A per-record
+    /// check is impossible for that owner, and inventing a lease field it does
+    /// not have would be a second scheme.
+    fn validate_authorized_lease(
+        &self,
+        object: &serde_json::Map<String, Value>,
+    ) -> Result<(), StoreError> {
+        let lease_field = match self.owner_kind {
+            SwarmSemanticOwnerKind::TaskController => "controller",
+            SwarmSemanticOwnerKind::AgentCoordinator => "coordinator",
+            SwarmSemanticOwnerKind::Governor => return Ok(()),
+        };
+        let (presenter, epoch) = read_lease(object, lease_field)?;
+        if presenter != self.authorization.presenter {
+            return Err(StoreError::InvalidField {
+                field: "swarm.authorization.presenter",
+                reason: "presenter does not match the record's own owner lease holder",
+            });
+        }
+        if epoch != self.authorization.epoch {
+            return Err(StoreError::InvalidField {
+                field: "swarm.authorization.epoch",
+                reason: "presented epoch does not match the record's own owner lease epoch",
+            });
+        }
         Ok(())
     }
 
@@ -401,7 +569,39 @@ pub fn decode_swarm_owner_revisions(
     Ok(batch)
 }
 
-/// Validates the one-operation task-control envelope and exact owner scope.
+/// Validates the one-operation task-control envelope, exact owner scope, and
+/// the owner-specific authorization bound to the executing transition
+/// (issue #1702 W3/A3).
+///
+/// Two independent bindings make "the author held authority" a verified fact
+/// rather than a claim:
+///
+/// 1. the record's OWNER LEASE, checked inside
+///    [`SwarmOwnerRevision::validate`] through
+///    [`SwarmOwnerRevision::validate_authorized_lease`]: the presented
+///    `SwarmOwnerAuthorization` must name this revision's own owner kind, and
+///    its presenter and epoch must equal the `controller` / `coordinator` fields
+///    the record itself carries. A well-formed coordinator record presented on
+///    the definition stream, or a record claiming an epoch its owner fields do
+///    not carry, is refused here — before persistence and before any effect; and
+/// 2. the record's State Fence against the transition's State Fence, so the
+///    write happens under exactly the authority the record was frozen at, with
+///    the Kernel having already compared that fence with its own live
+///    requirement.
+///
+/// The authenticated PRINCIPAL is a separate act,
+/// [`validate_swarm_owner_revision_authorization`], because a
+/// [`PreparedTransition`] is a semantic plan and carries no transport identity.
+/// That is the binding the Governor admission stream depends on, since an
+/// admission record carries no lease of its own to compare against.
+///
+/// # Errors
+///
+/// Returns [`StoreError::TransitionClassExceeded`] when the plan is not the
+/// single-operation task-control shape, [`StoreError::FenceMismatch`] when the
+/// record's fence is not the transition's fence, and the typed
+/// [`StoreError::InvalidField`] of the underlying contracts when the scope, the
+/// owner record, or the authorization does not hold.
 pub fn validate_swarm_owner_revision_transition(
     transition: &PreparedTransition,
 ) -> Result<(), StoreError> {
@@ -437,6 +637,51 @@ pub fn validate_swarm_owner_revision_transition(
     )?;
     if record_fence != transition.state_fence {
         return Err(StoreError::FenceMismatch);
+    }
+    // The owner binding itself (authorization owner kind, record shape and the
+    // presented lease against the record's own owner lease) was already
+    // established by `decode_swarm_owner_revisions` above, which runs
+    // `SwarmOwnerRevision::validate`. The owner LEASE epoch is deliberately
+    // NOT compared with the transition's authority-epoch sequence: they are
+    // different quantities. The lease epoch counts the Task Controller's or
+    // coordinator's own tenure (`controller.epoch` / `coordinator.epoch`); the
+    // transition's authority epoch is the store-wide lineage sequence the
+    // Kernel fences the write under, already compared with the record's own
+    // fence just above. Requiring the two numbers to be equal would reject every
+    // valid write as soon as the counters diverged — a stricter check than the
+    // contract states, not a more correct one.
+    Ok(())
+}
+
+/// Binds one owner revision's authorization to the AUTHENTICATED request the
+/// Store is executing (issue #1702 W3/A3).
+///
+/// [`validate_swarm_owner_revision_transition`] cannot do this: a
+/// [`PreparedTransition`] is a semantic plan and carries no transport identity.
+/// This function takes the [`RequestMeta`] the Kernel authenticated, so the
+/// presenter the evidence names is compared with the source identity of the
+/// real request rather than with anything the caller supplied. A caller
+/// relabelling its own role — presenting coordinator evidence on the Governor
+/// stream, or a foreign principal as the Task Controller — fails here.
+///
+/// Call it wherever the authenticated request context is in hand; it is
+/// deliberately a separate act from the plan check so a caller cannot skip it
+/// by accident while still passing plan validation.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidField`] when the presented principal is not the
+/// authenticated request source.
+pub fn validate_swarm_owner_revision_authorization(
+    revision: &SwarmOwnerRevision,
+    context: &crate::RequestMeta,
+) -> Result<(), StoreError> {
+    revision.validate()?;
+    if revision.authorization.presenter != context.source_id.as_str() {
+        return Err(StoreError::InvalidField {
+            field: "swarm.authorization.presenter",
+            reason: "does not match the authenticated request source",
+        });
     }
     Ok(())
 }
