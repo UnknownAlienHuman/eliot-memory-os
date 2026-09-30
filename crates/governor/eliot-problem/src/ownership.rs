@@ -320,7 +320,9 @@ impl AuthenticatedOwnerLease {
         issuer: &dyn OwnerLeaseIssuer,
     ) -> Result<Self, ProblemError> {
         let expected = grant.expected_commitment()?;
-        let held = issuer.commitment_for(grant).ok_or(ProblemError::OwnerLeaseMismatch)?;
+        let held = issuer
+            .commitment_for(grant)
+            .ok_or(ProblemError::OwnerLeaseMismatch)?;
         if held != expected {
             return Err(ProblemError::OwnerLeaseMismatch);
         }

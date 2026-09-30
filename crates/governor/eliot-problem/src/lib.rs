@@ -124,10 +124,7 @@ pub enum ProblemError {
     ImmutableState,
     /// A record revision or counter cannot advance without reusing an identity.
     #[error("{field} overflow: refusing to reuse revision {current}")]
-    CounterOverflow {
-        field: &'static str,
-        current: u64,
-    },
+    CounterOverflow { field: &'static str, current: u64 },
     /// The record is unassigned and therefore carries a visible obligation
     /// instead of an owner. It is not resolved, accepted risk, or discardable.
     #[error("record is unassigned: a reassignment or escalation obligation is outstanding")]
@@ -214,10 +211,7 @@ fn owner_name(value: &str) -> Result<(), ProblemError> {
 /// Append-only: an existing reference is kept once and its position is not
 /// rewritten, so a closure readback augments the observation history rather
 /// than replacing it.
-fn merge_evidence(
-    retained: &[ArtifactId],
-    observed: &[ArtifactId],
-) -> Vec<ArtifactId> {
+fn merge_evidence(retained: &[ArtifactId], observed: &[ArtifactId]) -> Vec<ArtifactId> {
     let mut merged = retained.to_vec();
     for reference in observed {
         if !merged.contains(reference) {
@@ -252,22 +246,18 @@ fn unassigned_legacy_epoch(revision: u64) -> Result<u64, ProblemError> {
 /// compare-and-set that has stopped comparing, so the caller sees a conflict
 /// and re-reads instead of committing under an identity it already used.
 fn next_revision(current: u64) -> Result<u64, ProblemError> {
-    current
-        .checked_add(1)
-        .ok_or(ProblemError::CounterOverflow {
-            field: "revision",
-            current,
-        })
+    current.checked_add(1).ok_or(ProblemError::CounterOverflow {
+        field: "revision",
+        current,
+    })
 }
 
 /// Advances the reopen counter under the same no-reuse rule as the revision.
 fn next_reopen_count(current: u32) -> Result<u32, ProblemError> {
-    current
-        .checked_add(1)
-        .ok_or(ProblemError::CounterOverflow {
-            field: "reopen_count",
-            current: u64::from(current),
-        })
+    current.checked_add(1).ok_or(ProblemError::CounterOverflow {
+        field: "reopen_count",
+        current: u64::from(current),
+    })
 }
 
 /// Signal severity from deterministic supervision.
@@ -623,7 +613,10 @@ impl ProblemHypothesis {
     /// Validates the statement, bearing evidence and its discriminating probe.
     pub fn validate(&self) -> Result<(), ProblemError> {
         text(&self.statement, "hypothesis.statement")?;
-        text(&self.discriminating_probe, "hypothesis.discriminating_probe")?;
+        text(
+            &self.discriminating_probe,
+            "hypothesis.discriminating_probe",
+        )?;
         nonempty(&self.supporting_evidence, "hypothesis.supporting_evidence")?;
         let evidence = self
             .supporting_evidence
@@ -920,10 +913,8 @@ impl Problem {
         self.check_closure_preconditions(closure)?;
         let revision = next_revision(self.revision)?;
         let mut candidate = self.clone();
-        candidate.observed_evidence = merge_evidence(
-            &candidate.observed_evidence,
-            &closure.verified_observables,
-        );
+        candidate.observed_evidence =
+            merge_evidence(&candidate.observed_evidence, &closure.verified_observables);
         candidate.state = ProblemState::Resolved;
         candidate.revision = revision;
         candidate.validate()?;
@@ -963,7 +954,8 @@ impl Problem {
             evidence: waiver.evidence.clone(),
         };
         let mut candidate = self.clone();
-        candidate.observed_evidence = merge_evidence(&candidate.observed_evidence, &waiver.evidence);
+        candidate.observed_evidence =
+            merge_evidence(&candidate.observed_evidence, &waiver.evidence);
         candidate.state = ProblemState::AcceptedRisk;
         candidate.revision = revision;
         candidate.validate()?;
@@ -1294,10 +1286,8 @@ impl Problem {
             }
             candidate.reopen(expected_fence, fresh)?;
         } else {
-            candidate.observed_evidence = merge_evidence(
-                &candidate.observed_evidence,
-                &request.revocation_evidence,
-            );
+            candidate.observed_evidence =
+                merge_evidence(&candidate.observed_evidence, &request.revocation_evidence);
             candidate.acknowledged_by = None;
         }
         candidate.revision = next_revision(candidate.revision)?;
@@ -1787,11 +1777,7 @@ impl Incident {
         // than a role the caller raising the loss picked.
         let route = OwnerRoute::SystemOwnerRecoveryPrincipal;
         let obligation = OwnershipObligation {
-            obligation_id: obligation_id(
-                self.incident_id.as_str(),
-                route,
-                owner.ownership_epoch,
-            )?,
+            obligation_id: obligation_id(self.incident_id.as_str(), route, owner.ownership_epoch)?,
             route,
             lost_lease: Some(owner.lease.clone()),
             ownership_epoch: owner.ownership_epoch,
@@ -1849,10 +1835,8 @@ impl Incident {
         }
         let revision = next_revision(self.revision)?;
         let mut candidate = self.clone();
-        candidate.evidence_refs = merge_evidence(
-            &candidate.evidence_refs,
-            &closure.verified_observables,
-        );
+        candidate.evidence_refs =
+            merge_evidence(&candidate.evidence_refs, &closure.verified_observables);
         candidate.state = IncidentState::Resolved;
         candidate.revision = revision;
         candidate.validate()?;
@@ -2223,10 +2207,7 @@ impl AttentionState {
     /// acknowledgement or a reassignment.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Resolved | Self::Waived | Self::Superseded
-        )
+        matches!(self, Self::Resolved | Self::Waived | Self::Superseded)
     }
 }
 
@@ -2476,10 +2457,8 @@ impl CriticalAttention {
         }
         let revision = next_revision(self.revision)?;
         let mut candidate = self.clone();
-        candidate.evidence_refs = merge_evidence(
-            &candidate.evidence_refs,
-            &closure.verified_observables,
-        );
+        candidate.evidence_refs =
+            merge_evidence(&candidate.evidence_refs, &closure.verified_observables);
         candidate.state = AttentionState::Resolved;
         candidate.influence_state = AttentionInfluence::Released;
         candidate.revision = revision;
@@ -3108,7 +3087,11 @@ mod tests {
         }
     }
 
-    fn lease_for(principal: &str, fence: &StateFence, epoch: u64) -> Result<AuthenticatedOwnerLease, ProblemError> {
+    fn lease_for(
+        principal: &str,
+        fence: &StateFence,
+        epoch: u64,
+    ) -> Result<AuthenticatedOwnerLease, ProblemError> {
         let grant = OwnerLeaseGrant {
             lease_id: format!("lease-{principal}-{epoch}"),
             holder: OwnerRef {
@@ -3199,7 +3182,10 @@ mod tests {
         value.transition(&fence, ProblemState::Triaged)?;
         value.transition(&fence, ProblemState::Diagnosing)?;
         value.transition(&fence, ProblemState::Verifying)?;
-        value.resolve(&fence, &closure(&fence, "verifier-1", vec![artifact("evidence-2")?]))?;
+        value.resolve(
+            &fence,
+            &closure(&fence, "verifier-1", vec![artifact("evidence-2")?]),
+        )?;
         assert!(matches!(
             value.reopen(&fence, Vec::new()),
             Err(ProblemError::ReopenRequiresEvidence)
