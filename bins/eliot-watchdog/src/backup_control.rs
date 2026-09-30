@@ -563,17 +563,11 @@ fn canonical_backup_operations() -> Vec<BackupOperationKind> {
 #[must_use]
 pub fn verify_registration_is_complete() -> bool {
     let registered = accepted_watchdog_backup_methods();
-    canonical_backup_operations()
-        .into_iter()
-        .all(|op| {
-            registered
-                .iter()
-                .any(|method| method.op == op)
-                == registers_watchdog_operation(op)
-        })
-        && registered
-            .iter()
-            .all(|method| registers_watchdog_operation(method.op))
+    canonical_backup_operations().into_iter().all(|op| {
+        registered.iter().any(|method| method.op == op) == registers_watchdog_operation(op)
+    }) && registered
+        .iter()
+        .all(|method| registers_watchdog_operation(method.op))
 }
 
 /// Resolves a wire id to its registered method before any owner effect runs.
@@ -796,8 +790,7 @@ impl<'a> WatchdogBackupRequest<'a> {
             Self::ArchiveVerification(verification) => &verification.identity,
             Self::RestoreStatus(status) => &status.identity,
             Self::RestoreReconcile {
-                request: reconcile,
-                ..
+                request: reconcile, ..
             } => &reconcile.identity,
         }
     }
@@ -818,8 +811,7 @@ impl<'a> WatchdogBackupRequest<'a> {
             }
             Self::RestoreStatus(status) => BackupRestoreStatus::validate(status),
             Self::RestoreReconcile {
-                request: reconcile,
-                ..
+                request: reconcile, ..
             } => BackupRestoreReconcile::validate(reconcile),
         }
     }
@@ -846,11 +838,18 @@ pub struct AdmittedWatchdogBackupRequest<'a> {
 pub enum WatchdogBackupChannelOutcome {
     /// The `#955` spool capture owner produced one bounded fence for this exact
     /// operation, and the requested page was read from that retained fence.
+    ///
+    /// Both owner values are boxed because they each carry a retained entry
+    /// vector, while the `Restore` disposition below is a single field. Holding
+    /// the two shapes in one enum unboxed would make every `Restore` answer as
+    /// large as a whole retained spool fence and its page, which is a cost the
+    /// reconcile contour — the one that actually answers — would pay for the
+    /// capture contour's data. The content is unchanged; only its placement is.
     Capture {
         /// The fence the capture owner retained for this operation.
-        fence: WatchdogSpoolFence,
+        fence: Box<WatchdogSpoolFence>,
         /// The bounded page read from that retained fence.
-        page: WatchdogSpoolSnapshotPage,
+        page: Box<WatchdogSpoolSnapshotPage>,
     },
     /// The isolated-restore owner's own disposition for the bounded step chain
     /// of this exact operation.
@@ -1331,7 +1330,10 @@ impl BackupControlHandle {
                     WatchdogSpoolBackupLimits::default(),
                 )?;
                 let page = self.port.read_page(&fence, request.page.page_index)?;
-                Ok(WatchdogBackupChannelOutcome::Capture { fence, page })
+                Ok(WatchdogBackupChannelOutcome::Capture {
+                    fence: Box::new(fence),
+                    page: Box::new(page),
+                })
             }
             BackupOperationKind::ReconcileRestore => {
                 let WatchdogBackupRequest::RestoreReconcile {
@@ -1418,7 +1420,9 @@ impl BackupControlHandle {
     ) -> Result<(), BackupControlError> {
         let identity = admitted.request.identity();
         let (fence, page) = match outcome {
-            WatchdogBackupChannelOutcome::Capture { fence, page } => (fence, page),
+            WatchdogBackupChannelOutcome::Capture { fence, page } => {
+                (fence.as_ref(), page.as_ref())
+            }
             WatchdogBackupChannelOutcome::Restore(disposition) => {
                 if *disposition == SpoolRestoreDisposition::Unknown {
                     return Err(BackupControlError::Rejected(format!(
