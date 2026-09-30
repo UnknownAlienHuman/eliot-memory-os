@@ -2891,13 +2891,29 @@ impl AgentFabric {
     /// superseded old wave fail with [`FabricError::Superseded`]: replacement
     /// work needs the new definition and its distinct admission. A draining
     /// old wave still admits mechanical progress under its recorded
-    /// disposition, but never semantic change. A stale or foreign coordinator
-    /// fails with [`FabricError::StaleOwnerLease`].
+    /// disposition, but never semantic change.
+    ///
+    /// #1702 W3/A3: the presenter is authenticated here against the
+    /// coordinator owner state the Store committed for THIS execution stream
+    /// (`owner_revision`), never against the lease inside the payload being
+    /// defended. Checking `execution.coordinator` alone would compare the
+    /// caller's claim with the caller's own record, which is the "a valid
+    /// payload digest does not prove its author's authority" failure: a
+    /// foreign coordinator could present an execution revision carrying a
+    /// lease it chose itself and pass. The durable owner revision must be the
+    /// execution record verbatim on the AgentCoordinator stream, so the only
+    /// presenter that gets through is the one the canonical transaction
+    /// actually recorded for this execution. A stale or foreign coordinator
+    /// fails with [`FabricError::StaleOwnerLease`]; a coordinator stream that
+    /// is not the one committed fails with [`FabricError::RevisionNotDurable`].
     ///
     /// # Errors
     ///
     /// Returns [`FabricError::Contract`] when the admission or execution is
-    /// unknown, or the mapped semantic rejection otherwise.
+    /// unknown, [`FabricError::RevisionNotDurable`] when the durable owner
+    /// revision is not this exact execution on the coordinator stream,
+    /// [`FabricError::StaleOwnerLease`] for a stale or foreign coordinator, or
+    /// the mapped semantic rejection otherwise.
     pub fn check_semantic_execution_update(
         &self,
         admission_id: &SwarmAdmissionId,
@@ -2905,6 +2921,8 @@ impl AgentFabric {
         update: &ExecutionUpdateProposal,
         caller_holder: &str,
         caller_epoch: u64,
+        owner_revision: &SwarmOwnerRevision,
+        receipt: &WriteReceipt,
     ) -> Result<(), FabricError> {
         let admission_key = admission_id.as_str().to_owned();
         let admission = self
@@ -2920,6 +2938,23 @@ impl AgentFabric {
             .ok_or_else(|| {
                 FabricError::Contract(format!("unknown semantic execution {execution_key}"))
             })?;
+        // Authenticate the presenter against the owner's own committed
+        // current-lease state, not against the presented revision's lease.
+        let record = serde_json::to_value(execution).map_err(|error| {
+            FabricError::Contract(format!("semantic execution encode: {error}"))
+        })?;
+        require_durable_owner_revision(
+            owner_revision,
+            receipt,
+            &record,
+            SwarmSemanticOwnerKind::AgentCoordinator,
+        )?;
+        if !execution
+            .coordinator
+            .authorizes(caller_holder, caller_epoch)
+        {
+            return Err(FabricError::StaleOwnerLease("swarm coordinator".to_owned()));
+        }
         let definition_key = admission.definition_id.as_str().to_owned();
         let definition = self
             .semantic_definitions
