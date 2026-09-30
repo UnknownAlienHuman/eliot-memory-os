@@ -708,8 +708,10 @@ impl KernelHostRequestClient {
     /// cancellation whose parent was built by another connection) stays
     /// unmarked, which only under-reports readiness — fail-closed, never
     /// advertised. A failed borrow is likewise skipped: the next successful
-    /// operation re-marks.
-    fn note_owner_settled(&mut self, correlation: &str) {
+    /// operation re-marks. Takes `&self`: mutation runs through the shared
+    /// owner's interior mutability, so marking composes with the `&self`
+    /// probe/disposition calls at every outcome site.
+    fn note_owner_settled(&self, correlation: &str) {
         let Ok(mut owner) = self.shared.try_borrow_mut() else {
             return;
         };
@@ -725,7 +727,7 @@ impl KernelHostRequestClient {
     /// cancellation, or an observed terminal state. Unknown-outcome and
     /// delivery failures never mark, so readiness is never inferred from an
     /// error.
-    fn record_settled<T, E>(&mut self, correlation: &str, outcome: Result<T, E>) -> Result<T, E> {
+    fn record_settled<T, E>(&self, correlation: &str, outcome: Result<T, E>) -> Result<T, E> {
         if outcome.is_ok() {
             self.note_owner_settled(correlation);
         }
