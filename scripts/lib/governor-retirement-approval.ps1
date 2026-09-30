@@ -398,6 +398,10 @@ function Get-GovernorRetirementTrackedBlobMap([string]$Repo, [string]$SourceComm
         if ($fields.Count -lt 3) { continue }
         $map[$path] = [string]$fields[2]
     }
+    $missingPaths = @($wanted | Where-Object { -not $map.ContainsKey([string]$_) })
+    if ($missingPaths.Count -gt 0) {
+        throw "tracked retirement input is missing or is not a blob in the pinned tree: $([string]::Join(',', $missingPaths))"
+    }
     return $map
 }
 
@@ -509,6 +513,9 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
         [void]$writer.GetAwaiter().GetResult()
         $process.StandardInput.Close()
         $process.WaitForExit()
+        if ($process.ExitCode -ne 0 -or $result.Count -ne $blobs.Count) {
+            throw "tracked retirement blob read was incomplete (exit=$($process.ExitCode) expected=$($blobs.Count) read=$($result.Count))"
+        }
     }
     finally {
         $process.StandardOutput.Close()
