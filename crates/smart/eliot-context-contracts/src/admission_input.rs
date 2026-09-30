@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AdmissionDisposition, AdmissionRecord, CONTEXT_CONTRACT_VERSION, CapacityLimits,
     ContextBinding, ContextCandidate, ContextCandidateSet, ContextEconomyReceipt, ContextError,
-    ContextOutcome, ContextRecipe, ContextRecipePolicy, DecisionContextIncomplete, DecisionRevision,
-    DecisionSafetyFloor, ExpansionHandle, LearningAdmissionTicket, LossPolicy,
+    ContextOutcome, ContextRecipe, ContextRecipePolicy, DecisionContextIncomplete,
+    DecisionRevision, DecisionSafetyFloor, ExpansionHandle, LearningAdmissionTicket, LossPolicy,
     NonRecoverableReason, OmissionRecord, RepresentationKind, StuEstimate, TokenizerObservation,
     canonical_digest, validate_digest, validate_text,
 };
