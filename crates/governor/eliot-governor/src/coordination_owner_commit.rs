@@ -55,6 +55,7 @@ use eliot_store_api::{
 };
 use thiserror::Error;
 
+use crate::composition::KernelGenerationPort;
 use crate::finish_attempt::GOVERNOR_SCOPE_ID;
 use crate::{CompositionError, CompositionReadiness, GovernorComposition, RecoveryOwner};
 
@@ -184,7 +185,13 @@ fn coordination_owner_envelope(
     Ok((envelope, digest))
 }
 
-impl<P: ?Sized> GovernorComposition<P> {
+// The bound must match the composition's own inherent impl at `composition.rs`
+// exactly. `readiness()`, `owners()`, `recovery_snapshot()`, and
+// `commit_canonical()` are all defined inside `impl<P: KernelGenerationPort +
+// ?Sized> GovernorComposition<P>`, so from a bare `P: ?Sized` this block the
+// bound is unsatisfied, rustc falls back to the same-named private field, and
+// the call silently resolves as a field access instead of a method.
+impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Returns the live coordination owner image together with the outer owner
     /// revision the next coordination commit must compare against.
     ///
