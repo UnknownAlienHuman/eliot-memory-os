@@ -686,20 +686,26 @@ pub(super) fn census_in_read(
                     marker.operation_id.as_str(),
                     marker.request_digest
                 );
-                if let Some(stored) = requests.get(row_key.as_str()).map_err(storage)? {
-                    let record: HostRequestRecord = decode(stored.value())?;
-                    if record.operation_id != marker.operation_id
-                        || record.request_digest != marker.request_digest
-                        || record.state != crate::HostRequestState::Terminal
-                        || RedbRecoveryStore::host_request_logical_key_for_record(&record)?
-                            .as_deref()
-                            != Some(key.value())
-                    {
-                        return Err(integrity(
+                let stored = requests
+                    .get(row_key.as_str())
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        integrity(
                             "host_request_logical_tombstone",
-                            "logical tombstone diverges from its retained host-request row",
-                        ));
-                    }
+                            "logical tombstone has no retained terminal host-request row",
+                        )
+                    })?;
+                let record: HostRequestRecord = decode(stored.value())?;
+                if record.operation_id != marker.operation_id
+                    || record.request_digest != marker.request_digest
+                    || record.state != crate::HostRequestState::Terminal
+                    || RedbRecoveryStore::host_request_logical_key_for_record(&record)?.as_deref()
+                        != Some(key.value())
+                {
+                    return Err(integrity(
+                        "host_request_logical_tombstone",
+                        "logical tombstone diverges from its retained host-request row",
+                    ));
                 }
                 continue;
             }
