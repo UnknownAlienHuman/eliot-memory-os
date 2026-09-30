@@ -96,7 +96,14 @@ pub struct ExactSourceRange {
 }
 
 impl ExactSourceRange {
-    fn validate(&self, source: &SourceSnapshot) -> Result<(), ContextError> {
+    /// Check this range against the immutable snapshot it claims to sit in.
+    ///
+    /// Crate-visible so the one range type in this crate is validated by one
+    /// rule wherever it is carried. `ContextCandidate::source_range` reuses this
+    /// exact check rather than restating it, so a range admitted on a candidate
+    /// and a range admitted on a boundary member cannot disagree about which
+    /// snapshot, which source revision, or which endpoint order is valid.
+    pub(crate) fn validate(&self, source: &SourceSnapshot) -> Result<(), ContextError> {
         validate_text(&self.source_revision, "boundary.range.source_revision")?;
         if self.snapshot_id != source.snapshot_id || self.source_revision != source.revision {
             return Err(ContextError::IdentityConflict);

@@ -32,8 +32,9 @@
 
 use blake3::Hasher;
 use eliot_context_contracts::{
-    AtomRepresentation, AuthorityClass, ContextBinding, ContextCandidate, LearningProvenance,
-    LossPolicy, MeasurementRef, PrivacyClass, ProviderRole, SourceSnapshot,
+    AtomRepresentation, AuthorityClass, BoundaryCoordinateSystem, ContextBinding, ContextCandidate,
+    ExactSourceRange, LearningProvenance, LossPolicy, MeasurementRef, PrivacyClass, ProviderRole,
+    SourceSnapshot,
 };
 use eliot_contracts::fences_match_exact;
 use eliot_evidence::EpistemicStatus;
@@ -190,6 +191,10 @@ pub fn produce_learning_candidate(
     }
     let mut content_hasher = Hasher::new();
     content_hasher.update(request.content.as_bytes());
+    let content_sha256 = content_hasher.finalize().to_hex().to_string();
+    let content_len = u64::try_from(request.content.len())
+        .map_err(|_| BoundsError::InvalidProduction("learning.content"))?;
+    let source_revision = request.source_revision.to_string();
     let candidate = ContextCandidate {
         binding: request.binding.clone(),
         atom_id,
@@ -197,11 +202,26 @@ pub fn produce_learning_candidate(
         source: SourceSnapshot {
             source_id,
             owner: source_owner,
-            snapshot_id,
-            revision: request.source_revision.to_string(),
-            content_sha256: content_hasher.finalize().to_hex().to_string(),
+            snapshot_id: snapshot_id.clone(),
+            revision: source_revision.clone(),
+            content_sha256,
             predecessor: None,
         },
+        // The snapshot this atom is admitted from is exactly `request.content`,
+        // and `content_sha256` above is that same content's digest, so the
+        // admitted extent is the whole snapshot: the half-open byte range
+        // `[0, len)` measured against the exact immutable source revision this
+        // record already names. It is stated rather than inferred, and the
+        // admitted representation is the verbatim `Whole` content below, so the
+        // range and the retained bytes are the same bytes.
+        source_range: Some(ExactSourceRange {
+            snapshot_id,
+            source_revision,
+            coordinate_system: BoundaryCoordinateSystem::Utf8ByteOffset,
+            start: 0,
+            end_exclusive: content_len,
+            length: content_len,
+        }),
         representation: AtomRepresentation::Whole {
             content: request.content.to_string(),
         },

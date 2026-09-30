@@ -40,8 +40,8 @@ pub use admission_input::{
 pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
     CapacityLimits, ContextCandidate, ContextRecipe, LearningProvenance, LossPolicy,
-    MeasurementRef, PrivacyClass, ProviderDisposition, ProviderRoleDenominator, RepresentationKind,
-    RoleLossRule,
+    MAX_ATOM_SOURCE_RANGE_UNITS, MeasurementRef, PrivacyClass, ProviderDisposition,
+    ProviderRoleDenominator, RepresentationKind, RoleLossRule,
 };
 pub use boundary::{
     BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryCoordinateSystem,
