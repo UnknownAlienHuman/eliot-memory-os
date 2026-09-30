@@ -513,78 +513,80 @@ impl KernelComposition {
     ) -> Result<(CanonicalStoreAvailability, StoreTruthEvidence), StoreFactRefusal> {
         // F-LOG-KERNEL-2 (#899): Store availability phases only; no operation,
         // digest, process, job or owner-error material is emitted.
+        //
+        // The record is always COMPLETE before the decision is taken: every
+        // one of the three fields is assigned on every path, and a fact that
+        // could not be read is recorded unreadable rather than left defaulted
+        // or inferred from its neighbour. Only then does the single fail-closed
+        // predicate decide.
         let gateway = match self.canonical_store_gateway.lock() {
             Ok(retained) => retained.clone(),
             // Inability to read the owner is not absence. The composition
-            // cannot prove a transport is missing, so the fact is recorded
-            // unreadable and both downstream facts are left unread rather
-            // than inferred from it.
+            // cannot prove a transport is missing, so connectivity is recorded
+            // unreadable and both downstream facts are recorded unreadable
+            // rather than being inferred from it.
             Err(_) => {
                 observe_entrypoint_with_detail(
                     EntrypointStage::StoreBootstrap,
                     "kernel.store.availability:connectivity_owner_unreadable",
                 );
-                return Err(StoreFactRefusal::OwnerUnreadable {
-                    owner: StoreFactOwner::Connectivity,
-                    reason: StoreOwnerUnreadable::GatewayOwnerPoisoned,
-                });
+                return Err(Self::refuse_on_connectivity(StoreConnectivity::Unreadable(
+                    StoreOwnerUnreadable::GatewayOwnerPoisoned,
+                )));
             }
         };
         let Some(gateway) = gateway else {
-            // A clean absence: the owner answered and holds nothing. The
-            // downstream facts are recorded unreadable rather than absent,
-            // because nothing was asked of an owner that does not exist.
+            // A clean absence: the owner answered and holds nothing. That is
+            // the only clean absence in this observation, and the downstream
+            // facts are recorded unreadable rather than absent, because
+            // nothing was asked of an owner that does not exist.
             observe_entrypoint_with_detail(
                 EntrypointStage::StoreBootstrap,
                 "kernel.store.availability:connectivity_detached",
             );
-            return Err(StoreFactRefusal::NotEstablished {
-                owner: StoreFactOwner::Connectivity,
-                reason: StoreFactNotEstablished::NoRetainedTransport,
-            });
+            return Err(Self::refuse_on_connectivity(StoreConnectivity::Detached));
         };
         // A fenced gateway belongs to a superseded generation awaiting
-        // replacement. That is present-but-closed, a different fact from
-        // "no transport", and I14.11 item 7 forbids reading it as restored.
+        // replacement. That is present-but-closed, a different fact from "no
+        // transport", and I14.11 item 7 forbids reading it as restored.
         if gateway.is_fenced() {
             observe_entrypoint_with_detail(
                 EntrypointStage::StoreBootstrap,
                 "kernel.store.availability:connectivity_fenced",
             );
-            return Err(StoreFactRefusal::NotEstablished {
-                owner: StoreFactOwner::Connectivity,
-                reason: StoreFactNotEstablished::SupersededGeneration,
-            });
+            return Err(Self::refuse_on_connectivity(StoreConnectivity::Fenced));
         }
         observe_entrypoint_with_detail(
             EntrypointStage::StoreBootstrap,
             "kernel.store.availability:connectivity_attached",
         );
-        let health = match gateway.health().await {
-            Ok(health) => health,
+        let (process_readiness, health) = match gateway.health().await {
+            Ok(health) => {
+                let readiness = if health.status == eliot_store_api::StoreHealthStatus::Ready {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        "kernel.store.availability:process_ready",
+                    );
+                    StoreProcessReadiness::Ready
+                } else {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        "kernel.store.availability:process_not_ready",
+                    );
+                    StoreProcessReadiness::NotReady
+                };
+                (readiness, health)
+            }
             Err(_) => {
                 observe_entrypoint_with_detail(
                     EntrypointStage::StoreBootstrap,
                     "kernel.store.availability:process_owner_unreadable",
                 );
-                return Err(StoreFactRefusal::OwnerUnreadable {
-                    owner: StoreFactOwner::ProcessReadiness,
-                    reason: StoreOwnerUnreadable::StoreDidNotAnswer,
-                });
+                return Err(Self::refuse_on(
+                    StoreProcessReadiness::Unreadable(StoreOwnerUnreadable::StoreDidNotAnswer),
+                    StoreSemanticFreshness::Unreadable(StoreOwnerUnreadable::StoreDidNotAnswer),
+                ));
             }
-        };
-        let process_readiness = if health.status == eliot_store_api::StoreHealthStatus::Ready {
-            observe_entrypoint_with_detail(
-                EntrypointStage::StoreBootstrap,
-                "kernel.store.availability:process_ready",
-            );
-            StoreProcessReadiness::Ready
-        } else {
-            observe_entrypoint_with_detail(
-                EntrypointStage::StoreBootstrap,
-                "kernel.store.availability:process_not_ready",
-            );
-            StoreProcessReadiness::NotReady
         };
         let snapshot = match gateway.validation_snapshot().await {
             Ok(snapshot) => snapshot,
@@ -593,24 +595,25 @@ impl KernelComposition {
                     EntrypointStage::StoreBootstrap,
                     "kernel.store.availability:freshness_owner_unreadable",
                 );
-                return Err(StoreFactRefusal::OwnerUnreadable {
-                    owner: StoreFactOwner::SemanticFreshness,
-                    reason: StoreOwnerUnreadable::StoreDidNotAnswer,
-                });
+                return Err(Self::refuse_on(
+                    process_readiness,
+                    StoreSemanticFreshness::Unreadable(StoreOwnerUnreadable::StoreDidNotAnswer),
+                ));
             }
         };
         // The snapshot is validated through the Store's own existing
         // `validate()`; no digest is recomputed here to make a comparison
-        // succeed.
+        // succeed. An answer its owner rejects is not a usable observation, so
+        // freshness is unreadable rather than fresh.
         if snapshot.validate().is_err() {
             observe_entrypoint_with_detail(
                 EntrypointStage::StoreBootstrap,
                 "kernel.store.availability:freshness_owner_unreadable",
             );
-            return Err(StoreFactRefusal::OwnerUnreadable {
-                owner: StoreFactOwner::SemanticFreshness,
-                reason: StoreOwnerUnreadable::StoreAnswerInvalid,
-            });
+            return Err(Self::refuse_on(
+                process_readiness,
+                StoreSemanticFreshness::Unreadable(StoreOwnerUnreadable::StoreAnswerInvalid),
+            ));
         }
         // Freshness is judged against the authority tuple and the resource
         // generation of the fence the caller presented *now*, using the
@@ -620,23 +623,24 @@ impl KernelComposition {
         // unset, and comparing those would report a fresh Store as stale.
         // A snapshot outside that tuple is stale truth: refused, named as
         // stale, and never reported as an outage.
-        let semantic_freshness = if eliot_contracts::StateFence::authorizes_canonical(
-            &snapshot.state_fence.authority_epoch,
-            &request_fence.authority_epoch,
-        ) && snapshot.state_fence.resource_generation == request_fence.resource_generation
-        {
-            observe_entrypoint_with_detail(
-                EntrypointStage::StoreBootstrap,
-                "kernel.store.availability:fresh",
-            );
-            StoreSemanticFreshness::Fresh
-        } else {
-            observe_entrypoint_with_detail(
-                EntrypointStage::StoreBootstrap,
-                "kernel.store.availability:stale",
-            );
-            StoreSemanticFreshness::Stale
-        };
+        let semantic_freshness =
+            if eliot_contracts::StateFence::authorizes_canonical(
+                &snapshot.state_fence.authority_epoch,
+                &request_fence.authority_epoch,
+            ) && snapshot.state_fence.resource_generation == request_fence.resource_generation
+            {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.availability:fresh",
+                );
+                StoreSemanticFreshness::Fresh
+            } else {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.availability:stale",
+                );
+                StoreSemanticFreshness::Stale
+            };
         let availability = CanonicalStoreAvailability {
             connectivity: StoreConnectivity::Attached,
             process_readiness,
@@ -653,6 +657,58 @@ impl KernelComposition {
                 validation_revision: snapshot.validation_revision,
             },
         ))
+    }
+
+    /// Fails closed on a connectivity fact alone, recording the two downstream
+    /// facts as unreadable rather than as absences.
+    ///
+    /// There is no transport to ask the Store through, so nothing has been
+    /// observed about the process or its semantic truth. Recording those two
+    /// as absent would assert a negative nobody measured; recording them as
+    /// fresh would grant authority on unread truth. They are recorded
+    /// unreadable, and the connectivity fact is the one that decides.
+    #[cfg(windows)]
+    fn refuse_on_connectivity(connectivity: StoreConnectivity) -> StoreFactRefusal {
+        let record = CanonicalStoreAvailability {
+            connectivity,
+            process_readiness: StoreProcessReadiness::Unreadable(
+                StoreOwnerUnreadable::NoTransportToQuery,
+            ),
+            semantic_freshness: StoreSemanticFreshness::Unreadable(
+                StoreOwnerUnreadable::NoTransportToQuery,
+            ),
+        };
+        // The connectivity arms are all refusals, so this predicate always
+        // decides; `Err` is returned rather than an `expect` so no edit can
+        // turn it into a fabricated success.
+        match record.refuse_canonical_sensitive_authority() {
+            Err(refusal) => refusal,
+            Ok(()) => StoreFactRefusal::NotEstablished {
+                owner: StoreFactOwner::Connectivity,
+                reason: StoreFactNotEstablished::NoRetainedTransport,
+            },
+        }
+    }
+
+    /// Fails closed on a record whose connectivity is established but whose
+    /// later facts are not yet readable.
+    #[cfg(windows)]
+    fn refuse_on(
+        process_readiness: StoreProcessReadiness,
+        semantic_freshness: StoreSemanticFreshness,
+    ) -> StoreFactRefusal {
+        let record = CanonicalStoreAvailability {
+            connectivity: StoreConnectivity::Attached,
+            process_readiness,
+            semantic_freshness,
+        };
+        match record.refuse_canonical_sensitive_authority() {
+            Err(refusal) => refusal,
+            Ok(()) => StoreFactRefusal::NotEstablished {
+                owner: StoreFactOwner::SemanticFreshness,
+                reason: StoreFactNotEstablished::SemanticTruthStale,
+            },
+        }
     }
 
     pub(crate) fn claim_canonical_store_slot(&self) -> Result<(), KernelBuildError> {
@@ -965,6 +1021,10 @@ pub enum StoreOwnerUnreadable {
     /// The Store answered with material its own `validate()` rejected, so the
     /// answer is not a usable observation.
     StoreAnswerInvalid,
+    /// There is no transport to ask the Store through, so nothing was
+    /// observed about this owner. This is distinct from a measured negative:
+    /// the fact was never reachable, not observed and found false.
+    NoTransportToQuery,
 }
 
 #[cfg(windows)]
@@ -976,6 +1036,7 @@ impl StoreOwnerUnreadable {
             Self::GatewayOwnerPoisoned => "gateway_owner_poisoned",
             Self::StoreDidNotAnswer => "store_did_not_answer",
             Self::StoreAnswerInvalid => "store_answer_invalid",
+            Self::NoTransportToQuery => "no_transport_to_query",
         }
     }
 }
