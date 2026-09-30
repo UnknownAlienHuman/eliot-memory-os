@@ -1724,7 +1724,7 @@ const fn compare_scope_declarations(
 }
 
 /// Resolves whether the Store contract types a page coverage statement.
-const fn store_coverage_statement(operation: NamedReadOperation) -> StoreCoverageStatement {
+fn store_coverage_statement(operation: NamedReadOperation) -> StoreCoverageStatement {
     if declares_store_coverage_statement(operation) {
         StoreCoverageStatement::TypedByStoreContract
     } else {

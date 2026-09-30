@@ -2151,7 +2151,7 @@ fn classify_payload_coverage(
 /// the owner gating a set the Store no longer declares. The set is still exactly
 /// these two reads — that is a fact about the Store's page contract, not a
 /// choice made here — but it is now written once, in the Store's own spelling.
-const fn declares_store_coverage_statement(operation: NamedReadOperation) -> bool {
+fn declares_store_coverage_statement(operation: NamedReadOperation) -> bool {
     matches!(
         named_read_operation_name(operation),
         EXPERIENCE_BANK_READ_NAME | EXPERIENCE_FEEDBACK_READ_NAME
