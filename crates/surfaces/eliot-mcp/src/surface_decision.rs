@@ -29,7 +29,8 @@ use thiserror::Error;
 
 use crate::{
     CANONICAL_DEFINITION_VERSION, EffectClass, OperationClass, SemanticRegistry,
-    ToolMethodIdentity, ToolSchema, known_tool_profile, published_mcp_tool_surface,
+    ToolMethodIdentity, ToolSchema, check_advertised_schema_compatibility, known_tool_profile,
+    published_mcp_tool_surface,
 };
 
 /// Maximum number of methods carried by one surface decision.
@@ -751,8 +752,10 @@ pub struct PermittedTaskSurface {
 ///
 /// Only visible and lazy-visible methods are admitted, and only when the
 /// generated descriptor still agrees with the live validated semantic-owner
-/// binding. Hidden, forbidden, and unavailable methods are withheld —
-/// omitted from the permitted subset, never warned about in prose.
+/// binding and stays inside the supported host compatibility band
+/// ([`check_advertised_schema_compatibility`]). Hidden, forbidden,
+/// unavailable, and compatibility-outside methods are withheld — omitted
+/// from the permitted subset, never warned about in prose.
 ///
 /// # Errors
 ///
@@ -780,7 +783,16 @@ pub fn derive_permitted_surface(
                             .resolve(name, &entry.method.definition_version)
                             .is_ok() =>
                     {
-                        permitted.push(descriptor.clone());
+                        if check_advertised_schema_compatibility(descriptor).is_ok() {
+                            permitted.push(descriptor.clone());
+                        } else {
+                            withheld.push(WithheldSurfaceMethod {
+                                method: name.to_owned(),
+                                disposition,
+                                reason: "advertised schema is outside the supported host compatibility band"
+                                    .to_owned(),
+                            });
+                        }
                     }
                     _ => withheld.push(WithheldSurfaceMethod {
                         method: name.to_owned(),

@@ -20,12 +20,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ADMITTED_TOOL_NAMES, ApplicationRequest, ClientCapabilities, ContractViolation,
-    HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
-    HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
-    McpProtocolVersion, PermittedTaskSurface, QueryInput, QueryMode, SemanticRegistry,
-    TaskSurfaceConditions, ToolRequest, ToolSchema, TypedRejection, bind_act_owner_inputs,
-    bind_list_surface_budget, canonical_registry, canonical_tool_schemas, classify_tool_request,
+    ADMITTED_TOOL_NAMES, ApplicationRequest, CANONICAL_DEFINITION_VERSION,
+    CANONICAL_SCHEMA_GENERATOR, ClientCapabilities, ContractViolation, HostCancellationRequest,
+    HostCorrelationId, HostCorrelationReceipt, HostGatewayError, HostInvocationRequest,
+    HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED, McpProtocolVersion,
+    PermittedTaskSurface, QueryInput, QueryMode, SemanticRegistry, TaskSurfaceConditions,
+    ToolRequest, ToolSchema, TypedRejection, bind_act_owner_inputs, bind_list_surface_budget,
+    canonical_registry, canonical_tool_schemas, classify_tool_request,
     compile_discovery_surface_decision, compile_task_relative_surface,
     decode_protected_request_bytes, derive_permitted_surface, published_mcp_tool_surface,
     reject_duplicate_keys, validate_proof_ceiling, validate_tool_request_owner,
@@ -2423,6 +2424,26 @@ fn reject_blank_wire_id(correlation: &JsonRpcId) -> Result<(), WireRejection> {
     Ok(())
 }
 
+/// Rejects dispatch when the advertised descriptor version matches neither the
+/// canonical definition version nor the semantic owner's method version, so
+/// the advertised schema identity stays bound to the decoder contract version.
+fn reject_descriptor_version_skew(
+    descriptor_version: &str,
+    owner_method_version: &str,
+    tool_name: &str,
+) -> Result<(), WireRejection> {
+    if descriptor_version != CANONICAL_DEFINITION_VERSION
+        || descriptor_version != owner_method_version
+    {
+        return Err(WireRejection::with_data(
+            WIRE_METHOD_NOT_FOUND,
+            "tool schema version does not match its decoder contract",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the `tools/call` host invocation from a wire name plus arguments.
 ///
 /// Only the eight advertised canonical tools are admitted; anything else is
@@ -2484,13 +2505,11 @@ pub fn build_host_invocation(
             json!({ "tool": bound_wire_text(tool_name) }),
         )
     })?;
-    if descriptor.definition_version != owner.method.definition_version {
-        return Err(WireRejection::with_data(
-            WIRE_METHOD_NOT_FOUND,
-            "tool schema version does not match its decoder contract",
-            json!({ "tool": bound_wire_text(tool_name) }),
-        ));
-    }
+    reject_descriptor_version_skew(
+        descriptor.definition_version.as_str(),
+        owner.method.definition_version.as_str(),
+        tool_name,
+    )?;
     // I7.24 call admission: carry the invoked surface/method/profile revisions
     // through the shared dispatch gate. The wire carries no authenticated
     // task or grant, so those bind as unresolved rather than invented; the
@@ -2912,10 +2931,13 @@ fn bound_wire_text(value: &str) -> String {
 /// Presentation translates only the `tools/list` envelope keys: each
 /// descriptor's input and output schemas move verbatim, preserving
 /// referenced definitions, nested discriminators, and semantic constraints.
-/// Identity travels in the additive per-entry `_meta` (schema digest plus
-/// the definition version owned by the canonical version owner), and the
-/// list `_meta` records the one schema dialect every rendered schema
-/// declares, so a host that cannot represent it can withhold the surface
+/// Descriptors outside the supported host compatibility band never reach
+/// this entry: #1745's admitted subset withholds them with an explicit
+/// reason. Identity travels in the additive per-entry `_meta` (schema digest
+/// plus the definition version owned by the canonical version owner), and
+/// the list `_meta` records the one schema dialect every rendered schema
+/// declares, the pinned generator configuration, and the governing contract
+/// identity, so a host that cannot represent it can withhold the surface
 /// instead of silently dropping constraints.
 fn render_tool_list_surface(descriptors: &[ToolSchema]) -> Result<Value, WireRejection> {
     let tools: Vec<Value> = descriptors
@@ -2949,6 +2971,14 @@ fn render_tool_list_surface(descriptors: &[ToolSchema]) -> Result<Value, WireRej
     if let Some(dialect) = dialect {
         meta.insert("eliot/schemaDialect".to_owned(), Value::String(dialect));
     }
+    meta.insert(
+        "eliot/schemaGenerator".to_owned(),
+        Value::String(CANONICAL_SCHEMA_GENERATOR.to_owned()),
+    );
+    meta.insert(
+        "eliot/definitionVersion".to_owned(),
+        Value::String(CANONICAL_DEFINITION_VERSION.to_owned()),
+    );
     Ok(json!({
         "tools": tools,
         "_meta": Value::Object(meta),
