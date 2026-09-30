@@ -60,8 +60,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_contracts::ResourceGeneration;
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, OperationId, OrderingHeadExpectation, PreparedTransition,
-    RequestMeta, ReservedWriteRequest, RevisionHeadExpectation, StateFence, StoreError,
-    WriteReceipt,
+    RequestMeta, ReservedWriteRequest, ResourceGeneration, RevisionHeadExpectation, StateFence,
+    StoreError, WriteReceipt,
 };
 use futures_util::future::join_all;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
