@@ -469,7 +469,7 @@ impl KernelComposition {
         #[cfg(windows)]
         Self::adopt_descriptor_supervision_authority(&mut config, &prepared.descriptor)
             .map_err(&terminal)?;
-        Self::assemble_with_prepared_material(config, prepared, ors, ors_path, platform)
+        Self::assemble_with_prepared_material(config, prepared, ors, ors_path, platform, canonical_store_evidence)
             .map_err(&terminal)
     }
 
@@ -531,6 +531,7 @@ impl KernelComposition {
         ors: Arc<RedbRecoveryStore>,
         ors_path: PathBuf,
         platform: Arc<WindowsPlatform>,
+        canonical_store_evidence: Arc<CanonicalStoreEvidence>,
     ) -> Result<Self, KernelBuildError> {
         let snapshot_binding = AuthoritySnapshotBinding::from_wire(
             prepared.descriptor.snapshot_binding.clone(),
@@ -1315,8 +1316,11 @@ impl KernelComposition {
         ors_object_path: PathBuf,
         process_gateway: Option<Arc<ProcessExecutionGateway>>,
         platform: Arc<WindowsPlatform>,
-        _canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
+        canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
     ) -> Result<Self, KernelBuildError> {
+        #[cfg(not(windows))]
+        let _ = canonical_store_evidence;
+
         // F-LOG-KERNEL-2 (#899): assembly phases only; the public
         // constructors own the single terminal per failed build. Only fixed
         // phase labels plus numeric epoch/generation are emitted, never raw
@@ -1999,7 +2003,7 @@ impl KernelComposition {
             backup_capture,
             backup_owner_clients,
             #[cfg(windows)]
-            canonical_store_evidence: _canonical_store_evidence,
+            canonical_store_evidence,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]
