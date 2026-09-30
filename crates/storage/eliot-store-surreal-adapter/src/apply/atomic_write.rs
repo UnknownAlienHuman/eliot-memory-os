@@ -18,8 +18,11 @@ use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::plan::{ApplyPlan, EvidenceRecord, PayloadAuthorityRecord};
 use crate::schema;
+use crate::source_artifact_context::CanonicalCausalProjection;
 use eliot_store_api::epistemic_revision::EpistemicCommit;
-use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, StateFence, StoreError, WriteReceipt};
+use eliot_store_api::{
+    OrderingHead, ReceiptId, RevisionHead, ScopeId, StateFence, StoreError, WriteReceipt,
+};
 
 // Read and compare in the same transaction as the fence CAS and receipt.
 // The fence CAS serializes racing writers even when the position is absent.
@@ -105,6 +108,7 @@ pub(super) enum TxLane {
 const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "canonical_fence_cas_conflict",
     "canonical_fence_create_conflict",
+    "causal_parent_conflict",
     "notification_revision_conflict",
     "reactive_session_conflict",
     "reactive_snapshot_conflict",
@@ -227,6 +231,7 @@ pub(super) async fn write_transaction(
     transition: &eliot_store_api::PreparedTransition,
     plan: &ApplyPlan,
     receipt: &WriteReceipt,
+    causal: &CanonicalCausalProjection,
     initial_state: bool,
     expected_commit_sequence: u64,
     expected_outbox_sequence: u64,
@@ -244,6 +249,7 @@ pub(super) async fn write_transaction(
         transition,
         plan,
         receipt,
+        causal,
         initial_state,
         expected_commit_sequence,
         expected_outbox_sequence,
@@ -306,6 +312,7 @@ fn build_apply_statements(
     transition: &eliot_store_api::PreparedTransition,
     plan: &ApplyPlan,
     receipt: &WriteReceipt,
+    causal: &CanonicalCausalProjection,
     initial_state: bool,
     expected_commit_sequence: u64,
     expected_outbox_sequence: u64,
@@ -331,6 +338,20 @@ fn build_apply_statements(
         .request
         .metadata;
     let epistemic = EpistemicCommit::from_prepared(context, transition)?;
+
+    sql.push_str(schema::TX_GUARD_CAUSAL_PREDECESSOR);
+    bindings.insert(
+        "expected_causal_commit_sequence".to_owned(),
+        json!(causal.commit_sequence()),
+    );
+    bindings.insert(
+        "expected_parent_commit_sequence".to_owned(),
+        json!(causal.commit_sequence().saturating_sub(1)),
+    );
+    bindings.insert(
+        "expected_parent_receipt_id".to_owned(),
+        json!(causal.parent_receipt_id().map(ReceiptId::as_str)),
+    );
     if let Some(commit) = &epistemic {
         commit.readback(receipt)?;
         sql.push_str(EPISTEMIC_CAS);
