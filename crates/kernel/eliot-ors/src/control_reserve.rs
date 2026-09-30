@@ -15,7 +15,7 @@
 //! W4 ORS wave: every [`OrsPermit`] is owner-issued non-clone evidence bound
 //! to capacity class, bottleneck/unit/granted amount, typed operation,
 //! operation identity, owner and the typed [`AuthorityEpoch`] observed at
-//! acquisition, mirroring the front-door ControlPermit evidence grade.
+//! acquisition, mirroring the front-door [`ControlPermit`] evidence grade.
 //! Every denial names the exact bottleneck, shed work and observed epoch. A
 //! stale epoch, changed operation or changed owner fails before consumption
 //! because the evidence no longer matches the current owner state; there is
