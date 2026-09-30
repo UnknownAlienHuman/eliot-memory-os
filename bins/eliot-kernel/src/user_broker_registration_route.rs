@@ -108,8 +108,8 @@ fn peer_claims_registration(
         || identity.deadline_unix_ms > request.lease_expires_at
         || request.observed_at > now
         || request.lease_expires_at <= now
-        || &identity.request.state_fence != &session.module_generation.state_fence
-        || &identity.request.state_fence != &metadata.state_fence
+        || identity.request.state_fence != session.module_generation.state_fence
+        || identity.request.state_fence != metadata.state_fence
     {
         return Err(TransportError::SessionFenced);
     }
@@ -122,7 +122,7 @@ fn peer_claims_registration(
     if !session
         .authority_epoch
         .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
-        || &session.module_generation.state_fence != &policy.module_generation.state_fence
+        || session.module_generation.state_fence != policy.module_generation.state_fence
     {
         return Err(TransportError::SessionFenced);
     }
@@ -167,7 +167,7 @@ fn registration_record(
         &grant.fence_id,
     ))?;
     let record_id =
-        OperationIdentity::new(format!("user-broker-registration:{}", registration_digest))
+        OperationIdentity::new(format!("user-broker-registration:{registration_digest}"))
             .map_err(|_| TransportError::SessionFenced)?;
     let authority_epoch = ors_epoch_lineage(&grant.authority_epoch, previous_epoch)?;
     let state_fence_snapshot =
@@ -181,8 +181,7 @@ fn registration_record(
     let payload_length =
         u64::try_from(payload_bytes.len()).map_err(|_| TransportError::SessionFenced)?;
     let locator = PlatformHandle::new(format!(
-        "ors:user-broker-registration:{}",
-        registration_digest
+        "ors:user-broker-registration:{registration_digest}"
     ))
     .map_err(|_| TransportError::SessionFenced)?;
     let record = OperationalRecordInput::immutable_locator(
