@@ -2029,6 +2029,10 @@ impl KernelComposition {
         #[cfg(windows)]
         self.require_current_daemon_session(session)?;
         let result = match operation {
+            #[cfg(windows)]
+            scan_disclosure_route::OPERATION => {
+                self.scan_disclosure_owner_operation(session, payload)
+            }
             "snapshot" => self.daemon_snapshot().map(|value| {
                 serde_json::json!({
                     "status": "known",

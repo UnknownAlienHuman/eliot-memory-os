@@ -153,11 +153,10 @@ use eliot_governor::{
     WorkScopeDescriptor, derive_observed_resources,
 };
 use eliot_integration_coverage::{GovernanceProfile, IntegrationCoverageProfile};
-use eliot_ors::{
-    OrsError, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner,
-    ScanDisclosureStageOutcome,
-};
 use eliot_observation::TaskSelectionEvidence;
+use eliot_ors::{
+    OrsError, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
+};
 use eliot_protocol::{
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
