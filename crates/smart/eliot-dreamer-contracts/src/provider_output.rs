@@ -11,14 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::draft::ModelDraft;
 use crate::error::{ContractViolation, check_schema_version, check_vec_bound};
-use crate::grounding::{MaterialClaim, NonMaterialClaim};
+use crate::grounding::{MaterialClaim, MAX_CLAIMS, NonMaterialClaim};
 use crate::screen::ScreenBinding;
 
 /// Exact schema version accepted for the provider output envelope.
 pub const PROVIDER_OUTPUT_SCHEMA_VERSION: u32 = 2;
-
-/// Maximum provider-authored grounding claims in one response.
-pub const PROVIDER_OUTPUT_CLAIMS_CEILING: usize = 1024;
 
 /// One provider-authored pair of hypothesis and typed grounding members.
 ///
@@ -56,12 +53,12 @@ impl ProviderOutputV2 {
         self.draft.validate()?;
         check_vec_bound(
             self.grounding.claims.len(),
-            PROVIDER_OUTPUT_CLAIMS_CEILING,
+            MAX_CLAIMS,
             "grounding.claims",
         )?;
         check_vec_bound(
             self.grounding.non_material_claims.len(),
-            PROVIDER_OUTPUT_CLAIMS_CEILING,
+            MAX_CLAIMS,
             "grounding.non_material_claims",
         )?;
         for claim in &self.grounding.claims {
