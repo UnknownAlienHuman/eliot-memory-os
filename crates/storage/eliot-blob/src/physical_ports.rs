@@ -16,7 +16,9 @@ use eliot_blob_api::{
     CompressionDescriptor,
 };
 use eliot_platform::WorkScopePath;
-use eliot_platform_windows::blob_file_store::{BlobFilePathState, BlobFileStore, BlobFileStoreError};
+use eliot_platform_windows::blob_file_store::{
+    BlobFilePathState, BlobFileStore, BlobFileStoreError,
+};
 
 use crate::{
     BlobCasProviderResult, BlobCompressionPort, BlobPathState, BlobPlatformPort, BlobRootOwner,
@@ -67,12 +69,12 @@ impl BlobCompressionPort for ZstdBlobCompression {
         };
         let mut encoder = zstd::stream::write::Encoder::new(writer, self.level)
             .map_err(|error| BlobError::Provider(format!("Zstandard encoder refused: {error}")))?;
-        encoder
-            .write_all(plaintext)
-            .map_err(|error| BlobError::Provider(format!("Zstandard compression failed: {error}")))?;
-        let output = encoder
-            .finish()
-            .map_err(|error| BlobError::Provider(format!("Zstandard finalization failed: {error}")))?;
+        encoder.write_all(plaintext).map_err(|error| {
+            BlobError::Provider(format!("Zstandard compression failed: {error}"))
+        })?;
+        let output = encoder.finish().map_err(|error| {
+            BlobError::Provider(format!("Zstandard finalization failed: {error}"))
+        })?;
         Ok(output.bytes)
     }
 
@@ -83,9 +85,7 @@ impl BlobCompressionPort for ZstdBlobCompression {
         max_output_bytes: u64,
     ) -> Result<Vec<u8>, BlobError> {
         descriptor.validate()?;
-        if descriptor.algorithm.as_str() != ZSTD_ALGORITHM
-            || descriptor.version != ZSTD_VERSION
-        {
+        if descriptor.algorithm.as_str() != ZSTD_ALGORITHM || descriptor.version != ZSTD_VERSION {
             return Err(BlobError::ProviderUnavailable(
                 "zstd-v1 compression profile",
             ));
@@ -179,10 +179,9 @@ impl WindowsBlobPlatform {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| BlobError::Provider("system clock is before Unix epoch".to_owned()))?
             .as_nanos();
-        let sequence = PHYSICAL_PROVIDER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let backend_generation = (now as u64)
-            ^ (u64::from(owner.process_id()) << 32)
-            ^ sequence;
+        let sequence =
+            PHYSICAL_PROVIDER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let backend_generation = (now as u64) ^ (u64::from(owner.process_id()) << 32) ^ sequence;
         if backend_generation == 0 {
             return Err(BlobError::Provider(
                 "physical Blob provider generation could not be established".to_owned(),
@@ -227,7 +226,10 @@ impl WindowsBlobPlatform {
     }
 
     fn require_claim(&self) -> Result<&BlobRootLease, BlobError> {
-        let lease = self.claimed_lease.as_ref().ok_or(BlobError::OwnerConflict)?;
+        let lease = self
+            .claimed_lease
+            .as_ref()
+            .ok_or(BlobError::OwnerConflict)?;
         self.validate_lease(lease)?;
         Ok(lease)
     }
@@ -243,7 +245,11 @@ static PHYSICAL_PROVIDER_GENERATION: std::sync::atomic::AtomicU64 =
 impl BlobPlatformPort for WindowsBlobPlatform {
     fn claim_root(&mut self, lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
         self.validate_lease(lease)?;
-        if self.claimed_lease.as_ref().is_some_and(|claimed| claimed != lease) {
+        if self
+            .claimed_lease
+            .as_ref()
+            .is_some_and(|claimed| claimed != lease)
+        {
             return Err(BlobError::OwnerConflict);
         }
         self.probe_permission_proof()?;
@@ -274,7 +280,11 @@ impl BlobPlatformPort for WindowsBlobPlatform {
         })
     }
 
-    fn prove_contained(&self, lease: &BlobRootLease, path: &WorkScopePath) -> Result<(), BlobError> {
+    fn prove_contained(
+        &self,
+        lease: &BlobRootLease,
+        path: &WorkScopePath,
+    ) -> Result<(), BlobError> {
         self.validate_lease(lease)?;
         if self.claimed_lease.as_ref() != Some(lease) {
             return Err(BlobError::OwnerConflict);
@@ -284,17 +294,23 @@ impl BlobPlatformPort for WindowsBlobPlatform {
 
     fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
         self.require_claim()?;
-        self.files.read_bounded(path, max_bytes).map_err(map_file_error)
+        self.files
+            .read_bounded(path, max_bytes)
+            .map_err(map_file_error)
     }
 
     fn write_new_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
         self.require_claim()?;
-        self.files.create_new_durable(path, bytes).map_err(map_file_error)
+        self.files
+            .create_new_durable(path, bytes)
+            .map_err(map_file_error)
     }
 
     fn replace_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
         self.require_claim()?;
-        self.files.replace_durable(path, bytes).map_err(map_file_error)
+        self.files
+            .replace_durable(path, bytes)
+            .map_err(map_file_error)
     }
 
     fn cas_capability(&self) -> BlobCasCapability {
@@ -368,14 +384,16 @@ impl BlobPlatformPort for WindowsBlobPlatform {
         } else {
             match observed_bytes {
                 Some((_, observed_identity)) => {
-                    let expected_sha256 = request.expected.sha256().ok_or_else(|| {
-                        BlobError::CasFailure {
-                            failure: Box::new(BlobCasFailure::Internal {
-                                request: Box::new(request.clone()),
-                                reason: eliot_blob_api::BlobCasInternalReason::InvalidRequest,
-                            }),
-                        }
-                    })?;
+                    let expected_sha256 =
+                        request
+                            .expected
+                            .sha256()
+                            .ok_or_else(|| BlobError::CasFailure {
+                                failure: Box::new(BlobCasFailure::Internal {
+                                    request: Box::new(request.clone()),
+                                    reason: eliot_blob_api::BlobCasInternalReason::InvalidRequest,
+                                }),
+                            })?;
                     match self.files.replace_durable_if_matches(
                         &request.target,
                         observed_identity,
@@ -383,14 +401,12 @@ impl BlobPlatformPort for WindowsBlobPlatform {
                         bytes,
                     ) {
                         Ok(()) => Ok(()),
-                        Err(BlobFileStoreError::PreconditionFailed) => {
-                            Err(BlobError::CasFailure {
-                                failure: Box::new(BlobCasFailure::ExpectedStateConflict {
-                                    request: Box::new(request.clone()),
-                                    observed: observed.clone(),
-                                }),
-                            })
-                        }
+                        Err(BlobFileStoreError::PreconditionFailed) => Err(BlobError::CasFailure {
+                            failure: Box::new(BlobCasFailure::ExpectedStateConflict {
+                                request: Box::new(request.clone()),
+                                observed: observed.clone(),
+                            }),
+                        }),
                         Err(error) => Err(map_file_error(error)),
                     }
                 }
@@ -398,8 +414,7 @@ impl BlobPlatformPort for WindowsBlobPlatform {
                     .files
                     .create_new_durable(&request.target, bytes)
                     .map_err(map_file_error),
-            }
-            ?;
+            }?;
             BlobCasSuccessKind::Applied
         };
         let result = BlobCasProviderResult {
@@ -452,7 +467,10 @@ impl BlobPlatformPort for WindowsBlobPlatform {
 
     fn stat(&self, path: &WorkScopePath) -> Result<BlobPathState, BlobError> {
         self.require_claim()?;
-        self.files.stat(path).map(map_path_state).map_err(map_file_error)
+        self.files
+            .stat(path)
+            .map(map_path_state)
+            .map_err(map_file_error)
     }
 
     fn list(&self, prefix: &WorkScopePath) -> Result<Vec<WorkScopePath>, BlobError> {
@@ -489,9 +507,9 @@ fn map_file_error(error: BlobFileStoreError) -> BlobError {
     match error {
         BlobFileStoreError::NotFound => BlobError::NotFound,
         BlobFileStoreError::AlreadyExists => BlobError::IdempotencyConflict,
-        BlobFileStoreError::UnsupportedPlatform => BlobError::ProviderUnavailable(
-            "Windows reparse-safe Blob filesystem provider",
-        ),
+        BlobFileStoreError::UnsupportedPlatform => {
+            BlobError::ProviderUnavailable("Windows reparse-safe Blob filesystem provider")
+        }
         BlobFileStoreError::Platform(source) => BlobError::Provider(source.to_string()),
         BlobFileStoreError::InvalidPath | BlobFileStoreError::ReparsePoint => {
             BlobError::InvalidContract(error.to_string())

@@ -15,8 +15,8 @@ use eliot_artifact::{
     ArtifactReadReceipt, ArtifactReference, VerifiedArtifact,
 };
 use eliot_blob::{
-    BlobResidencyDomains, BlobRootOwner, BlobServicePorts, BlobStoreService,
-    DpapiUserAeadPort, DpapiUserKeyPort, WindowsBlobPlatform, ZstdBlobCompression,
+    BlobResidencyDomains, BlobRootOwner, BlobServicePorts, BlobStoreService, DpapiUserAeadPort,
+    DpapiUserKeyPort, WindowsBlobPlatform, ZstdBlobCompression,
 };
 use eliot_blob_api::{
     BlobError, BlobId, BlobPolicyBinding, BlobReadRequest, BlobReceiptContext, RetentionClass,
@@ -34,8 +34,13 @@ const SOURCE_BLOB_DIRECTORY: &str = "source-artifacts";
 const SOURCE_BLOB_OWNER_ID: &str = "eliotd-source-artifact-owner-v1";
 const SOURCE_BLOB_KEY_LINEAGE: &str = "eliotd-source-artifact-key-v1";
 
-type SourceBlobService =
-    BlobStoreService<WindowsBlobPlatform, ZstdBlobCompression, DpapiUserKeyPort, DpapiUserAeadPort, ()>;
+type SourceBlobService = BlobStoreService<
+    WindowsBlobPlatform,
+    ZstdBlobCompression,
+    DpapiUserKeyPort,
+    DpapiUserAeadPort,
+    (),
+>;
 
 /// The sole same-stack daemon owner for source-artifact Blob publication and
 /// readback. The source backend is D1 per I5.2; this composition does not
@@ -139,7 +144,8 @@ impl SourceArtifactOwner {
         let context = receipt_context(admission);
         let blob = self.blob_for_context(&context)?;
         let root_lease = self.root_owner.lease_for_request(&context.request)?;
-        let ready = blob.stage_source_with_domains(context, root_lease, bytes, policy, residency)?;
+        let ready =
+            blob.stage_source_with_domains(context, root_lease, bytes, policy, residency)?;
         ready.validate()?;
         ArtifactReference::new(
             identity,
@@ -157,8 +163,9 @@ impl SourceArtifactOwner {
         &'a self,
         admission: &'a SourceArtifactAdmission,
         reference: ArtifactReference,
-    ) -> impl Future<Output = Result<(VerifiedArtifact, ArtifactReadReceipt), SourceArtifactOwnerError>> + 'a
-    {
+    ) -> impl Future<
+        Output = Result<(VerifiedArtifact, ArtifactReadReceipt), SourceArtifactOwnerError>,
+    > + 'a {
         async move {
             if admission.operation().effect != EffectClass::Read {
                 return Err(SourceArtifactOwnerError::WrongEffect);
@@ -189,7 +196,8 @@ impl SourceArtifactOwner {
         let issuer_anchor = platform.receipt_issuer_anchor()?;
         let credential_platform = WindowsPlatform::new(self.root_owner.root_id().to_owned())
             .map_err(|error| BlobError::Provider(format!("construct DPAPI platform: {error}")))?;
-        let keys = DpapiUserKeyPort::new(BlobId::new(SOURCE_BLOB_KEY_LINEAGE)?, self.key_generation)?;
+        let keys =
+            DpapiUserKeyPort::new(BlobId::new(SOURCE_BLOB_KEY_LINEAGE)?, self.key_generation)?;
         Ok(SourceBlobService::new_with_owner(
             &self.root_owner,
             root_lease,

@@ -38,12 +38,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
-use eliot_contracts::StateFence;
 pub use eliot_blob_api::{
     BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
     BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
     BlobPublicationFence, BlobPublicationObligation, PublishState,
 };
+use eliot_contracts::StateFence;
 pub mod backup_io;
 pub use backup_io::{
     BACKUP_MAX_PLAINTEXT_BYTES, CaptureOutcome, CapturePorts, ConsumerEvidencePack, ExportedPage,
@@ -355,12 +355,7 @@ impl BlobRootOwner {
         lifecycle_fence
             .validate()
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-        Self::claim_inner(
-            root_id,
-            owner_id,
-            process_id,
-            Some(lifecycle_fence),
-        )
+        Self::claim_inner(root_id, owner_id, process_id, Some(lifecycle_fence))
     }
 
     fn claim_inner(
@@ -502,10 +497,7 @@ impl BlobRootOwner {
     /// never accepts a root identity or generation from an untrusted Blob
     /// payload. A missing/failed OS lease heartbeat or a malformed or
     /// mismatched request refuses issuance.
-    pub fn lease_for_request(
-        &self,
-        request: &RequestBinding,
-    ) -> Result<BlobRootLease, BlobError> {
+    pub fn lease_for_request(&self, request: &RequestBinding) -> Result<BlobRootLease, BlobError> {
         if self.heartbeat_failure().is_some() {
             return Err(BlobError::OwnerConflict);
         }
@@ -529,10 +521,7 @@ impl BlobRootOwner {
         }
         let root_id = PlatformHandle::new(self.root_id.clone())
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-        let lease_id = BlobId::new(format!(
-            "request-{}",
-            request.metadata.request_id.as_str()
-        ))?;
+        let lease_id = BlobId::new(format!("request-{}", request.metadata.request_id.as_str()))?;
         let lease = BlobRootLease {
             root_id,
             owner_id: self.owner_id.clone(),
@@ -5234,10 +5223,7 @@ where
     /// This owner-only entry point is available to a source-only composition
     /// whose `L` has no live-set implementation; it cannot perform GC or
     /// reachability operations.
-    pub fn stage_source(
-        &self,
-        request: BlobStageRequest,
-    ) -> Result<BlobReadyReceipt, BlobError> {
+    pub fn stage_source(&self, request: BlobStageRequest) -> Result<BlobReadyReceipt, BlobError> {
         self.core.stage_sync(request)
     }
 
@@ -5266,10 +5252,7 @@ where
     /// Reads and verifies exact plaintext bytes through the canonical
     /// BlobStoreCore path. The returned chunk carries the original
     /// independently verifiable Blob read receipt.
-    pub fn read_source(
-        &self,
-        request: BlobReadRequest,
-    ) -> Result<BlobReadChunk, BlobError> {
+    pub fn read_source(&self, request: BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
         self.core.read_sync(&request)
     }
 

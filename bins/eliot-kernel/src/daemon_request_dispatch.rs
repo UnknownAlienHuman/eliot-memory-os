@@ -25,6 +25,8 @@ use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::MaintenanceTriggerDeliveryError;
 #[cfg(windows)]
+use eliot_kernel_service::ProcessExecutionRequest;
+#[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
     StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
@@ -43,8 +45,6 @@ use eliot_kernel_service::{
     IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
     StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
 };
-#[cfg(windows)]
-use eliot_kernel_service::ProcessExecutionRequest;
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionError, ProcessExecutionView, ProcessLifecycle,
@@ -66,13 +66,12 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRef, CanonicalRequestView, MAX_RECOVERY_OWNER_RECORDS,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
-    StoreRecoveryRequest, StoreRecoverySnapshot, CausalWriteReceipt, WriteReceipt,
-    WriteReceiptStatus,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    CampaignSourceRevisionRef, CanonicalRequestView, CausalWriteReceipt,
+    MAX_RECOVERY_OWNER_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
+    RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
+    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::Deserialize;
 
@@ -96,8 +95,7 @@ pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervisi
 /// `operation` discriminator does not collide with the daemon routing key.
 /// Every leg remains bound to the daemon frame's original request identity
 /// and authenticated session.
-pub(crate) const EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION: &str =
-    "execute_current_source_process";
+pub(crate) const EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION: &str = "execute_current_source_process";
 /// Authenticated Governor publish operation carrying one live-derivation
 /// projection (issue #1935 AUD1, I7.16). The Governor-owned derivation
 /// publishes its exact revision, exact active fingerprint, and exact

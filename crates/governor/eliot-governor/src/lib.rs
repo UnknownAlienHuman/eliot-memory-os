@@ -131,12 +131,12 @@ mod problem_owner_transitions;
 mod quality_applicability;
 mod reactive_admission;
 mod route_registry;
-mod source_artifact_admission;
-mod source_artifact_blob_profile;
 mod scan_disclosure_owner;
 mod scope_identity_admission;
 mod selection_chain;
 mod skill_lifecycle;
+mod source_artifact_admission;
+mod source_artifact_blob_profile;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
@@ -285,24 +285,6 @@ pub use route_registry::{
     RouteOutcomeProfile, RouteOutcomeProfileIndex, RouteRefusalReason, RouteRegistryError,
     RuntimeRoute, diverging_scope_layers, effective_route_key,
 };
-pub use source_artifact_admission::{
-    SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
-    issue_source_artifact_admission,
-};
-pub use source_artifact_blob_profile::{
-    SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING,
-    SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING,
-    SOURCE_ARTIFACT_BLOB_EFFECT_CEILING_SETTING,
-    SOURCE_ARTIFACT_BLOB_ENCRYPTION_KEY_DOMAIN_SETTING,
-    SOURCE_ARTIFACT_BLOB_ERASURE_DOMAIN_SETTING,
-    SOURCE_ARTIFACT_BLOB_INSTRUCTION_TAINT_SETTING,
-    SOURCE_ARTIFACT_BLOB_PRIVACY_CLASS_SETTING,
-    SOURCE_ARTIFACT_BLOB_RETENTION_CLASS_SETTING,
-    SOURCE_ARTIFACT_BLOB_RETENTION_DOMAIN_SETTING,
-    SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING,
-    SourceArtifactBlobPolicy, SourceArtifactBlobProfile, SourceArtifactBlobProfileError,
-    SourceArtifactResidencyDomains, SourceArtifactRetentionClass,
-};
 pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 pub use scope_identity_admission::{
     BindingToken, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
@@ -326,6 +308,21 @@ pub use selection_chain::{
     selection_chain_security_context, selection_claim_ceiling,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
+pub use source_artifact_admission::{
+    SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
+    issue_source_artifact_admission,
+};
+pub use source_artifact_blob_profile::{
+    SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING,
+    SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING,
+    SOURCE_ARTIFACT_BLOB_EFFECT_CEILING_SETTING,
+    SOURCE_ARTIFACT_BLOB_ENCRYPTION_KEY_DOMAIN_SETTING,
+    SOURCE_ARTIFACT_BLOB_ERASURE_DOMAIN_SETTING, SOURCE_ARTIFACT_BLOB_INSTRUCTION_TAINT_SETTING,
+    SOURCE_ARTIFACT_BLOB_PRIVACY_CLASS_SETTING, SOURCE_ARTIFACT_BLOB_RETENTION_CLASS_SETTING,
+    SOURCE_ARTIFACT_BLOB_RETENTION_DOMAIN_SETTING, SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING,
+    SourceArtifactBlobPolicy, SourceArtifactBlobProfile, SourceArtifactBlobProfileError,
+    SourceArtifactResidencyDomains, SourceArtifactRetentionClass,
+};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
 pub use swarm_plan_attachment_ownership::{
     AttachmentOwnershipDomain, AttachmentOwnershipScope, OwnershipOutcome,

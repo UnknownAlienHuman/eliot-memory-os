@@ -23,8 +23,8 @@ use eliot_store_api::{
     NamedReadRequest, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
     RevisionHeadExpectation, ScopeId, StoreHealth, TaskContractAcceptanceSet, WriteReceipt,
     decode_task_contract_acceptance_set, generated_operation_manifests,
-    task_contract_acceptance_read_request,
-    validate_store_receipt_envelope_with_causal, verify_canonical_request_hash,
+    task_contract_acceptance_read_request, validate_store_receipt_envelope_with_causal,
+    verify_canonical_request_hash,
 };
 use tracing::Instrument as _;
 
@@ -320,9 +320,11 @@ impl KernelTransitionPort for DaemonKernelClient {
 
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
         Box::pin(async move {
-            Ok(KernelTransitionPort::receipt_with_causal(self, operation_id)
-                .await?
-                .map(|pair| pair.receipt))
+            Ok(
+                KernelTransitionPort::receipt_with_causal(self, operation_id)
+                    .await?
+                    .map(|pair| pair.receipt),
+            )
         })
     }
 
