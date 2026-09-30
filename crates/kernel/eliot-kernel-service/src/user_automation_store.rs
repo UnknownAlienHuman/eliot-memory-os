@@ -449,6 +449,28 @@ fn retained_owner_revision(entry: &Value) -> Result<UserAutomationRevision, Stor
 /// which the preflight reader reports as a named missing owner instead of
 /// substituting a receipt, and a present-but-invalid envelope fails closed
 /// rather than being silently dropped.
+///
+/// # Production caller
+///
+/// The one call site is
+/// [`CanonicalUserAutomationStore::project_owner_snapshot`] in this file,
+/// which fills `UserAutomationOwnerSnapshot::normalization_receipt` from the
+/// decoded envelope. That projection is not a library-internal helper: it is
+/// reached only through
+/// `crates/kernel/eliot-kernel-service/src/store_gateway.rs::KernelStoreGateway::read_user_automation_owner`
+/// (the `pub` method that performs the Store IO and calls
+/// `project_owner_snapshot`), which in turn is called from the authenticated
+/// operator surface
+/// `bins/eliot-kernel/src/daemon_request_dispatch.rs::KernelComposition::user_automation_operator_operation`.
+///
+/// The envelope this decodes is written by the production mutation leg in
+/// this same file — `mutation_parameters` calls
+/// `revision_with_owner_normalization_receipt` to seal it beside the
+/// revision — and the Surreal adapter persists it under
+/// [`eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON`]. Its
+/// consumer is
+/// `store_gateway.rs::KernelStoreGateway::assemble_run_now_preflight_projection`
+/// via `select_retained_normalization_receipts`.
 fn decode_retained_normalization_envelope(
     entry: &Value,
 ) -> Result<Option<ReceiptEnvelope>, StoreError> {
