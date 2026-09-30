@@ -1318,7 +1318,10 @@ impl OnboardingReadinessReceipt {
                 || evidence.selection_source_ref != *selection_source_ref
                 || evidence.evidence_ref != *evidence_ref
                 || evidence.work_scope_ref != self.scope.scope_ref
-                || self.state_fence.task_revision.map(|revision| revision.value())
+                || self
+                    .state_fence
+                    .task_revision
+                    .map(|revision| revision.value())
                     != Some(evidence.task_revision)
             {
                 return Err(WorkScopeError::BindingReceiptMismatch);
