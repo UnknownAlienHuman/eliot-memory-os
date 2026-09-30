@@ -83,7 +83,7 @@ fn emit_build_module_manifest() -> Option<Result<(), String>> {
                 .map_err(|error| format!("flush module manifest: {error}"))?;
             Ok(())
         })();
-        return Some(result);
+        Some(result)
     }
 
     #[cfg(not(windows))]
