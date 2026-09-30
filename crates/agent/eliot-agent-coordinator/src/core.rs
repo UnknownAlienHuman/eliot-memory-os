@@ -3431,10 +3431,6 @@ impl AgentCoordinator {
         if snapshot.config != live_config {
             return Err(CoordinatorError::StaleCapacity);
         }
-        let live_binding = provider.binding();
-        if snapshot.provider_binding != live_binding {
-            return Err(CoordinatorError::StaleProviderBinding);
-        }
         if snapshot.event_sequence
             != u64::try_from(snapshot.events.len())
                 .map_err(|_| CoordinatorError::SnapshotRollback)?
@@ -3456,6 +3452,17 @@ impl AgentCoordinator {
         coordinator.replay_snapshot_events(&expected_events)?;
         if coordinator.events != expected_events {
             return Err(CoordinatorError::SnapshotDigest);
+        }
+        // Binding comparison runs AFTER replay (issue #1108 A8): a fresh
+        // verifier binds `Gap` until its first `verify` succeeds, so
+        // comparing before replay refuses every legitimate verified
+        // restore. Every replayed event re-verifies through the sealed
+        // owner verifier, flipping this instance to `Verified` only on
+        // owner `Ok`; stale/missing evidence therefore fails inside
+        // replay, and a serialized `Verified` label alone still restores
+        // nothing because the post-replay binding stays `Gap`.
+        if snapshot.provider_binding != coordinator.provider.binding() {
+            return Err(CoordinatorError::StaleProviderBinding);
         }
         Ok(coordinator)
     }
