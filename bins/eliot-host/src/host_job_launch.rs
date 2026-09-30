@@ -387,7 +387,9 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
         // refused as an untrustworthy read instead of being recorded into a
         // directive or admitted against the retained child; a corrupt read is
         // not absence, so the start/reconnect defers.
-        StoreEndpointObservation::Occupied { owner_process_id: 0 } => {
+        StoreEndpointObservation::Occupied {
+            owner_process_id: 0,
+        } => {
             host_launch_observe("host.launch store endpoint owner unobservable");
             Err(HostError::StoreEndpointOwnerUnreadable(format!(
                 "planned Store endpoint {endpoint} owner observation is not a real process; a corrupt read is not absence, so the start/reconnect defers until exact installation ownership is observable"
