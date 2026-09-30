@@ -613,11 +613,12 @@ impl KernelComposition {
         // reach Host. The contour comparison uses the retained owner
         // identities, never caller-supplied name text.
         {
-            let owner = self
-                .kernel_owner
-                .lock()
-                .map_err(|_| KernelServiceError::Platform("kernel owner lock poisoned".to_owned()))?;
-            let held = owner.as_ref().ok_or(KernelServiceError::ReadinessNotProven)?;
+            let owner = self.kernel_owner.lock().map_err(|_| {
+                KernelServiceError::Platform("kernel owner lock poisoned".to_owned())
+            })?;
+            let held = owner
+                .as_ref()
+                .ok_or(KernelServiceError::ReadinessNotProven)?;
             if !held.is_for(&candidate.installation_id, &candidate.activation_id) {
                 return Err(KernelServiceError::ReadinessNotProven);
             }
