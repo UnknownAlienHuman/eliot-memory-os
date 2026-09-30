@@ -938,7 +938,7 @@ fn reconstruction_intent() -> QueryIntent {
 }
 
 /// Builds a bounded, control-character-free reason for a disposition.
-fn bounded_reason(prefix: &'static str, detail: impl std::fmt::Display) -> String {
+pub(crate) fn bounded_reason(prefix: &'static str, detail: impl std::fmt::Display) -> String {
     let mut reason = format!("{prefix}: {detail}");
     reason = reason
         .chars()
@@ -1202,7 +1202,7 @@ fn classify_role_envelope(
 /// `None` from a successful read is an authoritative empty positions view.
 /// A non-committed or undecodable payload is `Unavailable`, never empty and
 /// never promoted: only an external receipt proves an admitted position.
-fn decode_epistemic_payload(
+pub(crate) fn decode_epistemic_payload(
     payload: &Value,
 ) -> (ProjectionState, Option<EpistemicPositionReadback>) {
     let readback: Option<EpistemicPositionReadback> = match serde_json::from_value(payload.clone())

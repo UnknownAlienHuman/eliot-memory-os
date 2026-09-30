@@ -40,6 +40,7 @@ mod capability_evidence;
 mod capability_evidence_commit;
 mod composition;
 mod context_inputs;
+mod context_role_inputs;
 mod cue_composition;
 mod epistemic_composition;
 mod experience_commit;
@@ -50,6 +51,7 @@ pub use context_inputs::{
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
     ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME, RoleAcquisition, SevenRoleInputs,
 };
+pub use context_role_inputs::{EPISTEMIC_ROLE_OWNER, RoleInputError, decode_epistemic_role};
 pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,

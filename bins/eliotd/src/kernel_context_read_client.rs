@@ -97,8 +97,8 @@ use eliot_contracts::{
 use eliot_governor::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs,
     KernelGenerationSnapshotProvider, KernelPortError, ROLE_AFFORDANCES, ROLE_ATTENTION_CONFLICT,
-    ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY,
-    ROLE_TASK_FRAME, SevenRoleInputs,
+    ROLE_CUE_ACTIVATION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME,
+    RoleInputError, SevenRoleInputs, decode_epistemic_role,
 };
 use eliot_learning_contracts::CampaignLearningStateView;
 use eliot_protocol::{
@@ -1299,6 +1299,18 @@ pub enum PacketCompositionError {
         /// Existing owner of the missing projection conversion.
         owner: &'static str,
     },
+    /// A role's owner conversion exists and refused the acquired payload.
+    ///
+    /// #1862: distinct from [`PacketCompositionError::RoleConversionMissing`],
+    /// which names a conversion that does not exist. This one names a conversion
+    /// that ran over the owner's own record and rejected it — an absent read
+    /// identity, another operation, another scope or State Fence, a payload
+    /// that is not the owner's record, or no single current admitted position.
+    /// The typed refusal crosses this boundary with its role and owner intact
+    /// rather than being reported as a missing conversion, so a caller can tell
+    /// the two apart.
+    #[error("packet role conversion refused the acquired payload: {0}")]
+    RoleInputRefused(Box<RoleInputError>),
     /// The candidate owner rejected the compilation.
     #[error("packet candidate construction failed: {0}")]
     Candidates(Box<ContextError>),
@@ -1574,11 +1586,20 @@ impl KernelContextReadClient {
     /// - a required role without readable source fails as
     ///   [`PacketCompositionError::RoleUnavailable`] — a missing required input
     ///   never becomes a complete empty view;
-    /// - a `Complete`, `Partial`, or `Stale` role fails as
-    ///   [`PacketCompositionError::RoleConversionMissing`] naming its existing
-    ///   owner, because member ceilings and typed envelopes belong to that
-    ///   owner: generic authority rows are not automatically admitted
-    ///   Cue/negative-memory/capability inputs.
+    /// - a `Complete`, `Partial`, or `Stale` role whose owner conversion does not
+    ///   exist fails as [`PacketCompositionError::RoleConversionMissing`]
+    ///   naming its existing owner, because member ceilings and typed envelopes
+    ///   belong to that owner: generic authority rows are not automatically
+    ///   admitted Cue/negative-memory/capability inputs;
+    /// - #1862: the epistemic role is no longer in that class. Its owner
+    ///   conversion (`eliot_governor::decode_epistemic_role`) exists and runs
+    ///   over the acquired payload, selecting and binding the single current
+    ///   admitted position the owner already published; a payload it refuses
+    ///   fails as [`PacketCompositionError::RoleInputRefused`] carrying the
+    ///   owner's typed reason. The attention, cue and evidence roles still have
+    ///   no owner conversion, so `optional_role`'s refusal stands for them
+    ///   unchanged, as does `required_projection`'s for the three required
+    ///   roles.
     ///
     /// The admission closure pieces, the `quality` scorecard, the assembly
     /// `policy`, and the `measure` callback all arrive from their owners: a
@@ -1608,7 +1629,9 @@ impl KernelContextReadClient {
     /// owner-issued `SafetyFloorIdentity` — the floor is resolved there through
     /// `eliot_context::campaign_publication::context_safety_floor_identity` and
     /// checked by this edge's own admission join. The remaining suppliers
-    /// (seven-role acquisitions, candidate policy, priority policy, admission
+    /// (six of the seven-role acquisitions — the epistemic one now has an owner
+    /// conversion, the attention, cue and evidence ones plus the three required
+    /// roles do not — together with candidate policy, priority policy, admission
     /// rule record, measurement profile, per-atom measurements, quality card,
     /// assembly policy, measurement callback) are still absent, so the packet
     /// keeps its unbound-closure gap; the per-identity account is recorded on
@@ -1755,6 +1778,11 @@ impl KernelContextReadClient {
             request,
             &scope_revision,
         )?;
+        // #1862: the epistemic role has an owner conversion, so it is decoded
+        // from the acquired payload rather than refused. The three roles below
+        // still have none and keep their typed refusal.
+        let epistemic = decode_epistemic_role(&seven.epistemic, &request.binding)
+            .map_err(role_input_failure)?;
         let candidates = construct_context_candidates(
             request,
             recipe,
@@ -1764,11 +1792,7 @@ impl KernelContextReadClient {
                 ROLE_ATTENTION_CONFLICT,
                 "eliot-context-contracts",
             )?,
-            optional_role(
-                &seven.epistemic,
-                ROLE_EPISTEMIC_POSITION,
-                "eliot-epistemic-contracts",
-            )?,
+            epistemic.as_ref(),
             optional_role(&seven.cue, ROLE_CUE_ACTIVATION, "eliot-cue-contracts")?,
             &negative_memory,
             optional_role(&seven.evidence, ROLE_EVIDENCE_ASSURANCE, "eliot-evidence")?,
@@ -1979,16 +2003,34 @@ fn observed_scope_revision(seven: &SevenRoleInputs) -> Result<String, PacketComp
         .ok_or(PacketCompositionError::BindingMismatch)
 }
 
-/// Maps one optional role to its candidate-stage input.
+/// Projects one owner-conversion refusal onto the daemon-facing composition
+/// error without losing its typed role/owner/detail.
+///
+/// #1862: a role whose owner conversion exists and refused its payload is not
+/// reported as [`PacketCompositionError::RoleConversionMissing`], which names a
+/// conversion that does not exist. Collapsing the two would tell a reader that
+/// the epistemic conversion is still unimplemented after it exists.
+fn role_input_failure(error: RoleInputError) -> PacketCompositionError {
+    PacketCompositionError::RoleInputRefused(Box::new(error))
+}
+
+/// Maps one optional role without an owner conversion to its candidate-stage
+/// input.
 ///
 /// Only non-readable acquisitions map to `None` (the mapper reports the slot
 /// `Missing`, keeping the optional failure scoped). A readable acquisition —
 /// `Complete`, `Partial`, or `Stale` — fails as `RoleConversionMissing`
 /// naming its existing owner, because only that owner may interpret the
-/// payload as typed attention/epistemic/cue/evidence members. An
+/// payload as typed attention/cue/evidence members. An
 /// authoritative `KnownEmpty` likewise maps to `None`: the empty typed
 /// projection constructor belongs to the same owner, so absence of that
 /// constructor is absence of supply, never an implicit empty.
+///
+/// #1862: this mapper is reached for the attention, cue and evidence roles
+/// only. The epistemic role left it when its owner conversion landed; the
+/// payload behind these three reads is a retained authority-record envelope,
+/// not the typed family its slot names, so the refusal is the honest outcome
+/// and not a gap in this function.
 fn optional_role<T>(
     role: &eliot_governor::RoleAcquisition,
     label: &'static str,
