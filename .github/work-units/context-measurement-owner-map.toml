@@ -18,9 +18,10 @@
 #     scope is permitted, and the loader rejects `*` and any trailing `/`;
 #   * one exact scope belongs to exactly one owner; the loader rejects a path claimed twice;
 #   * a candidate with no existing exact-scope owner has NO row here and stays `unresolved`.
-#     `crates/eliot-engine/src/control_plane.rs` and `crates/eliot-engine/src/cognition.rs`
-#     are therefore deliberately absent: no #704/#783/#878/#880 seam covers them, and inventing
-#     a plausible owner would be a false ownership claim.
+#     A candidate the map does not place under its declared owner's exact scope is also
+#     `unresolved`, and `sync` then leaves the coverage disposition INCOMPLETE: the map is
+#     the second, independent half of the ownership proof, so an allocation without a map
+#     row is never silently owned.
 #   * this map records ownership of a candidate, not write permission. Write scope and
 #     read-only helper spans remain on each consumer workset row of the inventory.
 
@@ -50,9 +51,11 @@ source_paths = [
 [[owners]]
 issue = "#878"
 source_paths = [
+  "crates/eliot-engine/src/cognition.rs",
   "crates/eliot-engine/src/context.rs",
   "crates/eliot-engine/src/context/packet_quality.rs",
   "crates/eliot-engine/src/context_contracts.rs",
+  "crates/eliot-engine/src/control_plane.rs",
   "crates/eliot-engine/src/host.rs",
   "crates/smart/eliot-context-contracts/src/measurement.rs",
 ]
