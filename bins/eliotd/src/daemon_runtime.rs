@@ -726,13 +726,29 @@ pub(super) fn run() -> Result<(), String> {
     // and submits any unavailable-family decision through the canonical
     // notification path using only the composition's admitted fence.
     let startup_maintenance_observations = [
+        // The startup reconciliation observation carries the seven declared
+        // startup slot dispositions themselves (`ledger_report`), so its family
+        // is the one that observation concerns: a declared slot that is not
+        // bound, or bound but unusable, is the daemon's own declared-capability
+        // conformance gap. See `conformance_observed_family`; the family is
+        // derived from this same projection the report was rendered from, never
+        // from a literal.
         maintenance_observation(
             MaintenanceTriggerOrigin::StartupReconciliation,
+            conformance_observed_family(&startup_readiness),
             &[startup_readiness.ledger_report()],
             false,
         ),
+        // Same declared-capability denominator, read as the cold-start
+        // completion verdict: `startup_bindings_complete` is the strict
+        // expected-versus-supplied boolean over the same seven slots and
+        // `report` is the bounded readiness record carrying the core verdict
+        // and the degraded set. Same family for the same observed gap; the
+        // trigger identity still separates the two, because the catalog's
+        // deduplication key includes the origin.
         maintenance_observation(
             MaintenanceTriggerOrigin::ColdStartCompletion,
+            conformance_observed_family(&startup_readiness),
             &[
                 format!(
                     "startup_bindings_complete={}",
@@ -1760,11 +1776,18 @@ async fn run_loop(
                     &mut maintenance_flight,
                     &mut maintenance_failure_guard,
                 );
-                // Issue #1867 W1: the improvement-intake dispatch rides the same
-                // cadence and the same real idle observation, on its own single-
-                // owner flight. It never shares the notification completion
-                // branch, so a blocked durable commit cannot delay the
-                // maintenance notification.
+                // Issue #1867 W2/A1: the improvement-intake dispatch rides the
+                // same cadence, on its own single-owner flight. It never shares
+                // the notification completion branch, so a blocked durable
+                // commit cannot delay the maintenance notification.
+                //
+                // It also makes its OWN observation rather than borrowing the
+                // idle maintenance one, because it is the step that feeds the
+                // improvement funnel and it holds the declared-capability
+                // readiness projection the idle site does not. That is what
+                // lets a real observed conformance gap name the conformance
+                // family and reach the Self-Quality conformance-diagnosis
+                // contract; see `improvement_intake_observation`.
                 //
                 // #1867 W3: the step also reads the deduplication registry back
                 // from the durable candidate records over the retained Kernel
@@ -1773,6 +1796,7 @@ async fn run_loop(
                     &kernel,
                     &composition,
                     &flight,
+                    &readiness_projection,
                     &mut improvement_intake_flight,
                 );
             }
@@ -2087,14 +2111,32 @@ fn note_supervision_applied(
 
 /// Builds the sanitized maintenance observation for one wired trigger site.
 ///
-/// Shared by every trigger arm so each one names the same self-observed family
-/// and passes its evidence identities through the shared diagnostics sanitizer:
-/// a trigger can never carry control characters, secrets, or unbounded detail
-/// into the evaluator's own field validation. The family is the one
-/// self-observed family this daemon can honestly name today; the registered
-/// per-observation family catalog is #1693's to supply.
+/// Shared by every trigger arm so each one passes its evidence identities
+/// through the shared diagnostics sanitizer: a trigger can never carry control
+/// characters, secrets, or unbounded detail into the evaluator's own field
+/// validation.
+///
+/// # The family is a parameter, because it is the caller's real observation
+///
+/// It used to be hardcoded here as [`SELF_OBSERVED_FAMILY`] for every site,
+/// which made two registered families structurally unreachable: no live
+/// observation could ever carry `MaintenanceFamily::DonorConformance` or
+/// `MaintenanceFamily::SecurityDependencyScan`, so every live candidate was
+/// labelled [`eliot_improvement::EvidenceSource::Attempt`] and the
+/// Self-Quality conformance-diagnosis projection in
+/// `improvement_intake_dispatch::conformance_diagnosis_evidence` could not be
+/// reached by any production call (issue #1867 W2/A1).
+///
+/// Each call site therefore names the family its OWN evidence supports — see
+/// [`conformance_observed_family`] for the sites that observe a
+/// declared-capability conformance gap, and the comment at each remaining site
+/// for the family that observation concerns. The registered per-family catalog
+/// (#1693) still decides the mode, the conditions, the deduplication scope and
+/// the route; it does not and cannot invent which family an observed signal
+/// concerns, and neither does this constructor.
 fn maintenance_observation(
     origin: MaintenanceTriggerOrigin,
+    family: eliot_maintenance::MaintenanceFamily,
     evidence_refs: &[String],
     activation_in_flight: bool,
 ) -> MaintenanceObservation {
@@ -2104,10 +2146,80 @@ fn maintenance_observation(
         .collect();
     MaintenanceObservation {
         origin,
-        family: SELF_OBSERVED_FAMILY,
+        family,
         evidence_refs,
         activation_in_flight,
     }
+}
+
+/// The family an observation of the daemon's own declared-capability
+/// conformance gap concerns (issue #1867 W2/A1, I12.24:50).
+///
+/// # What is observed here
+///
+/// [`StartupReadinessProjection`] is the daemon's own expected-versus-supplied
+/// record over its declared integration contract, and both reads below are
+/// that record and nothing else:
+///
+/// - [`every_declared_capability_bound`] is true only when EVERY declared
+///   slot is bound with its own proof, so a `false` is a slot the daemon
+///   declared and cannot use;
+/// - [`degraded_capabilities`] is the exact set of declared OPTIONAL
+///   capabilities currently unavailable. Its own documentation excludes
+///   mandatory capabilities because their unavailability is already a withheld
+///   core verdict.
+///
+/// [`every_declared_capability_bound`]:
+/// `StartupReadinessProjection::every_declared_capability_bound`
+/// [`degraded_capabilities`]: `StartupReadinessProjection::degraded_capabilities`
+///
+/// Both are pure reads of state the daemon produced: the startup attach sites
+/// filled the ledger, and `observe_owner` re-derives it under the composition
+/// lock on every health heartbeat. Neither performs IO, opens a client, or
+/// starts anything.
+///
+/// # Why `DonorConformance` is the family a gap names
+///
+/// `MaintenanceFamily::DonorConformance` is the registered family whose own
+/// obligation is "Donor or conformance audit"
+/// (`crates/governor/eliot-maintenance/src/lib.rs:115-116`), and I12.24:50
+/// names `Architecture/Implementation/runtime conformance gap` as an
+/// improvement trigger. A declared capability that is not bound, or bound but
+/// unusable, is exactly that gap between what the Architecture declares and
+/// what the running composition is. Its registered entry also accepts both
+/// origins these sites raise: `Policy` (which `IdleTransition` maps to) and
+/// `Onboarding`/`Installation` (which `ColdStartCompletion` maps to), so the
+/// named family is eligible at the sites that can observe the gap rather than
+/// ineligible by construction.
+///
+/// # What this does NOT claim
+///
+/// Naming the family does NOT claim that a conformance audit ran. The
+/// registered entry records that no conformance audit runner is admitted —
+/// "no donor or conformance audit runner is admitted:
+/// `crates/foundation/eliot-conformance-contracts` is a stateless effect-free
+/// contract crate that explicitly does not discover evidence or promote
+/// support" (`maintenance_family_catalog.rs:1514`) — so the owner's decision
+/// for it is the real `Block`/`AutomationOff` a family with no route receives.
+/// That is the honest signal, and it is the one the improvement brief is
+/// about: the daemon observed a conformance gap, and no admitted owner can
+/// resolve it.
+///
+/// # When nothing is degraded
+///
+/// If every declared capability is bound and none is degraded, the same
+/// observation concerns the daemon's own health and maintenance debt and names
+/// [`SELF_OBSERVED_FAMILY`], exactly as the idle and store-health sites do. A
+/// healthy daemon therefore never claims a conformance gap it did not observe.
+fn conformance_observed_family(
+    startup_readiness: &StartupReadinessProjection,
+) -> eliot_maintenance::MaintenanceFamily {
+    if startup_readiness.every_declared_capability_bound()
+        && startup_readiness.degraded_capabilities().is_empty()
+    {
+        return SELF_OBSERVED_FAMILY;
+    }
+    eliot_maintenance::MaintenanceFamily::DonorConformance
 }
 
 /// Evaluates one real maintenance observation and captures the exact admitted
@@ -2208,10 +2320,19 @@ fn maybe_start_startup_maintenance_triggers(
 /// idle *observation*, not a busy-to-idle edge detector: the loop retains no
 /// previous-idle flag, and inventing one to manufacture a transition edge
 /// would be a fabricated event source.
+///
+/// The family is [`SELF_OBSERVED_FAMILY`]: the only thing this site observes
+/// is whether admitted interactive work is in flight, which is the daemon's
+/// own health and maintenance-debt review and nothing more. It is NOT named
+/// [`conformance_observed_family`]'s conformance family, because this site
+/// holds no declared-capability evidence at all; the improvement intake, which
+/// does hold that projection, takes its own observation
+/// ([`improvement_intake_observation`]) rather than borrowing this one.
 fn idle_maintenance_observation(flight: &ActivationFlight) -> MaintenanceObservation {
     let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
     maintenance_observation(
         MaintenanceTriggerOrigin::IdleTransition,
+        SELF_OBSERVED_FAMILY,
         &[format!("activation_in_flight={activation_in_flight}")],
         activation_in_flight,
     )
@@ -2482,8 +2603,38 @@ async fn run_health_heartbeat_tick(
         // rejected evaluation is an explicit typed gap, never a daemon-killing
         // error, and the trigger stays durable for the next eligible pass.
         let blocked_automation = match guard.evaluate_maintenance_trigger_with_evidence(
+            // The family is [`SELF_OBSERVED_FAMILY`]: the observed evidence is
+            // the durable store's own health status and its canonical operation
+            // manifest identity, which is the daemon's admitted health and
+            // maintenance debt.
+            //
+            // It is deliberately NOT `MaintenanceFamily::SecurityDependencyScan`,
+            // and the reason is measured, not stylistic. That family's
+            // registered observation is "scripts/verify-dependency-policy.py
+            // pinned-scanner canonical receipt" and its registered execution
+            // owner is recorded as unavailable with the reason "no runtime scan
+            // owner is admitted: `docs/DEPENDENCY_POLICY.md` pins the scanner to
+            // cargo-deny 0.20.2 plus a verified executable digest ... and no
+            // eliotd Kernel operation or Rust owner exposes a scan result to the
+            // daemon" (`maintenance_family_catalog.rs:1441-1457`). The digest
+            // this site observes is `StoreHealth::manifest_digest` — the store
+            // API's own operation-manifest identity returned by the health
+            // poll — not a scanner receipt, advisory-set digest or policy
+            // finding set, so naming that family here would claim a scan
+            // result nobody produced. It is also ineligible by origin: this
+            // site's `AdmittedObservation` maps to `MaintenanceTrigger::
+            // WatchdogProblem`, which is not among that entry's registered
+            // origins (`Human`, `Policy`, `Installation`).
+            //
+            // Consequence, stated so it is not read as covered:
+            // `improvement_intake_dispatch::maintenance_evidence_source`'s
+            // `SecurityDependencyScan => EvidenceSource::SecurityIncident` arm
+            // remains unreachable, because reaching it needs a real pinned-
+            // scanner receipt surfaced to this daemon, and no admitted owner
+            // surfaces one.
             maintenance_observation(
                 MaintenanceTriggerOrigin::AdmittedObservation,
+                SELF_OBSERVED_FAMILY,
                 &[
                     format!("store_health={:?}", health.status),
                     health.manifest_digest.as_str().to_owned(),
@@ -5011,10 +5162,74 @@ fn report_improvement_candidate_route(
     }
 }
 
+/// The improvement intake's OWN observation, and the family its evidence
+/// concerns (issue #1867 W2/A1, I12.24:50).
+///
+/// # Why the intake does not reuse the idle maintenance observation
+///
+/// It used to call [`idle_maintenance_observation`], whose only evidence is
+/// `activation_in_flight={bool}`. That observation cannot name a conformance
+/// family honestly, so the whole Self-Quality conformance-diagnosis leg (the
+/// `conformance_diagnosis_evidence` projection in `improvement_intake_dispatch`,
+/// reached from `assemble_improvement_artifact` when
+/// `maintenance_evidence_source` returns `ConformanceDiagnosis`) had no live
+/// producer: every candidate was labelled an attempt. The intake step is the
+/// one that feeds the improvement funnel, so it now makes its own observation
+/// at the same cadence, from the readiness projection the tick already holds.
+///
+/// # What this site observes
+///
+/// Two real records, and nothing spelled:
+///
+/// - `declared_capabilities_bound` is
+///   [`every_declared_capability_bound`] over the declared slot denominator —
+///   the expected-versus-supplied comparison the daemon's own startup attach
+///   sites and `observe_owner` produce;
+/// - the bounded readiness record [`report`], which carries the core verdict,
+///   the owner generation and epoch the verdict was derived from, the degraded
+///   optional set, and every slot's mandatory flag, availability and prior
+///   failure.
+///
+/// [`every_declared_capability_bound`]:
+/// `StartupReadinessProjection::every_declared_capability_bound`
+/// [`report`]: `StartupReadinessProjection::report`
+///
+/// The `activation_in_flight` evidence and the gate it feeds are unchanged: the
+/// intake is still gated on the real admitted activation state captured before
+/// its future is created, exactly as the idle maintenance trigger is.
+///
+/// The family is [`conformance_observed_family`], so an observed declared-
+/// capability gap is raised as the conformance family and reaches the funnel
+/// through the Self-Quality conformance-diagnosis contract, while a daemon
+/// whose declared set is fully bound and undegraded keeps naming
+/// [`SELF_OBSERVED_FAMILY`] and its attempt lineage. This is a pure read of
+/// retained state: no IO, no client, no clock, and it happens on the
+/// single-threaded loop before the flight future is created, so the borrowed
+/// projection never crosses the future.
+fn improvement_intake_observation(
+    activation_flight: &ActivationFlight,
+    startup_readiness: &StartupReadinessProjection,
+) -> MaintenanceObservation {
+    let activation_in_flight = matches!(activation_flight, ActivationFlight::InFlight(_));
+    maintenance_observation(
+        MaintenanceTriggerOrigin::IdleTransition,
+        conformance_observed_family(startup_readiness),
+        &[
+            format!("activation_in_flight={activation_in_flight}"),
+            format!(
+                "declared_capabilities_bound={}",
+                startup_readiness.every_declared_capability_bound()
+            ),
+            startup_readiness.report(),
+        ],
+        activation_in_flight,
+    )
+}
+
 /// Starts one improvement-intake step when its flight is idle. The
-/// observation is captured from the activation state before the future is
-/// created, so the decision and its evidence are the same observation; a busy
-/// flight is left untouched.
+/// observation is captured from the activation state and the readiness
+/// projection before the future is created, so the decision and its evidence
+/// are the same observation; a busy flight is left untouched.
 ///
 /// The retained Kernel client is cloned into the future because the step now
 /// performs an authenticated named read — the deduplication-registry read-back
@@ -5024,12 +5239,13 @@ fn maybe_start_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     activation_flight: &ActivationFlight,
+    startup_readiness: &StartupReadinessProjection,
     flight: &mut ImprovementIntakeFlight,
 ) {
     if !matches!(flight, ImprovementIntakeFlight::Idle) {
         return;
     }
-    let observation = idle_maintenance_observation(activation_flight);
+    let observation = improvement_intake_observation(activation_flight, startup_readiness);
     let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
     *flight = ImprovementIntakeFlight::InFlight(ImprovementIntakeFlightState {

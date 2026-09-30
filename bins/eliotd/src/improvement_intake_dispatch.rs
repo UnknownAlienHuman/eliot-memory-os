@@ -28,6 +28,16 @@
 //! evidence was. The derivation — and why no `Watchdog` label survives it —
 //! are documented on that function.
 //!
+//! Since #1867 W2/A1 that derivation is LIVE for the conformance source rather
+//! than only declared: the daemon names the observed family at each trigger
+//! site instead of hardcoding one (`daemon_runtime::maintenance_observation`
+//! takes the family as a parameter), so a real declared-capability conformance
+//! gap observed at the startup or improvement-intake sites reaches
+//! [`conformance_diagnosis_evidence`] below and enters the funnel through the
+//! Self-Quality conformance-diagnosis contract. The security-incident arm is
+//! still unreachable, and [`maintenance_evidence_source`] records the measured
+//! reason for that rather than substituting a label.
+//!
 //! # The durable port is the existing Governor/Kernel named mutation
 //!
 //! The owner-actionable artifact (candidate revision + brief + owner decision)
@@ -812,10 +822,30 @@ fn enforce_advisory_class_gate(
 ///
 /// - `MaintenanceFamily::SecurityDependencyScan` is the daemon's
 ///   security/dependency incident family, and I12.24:49 names "security
-///   incident".
+///   incident". It is still UNREACHABLE from this daemon, and the reason is
+///   measured rather than assumed: the only site that observes anything close
+///   to a dependency or manifest identity is the store-health poll
+///   (`daemon_runtime.rs`, the `AdmittedObservation` trigger), and what it
+///   observes is `StoreHealth::manifest_digest` — the store API's own
+///   operation-manifest identity — while that family's registered observation
+///   is the pinned-scanner canonical receipt from
+///   `scripts/verify-dependency-policy.py` and its registered execution owner
+///   is recorded as unavailable because "no eliotd Kernel operation or Rust
+///   owner exposes a scan result to the daemon"
+///   (`maintenance_family_catalog.rs:1441-1457`). That site's origin also maps
+///   to `MaintenanceTrigger::WatchdogProblem`, which is not one of that
+///   entry's registered origins (`Human`, `Policy`, `Installation`). Naming
+///   the family there would claim a scan nobody ran, so this arm stays
+///   unreachable until a real scan receipt is surfaced to the daemon.
 /// - `MaintenanceFamily::DonorConformance` is the conformance-audit family,
 ///   and I12.24:50 names "Architecture/Implementation/runtime conformance gap",
-///   which the closed set spells [`EvidenceSource::ConformanceDiagnosis`].
+///   which the closed set spells [`EvidenceSource::ConformanceDiagnosis`]. It
+///   is REACHABLE: the daemon names it at the sites whose own evidence is a
+///   declared-capability conformance gap — the two startup trigger sites and
+///   the improvement-intake observation, through
+///   `daemon_runtime::conformance_observed_family` (issue #1867 W2/A1). That
+///   is what makes [`conformance_diagnosis_evidence`] a live projection rather
+///   than an unreachable one.
 /// - every other family, at every decision the evaluator can return, is the
 ///   attempt itself: `AutomationDecision::Start` admits the job, `Suggest`
 ///   preserves a recommendation instead, `Defer` holds it for a later eligible
@@ -836,9 +866,11 @@ fn enforce_advisory_class_gate(
 /// `MaintenanceTriggerOrigin::AdmittedObservation`
 /// (`maintenance_trigger_evaluator.rs:125`), while the observation this dispatch
 /// records is built from `MaintenanceTriggerOrigin::IdleTransition`
-/// (`daemon_runtime.rs:2169`), which maps to `MaintenanceTrigger::Policy`
-/// (`maintenance_trigger_evaluator.rs:123`). A policy-driven occurrence is not
-/// a Watchdog suggestion, and nothing in the decision could make it one.
+/// (`daemon_runtime.rs::idle_maintenance_observation` and
+/// `daemon_runtime.rs::improvement_intake_observation`), which maps to
+/// `MaintenanceTrigger::Policy` (`maintenance_trigger_evaluator.rs:123`). A
+/// policy-driven occurrence is not a Watchdog suggestion, and nothing in the
+/// decision could make it one.
 ///
 /// The residual this function used to carry claimed
 /// [`EvidenceSource::Watchdog`] for every decision that was neither of the two
@@ -915,10 +947,44 @@ fn conformance_diagnosis_evidence(
         // The routing table's own default owner for a conformance-dimension
         // finding with no counterevidence and no special family
         // (`routing.rs::route_owner`, rules 1-9 miss, rule 10 default), i.e.
-        // the owner a real conformance finding reaches. `route_owner` itself is
-        // not called here because it takes a `SelfQualityObservation` and this
-        // daemon holds no frozen #820 observation snapshot; the same default is
-        // named rather than re-derived.
+        // the owner a real conformance finding reaches.
+        //
+        // `route_owner` itself is NOT called here, and the reason is measured
+        // on this tree rather than assumed. It takes a
+        // `SelfQualityObservation`, whose every variant wraps an
+        // `ObservationCore`
+        // (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:362-376`),
+        // and that core has ten required fields. Most of them are owner-binding,
+        // window and measurement facts this daemon does not hold and cannot
+        // honestly produce at any trigger site: `OwnerBinding`
+        // (`owner_ref`, `schema_ref`, `revision_ref`, `content_digest`),
+        // `ObservationWindow` (`observed_from_ms`, `observed_to_ms`,
+        // `environment_ref`, `platform_ref`, `toolchain_ref`), the `metric`
+        // measurement (`value`, `unit_ref`, `normalization_ref`,
+        // `population_ref`, `presence`) and the declared `completeness`
+        // denominators. The daemon's real observation is a maintenance
+        // decision: a `trigger_id`, a `family`, a `scope_ref` and the observed
+        // evidence identities. Manufacturing a window, a platform, a toolchain
+        // or a metric normalization to satisfy the constructor would fabricate
+        // precisely the observation the owner routing is supposed to read, so
+        // the default is named instead and the routing table is not
+        // circumvented by re-deriving a different one.
+        //
+        // `ASSUMPTION:` the named default is the owner `route_owner` would
+        // return for the finding recorded here, and the precedence table makes
+        // that checkable without holding the observation: rule 1 needs
+        // non-empty counterevidence (this handoff carries none), rules 2-8 key
+        // on the six family names `RECOVERY`, `ERASURE_INFLUENCE`,
+        // `SECURITY_PRIVACY`, `HUMAN_ATTENTION`, `COST_QUOTA`, `PRODUCT`,
+        // `PERFORMANCE_RESOURCES`, `MEMORY_PROVENANCE`,
+        // `RECOVERY_COMPATIBILITY` and `SOURCE_BUILD` (this finding's family
+        // is a maintenance `DONOR_CONFORMANCE`, which is none of them), and
+        // rule 9 needs a `LearningQuality`/`ContextQuality` dimension or an
+        // `Inconclusive`/`Missing` status (this is a conformance-dimension
+        // finding reached through a blocking maintenance decision). Rules 1-9
+        // therefore miss and rule 10 is the default. If a future change makes
+        // this finding a `SECURITY_PRIVACY` or `COST_QUOTA` one, the owner
+        // must be routed, not defaulted.
         owner: SelfQualityHandoffOwner::DevelopmentDiagnosis675,
         priority: conformance_priority(decision),
         symptom_refs: vec![format!("maintenance-trigger:{}", decision.trigger_id)],
