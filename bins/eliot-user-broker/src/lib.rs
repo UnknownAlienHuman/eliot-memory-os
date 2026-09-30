@@ -1210,6 +1210,10 @@ pub struct BrokerComposition {
     #[cfg(windows)]
     generation_job: own_generation_job::OwnedGenerationJob,
     registration_digest: Option<String>,
+    /// The authenticated Kernel client is retained for typed Operator
+    /// challenge/redeem and authority checks, separate from the core broker's
+    /// generic launch AuthorityPort.
+    kernel_client: Option<SharedKernelClient>,
     identity_issuer: IssuerHandle,
     /// Kernel-backed Operator session bindings keyed by issued handoff
     /// nonce (I11.8). Each row pins the live Kernel-issued registration
@@ -1311,11 +1315,22 @@ impl BrokerComposition {
         Ok(())
     }
 
+    fn kernel_authority_port(&self) -> Result<KernelAuthorityPort, CompositionError> {
+        let client = self.kernel_client.as_ref().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorHandoffUncomposed
+                .with_platform("Kernel authority client is not composed")
+        })?;
+        Ok(KernelAuthorityPort {
+            client: client.clone(),
+            issuer: self.identity_issuer.clone(),
+        })
+    }
+
     fn start_with_ports(
         config: BrokerConfig,
         authority: Option<Box<dyn AuthorityPort>>,
         process: Option<Box<dyn ProcessPort>>,
-        _kernel_client: Option<SharedKernelClient>,
+        kernel_client: Option<SharedKernelClient>,
         launch: Option<(BrokerLaunchBinding, ProtectedPathLease)>,
         issuer: IssuerHandle,
     ) -> Result<Self, CompositionError> {
@@ -1436,6 +1451,7 @@ impl BrokerComposition {
             #[cfg(windows)]
             generation_job,
             registration_digest,
+            kernel_client,
             identity_issuer: issuer,
             operator_session_bindings: BTreeMap::new(),
             approval_bindings: BTreeMap::new(),

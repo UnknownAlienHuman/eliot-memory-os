@@ -24,14 +24,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{
-    AuthorityPort, LaunchGrant, LaunchRequest, PortError, RegistrationFenceReceipt,
+    AuthorityPort, LaunchGrant, LaunchRequest, OperatorChallenge, OperatorChallengeRequest,
+    OperatorRedeemRequest, OperatorSessionGrant, PortError, RegistrationFenceReceipt,
     RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt, RegistrationRequest,
 };
 
 use super::SharedKernelClient;
 use crate::operation_identity::{
     AUTHORIZE_LAUNCH_OPERATION, BrokerOperation, FENCE_OPERATION, HEARTBEAT_OPERATION,
-    IssuerHandle, OperationIdentityError, REGISTER_OPERATION,
+    IssuerHandle, OPERATOR_CHALLENGE_OPERATION, OPERATOR_REDEEM_OPERATION,
+    OperationIdentityError, REGISTER_OPERATION,
 };
 
 fn kernel_port_error(error: eliot_cli::kernel_client::KernelClientError) -> PortError {
@@ -112,6 +114,8 @@ impl KernelAuthorityPort {
             BrokerOperation::Register => guard.issue_register(payload, now),
             BrokerOperation::HeartbeatRenewal => guard.issue_heartbeat(payload, now),
             BrokerOperation::FenceLogoff => guard.issue_fence(payload, now),
+            BrokerOperation::OperatorChallenge => guard.issue_operator_challenge(payload, now),
+            BrokerOperation::OperatorRedeem => guard.issue_operator_redeem(payload, now),
             BrokerOperation::AuthorizeLaunch => {
                 return Err(PortError::Invalid(
                     "authorize-launch requires its caller launch binding".to_owned(),
@@ -192,5 +196,44 @@ impl AuthorityPort for KernelAuthorityPort {
             serde_json::from_value(value)
                 .map_err(|error| PortError::Invalid(format!("decode fence receipt: {error}")))
         })
+    }
+}
+
+impl KernelAuthorityPort {
+    /// Requests a fresh one-shot challenge for the exact issued Operator
+    /// endpoint and OS-observed peer. The response comes directly from the
+    /// Kernel owner; this transport neither derives nor caches a challenge.
+    pub(crate) fn operator_challenge(
+        &self,
+        request: &OperatorChallengeRequest,
+    ) -> Result<OperatorChallenge, PortError> {
+        let payload =
+            serde_json::to_value(request).map_err(|error| PortError::Invalid(error.to_string()))?;
+        let identity = self.issue(BrokerOperation::OperatorChallenge, &payload)?;
+        serde_json::from_value(kernel_call(
+            &self.client,
+            OPERATOR_CHALLENGE_OPERATION,
+            payload,
+            identity,
+        )?)
+        .map_err(|error| PortError::Invalid(format!("decode Operator challenge: {error}")))
+    }
+
+    /// Redeems one exact Kernel challenge into the Kernel-issued short-lived
+    /// Operator session grant. No broker-local session token is synthesized.
+    pub(crate) fn operator_redeem(
+        &self,
+        request: &OperatorRedeemRequest,
+    ) -> Result<OperatorSessionGrant, PortError> {
+        let payload =
+            serde_json::to_value(request).map_err(|error| PortError::Invalid(error.to_string()))?;
+        let identity = self.issue(BrokerOperation::OperatorRedeem, &payload)?;
+        serde_json::from_value(kernel_call(
+            &self.client,
+            OPERATOR_REDEEM_OPERATION,
+            payload,
+            identity,
+        )?)
+        .map_err(|error| PortError::Invalid(format!("decode Operator session grant: {error}")))
     }
 }
