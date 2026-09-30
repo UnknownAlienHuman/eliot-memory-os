@@ -7,7 +7,7 @@
 //! the eight classes that evidence belongs to and what, if anything, that class
 //! is allowed to propose.
 //!
-//! Three properties are structural rather than documented:
+//! Four properties are structural rather than documented:
 //!
 //! - A model-only observation resolves to
 //!   [`IndicatorResolution::CandidateOnly`]. That variant has no restriction
@@ -16,6 +16,11 @@
 //! - The three content-shaped classes resolve to a candidate only even under a
 //!   deterministic rule, because instruction-like text is an observed or
 //!   suspected pattern and not proof of malicious intent.
+//! - Retained foreign material carries the producer's classification of the
+//!   passage's role in it, and a quoted example or a narration is not the
+//!   source's own directive. Only a directly issued passage establishes the
+//!   attempt these classes compare against, so a benign example is never a
+//!   complete comparison and never a finding.
 //! - A restriction carries no instruction taint of its own and no field for a
 //!   standing instruction, tool definition, policy, credential or Incident, so
 //!   no evidence payload and no source content can change one.
@@ -242,10 +247,16 @@ pub enum DroppedEvidenceKind {
 ///
 /// The instruction-attempt class and the standing-instruction/secret-persistence
 /// class cite retained material the same way — an immutable artifact the
-/// passage was read from, plus retained handles for the passage inside it — and
-/// differ only in what they conclude from it. They therefore share this one
-/// shape and are distinguished by their [`IndicatorEvidence`] variant and its
-/// class-specific field, rather than by two near-identical payload structs.
+/// passage was read from, retained handles for the passage inside it, and the
+/// role that passage plays in those bytes — and differ only in what they
+/// conclude from it. They therefore share this one shape and are distinguished
+/// by their [`IndicatorEvidence`] variant and its class-specific field, rather
+/// than by two near-identical payload structs.
+///
+/// The [`content_role`](Self::content_role) lives here rather than on one
+/// variant so that material read out of an external artifact cannot be cited
+/// without saying whether the source issued the passage or merely reproduced
+/// it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RetainedExternalEvidence {
@@ -253,6 +264,9 @@ pub struct RetainedExternalEvidence {
     pub retained_source_ref: String,
     /// Retained handles for the passage itself, in the restricted store.
     pub evidence_handles: Vec<String>,
+    /// Whether these bytes issue the instruction-shaped request themselves or
+    /// only reproduce one as an example or a description.
+    pub content_role: ExternalContentRole,
 }
 
 /// An installed tool definition that departs from the approved schema.
@@ -349,10 +363,9 @@ pub struct UndeclaredEffectEvidence {
 pub enum IndicatorEvidence {
     /// External material that attempts to issue system or tool instructions.
     ExternalInstructionAttempt {
-        /// The retained foreign material the passage was read from.
+        /// The retained foreign material the passage was read from, including
+        /// the producer's classification of the passage's role in it.
         retained: RetainedExternalEvidence,
-        /// The producer's classification of the passage's role.
-        content_role: ExternalContentRole,
     },
     UnexpectedToolDefinitionChange(ToolDefinitionChangeEvidence),
     /// A source asking to persist a standing instruction or a secret.
@@ -420,18 +433,17 @@ impl IndicatorEvidence {
     /// record a bounded restriction over a comparison that was never made. An
     /// instruction-shaped passage that the producer classified as a quoted
     /// example or as narration establishes no attempt by this source at all, so
-    /// it reports unknown coverage rather than complete.
+    /// it reports unknown coverage rather than complete. That holds for both
+    /// classes that read retained foreign material: the classification is
+    /// required of the bytes, not merely of the artifact they were read from.
     ///
-    /// The two classes with no optional baseline name the field their
-    /// comparison rests on instead of asserting a bare `true`, so each arm
-    /// states what it actually depends on.
+    /// Every arm names the field its comparison rests on instead of asserting a
+    /// bare `true`, so each one states what it actually depends on.
     pub const fn has_comparison_inputs(&self) -> bool {
         match self {
-            Self::ExternalInstructionAttempt { content_role, .. } => {
-                matches!(content_role, ExternalContentRole::DirectInstruction)
-            }
-            Self::StandingInstructionOrSecretPersistence { retained, .. } => {
-                !retained.retained_source_ref.is_empty()
+            Self::ExternalInstructionAttempt { retained, .. }
+            | Self::StandingInstructionOrSecretPersistence { retained, .. } => {
+                matches!(retained.content_role, ExternalContentRole::DirectInstruction)
             }
             Self::UnexpectedToolDefinitionChange(evidence) => {
                 evidence.approved_schema_revision.is_some()
