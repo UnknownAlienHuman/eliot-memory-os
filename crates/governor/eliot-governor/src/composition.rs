@@ -284,7 +284,7 @@ pub trait KernelTransitionPort: Send + Sync {
     ) -> KernelPortFuture<'_, TaskContractAcceptanceSet> {
         Box::pin(async {
             Err(KernelPortError::NotAdmitted(
-                "TaskContract owner acceptance-set read is not admitted".to_owned(),
+                "`TaskContract` owner acceptance-set read is not admitted".to_owned(),
             ))
         })
     }
@@ -306,6 +306,12 @@ pub enum KernelPortError {
     /// The authenticated Kernel generation is not currently admitted.
     #[error("Kernel generation is not admitted: {0}")]
     NotAdmitted(String),
+    /// The owner could not prove a task selection for this request.
+    #[error("task selection is required")]
+    TaskSelectionRequired,
+    /// The selected task does not govern the observed WorkScope.
+    #[error("task scope is incompatible")]
+    TaskScopeIncompatible,
 }
 
 /// The proved canonical second phase of one grant closure, carried across the
@@ -7559,90 +7565,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             | TaskBindingState::Stale { .. }
             | TaskBindingState::Ambiguous { .. } => Ok((None, receipt)),
         }
-    }
-
-    /// Reissues the exact selection evidence retained by one durable readiness
-    /// receipt after joining it to the live activation and current `TaskContract`
-    /// owner record.
-    ///
-    /// This returns no evidence for legacy receipts or non-current selections.
-    /// For a current selection, the retained evidence must equal the value
-    /// derived from the exact active `WorkLease`/`WorkItem` and the owner-recorded
-    /// acceptance digest at the same fence. Caller-supplied source handles and
-    /// digests are never adopted.
-    pub async fn task_selection_evidence_for_claim(
-        &self,
-        now: u64,
-        claim: &ColdStartReadinessClaim,
-    ) -> Result<Option<TaskSelectionEvidence>, CompositionError> {
-        let (activation, receipt) = self.current_task_selection_for_claim(now, claim)?;
-        let Some(activation) = activation else {
-            return Ok(None);
-        };
-        let retained = receipt
-            .task_selection_evidence
-            .as_ref()
-            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
-        let (evidence, _) = self
-            .issue_task_selection_evidence_for_binding(
-                now,
-                (&receipt.principal_ref, &receipt.session_ref),
-                &receipt.scope.scope_ref,
-                &receipt.state_fence,
-                (
-                    activation.task_id.as_str(),
-                    activation.task_revision,
-                    Some(&retained.acceptance_digest),
-                ),
-            )
-            .await?;
-        if &evidence != retained {
-            return Err(CompositionError::ActivationStaleFence);
-        }
-        Ok(Some(evidence))
-    }
-
-    /// Issues selection evidence directly for one explicit authenticated
-    /// Task Controller request, without requiring a cold-start readiness
-    /// receipt.
-    ///
-    /// The request must name the session, task, `WorkScope`, and exact current
-    /// fence. Governor independently reads the unique active `WorkLease` and
-    /// linked `WorkItem`, obtains the principal from their authenticated active
-    /// session, and reads the current `WorkScope` binding and `TaskContract`
-    /// acceptance set at that same fence. The acceptance digest and revision
-    /// are copied from the canonical owner record unchanged. No latest-task,
-    /// open-task, or caller-supplied provenance fallback is used.
-    ///
-    /// The returned `WorkScope` snapshot is an independent expected binding for
-    /// the caller's Host observation. Coordination's `WorkItem` and `WorkLease`
-    /// records do not contain an operating-system workspace locator.
-    pub async fn task_selection_evidence_for_request(
-        &self,
-        now: u64,
-        authenticated_principal_ref: &str,
-        request_session_ref: &str,
-        request_task_ref: &str,
-        request_scope_ref: &str,
-        request_fence: &StateFence,
-    ) -> Result<TaskSelectionAdmissionBinding, CompositionError> {
-        let pending = self.prepare_task_selection_for_request(
-            now,
-            authenticated_principal_ref,
-            request_session_ref,
-            request_task_ref,
-            request_scope_ref,
-            request_fence,
-        )?;
-        let acceptance = self
-            .kernel
-            .task_contract_acceptance_set(
-                pending.task_id(),
-                pending.task_revision(),
-                pending.state_fence(),
-            )
-            .await?;
-        self.finish_task_selection_for_request(pending, now, acceptance)
     }
 
     /// Captures the validated owner selection before the caller performs the
