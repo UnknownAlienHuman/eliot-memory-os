@@ -7,7 +7,7 @@ use eliot_contracts::{
     ClockReading, OperationId, RequestId, ResourceGeneration, StateFence, TaskRevision,
     canonical_json_bytes,
 };
-use eliot_protocol::{RequestIdentity, host_request_operation_id};
+use eliot_protocol::{HostRequestKind, RequestIdentity, host_request_operation_id};
 use eliot_receipts::{
     EffectClass, OperationBinding, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding,
     WorkScopeId,
@@ -96,7 +96,8 @@ fn validate_original_read_request<'a>(
         ),
     )?;
 
-    if identity.capability != "eliot.query"
+    if input.envelope.kind != HostRequestKind::Invocation
+        || identity.capability != "eliot.query"
         || identity.request_id.as_str().trim().is_empty()
         || identity.task_id.as_deref() != Some(metadata_task.as_str())
         || identity.session_id.as_deref() != Some(metadata_session.as_str())
@@ -116,7 +117,7 @@ fn validate_original_read_request<'a>(
         || input.now.value() >= identity.deadline_unix_ms
     {
         return Err(SourceArtifactAdmissionError::Binding(
-            "context metadata or Kernel attempt differs from the original admitted host request",
+            "context metadata or Kernel attempt differs from the original admitted query invocation",
         ));
     }
 
