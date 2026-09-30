@@ -58,6 +58,17 @@
 //! [`KernelAuthority`] sequence, so the request epoch is compared by sequence
 //! exactly like [`KernelAuthority::consume`]; full lineage-tuple fencing
 //! belongs to the I6.10 authority owner (STITCH).
+//!
+//! The grant and its release are joined by ONE owner-derived key: the
+//! owner-minted `permit_id` this owner already stamps from its never-reset
+//! permit sequence, which both [`CapacityPermitBinding`] and
+//! `CapacityReleaseEvidence` name. The issued handle carries the exact recorded
+//! binding, so [`ControlPermit::release_binding_evidence`] emits release
+//! evidence that the contract's own
+//! `CapacityReleaseEvidence::matches_binding` accepts for that one binding, or
+//! refuses through the typed field error. No second digest scheme, nonce,
+//! counter, clock or MAC is introduced: the join key is the permit identity the
+//! frozen contract already fixes.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -71,8 +82,9 @@ use crate::authority::{AuthorityGrant, AuthorityReceipt, KernelAuthority};
 use crate::error::{KernelError, validate_id};
 
 pub use eliot_runtime_contracts::{
-    CapacityBottleneck, CapacityClass, CapacityPermitBinding, CapacityRequest,
-    ControlOperationClass, EmergencyOperationClass, NormalWorkClass, RequestedOperationClass,
+    CapacityBottleneck, CapacityClass, CapacityPermitBinding, CapacityReleaseEvidence,
+    CapacityRequest, ControlOperationClass, EmergencyOperationClass, NormalWorkClass,
+    PermitTerminalDisposition, RequestedOperationClass,
 };
 
 /// Runtime owner reference minted on every front-door permit binding.
@@ -169,6 +181,32 @@ struct PartitionedInner {
     permit_sequence: AtomicU64,
 }
 
+impl PartitionedInner {
+    /// The owner's contemporaneous observation of one partition: its exact
+    /// capacity and the holds recorded against it at this instant.
+    ///
+    /// One renderer serves both the issuance and the release record, so a
+    /// capacity observation never takes two shapes.
+    fn partition_observation(&self, class: CapacityClass) -> String {
+        let (capacity, in_flight) = match class {
+            CapacityClass::NormalWorkload => {
+                (self.normal_capacity, self.normal_in_flight.load(Ordering::Acquire))
+            }
+            CapacityClass::ProtectedControl => {
+                (self.protected_capacity, self.protected_in_flight.load(Ordering::Acquire))
+            }
+            CapacityClass::EmergencyLastResort => {
+                (self.emergency_capacity, self.emergency_in_flight.load(Ordering::Acquire))
+            }
+        };
+        format!(
+            "front-door:{}:{} capacity {capacity} in-flight {in_flight}",
+            FRONT_DOOR_BOTTLENECK.as_contract_str(),
+            class.as_contract_str(),
+        )
+    }
+}
+
 /// A single held capacity permit, bound to class, bottleneck, operation, owner
 /// and epoch. Releasing is explicit and exactly-once via [`Self::release`],
 /// which consumes the permit; drop is the backstop returning exactly the
@@ -185,6 +223,15 @@ pub struct ControlPermit {
     operation_id: String,
     owner: String,
     epoch: AuthorityEpoch,
+    /// The exact owner-minted binding this handle was issued with, present only
+    /// for a permit granted through [`FrontDoor::issue_permit`].
+    ///
+    /// It is the same record the owner hands the caller, not a restatement of
+    /// it, so the handle and the returned binding cannot drift apart. It is
+    /// what lets [`Self::release_binding_evidence`] close exactly the grant it
+    /// was issued for. A typed partition acquisition mints no binding, carries
+    /// `None` here, and therefore has no contract release record to emit.
+    issued: Option<CapacityPermitBinding>,
 }
 
 /// Exactly-once release evidence for one [`ControlPermit`].
@@ -331,6 +378,78 @@ impl ControlPermit {
             );
         }
         evidence
+    }
+
+    /// Releases the held slot and closes the exact binding this permit was
+    /// issued for, returning the contract's owner-produced release record.
+    ///
+    /// The join is the owner-minted `permit_id` the binding and the emitted
+    /// [`CapacityReleaseEvidence`] both carry: for a permit granted through
+    /// [`FrontDoor::issue_permit`], the returned record provably closes that one
+    /// grant, checked with the contract's own
+    /// [`CapacityReleaseEvidence::matches_binding`] against the recorded
+    /// binding rather than restated here. Released limit, observed owner
+    /// generation, Authority Epoch and profile identity and revision are the
+    /// recorded values, never recomputed to make the check pass.
+    ///
+    /// `now_ms` is the caller's releasing clock, exactly as in
+    /// [`FrontDoor::issue_permit`]; this owner holds no clock. The slot returns
+    /// exactly once through [`Self::release`] — the kernel-internal record that
+    /// produces is not returned here, because the contract record is the one
+    /// that names the closed binding. Whether or not the record closes its
+    /// binding, the partition still returns: an unmatchable release is a typed
+    /// refusal and never a reported clean release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::InvalidField`] when the handle was not issued
+    /// through [`FrontDoor::issue_permit`] and therefore mints no binding to
+    /// close, when it holds no partition slot to release, when the releasing
+    /// clock is negative, or when the assembled record does not match the
+    /// binding it claims to close.
+    pub fn release_binding_evidence(
+        self,
+        now_ms: i64,
+    ) -> Result<CapacityReleaseEvidence, KernelError> {
+        let Some(binding) = self.issued.clone() else {
+            return Err(KernelError::InvalidField {
+                field: "control_permit.issued_binding",
+                reason: "this permit was not issued by the front door, so it mints no owner-minted binding to close",
+            });
+        };
+        let Some(inner) = self.inner.clone() else {
+            return Err(KernelError::InvalidField {
+                field: "control_permit.inner",
+                reason: "a released permit holds no partition slot, so it can produce no owner release observation",
+            });
+        };
+        let released_at_ms = u64::try_from(now_ms).map_err(|_| KernelError::InvalidField {
+            field: "capacity_release.released_at_ms",
+            reason: "the releasing clock must be non-negative",
+        })?;
+        let class = self.class;
+        drop(self.release());
+        let evidence = CapacityReleaseEvidence {
+            permit_id: binding.permit_id.clone(),
+            operation_id: binding.operation_id.clone(),
+            terminal_disposition: PermitTerminalDisposition::Released,
+            released_limit: binding.granted_limit,
+            observed_owner_generation_ref: binding.capacity_owner_generation_ref,
+            authority_epoch_ref: binding.authority_epoch_ref.clone(),
+            profile_id: binding.profile_id.clone(),
+            profile_revision: binding.profile_revision.clone(),
+            released_at_ms,
+            evidence_refs: vec![inner.partition_observation(class)],
+            reconciliation_ref: format!("{}:{}", FRONT_DOOR_OWNER, binding.permit_id),
+        };
+        evidence.validate()?;
+        if !evidence.matches_binding(&binding) {
+            return Err(KernelError::InvalidField {
+                field: "capacity_release.permit_id",
+                reason: "release evidence does not match the binding it claims to close; the permit is not reported released",
+            });
+        }
+        Ok(evidence)
     }
 }
 
@@ -575,6 +694,7 @@ impl ControlReserve {
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
             epoch,
+            issued: None,
         })
     }
 
@@ -628,6 +748,7 @@ impl ControlReserve {
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
             epoch,
+            issued: None,
         })
     }
 
@@ -673,6 +794,7 @@ impl ControlReserve {
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
                 epoch,
+                issued: None,
             });
         }
         if self.available_protected() == 0 {
@@ -714,6 +836,7 @@ impl ControlReserve {
             operation_id: "legacy-control".to_owned(),
             owner: "legacy-control-reserve".to_owned(),
             epoch,
+            issued: None,
         })
     }
 }
@@ -1318,7 +1441,11 @@ impl FrontDoor {
     /// maintenance operation onto protected or emergency capacity (A5). The
     /// binding matches its request only through
     /// [`CapacityPermitBinding::matches_request`]; changed content conflicts
-    /// instead of replaying (A7).
+    /// instead of replaying (A7). The returned handle carries that same
+    /// owner-minted record, so the grant and its
+    /// [`ControlPermit::release_binding_evidence`] terminal check are joined by
+    /// the one `permit_id` this owner already mints from its never-reset permit
+    /// sequence — no second digest, nonce, counter, clock or MAC.
     ///
     /// The caller supplies its clock (`now_ms`, as in [`Self::authorize`])
     /// and the issuing owner generation: the front door owns no generation
@@ -1371,7 +1498,7 @@ impl FrontDoor {
             field: "capacity_request.issued_at_ms",
             reason: "the issuing clock must be non-negative",
         })?;
-        let permit = match request.operation {
+        let mut permit = match request.operation {
             RequestedOperationClass::Normal(work) => self.reserve.try_acquire_normal(
                 work,
                 &request.requesting_owner_ref,
@@ -1426,30 +1553,15 @@ impl FrontDoor {
             binding.matches_request(request),
             "front-door minted permit binding must match its request"
         );
+        // One join key: the handle holds the exact record the owner hands back,
+        // so `release_binding_evidence` closes this grant and only this grant.
+        permit.issued = Some(binding.clone());
         Ok((permit, binding))
     }
 
     /// Records the owner's contemporaneous partition observation for one issuance.
     fn issue_evidence(&self, class: CapacityClass) -> String {
-        let (capacity, in_flight) = match class {
-            CapacityClass::NormalWorkload => (
-                self.reserve.normal_capacity(),
-                self.reserve.normal_capacity() - self.reserve.available_normal(),
-            ),
-            CapacityClass::ProtectedControl => (
-                self.reserve.protected_capacity(),
-                self.reserve.protected_capacity() - self.reserve.available_protected(),
-            ),
-            CapacityClass::EmergencyLastResort => (
-                self.reserve.emergency_capacity(),
-                self.reserve.emergency_capacity() - self.reserve.available_emergency(),
-            ),
-        };
-        format!(
-            "front-door:{}:{} capacity {capacity} in-flight {in_flight}",
-            FRONT_DOOR_BOTTLENECK.as_contract_str(),
-            class.as_contract_str(),
-        )
+        self.reserve.inner.partition_observation(class)
     }
 
     /// Reconciles held capacity after the durable recovery epoch is
