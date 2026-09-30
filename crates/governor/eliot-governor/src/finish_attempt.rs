@@ -1528,20 +1528,19 @@ fn check_finish_receipt(
             "prepared receipt has the wrong transition class".to_owned(),
         ));
     }
-    if let Some(transition) = expected_transition {
-        if receipt.canonical_request_hash != transition.identity.canonical_request_hash
+    if let Some(transition) = expected_transition
+        && (receipt.canonical_request_hash != transition.identity.canonical_request_hash
             || receipt.transition_class != transition.transition_class
             || receipt.operation_manifest_digest != transition.operation_manifest_digest
             || receipt.admission_digest != transition.admission_digest
             || receipt.mutation_plan_digest != transition.mutation_plan_digest
             || receipt.semantic_source_revisions != transition.semantic_source_revisions
             || receipt.policy_config_schema_versions
-                != eliot_store_api::PolicyConfigSchemaVersions::bound_to(transition)
-        {
-            return Err(FinishAttemptError::Store(
-                "committed receipt does not match the original prepared transition".to_owned(),
-            ));
-        }
+                != eliot_store_api::PolicyConfigSchemaVersions::bound_to(transition))
+    {
+        return Err(FinishAttemptError::Store(
+            "committed receipt does not match the original prepared transition".to_owned(),
+        ));
     }
     if receipt.status != WriteReceiptStatus::Committed {
         return Err(FinishAttemptError::Store(format!(
