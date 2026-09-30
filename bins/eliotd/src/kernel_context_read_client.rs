@@ -1963,7 +1963,7 @@ fn admit_packet_candidates(
     {
         HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
         HeadroomAdmissionOutcome::Refused(refusal) => {
-            return Err(PacketCompositionError::HeadroomRefused(refusal));
+            return Err(PacketCompositionError::HeadroomRefused { refusal });
         }
     };
     result
