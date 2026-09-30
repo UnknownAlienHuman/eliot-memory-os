@@ -505,6 +505,10 @@ mod tests {
                 hex_handle("c"),
                 handle("--native-worker-artifact-sha256"),
                 hex_handle("d"),
+                handle("--user-broker-executable"),
+                path("eliot-user-broker.exe"),
+                handle("--user-broker-artifact-sha256"),
+                hex_handle("9"),
                 handle("--eliotd-descriptor"),
                 path("eliotd.json"),
                 handle("--eliotd-descriptor-sha256"),
@@ -548,6 +552,8 @@ mod tests {
             testd_artifact_digest: hex_handle("c"),
             native_worker_executable_path: path("eliot-native-worker.exe"),
             native_worker_artifact_digest: hex_handle("d"),
+            user_broker_executable_path: path("eliot-user-broker.exe"),
+            user_broker_artifact_digest: hex_handle("9"),
             wasm_host_executable_path: path("eliot-wasm-host.exe"),
             wasm_host_artifact_digest: hex_handle("f"),
             descriptor_digest: hex_handle("0"),
@@ -572,6 +578,7 @@ mod tests {
             doctor_artifact_digest: hex_handle("b"),
             testd_artifact_digest: hex_handle("c"),
             native_worker_artifact_digest: hex_handle("d"),
+            user_broker_artifact_digest: hex_handle("9"),
             wasm_host_artifact_digest: hex_handle("f"),
             kernel_executable_path: handle(dir.join("eliot-kernel.exe").to_string_lossy().as_ref()),
             store_bridge_executable_path: handle(
@@ -589,6 +596,9 @@ mod tests {
                 dir.join("eliot-native-worker.exe")
                     .to_string_lossy()
                     .as_ref(),
+            ),
+            user_broker_executable_path: handle(
+                dir.join("eliot-user-broker.exe").to_string_lossy().as_ref(),
             ),
             wasm_host_executable_path: handle(
                 dir.join("eliot-wasm-host.exe").to_string_lossy().as_ref(),
