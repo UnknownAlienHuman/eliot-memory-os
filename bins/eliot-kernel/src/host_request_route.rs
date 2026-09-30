@@ -4828,10 +4828,15 @@ impl KernelComposition {
         }
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
-        // canonical readback rather than a second completion.
+        // canonical readback rather than a second completion. Issue #1739 W4:
+        // the replay serves the same retained result only with the same owner
+        // receipt — a receiptless or foreign-receipt presentation is not this
+        // retained outcome and falls through to the lineage gate below, which
+        // fails closed instead of serving it as the completion.
         if stored.state == HostRequestState::ResultReceived
             && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
             && stored.result_response.as_ref() == Some(&body.response)
+            && same_observe_owner_receipt(&stored, body)
         {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
@@ -5397,6 +5402,31 @@ struct RetainedResultProvenance {
     effect_evidence: Option<HostRequestEffectEvidence>,
     /// Result-side lineage claims and references, when the leg submitted any.
     result_lineage: Option<HostRequestRetainedLineage>,
+}
+
+/// Reports whether one submitted observe body presents the same owner receipt
+/// the durable row retained (issue #1739 W4).
+///
+/// Both sides are ORIGINALLY RECORDED values: the presented lineage already
+/// binds `body.result_digest` through [`HostRequestResultBody::validate`],
+/// and the retained lineage already binds `stored.result_digest` through the
+/// persist path, so equal digests plus the equal receipt reference mean the
+/// presentation repeats THIS retained outcome rather than a receiptless or
+/// foreign-receipt body over identical bytes. A row that retained no receipt
+/// has no same receipt to present. Pure: no IO, no digest recomputation, no
+/// promotion — a mismatch simply declines the replay arm and the submission
+/// falls through to the lineage gate, which fails closed.
+fn same_observe_owner_receipt(
+    stored: &HostRequestRecord,
+    body: &HostRequestResultBody,
+) -> bool {
+    match (&stored.result_lineage, &body.lineage) {
+        (Some(retained), Some(presented)) => {
+            presented.output_digest == retained.output_digest
+                && presented.semantic_receipt_ref == retained.semantic_receipt_ref
+        }
+        _ => false,
+    }
 }
 
 /// Projects one submitted result body into the ORS-owned durable evidence and
