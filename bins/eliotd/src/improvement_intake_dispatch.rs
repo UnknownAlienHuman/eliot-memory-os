@@ -34,9 +34,22 @@
 //! takes the family as a parameter), so a real declared-capability conformance
 //! gap observed at the startup or improvement-intake sites reaches
 //! [`conformance_diagnosis_evidence`] below and enters the funnel through the
-//! Self-Quality conformance-diagnosis contract. The security-incident arm is
-//! still unreachable, and [`maintenance_evidence_source`] records the measured
-//! reason for that rather than substituting a label.
+//! Self-Quality conformance-diagnosis contract.
+//!
+//! # What is still NOT connected, measured rather than asserted
+//!
+//! W2 also names attempts/evaluators, campaign closure, security incidents,
+//! accepted implementation deviations, complaints, Watchdog, Dreamer and
+//! Concilium suggestions. On this tree only the first and the conformance
+//! diagnosis are reachable, and the reasons are recorded per-arm on
+//! [`maintenance_evidence_source`]: a family census shows the only families any
+//! production trigger site can name are [`crate::SELF_OBSERVED_FAMILY`] and
+//! `MaintenanceFamily::DonorConformance`, so every other source needs a
+//! producer that does not exist yet rather than a match arm that is missing
+//! here. The security-incident arm is annotated at the arm itself with the
+//! receipt and trigger site that would make it live; Watchdog, Dreamer and
+//! Concilium have no arm and are annotated as such. None is filled from a
+//! substitute value.
 //!
 //! # The durable port is the existing Governor/Kernel named mutation
 //!
@@ -846,13 +859,25 @@ fn enforce_advisory_class_gate(
 ///   `daemon_runtime::conformance_observed_family` (issue #1867 W2/A1). That
 ///   is what makes [`conformance_diagnosis_evidence`] a live projection rather
 ///   than an unreachable one.
-/// - every other family, at every decision the evaluator can return, is the
-///   attempt itself: `AutomationDecision::Start` admits the job, `Suggest`
-///   preserves a recommendation instead, `Defer` holds it for a later eligible
-///   window, `Block` and `Escalate` deny or escalate it, and
-///   `SuppressDuplicate` records that equivalent work is already active. Each
-///   of those is an outcome this daemon itself produced, and none of them is a
-///   Watchdog suggestion.
+/// - every other family is the attempt itself, and the set of families that can
+///   reach this function is EXACTLY [`crate::SELF_OBSERVED_FAMILY`] and
+///   `MaintenanceFamily::DonorConformance`. That is measured, not assumed: the
+///   sole caller of `assemble_improvement_artifact` is
+///   `daemon_runtime::improvement_intake_artifact` (`daemon_runtime.rs:4813`),
+///   it is the only caller of `run_improvement_intake`, and the one observation
+///   that function is ever handed is built by
+///   `daemon_runtime::improvement_intake_observation` — whose family is
+///   `daemon_runtime::conformance_observed_family` (issue #1867 W2/A1) and
+///   whose origin is `MaintenanceTriggerOrigin::IdleTransition`. So the
+///   residual resolves to `SelfQualityDebt` and to nothing else, which is the
+///   measured reason the remaining I12.24 sources have no arm here rather than
+///   a judgement about them. What the residual covers is the DECISION, not the
+///   family: `AutomationDecision::Start` admits the job, `Suggest` preserves a
+///   recommendation instead, `Defer` holds it for a later eligible window,
+///   `Block` and `Escalate` deny or escalate it, and `SuppressDuplicate`
+///   records that equivalent work is already active. Each of those is an
+///   outcome this daemon itself produced, and none of them is a Watchdog
+///   suggestion.
 ///
 /// # Why no decision reaching this function is a `Watchdog` observation
 ///
@@ -892,11 +917,90 @@ fn enforce_advisory_class_gate(
 /// `eliot-maintenance` contract change this issue does not own; the honest
 /// outcome here is the `Attempt` label above plus that stated ceiling, not a
 /// refusal to classify a live observation.
+///
+/// # The three sources with NO arm, and the producer each waits for
+///
+/// [`EvidenceSource::Watchdog`], [`EvidenceSource::Dreamer`] and
+/// [`EvidenceSource::Concilium`] are the W2 sources that are not merely an
+/// unreachable arm but an ABSENT one: the match below has no pattern that could
+/// produce them, while the closed vocabulary does carry all three honestly
+/// (`evidence_sources.rs:29-31`). They share the one reason stated in the
+/// `ASSUMPTION` above — the origin does not travel on the decision — and each
+/// additionally has no producer of its own:
+///
+/// - `Watchdog` needs a Watchdog/Doctor RECIPE that proposes maintenance work
+///   and reaches a trigger site. The origin denoting one exists and is live
+///   ([`crate::MaintenanceTriggerOrigin::AdmittedObservation`], used at
+///   `daemon_runtime.rs:2636`), but that site's observation is the store-health
+///   poll, so its decision is a `SelfQualityDebt` decision about this daemon's
+///   own health that is routed to `note_blocked_automation_notification`
+///   (`daemon_runtime.rs:2669-2670`), never to the intake. The family census
+///   above settles it: no decision reaching this function can carry the
+///   Watchdog origin even though the origin is live elsewhere in the daemon.
+/// - `Dreamer` needs a Dreamer that SUGGESTS work. That route is
+///   owner-declared and unassigned on this base — an omitted Dreamer route
+///   resolves to `RouteState::Unassigned` with no paid route
+///   (`eliot_config::first_run::decide_first_run`) — and although
+///   `SelfQualityDebt` registers `Dreamer` among its origins, no Dreamer
+///   instance proposes anything to this daemon.
+/// - `Concilium` needs a deliberation verdict with a route into this intake,
+///   and the funnel's request source is absent (see this module's header on
+///   `ImprovementRouteRequest` having no production request source), so a
+///   verdict has no path into `assemble_improvement_artifact`.
+///
+/// None is filled here because none has a producer this file could read without
+/// inventing the observation it claims. Filling any of them from a decision
+/// would reinstate exactly the misattribution the removed residual was.
 pub fn maintenance_evidence_source(
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> EvidenceSource {
     use eliot_maintenance::MaintenanceFamily;
     match decision.family {
+        // DEAD ARM — kept, not wired. Measured unreachable on this tree, and
+        // the precise missing producer is recorded here so the next owner does
+        // not re-derive it. Reaching it needs a decision whose `family` is
+        // `SecurityDependencyScan`, and the family is the CALLER's real
+        // observation, so the producer this arm waits for is a trigger site
+        // that observes a security/dependency scan receipt and names the
+        // family. No such site exists:
+        //
+        // 1. No scan is performed for this daemon. The family's registered
+        //    observation is the "scripts/verify-dependency-policy.py
+        //    pinned-scanner canonical receipt" and its registered execution
+        //    owner is recorded unavailable because "no eliotd Kernel operation
+        //    or Rust owner exposes a scan result to the daemon"
+        //    (`maintenance_family_catalog.rs:1448-1449`). Producing the receipt
+        //    is a `scripts/` and dependency-policy owner's job, not this
+        //    dispatch layer's.
+        // 2. The one daemon site whose trigger origin IS the Watchdog/Doctor
+        //    problem origin (`MaintenanceTriggerOrigin::AdmittedObservation`,
+        //    `maintenance_trigger_evaluator.rs:125`) is the store-health poll
+        //    (`daemon_runtime.rs:2635-2643`), and it observes
+        //    `StoreHealth::manifest_digest` — the store API's own
+        //    operation-manifest identity — naming `SELF_OBSERVED_FAMILY`. That
+        //    is not a scanner receipt, and it is ineligible for this family
+        //    twice over: the observed value is the wrong kind of fact, and the
+        //    origin is not among this entry's registered origins (`Human`,
+        //    `Policy`, `Installation`; `maintenance_family_catalog.rs:1444`).
+        // 3. The exhaustive family census confirms the gap is total, not a
+        //    missing match arm: the only `MaintenanceFamily` values any
+        //    production trigger site names are `SELF_OBSERVED_FAMILY`
+        //    (`SelfQualityDebt`) and `MaintenanceFamily::DonorConformance`
+        //    (`maintenance_trigger_evaluator.rs:372`, and
+        //    `daemon_runtime::conformance_observed_family`).
+        //
+        // What would make it reachable, concretely: an admitted owner that
+        // surfaces the pinned-scanner receipt (advisory set digest, policy
+        // finding set digest, scanner identity and executable digest) to this
+        // daemon as a `MaintenanceObservation` evidence set, AND a trigger site
+        // that names `SecurityDependencyScan` at an origin its catalog entry
+        // registers. Either half alone still leaves the arm dead: a receipt
+        // with no family-naming site reaches nothing, and a family-naming site
+        // with no receipt claims a scan nobody ran. The arm is not deleted
+        // because `EvidenceSource::SecurityIncident` is a real I12.24:49
+        // source and the family's registered observation is exactly a scan
+        // receipt — the vocabulary and the catalog both already name it; only
+        // the producer is missing.
         MaintenanceFamily::SecurityDependencyScan => EvidenceSource::SecurityIncident,
         MaintenanceFamily::DonorConformance => EvidenceSource::ConformanceDiagnosis,
         _ => EvidenceSource::Attempt,
