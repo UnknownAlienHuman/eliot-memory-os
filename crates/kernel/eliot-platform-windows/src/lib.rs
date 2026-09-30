@@ -3292,15 +3292,134 @@ impl FilesystemPort for WindowsPlatform {
         };
         match request.operation {
             FilesystemOperation::Stat => PortOutcome::Known(observation),
-            FilesystemOperation::Read => PortOutcome::Partial {
+            FilesystemOperation::Read if !metadata.is_file() => PortOutcome::Partial {
                 value: observation,
                 missing: vec![handle("content_digest")],
             },
+            #[cfg(windows)]
+            FilesystemOperation::Read => {
+                match read_filesystem_content_digest(&self.root, &path) {
+                    Ok((size, digest)) => PortOutcome::Known(FilesystemObservation {
+                        path: request.path.clone(),
+                        kind: FileKind::File,
+                        size: Some(size),
+                        content_digest: Some(handle(&format!("sha256:{digest}"))),
+                    }),
+                    Err(error) => inspect_failure(&error),
+                }
+            }
+            #[cfg(not(windows))]
+            FilesystemOperation::Read => PortOutcome::Unknown(UnknownReason::Unsupported),
             FilesystemOperation::Write { .. } | FilesystemOperation::Remove => {
                 PortOutcome::Unknown(UnknownReason::Unsupported)
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn read_filesystem_content_digest(
+    root: &Path,
+    path: &Path,
+) -> Result<(u64, String), std::io::Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(indeterminate_filesystem_read)?;
+    let parent_pins = pin_ancestors(root, parent).map_err(|_| indeterminate_filesystem_read())?;
+    let parent_identities = parent_pins
+        .iter()
+        .map(|directory| {
+            file_identity_from_handle(directory).map_err(|_| indeterminate_filesystem_read())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut file = open_work_scope_file_read_exclusive(path)?;
+    let before_metadata = file.metadata()?;
+    if !before_metadata.is_file() || is_reparse_point(&before_metadata) {
+        return Err(indeterminate_filesystem_read());
+    }
+    let before_identity =
+        file_identity_from_handle(&file).map_err(|_| indeterminate_filesystem_read())?;
+    let before_modified = before_metadata.modified()?;
+    let expected_size = before_metadata.len();
+
+    // The read-only handle shares only reads, so another writer or path
+    // replacement cannot change the file while this one-pass digest is made.
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(u64::try_from(count).map_err(|_| indeterminate_filesystem_read())?)
+            .ok_or_else(indeterminate_filesystem_read)?;
+        if bytes_read > expected_size {
+            return Err(indeterminate_filesystem_read());
+        }
+        hasher.update(&buffer[..count]);
+    }
+
+    let after_metadata = file.metadata()?;
+    let after_identity =
+        file_identity_from_handle(&file).map_err(|_| indeterminate_filesystem_read())?;
+    if bytes_read != expected_size
+        || after_metadata.len() != expected_size
+        || after_metadata.modified()? != before_modified
+        || after_identity != before_identity
+    {
+        return Err(indeterminate_filesystem_read());
+    }
+
+    // Re-open without reading bytes to bind the handle snapshot back to the
+    // exact WorkScope path after the content pass.
+    let path_readback = open_work_scope_file_read_exclusive(path)?;
+    let path_identity =
+        file_identity_from_handle(&path_readback).map_err(|_| indeterminate_filesystem_read())?;
+    let path_metadata = path_readback.metadata()?;
+    if path_identity != before_identity
+        || path_metadata.len() != expected_size
+        || path_metadata.modified()? != before_modified
+    {
+        return Err(indeterminate_filesystem_read());
+    }
+
+    for (directory, expected_identity) in parent_pins.iter().zip(parent_identities) {
+        let actual_identity =
+            file_identity_from_handle(directory).map_err(|_| indeterminate_filesystem_read())?;
+        if actual_identity != expected_identity {
+            return Err(indeterminate_filesystem_read());
+        }
+    }
+
+    Ok((bytes_read, format!("{:x}", hasher.finalize())))
+}
+
+#[cfg(windows)]
+fn open_work_scope_file_read_exclusive(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(indeterminate_filesystem_read());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn indeterminate_filesystem_read() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::InvalidData)
 }
 
 impl ServicePort for WindowsPlatform {

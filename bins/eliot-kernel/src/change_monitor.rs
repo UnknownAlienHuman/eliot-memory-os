@@ -13,9 +13,12 @@
 //! block the host-request route queries. Two producers feed it: the Kernel
 //! process-effect lane (`crate::process_execution::KernelGovernedProcessEffectPort`,
 //! attached in the owning crate) for host-event hints over the
-//! admission-declared mutation set (one hint per declared target), and the
-//! ([`observe_filesystem_notification`]) for received OS filesystem
-//! notifications. The adapter opens the hinted tracked source twice per
+//! admission-declared mutation set (one hint per declared target) plus its
+//! poll-reconcile leg ([`observe_filesystem_notification`] with
+//! [`HintOrigin::PollReconcile`]) for retained-digest transitions no
+//! admission explains, and the same adapter with
+//! [`HintOrigin::FilesystemNotification`] for received OS filesystem
+//! notifications once the watcher lane attaches. The adapter opens the hinted tracked source twice per
 //! observation and reads the real Git substrate (`.git/HEAD` plus the
 //! resolved ref, loose or packed) around those reads, so a filesystem hint
 //! confirms against actual Git/content re-read evidence instead of content
@@ -75,6 +78,8 @@ pub(crate) enum ChangeMonitorError {
     LedgerPoisoned,
     /// A hint or governed record fails shape validation.
     InvalidHint,
+    /// The observation transfer document cannot be encoded.
+    TransferEncode,
     /// Changed bytes replay under an already-bound hint identity.
     HintConflict,
     /// Confirmation names a hint the ledger never ingested.
@@ -101,7 +106,8 @@ pub(crate) enum ChangeMonitorError {
     UnknownChange,
     /// Reconciliation evidence does not prove the exact recorded transition.
     TransitionMismatch,
-    /// The durable ledger sidecar cannot be read or written.
+    /// The durable ledger sidecar or observation transfer cannot be read
+    /// or written.
     SidecarUnavailable,
     /// The durable ledger sidecar failed integrity validation.
     SidecarCorrupt,
@@ -112,6 +118,7 @@ impl std::fmt::Display for ChangeMonitorError {
         let code = match self {
             Self::LedgerPoisoned => "change_monitor_ledger_poisoned",
             Self::InvalidHint => "change_monitor_invalid_hint",
+            Self::TransferEncode => "change_monitor_transfer_encode",
             Self::HintConflict => "change_monitor_hint_conflict",
             Self::UnknownHint => "change_monitor_unknown_hint",
             Self::UnstableReadback => "change_monitor_unstable_readback",
@@ -134,13 +141,17 @@ impl std::error::Error for ChangeMonitorError {}
 /// by the Kernel process-effect lane for an admitted tool operation whose
 /// effect is read back; `FilesystemNotification` is built only by the
 /// filesystem/Git observation adapter ([`observe_filesystem_notification`])
-/// from a received OS notification confirmed against actual Git-substrate
-/// plus content re-read evidence. Filesystem, tool, and artifact semantics
-/// beyond that live in the Governor-owned projection (`eliot-change-monitor`
-/// under `crates/governor`); the Kernel observes the Git HEAD substrate
-/// read-only (see [`GitReadback`]) and performs no porcelain status, so a
-/// filesystem-sourced transition surfaces as an unknown-origin Material
-/// change on real content evidence, never as an invented repository claim.
+/// from a received OS notification (the future watcher lane) confirmed
+/// against actual Git-substrate plus content re-read evidence;
+/// `PollReconcile` is built by the same adapter for an inferred
+/// declared-target transition the process-effect lane re-checks — real
+/// evidence, honestly labeled, never an OS notification. Filesystem, tool,
+/// and artifact semantics beyond that live in the Governor-owned projection
+/// (`eliot-change-monitor` under `crates/governor`); the Kernel observes
+/// the Git HEAD substrate read-only (see [`GitReadback`]) and performs no
+/// porcelain status, so a filesystem-sourced transition surfaces as an
+/// unknown-origin Material change on real content evidence, never as an
+/// invented repository claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum HintOrigin {
     HostEvent,
@@ -152,9 +163,19 @@ pub(crate) enum HintOrigin {
 /// itself.
 ///
 /// Caller (I10.21 W2): `crate::process_execution::KernelGovernedProcessEffectPort`
-/// ingests each governed tool operation as a host-event hint;
-/// [`observe_filesystem_notification`] ingests each received OS filesystem
-/// notification as a filesystem hint with real Git-substrate evidence.
+/// ingests each governed tool operation as a host-event hint and each
+/// retained-digest transition as a poll-reconcile hint;
+/// [`observe_filesystem_notification`] will ingest each received OS
+/// filesystem notification as a filesystem hint with real Git-substrate
+/// evidence once the watcher lane attaches.
+///
+/// Correlation (I10.21 W3): a host-event hint carries the Session,
+/// ActionLease, tool operation, attempt receipt, and State-Fence generation
+/// the producing lane claims for it — the claimant's identity, never proof
+/// of who wrote the bytes. A filesystem hint carries none of these: an OS
+/// notification names no governed claimant, so absent correlation is the
+/// explicit uncertain-provenance classification, not a missing field. The
+/// new correlation fields default for sidecars written before them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct KernelChangeHint {
     pub hint_id: String,
@@ -162,6 +183,16 @@ pub(crate) struct KernelChangeHint {
     pub path: String,
     pub origin: HintOrigin,
     pub origin_ref: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub action_lease: Option<String>,
+    #[serde(default)]
+    pub operation: Option<String>,
+    #[serde(default)]
+    pub attempt_receipt: Option<String>,
+    #[serde(default)]
+    pub fence_generation: Option<u64>,
 }
 
 /// One direct content read: the exact bytes hashed, or the proven absence
@@ -431,6 +462,31 @@ fn validate_hint(hint: &KernelChangeHint) -> Result<(), ChangeMonitorError> {
     {
         return Err(ChangeMonitorError::InvalidHint);
     }
+    // I10.21 W3: claimed correlation is validated exactly like any other
+    // reference. Absent correlation stays absent: only the producing lane's
+    // claimed Session/lease/operation/attempt may appear here, and a
+    // filesystem hint (no governed claimant) carries none.
+    for reference in [
+        hint.session.as_ref(),
+        hint.action_lease.as_ref(),
+        hint.operation.as_ref(),
+        hint.attempt_receipt.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !text(reference) {
+            return Err(ChangeMonitorError::InvalidHint);
+        }
+    }
+    if hint.origin != HintOrigin::HostEvent
+        && (hint.session.is_some()
+            || hint.action_lease.is_some()
+            || hint.operation.is_some()
+            || hint.attempt_receipt.is_some())
+    {
+        return Err(ChangeMonitorError::InvalidHint);
+    }
     Ok(())
 }
 
@@ -568,8 +624,8 @@ pub(crate) fn material_transition_ids(
 /// Confirmation is evidence-driven, never sticky: identical evidence
 /// replays the identical outcome, while new evidence under a retried
 /// operation re-evaluates and emits the transition it actually proves.
-/// A `FilesystemNotification` hint confirms only against actual Git plus
-/// content re-read evidence: `git: None` is refused with
+/// A filesystem or poll-reconcile hint confirms only against actual Git
+/// plus content re-read evidence: `git: None` is refused with
 /// [`ChangeMonitorError::InvalidGitEvidence`], so an inferred transition no
 /// admission explains never becomes a filesystem observation on content
 /// polling alone. The refusal leaves the hint pending, which keeps governed
@@ -603,11 +659,13 @@ pub(crate) fn confirm_hint(
         .get(hint_id)
         .ok_or(ChangeMonitorError::UnknownHint)
         .map(|entry| (entry.hint.resource.clone(), entry.hint.origin))?;
-    // I10.21 W2: a filesystem hint is an OS notification confirmed against
-    // actual Git/content re-reads, never content polling over one image. A
-    // filesystem confirmation without Git readback proves no repository
-    // state and is refused instead of recorded.
-    if origin == HintOrigin::FilesystemNotification && verification.git.is_none() {
+    // I10.21 W2: a filesystem or poll-reconcile hint is a filesystem/Git
+    // observation confirmed against actual Git/content re-reads, never
+    // content polling over one image. Such a confirmation without Git
+    // readback proves no repository state and is refused instead of
+    // recorded. Only a host-event hint (the governed lane's own content
+    // re-reads) decides on content evidence alone.
+    if origin != HintOrigin::HostEvent && verification.git.is_none() {
         return Err(ChangeMonitorError::InvalidGitEvidence);
     }
     if before_digest == after_digest {
@@ -688,13 +746,13 @@ pub(crate) fn confirm_hint(
     })
 }
 
-/// One operating-system filesystem notification received by the Kernel
-/// (I10.21 W2, AUD2 defect 2). Unlike the inferred declared-target
-/// transition the process-effect lane polls at pre-effect capture, this is
-/// a delivered OS event: the watcher observed `path` change and handed over
-/// `event_ref`. It is still only a hint until
-/// [`observe_filesystem_notification`] confirms it against actual
-/// Git-substrate plus content re-read evidence.
+/// One filesystem notification received by the Kernel (I10.21 W2, AUD2
+/// defect 2): either a delivered OS event (the watcher observed `path`
+/// change and handed over `event_ref`) or the process-effect lane's
+/// poll-reconcile re-check of an inferred declared-target transition. The
+/// stamped [`HintOrigin`] tells them apart; either way it is still only a
+/// hint until [`observe_filesystem_notification`] confirms it against
+/// actual Git-substrate plus content re-read evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FilesystemEventNotification {
     pub event_ref: String,
@@ -824,13 +882,19 @@ fn read_substrate_in(
     })
 }
 
-/// Observes one received OS filesystem notification against actual
-/// Git/content re-read evidence and feeds the result through the existing
-/// owner port ([`ingest_hint`] + [`confirm_hint`], I10.21 W2): no second
-/// ledger, no parallel evidence channel. The adapter opens the hinted
-/// tracked source itself twice (pairwise-independent reads that must
-/// agree), with a real Git HEAD-substrate read before the first content
-/// read and another after the re-read; a HEAD move under observation is
+/// Observes one filesystem hint against actual Git/content re-read
+/// evidence and feeds the result through the existing owner port
+/// ([`ingest_hint`] + [`confirm_hint`], I10.21 W2): no second ledger, no
+/// parallel evidence channel. `origin` names the true producer route:
+/// [`HintOrigin::FilesystemNotification`] for a received OS notification
+/// (the future OS-watcher lane), or [`HintOrigin::PollReconcile`] for an
+/// inferred declared-target transition the process-effect lane re-checks
+/// (audit 5910747803 defect 2: a polled transition is never labeled an OS
+/// notification). [`HintOrigin::HostEvent`] is refused: the host-event
+/// route ingests directly. The adapter opens the hinted tracked source
+/// itself twice (pairwise-independent reads that must agree), with a real
+/// Git HEAD-substrate read before the first content read and another after
+/// the re-read; a HEAD move under observation is
 /// [`ChangeMonitorError::UnstableReadback`], exactly like disagreeing
 /// content reads. `before_digest` is the previously admitted content digest
 /// for the hinted source when the caller retains one (`None` on first
@@ -842,16 +906,21 @@ fn read_substrate_in(
 /// (Deletion readback is a separate lane: an absent tracked source is
 /// refused here rather than represented.)
 ///
-/// Caller (I10.21 W2): the OS-watcher lane once attached. No in-tree caller
-/// wires an OS watcher yet; until that lane lands, the process-effect lane
-/// keeps its host-event leg and its polling-inferred filesystem path — the
-/// latter now fails closed under [`confirm_hint`] instead of recording a
-/// `FilesystemNotification` on content polling alone.
+/// Caller (I10.21 W2): `crate::process_execution::KernelGovernedProcessEffectPort`
+/// poll-reconcile leg today; the OS-watcher lane once attached (with
+/// `FilesystemNotification`).
 pub(crate) fn observe_filesystem_notification(
     workspace_root: &std::path::Path,
     notification: &FilesystemEventNotification,
     before_digest: Option<&str>,
+    origin: HintOrigin,
 ) -> Result<HintConfirmation, ChangeMonitorError> {
+    if !matches!(
+        origin,
+        HintOrigin::FilesystemNotification | HintOrigin::PollReconcile
+    ) {
+        return Err(ChangeMonitorError::InvalidHint);
+    }
     if !text(&notification.event_ref)
         || !text(&notification.resource)
         || !validate_relative_path(&notification.path)
@@ -896,8 +965,18 @@ pub(crate) fn observe_filesystem_notification(
         hint_id: hint_id.clone(),
         resource: notification.resource.clone(),
         path: notification.path.clone(),
-        origin: HintOrigin::FilesystemNotification,
+        origin,
         origin_ref: Some(notification.event_ref.clone()),
+        // I10.21 W3: an OS notification names no governed claimant, so
+        // the hint carries no Session/lease/operation/attempt correlation.
+        // Absent correlation is the explicit uncertain-provenance
+        // classification; invented attribution is refused by
+        // [`validate_hint`].
+        session: None,
+        action_lease: None,
+        operation: None,
+        attempt_receipt: None,
+        fence_generation: None,
     };
     ingest_hint(hint).map(|_| ())?;
     let verification = HintVerification {
@@ -1262,14 +1341,23 @@ pub(crate) fn persist_ledger_sidecar() -> Result<(), ChangeMonitorError> {
     })?;
     let bytes =
         serde_json::to_vec(&snapshot).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
+    write_durable_json(&path, &bytes)
+}
+
+/// Writes one durable JSON projection atomically (temporary file plus
+/// rename), creating the parent directory first. Shared by the ledger
+/// sidecar and the observation transfer so both durable projections keep
+/// the same crash-window behavior: a reader never sees a half-written
+/// document.
+fn write_durable_json(path: &Path, bytes: &[u8]) -> Result<(), ChangeMonitorError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
     }
     let staging = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&staging, &bytes).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
-    std::fs::rename(&staging, &path).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
+    std::fs::write(&staging, bytes).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
+    std::fs::rename(&staging, path).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
     Ok(())
 }
 
@@ -1425,32 +1513,340 @@ pub(crate) fn governed_acceptance_blocked() -> bool {
         || ledger.unknown.values().any(|unknown| !unknown.reconciled)
 }
 
+/// Normalizes one finish-declared resource for the per-resource
+/// acceptance gate (I10.21 A2): separator folding (`\` vs `/` across
+/// Windows finish drafts and native ledger keys) with redundant trailing
+/// separators trimmed. Returns `None` for an empty or control-carrying
+/// query, which the gate treats as unmatched. Opaque content-addressed
+/// artifact handles that name no path normalize to themselves and keep
+/// missing the ledger's tracked-source keys by construction: mapping those
+/// needs the admitted handle-to-source mapping owned outside this ledger,
+/// so such candidates keep the global gate as fallback (see
+/// [`governed_acceptance_blocked_for`]).
+fn normalize_gate_resource(value: &str) -> Option<String> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    let folded = value.replace('\\', "/");
+    let trimmed = folded.trim_matches('/').to_owned();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// Returns whether governed acceptance for one tracked resource is
 /// currently blocked: a hint naming that resource is still unverified, or
 /// an unknown-origin Material change naming that resource is still
 /// unreconciled (I10.21 A2, per-resource scope).
 ///
-/// Scoping is by the tracked source identity carried on the admitted hint
-/// (`KernelChangeHint::resource`) and preserved on the unknown-origin
-/// record derived from it. The live finish leg does NOT scope by this
-/// query today: finish drafts name opaque artifact handles while this
-/// ledger keys tracked-source identity, and no admitted mapping proves a
-/// handle disjoint from a blocked resource, so the leg keeps the sound
-/// global gate above. This query is the per-resource end of the future
-/// Kernel-ledger/Governor-monitor identity bridge (see
+/// Scoping compares through [`normalize_gate_resource`] on both the
+/// finish-declared query and the ledger's tracked-source keys, so a
+/// path-shaped finish ref reaches the same resource the effect lane
+/// recorded under its native separators. The live finish leg does NOT
+/// otherwise assume identity: finish drafts name opaque artifact handles
+/// while this ledger keys tracked-source identity, and no admitted mapping
+/// proves a handle disjoint from a blocked resource, so the leg keeps the
+/// sound global gate above. This query is the per-resource end of the
+/// future Kernel-ledger/Governor-monitor identity bridge (see
 /// `eliot-change-monitor::ChangeMonitor::blocks_acceptance_for`): it
 /// becomes leg-eligible only with an admitted handle-to-source mapping,
 /// never by assuming one. A poisoned ledger fails closed.
+///
+/// Caller: `host_request_route::daemon_claim_queue::submit_finish_result`.
 pub(crate) fn governed_acceptance_blocked_for(resource: &str) -> bool {
     let Ok(ledger) = ledger() else {
         return true;
     };
-    ledger
+    let Some(query) = normalize_gate_resource(resource) else {
+        return false;
+    };
+    ledger.hints.values().any(|entry| {
+        entry.confirmation.is_none()
+            && normalize_gate_resource(entry.hint.resource.as_str()).as_ref() == Some(&query)
+    }) || ledger.unknown.values().any(|unknown| {
+        !unknown.reconciled
+            && normalize_gate_resource(unknown.resource.as_str()).as_ref() == Some(&query)
+    })
+}
+
+/// Version of the Kernel observation transfer schema below. It binds the
+/// exact field contract the Governor owner ingests; a schema change bumps
+/// this version instead of silently reinterpreting fields.
+pub(crate) const OBSERVATION_TRANSFER_FORMAT_VERSION: u32 = 1;
+
+/// Descriptor of the projection that produced one transfer document
+/// (I10.21 W6: algorithm/version are recorded, not implied).
+pub(crate) const OBSERVATION_TRANSFER_PROJECTION: &str = "kernel-change-ledger/v1";
+
+/// Evidence class for one transferred record (I10.21 W6): the Kernel's
+/// origin-attribution confidence vocabulary. A governed-admitted record
+/// carries the full Session/lease/operation/attempt/diff/fence correlation
+/// the producing lane proved; an unreconciled unknown carries the exact
+/// before/after pair with no claimant; a gap marker carries only the frozen
+/// before-state its blocking duty guards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum TransferEvidenceClass {
+    GovernedAdmitted,
+    UnknownUnreconciled,
+    UnknownReconciled,
+    ObservationGap,
+}
+
+/// One pending hint for the Governor owner (I10.21 W4): the hint identity
+/// plus the claimant correlation the Kernel admitted (I10.21 W3), so the
+/// owner confirms the same re-check instead of minting a parallel one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TransferredPendingHint {
+    pub hint_id: String,
+    pub resource: String,
+    pub path: String,
+    pub origin: HintOrigin,
+    pub origin_ref: Option<String>,
+    pub session: Option<String>,
+    pub action_lease: Option<String>,
+    pub operation: Option<String>,
+    pub attempt_receipt: Option<String>,
+    pub fence_generation: Option<u64>,
+}
+
+/// One unknown-origin Material change for the Governor owner (I10.21 W4):
+/// the exact before/after pair and transition the Kernel ledger recorded,
+/// with its reconciliation state and evidence class (I10.21 W6).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TransferredUnknownChange {
+    pub change_id: String,
+    pub resource: String,
+    pub before_digest: Option<String>,
+    pub after_digest: Option<String>,
+    pub transition_digest: String,
+    pub reconciled: bool,
+    pub evidence_class: TransferEvidenceClass,
+}
+
+/// One governed-tool original for the Governor owner (I10.21 W5): the
+/// immutable original anchor identity — the exact operation/diff identity
+/// plus the before/after revisions the ledger hashed itself — with the
+/// full Session/lease/operation/attempt/fence correlation. These are the
+/// immutable candidate/evidence inputs the anchored-review resolver
+/// consumes; the Kernel never resolves, it only provisions admitted
+/// inputs in ledger key order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TransferredGovernedOriginal {
+    pub change_id: String,
+    pub resource: String,
+    pub path: String,
+    pub before_path: Option<String>,
+    pub before_revision: Option<String>,
+    pub before_digest: Option<String>,
+    pub after_revision: Option<String>,
+    pub after_digest: Option<String>,
+    pub session: String,
+    pub action_lease: String,
+    pub operation: String,
+    pub attempt_receipt: String,
+    pub diff_handle: String,
+    pub fence_generation: u64,
+    pub fence_invalidated: bool,
+    /// A governed original is admitted evidence by construction (I10.21
+    /// W6): the ledger hashed the tracked-source bytes itself and bound
+    /// the full correlation before storing.
+    pub evidence_class: TransferEvidenceClass,
+}
+
+/// One unknown-to-evidence link for the Governor owner (I10.21 W5/W6):
+/// history-preserving reconciliation evidence, never a rewrite.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TransferredReconciliation {
+    pub unknown_change_id: String,
+    pub evidence_change_id: String,
+}
+
+/// One retained resource tip for the Governor owner (I10.21 W4): the last
+/// proved digest plus the last confirmed repository commit, so the owner
+/// restarts from the same baseline instead of establishing a fresh one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TransferredResourceTip {
+    pub resource: String,
+    pub digest: Option<String>,
+    pub head_commit: Option<String>,
+    pub repository: Option<String>,
+}
+
+/// The single-owner projection export (I10.21 W4/W5/W6): every pending
+/// hint, unknown-origin change, governed original, reconciliation link,
+/// and retained tip in ledger key order, so the Governor owner rebuilds
+/// the same projection instead of answering from disconnected state
+/// (audit 5910747803 defect 7).
+///
+/// Section mapping for the Governor seam: pending hints plus tips feed
+/// `eliot_change_monitor::ChangeMonitor::confirm_kernel_readback`;
+/// governed originals feed
+/// `eliot_change_monitor::ChangeMonitor::ingest_governed_tool_mutation`;
+/// reconciliation links feed
+/// `eliot_change_monitor::ChangeMonitor::reconcile_unknown_change`;
+/// governed originals plus tips are the immutable candidate/evidence
+/// inputs for `eliot_change_monitor::ChangeMonitor::resolve_anchor`
+/// (I10.18: current-location resolution uses I10.21 and remains
+/// exact/moved/modified/ambiguous/stale/deleted/unavailable; ambiguous
+/// resolution never silently attaches to the most similar fragment).
+/// I10.21 W6 is satisfied on this side by `format_version`,
+/// `projection`, the per-record `evidence_class`, and the complete
+/// inputs/evidence carried inline: the resolver's own
+/// `AnchorResolutionObservation` publication stays the Governor owner's
+/// duty at its anchored-review caller.
+///
+/// STITCH: no in-tree Governor caller exists yet. The consumer must live
+/// outside this crate (a `bins` root never depends on Governor crates):
+/// hydrate the `GovernorOwners.change_monitor` consulted by
+/// `crates/governor/eliot-governor/src/finish_attempt.rs::GovernorFinishAttempt::prepare_finish_decision`
+/// (acceptance gate) — supplied via
+/// `crates/governor/eliot-governor/src/composition.rs::GovernorComposition::prepare_finish_decision`
+/// — from `export_observation_transfer_json` (live) or the durable
+/// `kernel-change-transfer.v1.json` file [`persist_observation_transfer`]
+/// maintains beside the ledger sidecar (cross-restart) before the gate
+/// consults `has_pending_hints`/`has_unknown_material_change`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ObservationTransferDocument {
+    pub format_version: u32,
+    pub projection: String,
+    pub pending_hints: Vec<TransferredPendingHint>,
+    pub unknown_changes: Vec<TransferredUnknownChange>,
+    pub governed_originals: Vec<TransferredGovernedOriginal>,
+    pub reconciliations: Vec<TransferredReconciliation>,
+    pub tips: Vec<TransferredResourceTip>,
+}
+
+/// Builds the single-owner projection export from the live ledger
+/// (I10.21 W4/W5/W6). Iteration follows the ledger's key order, so the
+/// same ledger always exports the same document. A poisoned ledger fails
+/// closed instead of exporting a half-read projection.
+pub(crate) fn export_observation_transfer(
+) -> Result<ObservationTransferDocument, ChangeMonitorError> {
+    let ledger = ledger()?;
+    let pending_hints = ledger
         .hints
         .values()
-        .any(|entry| entry.confirmation.is_none() && entry.hint.resource.as_str() == resource)
-        || ledger
-            .unknown
-            .values()
-            .any(|unknown| !unknown.reconciled && unknown.resource.as_str() == resource)
+        .filter(|entry| entry.confirmation.is_none())
+        .map(|entry| TransferredPendingHint {
+            hint_id: entry.hint.hint_id.clone(),
+            resource: entry.hint.resource.clone(),
+            path: entry.hint.path.clone(),
+            origin: entry.hint.origin,
+            origin_ref: entry.hint.origin_ref.clone(),
+            session: entry.hint.session.clone(),
+            action_lease: entry.hint.action_lease.clone(),
+            operation: entry.hint.operation.clone(),
+            attempt_receipt: entry.hint.attempt_receipt.clone(),
+            fence_generation: entry.hint.fence_generation,
+        })
+        .collect();
+    let unknown_changes = ledger
+        .unknown
+        .iter()
+        .map(|(change_id, unknown)| TransferredUnknownChange {
+            change_id: change_id.clone(),
+            resource: unknown.resource.clone(),
+            before_digest: unknown.before_digest.clone(),
+            after_digest: unknown.after_digest.clone(),
+            transition_digest: unknown.transition_digest.clone(),
+            reconciled: unknown.reconciled,
+            evidence_class: if unknown.unresolved_gap {
+                TransferEvidenceClass::ObservationGap
+            } else if unknown.reconciled {
+                TransferEvidenceClass::UnknownReconciled
+            } else {
+                TransferEvidenceClass::UnknownUnreconciled
+            },
+        })
+        .collect();
+    let governed_originals = ledger
+        .governed
+        .iter()
+        .map(|(change_id, record)| TransferredGovernedOriginal {
+            change_id: change_id.clone(),
+            resource: record.resource.clone(),
+            path: record.path.clone(),
+            before_path: record.before_path.clone(),
+            before_revision: record.before_revision.clone(),
+            before_digest: record.before_digest.clone(),
+            after_revision: record.after_revision.clone(),
+            after_digest: record.after_digest.clone(),
+            session: record.session.clone(),
+            action_lease: record.action_lease.clone(),
+            operation: record.operation.clone(),
+            attempt_receipt: record.attempt_receipt.clone(),
+            diff_handle: record.diff_handle.clone(),
+            fence_generation: record.fence_generation,
+            fence_invalidated: record.fence_invalidated,
+            evidence_class: TransferEvidenceClass::GovernedAdmitted,
+        })
+        .collect();
+    let reconciliations = ledger
+        .reconciliations
+        .iter()
+        .map(|link| TransferredReconciliation {
+            unknown_change_id: link.unknown_change_id.clone(),
+            evidence_change_id: link.evidence_change_id.clone(),
+        })
+        .collect();
+    let tips = ledger
+        .tips
+        .iter()
+        .map(|(resource, tip)| TransferredResourceTip {
+            resource: resource.clone(),
+            digest: tip.digest.clone(),
+            head_commit: tip.head_commit.clone(),
+            repository: tip.repository.clone(),
+        })
+        .collect();
+    Ok(ObservationTransferDocument {
+        format_version: OBSERVATION_TRANSFER_FORMAT_VERSION,
+        projection: OBSERVATION_TRANSFER_PROJECTION.to_owned(),
+        pending_hints,
+        unknown_changes,
+        governed_originals,
+        reconciliations,
+        tips,
+    })
+}
+
+/// Encodes the single-owner projection export for the Governor seam
+/// (I10.21 W4): the JSON vehicle the out-of-crate hydration lane parses
+/// without depending on this crate's types. Encoding failure is typed,
+/// never a silent empty document.
+pub(crate) fn export_observation_transfer_json() -> Result<String, ChangeMonitorError> {
+    let document = export_observation_transfer()?;
+    serde_json::to_string(&document).map_err(|_| ChangeMonitorError::TransferEncode)
+}
+
+/// Name of the durable observation transfer beside the ledger sidecar.
+const OBSERVATION_TRANSFER_FILE_NAME: &str = "kernel-change-transfer.v1.json";
+
+/// Locates the durable observation transfer: `.eliot/` under the default
+/// work root, beside the ledger sidecar. Same stability contract as the
+/// sidecar: the path is stable across restarts for a deployment.
+fn observation_transfer_path() -> Option<PathBuf> {
+    crate::default_work_root()
+        .ok()
+        .map(|root| root.join(".eliot").join(OBSERVATION_TRANSFER_FILE_NAME))
+}
+
+/// Persists the single-owner projection export beside the ledger sidecar
+/// (I10.21 W4 durability): the exact document
+/// [`export_observation_transfer`] builds, through the shared atomic
+/// durable write. Best-effort by the same contract as the sidecar:
+/// persistence loss never fails the observation it just recorded, but the
+/// caller surfaces the outcome so durability loss stays visible. The
+/// Governor hydration lane reads this file to converge its owner on the
+/// Kernel projection — including across a Kernel restart, when the live
+/// export is unreachable but retained unknowns still block.
+///
+/// Caller: `crate::process_execution::KernelGovernedProcessEffectPort`,
+/// after ledger mutations, beside the sidecar persist.
+pub(crate) fn persist_observation_transfer() -> Result<(), ChangeMonitorError> {
+    let Some(path) = observation_transfer_path() else {
+        return Err(ChangeMonitorError::SidecarUnavailable);
+    };
+    let document = export_observation_transfer()?;
+    let bytes =
+        serde_json::to_vec(&document).map_err(|_| ChangeMonitorError::TransferEncode)?;
+    write_durable_json(&path, &bytes)
 }
