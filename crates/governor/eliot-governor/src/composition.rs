@@ -21,7 +21,9 @@ use crate::canonical_projections::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
-use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
+use crate::finish_attempt::{
+    PreparedFinishDecision, PreparedKernelExchange, current_plan_envelope,
+};
 use crate::migration_inventory::PRODUCT_PROOF_PLAN;
 use crate::negative_memory_gate::{
     self, NegativeMemoryGateDecision, NegativeMemoryGateInput, evaluate_negative_memory_gate,
@@ -74,7 +76,7 @@ use eliot_diagnostic::{
 };
 use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
 use eliot_finish::{
-    DescendantClosure, FinishDecisionReceipt, FinishLifecycleAction, FinishService,
+    DescendantClosure, FinishDecisionReceipt, FinishError, FinishLifecycleAction, FinishService,
 };
 use eliot_influence::RevocationBounds;
 use eliot_instrument_api::{
@@ -92,7 +94,7 @@ use eliot_maintenance::{
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_observation::{ObservationAdmissionResult, ObservationJournal, ObservationJournalEntry};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -3776,6 +3778,63 @@ impl CanonicalAdmissionOwner {
         Ok(fact)
     }
 
+    /// Builds the next canonical admission owner image that carries one
+    /// Task Controller's current plan revision (issue #1741, I7.9).
+    ///
+    /// # Why this producer exists
+    ///
+    /// `current_plan` is `None` in the all-absent genesis payload, and until this
+    /// method nothing could ever make it `Some`. The genesis packet is by
+    /// construction the canonical all-absent image — its `validate` pins every
+    /// owner payload to exactly that form, so a plan installed there would be a
+    /// fabricated second plan authority rather than an owner-issued one — and
+    /// both pre-existing producers ([`Self::prepare_verifier_execution_fact`]
+    /// and [`Self::prepare_finish_evidence`]) only ever *carry forward*
+    /// `self.snapshot.current_plan`. The plan dimension was therefore
+    /// write-once-absent, so [`Self::read_current_plan`] and
+    /// `read_current_activation_plan` refused on every live daemon, which
+    /// dead-ended `prepare_finish_evidence` at its `read_current_plan` call
+    /// before it could ever reach the contract owner's acceptance denominator.
+    ///
+    /// # Ownership (A00-07:50, A02-02:22, A10-04:22, I06-10:70, I07-21:9)
+    ///
+    /// Architecture names the Task Controller as the role that owns "the current
+    /// plan revision" of one task under the active Authority Epoch, holding a
+    /// `TaskControllerLease`, and withholds that authority from the Main Agent
+    /// and from workers (`I10-15:194`: "workers cannot mutate the current plan
+    /// in place"). This is that owner boundary on the existing
+    /// [`CanonicalAdmissionOwner`]: it extends the existing scheme and invents no
+    /// new plan identity type, vocabulary, or admission path.
+    ///
+    /// The plan is admitted only for a task it names, only under this exact
+    /// fence, and only when the resulting image validates. Re-admitting the plan
+    /// the owner already holds is idempotent: the caller compares the derived
+    /// binding against [`Self::read_current_plan`] and skips the write, so this
+    /// never mints a second owner revision for the same plan. A verifier
+    /// execution fact or finish evidence already retained under a *different*
+    /// plan cannot survive the transition, because
+    /// [`CanonicalAdmissionSnapshot::validate`] refuses a fact or evidence image
+    /// that does not match `current_plan` — the old plan's derived state is
+    /// dropped with it rather than carried across a plan change.
+    pub fn prepare_current_plan(
+        &self,
+        plan: CanonicalPlanBinding,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        plan.validate()?;
+        let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: Some(plan),
+            verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
+            finish_evidence: self.snapshot.finish_evidence.clone(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     /// Builds the next canonical admission owner image after a Governor-owned
     /// finish-evidence derivation.  This is a pure owner transition payload;
     /// persistence is performed only by the Kernel transition port.
@@ -5739,6 +5798,105 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         self.owners.canonical.read_current_plan(state_fence)
+    }
+
+    /// Admits the Task Controller's current plan revision for one task from
+    /// owner state alone, and returns the exact exchange that leg still owes
+    /// (issue #1741, I7.9).
+    ///
+    /// This is the production producer for `CanonicalAdmissionSnapshot::current_plan`.
+    /// It performs no transport and mutates nothing, so the caller holds its
+    /// composition borrow for this call alone and releases it before
+    /// [`PreparedKernelExchange::exchange`].
+    ///
+    /// # Where the plan identity comes from
+    ///
+    /// Every field is read from an owner, never taken from a caller:
+    ///
+    /// * `plan_id` / `plan_revision` — the plan identity the Task-selection
+    ///   owner's accepted, same-fence, task-bound observation receipt already
+    ///   records (`ObservationPlanBinding`). That receipt is the durable owner
+    ///   record of the admitted plan revision, and it is the same record the
+    ///   finish path's `matches_plan` join compares the owner plan against, so
+    ///   the plan admitted here cannot disagree with the evidence it is later
+    ///   joined to.
+    /// * `task_id` / `task_revision` — the live task-lifecycle owner record, so
+    ///   the admitted plan is current by construction rather than by a
+    ///   caller-asserted revision. A task is the documented unit of plan
+    ///   ownership (A10-04:22: "exactly one Task Controller owns the current
+    ///   plan revision for the Authority Epoch"), so the plan is bound to the
+    ///   owner record that holds that authority.
+    /// * `work_scope_id` — the same selection receipt's `work_scope_ref`.
+    ///
+    /// The verifier request contract is deliberately *not* supplied here. The
+    /// governing fragments assign plan-revision ownership to the Task Controller
+    /// (A00-07:50, A02-02:22, A10-04:22, I07-21:9) and keep the verifier under an
+    /// Evaluation Contract (A05-05, I07-27), but name no owner that publishes a
+    /// `CanonicalVerifierPlanBinding` — and none exists: the type has no struct
+    /// literal anywhere in the tree, so it is reachable only by deserialization.
+    /// It is therefore left absent, which [`CanonicalPlanBinding::validate`]
+    /// admits, so the plan *identity* is admitted on the evidence that actually
+    /// exists and every consumer that requires a verifier keeps refusing on its
+    /// own pre-existing typed check rather than reading a synthesized contract.
+    ///
+    /// # Idempotence
+    ///
+    /// When the owner already holds exactly this plan, `None` is returned and no
+    /// owner revision is minted: a re-admission of an already-current plan must
+    /// not look like a new canonical fact. `Some` is returned only when the
+    /// owner image would actually change.
+    ///
+    /// # Fail-closed
+    ///
+    /// Refuses, without mutating anything, when the composition is not ready;
+    /// when the task is absent, stale for the fence, at a zero revision, or not
+    /// in a plan-bearing state; when the Task-selection owner has no accepted,
+    /// same-fence, task-bound, plan-bearing, uncontaminated receipt for this
+    /// exact task revision; when those receipts disagree about the plan identity;
+    /// or when the resulting owner image does not validate. There is no
+    /// synthesized plan and no fallback to the genesis image.
+    pub fn prepare_current_plan_admission(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        task_id: &TaskId,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        identity
+            .validate()
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        if identity.request.state_fence != identity.request.metadata.state_fence {
+            return Err(FinishError::FenceMismatch.into());
+        }
+        let fence = identity.request.metadata.state_fence.clone();
+        if self.owners.canonical.state_fence() != &fence {
+            return Err(FinishError::FenceMismatch.into());
+        }
+        if identity.request.metadata.task_id.as_ref() != Some(task_id) {
+            return Err(FinishAttemptError::Composition(
+                eliot_canonical::CanonicalError::TaskBindingMismatch,
+            )
+            .into());
+        }
+        let service = self.finish_attempt_service();
+        let plan = service.admit_task_controller_plan(task_id)?;
+        // Already current: the owner holds exactly this plan, so there is no
+        // owner image to publish and no revision to advance.
+        if self
+            .owners
+            .canonical
+            .read_current_plan(&fence)
+            .is_ok_and(|current| current == plan)
+        {
+            return Ok(None);
+        }
+        let snapshot = self.owners.canonical.prepare_current_plan(plan)?;
+        let envelope = current_plan_envelope(identity, operation_id, &snapshot, task_id)?;
+        Ok(Some(
+            service.prepare_current_plan_exchange(identity, operation_id, envelope)?,
+        ))
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.

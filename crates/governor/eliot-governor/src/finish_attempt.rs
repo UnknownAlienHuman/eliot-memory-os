@@ -716,6 +716,129 @@ fn task_closure_authority_ref(
 }
 
 impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
+    /// Derives the Task Controller's current plan revision for one task from
+    /// owner state alone (issue #1741, I7.9).
+    ///
+    /// This is the read half of current-plan admission, and the only place the
+    /// plan identity is assembled. It reads the live task-lifecycle record and
+    /// the Task-selection owner's accepted receipts; it takes no plan, no
+    /// revision, and no scope from a caller, so no caller can hand the canonical
+    /// owner a plan of its own choosing.
+    ///
+    /// The plan identity comes from the `ObservationPlanBinding` the accepted
+    /// receipt already carries, matched to this exact fence and this exact
+    /// owner-resolved task revision. That is deliberate: the finish path's own
+    /// `matches_plan` join requires the retained observation receipts to bind the
+    /// same plan, so deriving the plan from those receipts is what makes the
+    /// owner and its evidence provably about the same plan revision rather than
+    /// two independently asserted facts.
+    ///
+    /// A receipt whose selection is contaminated is skipped: a quarantined
+    /// selection does not establish a usable current plan. Two accepted receipts
+    /// that disagree about the plan identity are ambiguous owner state, not a
+    /// majority vote, so this refuses instead of picking one.
+    pub fn admit_task_controller_plan(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<CanonicalPlanBinding, FinishAttemptError> {
+        let task = self.task.task(task_id).ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "canonical task {} is absent; no current plan can be admitted for it",
+                task_id.as_str()
+            )))
+        })?;
+        let fence = self.canonical.state_fence().clone();
+        if task.task_id != *task_id || task.state_fence != fence {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "task-lifecycle owner record is stale for current plan admission".to_owned(),
+            )));
+        }
+        // A task holds a plan only while the Task Controller's authority over it
+        // is live. This is the same state set `read_unique_agent_activation`
+        // admits, so the plan cannot be installed for a task that is already
+        // closing, blocked, or never authorized.
+        if task.revision == 0
+            || !matches!(
+                task.state,
+                TaskState::ActionAuthorized | TaskState::Executing | TaskState::Verifying
+            )
+        {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "task is not in a plan-bearing state; current plan admission is refused"
+                    .to_owned(),
+            )));
+        }
+        let mut plan_identity: Option<(String, String, String)> = None;
+        for entry in self.observation.snapshot() {
+            let receipt = match &entry.result {
+                ObservationAdmissionResult::Accepted { receipt }
+                | ObservationAdmissionResult::Replayed { receipt } => receipt,
+                ObservationAdmissionResult::Rejected { .. } => continue,
+            };
+            let Some(selection) = receipt.task_selection.as_ref().filter(|selection| {
+                receipt.state_fence == fence
+                    && selection.task_ref == task_id.as_str()
+                    && selection.task_revision == task.revision
+                    && !selection.is_contaminated()
+            }) else {
+                continue;
+            };
+            let Some(plan) = receipt
+                .plan
+                .as_ref()
+                .filter(|plan| plan.state_fence == fence && plan.validate().is_ok())
+            else {
+                continue;
+            };
+            let observed = (
+                plan.plan_id.clone(),
+                plan.plan_revision.clone(),
+                selection.work_scope_ref.clone(),
+            );
+            if plan_identity.as_ref().is_some_and(|seen| *seen != observed) {
+                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                    "task-selection owner evidence disagrees about the current plan identity"
+                        .to_owned(),
+                )));
+            }
+            plan_identity = Some(observed);
+        }
+        let (plan_id, plan_revision, work_scope_id) = plan_identity.ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "task-selection owner has no same-fence, task-bound, plan-bearing accepted receipt; \
+                 current plan admission is refused"
+                    .to_owned(),
+            ))
+        })?;
+        // The verifier request contract is left exactly as the owner does not yet
+        // hold one. `CanonicalVerifierPlanBinding` has no producer anywhere in the
+        // tree — not even a test constructs one, so it is reachable only by
+        // deserialization — and synthesising an instrument/profile/target/test-id
+        // contract here would be a second, fabricated plan authority. A plan
+        // without it is the honest owner state: `CanonicalPlanBinding::validate`
+        // already admits an absent verifier for exactly this reason, and every
+        // consumer that needs one refuses on its own pre-existing typed check
+        // rather than reading a stand-in.
+        CanonicalPlanBinding::new(plan_id, plan_revision, *task_id, work_scope_id)
+            .map_err(FinishAttemptError::Composition)
+    }
+
+    /// Wraps the current-plan owner transition in the exact prepared exchange
+    /// the finish path already uses for every other canonical owner leg.
+    ///
+    /// The prepared leg is pure: it derives the immutable transition from the
+    /// envelope and checks it against the admitted identity, so the caller may
+    /// release its composition borrow before
+    /// [`PreparedKernelExchange::exchange`].
+    pub(crate) fn prepare_current_plan_exchange(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        envelope: CanonicalWriteEnvelope,
+    ) -> Result<PreparedKernelExchange, FinishAttemptError> {
+        prepare_exchange(self.canonical, identity, envelope)
+    }
+
     /// Rehydrates the contract owner's exact `TaskContract` acceptance-item
     /// enumeration for one finish candidate (issue #1741, I7.9).
     ///
@@ -1424,6 +1547,51 @@ fn canonical_owner_snapshot_envelope(
         expected_revision_heads: Vec::new(),
         expected_ordering_heads: Vec::new(),
     })
+}
+
+/// Builds the envelope that publishes a current-plan owner image.
+///
+/// This deliberately reuses [`canonical_owner_snapshot_envelope`] and therefore
+/// the same activated `RecordFinishEvidence` mutation, for the same reason the
+/// store keeps that image opaque: `owner/canonical` holds exactly one
+/// `CanonicalAdmissionSnapshot`, and `current_plan` is one field of it. A
+/// separate mutation would arbitrate the same `owner/canonical` revision head
+/// with a second name for the same row, which is precisely the second scheme
+/// this must not introduce. The store applies the identical fenced revision CAS
+/// over the identical opaque `snapshot_json`, so the plan image commits
+/// atomically and is read back by the same owner recovery that every other
+/// canonical leg uses.
+///
+/// The proof handle is a digest over the exact admitted plan binding, so the
+/// published image is content-bound to the plan it admits rather than to a
+/// restated label.
+pub(crate) fn current_plan_envelope(
+    identity: &RequestIdentity,
+    operation_id: &OperationId,
+    snapshot: &CanonicalAdmissionSnapshot,
+    task_id: &TaskId,
+) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
+    let plan = snapshot.current_plan.as_ref().ok_or_else(|| {
+        FinishAttemptError::Serialization(
+            "current-plan envelope cannot publish an absent plan owner".to_owned(),
+        )
+    })?;
+    if plan.task_id != *task_id {
+        return Err(FinishAttemptError::Serialization(
+            "current-plan envelope names another task than the admitted one".to_owned(),
+        ));
+    }
+    let plan_digest = sha256_hex(
+        &canonical_json_bytes(plan)
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?,
+    );
+    canonical_owner_snapshot_envelope(
+        identity,
+        operation_id.clone(),
+        snapshot,
+        task_id.as_str(),
+        &format!("current-plan:{plan_digest}"),
+    )
 }
 
 fn finish_evidence_envelope(

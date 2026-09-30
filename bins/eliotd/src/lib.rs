@@ -1632,6 +1632,34 @@ impl DaemonComposition {
             .await
     }
 
+    /// Prepares the canonical owner leg that admits the Task Controller's
+    /// current plan revision for one task (issue #1741, I7.9).
+    ///
+    /// This is the production producer for the canonical owner's `current_plan`
+    /// dimension, which the all-absent genesis image leaves empty and which
+    /// every finish-path reader therefore refused. The plan identity is derived
+    /// by the Governor from its own Task-selection and task-lifecycle owners;
+    /// this binary supplies only the admitted identity, operation and task, so it
+    /// cannot assemble a plan of its own.
+    ///
+    /// `None` means the owner already holds exactly this plan, so no owner
+    /// revision is minted and no exchange is owed.
+    ///
+    /// This phase transports nothing: the caller holds the composition lock for
+    /// the call alone and releases it before the exchange.
+    pub fn prepare_current_plan_admission(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        task_id: &eliot_contracts::TaskId,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .prepare_current_plan_admission(identity, operation_id, task_id)
+    }
+
     /// Prepares the Governor-owned finish-evidence exchange without transporting it.
     ///
     /// `contract_acceptance` is the contract owner's rehydrated enumeration from
