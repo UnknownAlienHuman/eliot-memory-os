@@ -3754,7 +3754,7 @@ impl ApprovedGenerationRegistry {
         admission: &PreparedDestinationAdmission,
     ) -> Result<PreparedDestinationAdmission, InstallationError> {
         self.validate()?;
-        if admission
+        admission
             .validate()
             .map_err(|error| InstallationError::InvalidField {
                 field: "prepared_isolated_destination".to_owned(),
@@ -3790,9 +3790,11 @@ impl ApprovedGenerationRegistry {
             }
             return Err(InstallationError::IdentityConflict);
         }
-        if self.prepared_isolated_destinations.iter().any(|held| {
-            held.destination_installation == admission.destination_installation
-        }) {
+        if self
+            .prepared_isolated_destinations
+            .iter()
+            .any(|held| held.destination_installation == admission.destination_installation)
+        {
             return Err(InstallationError::IdentityConflict);
         }
         self.prepared_isolated_destinations.push(admission.clone());
@@ -4851,11 +4853,9 @@ impl ApprovedGenerationRegistry {
             {
                 return Err(InstallationError::IdentityConflict);
             }
-            if self
-                .generations
-                .iter()
-                .any(|generation| generation.manifest.generation == admission.destination_installation)
-            {
+            if self.generations.iter().any(|generation| {
+                generation.manifest.generation == admission.destination_installation
+            }) {
                 return Err(InstallationError::IdentityConflict);
             }
         }

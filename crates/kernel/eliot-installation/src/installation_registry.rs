@@ -1665,10 +1665,9 @@ impl InstallationHostRootClass {
 /// protected-root lease's proof and are composed by the caller on top.
 #[must_use]
 pub fn classify_installation_host_root(path: &Path) -> InstallationHostRootClass {
-    let Ok(identity) = WindowsPathIdentity::parse_root(
-        &path.to_string_lossy(),
-        "installation_registry.host_root",
-    ) else {
+    let Ok(identity) =
+        WindowsPathIdentity::parse_root(&path.to_string_lossy(), "installation_registry.host_root")
+    else {
         return InstallationHostRootClass::Unowned;
     };
     let Some(key_index) = identity
