@@ -4653,9 +4653,10 @@ impl MemoryStore {
     /// Builds the versioned `GetAttentionAndProblems` payload (T11.3).
     ///
     /// Reads only actually admitted problem-leg transitions: the
-    /// `ReconcileRecovery` records stored by the commit path, in commit
-    /// order, filtered by exact scope and, when supplied, exact `problem_id`
-    /// match. Zero matches are an exact empty result, not an error.
+    /// `ReconcileRecovery` and `ApplyProblemOwnerState` records stored by the
+    /// commit path, in commit order, filtered by exact scope and, when
+    /// supplied, exact `problem_id` match. Zero matches are an exact empty
+    /// result, not an error.
     fn attention_problems_payload(
         state: &MemoryState,
         query: &NamedReadRequest,
@@ -4690,7 +4691,11 @@ impl MemoryStore {
             .enumerate()
             .filter(|(_, record)| {
                 record.scope_id == scope_id
-                    && record.operation.operation == NamedMutationOperation::ReconcileRecovery
+                    && matches!(
+                        record.operation.operation,
+                        NamedMutationOperation::ReconcileRecovery
+                            | NamedMutationOperation::ApplyProblemOwnerState
+                    )
                     && problem_id.is_none_or(|wanted| {
                         record
                             .operation

@@ -115,6 +115,7 @@ mod operator_reconciliation;
 mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
+mod problem_owner_transitions;
 mod reactive_admission;
 mod route_registry;
 mod scan_disclosure_owner;
@@ -245,6 +246,10 @@ pub use owner_closure_provider::{
     AdmittedHydrationsSnapshot, GrantAdmissionParams, IntroductionAdmissionParams,
     OWNER_HYDRATION_SNAPSHOT_SCHEMA, OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider,
     PreservedAdmission,
+};
+pub use problem_owner_transitions::{
+    PreparedProblemOwnerTransition, ProblemOwnerClosure, ProblemOwnerTransitionBody,
+    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
