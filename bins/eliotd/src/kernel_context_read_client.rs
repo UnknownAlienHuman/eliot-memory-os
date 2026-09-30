@@ -73,7 +73,8 @@ use std::sync::Arc;
 
 use eliot_context_admission::{
     HeadroomAdmissionOutcome, HeadroomContext, HeadroomRefusalRecord, MaterialRankTraceDelivery,
-    admit_context_traced_with_headroom, check_campaign_view_for_admission,
+    UnitGroupContext, admit_context_traced_with_boundaries, admit_context_traced_with_headroom,
+    check_campaign_view_for_admission,
 };
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, HeadroomHandoffRefusal,
@@ -86,10 +87,11 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
-    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
-    ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
-    HeadroomAllocationLedger, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
-    QualityRefusal, QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement,
+    AdmittedContextSet, BoundaryMetadataSet, BoundaryValidationLimits, CONTEXT_CONTRACT_VERSION,
+    ContextBinding, ContextError, ContextOutcome, ContextRecipe, DecisionContextIncomplete,
+    DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAllocationLedger,
+    MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId, QualityRefusal,
+    QualityScorecard, ResolvedContextRecipe, SafetyFloorIdentity, SerializedContextMeasurement,
     SuppliedOmissionBinding,
 };
 use eliot_contracts::{
@@ -1390,6 +1392,53 @@ pub enum PacketCompositionError {
     /// terminated through its issuer rather than stranded.
     #[error("packet headroom handoff refused: {0}")]
     HeadroomHandoff(Box<HeadroomHandoffRefusal>),
+    /// The owner-derived indivisible-unit evidence for this compilation is not
+    /// usable on the path it selects.
+    ///
+    /// #1725 audit 5918725957 item 3. The owner DID issue indivisible-unit
+    /// evidence for this compilation and it does not describe this compilation:
+    /// the resolved recipe revision does not re-derive from its own approved
+    /// content, does not bind the exact recipe instance this decision is made
+    /// under, or was not the revision the owner-minted Safety Floor was issued
+    /// under. That is a refused capability, not a reason to retry the weaker
+    /// entry — falling back would admit the packet without the whole-unit floor
+    /// its owner declared, which is exactly the deceptive-complete packet the
+    /// evidence exists to prevent. The typed contract failure crosses this
+    /// boundary unchanged.
+    #[error("packet indivisible-unit evidence does not describe this compilation: {0}")]
+    UnitGroupEvidence(Box<ContextError>),
+}
+
+/// The owner-derived evidence that selects the composed indivisible-group
+/// admission path for one packet compilation.
+///
+/// #1725 audit 5918725957 item 3, and I12.13 "Bind indivisible groups" plus its
+/// whole-unit floor. Both halves are owner records, and both must describe THIS
+/// compilation:
+///
+/// - `resolution` is the exact approved recipe revision the Context owner
+///   selected through `ApprovedRecipeCatalogue::resolve`. Its
+///   `policy.section_budgets` are the whole-unit budgets the admitted set is
+///   checked against, so budgets from a different revision than the floor's
+///   would certify a section against foreign policy.
+/// - `boundaries` is the #1727 owner-issued unit/member metadata for the
+///   indivisible units this compilation can contain, validated by the shared
+///   boundary contract under `limits`.
+///
+/// This composition mints none of it and contacts no owner. `None` means the
+/// owner issued no indivisible-unit metadata for this compilation, which is the
+/// route that legitimately admits through the unbounded guarded entry. It never
+/// means "try the strict path and fall back": evidence that is present but does
+/// not describe this compilation fails as
+/// [`PacketCompositionError::UnitGroupEvidence`].
+#[derive(Clone, Copy, Debug)]
+pub struct PacketUnitGroupEvidence<'a> {
+    /// The exact approved recipe revision this compilation admits under.
+    pub resolution: &'a ResolvedContextRecipe,
+    /// The owner-issued unit/member metadata for this decision.
+    pub boundaries: &'a BoundaryMetadataSet,
+    /// The bounds this projection site validates that metadata under.
+    pub limits: &'a BoundaryValidationLimits,
 }
 
 /// Owner-supplied admission closure for one packet compilation.
@@ -1727,6 +1776,13 @@ impl KernelContextReadClient {
     /// validated evidence. Admission runs under that reservation, and the
     /// assembled output is rechecked against it before the packet is
     /// action-ready.
+    /// #1725 indivisible-group join: `unit_evidence` is the owner-derived
+    /// evidence that selects which admission entry runs — the composed
+    /// whole-unit entry when the owner issued indivisible-unit metadata for this
+    /// compilation, and the existing unbounded guarded entry when it issued
+    /// none. It is an owner record like `floor`, never a flag this composition
+    /// sets for itself; see [`PacketUnitGroupEvidence`] and
+    /// [`admit_packet_candidates`].
     #[allow(clippy::too_many_arguments)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
@@ -1736,6 +1792,7 @@ impl KernelContextReadClient {
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
         floor: &SafetyFloorIdentity,
+        unit_evidence: Option<&PacketUnitGroupEvidence<'_>>,
         headroom_request: &DownstreamHeadroomRequest,
         headroom_result: &DownstreamHeadroomResult,
         headroom_ledger: &HeadroomAllocationLedger,
@@ -1832,7 +1889,7 @@ impl KernelContextReadClient {
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        let (admitted, delivery) = admit_packet_candidates(&input, &headroom)?;
+        let (admitted, delivery) = admit_packet_candidates(&input, &headroom, unit_evidence)?;
         Self::require_campaign_view_for_assembly(
             &admitted,
             campaign_view,
@@ -1974,15 +2031,78 @@ fn composition_failure(
     }
 }
 
+/// Proves the owner-derived indivisible-unit evidence describes THIS
+/// compilation, and hands the admission cell the two records together.
+///
+/// Three comparisons, each against an owner-published record this compilation
+/// did not choose:
+///
+/// 1. `ResolvedContextRecipe::validate` re-derives every recorded value of the
+///    resolution from the approved policy content it carries — the activation
+///    decision that made it current, the compiler-generation and route-profile
+///    contour it is pinned to, the declared applicability covering the
+///    compilation it was made for, and its own resolution digest. A resolution
+///    that does not re-derive is not a resolution.
+/// 2. `ContextRecipePolicy::binds_recipe` proves the approved policy is the
+///    exact revision the recipe instance recorded in its
+///    `DecisionRevision::policy_sha256`, and that the two records agree on the
+///    per-role loss policy. This is what makes the budgets inside this evidence
+///    the budgets of the recipe this decision admits under.
+/// 3. The owner-minted `SafetyFloorIdentity` was issued under that same
+///    approved revision, so the protected floor and the whole-unit budgets can
+///    never come from two different revisions of one compilation.
+///
+/// The unit/member metadata is not checked here beyond being carried: the
+/// admission cell joins it to this decision's own binding and candidate
+/// denominator itself, through its own `UnitGroupBinding::bind`, and refuses a
+/// set that describes another decision.
+fn checked_unit_group_context<'a>(
+    input: &AdmissionInput,
+    evidence: &'a PacketUnitGroupEvidence<'_>,
+) -> Result<UnitGroupContext<'a>, PacketCompositionError> {
+    let refuse = |error: ContextError| PacketCompositionError::UnitGroupEvidence(Box::new(error));
+    evidence.resolution.validate().map_err(refuse)?;
+    evidence
+        .resolution
+        .policy
+        .binds_recipe(&input.recipe)
+        .map_err(refuse)?;
+    if input.floor.decision.policy_sha256 != evidence.resolution.identity.policy_sha256 {
+        return Err(refuse(ContextError::IdentityConflict));
+    }
+    Ok(UnitGroupContext {
+        boundaries: evidence.boundaries,
+        limits: evidence.limits,
+        section_budgets: &evidence.resolution.policy.section_budgets,
+    })
+}
+
 /// Admits one packet candidate set through the admission owner under one
 /// granted downstream reservation.
 ///
-/// Runs the admission owner's reservation-aware traced join
-/// ([`admit_context_traced_with_headroom`]) over the caller-built
-/// [`AdmissionInput`] and the caller's owner-issued headroom evidence. The pure
-/// compiler reads the owner-issued permit bindings out of that evidence and
-/// performs no I/O; the reservation owner stays the only party that can release
-/// or reconcile them.
+/// The admission ENTRY is selected from owner-derived evidence, never from a
+/// constant. `unit_evidence` is what the owner issued for this compilation:
+///
+/// * `Some` — the owner issued indivisible-unit metadata together with the
+///   approved recipe revision it was issued under, so this packet can contain
+///   call/result pairs or evidence edges. The composed entry
+///   ([`admit_context_traced_with_boundaries`]) is then required, not optional:
+///   it binds every indivisible group whole AND checks the admitted set against
+///   that revision's whole-unit section budgets, in one selection.
+/// * `None` — the owner issued no indivisible-unit metadata for this
+///   compilation. The unbounded guarded entry
+///   ([`admit_context_traced_with_headroom`]) is the correct path here and its
+///   existing behaviour is unchanged.
+///
+/// There is no third case. Evidence that is present but does not describe this
+/// compilation never retries the weaker entry; it fails as
+/// [`PacketCompositionError::UnitGroupEvidence`] with the owner's typed
+/// contract failure, so a packet is never admitted without the whole-unit floor
+/// its owner declared just because the declared floor was unreadable.
+///
+/// Both entries run exactly one selection and both refuse learning-marked input,
+/// so the Governor/native learning ownership rule — governed learning stays out
+/// of this guest closure — holds identically on either path.
 ///
 /// A refused reservation returns [`PacketCompositionError::HeadroomRefused`]
 /// carrying the attempted recipe and binding, so no admitted set and no
@@ -1998,8 +2118,16 @@ fn composition_failure(
 fn admit_packet_candidates(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
+    unit_evidence: Option<&PacketUnitGroupEvidence<'_>>,
 ) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
-    let (result, traces) = match admit_context_traced_with_headroom(input, headroom)
+    let admitted_outcome = match unit_evidence {
+        Some(evidence) => {
+            let units = checked_unit_group_context(input, evidence)?;
+            admit_context_traced_with_boundaries(input, headroom, &units)
+        }
+        None => admit_context_traced_with_headroom(input, headroom),
+    };
+    let (result, traces) = match admitted_outcome
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?
     {
         HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
