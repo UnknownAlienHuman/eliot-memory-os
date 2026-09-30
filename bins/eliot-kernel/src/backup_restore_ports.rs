@@ -591,9 +591,17 @@ pub fn require_production_admitted(
 /// itself is NOT carried here: it is injected as `J: RestoreJournalPort`
 /// (see [`require_production_admitted`]) so no substitute can hide inside
 /// this bundle. Owner channels that are not yet bound here (canonical Store,
-/// ORS recovery, Watchdog spool, Blob, installation identity) arrive as
-/// evidence obligations in the finalized receipt, never as live handles in
-/// this struct. The issues that delivered those owner sides — #952 (PR #3881),
+/// ORS recovery, the #955 Watchdog reconciliation channel, Blob, installation
+/// identity) arrive as evidence obligations in the finalized receipt, never as
+/// live handles in this struct.
+///
+/// The #955 side is bound only as far as the ARCHIVE allows: the mandatory
+/// `watchdog_spool` member is now read and its unresolved critical signals are
+/// carried as suspended historical evidence, so the member is neither dropped
+/// nor published as reconciled. Reconciliation is the #955 owner's own decision
+/// and no Watchdog authority is ever activated here, so `watchdog_signals`
+/// stays an unsatisfied obligation. The issues that delivered those owner
+/// sides — #952 (PR #3881),
 /// #953 (PR #3833), #955 (PR #2716), #956 (PR #2435) and #958 (PR #3879, whose
 /// destination-evidence producer this file now carries) — are
 /// coordination history, not code in this repository: what is absent is the
