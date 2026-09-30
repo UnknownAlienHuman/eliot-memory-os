@@ -79,8 +79,12 @@ fn structured_object(value: &Value, field: &'static str) -> Result<(), ProtocolE
             reason: "must be a JSON object",
         });
     }
-    let bytes =
-        canonical_json_bytes(value).map_err(|error| ProtocolError::Json(error.to_string()))?;
+    structured_value(value, field)
+}
+
+fn structured_value(value: &Value, field: &'static str) -> Result<(), ProtocolError> {
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| ProtocolError::Json(error.to_string()))?;
     if bytes.len() > MAX_TASK_CONTROLLER_VALUE_BYTES {
         return Err(ProtocolError::InvalidField {
             field,
@@ -146,6 +150,108 @@ pub struct TaskControllerOrientationOutputSchemaRecipe {
     pub schema_digest: String,
 }
 
+/// Original native inputs for deriving the A-12 cue binding and closed A-10
+/// snapshot in the initial Orientation source publisher.
+///
+/// These values are carried unchanged from their owner into the Governor
+/// admission path. The protocol checks only the versioned JSON envelope and
+/// bounds; the Governor decodes the native contracts, proves the observation
+/// admission is current, and invokes the A-12/A-10 owners. This record grants
+/// no cue admission by itself.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerOrientationCueAdmissionInputV1 {
+    /// Closed wire version for this original supplier record.
+    pub schema_version: u16,
+    /// Exact accepted observation admission receipt from the Observation owner.
+    pub observation_admission: Value,
+    /// Original touched denominator rows supplied to A-12.
+    pub touched: Vec<Value>,
+    /// Original optional expected-reuse evidence supplied to A-12.
+    pub hint: Option<Value>,
+    /// Original binding profile supplied to A-12.
+    pub binding_profile: Value,
+    /// Original snapshot identity supplied to A-10.
+    pub snapshot_id: Value,
+    /// Exact closure denominator supplied to the closed A-10 builder.
+    pub denominator: Value,
+    /// Original relation edges supplied to the closed A-10 builder.
+    pub relation_edges: Vec<Value>,
+    /// Original optional relation-registry revision supplied to A-10.
+    pub registry_revision: Option<String>,
+    /// Original policy-owned edge weights supplied to the closed A-10 builder.
+    pub weights: Vec<Value>,
+}
+
+impl TaskControllerOrientationCueAdmissionInputV1 {
+    /// Validates the transport shape and encoded-value bounds only.
+    ///
+    /// Native admission, source currentness, task/scope/fence equality and
+    /// A-12/A-10 closure remain the owning Governor's responsibility.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != 1 {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.cue.schema_version",
+                reason: "must use OrientationCueAdmissionInputV1",
+            });
+        }
+        structured_object(
+            &self.observation_admission,
+            "task_controller_invocation.orientation.cue.observation_admission",
+        )?;
+        structured_object(
+            &self.binding_profile,
+            "task_controller_invocation.orientation.cue.binding_profile",
+        )?;
+        structured_value(
+            &self.snapshot_id,
+            "task_controller_invocation.orientation.cue.snapshot_id",
+        )?;
+        structured_object(
+            &self.denominator,
+            "task_controller_invocation.orientation.cue.denominator",
+        )?;
+        if let Some(hint) = &self.hint {
+            structured_object(hint, "task_controller_invocation.orientation.cue.hint")?;
+        }
+        for row in &self.touched {
+            structured_object(
+                row,
+                "task_controller_invocation.orientation.cue.touched",
+            )?;
+        }
+        for (field, values) in [
+            (
+                "task_controller_invocation.orientation.cue.relation_edges",
+                self.relation_edges.as_slice(),
+            ),
+            (
+                "task_controller_invocation.orientation.cue.weights",
+                self.weights.as_slice(),
+            ),
+        ] {
+            for value in values {
+                structured_object(value, field)?;
+            }
+        }
+        if let Some(revision) = &self.registry_revision {
+            bounded_text(
+                revision,
+                "task_controller_invocation.orientation.cue.registry_revision",
+            )?;
+        }
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if bytes.len() > MAX_TASK_CONTROLLER_VALUE_BYTES {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.cue",
+                reason: "exceeds the bounded JSON value size",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Typed Task Controller payload for the explicit Orientation operation.
 ///
 /// The request is already sealed by its original publisher. Its reference and
@@ -168,6 +274,11 @@ pub struct TaskControllerOrientationInput {
     /// Original Governor `CampaignSourceRevisionRead` for the Orientation
     /// classification profile, retained for downstream native validation.
     pub orientation_classification_source_readback: Value,
+    /// Original native Observation/A-12 and A-10 inputs for the initial
+    /// Orientation source publisher. Existing sealed-v3 consumers may omit
+    /// this field; the new publisher refuses when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_admission_input: Option<TaskControllerOrientationCueAdmissionInputV1>,
     /// Distinct named-read claim for the semantic `DreamJobInput` publication.
     pub semantic_source: TaskControllerOrientationSourceClaim,
     /// Exact original `OutputSchema` role declaration from the job recipe.
@@ -241,6 +352,9 @@ impl TaskControllerOrientationInput {
             &self.orientation_classification_source_readback,
             "task_controller_invocation.orientation.classification_source_readback",
         )?;
+        if let Some(cue_input) = &self.cue_admission_input {
+            cue_input.validate()?;
+        }
         if runtime_input.semantic_source != self.semantic_source
             || runtime_input.output_contract != submission.output_contract
             || runtime_input.context_reconstruction_result
