@@ -110,7 +110,7 @@ use eliot_instrument_runner::{
     PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageEvidence,
     StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
     VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
-    profile::{PROFILE_ALIASES, builtin_specs},
+    profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs},
     resolve_verification_route, verify_profile_parity,
 };
 use eliot_process::{
@@ -1477,14 +1477,19 @@ impl StagePort {
 
 /// The exact process argv one admitted stage runs.
 ///
-/// It is built from the admitted spec's own argument template and nothing else.
-/// An admitted template is empty for every builtin verification spec, so a stage
-/// runs its executable with no arguments at all rather than with a command this
-/// entry invented; a spec that declares a template contributes exactly those
-/// arguments. Either way the argv is profile text read from the admitted
-/// registry, not a command list restated here.
+/// It is the stage's bound spec's declared [`InstrumentSpec::verification_command`]
+/// and nothing else: the real verification command the admitted profile
+/// revision executes, read from the one admitted registry a local entrypoint
+/// and CI both resolve. It is NOT derived from `argument_template` — that
+/// field bounds what a CALLER may contribute and admits only the empty vector
+/// for every builtin, which is why deriving argv from it ran each stage's
+/// executable with no arguments at all, producing a tool's default/help
+/// output rather than a package verification. An admitted verification
+/// command is non-empty by construction, so a stage can never again launch
+/// its executable with no command, and the argv is profile text read from the
+/// admitted registry rather than a command list restated here (I18.21:11).
 fn stage_argv(stage: &PlannedStage) -> Vec<String> {
-    stage.stage.argument_template.clone()
+    stage.stage.verification_command.clone()
 }
 
 /// Seals the one permit-bound process request for one admitted stage.
@@ -1570,15 +1575,41 @@ fn seal_stage_request(
     )
 }
 
-/// The isolated environment projection every admitted stage child runs under.
+/// The explicitly permitted toolchain environment every admitted stage child runs under.
 ///
-/// An empty projection with `EnvironmentInheritance::None` is the same isolated
-/// class the admitted specs declare: the child receives no ambient variable and
-/// no inherited secret, and the digest of that projection is what the executor
-/// binds as the stage's environment identity.
+/// `EnvironmentInheritance::None` is unchanged: the child receives no ambient
+/// variable and no inherited secret, and the executor still builds the child's
+/// environment block from exactly the names on this projection. What changed is
+/// that the projection is no longer EMPTY. A real admitted verification command
+/// — `cargo build`, `cargo clippy`, `cargo nextest run`, `cargo fmt --check` —
+/// locates its own `rustc`, its `rustup` shim, and any build-script interpreter
+/// through `PATH`, and `scripts/verify.ps1` already resolves the resolver's own
+/// executable through that same `PATH`; with nothing declared, such a command had
+/// no toolchain at all and could not be a verification. Only `PATH` is declared,
+/// and its value is read from the real process environment rather than
+/// synthesised, so the projection states a fact that already holds instead of
+/// inventing a search path.
+///
+/// This is the minimal set, not an inherited environment. I18.21:10 is why the
+/// value is named on the projection and hashed rather than leaked: the executor
+/// binds `environment_projection_digest` of exactly this projection as the
+/// stage's environment identity, so the permitted toolchain environment is now
+/// a declared, digest-bound, reviewable property of every admitted stage instead
+/// of an invisible ambient fact. Nothing switches to
+/// `EnvironmentInheritance::Allowlisted`, and every other ambient variable stays
+/// out.
+///
+/// A machine that publishes no `PATH` cannot run an admitted verification
+/// command at all, so that is refused here rather than sealed as a child that
+/// would fail for a reason the receipt could not explain.
 fn isolated_projection() -> Result<EnvironmentProjection, CliError> {
+    let path = std::env::var(TOOLCHAIN_PATH_ENV).map_err(|error| {
+        CliError::Contract(format!(
+            "explicitly permitted toolchain environment is unavailable: {TOOLCHAIN_PATH_ENV} is unset ({error})"
+        ))
+    })?;
     Ok(EnvironmentProjection::new(
-        BTreeMap::new(),
+        BTreeMap::from([(TOOLCHAIN_PATH_ENV.to_owned(), path)]),
         Vec::new(),
         EnvironmentInheritance::None,
     )?)
@@ -1619,7 +1650,7 @@ impl StageLauncher for StageRoute {
             "worktree:{}",
             &sha256_hex(self.layout.source_root.as_bytes())[..16]
         );
-        let request_id = operation_identity(stage_id, &stage.stage.argument_template);
+        let request_id = operation_identity(stage_id, &stage_argv(stage));
         let invocation = InstrumentInvocation {
             request: RequestMetadata {
                 request_id: RequestId::new(request_id).map_err(|error| {
