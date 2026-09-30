@@ -12,23 +12,28 @@
 //! in no committed row of that family, and this row is where it goes.
 //!
 //! It is deliberately NOT a second route owner, a second cutover machine, or a
-//! second store. It has no epoch transition, no route, no artifact identity and
-//! no in-flight set, because none of those happened: no switch occurred to
-//! record. It answers exactly one question — did an irreversible effect occur
-//! on this route scope under this committed cutover — and the rollback decision
-//! reads it through the same [`crate::RedbRecoveryStore`] that already owns
-//! every other durable fact about this route.
+//! second store. It has no epoch transition, no artifact identity and no in-flight
+//! set, because none of those happened: no switch occurred to record. It answers
+//! exactly one question — did an irreversible effect occur on this route scope
+//! under this committed cutover — and the rollback decision reads it through the
+//! same [`crate::RedbRecoveryStore`] that already owns every other durable fact
+//! about this route: [`crate::RedbRecoveryStore::commit_irreversible_storage_effect`]
+//! writes the declaration and
+//! [`crate::RedbRecoveryStore::irreversible_storage_effects`] is the reader's
+//! only way to see it, keyed by the route scope.
 //!
 //! Every field is either owner-issued or a coordinate the committed cutover row
-//! already carries, and the writer re-derives the two that matter rather than
-//! accepting them:
+//! already carries, and the writer checks the two that matter against the
+//! durable owner rather than accepting them:
 //!
-//! - `cutover_linearization_record_id` is read out of the committed
-//!   [`crate::GenerationCutoverOwnership`] row inside the same write
-//!   transaction that writes this declaration, and a presented value that
-//!   differs from it is refused. A declaration can therefore not name a
+//! - `cutover_linearization_record_id` must equal the committed
+//!   [`crate::GenerationCutoverOwnership`] row's own, read inside the same write
+//!   transaction that writes this declaration, and a presented value that differs
+//!   is refused. The epoch and generation pair are absent from the record
+//!   entirely rather than checked, so a declaration has nothing that could name a
 //!   cutover identity, an epoch or a generation the committed cutover does not
-//!   itself carry.
+//!   itself carry; the reader takes those from the committed row the accessor
+//!   proves the declaration is bound to.
 //! - `linearization_record_id` is minted by the writer from the store's own
 //!   operational order. A caller cannot supply it, so a row cannot claim a
 //!   durable position it was not written at.
@@ -37,7 +42,9 @@
 //! [`crate::CanonicalStoreRouteOwnership`]: an identical declaration is
 //! idempotent and a different one under the same key is refused, because an
 //! irreversible effect that occurred can never be re-described as a different
-//! one.
+//! one. The key is one `(route scope, cutover, effect)` triple rather than the
+//! cutover alone, so declaring a second effect under the same switch appends a
+//! row instead of rewriting the first, which a write-once row cannot do.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,9 +55,11 @@ use crate::model::{OrsError, validate_digest, validate_text};
 ///
 /// This is the durable owner's copy of the class, owned here beside the
 /// [`crate::StateMigrationDecision`] that the same rule reads at the cutover.
-/// `eliot-kernel-service` re-exports this exact type rather than declaring a
-/// second one, so the coordinator's ledger and this durable row cannot drift
-/// into two vocabularies: there is one class, one spelling and one wire name.
+/// `eliot-kernel-service` re-exports this exact type; a second
+/// `IrreversibleStorageEffect` declaration there would be a second owner of one
+/// class rather than a convenience, so the coordinator's ledger and this durable
+/// row cannot drift into two vocabularies: one class, one spelling, one wire
+/// name.
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -91,9 +100,9 @@ pub struct IrreversibleStorageEffectRecord {
     pub cutover_id: String,
     /// That committed cutover row's own ORS linearization identity.
     ///
-    /// Written by the store from the committed row, never accepted from a
-    /// caller, so a declaration is bound to the exact durable switch it
-    /// describes.
+    /// Checked by the store against the committed row's own value inside the
+    /// write transaction, so it is never a caller-chosen label: a declaration is
+    /// bound to the exact durable switch it describes.
     pub cutover_linearization_record_id: String,
     /// Which irreversible effect occurred.
     pub effect: IrreversibleStorageEffect,

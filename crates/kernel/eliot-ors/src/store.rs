@@ -466,12 +466,13 @@ const CANONICAL_STORE_ROUTE_OWNERSHIP: TableDefinition<&str, &str> =
 /// content. The committed `CUTOVER_OWNERSHIP` row's `migration` decision is
 /// fixed at the linearization point, so an effect issued after that point is in
 /// no row of that family; this is where it is recorded instead. The writer
-/// derives the cutover's linearization identity from the committed row inside
-/// the same transaction rather than accepting one, and mints the declaration's
-/// own from the store's operational order, so a caller can assert neither. This
-/// is one more table in the existing ORS table family, owned by the same
-/// `RedbRecoveryStore` and written through the same `persistence_codec`; it is
-/// not a second route owner, a second cutover machine or a second store.
+/// checks the cutover's own linearization identity against the committed row
+/// inside the same transaction rather than accepting one, and mints the
+/// declaration's own from the store's operational order, so a caller can assert
+/// neither. This is one more table in the existing ORS table family, owned by
+/// the same `RedbRecoveryStore` and written through the same
+/// `persistence_codec`; it is not a second route owner, a second cutover machine
+/// or a second store.
 const IRREVERSIBLE_STORAGE_EFFECTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_irreversible_storage_effects_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
@@ -30837,16 +30838,19 @@ impl RedbRecoveryStore {
     ///    `cutover_linearization_record_id`, so a declaration is bound to the
     ///    exact durable switch rather than to a label.
     ///
+    /// The epoch and generation pair are not among the refused values because the
+    /// declaration does not carry them: a record that held no epoch and no
+    /// generation has nothing that could name a cutover identity, epoch or
+    /// generation the committed row does not itself carry, and
+    /// [`Self::irreversible_storage_effects`] hands the reader the committed row
+    /// that does.
+    ///
     /// The declaration's own `linearization_record_id` is refused if presented
     /// and minted here from the store's operational order, so no caller can
     /// claim a durable position. The row is write-once by content under a key
     /// derived from the whole owner-bound content: an exact replay is
     /// idempotent, and a different declaration under the same key is refused
     /// rather than overwriting an effect that already occurred.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the family's write path proves the cutover binding, write-once content and owner-minted linearization identity atomically"
-    )]
     pub fn commit_irreversible_storage_effect(
         &self,
         declaration: &IrreversibleStorageEffectRecord,
@@ -30934,6 +30938,14 @@ impl RedbRecoveryStore {
     /// Returns the irreversible effects durably declared on one capability route
     /// scope, each re-proved against the committed cutover row it names.
     ///
+    /// The scope is the whole key, because `I5.11`'s sentence is about the route
+    /// and not about one switch: an irreversible migration or external effect
+    /// declared under an earlier committed cutover of this scope closes the
+    /// rollback path for the scope, so a caller asking about the route receives
+    /// every committed cutover's declarations, superseded ones included. The
+    /// declarations are returned in their own durable key order, which is
+    /// `(route scope, cutover, effect)`.
+    ///
     /// The binding is checked here, in the transaction that reads both tables,
     /// and against the ORIGINAL recorded cutover row: a declaration survives
     /// only while the cutover it names is still a `Committed` row of the same
@@ -30941,10 +30953,20 @@ impl RedbRecoveryStore {
     /// cutover this store does not hold, or one that is no longer committed for
     /// that scope, is an `IntegrityProblem` rather than a row that is quietly
     /// dropped — dropping it would read an irreversible effect as an absence.
+    /// The committed row is also where the epoch and generation pair come from:
+    /// the declaration carries neither, so a reader receives them from the cutover
+    /// row this accessor proved the declaration is bound to rather than from the
+    /// declaration itself.
     ///
-    /// `Ok(vec![])` is the absence of the optional table in a database that
-    /// predates it, which means no effect was ever declared. Every other storage
-    /// refusal and every typed ORS class reaches the caller unchanged.
+    /// The reader's answer shapes are exactly three: `Ok(vec![])` when this scope
+    /// has no declaration; a row-bearing `Ok` when it has some; and
+    /// `OrsError::Storage` carrying redb's `Table
+    /// 'ors_irreversible_storage_effects_v1' does not exist` when the database
+    /// predates the table, which is the same compatibility reading
+    /// [`Self::load_canonical_store_route_ownership`] documents for its own
+    /// optional table and the caller already makes for the cutover table. Every
+    /// other storage refusal and every typed ORS class reaches the caller
+    /// unchanged.
     pub fn irreversible_storage_effects(
         &self,
         route_scope_hash: &str,

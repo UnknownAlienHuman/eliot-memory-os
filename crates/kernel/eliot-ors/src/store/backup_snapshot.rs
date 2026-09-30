@@ -1155,8 +1155,9 @@ fn source_bound_exclusions() -> Vec<DispositionedTable> {
     tables
 }
 
-/// The six exclusions that are owner state: four re-established by the
-/// receiving owner, two superseded or already-committed facts.
+/// The eight exclusions that are owner state: six the receiving owner
+/// re-establishes from its own operations, two superseded or already-committed
+/// facts.
 fn owner_state_exclusions() -> Vec<DispositionedTable> {
     vec![
         // ---- Owner-re-established state, not historical evidence ------------
