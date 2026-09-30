@@ -4599,11 +4599,8 @@ impl KernelComposition {
                 // Issue #1739 W2: execution consumes the exact typed bytes off
                 // the durable #1713 row; a queue body that is not the admitted
                 // bytes conflicts instead of replacing the admitted operation.
-                // A pair with no durably bound bytes is not executable: a
-                // payload digest alone never executes after a restart, so the
-                // unbound pair is pruned like any other non-executable entry
-                // and the waiter reconciles via the durable record (a resubmit
-                // re-binds and re-queues through the fill leg).
+                // No durably bound bytes means not executable: prune the
+                // unbound pair; the waiter reconciles via the durable record.
                 let tool = match stored.payload_body.as_ref() {
                     Some(durable) if tool == durable => durable.clone(),
                     Some(_) => return Err(TransportError::IdentityConflict),
