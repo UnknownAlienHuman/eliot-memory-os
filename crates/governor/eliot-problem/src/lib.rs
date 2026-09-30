@@ -2161,7 +2161,6 @@ pub enum AttentionState {
 #[serde(deny_unknown_fields)]
 pub struct CriticalAttention {
     pub attention_id: AttentionId,
-    pub obligation: String,
     /// I13.7 `scope/task` the obligation applies to.
     pub scope: String,
     /// I13.7 `affected_action_classes`, the actions this blocks.
@@ -2234,7 +2233,6 @@ impl AttentionState {
 impl CriticalAttention {
     /// Validates that an attention is durable obligation state, not a toast.
     pub fn validate(&self) -> Result<(), ProblemError> {
-        text(&self.obligation, "obligation")?;
         text(&self.scope, "scope")?;
         text(&self.review_condition, "review_condition")?;
         text(&self.resolution_condition, "resolution_condition")?;
@@ -2342,10 +2340,12 @@ impl CriticalAttention {
     /// condition, escalation route, waiver authority, the independently
     /// expected closure set and the State Fence. No later transition erases the
     /// obligation or its evidence.
+    ///
+    /// A newly created attention has a live owner, so it retains no outstanding
+    /// owner-loss obligation; `obligation` is set only by owner loss.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         attention_id: AttentionId,
-        obligation: String,
         scope: String,
         affected_scope_actions: Vec<String>,
         evidence_refs: Vec<ArtifactId>,
@@ -2359,7 +2359,6 @@ impl CriticalAttention {
     ) -> Result<Self, ProblemError> {
         let value = Self {
             attention_id,
-            obligation,
             scope,
             affected_scope_actions,
             evidence_refs,

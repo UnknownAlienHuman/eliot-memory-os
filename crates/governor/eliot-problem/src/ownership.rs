@@ -118,6 +118,18 @@ pub struct LeaseIdentity {
 }
 
 impl LeaseIdentity {
+    /// Whether this is exactly the lease identity named by `observed`.
+    ///
+    /// Exact over the whole tuple — lease id, commitment and ownership epoch —
+    /// not just the identity string. A renewal keeps the lease id but changes
+    /// the commitment and epoch, so this is what stops a delayed expiry for an
+    /// already-renewed lease from unassigning its successor: the observed
+    /// identity is no longer the one the record retains.
+    #[must_use]
+    pub fn is_exactly(&self, observed: &LeaseIdentity) -> bool {
+        self == observed
+    }
+
     /// Validates a lease identity and its commitment shape.
     pub fn validate(&self) -> Result<(), ProblemError> {
         crate::text(&self.lease_id, "lease_id")?;
@@ -281,7 +293,7 @@ impl AuthenticatedOwnerLease {
     /// Whether this authenticated lease is the exact one named by `observed`.
     #[must_use]
     pub fn is_exactly(&self, observed: &LeaseIdentity) -> bool {
-        self.identity == *observed
+        self.identity.is_exactly(observed)
     }
 
     /// Whether the lease is inside its validity window at `now_ms`.
@@ -692,7 +704,10 @@ pub fn obligation_id(
 }
 
 /// Whether a value is a lowercase SHA-256 digest.
-const fn is_commitment(value: &str) -> bool {
+///
+/// Not `const`: the byte scan is not const on this toolchain, and nothing here
+/// needs a compile-time commitment check.
+fn is_commitment(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
