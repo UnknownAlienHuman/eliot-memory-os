@@ -265,6 +265,15 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
     if eliot_wasm_runtime::lifecycle::enforce_guest_no_effect(&request.limits, &report).is_err() {
         return fail("GUEST_EXEC_EMISSION_DENIED", EXIT_NOT_COMPLETED);
     }
+    // Output-ceiling emission gate (issue #758 P7.3): the provider lifts
+    // the value under its own output check, but this child owns the stdout
+    // host-resource boundary, so an over-ceiling byte vector is denied here
+    // with empty stdout instead of emitted. The provider reports
+    // over-ceiling results as OutputLimit, never Completed, so this gate
+    // only fires on a provider regression — fail closed, never truncate.
+    if report.output.len() as u64 > request.limits.max_output_bytes {
+        return fail("GUEST_EXEC_OUTPUT_DENIED", EXIT_NOT_COMPLETED);
+    }
     // Measurements first: a completed run without fully observed metering
     // is unreportable — exit without stdout rather than emit output the
     // parent cannot contract-check. The metering line also precedes stdout
