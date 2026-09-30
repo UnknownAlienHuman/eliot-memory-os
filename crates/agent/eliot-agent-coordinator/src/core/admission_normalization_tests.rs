@@ -13,13 +13,40 @@ use eliot_security_contracts::PrivacyClass;
 use super::{AgentCoordinator, ProviderProofKind, ProviderVerifier};
 use crate::{
     AdmissionId, AdmittedLaneReceipt, CandidateId, CoordinatorConfig, CoordinatorError,
-    CoordinatorEvent, LearningRole, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
-    ProviderIdentity, RecipeId, RecipeManifest, RoleProfileId, RoleProfileManifest,
-    RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
+    CoordinatorEvent, LearningRole, PlanGap, PolicyBoundClassLimits, ProviderAdmissionReceipt,
+    ProviderBindingSnapshot, ProviderIdentity, RecipeId, RecipeManifest, RoleProfileId,
+    RoleProfileManifest, RouteCandidateEvidence, SchedulingProfile, StaffingLaneRequest,
+    StaffingPlanCandidate, StaffingPlanRequest, WipPartitionKey, WipPartitionLimit, WorkClass,
     WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// The nine-class policy these admissions are decided under (issue #1683 W1b).
+/// Built through the real [`SchedulingProfile::i14_2_initial`] constructor and
+/// carrying the I14.2 documented item ceilings, so the per-class item ceiling
+/// never masks the normalization assertions below.
+fn profile() -> SchedulingProfile {
+    SchedulingProfile::i14_2_initial(
+        "test-normalization-profile-v1",
+        &WorkClass::ALL
+            .iter()
+            .map(|work_class| PolicyBoundClassLimits {
+                work_class: *work_class,
+                max_items: None,
+                max_bytes: u64::MAX,
+                max_concurrency: 64,
+                deadline_ms: u64::MAX,
+                weight: 1,
+                wip_partitions: vec![WipPartitionLimit {
+                    key: WipPartitionKey::Route,
+                    max_in_flight: 64,
+                }],
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("valid fixture scheduling profile")
+}
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -442,7 +469,7 @@ fn verifier_event_snapshot_and_return_value_bind_one_normalized_payload() -> Tes
     let candidate = coordinator.plan(request)?;
     assert_eq!(candidate.candidate_id, incoming.candidate_id);
 
-    let returned = coordinator.admit(incoming)?;
+    let returned = coordinator.admit(&profile(), incoming)?;
     assert_eq!(returned, normalized);
     assert_eq!(serde_json::to_string(&returned)?, normalized_payload);
 
@@ -461,6 +488,7 @@ fn verifier_event_snapshot_and_return_value_bind_one_normalized_payload() -> Tes
     let restored = AgentCoordinator::restore_with_provider(
         snapshot.clone(),
         cfg,
+        &profile(),
         Box::new(provider(
             &proof_ref,
             normalized_payload,
@@ -482,7 +510,7 @@ fn proof_bound_to_pre_normalized_order_is_rejected_without_mutation() -> TestRes
     coordinator.plan(request)?;
     let before = coordinator.snapshot_json()?;
     assert!(matches!(
-        coordinator.admit(incoming),
+        coordinator.admit(&profile(), incoming),
         Err(CoordinatorError::ProviderVerification(_))
     ));
     assert_eq!(coordinator.snapshot_json()?, before);
@@ -498,13 +526,13 @@ fn semantic_replay_with_another_lane_order_is_idempotent() -> TestResult {
         Box::new(provider(&proof_ref, normalized_payload, 0)),
     )?;
     coordinator.plan(request)?;
-    let first = coordinator.admit(incoming)?;
+    let first = coordinator.admit(&profile(), incoming)?;
     assert_eq!(first, normalized);
     let event_count = coordinator.events().len();
 
     let mut replay = normalized.clone();
     replay.admitted_lanes.reverse();
-    assert_eq!(coordinator.admit(replay)?, normalized);
+    assert_eq!(coordinator.admit(&profile(), replay)?, normalized);
     assert_eq!(coordinator.events().len(), event_count);
     Ok(())
 }

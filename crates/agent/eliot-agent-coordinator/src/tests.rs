@@ -30,16 +30,49 @@ use crate::{
     AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CancelCommand,
     CancellationReconciliationId, CandidateId, CoordinatorConfig, CoordinatorError,
     CoordinatorEvent, DescendantClosureSubmission, ExecutionContext, LearningRole, ObservationId,
-    OperationId, OutcomeReconciliationId, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
-    ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
-    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
-    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId, RecipeId,
-    RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
-    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
-    UnknownOutcomeResolution, WorkClass, WorkerId,
+    OperationId, OutcomeReconciliationId, OwnerCurrentness, PlanGap, PolicyBoundClassLimits,
+    PresentedClaimMaterial, ProviderAdmissionReceipt, ProviderBindingSnapshot,
+    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
+    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
+    ReassignmentId, RecipeId, RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest,
+    RouteCandidateEvidence, SchedulingProfile, StaffingLaneRequest, StaffingPlanCandidate,
+    StaffingPlanRequest, SubmissionId, UnknownOutcomeResolution, WipPartitionKey, WipPartitionLimit,
+    WorkClass, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// The nine-class policy every test admission and reassignment is decided
+/// under (issue #1683 W1b).
+///
+/// Built through the real [`SchedulingProfile::i14_2_initial`] constructor, so
+/// the fixture exercises the same validated nine-class set production does and
+/// cannot drift from it. `max_items: None` takes the I14.2 documented item
+/// ceilings verbatim (interactive 512, verification 512, canonical write 2048,
+/// background 1024, reports 128), every one of which is above what these
+/// fixtures admit, so the per-class item ceiling never masks an assertion these
+/// tests already make about the coordinator's own limits.
+fn profile() -> SchedulingProfile {
+    SchedulingProfile::i14_2_initial(
+        "test-scheduling-profile-v1",
+        &WorkClass::ALL
+            .iter()
+            .map(|work_class| PolicyBoundClassLimits {
+                work_class: *work_class,
+                max_items: None,
+                max_bytes: u64::MAX,
+                max_concurrency: 64,
+                deadline_ms: u64::MAX,
+                weight: 1,
+                wip_partitions: vec![WipPartitionLimit {
+                    key: WipPartitionKey::Route,
+                    max_in_flight: 64,
+                }],
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("valid fixture scheduling profile")
+}
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -555,7 +588,7 @@ fn plan_and_admit(
     parent_attempt: Option<AttemptId>,
 ) -> TestResult<ProviderAdmissionReceipt> {
     let candidate = coordinator.plan(request(tag, specs, parent_attempt)?)?;
-    Ok(coordinator.admit(provider_receipt(&candidate, tag)?)?)
+    Ok(coordinator.admit(&profile(), provider_receipt(&candidate, tag)?)?)
 }
 
 fn usage() -> UsageReceipt {
@@ -755,7 +788,7 @@ fn sealed_verifier_rejects_forged_provider_receipt() -> TestResult {
     let mut receipt = provider_receipt(&candidate, "good")?;
     receipt.g11_admission_receipt_ref = "caller-forged-proof".to_owned();
     assert!(matches!(
-        coordinator.admit(receipt),
+        coordinator.admit(&profile(), receipt),
         Err(CoordinatorError::ProviderVerification(_))
     ));
     Ok(())
@@ -833,12 +866,12 @@ fn writer_is_retained_until_authenticated_worker_fence() -> TestResult {
     )?)?;
     let new_receipt = provider_receipt(&candidate, "new")?;
     assert!(matches!(
-        coordinator.admit(new_receipt.clone()),
+        coordinator.admit(&profile(), new_receipt.clone()),
         Err(CoordinatorError::MutatingWriterConflict(scope)) if scope == "shared-scope"
     ));
     forged.fence_receipt_ref = "proof-fence-old".to_owned();
     coordinator.mark_worker_lost(old_context, forged)?;
-    coordinator.admit(new_receipt)?;
+    coordinator.admit(&profile(), new_receipt)?;
     Ok(())
 }
 
@@ -910,7 +943,7 @@ fn unknown_outcome_retains_writer_until_authenticated_reconciliation() -> TestRe
     )?)?;
     let after = provider_receipt(&candidate, "after")?;
     assert!(matches!(
-        coordinator.admit(after.clone()),
+        coordinator.admit(&profile(), after.clone()),
         Err(CoordinatorError::MutatingWriterConflict(_))
     ));
     coordinator.reconcile_unknown_outcome(
@@ -926,7 +959,7 @@ fn unknown_outcome_retains_writer_until_authenticated_reconciliation() -> TestRe
             effect_reconciliation_ref: "proof-unknown-unknown".to_owned(),
         },
     )?;
-    coordinator.admit(after)?;
+    coordinator.admit(&profile(), after)?;
     Ok(())
 }
 
@@ -975,7 +1008,7 @@ fn admission_bijection_and_reassignment_capacity_fail_closed() -> TestResult {
     duplicate.admitted_lanes[1].priority = first.priority;
     duplicate.admitted_lanes[1].mutation_scope = first.mutation_scope;
     assert_eq!(
-        bijection.admit(duplicate),
+        bijection.admit(&profile(), duplicate),
         Err(CoordinatorError::DuplicateIdentity(
             "admitted_work_unit_role"
         ))
@@ -1034,7 +1067,7 @@ fn admission_bijection_and_reassignment_capacity_fail_closed() -> TestResult {
         budget: budget(),
     };
     assert!(matches!(
-        capacity.reassign(context.clone(), reassignment),
+        capacity.reassign(&profile(), context.clone(), reassignment),
         Err(CoordinatorError::RouteMismatch)
     ));
     let duplicate_lease = ProviderReassignmentReceipt {
@@ -1050,7 +1083,7 @@ fn admission_bijection_and_reassignment_capacity_fail_closed() -> TestResult {
         budget: budget(),
     };
     assert_eq!(
-        capacity.reassign(context, duplicate_lease),
+        capacity.reassign(&profile(), context, duplicate_lease),
         Err(CoordinatorError::DuplicateIdentity("new_lease_id"))
     );
     Ok(())
@@ -1084,7 +1117,7 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
     old_request.lanes[0].route_candidates[0].capacity_limit = 1;
     let old_candidate = coordinator.plan(old_request)?;
     assert_eq!(old_candidate.lanes[0].capacity_limit, 1);
-    let old = coordinator.admit(provider_receipt(&old_candidate, "cap-old")?)?;
+    let old = coordinator.admit(&profile(), provider_receipt(&old_candidate, "cap-old")?)?;
     let old_lane = old.admitted_lanes[0].clone();
     let old_context = ExecutionContext::from(&old);
     coordinator.start_attempt(old_context.clone(), old_lane.attempt_id.clone())?;
@@ -1104,7 +1137,7 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
     second_request.lanes[0].route_candidates[0].capacity_limit = 1;
     let second_candidate = coordinator.plan(second_request)?;
     assert_eq!(
-        coordinator.admit(provider_receipt(&second_candidate, "cap-second")?),
+        coordinator.admit(&profile(), provider_receipt(&second_candidate, "cap-second")?),
         Err(CoordinatorError::Backpressure {
             active: 1,
             requested: 1,
@@ -1145,7 +1178,7 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
         budget: budget(),
     };
     assert_eq!(
-        coordinator.reassign(old_context.clone(), route_change),
+        coordinator.reassign(&profile(), old_context.clone(), route_change),
         Err(CoordinatorError::RouteMismatch)
     );
 
@@ -1164,7 +1197,7 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
         budget: budget(),
     };
     assert_eq!(
-        coordinator.reassign(old_context, widening),
+        coordinator.reassign(&profile(), old_context, widening),
         Err(CoordinatorError::Backpressure {
             active: 1,
             requested: 1,
@@ -1398,6 +1431,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
     let restored = AgentCoordinator::restore_with_provider(
         snapshot.clone(),
         cfg.clone(),
+    &profile(),
         Box::new(verifier(&proofs, snapshot.event_sequence)),
     )?;
     assert_eq!(restored.events(), coordinator.events());
@@ -1408,6 +1442,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
         AgentCoordinator::restore_with_provider(
             rollback,
             cfg.clone(),
+    &profile(),
             Box::new(verifier(&proofs, 0))
         )
         .err(),
@@ -1419,6 +1454,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
         AgentCoordinator::restore_with_provider(
             widened,
             cfg.clone(),
+    &profile(),
             Box::new(verifier(&proofs, 0))
         )
         .err(),
@@ -1428,6 +1464,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
         AgentCoordinator::restore_with_provider(
             snapshot.clone(),
             cfg.clone(),
+    &profile(),
             Box::new(verifier(&proofs, snapshot.event_sequence + 1))
         )
         .err(),
@@ -1436,7 +1473,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
     let mut tampered = snapshot;
     tampered.event_digest = "0".repeat(64);
     assert_eq!(
-        AgentCoordinator::restore_with_provider(tampered, cfg, Box::new(verifier(&proofs, 0)))
+        AgentCoordinator::restore_with_provider(tampered, cfg, &profile(), Box::new(verifier(&proofs, 0)))
             .err(),
         Some(CoordinatorError::SnapshotDigest)
     );
@@ -1463,7 +1500,7 @@ fn public_restore_with_missing_provider_remains_plan_gap() -> TestResult {
         None,
     )?)?;
     let json = coordinator.snapshot_json()?;
-    let restored = AgentCoordinator::restore_json(&json, cfg, gap)?;
+    let restored = AgentCoordinator::restore_json(&json, cfg, &profile(), gap)?;
     assert_eq!(restored.events(), coordinator.events());
     Ok(())
 }
@@ -1487,7 +1524,7 @@ fn coordinator_case_10_exact_state_fence_is_preserved_through_execution() -> Tes
     let expected = request.state_fence.clone();
     let candidate = coordinator.plan(request)?;
     assert_eq!(candidate.state_fence, expected);
-    let admitted = coordinator.admit(provider_receipt(&candidate, "case-10")?)?;
+    let admitted = coordinator.admit(&profile(), provider_receipt(&candidate, "case-10")?)?;
     assert_eq!(admitted.state_fence, expected);
     let context = ExecutionContext::from(&admitted);
     let attempt_id = admitted.admitted_lanes[0].attempt_id.clone();
@@ -1520,7 +1557,7 @@ fn coordinator_case_11_wrong_controller_epoch_has_no_mutation() -> TestResult {
     let mut receipt = provider_receipt(&candidate, "case-11")?;
     receipt.controller_epoch = test_epoch(TEST_LINEAGE_A, 2);
     assert_eq!(
-        coordinator.admit(receipt).err(),
+        coordinator.admit(&profile(), receipt).err(),
         Some(CoordinatorError::StaleController)
     );
     assert_eq!(coordinator.snapshot_json()?, before);
@@ -1568,7 +1605,7 @@ fn coordinator_case_12_all_state_fence_revision_mismatches_are_stale_before_muta
         let mut receipt = provider_receipt(&candidate, &format!("case-12-{name}"))?;
         receipt.state_fence = mismatch;
         assert_eq!(
-            coordinator.admit(receipt).err(),
+            coordinator.admit(&profile(), receipt).err(),
             Some(CoordinatorError::StaleFence)
         );
         assert_eq!(coordinator.snapshot_json()?, baseline);
@@ -1641,6 +1678,7 @@ fn coordinator_case_15_snapshot_v4_roundtrip_binds_all_properties() -> TestResul
     let restored = AgentCoordinator::restore_with_provider(
         snapshot.clone(),
         config(2, 2),
+    &profile(),
         Box::new(verifier(
             &["proof-admission-case-15"],
             snapshot.event_sequence,
@@ -1696,6 +1734,7 @@ fn coordinator_case_16_snapshot_v3_and_v4_legacy_fence_reject_before_replay() ->
         AgentCoordinator::restore_json(
             &v3.to_string(),
             config(2, 2),
+    &profile(),
             PlanGap::G11Unavailable {
                 reason: "fixture".to_owned()
             }
@@ -1709,6 +1748,7 @@ fn coordinator_case_16_snapshot_v3_and_v4_legacy_fence_reject_before_replay() ->
         AgentCoordinator::restore_json(
             &legacy.to_string(),
             config(2, 2),
+    &profile(),
             PlanGap::G11Unavailable {
                 reason: "fixture".to_owned()
             }
@@ -1872,6 +1912,7 @@ fn coordinator_case_19_replay_conflict_and_snapshot_forgery_fail_closed() -> Tes
         AgentCoordinator::restore_with_provider(
             snapshot,
             config(2, 2),
+    &profile(),
             Box::new(verifier(&proofs, 0))
         )
         .err(),
@@ -2342,6 +2383,7 @@ fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> T
     let restored_pre = AgentCoordinator::restore_with_provider(
         pre_binding.clone(),
         config(4, 4),
+    &profile(),
         Box::new(verifier(&proofs, pre_binding.event_sequence)),
     )?;
     assert_eq!(
@@ -2363,6 +2405,7 @@ fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> T
     let restored_post = AgentCoordinator::restore_with_provider(
         post_binding.clone(),
         config(4, 4),
+    &profile(),
         Box::new(verifier(&proofs, post_binding.event_sequence)),
     )?;
     assert_eq!(
@@ -2727,6 +2770,7 @@ fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult 
     let mut restored = AgentCoordinator::restore_with_provider(
         snapshot.clone(),
         config(4, 4),
+    &profile(),
         Box::new(verifier(&proofs, snapshot.event_sequence)),
     )?;
     assert_eq!(
@@ -2888,7 +2932,7 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
     )?)?;
     let mut receipt = provider_receipt(&candidate, "s5d")?;
     receipt.admitted_lanes[0].admitted_route = None;
-    let admitted = legacy.admit(receipt)?;
+    let admitted = legacy.admit(&profile(), receipt)?;
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     assert_eq!(
@@ -2939,6 +2983,7 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
     )?;
     let new_worker = WorkerId::new("worker-s5e-new")?;
     coordinator.reassign(
+        &profile(),
         context.clone(),
         ProviderReassignmentReceipt {
             reassignment_id: ReassignmentId::new("reassign-s5e")?,
@@ -3022,7 +3067,7 @@ fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
         }],
         None,
     )?)?;
-    sanity.admit(provider_receipt(&sanity_candidate, "s5f")?)?;
+    sanity.admit(&profile(), provider_receipt(&sanity_candidate, "s5f")?)?;
 
     // Wrong attempt identity (recomputed digest isolates the linkage failure).
     let mut wrong_attempt = good.clone();
@@ -3036,7 +3081,7 @@ fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
         admission.self_digest = admission.compute_digest()?;
     }
     assert_eq!(
-        coord.admit(wrong_attempt).err(),
+        coord.admit(&profile(), wrong_attempt).err(),
         Some(CoordinatorError::IdentityConflict("admitted_route"))
     );
 
@@ -3053,7 +3098,7 @@ fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
         admission.self_digest = admission.compute_digest()?;
     }
     assert_eq!(
-        coord.admit(wrong_route).err(),
+        coord.admit(&profile(), wrong_route).err(),
         Some(CoordinatorError::IdentityConflict("admitted_route"))
     );
 
@@ -3069,7 +3114,7 @@ fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
         admission.self_digest = admission.compute_digest()?;
     }
     assert_eq!(
-        coord.admit(wrong_digest).err(),
+        coord.admit(&profile(), wrong_digest).err(),
         Some(CoordinatorError::IdentityConflict("admitted_route"))
     );
 
@@ -3086,7 +3131,7 @@ fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
         admission.self_digest = admission.compute_digest()?;
     }
     assert_eq!(
-        coord.admit(no_route).err(),
+        coord.admit(&profile(), no_route).err(),
         Some(CoordinatorError::IdentityConflict("admitted_route"))
     );
 
@@ -3101,7 +3146,7 @@ fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
         admission.self_digest = zero_digest()?;
     }
     assert!(matches!(
-        coord.admit(bad_digest).err(),
+        coord.admit(&profile(), bad_digest).err(),
         Some(CoordinatorError::ProviderContract(_))
     ));
     Ok(())
@@ -3633,6 +3678,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     let mut coordinator = AgentCoordinator::restore_with_admitted_provider(
         pre_snapshot.clone(),
         cfg.clone(),
+    &profile(),
         admitted_capability(pre_snapshot.event_sequence)?,
     )?;
     assert_eq!(coordinator.events().len(), event_count_before);
@@ -3647,6 +3693,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     let mut restored = AgentCoordinator::restore_with_admitted_provider(
         durable.clone(),
         cfg.clone(),
+    &profile(),
         admitted_capability(durable.event_sequence)?,
     )?;
     assert_eq!(restored.events(), coordinator.events());
@@ -3804,6 +3851,7 @@ fn production_verifier_fences_and_reassigns() -> TestResult {
     )?;
     let new_attempt = AttemptId::new("attempt-prod-fence-new")?;
     coordinator.reassign(
+        &profile(),
         context,
         ProviderReassignmentReceipt {
             reassignment_id: ReassignmentId::new("reassign-prod-fence")?,
@@ -3877,15 +3925,15 @@ fn production_replay_is_idempotent_and_conflict_fails_closed() -> TestResult {
     )?)?;
     let receipt = provider_receipt(&candidate, "prod-replay")?;
     let events_before = coordinator.events().len();
-    let first = coordinator.admit(receipt.clone())?;
+    let first = coordinator.admit(&profile(), receipt.clone())?;
     assert_eq!(coordinator.events().len(), events_before + 1);
-    let replayed = coordinator.admit(receipt.clone())?;
+    let replayed = coordinator.admit(&profile(), receipt.clone())?;
     assert_eq!(replayed, first);
     assert_eq!(coordinator.events().len(), events_before + 1);
     let mut conflict = receipt;
     conflict.durable_job_ref = "durable-job-changed".to_owned();
     assert_eq!(
-        coordinator.admit(conflict).err(),
+        coordinator.admit(&profile(), conflict).err(),
         Some(CoordinatorError::IdentityConflict("admission_id"))
     );
     assert_eq!(coordinator.events().len(), events_before + 1);
@@ -3918,7 +3966,7 @@ fn production_revoked_capability_fails_closed_without_mutation() -> TestResult {
     let before = coordinator.snapshot_json()?;
     assert_eq!(
         coordinator
-            .admit(provider_receipt(&candidate, "prod-revoked")?)
+            .admit(&profile(), provider_receipt(&candidate, "prod-revoked")?)
             .err(),
         Some(CoordinatorError::StaleProviderBinding)
     );
@@ -3953,7 +4001,7 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
     let before = coordinator.snapshot_json()?;
     assert_eq!(
         coordinator
-            .admit(provider_receipt(&candidate, "prod-stale-cap")?)
+            .admit(&profile(), provider_receipt(&candidate, "prod-stale-cap")?)
             .err(),
         Some(CoordinatorError::StaleCapacity)
     );
@@ -3982,7 +4030,7 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
     )?)?;
     assert_eq!(
         coordinator
-            .admit(provider_receipt(&candidate, "prod-stale-route")?)
+            .admit(&profile(), provider_receipt(&candidate, "prod-stale-route")?)
             .err(),
         Some(CoordinatorError::RouteEvidence)
     );
@@ -4010,7 +4058,7 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
     )?)?;
     assert_eq!(
         coordinator
-            .admit(provider_receipt(&candidate, "prod-stale-epoch")?)
+            .admit(&profile(), provider_receipt(&candidate, "prod-stale-epoch")?)
             .err(),
         Some(CoordinatorError::StaleController)
     );
@@ -4033,7 +4081,7 @@ fn production_foreign_identity_fails_closed() -> TestResult {
     receipt.provider_identity.verifier_identity = "foreign-verifier".to_owned();
     let before = coordinator.snapshot_json()?;
     assert_eq!(
-        coordinator.admit(receipt).err(),
+        coordinator.admit(&profile(), receipt).err(),
         Some(CoordinatorError::StaleProviderBinding)
     );
     assert_eq!(coordinator.snapshot_json()?, before);
@@ -4054,7 +4102,7 @@ fn plan_only_constructor_still_refuses_effects() -> TestResult {
     )?)?;
     let receipt = provider_receipt(&candidate, "prod-split")?;
     assert!(matches!(
-        gap_coordinator.admit(receipt.clone()),
+        gap_coordinator.admit(&profile(), receipt.clone()),
         Err(CoordinatorError::PlanGap(_))
     ));
     let mut production = production_coordinator(cfg)?;
@@ -4063,7 +4111,7 @@ fn plan_only_constructor_still_refuses_effects() -> TestResult {
         &[bind_lane_spec("work-prod-split", "reader-prod-split", "a")],
         None,
     )?)?;
-    production.admit(receipt)?;
+    production.admit(&profile(), receipt)?;
     Ok(())
 }
 
@@ -4089,6 +4137,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
     let restored = AgentCoordinator::restore_with_admitted_provider(
         snapshot.clone(),
         cfg.clone(),
+    &profile(),
         admitted_capability(snapshot.event_sequence)?,
     )?;
     assert_eq!(restored.events(), coordinator.events());
@@ -4096,6 +4145,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
         AgentCoordinator::restore_with_admitted_provider(
             snapshot.clone(),
             cfg.clone(),
+    &profile(),
             admitted_capability_for(
                 provider_identity(),
                 true,
@@ -4115,6 +4165,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
         AgentCoordinator::restore_with_admitted_provider(
             snapshot.clone(),
             cfg.clone(),
+    &profile(),
             admitted_capability(snapshot.event_sequence + 1)?,
         )
         .err(),
@@ -4128,6 +4179,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
         AgentCoordinator::restore_with_admitted_provider(
             snapshot,
             cfg,
+    &profile(),
             admitted_capability_for(
                 foreign_identity,
                 false,
@@ -4223,7 +4275,7 @@ fn work_class_all_nine_values_admit_and_echo() -> TestResult {
         assert_eq!(candidate.work_class.as_wire_str(), *class);
         assert_eq!(candidate.lanes.len(), 1);
         assert_eq!(candidate.lanes[0].work_class, expected);
-        let receipt = coord.admit(provider_receipt(&candidate, &tag)?)?;
+        let receipt = coord.admit(&profile(), provider_receipt(&candidate, &tag)?)?;
         assert_eq!(receipt.admitted_lanes.len(), 1);
         assert_eq!(receipt.admitted_lanes[0].work_class, expected);
         let next = coord.next_ready().ok_or("admitted work must be ready")?;
@@ -4326,7 +4378,7 @@ fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
     forged.admitted_lanes[0].work_class = WorkClass::Control;
     assert_eq!(
         coord
-            .admit(forged)
+            .admit(&profile(), forged)
             .err()
             .map(|error| matches!(error, CoordinatorError::IdentityConflict("admitted_lane"))),
         Some(true)
@@ -4353,8 +4405,8 @@ fn work_class_control_sorts_before_higher_priority_normal() -> TestResult {
     lo.lanes[0].priority = 0;
     let hi_candidate = coord.plan(hi)?;
     let lo_candidate = coord.plan(lo)?;
-    coord.admit(provider_receipt(&hi_candidate, "wchi")?)?;
-    coord.admit(provider_receipt(&lo_candidate, "wclo")?)?;
+    coord.admit(&profile(), provider_receipt(&hi_candidate, "wchi")?)?;
+    coord.admit(&profile(), provider_receipt(&lo_candidate, "wclo")?)?;
     let next = coord.next_ready().ok_or("admitted work must be ready")?;
     assert_eq!(next.work_class, WorkClass::Control);
     Ok(())

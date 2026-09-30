@@ -11,10 +11,11 @@ use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CandidateId,
     CoordinatorConfig, CoordinatorError, CoordinatorEvent, ExecutionContext, LearningRole,
-    OwnerCurrentness, PlanGap, PresentedClaimMaterial, ProviderAdmissionReceipt,
-    ProviderExecutionBindingSubmission, ProviderIdentity, RecipeId, RecipeManifest, RoleProfileId,
-    RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
-    StaffingPlanRequest, WorkerId,
+    OwnerCurrentness, PlanGap, PolicyBoundClassLimits, PresentedClaimMaterial,
+    ProviderAdmissionReceipt, ProviderExecutionBindingSubmission, ProviderIdentity, RecipeId,
+    RecipeManifest, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence, SchedulingProfile,
+    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, WipPartitionKey,
+    WipPartitionLimit, WorkClass, WorkerId,
 };
 use eliot_contracts::{EpochLineageId, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
@@ -23,6 +24,32 @@ use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::PrivacyClass;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// The nine-class policy these admissions and this restore are decided under
+/// (issue #1683 W1b). Built through the real
+/// [`SchedulingProfile::i14_2_initial`] constructor, so the fixture cannot
+/// drift from the validated nine-class set production uses.
+fn profile() -> SchedulingProfile {
+    SchedulingProfile::i14_2_initial(
+        "test-integration-profile-v1",
+        &WorkClass::ALL
+            .iter()
+            .map(|work_class| PolicyBoundClassLimits {
+                work_class: *work_class,
+                max_items: None,
+                max_bytes: u64::MAX,
+                max_concurrency: 64,
+                deadline_ms: u64::MAX,
+                weight: 1,
+                wip_partitions: vec![WipPartitionLimit {
+                    key: WipPartitionKey::Route,
+                    max_in_flight: 64,
+                }],
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("valid fixture scheduling profile")
+}
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -339,7 +366,7 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
         }],
     };
     assert!(matches!(
-        coordinator.admit(forged),
+        coordinator.admit(&profile(), forged),
         Err(CoordinatorError::PlanGap(PlanGap::A01Unaccepted { .. }))
     ));
     Ok(())
@@ -566,12 +593,13 @@ fn production_capability_admits_and_restores_receipt() -> TestResult {
     let mut coordinator =
         AgentCoordinator::new_with_admitted_provider(cfg.clone(), integration_capability(false)?)?;
     let candidate = coordinator.plan(request()?)?;
-    let admitted = coordinator.admit(integration_admission_receipt(&candidate)?)?;
+    let admitted = coordinator.admit(&profile(), integration_admission_receipt(&candidate)?)?;
     assert_eq!(admitted.admitted_lanes.len(), 1);
     let snapshot = coordinator.snapshot()?;
     let restored = AgentCoordinator::restore_with_admitted_provider(
         snapshot.clone(),
         cfg.clone(),
+        &profile(),
         integration_capability(false)?,
     )?;
     assert_eq!(restored.events(), coordinator.events());
@@ -582,6 +610,7 @@ fn production_capability_admits_and_restores_receipt() -> TestResult {
         AgentCoordinator::restore_with_admitted_provider(
             snapshot,
             cfg,
+            &profile(),
             integration_capability(true)?,
         )
         .err(),

@@ -1248,11 +1248,30 @@ impl AgentCoordinator {
     }
 
     /// Reconciles only an admission accepted by the sealed verifier.
+    ///
+    /// `profile` is the validated nine-class scheduling policy this admission
+    /// is decided under. It is checked with its own
+    /// [`SchedulingProfile::validate`] on the value the caller presented — the
+    /// original recorded policy, never a recomputed one — so an invalid or
+    /// incomplete policy refuses the admission rather than degrading it to a
+    /// profile-free one. The per-class I14.2 item ceiling it declares bounds
+    /// this call through [`Self::validate_class_item_ceilings`]; the profile is
+    /// consulted for nothing else here, because the other per-class dimensions
+    /// are re-derived on every pull from live state and re-checking them at
+    /// admission would consult a snapshot rather than the running system.
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile's own validation failure, the existing typed
+    /// [`CoordinatorError::Backpressure`] when a class's item ceiling would be
+    /// crossed, and every rejection this method already raised unchanged.
     #[allow(clippy::too_many_lines)]
     pub fn admit(
         &mut self,
+        profile: &SchedulingProfile,
         mut receipt: ProviderAdmissionReceipt,
     ) -> Result<ProviderAdmissionReceipt, CoordinatorError> {
+        profile.validate()?;
         validate_admission_text(&receipt)?;
         receipt.admitted_lanes.sort_by(|left, right| {
             left.work_unit_id
@@ -1314,8 +1333,16 @@ impl AgentCoordinator {
         let mut workers = BTreeSet::new();
         let mut scopes = BTreeSet::new();
         let mut route_additions = BTreeMap::<String, RouteCapacityRequest>::new();
+        // Issue #1683 W1b: the admitted lanes' per-class counts, so the I14.2
+        // item ceiling is enforced per class against the profile this
+        // admission is decided under. Accumulated from the receipt's own
+        // lanes, so the count cannot disagree with what is about to be stored,
+        // and indexed by `WorkClass::rank` like every other per-class table in
+        // this crate.
+        let mut class_additions = [0usize; 9];
         for lane in &receipt.admitted_lanes {
             validate_admitted_lane(lane)?;
+            class_additions[usize::from(lane.work_class.rank())] += 1;
             let lane_key = (lane.work_unit_id.clone(), lane.role_id.clone());
             if !lane_keys.insert(lane_key.clone()) {
                 return Err(CoordinatorError::DuplicateIdentity(
@@ -1389,6 +1416,10 @@ impl AgentCoordinator {
                 }
             }
         }
+        // Issue #1683 W1b: the per-class item ceiling is checked after the
+        // global and route ceilings, immediately before any state is written,
+        // so a refused admission leaves the projection exactly as it was.
+        self.validate_class_item_ceilings(profile, &class_additions)?;
         self.validate_route_capacity(route_additions)?;
 
         for lane in &receipt.admitted_lanes {
@@ -2341,12 +2372,27 @@ impl AgentCoordinator {
         Ok(result)
     }
 
+    /// `profile` is the validated nine-class scheduling policy this
+    /// reassignment is decided under, checked with the same
+    /// [`SchedulingProfile::validate`] on the caller's original value that
+    /// [`Self::admit`] applies, and consulted for the same one thing: the
+    /// per-class I14.2 item ceiling. A reassignment re-enters the ready queue
+    /// as new work, so leaving it unbounded is the same gap as an unbounded
+    /// admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile's own validation failure, the existing typed
+    /// [`CoordinatorError::Backpressure`] when the class's item ceiling would
+    /// be crossed, and every rejection this method already raised unchanged.
     #[allow(clippy::too_many_lines)]
     pub fn reassign(
         &mut self,
+        profile: &SchedulingProfile,
         context: ExecutionContext,
         receipt: ProviderReassignmentReceipt,
     ) -> Result<ReassignmentReceipt, CoordinatorError> {
+        profile.validate()?;
         self.validate_context(&context)?;
         validate_text(&receipt.g11_receipt_ref, "g11_receipt_ref")?;
         receipt.route.validate().map_err(provider_contract)?;
@@ -2399,6 +2445,14 @@ impl AgentCoordinator {
                 limit: self.config.max_admitted_attempts,
             });
         }
+        // Issue #1683 W1b: a reassignment re-enters the ready queue as new work
+        // in the old attempt's class, so it is bounded by that class's I14.2
+        // item ceiling under the same validated profile `admit` uses. The old
+        // attempt is `LostFenced`, hence terminal, so it is already outside the
+        // counted population and this really is one net addition.
+        let mut class_additions = [0usize; 9];
+        class_additions[usize::from(old.work_class.rank())] = 1;
+        self.validate_class_item_ceilings(profile, &class_additions)?;
         self.validate_route_capacity(BTreeMap::from([(
             route_key(&old.route),
             RouteCapacityRequest {
@@ -3192,13 +3246,19 @@ impl AgentCoordinator {
     }
 
     /// Plan-only public restore reinstalls the `PLAN_GAP` verifier.
+    ///
+    /// `profile` is the validated nine-class policy the replayed admissions
+    /// are re-decided under (issue #1683 W1b); see
+    /// [`Self::replay_snapshot_events`]. A restore that did not carry one
+    /// could rebuild a projection no live [`Self::admit`] would accept.
     pub fn restore(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
+        profile: &SchedulingProfile,
         gap: PlanGap,
     ) -> Result<Self, CoordinatorError> {
         gap.validate()?;
-        Self::restore_with_provider(snapshot, live_config, Box::new(GapProvider { gap }))
+        Self::restore_with_provider(snapshot, live_config, profile, Box::new(GapProvider { gap }))
     }
 
     /// Closed production restore on freshly supplied Kernel admission (T9-05,
@@ -3209,14 +3269,20 @@ impl AgentCoordinator {
     /// and every replayed event re-verifies through the T9-04 pure verifier,
     /// so a serialized `Verified` label alone never restores authority and
     /// revoked or stale Kernel evidence fails closed.
+    ///
+    /// `profile` is the validated nine-class policy the replayed admissions
+    /// are re-decided under (issue #1683 W1b); see
+    /// [`Self::replay_snapshot_events`].
     pub fn restore_with_admitted_provider(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
+        profile: &SchedulingProfile,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, CoordinatorError> {
         Self::restore_with_provider(
             snapshot,
             live_config,
+            profile,
             Box::new(KernelProviderVerifier::new(capability)),
         )
     }
@@ -3255,13 +3321,16 @@ impl AgentCoordinator {
         }
     }
 
+    /// `profile` is the validated nine-class policy the replayed admissions
+    /// are re-decided under (issue #1683 W1b); see [`Self::restore`].
     pub fn restore_json(
         json: &str,
         live_config: CoordinatorConfig,
+        profile: &SchedulingProfile,
         gap: PlanGap,
     ) -> Result<Self, CoordinatorError> {
         let snapshot = Self::decode_snapshot_wire(json)?;
-        Self::restore(snapshot, live_config, gap)
+        Self::restore(snapshot, live_config, profile, gap)
     }
 
     /// Production JSON restore on freshly supplied Kernel admission (issue
@@ -3277,19 +3346,24 @@ impl AgentCoordinator {
     /// durable fabric-restore driver (#1108 lane). Forbidden: serializing
     /// an already-typed snapshot and reparsing it (no-op shim, not a
     /// live ingress).
+    /// `profile` is the validated nine-class policy the replayed admissions
+    /// are re-decided under (issue #1683 W1b); see
+    /// [`Self::restore_with_admitted_provider`].
     pub fn restore_snapshot_json(
         json: &str,
         live_config: CoordinatorConfig,
+        profile: &SchedulingProfile,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, CoordinatorError> {
         let snapshot = Self::decode_snapshot_wire(json)?;
-        Self::restore_with_admitted_provider(snapshot, live_config, capability)
+        Self::restore_with_admitted_provider(snapshot, live_config, profile, capability)
     }
 
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn restore_with_provider(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
+        profile: &SchedulingProfile,
         provider: Box<dyn ProviderVerifier>,
     ) -> Result<Self, CoordinatorError> {
         if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
@@ -3321,15 +3395,26 @@ impl AgentCoordinator {
         }
         let expected_events = snapshot.events.clone();
         let mut coordinator = Self::with_provider(live_config, provider)?;
-        coordinator.replay_snapshot_events(&expected_events)?;
+        coordinator.replay_snapshot_events(profile, &expected_events)?;
         if coordinator.events != expected_events {
             return Err(CoordinatorError::SnapshotDigest);
         }
         Ok(coordinator)
     }
 
+    /// Re-derives the projection from the recorded event log.
+    ///
+    /// `profile` is the policy the replayed admissions are re-decided under.
+    /// Replay must reach the same state the log recorded, so it runs the same
+    /// [`Self::admit`] and [`Self::reassign`] an original admission ran,
+    /// including the per-class item ceiling (issue #1683 W1b). A replay that
+    /// skipped the ceiling would rebuild a projection no live `admit` could
+    /// have produced, which is the weaker check this must not become; the
+    /// ceiling is re-checked here rather than trusted from the log because the
+    /// log records the outcome, not the policy that produced it.
     fn replay_snapshot_events(
         &mut self,
+        profile: &SchedulingProfile,
         expected_events: &[CoordinatorEvent],
     ) -> Result<(), CoordinatorError> {
         let coordinator = &mut *self;
@@ -3339,7 +3424,7 @@ impl AgentCoordinator {
                     coordinator.plan(*request)?;
                 }
                 CoordinatorEvent::PlanAdmitted { receipt } => {
-                    coordinator.admit(*receipt)?;
+                    coordinator.admit(profile, *receipt)?;
                 }
                 CoordinatorEvent::AttemptStarted {
                     context,
@@ -3357,7 +3442,7 @@ impl AgentCoordinator {
                     coordinator.mark_worker_lost(context, *receipt)?;
                 }
                 CoordinatorEvent::Reassigned { context, receipt } => {
-                    coordinator.reassign(context, *receipt)?;
+                    coordinator.reassign(profile, context, *receipt)?;
                 }
                 CoordinatorEvent::ResultSubmitted {
                     context,
@@ -3531,6 +3616,58 @@ impl AgentCoordinator {
                     active,
                     requested: addition.requested,
                     limit: effective_limit,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// I14.2 per-class item ceiling at the admission boundary (issue #1683
+    /// W1b).
+    ///
+    /// The selection path reads the validated profile's per-class item ceiling
+    /// only to bound its scan window ([`offer_class_head`]); nothing on this
+    /// path read it before, so a burst that passed selection could then be
+    /// admitted against a ceiling the policy never bounded. This is that
+    /// ceiling, consulted at the point the policy assigns it: the item ceiling
+    /// counts a class's own admitted items, which only admission changes.
+    ///
+    /// Counted per class from the same live non-terminal population the
+    /// selector counts ([`class_views`]), never as a percentage or a global
+    /// scalar, so one saturated class cannot consume another's item budget
+    /// (I14.3's multidimensional accounting). The physical reserve split stays
+    /// where it is owned, in `eliot_kernel_core::ControlReserve`; this repeats
+    /// no part of it and adds no reservation scheme.
+    ///
+    /// The limit is the profile's own value and the refusal reuses the
+    /// existing typed [`CoordinatorError::Backpressure`], so a caller reads
+    /// the same refusal it already handles for a bounded coordinator and the
+    /// exact limiting value is published there.
+    fn validate_class_item_ceilings(
+        &self,
+        profile: &SchedulingProfile,
+        requested: &[usize; 9],
+    ) -> Result<(), CoordinatorError> {
+        for (index, count) in requested.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            let work_class = WorkClass::ALL[index];
+            let Some(class_profile) = profile.class_profile(work_class) else {
+                return Err(CoordinatorError::UnknownWorkClass(
+                    work_class.as_wire_str().to_owned(),
+                ));
+            };
+            let active = self
+                .attempts
+                .values()
+                .filter(|attempt| !attempt.state.is_terminal() && attempt.work_class == work_class)
+                .count();
+            if active.saturating_add(*count) > class_profile.max_items {
+                return Err(CoordinatorError::Backpressure {
+                    active,
+                    requested: *count,
+                    limit: class_profile.max_items,
                 });
             }
         }
