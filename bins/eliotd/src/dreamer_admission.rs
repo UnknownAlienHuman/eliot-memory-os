@@ -20,13 +20,21 @@
 
 use std::sync::Arc;
 
-use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
+use eliot_contracts::{
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    canonical_json_bytes,
+};
+use eliot_dreamer_contracts::{
+    ContractViolation, DreamJobInput, JobClass, dream_job_input_contract_identity,
+};
 use eliot_governor::{CompositionError, CompositionReadiness, KernelPortError};
 use eliot_protocol::dreamer_job::{
     DurableJobRequest, DurableJobResponse, JobOperation, JobRole, JobState, JobSubmission,
+    OpaqueContentRef,
 };
 use eliot_read::{LocalReadPort, ReadService};
 use eliot_store_api::ScopeId;
+use thiserror::Error;
 
 use super::dreamer_materials::{
     AdmittedSourceClaim, DreamerMaterialsError, OrientationMaterialBudget,
@@ -42,16 +50,245 @@ use crate::kernel_context_read_client::KernelContextReadClient;
 /// belongs to the K2 owner, never to a silent local edit.
 pub const DREAMER_JOB_WIRE_ID: &str = "eliot.kernel.dreamer-job";
 
+/// Original owner-issued semantic source carried through Orientation intake
+/// and handed to the claimed child unchanged.
+///
+/// The reference remains opaque to the Kernel queue. The canonical bytes are
+/// the exact bytes named by that reference, retained by the submitter and
+/// checked again through the named-read owner before queueing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrientationSemanticInputPublication {
+    /// Full original artifact and schema identity supplied by its owner.
+    pub reference: OpaqueContentRef,
+    /// Exact canonical DreamJobInput bytes retained by the producer.
+    pub canonical_bytes: Vec<u8>,
+}
+
+impl OrientationSemanticInputPublication {
+    /// Binds an owner-issued reference to its original canonical Orientation
+    /// input bytes without minting or replacing any source identity.
+    pub fn new(
+        reference: OpaqueContentRef,
+        canonical_bytes: Vec<u8>,
+    ) -> Result<Self, OrientationSemanticInputError> {
+        let publication = Self {
+            reference,
+            canonical_bytes,
+        };
+        publication.validated_job()?;
+        Ok(publication)
+    }
+
+    /// Reconstructs the typed publication from one authenticated durable reply.
+    ///
+    /// Missing legacy reference or inline bytes remain typed errors. The
+    /// response's reference and bytes are never replaced with a local value.
+    pub fn from_durable_response(
+        response: &DurableJobResponse,
+    ) -> Result<Self, OrientationSemanticInputError> {
+        response
+            .validate()
+            .map_err(|_| OrientationSemanticInputError::InvalidResponse)?;
+        let reference = response
+            .semantic_input
+            .clone()
+            .ok_or(OrientationSemanticInputError::MissingReference)?;
+        let canonical_bytes = response
+            .semantic_input_bytes
+            .clone()
+            .ok_or(OrientationSemanticInputError::MissingBytes)?;
+        let publication = Self {
+            reference,
+            canonical_bytes,
+        };
+        let job = publication.validated_job()?;
+        if job.job_id != response.job_id.as_str() {
+            return Err(OrientationSemanticInputError::JobMismatch);
+        }
+        if job.scope_id != response.scope.scope_id.as_str() {
+            return Err(OrientationSemanticInputError::ScopeMismatch);
+        }
+        if job.state_fence != response.scope.state_fence
+            || job.state_fence != response.request_identity.operation.state_fence
+            || job.state_fence != response.request_identity.request.request.state_fence
+            || job.state_fence != response.request_identity.request.request.metadata.state_fence
+        {
+            return Err(OrientationSemanticInputError::FenceMismatch);
+        }
+        let request_task = response
+            .request_identity
+            .request
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task_id| task_id.as_str());
+        if job.task_id.as_deref() != request_task {
+            return Err(OrientationSemanticInputError::TaskMismatch);
+        }
+        Ok(publication)
+    }
+
+    fn validated_job(&self) -> Result<DreamJobInput, OrientationSemanticInputError> {
+        self.reference
+            .validate("semantic_input.sha256")
+            .map_err(|_| OrientationSemanticInputError::InvalidReference)?;
+        let expected_contract = dream_job_input_contract_identity()?;
+        if self.reference.contract != expected_contract {
+            return Err(OrientationSemanticInputError::ContractIdentityMismatch);
+        }
+        self.reference
+            .validate_semantic_input_bytes(&self.canonical_bytes)
+            .map_err(|_| OrientationSemanticInputError::ReferenceBytesMismatch)?;
+        let job: DreamJobInput = serde_json::from_slice(&self.canonical_bytes)
+            .map_err(|_| OrientationSemanticInputError::Decode)?;
+        job.validate()?;
+        let encoded = canonical_json_bytes(&job)
+            .map_err(|_| OrientationSemanticInputError::CanonicalEncoding)?;
+        if encoded != self.canonical_bytes {
+            return Err(OrientationSemanticInputError::CanonicalEncoding);
+        }
+        if job.job_class != JobClass::Orientation {
+            return Err(OrientationSemanticInputError::WrongJobClass);
+        }
+        Ok(job)
+    }
+
+    fn validate_for_request(
+        &self,
+        request: &DurableJobRequest,
+        submission: &JobSubmission,
+    ) -> Result<DreamJobInput, OrientationSemanticInputError> {
+        let job = self.validated_job()?;
+        if self.reference != submission.semantic_input {
+            return Err(OrientationSemanticInputError::ReferenceMismatch);
+        }
+        let retained_bytes = submission
+            .semantic_input_bytes
+            .as_deref()
+            .ok_or(OrientationSemanticInputError::MissingBytes)?;
+        if retained_bytes != self.canonical_bytes.as_slice() {
+            return Err(OrientationSemanticInputError::ReferenceBytesMismatch);
+        }
+        if job.job_id != submission.job_id.as_str() {
+            return Err(OrientationSemanticInputError::JobMismatch);
+        }
+        if job.scope_id != submission.work_scope.scope_id.as_str() {
+            return Err(OrientationSemanticInputError::ScopeMismatch);
+        }
+        if job.state_fence != submission.work_scope.state_fence
+            || job.state_fence != request.request_identity.operation.state_fence
+            || job.state_fence != request.request_identity.request.request.state_fence
+            || job.state_fence != request.request_identity.request.request.metadata.state_fence
+        {
+            return Err(OrientationSemanticInputError::FenceMismatch);
+        }
+        let request_task = request
+            .request_identity
+            .request
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task_id| task_id.as_str());
+        if job.task_id.as_deref() != request_task {
+            return Err(OrientationSemanticInputError::TaskMismatch);
+        }
+        Ok(job)
+    }
+}
+
+/// Typed failures while retaining or validating an Orientation semantic input.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum OrientationSemanticInputError {
+    /// A legacy or incomplete owner response omitted the opaque reference.
+    #[error("semantic input reference is unavailable")]
+    MissingReference,
+    /// A legacy or incomplete owner response omitted the retained source bytes.
+    #[error("semantic input bytes are unavailable")]
+    MissingBytes,
+    /// The returned owner reply is not a valid durable response.
+    #[error("semantic input owner response is invalid")]
+    InvalidResponse,
+    /// The opaque reference is malformed or lacks its immutable artifact ID.
+    #[error("semantic input reference is invalid")]
+    InvalidReference,
+    /// The full original contract identity differs from the DreamJobInput schema identity.
+    #[error("semantic input contract identity does not match DreamJobInput")]
+    ContractIdentityMismatch,
+    /// The reference's byte length or digest does not bind the exact bytes.
+    #[error("semantic input bytes do not match their original reference")]
+    ReferenceBytesMismatch,
+    /// The request carries another owner-issued reference.
+    #[error("semantic input reference differs from the sealed durable request")]
+    ReferenceMismatch,
+    /// The original bytes are not canonical JSON for a valid DreamJobInput.
+    #[error("semantic input is not canonical DreamJobInput JSON")]
+    CanonicalEncoding,
+    /// The original bytes cannot be decoded as the declared schema.
+    #[error("semantic input cannot be decoded as DreamJobInput")]
+    Decode,
+    /// The DreamJobInput intrinsic bounds or fence validation failed.
+    #[error("DreamJobInput validation failed: {0}")]
+    InputValidation(#[from] ContractViolation),
+    /// The canonical job is declared for another Dreamer class.
+    #[error("semantic input job class is not Orientation")]
+    WrongJobClass,
+    /// The semantic source claim does not bind its reference digest and length.
+    #[error("semantic source claim does not bind its original reference")]
+    SourceClaimMismatch,
+    /// The semantic source handle aliases an ordinary evidence material handle.
+    #[error("semantic source claim must be distinct from evidence materials")]
+    SourceClaimNotDistinct,
+    /// The declared source claim failed its local shape checks.
+    #[error("semantic input source claim is invalid: {0}")]
+    SourceClaimInvalid(DreamerMaterialsError),
+    /// The named read failed or returned a stale/error disposition.
+    #[error("semantic input source resolution failed: {0}")]
+    Resolution(DreamerMaterialsError),
+    /// The named read did not return the exact original retained bytes.
+    #[error("semantic input named read differs from the retained original bytes")]
+    ResolvedBytesMismatch,
+    /// The semantic job identity differs from the durable job identity.
+    #[error("semantic input job identity does not match the durable request")]
+    JobMismatch,
+    /// The semantic scope differs from the admitted work scope.
+    #[error("semantic input scope does not match the admitted work scope")]
+    ScopeMismatch,
+    /// The semantic task differs from the admitted request task.
+    #[error("semantic input task does not match the admitted request task")]
+    TaskMismatch,
+    /// The semantic fence differs from the admitted request fence.
+    #[error("semantic input fence is stale or does not match the admitted request")]
+    FenceMismatch,
+    /// A source resolver was given an operation other than SUBMIT_JOB.
+    #[error("semantic input source resolution requires SUBMIT_JOB")]
+    NotSubmit,
+}
+
+/// Distinct named-read claim for the semantic job payload. It is not included
+/// in the ordinary evidence-material manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrientationSemanticInputClaim {
+    /// The original reference and canonical bytes sealed into the request.
+    pub publication: OrientationSemanticInputPublication,
+    /// Owner-admitted source used to independently resolve those same bytes.
+    pub source_claim: AdmittedSourceClaim,
+}
+
 /// One Orientation intake for Governor-routed queue submission.
 ///
-/// `request` is the complete K0 submit contract (caller-supplied admission rides inside the
-/// submission and is validated as shape only — a presented `AdmissionRef` never grants rights;
-/// the actual gate is Governor readiness plus the fence/material joins below). `scope`,
-/// `materials`, and `budget` drive the independent read-only verification.
+/// request is the complete K0 submit contract (caller-supplied admission rides inside the
+/// submission and is validated as shape only — a presented AdmissionRef never grants rights;
+/// the actual gate is Governor readiness plus the fence/material joins below). The separate
+/// semantic_input_claim resolves the declared DreamJobInput bytes; scope, materials, and budget
+/// drive independent read-only verification of evidence materials.
 #[derive(Clone, Debug)]
 pub struct OrientationSubmitInput {
     /// Closed K0 submit request with the requester role.
     pub request: DurableJobRequest,
+    /// Declared semantic source, separate from ordinary evidence materials.
+    pub semantic_input_claim: OrientationSemanticInputClaim,
     /// Scope the materials were admitted for; must equal the submission work scope.
     pub scope: ScopeId,
     /// Admitted source claims resolved and digest-checked before queueing.
@@ -178,16 +415,52 @@ impl<'a> GovernorDreamerAdapter<'a> {
         input: &OrientationSubmitInput,
         queue: &impl DreamerJobQueue,
     ) -> Result<DurableJobResponse, CompositionError> {
+        self.submit_orientation_typed(input, queue)
+            .await
+            .map_err(OrientationSubmitError::into_composition_error)
+    }
+
+    /// Submits one admitted Orientation intake while preserving semantic
+    /// source refusal as its own typed error.
+    pub async fn submit_orientation_typed(
+        &self,
+        input: &OrientationSubmitInput,
+        queue: &impl DreamerJobQueue,
+    ) -> Result<DurableJobResponse, OrientationSubmitError> {
         let admitted = self.composition.kernel_snapshot().state_fence();
         let readiness = self.composition.readiness();
-        let ctx = self.dreamer_route_context()?;
+        let ctx = self
+            .dreamer_route_context()
+            .map_err(OrientationSubmitError::Composition)?;
         if ctx.state_fence != admitted {
-            return Err(owner_error(
+            return Err(OrientationSubmitError::Composition(owner_error(
                 "dreamer route context does not match the admitted snapshot",
-            ));
+            )));
         }
         let service = ReadService::new(KernelContextReadClient::new(Arc::clone(self.kernel)));
-        submit_admitted_orientation(readiness, &admitted, &service, &ctx, input, queue).await
+        submit_admitted_orientation_typed(readiness, &admitted, &service, &ctx, input, queue).await
+    }
+}
+
+/// Typed outcome of Orientation submission. Semantic owner absence, staleness,
+/// or mismatch stays distinguishable from the preexisting composition and
+/// queue failures.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum OrientationSubmitError {
+    /// Readiness, admission, or queue owner failure.
+    #[error(transparent)]
+    Composition(#[from] CompositionError),
+    /// Missing, stale, or mismatched original semantic source.
+    #[error(transparent)]
+    SemanticInput(#[from] OrientationSemanticInputError),
+}
+
+impl OrientationSubmitError {
+    fn into_composition_error(self) -> CompositionError {
+        match self {
+            Self::Composition(error) => error,
+            Self::SemanticInput(error) => owner_error(error.to_string()),
+        }
     }
 }
 
@@ -231,19 +504,35 @@ pub(crate) async fn submit_admitted_orientation<'a>(
     input: &OrientationSubmitInput,
     queue: &'a impl DreamerJobQueue,
 ) -> Result<DurableJobResponse, CompositionError> {
+    submit_admitted_orientation_typed(readiness, admitted_fence, reads, ctx, input, queue)
+        .await
+        .map_err(OrientationSubmitError::into_composition_error)
+}
+
+/// Typed core of the Orientation source handoff. It preserves the semantic
+/// source's missing, stale, and mismatched dispositions for production callers.
+pub(crate) async fn submit_admitted_orientation_typed<'a>(
+    readiness: CompositionReadiness,
+    admitted_fence: &StateFence,
+    reads: &'a impl LocalReadPort,
+    ctx: &RequestMetadata,
+    input: &OrientationSubmitInput,
+    queue: &'a impl DreamerJobQueue,
+) -> Result<DurableJobResponse, OrientationSubmitError> {
     if readiness != CompositionReadiness::Ready {
-        return Err(CompositionError::NotReady);
+        return Err(CompositionError::NotReady.into());
     }
-    let submission = admit_orientation_request(&input.request, admitted_fence)?;
+    let submission = admit_orientation_request(&input.request, admitted_fence)
+        .map_err(OrientationSubmitError::Composition)?;
     if ctx.state_fence != *admitted_fence {
-        return Err(owner_error(
+        return Err(OrientationSubmitError::Composition(owner_error(
             "dreamer read context does not match the admitted fence",
-        ));
+        )));
     }
     if input.scope.as_str() != submission.work_scope.scope_id.as_str() {
-        return Err(owner_error(
+        return Err(OrientationSubmitError::Composition(owner_error(
             "dreamer intake scope does not match the submission work scope",
-        ));
+        )));
     }
     let manifest = freeze_orientation_manifest(
         input.scope.as_str(),
@@ -251,17 +540,73 @@ pub(crate) async fn submit_admitted_orientation<'a>(
         &input.materials,
         &input.budget,
     )
-    .map_err(|error| materials_error(&error))?;
+    .map_err(|error| OrientationSubmitError::Composition(materials_error(&error)))?;
     manifest
         .validate()
-        .map_err(|error| materials_error(&error))?;
+        .map_err(|error| OrientationSubmitError::Composition(materials_error(&error)))?;
     for claim in &input.materials {
         resolve_source_claim(reads, ctx, &input.scope, claim)
             .await
-            .map_err(|error| materials_error(&error))?;
+            .map_err(|error| OrientationSubmitError::Composition(materials_error(&error)))?;
     }
+    if input.materials.iter().any(|claim| {
+        claim.source_handle == input.semantic_input_claim.source_claim.source_handle
+    }) {
+        return Err(OrientationSemanticInputError::SourceClaimNotDistinct.into());
+    }
+    resolve_orientation_semantic_input(
+        reads,
+        ctx,
+        &input.scope,
+        &input.request,
+        &input.semantic_input_claim,
+    )
+    .await?;
     let response = queue.submit(ctx.clone(), input.request.clone()).await?;
-    bind_queued_response(&input.request, response)
+    bind_queued_response(&input.request, response).map_err(OrientationSubmitError::Composition)
+}
+
+/// Resolves and validates the declared semantic job claim against the exact
+/// reference and bytes already sealed into the durable request.
+///
+/// This claim is independent of ordinary evidence materials: it is never
+/// inserted into the material manifest or allowed to substitute for a model
+/// prompt. The returned publication preserves the owner's reference and exact
+/// canonical bytes for the later claimed-child handoff.
+pub(crate) async fn resolve_orientation_semantic_input(
+    reads: &impl LocalReadPort,
+    ctx: &RequestMetadata,
+    scope: &ScopeId,
+    request: &DurableJobRequest,
+    claim: &OrientationSemanticInputClaim,
+) -> Result<OrientationSemanticInputPublication, OrientationSemanticInputError> {
+    let JobOperation::Submit { submission } = &request.operation else {
+        return Err(OrientationSemanticInputError::NotSubmit);
+    };
+    claim
+        .source_claim
+        .validate()
+        .map_err(OrientationSemanticInputError::SourceClaimInvalid)?;
+    claim
+        .publication
+        .validate_for_request(request, submission)?;
+    if claim.source_claim.expected_digest != claim.publication.reference.sha256
+        || claim.source_claim.expected_byte_length != claim.publication.reference.byte_length
+    {
+        return Err(OrientationSemanticInputError::SourceClaimMismatch);
+    }
+    if scope.as_str() != submission.work_scope.scope_id.as_str()
+        || ctx.state_fence != submission.work_scope.state_fence
+    {
+        return Err(OrientationSemanticInputError::FenceMismatch);
+    }
+    let resolved = resolve_source_claim(reads, ctx, scope, &claim.source_claim)
+        .await
+        .map_err(OrientationSemanticInputError::Resolution)?;
+    if resolved != claim.publication.canonical_bytes {
+        return Err(OrientationSemanticInputError::ResolvedBytesMismatch);
+    }
+    Ok(claim.publication.clone())
 }
 
 /// Admits one K0 request for orientation intake: shape-valid `SUBMIT_JOB` with the requester
@@ -379,6 +724,16 @@ mod tests {
 
     fn test_submission(fence: &StateFence) -> TestResult<JobSubmission> {
         let epoch = fence.authority_epoch.clone();
+        let semantic_job = test_semantic_job(fence);
+        let semantic_input_bytes = canonical_json_bytes(&semantic_job)?;
+        let semantic_input = OpaqueContentRef {
+            contract: dream_job_input_contract_identity()?,
+            source_revision: "orientation-input-v1".to_owned(),
+            byte_length: u64::try_from(semantic_input_bytes.len())
+                .map_err(|_| "test semantic input length")?,
+            sha256: sha256_hex(&semantic_input_bytes),
+            artifact_id: Some(ArtifactId::new("artifact-semantic-input")?),
+        };
         let work_scope = WorkScopeBinding {
             scope_id: WorkScopeId::new("scope-one")?,
             product_id: ProductId::new("eliotd")?,
@@ -389,8 +744,8 @@ mod tests {
             job_id: TaskId::new("job-1")?,
             attempt_id: ArtifactId::new("attempt-1")?,
             work_scope: work_scope.clone(),
-            semantic_input: content_ref("input", 8, &"b".repeat(64))?,
-            semantic_input_bytes: None,
+            semantic_input,
+            semantic_input_bytes: Some(semantic_input_bytes),
             output_contract: content_ref("output", 8, &"c".repeat(64))?,
             admission: AdmissionRef {
                 authority: AuthorityBinding {
@@ -483,6 +838,31 @@ mod tests {
         request.validate()?;
         let mut stored = BTreeMap::new();
         let mut materials = Vec::new();
+        let JobOperation::Submit { submission } = &request.operation else {
+            return Err("test input request must submit".into());
+        };
+        let semantic_job = test_semantic_job(fence);
+        stored.insert(
+            "semantic-input".to_owned(),
+            serde_json::to_value(&semantic_job)?,
+        );
+        let semantic_publication = OrientationSemanticInputPublication::new(
+            submission.semantic_input.clone(),
+            submission
+                .semantic_input_bytes
+                .clone()
+                .ok_or("test semantic input bytes")?,
+        )?;
+        let semantic_input_claim = OrientationSemanticInputClaim {
+            source_claim: AdmittedSourceClaim {
+                source_handle: "semantic-input".to_owned(),
+                expected_digest: semantic_publication.reference.sha256.clone(),
+                expected_byte_length: semantic_publication.reference.byte_length,
+                privacy_class: "governed-internal".to_owned(),
+                route_class: "local-governed".to_owned(),
+            },
+            publication: semantic_publication,
+        };
         for (handle, payload) in payloads {
             let bytes = canonical_json_bytes(payload)?;
             stored.insert((*handle).to_owned(), (*payload).clone());
@@ -497,12 +877,38 @@ mod tests {
         Ok((
             OrientationSubmitInput {
                 request,
+                semantic_input_claim,
                 scope: ScopeId::new("scope-one")?,
                 materials,
                 budget: test_budget(),
             },
             stored,
         ))
+    }
+
+    fn test_semantic_job(fence: &StateFence) -> DreamJobInput {
+        DreamJobInput {
+            job_id: "job-1".to_owned(),
+            job_class: JobClass::Orientation,
+            exact_question: "What should be oriented?".to_owned(),
+            requester: "requester-1".to_owned(),
+            scope_id: "scope-one".to_owned(),
+            task_id: None,
+            state_fence: fence.clone(),
+            evidence_handles: Vec::new(),
+            memory_handles: Vec::new(),
+            architecture_handles: Vec::new(),
+            implementation_handles: Vec::new(),
+            conformance_handles: Vec::new(),
+            conflicts_and_unknowns: Vec::new(),
+            privacy_profile: "governed-internal".to_owned(),
+            allowed_tools: Vec::new(),
+            allowed_model_routes: vec!["route-1".to_owned()],
+            budget_units: 8,
+            deadline_ms: 1_000_000,
+            output_schema: "orientation/v1".to_owned(),
+            forbidden_effects: Vec::new(),
+        }
     }
 
     /// Test-only read port answering from caller-held payloads. Payloads are derived from the
