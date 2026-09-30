@@ -714,6 +714,15 @@ pub struct QualityRefusal {
 /// A block is an error; a non-blocking uncertainty is a returned value. That is
 /// what keeps an informational unknown visible without globally refusing
 /// unrelated safe work.
+///
+/// **`limitations` is the informational half of the partition.** For a blocking
+/// operation it is empty, because a blocking operation refuses instead of
+/// returning. For read-only diagnostic display it names every dimension this
+/// packet did not currently pass, so a granted display suitability is never
+/// mistaken for a clean packet: the limitation travels with the grant instead of
+/// being dropped on the floor. Each entry is one dimension's own result, with
+/// the state and the exact missing evidence it carries, so a reader does not
+/// re-derive which anchor, directive or verifier was absent.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QualitySuitability {
@@ -723,6 +732,17 @@ pub struct QualitySuitability {
     /// operation. Never empty for a blocking operation, because a blocking
     /// operation refuses instead of returning.
     pub unresolved_applicability: Vec<QualityApplicabilityInput>,
+    /// Dimension results this packet did not currently pass, in canonical
+    /// dimension order, when they are informational for this operation rather
+    /// than blocking it.
+    ///
+    /// Always empty for a blocking operation: a failed or unknown required
+    /// dimension is a refusal, not a returned value, so it never reaches this
+    /// list. Populated only for an operation that tolerates the dimension
+    /// without acting on it — read-only diagnostic display today — which is
+    /// exactly the A2 requirement that an incomplete packet stays *visible*
+    /// with its limitation named.
+    pub limitations: Vec<QualityDimensionResult>,
 }
 
 impl QualityScorecard {
@@ -783,6 +803,18 @@ impl QualityScorecard {
     /// * `additional_required` carries the blockers a recipe selected. It is
     ///   unioned with the independently mandatory set, so it can add a
     ///   constraint but never remove one.
+    ///
+    /// The two directions of the partition are exact and do not interfere: a
+    /// failed or unknown *required* dimension refuses this operation, and only
+    /// this operation, because [`QualityOperation::required_dimensions`] is a
+    /// closed function of the operation; and when the operation is granted
+    /// anyway — read-only diagnostic display, which requires no dimension — the
+    /// returned [`QualitySuitability`] names every dimension that did not
+    /// currently pass in its `limitations`. An informational non-blocking
+    /// unknown therefore stays visible without globally refusing unrelated
+    /// work, and optional metric uncertainty can neither conceal a mandatory
+    /// failure (it refuses the one operation that requires it) nor disable an
+    /// independent safe operation that does not.
     pub fn suitability(
         &self,
         operation: QualityOperation,
@@ -815,9 +847,27 @@ impl QualityScorecard {
         let applicability_blocks =
             operation.blocks_on_unresolved_applicability() && !unresolved_applicability.is_empty();
         if blocking.is_empty() && !applicability_blocks {
+            // The grant, not a silent pass. For a blocking operation `blocking` is
+            // empty here, so `limitations` is empty too and a returned suitability
+            // really did mean every required dimension was a current pass. For
+            // read-only diagnostic display no dimension is mandatory, so the same
+            // `Ok` arm would otherwise drop every failed and unknown result on the
+            // floor; carrying them as limitations is what keeps an incomplete
+            // packet visible with its limitation named instead of being displayed
+            // as though it were clean.
+            let limitations = if operation.blocks_on_unresolved_applicability() {
+                Vec::new()
+            } else {
+                self.results
+                    .iter()
+                    .filter(|result| !result.is_current_pass())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
             return Ok(QualitySuitability {
                 operation,
                 unresolved_applicability,
+                limitations,
             });
         }
         Err(QualityRefusal {
