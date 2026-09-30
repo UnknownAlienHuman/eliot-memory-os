@@ -2867,6 +2867,80 @@ pub trait RestoreTarget {
     ) -> Result<RestoreEvidence, BackupError>;
 }
 
+/// One immutable verified archive bound to its single publication operation:
+/// archive digest, operation identity, and idempotency key.
+///
+/// There is deliberately no durability field here. Durability is evidence the
+/// OWNER issues — it is [`PublicationReceipt::durable`] — and a note this owner
+/// wrote about its own publication would be a self-attested flag, not proof.
+/// The coordinator compares the owner's receipt against these three identities
+/// and nothing else.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedArchive {
+    /// Archive backup identity bound at build.
+    pub backup_id: String,
+    /// Deterministic digest of the complete encoded archive.
+    pub archive_sha256: String,
+    /// Publication operation identity (exactly one publish per operation).
+    pub operation_id: String,
+    /// Idempotency key binding backup identity and archive digest.
+    pub idempotency_key: String,
+}
+
+/// Durable receipt for one publication operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicationReceipt {
+    /// Publication operation identity the receipt answers for.
+    pub operation_id: String,
+    /// Archive digest the receipt confirms as durable.
+    pub archive_sha256: String,
+    /// Whether the archive is durably recorded by the owner.
+    pub durable: bool,
+}
+
+/// Typed publication failure in this package's own vocabulary.
+///
+/// An owner either refuses a publication it did not perform, or cannot prove
+/// whether it performed one. The second is not a total-failure answer, so it is
+/// its own variant and not a refused one: a caller that read it as "nothing was
+/// written" would blind-retry and publish the same operation twice.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum PublicationError {
+    /// The owner refused the publication; no archive is durably recorded.
+    #[error("publication refused: {0}")]
+    Refused(String),
+    /// The publication outcome is unknown; reconcile by operation identity.
+    #[error("publication outcome unknown for operation {0}; reconcile by identity")]
+    Unknown(String),
+}
+
+/// Publication port over the admitted artifact/blob owner.
+///
+/// The capture-side counterpart of [`RestoreTarget`], and it is declared here
+/// for the same reason: a port must sit at or below both the owner that
+/// implements it and the coordinator that consumes it, so neither of those two
+/// layers is forced to depend on the other to name the contract. Exactly one
+/// `publish_once` call happens per admitted capture operation with the exact
+/// operation identity and idempotency key. A lost publication response
+/// reconciles the SAME operation by identity through `reconcile`: the
+/// coordinator never publishes twice, and byte-equality of two archives or a
+/// process exit code is never attribution of durability.
+pub trait PublicationPort {
+    /// Publishes the verified archive bytes exactly once under the given
+    /// operation identity and idempotency key.
+    fn publish_once(
+        &mut self,
+        operation_id: &str,
+        idempotency_key: &str,
+        bytes: &[u8],
+    ) -> Result<PublicationReceipt, PublicationError>;
+
+    /// Reconciles a lost publication response by operation identity, adopting
+    /// the owner's durable receipt for the same operation without a second
+    /// publish.
+    fn reconcile(&mut self, operation_id: &str) -> Result<PublicationReceipt, PublicationError>;
+}
+
 /// Typed failures that preserve integrity and recovery boundaries.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum BackupError {

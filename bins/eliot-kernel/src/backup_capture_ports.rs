@@ -16,10 +16,19 @@
 //! prove nothing), the already-accepted owner-evidence bundle (`CapturePorts`),
 //! the adapters onto accepted owner-neutral APIs only
 //! (`owner_residency_key_digest`, `owner_suspended_recovery_refs`,
-//! `owner_fence_dispositions`), the exactly-once publication port
-//! (`PublicationPort`), and the fail-closed `KernelCaptureError` vocabulary
-//! with lossless mapping onto the accepted `BackupError` seam
+//! `owner_fence_dispositions`), and the fail-closed `KernelCaptureError`
+//! vocabulary with lossless mapping onto the accepted `BackupError` seam
 //! (`KernelCaptureError::to_backup`).
+//!
+//! The exactly-once publication port itself is NOT declared here: it is owned by
+//! the lower `eliot_backup` contract crate alongside its mirror
+//! `eliot_backup::RestoreTarget`, and the store owner that implements it must
+//! be able to name it without depending on this composition root. This module
+//! re-exports `PublicationPort`, `PublishedArchive` and `PublicationReceipt`
+//! unchanged so the Kernel's own public surface keeps resolving them, and maps
+//! the port's `PublicationError` into this file's capture vocabulary
+//! (`From<PublicationError> for KernelCaptureError`) instead of letting the port
+//! speak in a Kernel error it cannot see.
 //!
 //! Every adapter below is a thin projection of an API an owner already
 //! publishes. None of them derives a value the owner does not publish, keeps a
@@ -46,8 +55,13 @@ use std::collections::BTreeSet;
 
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupClass, BackupError, CanonicalRecord, ExportFence,
-    HostStateAuditFence, OrsSnapshotFence, WatchdogSpoolFence, suspended_recovery_entries,
+    HostStateAuditFence, OrsSnapshotFence, PublicationError, WatchdogSpoolFence,
+    suspended_recovery_entries,
 };
+// The publication port is declared by the lower contract crate (#974 N3); the
+// Kernel re-exports it so its own public surface and existing importers keep
+// resolving the same names.
+pub use eliot_backup::{PublicationPort, PublicationReceipt, PublishedArchive};
 use eliot_contracts::StateFence;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
@@ -637,60 +651,6 @@ pub fn validate_disposition_identities(
     Ok(())
 }
 
-/// One immutable verified archive bound to its single publication operation:
-/// archive digest, operation identity, and idempotency key.
-///
-/// There is deliberately no durability field here. Durability is evidence the
-/// OWNER issues — it is [`PublicationReceipt::durable`] — and a note this owner
-/// wrote about its own publication would be a self-attested flag, not proof.
-/// The coordinator compares the owner's receipt against these three identities
-/// and nothing else.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublishedArchive {
-    /// Archive backup identity bound at build.
-    pub backup_id: String,
-    /// Deterministic digest of the complete encoded archive.
-    pub archive_sha256: String,
-    /// Publication operation identity (exactly one publish per operation).
-    pub operation_id: String,
-    /// Idempotency key binding backup identity and archive digest.
-    pub idempotency_key: String,
-}
-
-/// Durable receipt for one publication operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublicationReceipt {
-    /// Publication operation identity the receipt answers for.
-    pub operation_id: String,
-    /// Archive digest the receipt confirms as durable.
-    pub archive_sha256: String,
-    /// Whether the archive is durably recorded by the owner.
-    pub durable: bool,
-}
-
-/// Publication port over the admitted artifact/blob owner.
-///
-/// Exactly one `publish_once` call happens per admitted capture operation with
-/// the exact operation identity and idempotency key. A lost publication
-/// response reconciles the SAME operation by identity through `reconcile`:
-/// the coordinator never publishes twice, and byte-equality of two archives
-/// or a process exit code is never attribution of durability.
-pub trait PublicationPort {
-    /// Publishes the verified archive bytes exactly once under the given
-    /// operation identity and idempotency key.
-    fn publish_once(
-        &mut self,
-        operation_id: &str,
-        idempotency_key: &str,
-        bytes: &[u8],
-    ) -> Result<PublicationReceipt, KernelCaptureError>;
-
-    /// Reconciles a lost publication response by operation identity, adopting
-    /// the owner's durable receipt for the same operation without a second
-    /// publish.
-    fn reconcile(&mut self, operation_id: &str) -> Result<PublicationReceipt, KernelCaptureError>;
-}
-
 /// Typed fail-closed errors for the Kernel capture owner.
 ///
 /// Every variant refuses an effect, an admission, or a publication; none
@@ -755,6 +715,23 @@ impl KernelCaptureError {
                 BackupError::Target(detail)
             }
             Self::PublicationUnknown(_) => BackupError::RestoreRollbackRequired,
+        }
+    }
+}
+
+impl From<PublicationError> for KernelCaptureError {
+    /// The port is declared by the lower contract crate, so its failure is typed
+    /// in that crate's vocabulary and crosses into the capture vocabulary here.
+    /// The `to_backup` mapping above is unchanged and still means the same
+    /// thing: a refused publication is an owner-issued refusal, which crosses as
+    /// a target failure, and an unknown outcome is
+    /// [`KernelCaptureError::PublicationUnknown`], which crosses as
+    /// rollback-required so the caller reconciles by identity instead of
+    /// blind-retrying.
+    fn from(error: PublicationError) -> Self {
+        match error {
+            PublicationError::Refused(detail) => Self::OwnerEvidenceInvalid(detail),
+            PublicationError::Unknown(detail) => Self::PublicationUnknown(detail),
         }
     }
 }
