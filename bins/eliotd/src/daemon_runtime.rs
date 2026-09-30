@@ -2436,9 +2436,58 @@ async fn publish_maintenance_source_results(
                 );
             }
             Err(error) => {
-                // The obligation is durable on the maintenance store, so a
-                // refused publication is a pending observation, not a lost
-                // result. It is reported and retried on a later pass.
+                // Two refusals, two dispositions, and the difference is the
+                // store's own receipt.
+                //
+                // A terminal non-committed receipt means the store decided this
+                // exact publication: the writeback is unavailable, and the gap
+                // is recorded on the retained job revision through its own
+                // store. Leaving it `Pending` would report a rejection as an
+                // attempt that was never made, and the daemon has no other
+                // durable place to say so.
+                //
+                // Every other refusal — an unready composition, a transport
+                // failure, a refused identity — produced no receipt at all. The
+                // obligation stays `Pending` and is re-presented on a later
+                // pass; recording a gap for an outage would invent a refusal the
+                // store never issued.
+                if let eliotd::maintenance_trigger_evaluator::MaintenanceResultPublishError::NotAdmitted {
+                    operation_id,
+                    status,
+                    ..
+                } = &error
+                    && let Some(refused_status) = refused_receipt_status(*status)
+                    && let Some(job_ref) = &obligation.job_ref
+                    && let Some(index) =
+                        jobs.iter().position(|job| job.job_id == job_ref.as_str())
+                {
+                    let publication_id = obligation.publication_id.clone();
+                    let recorded = {
+                        let mut guard = composition.lock().await;
+                        guard.record_maintenance_observation_gap(
+                            job_ref,
+                            &publication_id,
+                            operation_id.as_str(),
+                            refused_status,
+                        )
+                    };
+                    match recorded {
+                        // The retained revision in hand is replaced so the
+                        // coverage pass below reports this refusal as the
+                        // durable gap it is, not as an unstarted attempt.
+                        Ok(job) => jobs[index] = job,
+                        Err(gap_error) => {
+                            if failure_guard.should_emit() {
+                                let _ = eliotd::diagnostics::ErrorRecord::of(
+                                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                    "maintenance-result-observation-gap",
+                                    &gap_error.to_string(),
+                                )
+                                .emit();
+                            }
+                        }
+                    }
+                }
                 if failure_guard.should_emit() {
                     let _ = eliotd::diagnostics::ErrorRecord::of(
                         eliotd::diagnostics::OwningComponent::DaemonRuntime,
@@ -2472,12 +2521,28 @@ async fn publish_maintenance_source_results(
                     eliot_maintenance::OutstandingOutcome::ObservationOwed(obligation) => (
                         obligation.job_ref,
                         obligation.publication_id,
-                        format!(
-                            "work performed ({:?}) has no admitted observation; owner={}; resolves when {}",
-                            obligation.work_performed,
-                            obligation.obligation_owner,
-                            obligation.resolution_condition,
-                        ),
+                        // A recorded coverage gap is stated as such. It is the
+                        // writeback's availability, not the work: the work that
+                        // was performed is unaffected by whether its observation
+                        // could be written back, and a gap is never reconciled
+                        // into a result.
+                        match obligation.coverage_gap_ref {
+                            Some(gap_ref) => format!(
+                                "work performed ({:?}) has no admitted observation; owner={}; resolves when {}; writeback recorded unavailable under gap {} (profile {}, reason {})",
+                                obligation.work_performed,
+                                obligation.obligation_owner,
+                                obligation.resolution_condition,
+                                gap_ref,
+                                eliot_maintenance::OBSERVATION_GAP_PROFILE,
+                                eliot_maintenance::OBSERVATION_GAP_REASON,
+                            ),
+                            None => format!(
+                                "work performed ({:?}) has no admitted observation; owner={}; resolves when {}",
+                                obligation.work_performed,
+                                obligation.obligation_owner,
+                                obligation.resolution_condition,
+                            ),
+                        },
                     ),
                     eliot_maintenance::OutstandingOutcome::RevisionUnavailable { job_ref } => (
                         job_ref,
@@ -2510,6 +2575,31 @@ async fn publish_maintenance_source_results(
                 )
                 .emit();
             }
+        }
+    }
+}
+
+/// Maps one terminal store receipt status onto the maintenance owner's refusal
+/// vocabulary, or `None` when the receipt is not a refusal at all.
+///
+/// Total over [`eliot_store_api::WriteReceiptStatus`], so a newly added status
+/// cannot silently fall through. `Committed` maps to `None` and that is the rule
+/// rather than an oversight: a committed receipt is an admission, and the
+/// maintenance owner records admissions through its own receipt transition.
+/// Mapping it to a refusal here would give one store receipt two dispositions.
+fn refused_receipt_status(
+    status: eliot_store_api::WriteReceiptStatus,
+) -> Option<eliot_maintenance::RefusedReceiptStatus> {
+    match status {
+        eliot_store_api::WriteReceiptStatus::Committed => None,
+        eliot_store_api::WriteReceiptStatus::Rejected => {
+            Some(eliot_maintenance::RefusedReceiptStatus::Rejected)
+        }
+        eliot_store_api::WriteReceiptStatus::DeadLetter => {
+            Some(eliot_maintenance::RefusedReceiptStatus::DeadLettered)
+        }
+        eliot_store_api::WriteReceiptStatus::Cancelled => {
+            Some(eliot_maintenance::RefusedReceiptStatus::Cancelled)
         }
     }
 }

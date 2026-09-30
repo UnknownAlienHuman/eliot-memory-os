@@ -83,7 +83,7 @@ use eliot_instrument_nextest::{
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, MaintenanceController, MaintenanceError,
     MaintenanceFamily, MaintenanceJob, MaintenanceJobState, MaintenanceStateStore,
-    maintenance_decision_ref,
+    RefusedReceiptStatus, maintenance_decision_ref,
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
@@ -4902,6 +4902,60 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| {
                 CompositionError::Recovery(format!(
                     "maintenance observation receipt was not admitted: {error}"
+                ))
+            })
+    }
+
+    /// Records the explicit coverage gap for one refused maintenance result
+    /// writeback, on the same Kernel durable-job ledger the transitions and
+    /// receipt admissions already write through.
+    ///
+    /// `refused_operation_id` and `refused_status` are the exact facts the
+    /// canonical route returned: a gap may only be recorded against a terminal
+    /// non-committed store receipt, because a readiness or transport refusal
+    /// produced no receipt and must leave the obligation `Pending` for a later
+    /// retry. `RefusedReceiptStatus` has no `Committed` member, so an admission
+    /// cannot be recorded here at all. The gap identity is derived by the owner
+    /// from those values together with the publication identity, so a caller
+    /// cannot name a gap it did not earn and a repeated refusal of the same
+    /// result reconciles onto the same gap instead of appending another.
+    ///
+    /// This records a coverage consequence; it never admits an observation,
+    /// never reconciles an outstanding obligation and never writes an outcome.
+    /// An already-admitted receipt under that identity is refused rather than
+    /// downgraded to a gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not ready,
+    /// and [`CompositionError::Recovery`] when the maintenance owner refuses the
+    /// gap — an unknown publication identity, a conflicting recorded gap, or an
+    /// already-admitted observation. The owner's own [`MaintenanceError`] is
+    /// preserved in the detail so a dangling publication identity stays
+    /// distinguishable from a transport failure.
+    pub fn record_maintenance_observation_gap(
+        &mut self,
+        job_id: &str,
+        publication_id: &str,
+        refused_operation_id: &str,
+        refused_status: RefusedReceiptStatus,
+    ) -> Result<MaintenanceJob, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        self.owners
+            .maintenance
+            .record_observation_gap(
+                job_id,
+                &fence,
+                publication_id,
+                refused_operation_id,
+                refused_status,
+            )
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "maintenance observation gap was not recorded: {error}"
                 ))
             })
     }
