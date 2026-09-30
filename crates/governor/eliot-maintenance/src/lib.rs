@@ -1029,6 +1029,53 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         Ok(next)
     }
 
+    /// Records that the canonical observation route admitted one result this
+    /// job owed an observation for, and persists that fact on the job revision.
+    ///
+    /// This is the only transition that makes the second of the three states
+    /// durable. Before it the retained obligation is `Pending` — the work
+    /// happened and the observation does not exist yet. After it the retained
+    /// obligation carries the exact store receipt, so a later read can tell an
+    /// admitted observation from a merely referenced one.
+    ///
+    /// It writes through the same [`MaintenanceStateStore::save`] every
+    /// lifecycle transition uses, so the receipt and the revision it settles
+    /// become durable together or in neither. It never touches the lifecycle
+    /// state, the outcome reference or any earlier obligation, so admitting an
+    /// observation cannot rewrite the execution history it observes, and it
+    /// never writes an outcome: the only value it can add is a receipt the
+    /// caller already holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] when an identity is empty,
+    /// when this job owes no result observation under `publication_id`, or
+    /// when that obligation's delivery is already recorded as unavailable;
+    /// [`MaintenanceError::IdentityConflict`] when a different receipt is
+    /// already admitted under that identity; [`MaintenanceError::FenceMismatch`]
+    /// for a stale or mismatched fence; and [`MaintenanceError::Store`] when
+    /// the port refuses the write. Replaying the same receipt is a
+    /// reconciliation and persists nothing.
+    pub fn admit_observation_receipt(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+        publication_id: &str,
+        observation_receipt_ref: &str,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
+        let job = self.load_checked(job_id, fence)?;
+        let next = outcome_observation::admit_observation_delivery(
+            &job,
+            publication_id,
+            observation_receipt_ref,
+        )?;
+        if next == job {
+            return Ok(job);
+        }
+        self.store.save(&next)?;
+        Ok(next)
+    }
+
     fn load_checked(
         &mut self,
         job_id: &str,
