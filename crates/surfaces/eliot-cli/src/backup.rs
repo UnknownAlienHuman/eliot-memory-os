@@ -1007,8 +1007,13 @@ pub struct BackupOperationOutcome {
     /// command proved no cancellation at all. Bounded owned text: no archive
     /// bytes, no key material, no secret and no archived user data.
     pub owner_cleanup_state: Option<String>,
-    /// Gates the Kernel proved, in pass order; empty when the command
-    /// proves no rehearsal gate.
+    /// Gates the Kernel proved AND admitted, in pass order; empty when the
+    /// command proves no rehearsal gate.
+    ///
+    /// Every name here is a gate the execution actually ran. A gate that needed
+    /// owner-held state and did not run is never listed here: it reaches the
+    /// operator as a named entry in `missing_obligations` instead, so this field
+    /// cannot report a gate as passed that no owner admitted.
     pub gates_passed: Vec<String>,
     /// Bounded missing or failed obligations, each naming the exact owner
     /// or field the outcome is waiting on.
@@ -1344,14 +1349,60 @@ fn envelope_optional_text<'a>(
     }
 }
 
-fn envelope_gates(response: &Value) -> Result<Vec<String>, BackupClientError> {
-    let gates = response
-        .get("gates_passed")
-        .and_then(Value::as_array)
-        .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
-    if gates.is_empty() {
+/// The route one rehearsal reply says the execution actually admitted.
+///
+/// Two disjoint sets read together from the owner's own answer: the gates that
+/// ran, and the gates the owner did not admit. Carrying both is the point — a
+/// single list cannot say which gates ran without a reader inferring it from a
+/// naming convention, and a naming convention is exactly what let a deferred
+/// gate be reported as a passed one.
+struct ExecutedRoute<'a> {
+    /// Gates the execution ran and the owner admitted, in pass order.
+    passed: &'a [String],
+    /// Gates the owner did not admit, reported as outstanding obligations.
+    not_admitted: &'a [String],
+}
+
+/// Reads the executed route out of one rehearsal reply, as two disjoint sets.
+///
+/// `gates_passed` must name at least one gate (a rehearsal that proved nothing
+/// is not a rehearsal) and `gates_not_admitted` may be empty, but the two must
+/// NOT overlap. That overlap check is the whole point of reading them together:
+/// before this split, the two owner-held gates were emitted inside
+/// `gates_passed` with a `-deferred` suffix, so the projection reported eight
+/// "passed" gates of which two had provably not run, and a reader had no way to
+/// tell a passed gate from a deferred one without parsing a suffix. A reply that
+/// now lists one gate in both sets is exactly that contradiction reappearing, and
+/// it is refused rather than rendered.
+///
+/// The returned pair is the route the EXECUTION admitted, read from the owner's
+/// own answer. Neither set is checked against a list this surface holds, because
+/// a gate list validated against a copy of the producer's own list proves
+/// nothing about what ran; the only structural property asserted is the one the
+/// producer can contradict, which is that a gate did not both run and not run.
+fn envelope_executed_route(
+    response: &Value,
+) -> Result<(Vec<String>, Vec<String>), BackupClientError> {
+    let passed = envelope_gate_list(response, "gates_passed")?;
+    if passed.is_empty() {
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
+    let not_admitted = envelope_gate_list(response, "gates_not_admitted")?;
+    if passed.iter().any(|gate| not_admitted.contains(gate)) {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    }
+    Ok((passed, not_admitted))
+}
+
+/// Reads one bounded gate-name array from a reply envelope.
+fn envelope_gate_list(
+    response: &Value,
+    field: &'static str,
+) -> Result<Vec<String>, BackupClientError> {
+    let gates = response
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
     gates
         .iter()
         .map(|gate| {
@@ -2456,10 +2507,29 @@ pub fn backup_restore_test(
     envelope_command(&response, BACKUP_RESTORE_TEST_OPERATION)?;
     envelope_idempotency(&response, &request.request)?;
     let wire_status = envelope_status(&response)?;
+    // The route the execution actually admitted is read ONCE, here, before the
+    // reply is graded, and it is the grading input for the `blocked` band. It is
+    // read from the owner's own answer rather than reconstructed from the
+    // status, so the band this surface may claim is set by gates that provably
+    // ran and by gates the owner provably did not admit. A reply that does not
+    // carry the route at all yields `None`, which only the `blocked` arm accepts,
+    // so a richer status can never borrow another status's route to justify a
+    // ceiling.
+    let route_parts = if wire_status == BACKUP_STATE_BLOCKED {
+        Some(envelope_executed_route(&response)?)
+    } else {
+        None
+    };
+    let executed_route = route_parts
+        .as_ref()
+        .map(|(passed, not_admitted)| ExecutedRoute {
+            passed: passed.as_slice(),
+            not_admitted: not_admitted.as_slice(),
+        });
     // The reply is graded BEFORE any state or proven level is decided, so no
     // owner answer below is projected on the strength of a status this surface
     // has not first related to the catalogue row read above.
-    let claim = restore_test_claim(wire_status)?;
+    let claim = restore_test_claim(wire_status, executed_route.as_ref())?;
     // A successful exit is not this operation's own answer state: `ok` is the
     // only status here that is never a domain verdict, so the unknown state is
     // the single honest one for it. This mirrors the verify path's mapping and
@@ -2542,11 +2612,19 @@ pub fn backup_restore_test(
             if envelope_text(&response, "code")? != "plan_gap" {
                 return Err(BackupClientError::Client(CliError::ResultMismatch));
             }
-            outcome.gates_passed = envelope_gates(&response)?;
+            // The route read above, which `restore_test_claim` already required
+            // to be non-empty on the passed side and disjoint across both sides.
+            // Only the admitted half is reported as `gates_passed`; the gates the
+            // owner did NOT admit each become a bounded missing obligation,
+            // because a gate no owner admitted is an outstanding obligation and
+            // never a passed one.
+            let route = executed_route
+                .as_ref()
+                .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
+            outcome.gates_passed = route.passed.to_vec();
             // The Kernel's own owner name comes first, unresolved, exactly as
-            // the reply wrote it. The second entry is this surface's own
-            // bounded declaration obligation, not an owner answer: the
-            // `source:`/`destination:` lines above are what the request
+            // the reply wrote it. The declaration obligation is this surface's
+            // own: the `source:`/`destination:` lines above are what the request
             // declared, and no owner provisioned, admitted or issued either
             // identity, so the projection must not read as a provisioned
             // destination or an admitted source.
@@ -2554,6 +2632,11 @@ pub fn backup_restore_test(
                 envelope_text(&response, "missing_owner")?.to_owned(),
                 RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION.to_owned(),
             ];
+            for gate in route.not_admitted {
+                outcome
+                    .missing_obligations
+                    .push(format!("{RESTORE_TEST_GATE_OBLIGATION}: {gate}"));
+            }
             envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
         }
         BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED => {
@@ -2589,14 +2672,21 @@ pub fn backup_restore_test(
 /// Today's Kernel restore-test reply carries no effect class, no proof ceiling
 /// and no lifecycle-stage field: `handle_backup_restore_test` answers with the
 /// base envelope plus, for a blocked rehearsal, `code`, `missing_owner`,
-/// `reason` and `gates_passed` (`bins/eliot-kernel/src/request_dispatch.rs`).
-/// This claim is therefore graded from what the reply DOES carry — its
-/// `status`, and the stage that status together with the fields it is answered
-/// with actually evidences — and never from a field the owner did not send. No
-/// digest, receipt or synthetic ceiling is invented to make the relation look
-/// complete; the values below are the protocol owners' own [`BackupStage`],
-/// [`ProofCeiling`] and [`EffectClass`] members, and each arm names the
-/// strongest classification its status can honestly be read as.
+/// `reason`, `gates_passed` and `gates_not_admitted`
+/// (`bins/eliot-kernel/src/request_dispatch.rs`). This claim is therefore graded
+/// from what the reply DOES carry — its `status`, and the stage that status
+/// together with the fields it is answered with actually evidences — and never
+/// from a field the owner did not send. No digest, receipt or synthetic ceiling
+/// is invented to make the relation look complete; the values below are the
+/// protocol owners' own [`BackupStage`], [`ProofCeiling`] and [`EffectClass`]
+/// members, and each arm names the strongest classification its status can
+/// honestly be read as.
+///
+/// What bounds the `blocked` arm is [`envelope_executed_route`], not this table:
+/// the band it may claim is reached only because the reply's admitted route was
+/// read and checked to be disjoint from the route the owner did not admit, so
+/// the ceiling is set by gates that provably ran rather than by a gate list this
+/// surface restates.
 struct RestoreTestClaim {
     /// Furthest lifecycle stage this answer actually evidences.
     stage: BackupStage,
@@ -2613,19 +2703,42 @@ struct RestoreTestClaim {
 /// evidences that much and no more. A status outside the graded closed set is a
 /// typed result mismatch here, exactly as in [`envelope_status`]: a status this
 /// surface cannot name is a status it cannot bound.
-fn restore_test_claim(status: &str) -> Result<RestoreTestClaim, BackupClientError> {
+///
+/// The `blocked` arm is additionally gated on the reply's OWN executed route
+/// rather than on the status token alone, and that is what keeps this table from
+/// being today's hard-coded limited state standing in for a structural check.
+/// A `blocked` answer is graded at the candidate band only when the owner both
+/// admitted at least one gate AND named at least one gate it did not admit: the
+/// first is what earns the band and the second is what caps it. A `blocked`
+/// reply that claims an empty not-admitted set is saying it refused while
+/// admitting its whole route, and there is no reading of that which supports any
+/// band above the observation floor, so it is refused rather than rendered at a
+/// ceiling the owner's own answer contradicts.
+fn restore_test_claim(
+    status: &str,
+    executed_route: Option<&ExecutedRoute<'_>>,
+) -> Result<RestoreTestClaim, BackupClientError> {
     let claim = match status {
-        // The rehearsal's shape gates ran for real and the reply enumerates
-        // them, so this answer is bounded by exactly the band the catalogue row
-        // declares: a candidate-shaped rehearsal with no owner evidence behind
-        // it. A plan gap is the ABSENCE of a named owner, never a lifecycle
-        // advance, so the evidenced stage stays `Requested` even though the
-        // gates passed.
-        BACKUP_STATE_BLOCKED => RestoreTestClaim {
-            stage: BackupStage::Requested,
-            proof: ProofCeiling::CandidateArtifact,
-            effect: EffectClass::Candidate,
-        },
+        // The rehearsal's shape gates ran for real and the reply enumerates the
+        // ones that did, so this answer is bounded by exactly the band the
+        // catalogue row declares: a candidate-shaped rehearsal with no owner
+        // evidence behind it. A plan gap is the ABSENCE of a named owner, never
+        // a lifecycle advance, so the evidenced stage stays `Requested` even
+        // though the admitted gates passed. The gates the owner did NOT admit
+        // are reported as obligations, not folded into this ceiling — they are
+        // the reason the band stops where it does.
+        BACKUP_STATE_BLOCKED => {
+            let route =
+                executed_route.ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
+            if route.not_admitted.is_empty() {
+                return Err(BackupClientError::Client(CliError::ResultMismatch));
+            }
+            RestoreTestClaim {
+                stage: BackupStage::Requested,
+                proof: ProofCeiling::CandidateArtifact,
+                effect: EffectClass::Candidate,
+            }
+        }
         // Every remaining admitted status — a successful transport/exit, an
         // invalid request, a refusal, a cancellation — reports that this
         // operation did not run to any proven lifecycle step. The `ok` case is
@@ -2729,3 +2842,14 @@ fn require_restore_test_ceiling(
 /// of adding a new field to an outcome shared with create and verify. It is
 /// not an owner answer, not a receipt, and it never mints an identity.
 const RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION: &str = "request-declared source and destination identities are not owner-provisioned or owner-admitted";
+
+/// Prefix of the per-gate obligation reported for a gate the owner did NOT
+/// admit, one entry per such gate.
+///
+/// The Kernel's `gates_not_admitted` names gates it did not run; each becomes
+/// its own bounded `missing_obligation` so an operator reads which gate is
+/// outstanding rather than being told only that "some" owner-held gate was
+/// deferred. It is phrased as an obligation, not as a failure: the gate did not
+/// run because the owner state it needs does not exist yet, and the projection
+/// must not read as though the owner rejected it.
+const RESTORE_TEST_GATE_OBLIGATION: &str = "rehearsal gate not admitted by any owner";
