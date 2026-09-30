@@ -91,7 +91,8 @@ use eliot_contracts::{ArtifactId, ClockReading, ContractId, RequestMetadata};
 use eliot_evaluation_contracts::{
     ComparisonBasis, HumanAttentionClaim, HumanAttentionClaimApplicability,
     HumanAttentionClaimBasis, HumanAttentionClaimCaveat, HumanAttentionClaimKind,
-    HumanAttentionEvidenceKind, HumanAttentionMethod, HumanAttentionMetric,
+    HumanAttentionEvidenceKind, HumanAttentionEvidenceRead, HumanAttentionMethod,
+    HumanAttentionMetric, HumanAttentionSourceBinding,
 };
 use eliot_read::{
     BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
@@ -1348,9 +1349,12 @@ fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) ->
 //
 // W3, bounded owner evidence: [`assemble_human_attention_evidence`] takes the
 // caller-nominated named reads of notification delivery/disposition, exact
-// expiring approvals, task/verifier/outcome, and privacy records, binds their
-// owner-issued source revisions and the evaluation window consistently, and
-// returns either a complete package or a partial package carrying the exact
+// expiring approvals, task/verifier/outcome, and privacy records, binds the
+// exact per-read source revisions the shared evaluation owner consumes for
+// each slot (delivery and disposition stay distinct reads with distinct
+// revisions, and so do approval/telemetry, task/verifier, and
+// privacy/telemetry) alongside the evaluation window consistently, and returns
+// either a complete package or a partial package carrying the exact
 // gaps. A missing read is an explicit [`HumanAttentionReadPresentation::Unavailable`]
 // entry with its reason, so unavailable evidence yields a partial/inconclusive
 // assembly with exact gaps, never synthetic zeros: this section invents no
@@ -1424,6 +1428,33 @@ impl HumanAttentionReadSlot {
             Self::PrivacyRecords => "privacy_records",
         }
     }
+
+    /// Exact owner reads this slot binds, in binding order.
+    ///
+    /// Mirrors the shared evaluation owner's read split one-for-one: delivery
+    /// and disposition carry distinct revisions, the approval boundary joins
+    /// its approval revision with its telemetry revision, task outcomes join
+    /// the task read with the verifier read, and privacy joins its record
+    /// revision with its telemetry revision. The assembly requires exactly
+    /// this set with exact revisions, so the bound package lines up with the
+    /// record's source bindings instead of conflating independent owner
+    /// revisions into one.
+    #[must_use]
+    pub fn owner_reads(self) -> &'static [HumanAttentionEvidenceRead] {
+        use HumanAttentionEvidenceRead as OwnerRead;
+        match self {
+            Self::NotificationDeliveryDisposition => &[
+                OwnerRead::NotificationDelivery,
+                OwnerRead::NotificationDisposition,
+            ],
+            Self::ExpiringApprovals => &[
+                OwnerRead::ExpiringApproval,
+                OwnerRead::TelemetryCollection,
+            ],
+            Self::TaskVerifierOutcome => &[OwnerRead::TaskOutcome, OwnerRead::TaskVerifier],
+            Self::PrivacyRecords => &[OwnerRead::PrivacyRecord, OwnerRead::TelemetryCollection],
+        }
+    }
 }
 
 impl fmt::Display for HumanAttentionReadSlot {
@@ -1434,17 +1465,19 @@ impl fmt::Display for HumanAttentionReadSlot {
 
 /// One caller-nominated named owner read.
 ///
-/// The caller presents the exact owner-issued source revision it read and the
-/// evaluation window the read was taken for. The Governor binds them; it never
-/// re-reads the owner, never authorizes the access, and never declares the
-/// read complete.
+/// The caller presents the exact per-read source revisions it read — one
+/// [`HumanAttentionSourceBinding`] for each owner read in
+/// [`HumanAttentionReadSlot::owner_reads`] — and the evaluation window the
+/// reads were taken for. The Governor binds them; it never re-reads the
+/// owner, never authorizes the access, and never declares the read complete.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NominatedHumanAttentionRead {
     /// Which of the four named slots this nomination fills.
     pub read: HumanAttentionReadSlot,
-    /// Exact owner-issued source revision the caller read.
-    pub source_revision: String,
+    /// Exact owner-issued source revisions the caller read, exactly the
+    /// slot's owner reads each with an exact revision.
+    pub source_bindings: Vec<HumanAttentionSourceBinding>,
     /// Evaluation window the read was taken for; must equal the request window.
     pub window_ref: ContractId,
     /// Evidence artifacts the caller nominates from that read. A present read
@@ -1497,8 +1530,9 @@ pub struct HumanAttentionEvidenceRequest {
 pub struct BoundHumanAttentionRead {
     /// Which named slot this read fills.
     pub read: HumanAttentionReadSlot,
-    /// Exact owner-issued source revision the caller read.
-    pub source_revision: String,
+    /// Exact owner-issued source revisions the caller read, exactly the
+    /// slot's owner reads each with an exact revision.
+    pub source_bindings: Vec<HumanAttentionSourceBinding>,
     /// Evidence artifacts the caller nominated, in nomination order.
     pub evidence_refs: Vec<ArtifactId>,
     /// Contract evidence kinds this read feeds.
@@ -1599,6 +1633,15 @@ pub enum HumanAttentionEvaluationError {
     WindowMismatch {
         /// Slot whose window disagrees with the request window.
         read: HumanAttentionReadSlot,
+    },
+    /// A nominated read does not bind exactly its slot's owner reads, each
+    /// with an exact revision.
+    #[error("nominated {read} must bind exactly its owner reads: {expected:?}")]
+    WrongSourceBindings {
+        /// Slot whose source bindings are not exactly its owner reads.
+        read: HumanAttentionReadSlot,
+        /// Owner reads the slot requires, in binding order.
+        expected: Vec<HumanAttentionEvidenceRead>,
     },
     /// The assembly is partial; the missing slots travel with the refusal.
     #[error("evidence assembly is partial; no complete package was produced")]
@@ -1736,9 +1779,9 @@ pub struct HumanAttentionComparisonInput<'a> {
 /// Assemble bounded owner evidence for one evaluation window.
 ///
 /// This is the W3 producer: a pure function of the caller-nominated reads. It
-/// binds source revisions and the evaluation window consistently, keeps every
-/// nominated artifact unchanged, and turns each unavailable read into an exact
-/// gap. Missing evidence never becomes a zero, a denominator, or an
+/// binds the exact per-read source revisions and the evaluation window
+/// consistently, keeps every nominated artifact unchanged, and turns each
+/// unavailable read into an exact gap. Missing evidence never becomes a zero, a denominator, or an
 /// observation; it becomes a [`HumanAttentionEvidenceGap`] the persistence leg
 /// records as an explicit unknown with its reason.
 ///
@@ -1864,10 +1907,7 @@ fn bind_human_attention_slot(
                     presented: nominated.read,
                 });
             }
-            require_attention_text(
-                &nominated.source_revision,
-                "human_attention_evidence.read.source_revision",
-            )?;
+            check_source_bindings(nominated.read, &nominated.source_bindings)?;
             if nominated.window_ref != *window_ref {
                 return Err(HumanAttentionEvaluationError::WindowMismatch {
                     read: nominated.read,
@@ -1893,7 +1933,7 @@ fn bind_human_attention_slot(
             }
             bound_reads.push(BoundHumanAttentionRead {
                 read: nominated.read,
-                source_revision: nominated.source_revision.clone(),
+                source_bindings: nominated.source_bindings.clone(),
                 evidence_refs: nominated.evidence_refs.clone(),
                 evidence_kinds: nominated.evidence_kinds.clone(),
             });
@@ -1908,6 +1948,39 @@ fn bind_human_attention_slot(
             Ok(())
         }
     }
+}
+
+/// Checks that a nomination binds exactly its slot's owner reads.
+///
+/// Each binding must name one of the slot's
+/// [`HumanAttentionReadSlot::owner_reads`] with an exact non-blank revision,
+/// with no missing, foreign, or repeated owner read. The check keeps the
+/// Governor package aligned with the source bindings the shared evaluation
+/// owner assembles into the record: delivery and disposition, approval and
+/// telemetry, task and verifier, and privacy and telemetry revisions are
+/// never conflated into one.
+fn check_source_bindings(
+    read: HumanAttentionReadSlot,
+    bindings: &[HumanAttentionSourceBinding],
+) -> Result<(), HumanAttentionEvaluationError> {
+    let expected = read.owner_reads();
+    let exact = bindings.len() == expected.len()
+        && expected
+            .iter()
+            .all(|expected_read| bindings.iter().filter(|b| b.read == *expected_read).count() == 1);
+    if !exact {
+        return Err(HumanAttentionEvaluationError::WrongSourceBindings {
+            read,
+            expected: expected.to_vec(),
+        });
+    }
+    for binding in bindings {
+        require_attention_text(
+            &binding.source_revision,
+            "human_attention_evidence.read.source_revision",
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_claim_support(
