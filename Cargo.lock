@@ -1146,6 +1146,7 @@ dependencies = [
  "eliot-improvement",
  "eliot-reactive-context-plan",
  "eliot-receipts",
+ "eliot-security-contracts",
  "serde",
 ]
 
