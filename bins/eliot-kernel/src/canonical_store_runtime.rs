@@ -439,14 +439,9 @@ impl KernelComposition {
                 route.active_generation().value()
             ),
         );
-        let evidence = self
-            .canonical_store_evidence
-            .clone()
-            .ok_or_else(|| {
-                KernelBuildError::Service(
-                    "canonical Store evidence provider is unavailable".to_owned(),
-                )
-            })?;
+        let evidence = self.canonical_store_evidence.clone().ok_or_else(|| {
+            KernelBuildError::Service("canonical Store evidence provider is unavailable".to_owned())
+        })?;
         let gateway = Arc::new(KernelStoreGateway::new_with_evidence(
             self.service.clone(),
             Arc::new(client),
