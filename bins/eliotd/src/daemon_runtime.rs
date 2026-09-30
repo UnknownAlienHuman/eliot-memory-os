@@ -4880,9 +4880,9 @@ async fn submit_local_read_result_idempotent(
     }
 }
 
-/// Submits the exact retained committed Observe receipt body. A retry reuses
-/// the same receipt reference, response bytes and claimed attempt; it cannot
-/// rerun capture or turn an unknown effect into a deferral.
+/// Submits the exact retained staged or terminal Observe body. A retry reuses
+/// the same response bytes and claimed attempt; it cannot rerun capture or
+/// turn a staged/committed effect into a no-effect deferral.
 async fn submit_observe_result_idempotent(
     kernel: &DaemonKernelClient,
     body: &eliot_protocol::HostRequestResultBody,
@@ -4908,6 +4908,8 @@ enum ObservePollOutcome {
     Settled,
     Expired,
     StaleAttempt,
+    StagedPending,
+    ReceiptPending,
     ReconciliationRequired,
 }
 
@@ -4932,6 +4934,31 @@ struct ObserveStep {
     residual_owner: Option<&'static str>,
     /// Exact condition that resumes the deferred pair (`None` on an empty claim).
     resume: Option<&'static str>,
+    /// Exact claim and prepared capture retained across staged receipt polling.
+    pending: Option<PendingObserveCapture>,
+}
+
+/// Original admitted pair and exact Governor-prepared capture retained after
+/// Store durably stages its operation. Receipt polling never rebuilds or
+/// re-exchanges this capture under another identity.
+struct PendingObserveCapture {
+    claimed: eliotd::ObserveClaimedPair,
+    prepared: eliot_governor::PreparedMcpObservation,
+    staged_body: HostRequestResultBody,
+    stage_acknowledged: bool,
+    terminal_body: Option<HostRequestResultBody>,
+    suboperation: &'static str,
+    owner_capability: &'static str,
+    residual_owner: &'static str,
+    resume: &'static str,
+}
+
+enum PreparedObserveCapture {
+    Terminal(HostRequestResultBody),
+    Staged {
+        body: HostRequestResultBody,
+        prepared: eliot_governor::PreparedMcpObservation,
+    },
 }
 
 struct ObserveFlightState {
@@ -4939,16 +4966,19 @@ struct ObserveFlightState {
 }
 
 /// Sole owner of observe poll state in `run_loop`, mirroring
-/// [`LocalReadFlight`]. `Idle` means no observe work is outstanding;
-/// `InFlight` holds the one pending poll step. No second owner and no second
-/// concurrent observe step exist.
+/// [`LocalReadFlight`]. `Idle` permits a fresh claim, `Staged` retains one
+/// original claim/prepared capture while its receipt is pending, and
+/// `InFlight` holds the one poll step. No second owner or concurrent observe
+/// step exists.
 enum ObserveFlight {
     Idle,
+    Staged(PendingObserveCapture),
     InFlight(ObserveFlightState),
 }
 
-/// Pure tick gate: the observe timer starts work only when the flight is
-/// idle. The in-flight step is polled in its own `select!` branch.
+/// Pure tick gate: the observe timer starts work when the flight is idle or
+/// resumes its retained staged operation. The in-flight step is polled in its
+/// own `select!` branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObserveTickDecision {
     StartPoll,
@@ -4957,7 +4987,7 @@ enum ObserveTickDecision {
 
 fn decide_observe_tick(flight: &ObserveFlight) -> ObserveTickDecision {
     match flight {
-        ObserveFlight::Idle => ObserveTickDecision::StartPoll,
+        ObserveFlight::Idle | ObserveFlight::Staged(_) => ObserveTickDecision::StartPoll,
         ObserveFlight::InFlight(_) => ObserveTickDecision::SkipInFlight,
     }
 }
@@ -4981,27 +5011,79 @@ fn maybe_start_observe_poll(
     composition: &SharedComposition,
     flight: &mut ObserveFlight,
 ) {
-    if decide_observe_tick(flight) == ObserveTickDecision::StartPoll {
-        *flight = ObserveFlight::InFlight(ObserveFlightState {
-            future: start_observe_poll(kernel, composition),
-        });
+    if decide_observe_tick(flight) == ObserveTickDecision::SkipInFlight {
+        return;
+    }
+    let current = std::mem::replace(flight, ObserveFlight::Idle);
+    let future = match current {
+        ObserveFlight::Idle => start_observe_poll(kernel, composition),
+        ObserveFlight::Staged(pending) => {
+            start_staged_observe_poll(kernel, composition, pending)
+        }
+        ObserveFlight::InFlight(state) => {
+            *flight = ObserveFlight::InFlight(state);
+            return;
+        }
+    };
+    *flight = ObserveFlight::InFlight(ObserveFlightState { future });
+}
+
+fn start_staged_observe_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    pending: PendingObserveCapture,
+) -> Pin<Box<dyn std::future::Future<Output = ObserveCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    let composition_clone = Arc::clone(composition);
+    Box::pin(async move {
+        ObserveCompletion::Settled(
+            run_staged_observe_poll(&kernel_clone, &composition_clone, pending).await,
+        )
+    })
+}
+
+fn pending_observe_step(
+    outcome: ObservePollOutcome,
+    pending: PendingObserveCapture,
+) -> ObserveStep {
+    ObserveStep {
+        outcome,
+        suboperation: Some(pending.suboperation),
+        owner_capability: Some(pending.owner_capability),
+        residual_owner: Some(pending.residual_owner),
+        resume: Some(pending.resume),
+        pending: Some(pending),
     }
 }
 
-/// Polls the one in-flight observe step, pending forever while idle so
-/// health and shutdown stay pollable with no step outstanding.
+fn settled_staged_observe_step(
+    outcome: ObservePollOutcome,
+    pending: &PendingObserveCapture,
+) -> ObserveStep {
+    ObserveStep {
+        outcome,
+        suboperation: Some(pending.suboperation),
+        owner_capability: Some(pending.owner_capability),
+        residual_owner: Some(pending.residual_owner),
+        resume: None,
+        pending: None,
+    }
+}
+
+/// Polls the one in-flight observe step, pending while idle or staged so
+/// health and shutdown stay pollable between normal cadence ticks.
 async fn next_observe_completion(flight: &mut ObserveFlight) -> ObserveCompletion {
     match flight {
-        ObserveFlight::Idle => std::future::pending::<ObserveCompletion>().await,
+        ObserveFlight::Idle | ObserveFlight::Staged(_) => {
+            std::future::pending::<ObserveCompletion>().await
+        }
         ObserveFlight::InFlight(state) => (&mut state.future).await,
     }
 }
 
-/// Settles one completed observe step back to idle. Every outcome — null-poll
-/// backoff, honest deferral, settled record, the expected expiry race, or a
-/// stale attempt quarantine (the next claim mints or returns the current
-/// generation) — simply idles until the next tick; only a step failure fails
-/// the daemon closed.
+/// Settles one completed observe step back to idle or retains its staged
+/// continuation. A settled receipt idles; a nonterminal staged result keeps
+/// the same claim and prepared capture for the next cadence tick.
 fn settle_observe_completion(
     completion: ObserveCompletion,
     flight: &mut ObserveFlight,
@@ -5017,7 +5099,10 @@ fn settle_observe_completion(
                 residual_owner = step.residual_owner.unwrap_or("none"),
                 resume = step.resume.unwrap_or("none"),
             );
-            *flight = ObserveFlight::Idle;
+            *flight = step
+                .pending
+                .map(ObserveFlight::Staged)
+                .unwrap_or(ObserveFlight::Idle);
             Ok(())
         }
         ObserveCompletion::Settled(Err(error)) => Err(error),
@@ -5031,6 +5116,8 @@ fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
         ObservePollOutcome::Settled => "settled",
         ObservePollOutcome::Expired => "expired",
         ObservePollOutcome::StaleAttempt => "stale_attempt",
+        ObservePollOutcome::StagedPending => "staged_pending",
+        ObservePollOutcome::ReceiptPending => "receipt_pending",
         ObservePollOutcome::ReconciliationRequired => "reconciliation_required",
     }
 }
@@ -5038,9 +5125,11 @@ fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
 /// Runs one observe poll step: `semantic_observe_claim` (pair plus fenced
 /// attempt capability, or null meaning backoff), then
 /// [`serve_admitted_observe`] for the admitted pair under that attempt. Capture
-/// exchanges a prepared canonical transition and submits its checked receipt;
-/// non-capture deferrals mark the already-published pair Unknown and require
-/// reconciliation. A claimed pair is never relabeled as no-effect or requeued.
+/// exchanges one prepared canonical transition. A staged outcome retains that
+/// exact claim and prepared capture in the Observe flight until the Kernel
+/// receipt port returns its terminal receipt; non-capture deferrals mark the
+/// published pair Unknown and require reconciliation. A claimed pair is never
+/// relabeled as no-effect or requeued.
 async fn run_observe_poll(
     kernel: &DaemonKernelClient,
     composition: &SharedComposition,
@@ -5059,6 +5148,7 @@ async fn run_observe_poll(
             owner_capability: None,
             residual_owner: None,
             resume: None,
+            pending: None,
         });
     };
     let envelope = &claimed.envelope;
@@ -5074,10 +5164,11 @@ async fn run_observe_poll(
         owner_capability: Some(deferral.owner_capability),
         residual_owner: Some(deferral.residual_owner),
         resume: (outcome != ObservePollOutcome::ReconciliationRequired).then_some(deferral.resume),
+        pending: None,
     };
     if deferral.suboperation == eliotd::governor_observe_serve::ObserveSuboperation::Observation {
-        let body = match prepare_observation_capture(kernel, composition, claimed).await {
-            Ok(body) => body,
+        let prepared_capture = match prepare_observation_capture(kernel, composition, &claimed).await {
+            Ok(prepared_capture) => prepared_capture,
             Err(error) => {
                 kernel
                     .defer_observe_claim_async(&operation_id, &request_digest, attempt)
@@ -5088,6 +5179,49 @@ async fn run_observe_poll(
                         )
                     })?;
                 return Ok(step(ObservePollOutcome::ReconciliationRequired));
+            }
+        };
+        let body = match prepared_capture {
+            PreparedObserveCapture::Terminal(body) => body,
+            PreparedObserveCapture::Staged { body, prepared } => {
+                let staged_submission: eliot_store_api::WriteSubmission = serde_json::from_value(
+                    body.response
+                        .get("submission")
+                        .cloned()
+                        .ok_or_else(|| "staged Observe response omits its submission".to_owned())?,
+                )
+                .map_err(|error| format!("staged Observe submission cannot decode: {error}"))?;
+                let pending = PendingObserveCapture {
+                    claimed,
+                    prepared,
+                    staged_body: body,
+                    stage_acknowledged: false,
+                    terminal_body: None,
+                    suboperation: deferral.suboperation.as_str(),
+                    owner_capability: deferral.owner_capability,
+                    residual_owner: deferral.residual_owner,
+                    resume: deferral.resume,
+                };
+                let mut pending = pending;
+                let outcome = match submit_observe_result_idempotent(
+                    kernel,
+                    &pending.staged_body,
+                )
+                .await
+                {
+                    Ok(eliotd::ObserveSubmitOutcome::Staged(ack))
+                        if *ack == staged_submission =>
+                    {
+                        pending.stage_acknowledged = true;
+                        ObservePollOutcome::StagedPending
+                    }
+                    // A staged write already has a durable Store owner. Keep
+                    // this exact claim and prepared capture across ticks; a
+                    // failed stage ACK must never defer it as no-effect or
+                    // cause a second capture admission.
+                    Ok(_) | Err(_) => ObservePollOutcome::ReconciliationRequired,
+                };
+                return Ok(pending_observe_step(outcome, pending));
             }
         };
         let outcome = match submit_observe_result_idempotent(kernel, &body).await {
@@ -5122,6 +5256,113 @@ async fn run_observe_poll(
     Ok(step(outcome))
 }
 
+/// Continues one retained staged Observe operation on a normal poll tick.
+/// Until the exact Kernel `receipt` port returns a committed receipt, this
+/// keeps the original claim and prepared capture in the sole Observe flight.
+/// Submission retries reuse the same staged or terminal body byte-for-byte;
+/// the canonical capture is never replanned or exchanged again.
+async fn run_staged_observe_poll(
+    kernel: &DaemonKernelClient,
+    composition: &SharedComposition,
+    mut pending: PendingObserveCapture,
+) -> Result<ObserveStep, String> {
+    if !pending.stage_acknowledged {
+        let expected: eliot_store_api::WriteSubmission = serde_json::from_value(
+            pending
+                .staged_body
+                .response
+                .get("submission")
+                .cloned()
+                .ok_or_else(|| "retained staged Observe body omits its submission".to_owned())?,
+        )
+        .map_err(|error| format!("retained staged Observe submission cannot decode: {error}"))?;
+        match submit_observe_result_idempotent(kernel, &pending.staged_body).await {
+            Ok(eliotd::ObserveSubmitOutcome::Staged(ack)) if *ack == expected => {
+                pending.stage_acknowledged = true;
+            }
+            // Preserve the exact prepared operation through an ambiguous or
+            // stale ACK. It has already been durably staged; deferring it as
+            // no-effect would discard the only context that can accept its
+            // eventual receipt.
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    if pending.terminal_body.is_none() {
+        let expected_operation = host_request_operation_id(&pending.claimed.envelope);
+        if pending.claimed.attempt.operation_id != expected_operation {
+            return Err("retained staged Observe attempt changed its original operation".to_owned());
+        }
+        let operation_id = OperationId::new(expected_operation)
+            .map_err(|error| format!("retained staged Observe operation is invalid: {error}"))?;
+        let receipt = match kernel.receipt(operation_id).await {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                return Ok(pending_observe_step(
+                    ObservePollOutcome::ReconciliationRequired,
+                    pending,
+                ));
+            }
+        };
+        let Some(receipt) = receipt else {
+            return Ok(pending_observe_step(
+                if pending.stage_acknowledged {
+                    ObservePollOutcome::ReceiptPending
+                } else {
+                    ObservePollOutcome::ReconciliationRequired
+                },
+                pending,
+            ));
+        };
+        if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
+            return Err("staged Observe receipt lookup returned a noncommitted receipt".to_owned());
+        }
+        let services = ObserveCaptureServices {
+            kernel,
+            composition,
+        };
+        let completion = match accept_governed_capture(&services, &pending.prepared, receipt).await {
+            Ok(completion) => completion,
+            Err(_) => {
+                return Ok(pending_observe_step(
+                    ObservePollOutcome::ReconciliationRequired,
+                    pending,
+                ));
+            }
+        };
+        let retained = retain_observe_capture(&pending.claimed)?;
+        let terminal_body = render_observe_completion(&retained, completion);
+        drop(retained);
+        pending.terminal_body = match terminal_body {
+            Ok(body) => Some(body),
+            Err(_) => {
+                return Ok(pending_observe_step(
+                    ObservePollOutcome::ReconciliationRequired,
+                    pending,
+                ));
+            }
+        };
+    }
+
+    let body = pending
+        .terminal_body
+        .as_ref()
+        .ok_or_else(|| "staged Observe receipt completion body was not retained".to_owned())?;
+    match submit_observe_result_idempotent(kernel, body).await {
+        Ok(eliotd::ObserveSubmitOutcome::Accepted) => Ok(settled_staged_observe_step(
+            ObservePollOutcome::Settled,
+            &pending,
+        )),
+        // The committed receipt is already known. Preserve the exact terminal
+        // body and original capture on any nonterminal/ambiguous Host response
+        // so a later normal tick can retry only that same result.
+        Ok(_) | Err(_) => Ok(pending_observe_step(
+            ObservePollOutcome::ReconciliationRequired,
+            pending,
+        )),
+    }
+}
+
 struct ObserveCaptureServices<'a> {
     kernel: &'a DaemonKernelClient,
     composition: &'a SharedComposition,
@@ -5150,7 +5391,7 @@ async fn prepare_observation_capture(
     kernel: &DaemonKernelClient,
     composition: &SharedComposition,
     claimed: &eliotd::ObserveClaimedPair,
-) -> Result<HostRequestResultBody, String> {
+) -> Result<PreparedObserveCapture, String> {
     let services = ObserveCaptureServices {
         kernel,
         composition,
@@ -5181,11 +5422,14 @@ async fn prepare_observation_capture(
     match exchange_governed_capture(&services, &retained, &admitted, &prepared).await? {
         eliot_store_api::PreparedWriteOutcome::Staged(submission) => {
             let source = observe_original_write_submission(&retained.claimed.tool)?;
-            render_staged_observe_submission(&retained, &prepared, &source, *submission)
+            Ok(PreparedObserveCapture::Staged {
+                body: render_staged_observe_submission(&retained, &prepared, &source, *submission)?,
+                prepared,
+            })
         }
         eliot_store_api::PreparedWriteOutcome::Receipt(receipt) => {
             let completion = accept_governed_capture(&services, &prepared, *receipt).await?;
-            render_observe_completion(&retained, completion)
+            render_observe_completion(&retained, completion).map(PreparedObserveCapture::Terminal)
         }
     }
 }

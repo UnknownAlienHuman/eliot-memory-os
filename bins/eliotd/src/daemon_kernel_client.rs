@@ -1051,12 +1051,17 @@ pub fn parse_local_read_submit_outcome(
 }
 
 /// Typed outcome of one `semantic_observe_result` submit (issue #2565).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObserveSubmitOutcome {
     /// Kernel persisted the body through the ORS result path. An exact replay
     /// of an already-resulted operation reports here too — idempotent, even
     /// across deadline expiry.
     Accepted,
+    /// Kernel durably retained the complete original operation as a staged
+    /// write. This is a nonterminal handoff; the caller must retain its
+    /// original claim and prepared capture and poll the same operation for a
+    /// committed receipt.
+    Staged(Box<eliot_store_api::WriteSubmission>),
     /// The absolute deadline elapsed before the body could persist. This is
     /// the expected claim/submit race, projected as a known outcome — never
     /// as a transport error.
@@ -1437,6 +1442,8 @@ fn neutral_source_fence_matches_owner(
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_result`)
 /// answers `{"accepted": true}` on persist (exact replays included),
+/// `ACCEPTED_PENDING` with the exact typed `WriteSubmission` on a durable
+/// stage (no receipt or terminal claim),
 /// `{"accepted": false, "expired": true}` when the absolute deadline elapsed
 /// first, and `{"accepted": false, "stale": true, ...}` when the presented
 /// attempt is not the current fencing generation. Anything else is a contract
@@ -1447,6 +1454,43 @@ pub fn parse_observe_submit_outcome(
     // #740: submit-outcome span. Accepted/expired/stale stay distinct;
     // anything else is a contract violation, never a silent accept.
     let _span = tracing::info_span!("eliotd.observe_submit").entered();
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("accepted_pending") {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "Kernel staged Observe answer is not an object".to_owned())?;
+        if object.len() != 3
+            || !object.contains_key("status")
+            || !object.contains_key("value")
+            || object.get("recovery") != Some(&serde_json::Value::Null)
+        {
+            return Err("Kernel staged Observe answer has an open or invalid envelope".to_owned());
+        }
+        let typed = object
+            .get("value")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "Kernel staged Observe answer has no typed value".to_owned())?;
+        if typed.len() != 2
+            || typed.get("kind").and_then(serde_json::Value::as_str) != Some("write_submission")
+        {
+            return Err("Kernel staged Observe answer is not a closed write_submission".to_owned());
+        }
+        let submission: eliot_store_api::WriteSubmission = serde_json::from_value(
+            typed
+                .get("value")
+                .cloned()
+                .ok_or_else(|| "Kernel staged Observe answer omits its submission".to_owned())?,
+        )
+        .map_err(|error| format!("Kernel staged Observe submission cannot decode: {error}"))?;
+        submission
+            .validate()
+            .map_err(|error| format!("Kernel staged Observe submission is invalid: {error}"))?;
+        if submission.state != eliot_store_api::WriteSubmissionState::Staged
+            || submission.canonical_receipt_ref.is_some()
+        {
+            return Err("Kernel staged Observe answer is not a nonterminal staged submission".to_owned());
+        }
+        return Ok(ObserveSubmitOutcome::Staged(Box::new(submission)));
+    }
     let accepted = value
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
@@ -3148,9 +3192,10 @@ impl DaemonKernelClient {
     /// The body travels as the single-`result`-key
     /// `"semantic_observe_result"` payload and is validated before any
     /// transport is touched. Kernel persists through the ORS result path: an
-    /// exact replay stays idempotent (even across deadline expiry); an
-    /// elapsed absolute deadline is the expected race and projects as
-    /// [`ObserveSubmitOutcome::Expired`], never as a transport error.
+    /// exact replay stays idempotent (even across deadline expiry); a durable
+    /// stage projects its exact `WriteSubmission` as
+    /// [`ObserveSubmitOutcome::Staged`] without implying commit; an elapsed
+    /// absolute deadline projects as [`ObserveSubmitOutcome::Expired`].
     #[cfg(windows)]
     pub async fn submit_observe_result_async(
         &self,
@@ -3158,13 +3203,47 @@ impl DaemonKernelClient {
     ) -> Result<ObserveSubmitOutcome, super::DaemonError> {
         body.validate()
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let value = self
-            .transact_async(
-                "semantic_observe_result",
-                serde_json::json!({ "result": body }),
-            )
-            .await
+        let operation = "semantic_observe_result";
+        let payload = serde_json::json!({ "result": body });
+        let identity = self
+            .next_identity(&CanonicalKernelRequest {
+                operation,
+                scope: &self.connection_id,
+                request: &payload,
+            })
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = match self
+            .transact_async_with_identity_outcome(operation, payload, identity)
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?
+        {
+            WireOutcome::Known { value, recovery: None } => value,
+            WireOutcome::AcceptedPending {
+                value,
+                recovery: None,
+            } => serde_json::json!({
+                "status": "accepted_pending",
+                "value": value,
+                "recovery": null,
+            }),
+            WireOutcome::Known { .. } => {
+                return Err(super::DaemonError::Kernel(
+                    "Kernel Observe result known response unexpectedly carries recovery"
+                        .to_owned(),
+                ));
+            }
+            WireOutcome::AcceptedPending { .. } => {
+                return Err(super::DaemonError::Kernel(
+                    "Kernel staged Observe response unexpectedly carries recovery".to_owned(),
+                ));
+            }
+            WireOutcome::Error { code, reason } => {
+                return Err(super::DaemonError::Kernel(format!("{code}: {reason}")));
+            }
+            WireOutcome::Partial { reason, .. } | WireOutcome::Unknown { reason } => {
+                return Err(super::DaemonError::Kernel(reason));
+            }
+        };
         parse_observe_submit_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
