@@ -6987,8 +6987,19 @@ impl KernelComposition {
         expected
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        if operation.context != original_source.request.metadata
-            || operation.original_write_submission.as_ref() != Some(&original_submission)
+        Self::validate_staged_transition_owner_binding(
+            transition,
+            record,
+            &input.application_binding,
+            &original_source,
+        )?;
+        Self::validate_owner_enriched_request_context(
+            &operation.context,
+            &original_source,
+            &input.application_binding,
+            transition,
+        )?;
+        if operation.original_write_submission.as_ref() != Some(&original_submission)
             || reservation.token.reservation_id.as_str()
                 != submitted.ors_stage_ref.as_deref().unwrap_or_default()
             || reservation.token.operation_id != operation_identity
@@ -7172,8 +7183,13 @@ impl KernelComposition {
             &input.application_binding,
             &original_source,
         )?;
-        if operation.context != original_source.request.metadata
-            || operation.original_write_submission.as_ref() != Some(original_submission)
+        Self::validate_owner_enriched_request_context(
+            &operation.context,
+            &original_source,
+            &input.application_binding,
+            transition,
+        )?;
+        if operation.original_write_submission.as_ref() != Some(original_submission)
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -7195,12 +7211,6 @@ impl KernelComposition {
             .as_ref()
             .map(OpaqueLabel::as_str)
             .ok_or(TransportError::SessionFenced)?;
-        let source_task = source
-            .request
-            .metadata
-            .task_id
-            .as_ref()
-            .map(eliot_contracts::TaskId::as_str);
         if transition.state_fence != binding.state_fence
             || transition.scope_id.as_str() != retained_scope
             || transition.scope_id.as_str()
@@ -7209,13 +7219,59 @@ impl KernelComposition {
                     .as_ref()
                     .map(OpaqueLabel::as_str)
                     .ok_or(TransportError::SessionFenced)?
-            || source_task.is_some_and(|task| transition.task_id.as_deref() != Some(task))
+            || !transition
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&source.request.state_fence.authority_epoch)
+            || transition.state_fence.resource_generation
+                != source.request.state_fence.resource_generation
         {
             return Err(TransportError::IdentityConflict);
         }
-        if let Some(task) = transition.task_id.as_deref()
-            && (binding.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(task)
-                || binding.task_revision != transition.state_fence.task_revision)
+        if binding.task_ref.as_ref().map(OpaqueLabel::as_str) != transition.task_id.as_deref()
+            || binding.task_ref.is_some()
+                && binding.task_revision != transition.state_fence.task_revision
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_owner_enriched_request_context(
+        context: &eliot_contracts::RequestMetadata,
+        source: &RequestIdentity,
+        binding: &HostRequestApplicationBinding,
+        transition: &eliot_store_api::PreparedTransition,
+    ) -> Result<(), TransportError> {
+        let source_metadata = &source.request.metadata;
+        let semantic_session = binding.session_ref.as_ref().map(OpaqueLabel::as_str);
+        let semantic_task = binding.task_ref.as_ref().map(OpaqueLabel::as_str);
+        let application_origin = binding
+            .observation_policy_binding
+            .get("origin")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|origin| origin.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("APPLICATION_SESSION");
+        let context_session = context
+            .session_id
+            .as_ref()
+            .map(eliot_contracts::SessionId::as_str);
+        let context_task = context
+            .task_id
+            .as_ref()
+            .map(eliot_contracts::TaskId::as_str);
+        if context.request_id != source_metadata.request_id
+            || context.product_id != source_metadata.product_id
+            || context.source_id != source_metadata.source_id
+            || context.clock != source_metadata.clock
+            || context.state_fence != transition.state_fence
+            || transition.state_fence != binding.state_fence
+            || context_session != semantic_session
+            || context_task != semantic_task
+            || semantic_task != transition.task_id.as_deref()
+            || application_origin != binding.principal_ref.is_some()
+            || application_origin != binding.session_ref.is_some()
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -7239,6 +7295,20 @@ impl KernelComposition {
         let operation = &receipt_envelope.core.operation;
         let work_scope = &receipt_envelope.core.work_scope;
         let actual_task = receipt_envelope.core.task.as_ref();
+        let binding = &input.application_binding;
+        let context = &request.metadata;
+        Self::validate_owner_enriched_request_context(
+            context,
+            &original_source,
+            binding,
+            transition,
+        )?;
+        Self::validate_staged_transition_owner_binding(
+            transition,
+            record,
+            binding,
+            &original_source,
+        )?;
         if receipt.operation_id.as_str() != record.operation_id.as_str()
             || receipt.idempotency_key != record.idempotency_key.as_str()
             || receipt.canonical_request_hash != canonical_request_sha256
@@ -7250,19 +7320,6 @@ impl KernelComposition {
             || receipt.semantic_source_revisions != transition.semantic_source_revisions
             || transition.identity.operation_id.as_str() != record.operation_id.as_str()
             || transition.identity.idempotency_key.as_str() != record.idempotency_key.as_str()
-            || transition.state_fence != input.application_binding.state_fence
-            || !transition
-                .state_fence
-                .authority_epoch
-                .is_same_authority(&original_source.request.state_fence.authority_epoch)
-            || transition.state_fence.resource_generation
-                != original_source.request.state_fence.resource_generation
-            || transition.scope_id.as_str()
-                != record
-                    .scope_ref
-                    .as_ref()
-                    .map(OpaqueLabel::as_str)
-                    .ok_or(TransportError::SessionFenced)?
             || request.state_fence != transition.state_fence
             || operation.state_fence != transition.state_fence
             || work_scope.state_fence != transition.state_fence
@@ -7273,26 +7330,6 @@ impl KernelComposition {
             || original_source.cancellation_id.as_str() != record.cancellation_id.as_str()
             || original_source.deadline_unix_ms != record.deadline_unix_ms
             || original_source.request.metadata.request_id.as_str() != record.request_id.as_str()
-            || request.metadata.request_id != original_source.request.metadata.request_id
-            || request.metadata.product_id != original_source.request.metadata.product_id
-            || request.metadata.source_id != original_source.request.metadata.source_id
-            || request.metadata.clock != original_source.request.metadata.clock
-            || request
-                .metadata
-                .session_id
-                .as_ref()
-                .map(eliot_contracts::SessionId::as_str)
-                != input
-                    .application_binding
-                    .session_ref
-                    .as_ref()
-                    .map(OpaqueLabel::as_str)
-            || request
-                .metadata
-                .task_id
-                .as_ref()
-                .map(eliot_contracts::TaskId::as_str)
-                != transition.task_id.as_deref()
             || actual_task.map(|task| task.task_id.as_str()) != transition.task_id.as_deref()
             || actual_task.is_some_and(|task| {
                 task.state_fence != transition.state_fence
@@ -7303,11 +7340,7 @@ impl KernelComposition {
                 .session
                 .as_ref()
                 .map(|session| session.session_id.as_str())
-                != input
-                    .application_binding
-                    .session_ref
-                    .as_ref()
-                    .map(OpaqueLabel::as_str)
+                != binding.session_ref.as_ref().map(OpaqueLabel::as_str)
             || receipt_envelope
                 .core
                 .session
