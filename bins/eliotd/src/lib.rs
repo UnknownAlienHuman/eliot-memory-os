@@ -23,7 +23,8 @@ use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
     AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding, RequestIdentity,
+    AgentActivationResolutionDisposition, AgentActivationResolutionTicket,
+    AgentActivationResolvedBinding, RequestIdentity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
