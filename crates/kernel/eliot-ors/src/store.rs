@@ -34882,6 +34882,12 @@ impl OrsCoordinator<RedbRecoveryStore> {
             store: RedbRecoveryStore::open(path)?,
         })
     }
+
+    /// Reconciles staged generation cutovers for a drain and acknowledges the
+    /// exact remaining obligation with its durable cursor (#1686 item 5).
+    pub fn drain_cutover_flush_ack(&self, limit: u16) -> Result<CutoverFlushAck, OrsError> {
+        self.store.drain_cutover_flush_ack(limit)
+    }
 }
 
 impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
@@ -34926,12 +34932,6 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         limit: u16,
     ) -> Result<Vec<GenerationCutoverSnapshot>, OrsError> {
         self.store.reconcile_staged_generation_cutovers(limit)
-    }
-
-    /// Reconciles staged generation cutovers for a drain and acknowledges the
-    /// exact remaining obligation with its durable cursor (#1686 item 5).
-    pub fn drain_cutover_flush_ack(&self, limit: u16) -> Result<CutoverFlushAck, OrsError> {
-        self.store.drain_cutover_flush_ack(limit)
     }
 
     /// Atomically stages one envelope and reserves every declared scope.
