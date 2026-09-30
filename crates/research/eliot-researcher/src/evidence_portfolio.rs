@@ -3910,7 +3910,8 @@ impl<'a> AbsenceJoinBinding<'a> {
     /// with a manifest frozen over one of the two accountings, which is a
     /// different set of dispositions and a different member count.
     fn authorizes_other_coverage(&self) -> bool {
-        self.manifest.is_some_and(|admitted| admitted.coverage_digest != self.account_digest)
+        self.manifest
+            .is_some_and(|admitted| admitted.coverage_digest != self.account_digest)
     }
 
     /// Whether the assessment time is past the presented manifest's own frozen
@@ -3924,7 +3925,8 @@ impl<'a> AbsenceJoinBinding<'a> {
     /// an expired manifest that still binds current records must not read as a
     /// live authorization.
     fn manifest_expired(&self) -> bool {
-        self.manifest.is_some_and(|admitted| self.now_ms > admitted.expires_ms)
+        self.manifest
+            .is_some_and(|admitted| self.now_ms > admitted.expires_ms)
     }
 }
 
