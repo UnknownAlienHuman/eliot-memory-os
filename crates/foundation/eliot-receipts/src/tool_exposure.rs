@@ -1672,14 +1672,15 @@ impl ToolExposureHistoryEntry {
         match stage {
             ExposureHistoryStage::Registered => {
                 require_stage_recorded(
-                    successor.registered.observed.is_some(), "history.registered"
+                    successor.registered.observed.is_some(),
+                    "history.registered",
                 )?;
                 successor.registered = OwnerStageFact::unresolved();
             }
             ExposureHistoryStage::AdvertisedToRoute => {
                 require_stage_recorded(
                     successor.advertised_to_route.observed.is_some(),
-                    "history.advertised_to_route"
+                    "history.advertised_to_route",
                 )?;
                 successor.advertised_to_route = OwnerStageFact::unresolved();
             }
@@ -1701,21 +1702,20 @@ impl ToolExposureHistoryEntry {
                 successor.selected_by_planner_or_model = OwnerStageFact::unresolved();
             }
             ExposureHistoryStage::Called => {
-                require_stage_recorded(
-                    successor.called.observed.is_some(), "history.called"
-                )?;
+                require_stage_recorded(successor.called.observed.is_some(), "history.called")?;
                 successor.called = OwnerStageFact::unresolved();
             }
             ExposureHistoryStage::TransportCompleted => {
                 require_stage_recorded(
                     successor.transport_completed.observed.is_some(),
-                    "history.transport_completed"
+                    "history.transport_completed",
                 )?;
                 successor.transport_completed = OwnerStageFact::unresolved();
             }
             ExposureHistoryStage::ResultDelivery => {
                 require_stage_recorded(
-                    successor.result_delivery.is_some(), "history.result_delivery"
+                    successor.result_delivery.is_some(),
+                    "history.result_delivery",
                 )?;
                 successor.result_delivery = None;
                 successor.delivery_source_ref = None;
@@ -1723,7 +1723,7 @@ impl ToolExposureHistoryEntry {
             ExposureHistoryStage::ExpandedOrRetried => {
                 require_stage_recorded(
                     successor.expanded_or_retried.observed.is_some(),
-                    "history.expanded_or_retried"
+                    "history.expanded_or_retried",
                 )?;
                 successor.expanded_or_retried = OwnerStageFact::unresolved();
             }
