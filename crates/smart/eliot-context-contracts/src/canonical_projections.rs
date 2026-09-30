@@ -251,7 +251,7 @@ pub enum CanonicalProjectionSourceRole {
     TaskFrame,
     /// Task-scoped negative-memory source used to ground safety triggers.
     TaskScopedSafety,
-    /// Exact admitted WorkScope binding used by the affordance join.
+    /// Exact admitted `WorkScope` binding used by the affordance join.
     WorkScopeBinding,
     /// Authorized capability evidence used by the affordance join.
     AuthorizedAffordances,
@@ -421,12 +421,11 @@ impl CanonicalProjectionSourceReadback {
                 .snapshots
                 .iter()
                 .find(|other| other.role == source.role && other.target != source.target)
+                && shared_role.snapshot != source.snapshot
             {
-                if shared_role.snapshot != source.snapshot {
-                    return Err(ContextError::InvalidField(
-                        "projections.shared_source_lineage",
-                    ));
-                }
+                return Err(ContextError::InvalidField(
+                    "projections.shared_source_lineage",
+                ));
             }
         }
         let expected_missing = CANONICAL_PROJECTION_SOURCE_DENOMINATOR
