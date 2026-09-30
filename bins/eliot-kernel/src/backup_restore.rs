@@ -1253,17 +1253,34 @@ impl KernelBackupRestore {
     /// [`KernelRestoreTarget::apply_purge_ledger`] — instead of staging a
     /// ledger whose revision no owner ever issued.
     ///
-    /// The owner route DOES exist: [`restore_with_ors_journal`](Self::restore_with_ors_journal)
+    /// The owner route is LIVE: [`restore_with_ors_journal`](Self::restore_with_ors_journal)
     /// supplies the composition-owned ORS handle, and
-    /// `KernelComposition::backup_restore_with_ors_journal` is the intended
-    /// production caller of it. That composition entry is recorded in
-    /// `lib.rs` as having NO caller in this repository, so the owner route is
-    /// not yet live at runtime and this entry's refusal is not currently
-    /// reachable from production. Stated rather than papered over: #963/#2569
-    /// own the front-door connection, and a guard or refusal that is only
-    /// unreachable by accident is not a guard — the purge phase's own
-    /// rehearsal and absent-owner refusals are enforced at the phase, not
-    /// here, precisely so that wiring the entry does not change them.
+    /// `KernelComposition::backup_restore_with_ors_journal` (`lib.rs`) is its
+    /// production entry. That composition entry is reached on the registered
+    /// production front door —
+    /// `KernelComposition::dispatch_frame` →
+    /// `frame_dispatch::dispatch_frame_inner`'s `is_backup_operation` arm →
+    /// `request_dispatch::dispatch_backup_frame` →
+    /// `request_dispatch::handle_backup_restore_test` — which obtains the
+    /// owner-issued admission through
+    /// [`admit_restore_journal`](Self::admit_restore_journal) and then calls
+    /// that composition entry. The purge phase's owner route is therefore
+    /// reachable at runtime today, not merely intended.
+    ///
+    /// What has no production caller is THIS entry, and the reason is its
+    /// signature rather than a missing wiring: `restore` takes an injected
+    /// `J: RestoreJournalPort` and passes no `ors` handle down, so it runs the
+    /// same engine with the purge-ledger owner route absent. Production runs
+    /// the `restore_with_ors_journal` sibling and reaches this same private
+    /// `restore_with_owner` body with the composition-owned ORS
+    /// handle; there is one engine and one phase order, not a fallback. A
+    /// caller of this entry that DID supply a purge ledger would still be
+    /// refused in the purge phase by
+    /// [`KernelRestoreTarget::apply_purge_ledger`] with
+    /// [`BackupError::RestoreCapabilityUnsupported`] naming
+    /// `owners::PURGE_LEDGER_OWNER`, so the absent handle cannot silently
+    /// degrade a restore — the refusal is enforced at the phase, not here,
+    /// precisely so that the two entries do not diverge.
     pub fn restore<J: RestoreJournalPort>(
         &self,
         bundle: &BackupBundle,
