@@ -19,6 +19,9 @@ use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 
 use crate::SNAPSHOT_SCHEMA_VERSION;
+use crate::fair_pull_loop::{
+    FAIR_PULL_LOOP_PROOF_CEILING, FairPullLoop, FairPullOutcome, FairPullStart,
+};
 use crate::model::{
     AdmissionId, AttemptRecord, CancelCommand, CancellationFinalReceipt, CancellationReceipt,
     CancellationReconciliationId, CandidateId, CandidateResultReceipt, CapacityDeferral,
@@ -35,9 +38,6 @@ use crate::model::{
     StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeFinalReceipt,
     WipPartitionKey, WorkClass, WorkClassProfile, WorkClassSelectionReport, WorkerId,
     validate_text,
-};
-use crate::fair_pull_loop::{
-    FAIR_PULL_LOOP_PROOF_CEILING, FairPullLoop, FairPullOutcome, FairPullStart,
 };
 use crate::provider_admission::{
     AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
