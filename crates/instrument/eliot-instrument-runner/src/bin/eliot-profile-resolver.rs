@@ -530,6 +530,11 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
 
     let cell = Arc::new(DispatchCell::activate()?);
     let port = StagePort::seal_all(&cell, &epoch, &layout, &admitted)?;
+    // Every stage's validation context is registered with the cell the executor
+    // validates through, under the same operation identity its sealed request is
+    // keyed by, so a stage launch consumes its permit against the context that
+    // was captured when THAT request was sealed.
+    port.share_contexts(&cell)?;
     let runner = InstrumentRunner::new(Arc::new(StageExecutor::with(&cell)));
     let launcher = StageRoute {
         epoch,
@@ -937,7 +942,7 @@ fn seal_version_request(
         sha256_hex(format!("{operation}\0{}", argv.join("\u{1}")).as_bytes()),
     )]);
     let issued_at = now_unix_ms().max(1);
-    cell.issue(
+    let dispatch = cell.issue(
         &intent,
         fence,
         heads,
@@ -945,7 +950,14 @@ fn seal_version_request(
         issued_at.saturating_add(VERSION_WALL_TIMEOUT_MS),
         ActionLeaseRef::new(format!("{operation}-lease"))?,
         format!("{operation}-nonce"),
-    )
+    )?;
+    // This read owns its cell outright: it seals exactly one request, so the
+    // context captured with that request is registered under its own operation
+    // identity and consumed by that one launch. Taking only the request out of
+    // the pair leaves the registered context behind, which is what lets the read
+    // validate under the context it sealed with.
+    cell.register_context(operation, dispatch.context)?;
+    Ok(dispatch.request)
 }
 
 /// Reads the exact invocation text this binary accepts.
@@ -1141,12 +1153,18 @@ fn fresh_key_bytes() -> [u8; 32] {
 ///
 /// The cell issues one permit per admitted stage and stores the validation
 /// context those permits are consumed against. Every stage of a run shares the
-/// same authority epoch and generation, so the one stored context validates
-/// every permit the cell issued, while the per-stage one-shot nonce keeps each
-/// permit independently single-use.
+/// same authority epoch and generation, but each stage seals under its OWN
+/// fencing token, its OWN sealed intent and its OWN revision heads, so one
+/// shared slot cannot describe more than one of them: the slot is keyed by the
+/// request's own operation identity, which is the same key
+/// [`StagePort::seal_all`] seals it under and the same one
+/// [`StagePort::bind`] hands it back for. Validating a request therefore
+/// resolves the exact context captured when THAT request was sealed instead of
+/// whichever stage happened to seal last, while the per-stage one-shot nonce
+/// keeps each permit independently single-use.
 struct DispatchCell {
     authority: Mutex<DispatchPermitAuthority>,
-    context: Mutex<Option<DispatchValidationContext>>,
+    context: Mutex<BTreeMap<String, DispatchValidationContext>>,
 }
 
 impl DispatchCell {
@@ -1159,11 +1177,20 @@ impl DispatchCell {
         let key = KernelDispatchKey::from_secret_bytes(fresh_key_bytes())?;
         Ok(Self {
             authority: Mutex::new(DispatchPermitAuthority::activate(authority_id, key)),
-            context: Mutex::new(None),
+            context: Mutex::new(BTreeMap::new()),
         })
     }
 
-    /// Issues the single permit-bound process request for one admitted stage.
+    /// Issues the single permit-bound process request for one admitted stage,
+    /// together with the validation context that exact request is consumed
+    /// against.
+    ///
+    /// The context is returned to the caller rather than retained here: it is
+    /// the property of the one request just sealed, and it is the caller that
+    /// keys it by the same operation identity the request is sealed under. What
+    /// this cell keeps is exactly one thing — the single
+    /// [`DispatchPermitAuthority`] — so there is still exactly one permit
+    /// authority per run and no second issuance scheme.
     #[allow(clippy::too_many_arguments)]
     fn issue(
         &self,
@@ -1174,7 +1201,7 @@ impl DispatchCell {
         expires_at_unix_ms: u64,
         lease: ActionLeaseRef,
         nonce: String,
-    ) -> Result<ProcessRequest, CliError> {
+    ) -> Result<SealedDispatch, CliError> {
         // The heads are cloned out BEFORE the issuance consumes them, and the
         // validation context is built from that clone. This is the same value
         // the permit was issued with, not a second source: the authority builds
@@ -1196,10 +1223,10 @@ impl DispatchCell {
             .lock()
             .map_err(|_| CliError::Contract("dispatch authority lock poisoned".to_owned()))?
             .issue(intent, issuance)?;
-        // The stored context pins the exact material the permit was issued
-        // with — the same fence, its own authority epoch, and the same revision
-        // heads — so consume-time validation compares the permit against this
-        // snapshot rather than against ambient state.
+        // The context pins the exact material the permit was issued with — the
+        // same fence, its own authority epoch, and the same revision heads — so
+        // consume-time validation compares the permit against this snapshot
+        // rather than against ambient state.
         let context_epoch = fence.authority_epoch().clone();
         let context = DispatchValidationContext::new(
             observation_clock(issued_at_unix_ms),
@@ -1208,35 +1235,98 @@ impl DispatchCell {
             pinned_heads,
             VALIDATION_REVISION,
         )?;
-        *self
-            .context
-            .lock()
-            .map_err(|_| CliError::Contract("validation context lock poisoned".to_owned()))? =
-            Some(context);
-        Ok(ProcessRequest::new(intent.clone(), permit)?)
+        Ok(SealedDispatch {
+            request: ProcessRequest::new(intent.clone(), permit)?,
+            context,
+        })
     }
 
-    /// The stored validation context the executor consumes every permit against.
-    fn context(&self) -> Result<DispatchValidationContext, ProcessExecutionError> {
-        self.context
+    /// Registers one sealed request's validation context under the operation
+    /// identity that request was issued for.
+    ///
+    /// Registration is keyed by the request's own operation identity, which is
+    /// what `validate_and_consume` resolves against, so the context a permit is
+    /// consumed under always belongs to that permit. A second registration of one
+    /// identity is refused rather than replacing a context another sealed request
+    /// is already bound to.
+    fn register_context(
+        &self,
+        operation: String,
+        context: DispatchValidationContext,
+    ) -> Result<(), CliError> {
+        if self
+            .context
             .lock()
-            .map_err(|_| {
-                ProcessExecutionError::Unavailable("validation context poisoned".to_owned())
-            })?
-            .clone()
-            .ok_or_else(|| {
-                ProcessExecutionError::Unavailable("validation context absent".to_owned())
-            })
+            .map_err(|_| CliError::Contract("validation context lock poisoned".to_owned()))?
+            .insert(operation.clone(), context)
+            .is_some()
+        {
+            return Err(CliError::Contract(format!(
+                "dispatch validation context for operation '{operation}' was sealed twice"
+            )));
+        }
+        Ok(())
     }
 }
 
+/// The one sealed request a stage is bound to, with the validation context that
+/// request is consumed against.
+///
+/// The pair is returned from a single [`DispatchCell::issue`] call so the two
+/// cannot drift: they are built from the same issuance, in one scope, and
+/// travel to the port that stores them together.
+struct SealedDispatch {
+    /// The one-shot permit-bound request for this operation.
+    request: ProcessRequest,
+    /// The validation context captured for exactly this request.
+    context: DispatchValidationContext,
+}
+
+/// The exact validation context the given sealed request must be consumed
+/// against.
+///
+/// The lookup key is the request's own operation identity, which is the same
+/// key the request is sealed under in [`StagePort::seal_all`]. A request whose
+/// identity is absent resolves to nothing and is refused before the authority
+/// is touched: validating under a context this cell never sealed would compare
+/// a permit against a fence and revision heads that are not its own.
+fn resolve_validation_context(
+    contexts: &BTreeMap<String, DispatchValidationContext>,
+    request: &ProcessRequest,
+) -> Result<DispatchValidationContext, ProcessExecutionError> {
+    contexts
+        .get(request.operation_id().as_str())
+        .cloned()
+        .ok_or_else(|| {
+            ProcessExecutionError::Unavailable(format!(
+                "no sealed validation context for operation '{}'",
+                request.operation_id().as_str()
+            ))
+        })
+}
+
 impl DispatchValidationPort for DispatchCell {
+    /// Consumes this one request's permit under that one request's context.
+    ///
+    /// The context is resolved from the request's OWN operation identity before
+    /// the authority is locked, so a request is never validated against a
+    /// sibling stage's fence, epoch or revision heads. Resolution happens
+    /// first and consumes nothing: `DispatchPermitAuthority::validate_and_consume`
+    /// remains the only path that spends a permit, and it still refuses a
+    /// second validation of the same request with
+    /// `ContractError::DispatchPermitConsumed`.
     fn validate_and_consume(
         &self,
         request: ProcessRequest,
         observed: SuspendedProcessIdentity,
     ) -> Result<ValidatedDispatch, ProcessExecutionError> {
-        let context = self.context()?;
+        let context = resolve_validation_context(
+            self.context.lock().map_err(|_| {
+                ProcessExecutionError::Unavailable("validation context poisoned".to_owned())
+            })?
+            .as_ref(),
+            &request,
+        )?;
         self.authority
             .lock()
             .map_err(|_| ProcessExecutionError::Unavailable("authority lock poisoned".to_owned()))?
@@ -1351,13 +1441,23 @@ struct StageRoute {
 ///
 /// The sealed requests are keyed by the exact durable stage identity the
 /// orchestrator walks, so a bind for a stage this run never sealed fails closed
-/// instead of producing a request for whatever stage happens to come next.
+/// instead of producing a request for whatever stage happens to come next. Each
+/// sealed request travels with the validation context captured at its own
+/// sealing, keyed the same way, so the executor resolves the exact context of
+/// the request being validated rather than one shared run context.
 struct StagePort {
     /// One sealed, permit-bound request per admitted stage identity.
     ///
     /// Behind a mutex because `bind` takes `&self` (the port is shared) and
     /// because removing the slot is what enforces one seal per stage.
     sealed: std::sync::Mutex<BTreeMap<String, ProcessRequest>>,
+    /// The validation context captured with each sealed request, under the same
+    /// operation identity.
+    ///
+    /// Held beside `sealed` rather than in one shared slot because each stage
+    /// seals under its own fencing token and its own revision heads: a single
+    /// shared context could only ever describe the stage that sealed last.
+    contexts: std::sync::Mutex<BTreeMap<String, DispatchValidationContext>>,
     /// Evidence sink every stage launch retains through.
     sink: Arc<RetainedEvidenceSink>,
 }
@@ -1367,9 +1467,11 @@ impl StagePort {
     ///
     /// Sealing is a per-stage operation because the P-07 dispatch permit is
     /// one-shot: one permit can never launch two children. Each stage's request
-    /// is bound to its own one-shot nonce and its own sealed intent, and the
-    /// shared run context validates all of them because they carry the same
-    /// authority epoch and generation.
+    /// is bound to its own one-shot nonce, its own sealed intent, its own
+    /// fencing token and its own revision heads, and it is stored beside the
+    /// validation context captured for exactly that material — so the port hands
+    /// each stage a matched request/context pair rather than one request and one
+    /// context that may belong to different stages.
     fn seal_all(
         cell: &DispatchCell,
         epoch: &EpochId,
@@ -1378,11 +1480,12 @@ impl StagePort {
     ) -> Result<Self, CliError> {
         let plan = StageOrchestrator::plan(admitted);
         let mut sealed = BTreeMap::new();
+        let mut contexts = BTreeMap::new();
         for planned in &plan.stages {
             let stage_id = planned.route.stage().stage_id.as_str();
             let argv = stage_argv(planned);
             let operation = operation_identity(stage_id, &argv);
-            let request = seal_stage_request(
+            let dispatch = seal_stage_request(
                 cell,
                 epoch,
                 layout,
@@ -1390,12 +1493,38 @@ impl StagePort {
                 &planned.stage.executable,
                 &argv,
             )?;
-            sealed.insert(operation, request);
+            // Both entries are keyed by the operation identity the executor
+            // resolves the validation context by, so a sealed request and the
+            // context it is consumed under cannot come from different stages.
+            sealed.insert(operation.clone(), dispatch.request);
+            contexts.insert(operation, dispatch.context);
         }
         Ok(Self {
             sealed: std::sync::Mutex::new(sealed),
+            contexts: std::sync::Mutex::new(contexts),
             sink: Arc::new(RetainedEvidenceSink::default()),
         })
+    }
+
+    /// Publishes the contexts this run sealed to the cell the executor validates
+    /// each sealed request through.
+    ///
+    /// The executor holds this port as its [`DispatchValidationPort`], so the
+    /// cell it validates through resolves the per-stage context from the same
+    /// keyed map `bind` takes the request from. Registration only transfers
+    /// contexts this run already sealed under this run's own one-shot authority:
+    /// it issues nothing, and it refuses a second registration of one operation
+    /// rather than replacing a context another request is already bound to.
+    fn share_contexts(&self, cell: &DispatchCell) -> Result<(), CliError> {
+        let contexts = self
+            .contexts
+            .lock()
+            .map_err(|_| CliError::Contract("sealed stage context map poisoned".to_owned()))?
+            .clone();
+        for (operation, context) in contexts {
+            cell.register_context(operation, context)?;
+        }
+        Ok(())
     }
 }
 
@@ -1428,6 +1557,10 @@ fn stage_argv(stage: &PlannedStage) -> Vec<String> {
 /// a placeholder. That read is itself a governed launch under its own one-shot
 /// permit, so both children this function causes to exist — the `--version` probe
 /// and the stage itself — cross the single [`WindowsProcessExecutor`] boundary.
+///
+/// The returned [`SealedDispatch`] is the stage's request together with the
+/// validation context for the exact fence and revision heads this stage sealed
+/// under, so [`StagePort::seal_all`] keeps the two matched.
 fn seal_stage_request(
     cell: &DispatchCell,
     epoch: &EpochId,
@@ -1435,7 +1568,7 @@ fn seal_stage_request(
     stage_id: &str,
     executable_name: &str,
     argv: &[String],
-) -> Result<ProcessRequest, CliError> {
+) -> Result<SealedDispatch, CliError> {
     let executable = resolve_tool(executable_name)?;
     let projection = isolated_projection()?;
     let observed = ExecutableObservation::observe_at_path(
