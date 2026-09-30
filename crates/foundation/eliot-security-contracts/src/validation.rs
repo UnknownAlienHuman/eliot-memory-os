@@ -45,6 +45,12 @@ pub enum SecurityContractError {
     },
     #[error("security indicator evidence does not establish its own class: {field}")]
     IndicatorEvidenceUnproven { field: &'static str },
+    #[error("quarantine admission closure does not cover its affected source: {field}")]
+    QuarantineClosureScope { field: &'static str },
+    #[error("quarantine admission does not bind its expected state revision: {field}")]
+    QuarantineRevisionUnbound { field: &'static str },
+    #[error("quarantine admission owner is not the owner its decision was bound to: {field}")]
+    QuarantineOwnerMismatch { field: &'static str },
     #[error("revoked influence is still marked active")]
     RevokedInfluenceActive,
     #[error("revoked influence has no invalidation reason")]

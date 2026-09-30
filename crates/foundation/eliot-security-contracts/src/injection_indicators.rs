@@ -19,16 +19,26 @@
 //! - A restriction carries no instruction taint of its own and no field for a
 //!   standing instruction, tool definition, policy, credential or Incident, so
 //!   no evidence payload and no source content can change one.
+//!
+//! Quarantine admission adds a fourth, and it is the one that closes the gap
+//! between proposing a restriction and mutating state. A
+//! [`ProposedSourceRestriction`] is a proposal; [`AdmittedSourceQuarantine`] is
+//! the admitted transition, and the two are separated by type rather than by a
+//! check: the only ways to build an admission take either that restriction —
+//! which this map produces solely for a rule-bound independent observation — or
+//! an authorized decision's own identity. A model proposal has no rule field to
+//! supply and therefore no restriction to admit, so the path from a model-only
+//! judgement to a quarantine mutation does not exist to be closed later.
 
 use eliot_contracts::StateFence;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::SecurityContractError;
 use crate::surface_types::{
     AssessedSourceRevision, EffectCeiling, EpistemicUse, SourceAssurance, SourceUseAuthority,
     assessment_refs, assessment_text,
 };
+use crate::{InfluenceDependencyClosure, SecurityContractError};
 
 /// Number of indicator classes the I8.8 inventory fixes.
 pub const INDICATOR_CLASS_COUNT: usize = 8;
@@ -762,6 +772,301 @@ impl IndicatorResolution {
             Self::CandidateOnly { .. } => None,
             Self::BoundedRestriction(restriction) => Some(restriction),
         }
+    }
+}
+
+/// The bindings an authorized decision supplies for a quarantine.
+///
+/// Grouping them keeps the two authority arms comparable: the deterministic arm
+/// fills this from the restriction the indicator map produced, the authorized
+/// arm fills it from the decision, and both then pass through the same checks.
+/// It is a borrowed grouping only — it grants nothing on its own, and neither
+/// admission path accepts it without the authority that arm requires.
+pub struct QuarantineBindings<'a> {
+    /// The exact assessed source revision being quarantined.
+    pub assessed_source: &'a AssessedSourceRevision,
+    /// Uses that may remain admissible, before intersection.
+    pub permitted_uses: &'a [EpistemicUse],
+    /// Effect ceilings that may remain admissible, before intersection.
+    pub permitted_effects: &'a [EffectCeiling],
+    /// The release and rebuild condition that must hold before this lifts.
+    pub release_condition: &'a str,
+    /// The exact influence dependency closure this is bounded to.
+    pub dependency_closure: &'a InfluenceDependencyClosure,
+    /// The state revision the store will compare-and-swap against.
+    pub expected_state_revision: u64,
+    /// The named owner of this admission and of its release.
+    pub owner: &'a str,
+    /// The fence this admission was prepared under.
+    pub state_fence: &'a StateFence,
+}
+
+/// One admitted source quarantine, bound to everything it may affect.
+///
+/// This is the admission the Governor prepares and the Kernel/Store validate
+/// and receipt. It has exactly two construction paths, and both are authority:
+/// [`Self::admit_from_rule`], which takes a [`ProposedSourceRestriction`] that
+/// only [`IndicatorSourceMap::resolve`] produces and only for an independent
+/// observation carrying a rule binding, and [`Self::admit_from_decision`],
+/// which takes an authorized decision's own identity. A model-only judgement
+/// resolves to [`IndicatorResolution::CandidateOnly`], which carries no
+/// restriction payload, so there is no value it can hand to either path — the
+/// guarantee is carried by the shape of the input, not by a confidence check a
+/// later edit could remove.
+///
+/// Every binding below is compared rather than restated, and the closure is the
+/// exact affected scope, so an admission can name one source and one closure
+/// only.
+///
+/// It derives the wire traits because it is the record the Governor prepares
+/// and the Kernel/Store validate and receipt: `admit_from_rule` and
+/// `admit_from_decision` are the only ways to obtain one in Rust, and
+/// deserialization is how a prepared admission reaches the store that receipts
+/// it. Deserializing does not weaken that, because every binding is re-checked
+/// against the live closure, revision, owner and fence by
+/// [`Self::validate_against`] before it is admitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedSourceQuarantine {
+    affected_source: AssessedSourceRevision,
+    dependency_closure: InfluenceDependencyClosure,
+    permitted_uses: Vec<EpistemicUse>,
+    permitted_effects: Vec<EffectCeiling>,
+    expected_state_revision: u64,
+    owner: String,
+    release_condition: String,
+    state_fence: StateFence,
+}
+
+impl AdmittedSourceQuarantine {
+    /// Admits the quarantine a deterministic applicable rule supports.
+    ///
+    /// The permitted sets, the affected source revision and the release
+    /// condition all come from the restriction the indicator map produced, so a
+    /// caller cannot widen them here. `expected_state_revision` is the revision
+    /// the store will compare-and-swap against when it receipts this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the exact dependency closure does not name this
+    /// restriction's source, when the closure or fence is inconsistent, when
+    /// the owner or release condition is blank, or when no non-zero state
+    /// revision is expected.
+    pub fn admit_from_rule(
+        restriction: &ProposedSourceRestriction,
+        dependency_closure: &InfluenceDependencyClosure,
+        expected_state_revision: u64,
+        owner: &str,
+    ) -> Result<Self, SecurityContractError> {
+        Self::bind(QuarantineBindings {
+            assessed_source: &restriction.assessed_source,
+            permitted_uses: restriction.permitted_uses,
+            permitted_effects: restriction.permitted_effects,
+            release_condition: &restriction.release_condition,
+            dependency_closure,
+            expected_state_revision,
+            owner,
+            state_fence: &restriction.state_fence,
+        })
+    }
+
+    /// Admits the quarantine an authorized decision supports.
+    ///
+    /// The decision's identity and revision are validated rather than trusted,
+    /// so a blank or superseded decision cannot be replayed as a current one.
+    /// The affected source revision is still the assessed one, so this path
+    /// cannot quarantine a source nobody assessed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the decision reference or revision is blank, when
+    /// the exact dependency closure does not name the assessed source, or when
+    /// any other binding is unusable.
+    pub fn admit_from_decision(
+        decision_ref: &str,
+        decision_revision: &str,
+        bindings: QuarantineBindings<'_>,
+    ) -> Result<Self, SecurityContractError> {
+        assessment_text(decision_ref, "admission.decision_ref")?;
+        assessment_text(decision_revision, "admission.decision_revision")?;
+        Self::bind(bindings)
+    }
+
+    /// The single binding path both authority arms share.
+    ///
+    /// Every check is a comparison against a value the closure or the authority
+    /// supplied, so an admission cannot be assembled from restated strings that
+    /// disagree with the scope it claims to cover.
+    fn bind(bindings: QuarantineBindings<'_>) -> Result<Self, SecurityContractError> {
+        let QuarantineBindings {
+            assessed_source,
+            permitted_uses,
+            permitted_effects,
+            release_condition,
+            dependency_closure,
+            expected_state_revision,
+            owner,
+            state_fence,
+        } = bindings;
+        // The exact dependency closure is checked by the existing I12.20
+        // closure validator rather than restated here, so this admission cannot
+        // hold a closure shape that owner would refuse.
+        dependency_closure.validate()?;
+        // A closure that does not cover the affected source is not this
+        // source's quarantine. This comparison is what stops an admission from
+        // naming one source while bounding another.
+        if dependency_closure.root_ref != assessed_source.source_ref {
+            return Err(SecurityContractError::QuarantineClosureScope {
+                field: "admission.dependency_closure.root_ref",
+            });
+        }
+        if dependency_closure.state_fence != *state_fence {
+            return Err(SecurityContractError::FenceMismatch);
+        }
+        // An admission that expects revision zero names no committed
+        // predecessor, so there is nothing for the store to compare against.
+        if expected_state_revision == 0 {
+            return Err(SecurityContractError::QuarantineRevisionUnbound {
+                field: "admission.expected_state_revision",
+            });
+        }
+        assessment_text(owner, "admission.owner")?;
+        assessment_text(release_condition, "admission.release_condition")?;
+        if permitted_uses.is_empty() {
+            return Err(SecurityContractError::EmptyCollection {
+                field: "admission.permitted_uses",
+            });
+        }
+        if permitted_effects.is_empty() {
+            return Err(SecurityContractError::EmptyCollection {
+                field: "admission.permitted_effects",
+            });
+        }
+        Ok(Self {
+            affected_source: assessed_source.clone(),
+            dependency_closure: dependency_closure.clone(),
+            permitted_uses: permitted_uses.to_vec(),
+            permitted_effects: permitted_effects.to_vec(),
+            expected_state_revision,
+            owner: owner.trim().to_owned(),
+            release_condition: release_condition.trim().to_owned(),
+            state_fence: state_fence.clone(),
+        })
+    }
+
+    /// The exact source revision this admission quarantines.
+    #[must_use]
+    pub fn affected_source(&self) -> &AssessedSourceRevision {
+        &self.affected_source
+    }
+
+    /// The exact dependency closure this admission is bounded to.
+    #[must_use]
+    pub fn dependency_closure(&self) -> &InfluenceDependencyClosure {
+        &self.dependency_closure
+    }
+
+    /// The state revision this admission expects to replace.
+    #[must_use]
+    pub fn expected_state_revision(&self) -> u64 {
+        self.expected_state_revision
+    }
+
+    /// The named owner of this admission and of its release.
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// The release and rebuild condition that must hold before this lifts.
+    #[must_use]
+    pub fn release_condition(&self) -> &str {
+        &self.release_condition
+    }
+
+    /// The fence this admission was prepared under.
+    #[must_use]
+    pub fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Validates this admission against the bindings in force now.
+    ///
+    /// This is the Kernel/Store half of W5: the store compares the presented
+    /// closure, the live state revision, the live owner and the live fence
+    /// against what the admission committed, and refuses with a typed error
+    /// rather than admitting a quarantine whose bindings have moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the live fence differs, when the live closure is
+    /// not the one admitted, when the live revision is not the one expected, or
+    /// when the owner in force is not the owner this admission named.
+    pub fn validate_against(
+        &self,
+        live_closure: &InfluenceDependencyClosure,
+        live_state_revision: u64,
+        live_owner: &str,
+        live_fence: &StateFence,
+    ) -> Result<(), SecurityContractError> {
+        if self.state_fence != *live_fence {
+            return Err(SecurityContractError::FenceMismatch);
+        }
+        if self.dependency_closure != *live_closure {
+            return Err(SecurityContractError::StaleSourceAssessment {
+                field: "admission.dependency_closure",
+            });
+        }
+        if self.expected_state_revision != live_state_revision {
+            return Err(SecurityContractError::QuarantineRevisionUnbound {
+                field: "admission.expected_state_revision",
+            });
+        }
+        if self.owner != live_owner {
+            return Err(SecurityContractError::QuarantineOwnerMismatch {
+                field: "admission.owner",
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolves the use authority this admission leaves admissible.
+    ///
+    /// The permitted sets are intersected with the assurance in force and the
+    /// instruction taint is taken from that assurance verbatim, so an admitted
+    /// quarantine can only remove uses and effects: it never widens them and
+    /// never clears taint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fence differs, or when the source in force is
+    /// no longer the source this admission was prepared against.
+    pub fn resolve_use(
+        &self,
+        current_assurance: &SourceAssurance,
+        state_fence: &StateFence,
+    ) -> Result<SourceUseAuthority, SecurityContractError> {
+        if self.state_fence != *state_fence {
+            return Err(SecurityContractError::FenceMismatch);
+        }
+        if self.affected_source.source_ref != current_assurance.source_ref {
+            return Err(SecurityContractError::StaleSourceAssessment {
+                field: "admission.affected_source.source_ref",
+            });
+        }
+        Ok(SourceUseAuthority {
+            assessed_source: self.affected_source.clone(),
+            permitted_uses: intersect(
+                &self.permitted_uses,
+                &current_assurance.allowed_epistemic_use,
+            ),
+            permitted_effects: intersect(
+                &self.permitted_effects,
+                &current_assurance.allowed_effects,
+            ),
+            instruction_taint: current_assurance.instruction_taint,
+            state_fence: state_fence.clone(),
+        })
     }
 }
 
