@@ -1754,7 +1754,8 @@ impl KernelContextReadClient {
                     campaign_view,
                     context_recipe_body_digest,
                 )?;
-                match assemble_active_view(&admitted, recipe, quality.clone(), assembly, measure) {
+                match assemble_active_view(&admitted, recipe, quality.clone(), assembly, measure)
+                {
                     Err(error) => ContextCompilationOwnerOutcome::Refused(Box::new(
                         composition_failure(error, recipe, &request.binding),
                     )),

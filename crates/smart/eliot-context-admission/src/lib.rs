@@ -344,7 +344,8 @@ pub fn admit_context_traced_with_warnings(
 /// to the delivered trace set. No provider reasoning is stored here or in the
 /// traces it carries: only the permitted selection evidence and reasons the
 /// admission owner already bound.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialRankTraceDelivery {
     /// Decision anchor every delivered trace is bound to.
     pub decision_id: eliot_contracts::DecisionId,
@@ -367,7 +368,8 @@ pub struct MaterialRankTraceDelivery {
 }
 
 /// Reverse association from one selected material dependency to its trace.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialTraceDependencyBinding {
     /// Material whose selection recorded this dependency.
     pub atom_id: eliot_contracts::ArtifactId,
@@ -378,7 +380,8 @@ pub struct MaterialTraceDependencyBinding {
 }
 
 /// Reverse association from one selected material invalidation to its trace.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialTraceInvalidationBinding {
     /// Material whose selection recorded this invalidation.
     pub atom_id: eliot_contracts::ArtifactId,
