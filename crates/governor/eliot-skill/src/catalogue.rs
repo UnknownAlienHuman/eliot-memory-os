@@ -1517,14 +1517,18 @@ impl SkillCatalogue {
     /// `IdentityMismatch`. Failure reasons reuse the display path's typed
     /// fields; no second refusal vocabulary is introduced.
     ///
-    /// # STITCH: designated chain-resolution caller
+    /// # Production caller plus STITCH audit use
     ///
-    /// `caller: STITCH`. The designated caller is a receiver holding a
+    /// `caller: bins/eliotd/src/skill_lifecycle_adapters.rs::ForwardingSkillLifecycle::acknowledge_and_display`
+    /// (serve-then-resolve under the same catalogue lock: the chain
+    /// recompute-and-compare leg exceeds display's own checks, so a
+    /// substituted chain fails closed at serve time; driven by
+    /// `DaemonComposition::skill_carry_receipt_to_display` and the
+    /// `BridgeSkillForwarder::display_skill` port). A receiver-held
     /// presented or retained display past serve time (a receipt-chain audit
-    /// or a display/ack round trip that outlives the serving call); today
-    /// every display is derived fresh at serve time through
-    /// `activation_display`, where the same legs already bind, so no second
-    /// resolution path is manufactured here.
+    /// or a display/ack round trip outliving the serving call) stays
+    /// `caller: STITCH`: no live reporter holds retained displays, and none
+    /// is synthesized here.
     pub fn resolve_activation_chain(
         &self,
         skill_id: &str,
