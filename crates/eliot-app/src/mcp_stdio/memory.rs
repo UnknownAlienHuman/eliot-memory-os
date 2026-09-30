@@ -130,6 +130,10 @@ pub(super) async fn dispatch_memory_distillation_preview(
         "at_revision": snapshot_revision,
         "read_only": true,
         "plan": plan,
+        // A22/W9: the pre-#783 `token_units` basis, in its own explicit legacy
+        // shape, beside the current plan. It is never merged into the plan's
+        // own `token_units`, and it never converts to one.
+        "legacy_token_units_measurements": legacy_memory_token_units_wire(&records)?,
         "cursor": request.cursor,
         "next_cursor": next_cursor,
         "total_matching": total_matching,
@@ -235,6 +239,13 @@ pub(super) async fn dispatch_memory_distillation_apply(
         .await?;
         receipt.write_receipts.push(write_receipt);
     }
+    // W9/A22 boundary: the applied plan carries current canonical evidence,
+    // and every record in that plan was already measured by the single owner
+    // `canonical_memory_payload_measurement` when the plan was read back. A
+    // legacy `token_units` therefore has no path into current evidence at all:
+    // this apply path never reads a legacy figure, and the preview's legacy
+    // forms are a separate `legacy_token_units_measurements` array beside the
+    // plan, not a field of it.
     serde_json::to_value(receipt).map_err(Into::into)
 }
 
@@ -744,6 +755,39 @@ pub(super) async fn canonical_memory_snapshot(
             .is_empty();
     }
     Ok((snapshot_revision, records, complete))
+}
+
+/// Publish the explicit pre-#783 legacy `token_units` wire form beside the
+/// current measurement for one canonical memory record.
+///
+/// A22/W9. The current corpus item carries `token_units` as an exact canonical
+/// STU figure. The historical basis was `chars / 4`, which is neither bytes
+/// nor tokens, so it is published here in its **own** shape: a separate object
+/// with its own discriminator, its own `legacy_unit` and its own `estimated`
+/// status. It is not merged into `token_units`, not renamed to match it and
+/// not carried in any field whose name a reader could mistake for a current
+/// claim.
+///
+/// The returned value is the object as it appears on the wire. It is built and
+/// then re-decoded through the closed legacy decoder, so the form this surface
+/// publishes is the form the decoder admits - the two cannot drift apart, and
+/// a malformed legacy record is a typed failure rather than a silent default.
+pub(super) fn legacy_memory_token_units_wire(
+    records: &[CanonicalRecord<Value>],
+) -> Result<Vec<Value>> {
+    records
+        .iter()
+        .map(|record| {
+            let serialized = serde_json::to_string(&record.receipt_body)
+                .context("serialize canonical memory payload for the legacy wire form")?;
+            let unicode_scalar_values = u64::try_from(serialized.chars().count())
+                .context("legacy memory character count exceeds u64")?;
+            legacy_memory_token_units_wire_value(
+                &format!("canonical:{}", record.record_id),
+                unicode_scalar_values,
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn canonical_utility_sources(
