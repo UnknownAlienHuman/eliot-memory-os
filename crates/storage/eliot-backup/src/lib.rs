@@ -941,7 +941,18 @@ fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError>
             // ledger carried here, so a FullRecovery archive with no purge
             // ledger section and a nonzero revision (or a ledger with a zero
             // revision) is incompatible, not silently coherent.
-            if bundle.manifest.purge_ledger_revision == 0 && !bundle.purge_ledger.is_empty() {
+            //
+            // BOTH directions are refused, because the two readings must
+            // agree and neither may stand in for the other: a carried ledger
+            // under a zero revision, and a declared nonzero revision over an
+            // empty ledger. The second direction is what an installation that
+            // never purged would otherwise slip through — it declares a
+            // ledger position and carries nothing to account for it, so the
+            // position is asserted rather than bound, and the restore would
+            // have no independent set to reconcile it against.
+            let carries_purge_ledger = !bundle.purge_ledger.is_empty();
+            let declares_zero_revision = bundle.manifest.purge_ledger_revision == 0;
+            if carries_purge_ledger == declares_zero_revision {
                 return Err(BackupError::FenceMismatch {
                     subject: "purge ledger revision".to_owned(),
                 });
@@ -3972,7 +3983,13 @@ mod backup_verify_tests_948 {
             watchdog_spool: Some(watchdog_spool(fence_value)),
             host_audit: None,
             missing_features: Vec::new(),
-            purge_ledger_revision: 7,
+            // Coherent with the empty `purge_ledger` above: a FullRecovery
+            // archive that carries no purge ledger section declares the zero
+            // revision that is the only position such an archive can hold
+            // (`validate_class_requirements` refuses the pair in both
+            // directions). These cases exercise the class denominator, not the
+            // purge position, so the never-purged installation is the fixture.
+            purge_ledger_revision: 0,
         }
     }
 
