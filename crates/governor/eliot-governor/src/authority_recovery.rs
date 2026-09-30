@@ -15,19 +15,20 @@
 use super::CompositionError;
 use crate::owner_closure_provider::AdmittedHydrationsSnapshot;
 use eliot_authority::{
-    AuthorityError, EffectAuthorizer, EffectAuthorizerRecoverySnapshot,
-    GRANT_GRAPH_RECOVERY_SCHEMA, GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot,
-    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
-    IntroductionRevocationRequest, IntroductionStatus, LEGACY_GRANT_GRAPH_RECOVERY_VERSION,
-    P07PortError, RevocationHistoryEvidence, RevocationOperationIdentity,
-    RootTransitionActivationReceipt, RootTransitionActivationRequest, SnapshotId, SuppressedGrant,
+    AuthorityError, AuthorizedEffectRecoveryRecord, DependentEffectState, EffectAuthorizer,
+    EffectAuthorizerRecoverySnapshot, EffectOutcome, GRANT_GRAPH_RECOVERY_SCHEMA,
+    GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot, GrantRevocationRequest,
+    GrantStatus, IntroductionActivationRequest, IntroductionRevocationRequest, IntroductionStatus,
+    LEGACY_GRANT_GRAPH_RECOVERY_VERSION, P07PortError, ReceiptObligation,
+    RevocationHistoryEvidence, RevocationOperationIdentity, RootTransitionActivationReceipt,
+    RootTransitionActivationRequest, SnapshotId, SuppressedGrant,
 };
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_receipts::AuthorityBinding;
+use eliot_receipts::{AuthorityBinding, EffectClass};
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Versioned semantic owner payload retained by Governor recovery.
 ///
@@ -558,6 +559,22 @@ pub struct AuthorityOwner {
     /// snapshot, or an explicit legacy-unavailable marker. It is data, not a
     /// second graph owner.
     pub(crate) owner_hydrations: Option<AdmittedHydrationsSnapshot>,
+    /// Recovery-side effect obligations rebuilt from the restored
+    /// authorization ledger (issue #1793 seq 6). Keyed by idempotency
+    /// identity so expiry or loss of a local queue entry never releases
+    /// them; only reconcile-by-identity retires one. Rebuilt by
+    /// [`AuthorityOwner::rebuild_effect_obligations`] after restore and
+    /// before dependent dispatch. Not part of the versioned snapshot wire
+    /// contract: dispatch/observation transitions observed in this
+    /// generation are owner-retained until the durable owner write path
+    /// persists them.
+    effect_obligations: BTreeMap<String, RetainedEffectObligation>,
+    /// Durable revocation-history source revision applied by the latest
+    /// history-bound restore (`None` when restored without CURRENT history
+    /// evidence). Read back via
+    /// [`AuthorityOwner::authority_applicability`]; it is lineage, not a
+    /// second revocation store.
+    last_revocation_source_revision: Option<u64>,
 }
 
 /// Restored authority owner with the exact history-suppressed set.
@@ -591,6 +608,8 @@ impl AuthorityOwner {
             effects,
             grants,
             owner_hydrations: snapshot.owner_hydrations.clone(),
+            effect_obligations: BTreeMap::new(),
+            last_revocation_source_revision: None,
         })
     }
 
@@ -600,7 +619,8 @@ impl AuthorityOwner {
     ///
     /// `None` history refuses: unavailable history is not absence of
     /// revocation and never restores as an empty closure. Stale (fence or
-    /// revision drift, including drift against this snapshot's fence) and
+    /// revision drift, including drift against this snapshot's fence, and a
+    /// recorded commit epoch that is not current for this recovery fence) and
     /// unknown (invalid, unordered, or non-revoked closure) evidence refuse
     /// likewise. A revoked origin and its dependent grants stay suppressed
     /// in the restored owner; unrelated valid grants restore exactly as the
@@ -638,9 +658,30 @@ impl AuthorityOwner {
                     .to_owned(),
             )
         })?;
-        if evidence.state_fence != *expected_fence || evidence.state_fence != snapshot.state_fence {
+        // #1142: the fence the history was READ at is compared against this
+        // live recovery fence. The old second clause compared that same fence
+        // against `snapshot.state_fence`, which the `validate_against` above had
+        // already proven equal by construction, so it could never refuse.
+        if evidence.state_fence != *expected_fence {
             return Err(CompositionError::Recovery(
                 "authority revocation history is stale for this recovery fence".to_owned(),
+            ));
+        }
+        // The fence each closure was actually COMMITTED at, recorded in its own
+        // durable commit receipt, is then compared against the same live fence.
+        // That is the recorded-versus-live comparison on this path: the recorded
+        // value is sourced from the commit and the live value from the Kernel's
+        // current recovery fence, so it can refuse a closure committed under a
+        // foreign lineage or under an epoch this restore has not reached. It
+        // runs before any grant is restored.
+        if evidence
+            .require_recorded_commit_epochs_current(expected_fence)
+            .is_err()
+        {
+            return Err(CompositionError::Recovery(
+                "authority revocation history carries a recorded commit epoch that is not current \
+                 for this recovery fence"
+                    .to_owned(),
             ));
         }
         if evidence.source_revision != snapshot.grant_graph.revision {
@@ -673,6 +714,8 @@ impl AuthorityOwner {
                 effects,
                 grants: outcome.graph,
                 owner_hydrations: snapshot.owner_hydrations.clone(),
+                effect_obligations: BTreeMap::new(),
+                last_revocation_source_revision: Some(evidence.source_revision),
             },
             suppressed: outcome.suppressed,
         })
@@ -701,6 +744,12 @@ impl AuthorityOwner {
     }
 
     /// Emits the complete deterministic typed authority recovery payload.
+    ///
+    /// The emitted snapshot is serializable history only: it never proves
+    /// durable persistence of this generation's transitions. Dispatch and
+    /// observation progress observed since restore are owner-retained (see
+    /// `effect_obligations`) until the durable owner write path persists
+    /// them; only validated receipts reconcile a transition.
     pub fn snapshot(&self) -> Result<AuthorityOwnerSnapshot, CompositionError> {
         let grant_graph = self
             .grants
@@ -1036,5 +1085,767 @@ pub(crate) fn map_transition_receipt_error(error: &AuthorityError) -> P07PortErr
         AuthorityError::IdentityConflict => P07PortError::IdentityConflict,
         AuthorityError::P07Unavailable => P07PortError::Unavailable,
         _ => P07PortError::InvalidBinding,
+    }
+}
+
+/// Issue #1793, sequence 6-7: effect recovery obligations, reconcile-by-identity,
+/// and separated recovery status.
+///
+/// I6.6 compiles an effectful action into proposal → authorization → receipt.
+/// The [`EffectAuthorizer`] ledger durably retains the proposal and the exact
+/// authorization decision; this section retains the recovery-side obligations
+/// derived from those records — reserved scopes/resources, descendant and
+/// compensation links, possible-external-effect flags, and dispatch/outcome
+/// progress — so dependent work stays fenced by identity across restart.
+///
+/// I6.10 ordering applies: restore first restores historical authorizations,
+/// then the caller applies CURRENT grant/revocation/contest state (via
+/// [`AuthorityOwner::from_snapshot_with_revocation_history`]) and source
+/// receipts, then rebuilds these obligations (via
+/// [`AuthorityOwner::rebuild_effect_obligations`]) before dependent dispatch.
+/// Missing or corrupt state stays blocked: unknown idempotency identities can
+/// never dispatch or reconcile, and an unknown contest key is never read as
+/// proof that an authorization exists.
+///
+/// Nothing here mints authority. Dispatch permission is still joined by
+/// [`EffectAuthorizer::admit_effect_execution`] against the live lease, the
+/// exact executor boundary, and the current contest state; these methods only
+/// retain what the owner observed and report what is still pending.
+fn require_effect_text(value: &str, field: &'static str) -> Result<(), CompositionError> {
+    if value.trim().is_empty() {
+        return Err(CompositionError::Recovery(format!(
+            "effect recovery evidence has a blank {field}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_effect_digest(value: &str, field: &'static str) -> Result<(), CompositionError> {
+    require_effect_text(value, field)?;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CompositionError::Recovery(format!(
+            "effect recovery evidence has a malformed {field}"
+        )));
+    }
+    Ok(())
+}
+
+/// Outcome evidence linked to one exact original effect by identity.
+///
+/// The evidence names the original operation identity and idempotency key and
+/// carries the digest of the exact observed canonical receipt plus the
+/// authorized owner/executor boundary that observed it. A compensation carries
+/// its own evidence under its own identity; it never stands in for the
+/// original's observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkedOutcomeEvidence {
+    /// Exact original operation identity the observation belongs to.
+    pub operation_id: String,
+    /// Exact original idempotency key the observation belongs to.
+    pub idempotency_key: String,
+    /// Digest of the exact observed canonical receipt.
+    pub canonical_receipt_sha256: String,
+    /// Authorized owner/executor boundary that observed the effect.
+    pub observed_by: String,
+}
+
+impl LinkedOutcomeEvidence {
+    /// Builds validated linked outcome evidence. Blank identities, a
+    /// malformed receipt digest, or a blank observer refuse here, before any
+    /// ledger is touched.
+    pub fn new(
+        operation_id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        canonical_receipt_sha256: impl Into<String>,
+        observed_by: impl Into<String>,
+    ) -> Result<Self, CompositionError> {
+        let evidence = Self {
+            operation_id: operation_id.into(),
+            idempotency_key: idempotency_key.into(),
+            canonical_receipt_sha256: canonical_receipt_sha256.into(),
+            observed_by: observed_by.into(),
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Validates every evidence coordinate.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        require_effect_text(&self.operation_id, "evidence.operation_id")?;
+        require_effect_text(&self.idempotency_key, "evidence.idempotency_key")?;
+        require_effect_digest(
+            &self.canonical_receipt_sha256,
+            "evidence.canonical_receipt_sha256",
+        )?;
+        require_effect_text(&self.observed_by, "evidence.observed_by")?;
+        Ok(())
+    }
+}
+
+/// Dispatch/outcome progress of one retained effect obligation.
+///
+/// Terminal reconciliation is immutable: once `Reconciled`, no further
+/// transition is admitted. Unknown outcomes stay unknown until the exact
+/// linked evidence reconciles them; a compensation link never advances this
+/// state on its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffectDispatchProgress {
+    /// Historical authorization restored; no dispatch observed yet.
+    AuthorizedNotDispatched,
+    /// A sealed dispatch was admitted; the outcome is not yet observed.
+    DispatchedAwaitingObservation,
+    /// A post-dispatch lost result (or otherwise unobserved effect): the
+    /// original unknown outcome is retained, not upgraded or rolled back.
+    UnknownOutcome { reason: String },
+    /// Terminal observed disposition with its linked outcome evidence.
+    /// Immutable: reconciliation never rewrites this entry.
+    Reconciled {
+        outcome: EffectOutcome,
+        evidence: LinkedOutcomeEvidence,
+    },
+}
+
+impl EffectDispatchProgress {
+    /// True only for an immutable terminal reconciliation.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Reconciled { .. })
+    }
+}
+
+/// A separately authorized compensation linked to its original effect.
+///
+/// The compensation names its own operation identity and idempotency key,
+/// both of which must carry their own stored authorization. The link is
+/// audit lineage only: it never clears the original's uncertainty and never
+/// proves that repeating the original action is safe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectCompensationLink {
+    /// Idempotency key of the separately authorized compensation action.
+    pub compensation_key: String,
+    /// Operation identity of the separately authorized compensation action.
+    pub compensation_operation_id: String,
+}
+
+/// One recovery-side effect obligation retained by identity.
+///
+/// Reserved scopes/resources, the bound operation/executor/lease identities,
+/// and the possible-external-effect flag are derived from the stored
+/// authorization record and never rewritten. Descendant and compensation
+/// links, and dispatch/outcome progress, advance only through the explicit
+/// owner methods below.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedEffectObligation {
+    /// Exact idempotency identity this obligation is keyed by.
+    pub idempotency_key: String,
+    /// Exact original operation identity.
+    pub operation_id: String,
+    /// Action identity from the compiled proposal.
+    pub action_id: String,
+    /// Reserved resource retained from the stored authorization.
+    pub resource_ref: String,
+    /// Reserved operation kind retained from the stored authorization.
+    pub operation_kind: String,
+    /// Exact authorized executor boundary.
+    pub executor_boundary: String,
+    /// Exact authorizing lease identity.
+    pub lease_id: String,
+    /// Verifier/receipt obligations bound at authorization time.
+    pub receipt_obligations: Vec<ReceiptObligation>,
+    /// True when the admitted effect class may have external effects, so
+    /// dependents must assume the effect could have escaped local rollback.
+    pub possible_external_effect: bool,
+    /// Dispatch/outcome progress observed so far.
+    pub progress: EffectDispatchProgress,
+    /// Explicitly linked descendant operation identities fenced with this
+    /// obligation until it reconciles.
+    pub descendants: BTreeSet<String>,
+    /// Separately authorized compensations linked for audit. They never
+    /// advance `progress` on their own.
+    pub compensations: Vec<EffectCompensationLink>,
+}
+
+impl RetainedEffectObligation {
+    /// Derives the immutable obligation half from one stored authorization
+    /// record. Progress starts at `AuthorizedNotDispatched` with no links;
+    /// live transitions are reported through the owner methods.
+    fn from_authorized_record(record: &AuthorizedEffectRecoveryRecord) -> Self {
+        Self {
+            idempotency_key: record.idempotency_key.clone(),
+            operation_id: record.operation.operation_id.as_str().to_owned(),
+            action_id: record.action_id.clone(),
+            resource_ref: record.resource_ref.clone(),
+            operation_kind: record.operation.operation_kind.clone(),
+            executor_boundary: record.executor_boundary.clone(),
+            lease_id: record.lease_id.clone(),
+            receipt_obligations: record.receipt_obligations.clone(),
+            possible_external_effect: record.operation.effect == EffectClass::ExternalEffect,
+            progress: EffectDispatchProgress::AuthorizedNotDispatched,
+            descendants: BTreeSet::new(),
+            compensations: Vec::new(),
+        }
+    }
+}
+
+/// Proposal half of the separated recovery status: what was asked, with no
+/// authority implied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectProposalView {
+    pub action_id: String,
+    pub operation_id: String,
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub operation_kind: String,
+    pub resource_ref: String,
+    pub canonical_payload_sha256: String,
+}
+
+/// Authorization half of the separated recovery status: the exact stored
+/// decision bound to lease and executor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectAuthorizationView {
+    pub lease_id: String,
+    pub executor_boundary: String,
+    pub receipt_obligations: Vec<ReceiptObligation>,
+}
+
+/// Dispatch half of the separated recovery status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectDispatchView {
+    /// No historical authorization exists for this identity.
+    NeverAuthorized,
+    /// Authorized; no dispatch observed.
+    AwaitingDispatch,
+    /// A dispatch was admitted, lost, or terminally reconciled: consult
+    /// `outcome` for which.
+    Dispatched,
+}
+
+/// Outcome half of the separated recovery status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffectOutcomeView {
+    /// Never authorized, or authorized with no observation yet.
+    None,
+    /// Dispatched; the outcome is not yet observed.
+    AwaitingObservation,
+    /// The original unknown outcome is retained; reconciliation is pending.
+    Unknown { reason: String },
+    /// Terminal observed disposition with its linked evidence coordinates.
+    Reconciled {
+        outcome: EffectOutcome,
+        evidence_receipt_sha256: String,
+        observed_by: String,
+    },
+}
+
+/// One reason an effect still needs reconciliation. An empty list means
+/// nothing is pending on the recovery path (it is not execution permission:
+/// live dispatch still joins the lease, executor, and contest state).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffectPendingItem {
+    /// No historical authorization exists; missing state stays blocked.
+    MissingAuthorization,
+    /// The current standing is challenged by the named revoked roots and
+    /// must be rebuilt from clean inputs before further reliance.
+    ContestedByRoots { revoked_roots: Vec<String> },
+    /// A sealed dispatch has no observation yet.
+    DispatchUnobserved,
+    /// The original unknown outcome is retained until linked evidence
+    /// reconciles it.
+    UnknownOutcomeUnreconciled,
+}
+
+/// Separated recovery status for one effect identity (issue #1793 seq 7).
+///
+/// Proposal, authorization, dispatch, outcome, and pending reconciliation
+/// are exposed as independent sections with privacy-safe owned strings, so
+/// a status reader can never mistake one section for another. `current_contest`
+/// is the live contest overlay: per the effect ledger contract it reports
+/// `Admissible` for unknown keys, so callers must join it with
+/// `proposal.is_some()` — an admissible default for an unknown key is not
+/// proof that an authorization exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectRecoveryStatus {
+    pub idempotency_key: String,
+    pub proposal: Option<EffectProposalView>,
+    pub authorization: Option<EffectAuthorizationView>,
+    pub dispatch: EffectDispatchView,
+    pub outcome: EffectOutcomeView,
+    pub pending: Vec<EffectPendingItem>,
+    pub current_contest: DependentEffectState,
+}
+
+/// Current applicability rebuilt before reuse (issue #1793 seq 7).
+///
+/// Names the exact grant-graph revision, the durable revocation-history
+/// source revision applied (`None` when restored without CURRENT history
+/// evidence — that restore stays visibly incomplete), whether the closure
+/// hydration feed is present, and which effects the current contest state
+/// challenges. Missing or corrupt state is reported here, never defaulted
+/// to an empty permissive registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectAuthorityApplicability {
+    pub grant_graph_revision: u64,
+    pub revocation_source_revision: Option<u64>,
+    pub owner_hydrations_present: bool,
+    pub contested_effect_keys: Vec<String>,
+}
+
+impl AuthorityOwner {
+    /// Rebuilds recovery-side effect obligations after restart, before
+    /// dependent dispatch (issue #1793 seq 6).
+    ///
+    /// Every stored historical authorization gains an obligation carrying
+    /// its exact reserved scopes/resources, operation/executor/lease
+    /// identities, receipt obligations, and possible-external-effect flag.
+    /// Obligations already present keep their in-generation progress,
+    /// descendant/compensation links, and terminal history: the rebuild
+    /// never overwrites observed dispatch/outcome state, and obligations
+    /// for identities absent from the ledger are retained (expiry or loss
+    /// of a local queue entry does not release them).
+    ///
+    /// Returns the number of obligations newly derived from the ledger.
+    pub fn rebuild_effect_obligations(&mut self) -> Result<usize, CompositionError> {
+        let snapshot = self
+            .effects
+            .snapshot()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let mut created = 0;
+        for record in &snapshot.records {
+            if !self
+                .effect_obligations
+                .contains_key(&record.idempotency_key)
+            {
+                self.effect_obligations.insert(
+                    record.idempotency_key.clone(),
+                    RetainedEffectObligation::from_authorized_record(record),
+                );
+                created += 1;
+            }
+        }
+        Ok(created)
+    }
+
+    /// Reports that the sealed dispatch for one retained effect was admitted
+    /// at the effect boundary.
+    ///
+    /// Refuses unknown identities (missing state stays blocked, it is never
+    /// treated as an empty permissive grant), currently contested
+    /// authorizations, and any obligation that already left
+    /// `AuthorizedNotDispatched` — including immutable terminal history.
+    /// CURRENT revocation evidence must have been rebuilt first: an owner
+    /// restored without history-bound evidence keeps every dispatch refused
+    /// until a history-bound restore completes, so empty contest overlays
+    /// are never read as absence of revocation. This records the owner's
+    /// observation; execution permission itself was joined by
+    /// `admit_effect_execution` against the live lease, executor, and
+    /// contest state.
+    pub fn note_effect_dispatch_admitted(
+        &mut self,
+        idempotency_key: &str,
+    ) -> Result<(), CompositionError> {
+        let obligation = self
+            .effect_obligations
+            .get_mut(idempotency_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect dispatch names an identity with no retained authorization".to_owned(),
+                )
+            })?;
+        if self.last_revocation_source_revision.is_none() {
+            return Err(CompositionError::Recovery(
+                "effect dispatch requires CURRENT revocation evidence; rebuild it with a history-bound restore before dependent use"
+                    .to_owned(),
+            ));
+        }
+        if self
+            .effects
+            .dependent_effect_state(idempotency_key)
+            .is_contested()
+        {
+            return Err(CompositionError::Recovery(
+                "effect dispatch is contested by current revocation state".to_owned(),
+            ));
+        }
+        match &obligation.progress {
+            EffectDispatchProgress::AuthorizedNotDispatched => {}
+            EffectDispatchProgress::DispatchedAwaitingObservation
+            | EffectDispatchProgress::UnknownOutcome { .. } => {
+                return Err(CompositionError::Recovery(
+                    "effect dispatch is already admitted for this identity".to_owned(),
+                ));
+            }
+            EffectDispatchProgress::Reconciled { .. } => {
+                return Err(CompositionError::Recovery(
+                    "effect dispatch cannot re-open immutable terminal history".to_owned(),
+                ));
+            }
+        }
+        obligation.progress = EffectDispatchProgress::DispatchedAwaitingObservation;
+        Ok(())
+    }
+
+    /// Retains a post-dispatch lost result (or otherwise unobserved effect)
+    /// as the original unknown outcome.
+    ///
+    /// The obligation keeps its exact reserved scopes/resources and stays
+    /// fenced until reconcile-by-identity. Terminal history can never be
+    /// overwritten into unknown; unknown identities stay refused.
+    pub fn note_effect_unknown_outcome(
+        &mut self,
+        idempotency_key: &str,
+        reason: impl Into<String>,
+    ) -> Result<(), CompositionError> {
+        let reason = reason.into();
+        require_effect_text(&reason, "unknown_outcome.reason")?;
+        let obligation = self
+            .effect_obligations
+            .get_mut(idempotency_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect outcome names an identity with no retained authorization".to_owned(),
+                )
+            })?;
+        if obligation.progress.is_terminal() {
+            return Err(CompositionError::Recovery(
+                "effect outcome cannot overwrite immutable terminal history".to_owned(),
+            ));
+        }
+        obligation.progress = EffectDispatchProgress::UnknownOutcome { reason };
+        Ok(())
+    }
+
+    /// Reconciles the original effect through its authorized owner
+    /// observation plus linked outcome evidence (issue #1793 seq 6).
+    ///
+    /// The evidence must name this exact idempotency identity and the exact
+    /// stored operation identity, and the outcome must be terminal: an
+    /// unknown outcome is retained via [`Self::note_effect_unknown_outcome`],
+    /// never reconciled, and a compensation link never substitutes for the
+    /// original's observation. An already-reconciled obligation refuses: the
+    /// linked outcome evidence is appended once and terminal history is
+    /// never overwritten. Reconciliation releases the same-scope fence.
+    pub fn reconcile_effect_outcome(
+        &mut self,
+        idempotency_key: &str,
+        outcome: EffectOutcome,
+        evidence: LinkedOutcomeEvidence,
+    ) -> Result<(), CompositionError> {
+        evidence.validate()?;
+        if matches!(outcome, EffectOutcome::UnknownOutcome { .. }) {
+            return Err(CompositionError::Recovery(
+                "effect reconciliation requires a terminal observed outcome".to_owned(),
+            ));
+        }
+        let obligation = self
+            .effect_obligations
+            .get_mut(idempotency_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect reconciliation names an identity with no retained authorization"
+                        .to_owned(),
+                )
+            })?;
+        if evidence.idempotency_key != obligation.idempotency_key
+            || evidence.operation_id != obligation.operation_id
+        {
+            return Err(CompositionError::Recovery(
+                "effect outcome evidence does not match the retained operation identity".to_owned(),
+            ));
+        }
+        if obligation.progress.is_terminal() {
+            return Err(CompositionError::Recovery(
+                "effect reconciliation cannot overwrite immutable terminal history".to_owned(),
+            ));
+        }
+        obligation.progress = EffectDispatchProgress::Reconciled { outcome, evidence };
+        Ok(())
+    }
+
+    /// Links a separately authorized compensation to its original effect.
+    ///
+    /// Both identities must carry their own retained authorization: the
+    /// compensation is a separately authorized, separately observed action,
+    /// never an implicit reopening of the original. The link is audit
+    /// lineage only — it never advances the original's progress and never
+    /// erases original uncertainty. Only [`Self::reconcile_effect_outcome`]
+    /// with the proper observed disposition releases the original fence.
+    pub fn link_effect_compensation(
+        &mut self,
+        original_key: &str,
+        compensation_key: &str,
+        compensation_operation_id: &str,
+    ) -> Result<(), CompositionError> {
+        require_effect_text(compensation_key, "compensation.idempotency_key")?;
+        require_effect_text(compensation_operation_id, "compensation.operation_id")?;
+        let compensation = self
+            .effect_obligations
+            .get(compensation_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect compensation names an identity with no retained authorization"
+                        .to_owned(),
+                )
+            })?;
+        if compensation.operation_id != compensation_operation_id {
+            return Err(CompositionError::Recovery(
+                "effect compensation operation identity disagrees with the retained record"
+                    .to_owned(),
+            ));
+        }
+        let original = self
+            .effect_obligations
+            .get_mut(original_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "effect compensation names an original with no retained authorization"
+                        .to_owned(),
+                )
+            })?;
+        if original
+            .compensations
+            .iter()
+            .any(|link| link.compensation_key == compensation_key)
+        {
+            return Err(CompositionError::Recovery(
+                "effect compensation is already linked to this original".to_owned(),
+            ));
+        }
+        original.compensations.push(EffectCompensationLink {
+            compensation_key: compensation_key.to_owned(),
+            compensation_operation_id: compensation_operation_id.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Links an explicitly related descendant operation under one retained
+    /// obligation.
+    ///
+    /// Both identities must carry their own retained authorization. The
+    /// descendant stays fenced with the parent obligation's scope until the
+    /// parent reconciles; retrying the parent under a new operation identity
+    /// still requires the documented rollback/relationship and fresh
+    /// admission.
+    pub fn link_effect_descendant(
+        &mut self,
+        parent_key: &str,
+        child_key: &str,
+    ) -> Result<(), CompositionError> {
+        require_effect_text(child_key, "descendant.idempotency_key")?;
+        if parent_key == child_key {
+            return Err(CompositionError::Recovery(
+                "effect descendant cannot link an identity to itself".to_owned(),
+            ));
+        }
+        if !self.effect_obligations.contains_key(child_key) {
+            return Err(CompositionError::Recovery(
+                "effect descendant names an identity with no retained authorization".to_owned(),
+            ));
+        }
+        let parent = self.effect_obligations.get_mut(parent_key).ok_or_else(|| {
+            CompositionError::Recovery(
+                "effect descendant names a parent with no retained authorization".to_owned(),
+            )
+        })?;
+        if !parent.descendants.insert(child_key.to_owned()) {
+            return Err(CompositionError::Recovery(
+                "effect descendant is already linked to this parent".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Per-identity dispatch fence, consulted before dependent dispatch.
+    ///
+    /// Returns true (blocked) when no retained authorization exists for the
+    /// identity, when CURRENT revocation evidence was never rebuilt for this
+    /// owner (an owner restored without history-bound evidence stays fenced
+    /// until a history-bound restore completes, even with empty contest
+    /// overlays), when the current contest state challenges it, or when its
+    /// obligation already left `AuthorizedNotDispatched` — dispatched but
+    /// unobserved, unknown, or terminally reconciled identities never
+    /// re-dispatch under the same identity. Only a known, uncontested,
+    /// never-dispatched authorization on a history-bound owner reports
+    /// false. A retried operation needs its own explicitly linked
+    /// new-operation identity and fresh admission.
+    #[must_use]
+    pub fn effect_dispatch_blocked(&self, idempotency_key: &str) -> bool {
+        if self.last_revocation_source_revision.is_none() {
+            return true;
+        }
+        let Some(obligation) = self.effect_obligations.get(idempotency_key) else {
+            return true;
+        };
+        if self
+            .effects
+            .dependent_effect_state(idempotency_key)
+            .is_contested()
+        {
+            return true;
+        }
+        !matches!(
+            obligation.progress,
+            EffectDispatchProgress::AuthorizedNotDispatched
+        )
+    }
+
+    /// Same-scope dependent-work fence (issue #1793 seq 6).
+    ///
+    /// Returns true while any non-terminal obligation reserves exactly
+    /// `resource_ref`: dispatched-but-unobserved, unknown-outcome, and
+    /// contested-but-authorized obligations all keep the dependent ordering
+    /// scope blocked. Terminal reconciliation releases the scope, and scopes
+    /// with no retained obligation stay eligible, so independent work
+    /// proceeds while dependent work waits.
+    #[must_use]
+    pub fn dependent_scope_blocked(&self, resource_ref: &str) -> bool {
+        self.effect_obligations.values().any(|obligation| {
+            !obligation.progress.is_terminal() && obligation.resource_ref == resource_ref
+        })
+    }
+
+    /// Separated recovery status for one effect identity (issue #1793 seq 7).
+    ///
+    /// Proposal, authorization, dispatch, outcome, and pending
+    /// reconciliation are reported as independent sections. Unknown
+    /// identities report no proposal/authorization, `NeverAuthorized`
+    /// dispatch, `None` outcome, and a `MissingAuthorization` pending item —
+    /// never an admissible default.
+    #[must_use]
+    pub fn effect_recovery_status(&self, idempotency_key: &str) -> EffectRecoveryStatus {
+        let obligation = self.effect_obligations.get(idempotency_key);
+        let current_contest = self.effects.dependent_effect_state(idempotency_key);
+        let contested = current_contest.is_contested();
+        let (proposal, authorization, dispatch, outcome) = match obligation {
+            None => (
+                None,
+                None,
+                EffectDispatchView::NeverAuthorized,
+                EffectOutcomeView::None,
+            ),
+            Some(obligation) => {
+                let ledger = self.effect_ledger_record(idempotency_key);
+                let proposal = EffectProposalView {
+                    action_id: obligation.action_id.clone(),
+                    operation_id: obligation.operation_id.clone(),
+                    request_id: ledger
+                        .as_ref()
+                        .map(|record| record.operation.request_id.as_str().to_owned())
+                        .unwrap_or_default(),
+                    idempotency_key: obligation.idempotency_key.clone(),
+                    operation_kind: obligation.operation_kind.clone(),
+                    resource_ref: obligation.resource_ref.clone(),
+                    canonical_payload_sha256: ledger
+                        .map(|record| record.canonical_payload_sha256.clone())
+                        .unwrap_or_default(),
+                };
+                let authorization = EffectAuthorizationView {
+                    lease_id: obligation.lease_id.clone(),
+                    executor_boundary: obligation.executor_boundary.clone(),
+                    receipt_obligations: obligation.receipt_obligations.clone(),
+                };
+                let (dispatch, outcome) = match &obligation.progress {
+                    EffectDispatchProgress::AuthorizedNotDispatched => (
+                        EffectDispatchView::AwaitingDispatch,
+                        EffectOutcomeView::None,
+                    ),
+                    EffectDispatchProgress::DispatchedAwaitingObservation => (
+                        EffectDispatchView::Dispatched,
+                        EffectOutcomeView::AwaitingObservation,
+                    ),
+                    EffectDispatchProgress::UnknownOutcome { reason } => (
+                        EffectDispatchView::Dispatched,
+                        EffectOutcomeView::Unknown {
+                            reason: reason.clone(),
+                        },
+                    ),
+                    EffectDispatchProgress::Reconciled { outcome, evidence } => (
+                        EffectDispatchView::Dispatched,
+                        EffectOutcomeView::Reconciled {
+                            outcome: outcome.clone(),
+                            evidence_receipt_sha256: evidence.canonical_receipt_sha256.clone(),
+                            observed_by: evidence.observed_by.clone(),
+                        },
+                    ),
+                };
+                (Some(proposal), Some(authorization), dispatch, outcome)
+            }
+        };
+        let mut pending = Vec::new();
+        if obligation.is_none() {
+            pending.push(EffectPendingItem::MissingAuthorization);
+        }
+        if contested {
+            pending.push(EffectPendingItem::ContestedByRoots {
+                revoked_roots: current_contest
+                    .revoked_roots()
+                    .map(|roots| roots.iter().cloned().collect())
+                    .unwrap_or_default(),
+            });
+        }
+        match &outcome {
+            EffectOutcomeView::AwaitingObservation => {
+                pending.push(EffectPendingItem::DispatchUnobserved);
+            }
+            EffectOutcomeView::Unknown { .. } => {
+                pending.push(EffectPendingItem::UnknownOutcomeUnreconciled);
+            }
+            EffectOutcomeView::None | EffectOutcomeView::Reconciled { .. } => {}
+        }
+        EffectRecoveryStatus {
+            idempotency_key: idempotency_key.to_owned(),
+            proposal,
+            authorization,
+            dispatch,
+            outcome,
+            pending,
+            current_contest,
+        }
+    }
+
+    /// Idempotency keys with at least one pending reconciliation item, in
+    /// obligation order. Drives the status-path sweep without implying
+    /// execution permission for any key.
+    #[must_use]
+    pub fn pending_effect_keys(&self) -> Vec<String> {
+        self.effect_obligations
+            .keys()
+            .filter(|key| !self.effect_recovery_status(key).pending.is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Current applicability rebuilt before reuse (issue #1793 seq 7).
+    ///
+    /// Reports the exact grant-graph revision, the durable
+    /// revocation-history source revision applied at restore, whether the
+    /// closure hydration feed is present, and the currently contested
+    /// effects. A `None` source revision means the owner restored without
+    /// CURRENT history evidence: applicability is visibly incomplete and
+    /// dependent reuse must stay fenced until a history-bound restore
+    /// completes.
+    #[must_use]
+    pub fn authority_applicability(&self) -> EffectAuthorityApplicability {
+        EffectAuthorityApplicability {
+            grant_graph_revision: self.grants.revision(),
+            revocation_source_revision: self.last_revocation_source_revision,
+            owner_hydrations_present: self.owner_hydrations.is_some(),
+            contested_effect_keys: self.effects.contested_effect_keys(),
+        }
+    }
+
+    /// Reads one stored authorization record by identity. The ledger is the
+    /// authority for what was authorized; the obligation map is the
+    /// authority for what has been observed since.
+    fn effect_ledger_record(
+        &self,
+        idempotency_key: &str,
+    ) -> Option<AuthorizedEffectRecoveryRecord> {
+        self.effects.snapshot().ok().and_then(|snapshot| {
+            snapshot
+                .records
+                .into_iter()
+                .find(|record| record.idempotency_key == idempotency_key)
+        })
     }
 }

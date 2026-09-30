@@ -99,8 +99,23 @@ pub struct RevocationClosureDigestInput<'a> {
     pub invalidation_reason: Option<RevocationReason>,
     /// Terminal influence state.
     pub current_influence: InfluenceState,
-    /// Full fence/epoch the closure was committed at.
+    /// Fence/epoch the history that PRESENTED this closure was read under.
+    ///
+    /// This is the read-time coordinate, not the closure's commit epoch: the
+    /// durable producer echoes its live dispatch fence and the consumer copies
+    /// the echoed response fence, so both sides hash the same read. It binds
+    /// the presentation to the read that served it and is deliberately kept
+    /// separate from [`commit_state_fence`](Self::commit_state_fence), which
+    /// binds the closure to the epoch it was committed at.
     pub state_fence: &'a StateFence,
+    /// Fence/epoch the durable commit that produced this closure was committed
+    /// under, read out of that commit's own recorded authority binding.
+    ///
+    /// This is the recorded coordinate. It is sourced from the immutable commit
+    /// receipt the durable owner already holds, never from the serving read, so
+    /// hashing it binds the closure identity to its commit epoch instead of to
+    /// whichever read happened to project it.
+    pub commit_state_fence: &'a StateFence,
     /// The closure's own committed revision.
     pub revision: u64,
     /// Declared traversal bounds the membership was proven under.
@@ -149,8 +164,9 @@ pub fn revocation_affected_members_digest(affected: &BTreeSet<String>) -> Option
 
 /// Canonical request hash of one exact closure presentation: evidence
 /// version, closure identity, owner namespace, origin, sorted dependents,
-/// reason, terminal state, fence, revision, bounds, disposition, sorted
-/// omissions, and the affected-member count and digest.
+/// reason, terminal state, the presenting read's fence, the recorded commit
+/// fence/epoch, revision, bounds, disposition, sorted omissions, and the
+/// affected-member count and digest.
 ///
 /// I5.27 defines idempotency over canonical bytes, so a presentation whose
 /// declared hash disagrees with its own bytes is an identity conflict
@@ -173,6 +189,7 @@ pub fn revocation_closure_canonical_digest(
         invalidation_reason: input.invalidation_reason,
         current_influence: input.current_influence,
         state_fence: input.state_fence,
+        commit_state_fence: input.commit_state_fence,
         revision: input.revision,
         bounds: input.bounds,
         disposition: input.disposition,
@@ -206,6 +223,7 @@ struct RevocationClosureCanonicalPreimage<'a> {
     invalidation_reason: Option<RevocationReason>,
     current_influence: InfluenceState,
     state_fence: &'a StateFence,
+    commit_state_fence: &'a StateFence,
     revision: u64,
     bounds: RevocationClosureDigestBounds,
     disposition: &'a str,

@@ -19,9 +19,9 @@ mod ownership;
 
 pub use ownership::{
     AssignedOwnership, AuthenticatedOwnerLease, AuthorizedWaiver, ClosureEvidence, LeaseIdentity,
-    OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseLoss, OwnerLossReason, OwnerRoute, Ownership,
-    OwnershipObligation, Supersession, SupersessionRecord, UnassignedOwnership, WaiverRecord,
-    obligation_id,
+    OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseLoss, OwnerLeaseRevocation, OwnerLossReason,
+    OwnerRoute, Ownership, OwnershipObligation, Supersession, SupersessionRecord,
+    UnassignedOwnership, WaiverRecord, obligation_id,
 };
 
 /// Stable package identity.
@@ -141,6 +141,10 @@ pub enum ProblemError {
     /// and must not unassign the current successor.
     #[error("owner-loss event is stale for the lease and ownership epoch this record holds")]
     StaleOwnerLoss,
+    /// The lease owner records no loss of the presented ownership grant, so the
+    /// event was not real evidence of that lease ending and is not admitted.
+    #[error("the lease owner records no loss of this ownership lease")]
+    OwnerLossNotObserved,
     /// Closure evidence must come from a verifier independent of the owner.
     #[error("resolution evidence must come from a verifier independent of the owner")]
     IndependentVerifierRequired,
@@ -1083,15 +1087,28 @@ impl Problem {
 
     /// Records a fenced owner loss and leaves the obligation visible.
     ///
-    /// This is the seam that makes loss non-silent. The lease owner reports the
-    /// exact [`LeaseIdentity`] it observed dead; a loss naming a different
-    /// identity is a delayed event for an already-superseded lease and is
-    /// refused with [`ProblemError::StaleOwnerLoss`], so it cannot unassign the
-    /// current successor. When the loss is current, only the assignment is
-    /// cleared: the unresolved phase, evidence, hypotheses, repair history and
-    /// reopen history are all retained, and one obligation derived from the
-    /// record's own class and the fenced epoch is raised. The unresolved
-    /// Problem is still unresolved afterwards.
+    /// This is the seam that makes loss non-silent. Both halves of the fence
+    /// are checked here, and they are checked in this order because the second
+    /// is the one that is easy to lose:
+    ///
+    /// 1. `loss` is an [`OwnerLeaseLoss`], which has no public constructor. Its
+    ///    reason and evidence are the issuing owner's own, and its observed
+    ///    identity was re-derived from the grant the issuer was asked about, so
+    ///    the event is real evidence of a lease actually ending rather than a
+    ///    caller's assertion with a principal attached.
+    /// 2. The record's **current** retained lease identity is re-checked at this
+    ///    moment, not at the moment the event was produced. A loss naming a
+    ///    different identity is a delayed event for an already-superseded lease
+    ///    and is refused with [`ProblemError::StaleOwnerLoss`], so it cannot
+    ///    unassign the current successor — including when the successor renewed
+    ///    under the same `lease_id`, because the identity is compared over
+    ///    commitment and ownership epoch as well.
+    ///
+    /// When the loss is current, only the assignment is cleared: the unresolved
+    /// phase, evidence, hypotheses, repair history and reopen history are all
+    /// retained, and one obligation derived from the record's own class and the
+    /// fenced epoch is raised. The unresolved Problem is still unresolved
+    /// afterwards.
     ///
     /// An already-terminal record is preserved rather than reopened: losing a
     /// former owner does not resurrect a resolved Problem.
@@ -1103,7 +1120,7 @@ impl Problem {
         same_fence(expected_fence, &self.state_fence)?;
         loss.validate()?;
         let owner = self.ownership.assigned()?;
-        if !loss.observed_lease.is_exactly(&owner.lease) {
+        if !loss.observed_lease().is_exactly(&owner.lease) {
             return Err(ProblemError::StaleOwnerLoss);
         }
         if matches!(
@@ -1130,14 +1147,17 @@ impl Problem {
         // The one exact line where owner loss becomes a visible obligation and
         // the former owner is fenced: the assignment is replaced by an
         // unassigned state that names the fenced holder, the retained loss
-        // evidence and this obligation.
+        // evidence and this obligation. Nothing else on the candidate is
+        // touched — `state`, `observed_evidence`, `hypotheses`,
+        // `repair_history`, `reopen_history` and `expected_resolution` all
+        // survive, so only the expired assignment is cleared.
         let mut candidate = self.clone();
         candidate.ownership = Ownership::Unassigned(UnassignedOwnership {
             last_holder: owner.holder.clone(),
-            reason: loss.reason,
+            reason: loss.reason(),
             lost_lease: Some(owner.lease.clone()),
             ownership_epoch: owner.ownership_epoch,
-            loss_evidence: loss.evidence.clone(),
+            loss_evidence: loss.evidence().to_vec(),
             obligation: obligation.clone(),
         });
         candidate.obligation = Some(obligation.clone());
@@ -1884,6 +1904,12 @@ impl Incident {
 
     /// Records a fenced owner loss and leaves the obligation visible.
     ///
+    /// Both halves of the fence hold exactly as they do on the Problem: `loss`
+    /// is an [`OwnerLeaseLoss`] carrying the issuing owner's own reason and
+    /// evidence over an identity re-derived from the grant, and the record's
+    /// current retained lease identity is re-checked here rather than at
+    /// production time.
+    ///
     /// The promotion, its reason, its admitting authority, the source Problem
     /// link and the retained review requests all survive: losing the owner of
     /// an Incident does not soften what the Incident is. Only the assignment is
@@ -1898,7 +1924,7 @@ impl Incident {
         same_fence(expected_fence, &self.state_fence)?;
         loss.validate()?;
         let owner = self.ownership.assigned()?;
-        if !loss.observed_lease.is_exactly(&owner.lease) {
+        if !loss.observed_lease().is_exactly(&owner.lease) {
             return Err(ProblemError::StaleOwnerLoss);
         }
         if matches!(
@@ -1922,10 +1948,10 @@ impl Incident {
         let mut candidate = self.clone();
         candidate.ownership = Ownership::Unassigned(UnassignedOwnership {
             last_holder: owner.holder.clone(),
-            reason: loss.reason,
+            reason: loss.reason(),
             lost_lease: Some(owner.lease.clone()),
             ownership_epoch: owner.ownership_epoch,
-            loss_evidence: loss.evidence.clone(),
+            loss_evidence: loss.evidence().to_vec(),
             obligation: obligation.clone(),
         });
         candidate.obligation = Some(obligation.clone());
@@ -2746,6 +2772,12 @@ impl CriticalAttention {
 
     /// Records a fenced owner loss and leaves the obligation visible.
     ///
+    /// Both halves of the fence hold exactly as they do on the Problem: `loss`
+    /// is an [`OwnerLeaseLoss`] carrying the issuing owner's own reason and
+    /// evidence over an identity re-derived from the grant, and the record's
+    /// current retained lease identity is re-checked here rather than at
+    /// production time.
+    ///
     /// Only the assignment is cleared: the blocking action set, the obligation
     /// text, the evidence, the review condition and the expected closure set all
     /// survive, and the obligation escalates through the record's own recorded
@@ -2760,7 +2792,7 @@ impl CriticalAttention {
         same_fence(expected_fence, &self.state_fence)?;
         loss.validate()?;
         let owner = self.ownership.assigned()?;
-        if !loss.observed_lease.is_exactly(&owner.lease) {
+        if !loss.observed_lease().is_exactly(&owner.lease) {
             return Err(ProblemError::StaleOwnerLoss);
         }
         if self.state.is_terminal() {
@@ -2785,10 +2817,10 @@ impl CriticalAttention {
         let mut candidate = self.clone();
         candidate.ownership = Ownership::Unassigned(UnassignedOwnership {
             last_holder: owner.holder.clone(),
-            reason: loss.reason,
+            reason: loss.reason(),
             lost_lease: Some(owner.lease.clone()),
             ownership_epoch: owner.ownership_epoch,
-            loss_evidence: loss.evidence.clone(),
+            loss_evidence: loss.evidence().to_vec(),
             obligation: obligation.clone(),
         });
         candidate.obligation = Some(obligation.clone());
@@ -3153,6 +3185,7 @@ pub fn contract_identity() -> Result<eliot_contracts::ContractIdentity, ProblemE
             "owner_lease_grant": schemars::schema_for!(OwnerLeaseGrant),
             "lease_identity": schemars::schema_for!(LeaseIdentity),
             "owner_lease_loss": schemars::schema_for!(OwnerLeaseLoss),
+            "owner_lease_revocation": schemars::schema_for!(OwnerLeaseRevocation),
             "owner_loss_reason": schemars::schema_for!(OwnerLossReason),
             "owner_route": schemars::schema_for!(OwnerRoute),
             "ownership_obligation": schemars::schema_for!(OwnershipObligation),
@@ -3214,8 +3247,13 @@ mod tests {
     }
 
     /// The lease owner's own commitment store, standing in for the real issuer.
+    ///
+    /// `revocations` is the loss-direction half of the same durable state: the
+    /// issuer records nothing about a lease it has not stopped holding, which is
+    /// what makes `OwnerLeaseLoss::observed` refuse rather than believe a caller.
     struct TestIssuer {
         grants: Vec<OwnerLeaseGrant>,
+        revocations: Vec<(OwnerLeaseGrant, OwnerLeaseRevocation)>,
     }
 
     impl OwnerLeaseIssuer for TestIssuer {
@@ -3225,6 +3263,13 @@ mod tests {
             } else {
                 None
             }
+        }
+
+        fn revoked_lease(&self, grant: &OwnerLeaseGrant) -> Option<OwnerLeaseRevocation> {
+            self.revocations
+                .iter()
+                .find(|(revoked, _)| revoked == grant)
+                .map(|(_, revocation)| revocation.clone())
         }
     }
 
@@ -3247,6 +3292,7 @@ mod tests {
         };
         let issuer = TestIssuer {
             grants: vec![grant.clone()],
+            revocations: Vec::new(),
         };
         AuthenticatedOwnerLease::authenticate(&grant, &issuer)
     }

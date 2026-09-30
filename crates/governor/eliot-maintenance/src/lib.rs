@@ -98,8 +98,8 @@ pub use improvement_pipeline::{
 };
 pub use trigger_intake::{
     MaintenanceTriggerIntake, TriggerIntakeClasses, TriggerIntakeOperation, TriggerIntakePayload,
-    TriggerIntakePosition, TriggerIntakeRequest, TriggerIntakeRouting, TriggerIntakeSourceEvent,
-    TriggerIntakeWindow, derive_trigger_intake,
+    TriggerIntakePersistReceipt, TriggerIntakePosition, TriggerIntakeRequest, TriggerIntakeRouting,
+    TriggerIntakeSourceEvent, TriggerIntakeWindow, derive_trigger_intake,
 };
 
 /// Stable wire name for the maintenance governor contract.

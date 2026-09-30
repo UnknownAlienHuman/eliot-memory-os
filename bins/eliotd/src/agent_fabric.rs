@@ -239,9 +239,15 @@ pub enum PortBindingState {
     /// The binding was accepted but is now stale or revoked by its owner.
     StaleRevoked,
     /// The port does not report binding state. The fabric draws no absence
-    /// conclusion from this state and proceeds to the per-call owner
-    /// verifier, which remains the authority. This is the default for every
-    /// injected seam, so generic injection stays a seam, not a defect.
+    /// conclusion from this state, but it also grants no dependent use on
+    /// this state: an effecting operation blocked on an unreported binding
+    /// stops with a typed [`MissingPortResidual`] instead of deferring to a
+    /// call whose answer cannot prove owner issuance (issue #1700 AUD5). An
+    /// uncertain seam may back only operations that carry no map entry
+    /// (plan-only planning, read-only observation, recovery/status/control
+    /// reads, snapshot/restore), which never consult the binding. This is
+    /// the default for every injected seam, so generic injection stays a
+    /// seam, not a silent success.
     Uncertain,
 }
 
@@ -279,12 +285,16 @@ impl PortBindingState {
     }
 
     /// Returns true only when dependent use may proceed past the pre-check:
-    /// [`PortBindingState::Bound`] proceeds to the per-call owner verifier,
-    /// and [`PortBindingState::Uncertain`] defers to it entirely. Every
-    /// other state blocks with a typed residual at the point of use.
+    /// exactly [`PortBindingState::Bound`], which proceeds to the per-call
+    /// owner verifier. Every other state blocks with a typed residual at
+    /// the point of use — including [`PortBindingState::Uncertain`], whose
+    /// unreported binding cannot admit an effect whose owner call would
+    /// then succeed locally without proving owner issuance (issue #1700
+    /// AUD5). Plan-only/read-only operations keep their separate dependency
+    /// set and never consult this pre-check.
     #[must_use]
     pub const fn admits_dependent_use(&self) -> bool {
-        matches!(self, Self::Bound { .. } | Self::Uncertain)
+        matches!(self, Self::Bound { .. })
     }
 }
 
@@ -1769,10 +1779,17 @@ pub trait ModelRegistryPort: Send + Sync {
     /// Reports this port's accepted-interface binding state (issue #1700).
     ///
     /// The default is [`PortBindingState::Uncertain`]: the port does not
-    /// report binding state, so the fabric proceeds to the per-call owner
-    /// verifier, which remains the authority. Override with an
-    /// owner-affirmed [`PortBindingState::Bound`] (or a positively known
-    /// non-bound state) once the owner tracks acceptance revisions.
+    /// report binding state, so dependent use through the operation map
+    /// stops with a typed [`MissingPortResidual`] before the owner call —
+    /// an unreported binding cannot admit an effect whose answer cannot
+    /// prove owner issuance. Only an owner-affirmed
+    /// [`PortBindingState::Bound`] (or, for diagnosis, a positively known
+    /// non-bound state) proceeds past the pre-check, and only the per-call
+    /// owner verifier then admits effects. Operations without a map entry
+    /// (plan-only, read-only, recovery/status/control, snapshot/restore)
+    /// never consult this report. Override with an owner-affirmed
+    /// [`PortBindingState::Bound`] once the owner tracks acceptance
+    /// revisions.
     fn interface_binding(&self) -> PortBindingState {
         PortBindingState::Uncertain
     }
@@ -2220,13 +2237,13 @@ impl AgentFabric {
     /// Checks the accepted-interface binding of the single port the given
     /// operation depends on, before the owner call (issue #1700).
     ///
-    /// [`PortBindingState::Bound`] proceeds to the per-call owner verifier
-    /// and [`PortBindingState::Uncertain`] defers to it entirely: this check
-    /// supplements, never replaces, the existing per-call
+    /// [`PortBindingState::Bound`] proceeds to the per-call owner verifier:
+    /// this check supplements, never replaces, the existing per-call
     /// authority/fence/receipt verification. A positively reported
-    /// non-bound state stops before staging dependent capacity and returns
-    /// the typed [`MissingPortResidual`] at the point of use. Operations
-    /// without a map entry (plan-only planning, read-only observation,
+    /// non-bound state — or an unreported ([`PortBindingState::Uncertain`])
+    /// one — stops before staging dependent capacity and returns the typed
+    /// [`MissingPortResidual`] at the point of use. Operations without a
+    /// map entry (plan-only planning, read-only observation,
     /// recovery/status/control, snapshot/restore) never call this helper.
     ///
     /// # Errors
@@ -2366,8 +2383,8 @@ impl AgentFabric {
     /// the B-SWARM owner binds an accepted interface such a request is
     /// refused here, before any receipt, record, or coordinator planning, so
     /// the absence never fabricates success. Solo shapes (one lane, fanout
-    /// one) pass through untouched, and a bound or uncertain port defers to
-    /// the owner call as usual, so independent solo work is never blocked.
+    /// one) pass through untouched, and a bound port defers to the owner
+    /// call as usual, so independent solo work is never blocked.
     /// The peer channel stays unused: planning consults no peer behavior,
     /// only the swarm port's own binding report.
     ///
@@ -3336,6 +3353,21 @@ impl AgentFabric {
                 "attempt does not belong to this admission".to_owned(),
             ));
         }
+        // #1700 AUD3: a later stage revalidates every predecessor authority
+        // it consumes, not just its own port. Activation consumes the
+        // committed admission, so the admission owner's CURRENT
+        // binding/revocation state is re-read here on both the replay and
+        // the fresh path: an exact replay below returns the retained
+        // receipt only while its owner still admits dependent use, and
+        // renewed use after revocation fails with the retained operation
+        // and the typed stale/unknown disposition instead of converting the
+        // old receipt into current launch authority.
+        self.check_port_binding(
+            FabricOperation::CommitAdmission,
+            &admission_key,
+            Some(admission.fence.clone()),
+            Some(admission.epoch.clone()),
+        )?;
         let key = format!("{admission_key}/{}", attempt_id.as_str());
         if let Some(existing) = self.activations.get(&key).cloned() {
             self.record("activation_replayed", &key);
@@ -3418,6 +3450,24 @@ impl AgentFabric {
             .ok_or_else(|| {
                 FabricError::NotActivated(format!("no activation for {activation_key}"))
             })?;
+        // #1700 AUD3: dispatch consumes the committed admission and the
+        // activation evidence, so both predecessor owners are revalidated
+        // here alongside the duplicate guards below. A retained intent
+        // replays for reconciliation only while its owners still admit
+        // dependent use; use after revocation fails with the retained
+        // operation and the typed disposition instead of launching.
+        self.check_port_binding(
+            FabricOperation::CommitAdmission,
+            &admission_key,
+            Some(admission.fence.clone()),
+            Some(admission.epoch.clone()),
+        )?;
+        self.check_port_binding(
+            FabricOperation::Activate,
+            &activation_key,
+            Some(evidence.fence.clone()),
+            Some(evidence.epoch.clone()),
+        )?;
         // Enforced before the replay/duplicate guards so a route change for an
         // already-routed attempt is judged as a provider switch, not as a
         // duplicate dispatch id.
@@ -3584,6 +3634,25 @@ impl AgentFabric {
             Some(intent.fence.clone()),
             Some(intent.epoch.clone()),
         )?;
+        // #1700 AUD3: emission consumes the committed admission and the
+        // activation evidence behind the intent, so both predecessor owners
+        // are revalidated here as well as the egress port above. A revoked
+        // predecessor fails with the retained dispatch operation and the
+        // typed stale/unknown disposition instead of retaining the intent.
+        let admission_key = intent.admission_id.as_str().to_owned();
+        self.check_port_binding(
+            FabricOperation::CommitAdmission,
+            &admission_key,
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        )?;
+        let activation_key = format!("{admission_key}/{}", intent.attempt_id.as_str());
+        self.check_port_binding(
+            FabricOperation::Activate,
+            &activation_key,
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        )?;
         let ack = self.ports.dispatch_egress.emit(&intent)?;
         if ack.dispatch_id != dispatch_id {
             return Err(FabricError::IdentityConflict(
@@ -3672,9 +3741,27 @@ impl AgentFabric {
         }
         // Same gate and egress as `emit`: a missing egress binding blocks
         // before any launch, and the ack must match the recorded intent.
+        // #1700 AUD3: the frame consumes the committed admission and the
+        // activation evidence behind the recorded intent, so both
+        // predecessor owners are revalidated here as well as the egress
+        // port; use after revocation fails with the retained operation.
         self.check_port_binding(
             FabricOperation::Emit,
             dispatch_id,
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        )?;
+        let admission_key = intent.admission_id.as_str().to_owned();
+        self.check_port_binding(
+            FabricOperation::CommitAdmission,
+            &admission_key,
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        )?;
+        let activation_key = format!("{admission_key}/{}", intent.attempt_id.as_str());
+        self.check_port_binding(
+            FabricOperation::Activate,
+            &activation_key,
             Some(intent.fence.clone()),
             Some(intent.epoch.clone()),
         )?;
@@ -4336,7 +4423,7 @@ impl AgentFabric {
             snapshot,
             config,
             ports,
-            semantic_revisions,
+            semantic_revisions.as_ref(),
             capability,
         )
     }

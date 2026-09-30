@@ -79,23 +79,23 @@
           "destination": ".mcp.json",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "78810e509d2afbaafbcdf7fee2f5f258edfba42eb820021c57f01395acd6c535"
+          "sha256": "e79796f4dba21f21a6cc1ee0ae7a78014e3c36a000ae42b57ef19ce30be36ce9"
         },
         {
           "source": "plugin/eliot-governor/hooks/hooks.json",
           "destination": "hooks/hooks.json",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "da7a811da6d9193365c2a4f8cac382e6b289b0ec59e1dfad0cf29bb143e6441a"
+          "sha256": "bb07f8e5efd0f2aefed1c57a1f0e29bb740977789ed798514fe03c04ea8c5c24"
         }
       ]
     },
     "opencode": {
       "route_profile": "integrations/opencode/route-profile.json",
-      "route_profile_sha256": "e521f37e5d20e28e03fc89d5b0394c0ac93ef3163c13c0d84604d2e11b11f9df",
+      "route_profile_sha256": "0f5c089a6bb801e61329992c08e428472bfcbf8cd5ed56b6dbc730e3b828e692",
       "bundle_generation": "1217-A.1",
       "adapter_contract": "integrations/opencode/plugin-bridge-contract.json",
-      "adapter_contract_sha256": "622b3e3d85b4fa95a6fc5fdfcb9d7b4f97b1a69bf91c8479bc0a26f0106e1c39",
+      "adapter_contract_sha256": "ffb3fb10bd77608df5d9f06e4a8760cd2ff8ab51c1ea93d5e7bd921d17eb1b09",
       "adapter_generation": "eliot.opencode-plugin-bridge.v1",
       "adapter_note": "compatibility_fallback only_when_loopback_http_is_not_configured; cross_transport_failover_after_http_attempt is false; unprobed and requires live probe; contract presence is not admission.",
       "host_runtime_version": null,
@@ -108,14 +108,14 @@
           "destination": "opencode.json",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "2eed82bce727368d70ce13079e55abc74f7b438dc91ad5c192decd818f042d45"
+          "sha256": "e42328061e49ed3de32f32d0cd5befa627b2a793e2b7b9beddb36180f47130fe"
         },
         {
           "source": "integrations/opencode/plugins/eliot.js",
           "destination": "plugins/eliot.js",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "939748bbccc06a10969304105cae81e8979b211145096c57833fecb6dce009e3"
+          "sha256": "f09b2e70f998e94e361b6efbdb6facb0e9170fd7aab53a523f48199b074b8de0"
         },
         {
           "source": "integrations/opencode/instructions/eliot.md",
@@ -150,23 +150,23 @@
           "destination": ".mcp.json",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "044fb8474f434a8530c56482ca1efe9821cf4ff2746abf318fbb195de05aed25"
+          "sha256": "639a1aa2405d4a9496e6ae12ad0d3c2318bf0d9ab0f66efd5045008fc3673dc3"
         },
         {
           "source": "integrations/claude/eliot/hooks/hooks.json",
           "destination": "hooks/hooks.json",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "96e31cff33e55b18cd911cfb59424102e23caa7bc4b6461b197611d43f537952"
+          "sha256": "913decb9a2d0d17341881c9d3d352625d5851395dd546d8f97717f624e81182a"
         }
       ]
     },
     "antigravity": {
       "route_profile": "integrations/antigravity/route-profile.json",
-      "route_profile_sha256": "8bad3925bbdf4194df4c05c0d5ee971456460bd57bb2364cc9b54d92a58f790a",
+      "route_profile_sha256": "5139a35a5326ccd70e5396ee107e67154f9253827c75994325a3f2532f71ad2d",
       "bundle_generation": "1217-A.1",
       "adapter_contract": "integrations/antigravity/runtime-preflight.contract.json",
-      "adapter_contract_sha256": "4220c54ab5cdfb687503e1df24db256303272287218163c05acbfc7f7b0cd921",
+      "adapter_contract_sha256": "7286ac5ea99207eeb43a6b660db1c0b9bdf3272c190d87d33dd460c88601b389",
       "adapter_generation": "eliot.antigravity-runtime-preflight.v1",
       "adapter_note": "execution_allowed is false for all candidate runtimes; route_admitted is false; model_calls is 0; preflight fingerprint only, not admission.",
       "host_runtime_version": null,

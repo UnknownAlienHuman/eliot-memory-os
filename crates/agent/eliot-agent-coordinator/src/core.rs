@@ -12,8 +12,11 @@ use eliot_agent_api::{
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
-    LivePeerMessage, LivePeerMessageState, MessageId, ParentFinishCeiling, RevisionId, WorkItemId,
-    contract_shape_digest,
+    ExecutionUpdateProposal, LivePeerMessage, LivePeerMessageState, MessageId, OldWaveDisposition,
+    ParentFinishCeiling, RevisionId, SupersessionLink, SwarmAdmissionId, SwarmCoordinatorLease,
+    SwarmDefinitionId, SwarmExecutionId, SwarmExecutionRevision, SwarmExecutionState,
+    SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition, SwarmPlanView,
+    WorkItemId, check_owner_join, contract_shape_digest,
 };
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
@@ -45,6 +48,13 @@ use crate::provider_admission::{
 use crate::swarm_definition_admission::{
     SwarmDefinitionAdmissionPrep, admit_swarm_definition, begin_swarm_execution,
     compile_swarm_definition_admission, launch_swarm_child,
+};
+use crate::swarm_execution_ownership::{
+    CommittedOwnerImage, PublishOperation, PublishResume, RetainedWork, UnknownEffectWitness,
+    VerifiedPartialResult, WorkReplacement, advance_retained_state,
+    check_execution_update as check_swarm_execution_update, joined_owner_view,
+    mirror_admission_disposition, ownership_rejection, replace_active_work,
+    resume_execution_launch, resume_publish_after_commit, retain_history_after_owner_loss,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -882,6 +892,28 @@ pub struct AgentCoordinator {
     /// the newest armed transition, so replay re-derives it and a restart
     /// cannot strand eligible work.
     fair_pull_loop: FairPullLoop,
+    /// Coordinator-owned execution revisions and their retained history across
+    /// owner loss (issue #1702 W5/W7).
+    ///
+    /// The coordinator owns `SwarmExecutionState` under an exact active
+    /// admission (I10.15), so these are the coordinator's OWN records, not a
+    /// projection of another owner's. The number of CONCURRENTLY LIVE waves is
+    /// bounded by `CoordinatorConfig::max_admitted_attempts`; the maps keep
+    /// their entries afterwards, because retained history is never dropped, and
+    /// they are keyed by the execution identity the durable owner commits them
+    /// under. A replacement or an owner-loss rebind moves a record's lease and
+    /// carries its retained history forward instead of dropping it. Definitions
+    /// and admissions stay with their owners and are supplied by the caller, so
+    /// this map can never become a second definition or admission store.
+    semantic_executions: BTreeMap<SwarmExecutionId, SwarmExecutionRevision>,
+    /// Retained history per execution identity, including the verified partial
+    /// results and the unknown-effect witnesses a replacement or a loss must
+    /// not discard (issue #1702 A6).
+    retained_history: BTreeMap<SwarmExecutionId, RetainedWork>,
+    /// The explicit old-wave dispositions this coordinator has compiled, keyed
+    /// by the replacement definition identity. An old wave is never dispositioned
+    /// by the mere absence of an entry here.
+    replacement_dispositions: BTreeMap<SwarmDefinitionId, OldWaveDisposition>,
     events: Vec<CoordinatorEvent>,
 }
 
@@ -1011,6 +1043,9 @@ impl AgentCoordinator {
             next_enqueue_sequence: 0,
             fair_virtual_time: [0; 9],
             fair_pull_loop: FairPullLoop::default(),
+            semantic_executions: BTreeMap::new(),
+            retained_history: BTreeMap::new(),
+            replacement_dispositions: BTreeMap::new(),
             events: Vec::new(),
         })
     }
@@ -1317,6 +1352,483 @@ impl AgentCoordinator {
         executor: &dyn eliot_swarm::durable_work::WorkExecutor,
     ) -> Result<eliot_swarm::adapter_launch::SealedChildLaunch, CoordinatorError> {
         launch_swarm_child(plan, attachment, inputs, store, executor)
+    }
+
+    /// Adopts one coordinator-owned execution revision as this coordinator's
+    /// current wave (issue #1702 A1/A5, prerequisite for W5/A2).
+    ///
+    /// The coordinator is the execution owner (I10.15), so the exact revision
+    /// the durable Store committed under the coordinator's owner stream is
+    /// adopted here — this records it, it does not decide it. The presenter
+    /// must hold the revision's own current coordinator lease, and the full
+    /// ownership join against the caller-supplied definition and admission is
+    /// verified through the existing `check_owner_join`, so an execution that
+    /// does not bind its exact frozen definition and admitted admission never
+    /// enters this coordinator's state.
+    ///
+    /// Bounded by `max_admitted_attempts` concurrent waves: backpressure is
+    /// the existing [`CoordinatorError::Backpressure`], never silent growth of
+    /// live state. Same-identity replay is EXACT — the stored revision is
+    /// returned and nothing is rewritten; a reused identity with changed
+    /// content is the existing [`CoordinatorError::IdempotencyConflict`], never
+    /// an overwrite.
+    ///
+    /// The caller persists the revision through the canonical Store owner
+    /// BEFORE calling this; this performs no durable write, no launch, and no
+    /// admission decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::StaleController`] for a presenter outside the
+    /// revision's own lease, [`CoordinatorError::Backpressure`] when the
+    /// retained-wave ceiling is reached, [`CoordinatorError::IdempotencyConflict`]
+    /// for changed content under a live execution identity, and the typed
+    /// ownership rejection of `check_owner_join` otherwise.
+    pub fn adopt_semantic_execution(
+        &mut self,
+        definition: &SwarmPlanDefinition,
+        admission: &SwarmPlanAdmission,
+        execution: SwarmExecutionRevision,
+        coordinator_holder: &str,
+        coordinator_epoch: u64,
+    ) -> Result<(), CoordinatorError> {
+        execution.validate().map_err(ownership_rejection)?;
+        if !execution
+            .coordinator
+            .authorizes(coordinator_holder, coordinator_epoch)
+        {
+            return Err(CoordinatorError::StaleController);
+        }
+        if let Some(stored) = self.semantic_executions.get(&execution.execution_id) {
+            return if stored == &execution {
+                Ok(())
+            } else {
+                Err(CoordinatorError::IdempotencyConflict)
+            };
+        }
+        // The same strict ownership join the recovered record set is verified
+        // with (`swarm_execution_ownership::verify_owner_record_set`), run for
+        // this single record at the adoption boundary, and mapped through the
+        // module's one rejection mapper so both refusals speak the same
+        // coordinator vocabulary.
+        check_owner_join(definition, admission, &execution).map_err(ownership_rejection)?;
+        if self.semantic_executions.len() >= self.config.max_admitted_attempts {
+            return Err(CoordinatorError::Backpressure {
+                active: self.semantic_executions.len(),
+                requested: 1,
+                limit: self.config.max_admitted_attempts,
+            });
+        }
+        // An adopted wave always carries its retained history, so an owner loss
+        // later never has to reconstruct what it already knew. Adoption records
+        // no disposition of its own, so the wave's live default is recorded.
+        let retained = Self::retained_work_from(&execution, OldWaveDisposition::Drain);
+        self.retained_history
+            .insert(execution.execution_id.clone(), retained);
+        self.semantic_executions
+            .insert(execution.execution_id.clone(), execution);
+        Ok(())
+    }
+
+    /// Guards one coordinator execution update against frozen plan semantics
+    /// and against a wave this coordinator has already superseded (issue #1702
+    /// A1/A3, W5).
+    ///
+    /// This is the production caller of the coordinator's own
+    /// `check_execution_update`: the admission and execution must be this
+    /// coordinator's own admitted/adopted records (definitions and admissions
+    /// stay with their owners and are supplied by the caller), and the
+    /// explicit old-wave disposition this coordinator recorded for the
+    /// definition is applied before the contract owner's own freeze check runs.
+    ///
+    /// Any change to the work graph, objective, acceptance, ceilings, stop
+    /// conditions, wave or root fails with [`CoordinatorError::SemanticDrift`]
+    /// naming the exact field. A stale or foreign coordinator fails with
+    /// [`CoordinatorError::StaleController`]. An update against a cancelled or
+    /// superseded old wave fails with [`CoordinatorError::StaleAdmission`]:
+    /// replacement work needs the new definition and its distinct admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::UnknownAttempt`] when the execution is not
+    /// this coordinator's, and the typed semantic refusal otherwise.
+    pub fn check_semantic_execution_update(
+        &self,
+        admission: &SwarmPlanAdmission,
+        execution_id: &SwarmExecutionId,
+        update: &ExecutionUpdateProposal,
+        caller_holder: &str,
+        caller_epoch: u64,
+        definition: &SwarmPlanDefinition,
+    ) -> Result<(), CoordinatorError> {
+        let execution = self
+            .semantic_executions
+            .get(execution_id)
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        let supersession: Option<SupersessionLink> = definition
+            .supersedes
+            .clone()
+            .filter(|link| link.prior_definition_id == definition.definition_id)
+            .or_else(|| {
+                self.replacement_dispositions
+                    .get(&definition.definition_id)
+                    .map(|disposition| SupersessionLink {
+                        prior_definition_id: definition.definition_id.clone(),
+                        prior_revision: definition.definition_revision.clone(),
+                        disposition: *disposition,
+                    })
+            });
+        check_swarm_execution_update(
+            definition,
+            admission,
+            execution,
+            update,
+            caller_holder,
+            caller_epoch,
+            supersession.as_ref(),
+        )
+    }
+
+    /// Compiles one explicit replacement of active work (issue #1702 W5/A2).
+    ///
+    /// This is the production caller of `replace_active_work`. The same
+    /// authorized change through a NEW definition yields DISTINCT admission and
+    /// execution revisions — derived from the replacement definition's real
+    /// content digest, never from a counter — plus an EXPLICIT old-wave
+    /// disposition that is recorded here as a value, not left as an implicit
+    /// absence.
+    ///
+    /// The prior wave's retained history (state, coverage, verified partial
+    /// results, unknown effects) is carried into the replacement value and this
+    /// coordinator's retained history map; nothing about the old wave is
+    /// dropped. New work may not start under the old wave once the disposition
+    /// is `CANCEL` or `SUPERSEDE`, because
+    /// [`Self::check_semantic_execution_update`] then refuses it.
+    ///
+    /// If any gate refuses, NOTHING is recorded: the prior records and the prior
+    /// wave's explicit current authority stay exactly as they were.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed refusal of `replace_active_work`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_active_swarm_work(
+        &mut self,
+        prior_definition: &SwarmPlanDefinition,
+        prior_admission: &SwarmPlanAdmission,
+        prior_execution_id: &SwarmExecutionId,
+        retained_admission_id: &SwarmAdmissionId,
+        replacement_definition: &SwarmPlanDefinition,
+        replacement_wave: RevisionId,
+        coordinator_holder: &str,
+        coordinator_epoch: u64,
+    ) -> Result<WorkReplacement, CoordinatorError> {
+        let prior_execution = self
+            .semantic_executions
+            .get(prior_execution_id)
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        let retained = self
+            .retained_history
+            .get(prior_execution_id)
+            .cloned()
+            // A wave adopted before this coordinator tracked retained history is
+            // still described by its own revision; its disposition is the one
+            // the replacement about to compile, and it is overwritten with that
+            // explicit value on the retained record below.
+            .unwrap_or_else(|| {
+                Self::retained_work_from(prior_execution, OldWaveDisposition::Drain)
+            });
+        let mut replacement = replace_active_work(
+            prior_definition,
+            prior_admission,
+            prior_execution,
+            retained_admission_id,
+            replacement_definition,
+            replacement_wave,
+            coordinator_holder,
+            coordinator_epoch,
+        )?;
+        // Carry the old wave's verified partial results and unknown effects
+        // forward: a replacement disposes the wave, it does not erase what the
+        // wave already verified or what its effects actually were.
+        replacement.retained.verified_partial_results = retained.verified_partial_results;
+        replacement.retained.unknown_effects = retained.unknown_effects;
+        self.replacement_dispositions.insert(
+            prior_definition.definition_id.clone(),
+            replacement.old_wave_disposition,
+        );
+        self.retained_history
+            .insert(prior_execution_id.clone(), replacement.retained.clone());
+        Ok(replacement)
+    }
+
+    /// Retains one wave's history and rebinds it to a new coordinator epoch
+    /// after coordinator loss (issue #1702 W7/A6).
+    ///
+    /// This is the production caller of `retain_history_after_owner_loss`.
+    /// Only the affected owner's permission moves: the definition, admission,
+    /// wave, root, state and coverage bindings are preserved verbatim, so spend
+    /// is never reset and `UNKNOWN_OUTCOME` never becomes a clean failure.
+    /// Verified partial results are carried forward even when a later stage
+    /// failed, and unknown effects stay unknown.
+    ///
+    /// Same-identity replay is EXACT: re-presenting the stored lease returns
+    /// without rewriting anything; a non-advancing epoch or a foreign holder
+    /// fails with [`CoordinatorError::StaleController`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::UnknownAttempt`] for an unknown execution,
+    /// [`CoordinatorError::StaleController`] for a presenter outside the incoming
+    /// lease or a non-advancing epoch, and the typed retained-record refusal
+    /// otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retain_swarm_work_after_owner_loss(
+        &mut self,
+        execution_id: &SwarmExecutionId,
+        new_coordinator: &SwarmCoordinatorLease,
+        presenter_holder: &str,
+        presenter_epoch: u64,
+        verified_partial_results: Vec<VerifiedPartialResult>,
+        unknown_effects: Vec<UnknownEffectWitness>,
+        disposition: OldWaveDisposition,
+    ) -> Result<RetainedWork, CoordinatorError> {
+        let stored = self
+            .semantic_executions
+            .get(execution_id)
+            .cloned()
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        let retained = match self.retained_history.get(execution_id) {
+            Some(retained) => retained.clone(),
+            // A wave adopted before this coordinator tracked retained history is
+            // still described by its own revision. Its placeholder disposition is
+            // never surfaced: `retain_history_after_owner_loss` records the
+            // caller's explicit disposition on the record it returns.
+            None => Self::retained_work_from(&stored, OldWaveDisposition::Drain),
+        };
+        if stored.coordinator == *new_coordinator {
+            // Exact replay: the committed lease is already the current one, so
+            // the retained history is returned as it stands and nothing is
+            // rewritten. The unknown effects stay exactly as recorded.
+            return Ok(retained);
+        }
+        let (rebound, next) = retain_history_after_owner_loss(
+            &stored,
+            new_coordinator,
+            presenter_holder,
+            presenter_epoch,
+            RetainedWork {
+                verified_partial_results,
+                unknown_effects,
+                ..retained
+            },
+            disposition,
+        )?;
+        self.semantic_executions
+            .insert(execution_id.clone(), rebound);
+        self.retained_history
+            .insert(execution_id.clone(), next.clone());
+        Ok(next)
+    }
+
+    /// Resumes one interrupted publish after a crash between its commit and
+    /// its acknowledgement (issue #1702 A4).
+    ///
+    /// This is the production caller of `resume_publish_after_commit`. The
+    /// `committed` image is the durable owner's own verified readback, never a
+    /// caller's live map, and the intended operation travels with the exact
+    /// content for the identity it commits under. The verdict is content
+    /// equality: an exact replay is acknowledged with the committed result and
+    /// mints nothing, changed content under the same identity is the existing
+    /// [`CoordinatorError::IdempotencyConflict`], and an identity the image
+    /// does not carry is the honest first publish.
+    pub fn resume_semantic_publish(
+        &self,
+        operation: &PublishOperation,
+        committed: &CommittedOwnerImage,
+    ) -> Result<PublishResume, CoordinatorError> {
+        match resume_publish_after_commit(operation, committed) {
+            PublishResume::Conflict => Err(CoordinatorError::IdempotencyConflict),
+            verdict => Ok(verdict),
+        }
+    }
+
+    /// Refuses a duplicate execution launch for an already-committed execution
+    /// identity (issue #1702 A4).
+    ///
+    /// This is the production caller of `resume_execution_launch`. A
+    /// coordinator that crashed after committing an execution revision and
+    /// before acknowledging it cannot launch a second wave for that identity:
+    /// the committed keyed execution revisions ARE the record of what was
+    /// launched, so there is no dedupe table or attempt journal to drift.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::IdempotencyConflict`] when the committed
+    /// image already carries this execution identity.
+    pub fn resume_swarm_execution_launch(
+        &self,
+        execution_id: &SwarmExecutionId,
+        committed: &CommittedOwnerImage,
+    ) -> Result<(), CoordinatorError> {
+        resume_execution_launch(execution_id, committed)
+    }
+
+    /// Mirrors one Governor admission disposition this coordinator's own wave
+    /// is running under, and records the explicit old-wave status (issue #1702
+    /// W5/A2).
+    ///
+    /// The coordinator never originates a disposition: the Governor owner
+    /// decides and this records the decided value through the existing
+    /// `SwarmPlanAdmissionDisposition::decide` lifecycle. Re-mirroring the
+    /// stored disposition replays exactly and changes nothing, so a retried
+    /// Governor acknowledgement after a crash records no duplicate revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed disposition-lifecycle refusal otherwise.
+    pub fn mirror_swarm_admission_disposition(
+        &self,
+        admission: &SwarmPlanAdmission,
+        to: SwarmPlanAdmissionDisposition,
+    ) -> Result<SwarmPlanAdmission, CoordinatorError> {
+        mirror_admission_disposition(admission, to)
+    }
+
+    /// Reads the retained history of one wave, including its verified partial
+    /// results and unresolved unknown effects (issue #1702 A6).
+    ///
+    /// Read-only: it returns the retained record as it stands and never
+    /// authorizes anything. An unknown effect is reported as an unknown effect;
+    /// it is never omitted because it is unresolved.
+    #[must_use]
+    pub fn retained_swarm_history(&self, execution_id: &SwarmExecutionId) -> Option<&RetainedWork> {
+        self.retained_history.get(execution_id)
+    }
+
+    /// Builds the read-only joined owner view for one of this coordinator's own
+    /// waves (issue #1702 A6).
+    ///
+    /// This is the production caller of `joined_owner_view`. The joined read is
+    /// a projection: it owns nothing, authorizes nothing, and is never a write
+    /// authorization — `check_semantic_execution_update` and
+    /// `replace_active_swarm_work` remain the only paths that advance or
+    /// replace a wave. The unknown effects passed in are carried verbatim, so
+    /// an unresolved effect stays visible in the read instead of disappearing,
+    /// and the pending replacement is the explicit supersession link this
+    /// coordinator recorded for the prior definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::UnknownAttempt`] when the execution is not
+    /// this coordinator's, and the typed ownership rejection of the joined
+    /// owner check otherwise.
+    pub fn swarm_owner_view(
+        &self,
+        definition: &SwarmPlanDefinition,
+        admission: &SwarmPlanAdmission,
+        execution_id: &SwarmExecutionId,
+        unknown_effects: Vec<String>,
+    ) -> Result<SwarmPlanView, CoordinatorError> {
+        let execution = self
+            .semantic_executions
+            .get(execution_id)
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        let pending_replacement = definition.supersedes.clone().or_else(|| {
+            self.replacement_dispositions
+                .get(&definition.definition_id)
+                .map(|disposition| SupersessionLink {
+                    prior_definition_id: definition.definition_id.clone(),
+                    prior_revision: definition.definition_revision.clone(),
+                    disposition: *disposition,
+                })
+        });
+        joined_owner_view(
+            definition,
+            admission,
+            execution,
+            pending_replacement,
+            unknown_effects,
+        )
+    }
+
+    /// Advances one retained wave's execution state under this coordinator's own
+    /// current lease (issue #1702 A6).
+    ///
+    /// This is the production caller of `advance_retained_state`. A state
+    /// change the I14.20 execution lifecycle does not admit — skipping states,
+    /// reviving a terminal state, escalating an `UNKNOWN_OUTCOME` wave into a
+    /// clean terminal one — is refused before the revision is recorded, and the
+    /// retained history moves with the revision so the two can never disagree
+    /// about which state a wave actually reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::UnknownAttempt`] when the execution is not
+    /// this coordinator's, [`CoordinatorError::StaleController`] for a
+    /// presenter outside the revision's own lease, and the typed transition
+    /// refusal otherwise.
+    pub fn advance_retained_swarm_state(
+        &mut self,
+        execution_id: &SwarmExecutionId,
+        to: SwarmExecutionState,
+        caller_holder: &str,
+        caller_epoch: u64,
+    ) -> Result<RetainedWork, CoordinatorError> {
+        let stored = self
+            .semantic_executions
+            .get(execution_id)
+            .cloned()
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        let advanced = advance_retained_state(&stored, to, caller_holder, caller_epoch)?;
+        let previous = self
+            .retained_history
+            .get(execution_id)
+            .cloned()
+            .unwrap_or_else(|| Self::retained_work_from(&stored, OldWaveDisposition::Drain));
+        let next = RetainedWork {
+            state: advanced.state,
+            coordinator_epoch: advanced.coordinator.epoch,
+            previous_coordinator_epoch: previous.previous_coordinator_epoch,
+            ..previous
+        };
+        self.retained_history
+            .insert(execution_id.clone(), next.clone());
+        self.semantic_executions
+            .insert(execution_id.clone(), advanced);
+        Ok(next)
+    }
+
+    /// The one place this crate's own execution revisions become a
+    /// `RetainedWork` record (issue #1702 W7).
+    ///
+    /// Every binding is copied verbatim off the execution revision itself —
+    /// identity, wave, recorded state and coverage — so this constructor can
+    /// never invent, reset or terminalize anything: an `UNKNOWN_OUTCOME` wave
+    /// stays `UNKNOWN_OUTCOME`, coverage is never re-derived and the epoch is
+    /// read from the revision's own lease rather than counted here. The
+    /// retention event's explicit disposition is the only value the caller
+    /// supplies, because it is the one thing a revision does not record, and
+    /// `previous_coordinator_epoch` is set equal to the current one because a
+    /// retention that has not yet rebound the work to a newer epoch leaves
+    /// authority exactly where it was.
+    fn retained_work_from(
+        execution: &SwarmExecutionRevision,
+        disposition: OldWaveDisposition,
+    ) -> RetainedWork {
+        RetainedWork {
+            execution_id: execution.execution_id.clone(),
+            definition_id: execution.definition_id.clone(),
+            admission_id: execution.admission_id.clone(),
+            wave: execution.wave.clone(),
+            state: execution.state,
+            coverage_digest: execution.coverage_digest.clone(),
+            previous_coordinator_epoch: execution.coordinator.epoch,
+            coordinator_epoch: execution.coordinator.epoch,
+            verified_partial_results: Vec::new(),
+            unknown_effects: Vec::new(),
+            disposition,
+        }
     }
 
     /// Reconciles only an admission accepted by the sealed verifier.
@@ -3431,10 +3943,6 @@ impl AgentCoordinator {
         if snapshot.config != live_config {
             return Err(CoordinatorError::StaleCapacity);
         }
-        let live_binding = provider.binding();
-        if snapshot.provider_binding != live_binding {
-            return Err(CoordinatorError::StaleProviderBinding);
-        }
         if snapshot.event_sequence
             != u64::try_from(snapshot.events.len())
                 .map_err(|_| CoordinatorError::SnapshotRollback)?
@@ -3456,6 +3964,17 @@ impl AgentCoordinator {
         coordinator.replay_snapshot_events(&expected_events)?;
         if coordinator.events != expected_events {
             return Err(CoordinatorError::SnapshotDigest);
+        }
+        // Binding comparison runs AFTER replay (issue #1108 A8): a fresh
+        // verifier binds `Gap` until its first `verify` succeeds, so
+        // comparing before replay refuses every legitimate verified
+        // restore. Every replayed event re-verifies through the sealed
+        // owner verifier, flipping this instance to `Verified` only on
+        // owner `Ok`; stale/missing evidence therefore fails inside
+        // replay, and a serialized `Verified` label alone still restores
+        // nothing because the post-replay binding stays `Gap`.
+        if snapshot.provider_binding != coordinator.provider.binding() {
+            return Err(CoordinatorError::StaleProviderBinding);
         }
         Ok(coordinator)
     }

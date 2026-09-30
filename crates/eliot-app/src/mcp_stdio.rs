@@ -229,8 +229,11 @@ mod evaluation;
 mod experiment;
 mod finalization;
 mod input_validation;
+mod measurement_legacy_wire;
 mod memory;
 mod memory_grant;
+#[allow(clippy::wildcard_imports)]
+use measurement_legacy_wire::*;
 mod operator;
 mod replay;
 mod skill;
@@ -281,6 +284,12 @@ pub(crate) fn part_e_surface_report(profile: &str) -> Result<Value> {
     let tools = tool_definitions_for_profile(profile);
     let mut entries = Vec::with_capacity(tools.len());
     let mut combined_serialized = Vec::new();
+    // The combined legacy figure divides the *combined character* count by
+    // four, so that count is accumulated exactly as the loop walks the
+    // descriptions. It is never reconstructed from the byte length: dividing
+    // bytes by four would report a byte-derived number inside a field that
+    // claims a character basis, which is precisely the relabelling W9 forbids.
+    let mut combined_unicode_scalar_values: u64 = 0;
     for tool in &tools {
         let name = tool
             .get("name")
@@ -298,20 +307,51 @@ pub(crate) fn part_e_surface_report(profile: &str) -> Result<Value> {
             .context("tool definition has no string description")?;
         let measurement = canonical_serialized_measurement(description.as_bytes())?;
         combined_serialized.extend_from_slice(description.as_bytes());
+        let unicode_scalar_values = u64::try_from(description.chars().count())
+            .context("tool description character count exceeds u64")?;
+        combined_unicode_scalar_values = combined_unicode_scalar_values
+            .checked_add(unicode_scalar_values)
+            .context("combined tool description character count overflows u64")?;
+        let legacy_wire = legacy_tool_description_wire(name, unicode_scalar_values)?;
         entries.push(json!({
             "name": name,
             "description_ul_tokens": measurement.stu_estimate,
+            // A21/W9: the pre-#783 wire form is published beside the current
+            // one as its own explicitly legacy object, never as a renamed or
+            // reinterpreted copy of `description_ul_tokens`. It carries its own
+            // unit tag and its own `estimated` status, so a reader can tell
+            // which form it holds without inferring it from the field name.
+            // The legacy figure is the character count the historical `/4`
+            // divided; it is not bytes, not STU and not tokens.
+            "legacy_description_measurement": legacy_wire,
         }));
     }
     let combined = canonical_serialized_measurement(&combined_serialized)?;
     let combined_ul_tokens = combined.stu_estimate;
+    // The current aggregate figure, plus the pre-#783 aggregate form beside it
+    // under its own discriminator. `combined_description_legacy_estimate_units`
+    // is deliberately not called tokens: it is `ceil(chars / 4)` over the
+    // combined descriptions and is labelled `estimated` on the wire.
+    let combined_legacy_description_measurement = legacy_tool_description_wire(
+        COMBINED_TOOL_DESCRIPTION_LEGACY_REF,
+        combined_unicode_scalar_values,
+    )?;
+    let combined_legacy_description_estimate_units = combined_legacy_description_measurement
+        .get("legacy_estimate_units")
+        .and_then(Value::as_u64)
+        .context("combined legacy description estimate is not a u64 on the admitted wire form")?;
     Ok(json!({
         "profile": profile.as_str(),
         "tool_count": tools.len(),
         "combined_description_ul_tokens": combined_ul_tokens,
+        "combined_description_legacy_measurement": combined_legacy_description_measurement,
+        "combined_description_legacy_estimate_units": combined_legacy_description_estimate_units,
         "tools": entries,
     }))
 }
+
+/// Synthetic record reference used by the combined legacy description figure.
+const COMBINED_TOOL_DESCRIPTION_LEGACY_REF: &str = "combined_part_e_tool_descriptions";
 
 const GOVERNED_TOOLS: &[&str] = &[
     "eliot_task_contract_create",

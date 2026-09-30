@@ -473,9 +473,17 @@ pub enum SignalValidationError {
     EmptyField(&'static str),
     InvalidText(&'static str),
     ZeroValue(&'static str),
+    /// The finite Watchdog rule table does not record the named rule at the
+    /// named revision as competently covered, so the rule has no applicability
+    /// contract and cannot be evaluated. This is a refusal, never a default:
+    /// an unimplemented rule does not fall through to a weaker one.
+    RuleNotApplicable,
     IdentityChanged,
     RevisionOverflow,
-    UnexpectedRevision { expected: u64, actual: u64 },
+    UnexpectedRevision {
+        expected: u64,
+        actual: u64,
+    },
 }
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SignalValidationError> {

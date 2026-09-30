@@ -2015,10 +2015,15 @@ impl UserAutomationWakeHorizonPublication {
     /// Cross-checks the request against the exact immutable revision.
     ///
     /// The retained denominator must equal what this revision's normalized
-    /// contract compiles, every entry must be one of those occurrences with the
-    /// revision's own compiled source digest, and the published slice must be a
-    /// contiguous run of the denominator in the revision's own order. A
-    /// disposition advance must additionally start immediately after its
+    /// contract compiles, every entry must be one of those occurrences carrying
+    /// the revision's own compiled source digest AND the revision's own
+    /// owner-normalized occurrence key for that occurrence, and the published
+    /// slice must be a contiguous run of the denominator in the revision's own
+    /// order. The key is checked and not only the identity because the key is the
+    /// trigger basis the existing owner derives the scheduler's earliest start,
+    /// deadline and expiry from, so a substituted instant must be refused here
+    /// where the revision is available rather than at the owner that cannot see
+    /// it. A disposition advance must additionally start immediately after its
     /// consumed occurrence, so no future time is ever invented past the
     /// revision's normalized contract.
     pub fn validate_against_revision(
@@ -2067,14 +2072,30 @@ impl UserAutomationWakeHorizonPublication {
                 "horizon slice is not a bounded run of the revision denominator",
             ));
         }
-        for (entry, occurrence_id) in self
+        for (entry, identity) in self
             .entries
             .iter()
-            .zip(&denominator[start..start + self.entries.len()])
+            .zip(&identities[start..start + self.entries.len()])
         {
-            if &entry.occurrence_id != occurrence_id || entry.source_digest != source_digest {
+            // The occurrence key is the trigger basis, and it is what the existing
+            // owner derives the scheduler's `earliest_start`, `deadline` and
+            // `expiry` from, so it is checked here against the revision's own
+            // normalized key for this occurrence and not merely for a matching
+            // identity. An occurrence identity is compiled FROM its key, so a
+            // substituted instant would otherwise leave every other member
+            // intact while scheduling the wake for a time this revision never
+            // normalized.
+            let UserAutomationTrigger::Scheduled { occurrence_key } = &identity.trigger else {
+                return Err(UserAutomationExecutionError::Contract(
+                    UserAutomationError::Invalid("horizon.entry.occurrence_key"),
+                ));
+            };
+            if entry.occurrence_id != identity.occurrence_id
+                || entry.occurrence_key != *occurrence_key
+                || entry.source_digest != source_digest
+            {
                 return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
-                    "horizon entry occurrence/source digest",
+                    "horizon entry occurrence/trigger basis/source digest",
                 ));
             }
         }

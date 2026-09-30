@@ -233,26 +233,42 @@ EXPECTED_BASELINE_COUNT = len(EXPECTED_BASELINE_ROWS)
 # own source. #787 never chooses the migration; it only requires the
 # evidence. Each consumer is checked for a declared measurement dependency
 # marker in its declared seam files.
+#
+# This table is the *exact accepted adapter set*, one closed tuple per closed
+# consumer owner. It is deliberately exhaustive, not a sample: a migrated
+# consumer satisfies its dependency by naming one of the listed canonical crate
+# / port / adapter identifiers, and each listed identifier is itself an accepted
+# reference the oracle can name in a finding. Nothing outside these tuples is
+# accepted, and no marker set is widened at runtime -- an owner absent from this
+# table has NO accepted adapter and therefore can never satisfy the dependency
+# check (see :func:`_dependency_evidence` and the ``evaluate`` arm that iterates
+# exactly this table's keys). "Any one of these" is a closed disjunction over a
+# declared set, not a permissive trial decode: there is no fallback marker, no
+# substring-of-anything match beyond the exact literal, and no owner key added
+# without editing this closed table.
 CONSUMER_DEPENDENCY_MARKERS: dict[str, tuple[str, ...]] = {
-    # exact approved adapter / canonical entry points a migrated consumer may
-    # legitimately name; any of these satisfies the dependency check.
+    # Exact accepted references a migrated consumer may name. The crate name
+    # (``eliot_context_measurement`` / ``eliot_context_contracts``) is the
+    # Cargo dependency itself; ``measure_serialized_context`` is #704's
+    # canonical port; ``measure_exact_utf8`` is #704's exact adapter entry
+    # point; ``eliot_context_contracts`` is #584's public contract type crate.
     "#783": (
         "eliot_context_measurement",
+        "eliot_context_contracts",
         "measure_serialized_context",
         "measure_exact_utf8",
-        "eliot_context_contracts",
     ),
     "#878": (
         "eliot_context_measurement",
+        "eliot_context_contracts",
         "measure_serialized_context",
         "measure_exact_utf8",
-        "eliot_context_contracts",
     ),
     "#880": (
         "eliot_context_measurement",
+        "eliot_context_contracts",
         "measure_serialized_context",
         "measure_exact_utf8",
-        "eliot_context_contracts",
     ),
     CANONICAL_MEASUREMENT_OWNER: (
         "eliot_context_contracts",
@@ -470,6 +486,18 @@ def load_producer(root: Path) -> Any:
         "_locate_signal",
         "_case_sort_key",
         "_read_source",
+        "_measure_test_paths",
+        # The closed structural constants the artifact-read path validates
+        # against. They are the producer's, not a local copy: a widened or
+        # narrowed producer grammar must make the oracle fail closed as
+        # PRODUCER_ABSENT, never be silently re-typed here.
+        "TOP_LEVEL_KEYS",
+        "HEADER_KEYS",
+        "ROW_KEYS",
+        "SCHEMA",
+        "RULE_REVISION",
+        "_sha256",
+        "_canonical_bytes",
     ):
         if not hasattr(module, required):
             raise OracleError(
@@ -486,7 +514,37 @@ def load_producer(root: Path) -> Any:
 
 def _read_inventory_artifact(
     root: Path, producer: Any
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], str, bytes]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], str, bytes, str]:
+    """Read the stored artifact and separate *readability* from *freshness*.
+
+    Returns ``(header, rows, worksets, splits, inventory_digest, raw,
+    aggregate_fault)``.
+
+    Two independent things are decided here and they must not be conflated:
+
+    *Readability* -- the artifact parses, holds the producer's closed top-level
+    key set, and each row carries the producer's closed row keys and a
+    ``row_digest`` that re-derives over its own content. Without that, no row can
+    be named in a finding and the reconciliation is meaningless, so an
+    unreadable artifact is a typed ``INVENTORY_MALFORMED`` abort.
+
+    *Freshness* -- whether the artifact's recorded aggregates still describe the
+    live tree (measured test-path bytes, measured span digests, the recorded
+    inventory digest, the recorded source/rule/owner/map digests). Drift here is
+    STALENESS, not malformation: the artifact is well-formed and simply no
+    longer current. It is carried to the caller as ``aggregate_fault`` so the
+    rest of the evaluation still runs and still reports every other finding.
+    Collapsing the two is what previously let a single stale test-file size
+    abort the whole reconciliation with one finding and hide the baseline,
+    ownership and unit findings behind it.
+
+    The structural key/schema/row-digest rules below are read straight off the
+    producer's own closed constants (``TOP_LEVEL_KEYS``, ``ROW_KEYS``,
+    ``SCHEMA``, ``RULE_REVISION``, ``CLASSIFICATIONS``) and are re-checked by
+    the producer's own ``_validate_artifact`` in :func:`_producer_check`; this
+    file adds no row grammar of its own, it only refuses to *read* a row the
+    producer would not accept as well-formed.
+    """
     target = root / INVENTORY_REL
     if not target.is_file() or target.is_symlink():
         raise OracleError(
@@ -500,41 +558,83 @@ def _read_inventory_artifact(
             "INVENTORY_MALFORMED",
             f"the inventory artifact could not be read: {exc}",
         ) from exc
-    # A malformed or unreadable artifact must produce a TYPED failure, never a
-    # producer traceback escaping to the user: both the parse and the closed
-    # schema/aggregate validation are translated here.
     try:
         artifact = producer._parse_toml(raw, source=INVENTORY_REL)
-        # The producer's own `check` measures the declared test paths BEFORE
-        # validating, because a split's accounting is checked against the real
-        # files rather than against a stated number. The oracle reuses that exact
-        # sequence, so it inherits the producer's notion of what the artifact
-        # claims rather than inventing a looser one.
-        declared_worksets = artifact.get("consumer_worksets")
-        if not isinstance(declared_worksets, list):
-            raise OracleError(
-                "INVENTORY_MALFORMED",
-                f"consumer_worksets must be a list in {INVENTORY_REL}",
-            )
-        test_bytes = producer._measure_test_paths(root, declared_worksets)
-        header, rows, worksets, splits = producer._validate_artifact(artifact, test_bytes)
     except producer.InventoryError as exc:
         raise OracleError(
             "INVENTORY_MALFORMED",
-            f"the inventory artifact is malformed or internally inconsistent: {exc.code}: {exc.detail}",
+            f"the inventory artifact could not be parsed: {exc.code}: {exc.detail}",
         ) from exc
-    # A split table that survives the producer's own validation is carried to the
-    # caller, so the split check reads the producer's RESOLVED proposals rather
-    # than re-parsing the artifact. It is returned, not dropped: an unused
-    # binding here would be a dead binding, and the producer measures every
-    # declared test path precisely so a split cannot be trusted on a stated
-    # number.
+
+    if set(artifact.keys()) != producer.TOP_LEVEL_KEYS:
+        raise OracleError(
+            "INVENTORY_MALFORMED",
+            f"the inventory artifact top-level keys {sorted(artifact.keys())} are not the "
+            f"producer's closed set {sorted(producer.TOP_LEVEL_KEYS)}",
+        )
+    header = artifact.get("header")
+    rows = artifact.get("rows")
+    worksets = artifact.get("consumer_worksets")
+    splits = artifact.get("proposed_splits")
+    if not isinstance(header, dict) or not isinstance(rows, list):
+        raise OracleError(
+            "INVENTORY_MALFORMED",
+            f"the inventory artifact header/rows are not a table and a list in {INVENTORY_REL}",
+        )
+    if not isinstance(worksets, list) or not isinstance(splits, list):
+        raise OracleError(
+            "INVENTORY_MALFORMED",
+            f"consumer_worksets and proposed_splits must both be lists in {INVENTORY_REL}",
+        )
+    if set(header.keys()) != producer.HEADER_KEYS:
+        raise OracleError(
+            "INVENTORY_MALFORMED",
+            f"the inventory artifact header keys are not the producer's closed set",
+        )
+    if header.get("schema") != producer.SCHEMA or header.get("rule_revision") != producer.RULE_REVISION:
+        raise OracleError(
+            "INVENTORY_MALFORMED",
+            f"the inventory artifact declares schema {header.get('schema')!r} / rule revision "
+            f"{header.get('rule_revision')!r}, not the producer's "
+            f"{producer.SCHEMA!r} / {producer.RULE_REVISION!r}",
+        )
+    # Each row must be a closed-key table whose own row_digest re-derives over
+    # its content. This is the producer's own per-row rule
+    # (``_validate_artifact`` DIGEST_MISMATCH arm); a row that fails it cannot be
+    # named in a finding, so it is a readability failure, not a drift.
+    for row in rows:
+        if not isinstance(row, dict) or set(row.keys()) != producer.ROW_KEYS:
+            raise OracleError(
+                "INVENTORY_MALFORMED",
+                f"an inventory row is not a table with the producer's closed row keys",
+            )
+        recorded = row.get("row_digest")
+        recomputed = producer._sha256(
+            producer._canonical_bytes({k: v for k, v in row.items() if k != "row_digest"})
+        )
+        if not isinstance(recorded, str) or recorded != recomputed:
+            raise OracleError(
+                "INVENTORY_MALFORMED",
+                f"inventory row {row.get('id')} carries a row_digest that does not re-derive "
+                f"over its own content",
+            )
     if not isinstance(artifact.get("inventory_digest"), str):
         raise OracleError(
             "INVENTORY_MALFORMED",
             f"the inventory artifact declares no string inventory_digest: {INVENTORY_REL}",
         )
-    return header, rows, worksets, splits, str(artifact["inventory_digest"]), raw
+    if not rows:
+        raise OracleError(
+            "INVENTORY_INCOMPLETE",
+            f"the inventory artifact carries no rows; an empty inventory never succeeds",
+        )
+
+    # The producer's own full validation -- measured test-path bytes, span
+    # digests, aggregate arithmetic, the closed workset/split tables and the
+    # recorded inventory digest -- still runs, but through
+    # :func:`_producer_check`, which reports its verdict as a freshness finding.
+    # Its result is deliberately not used to gate row reading here.
+    return header, rows, worksets, splits, str(artifact["inventory_digest"]), raw, ""
 
 
 def _declared_universe(rows: list[dict[str, Any]]) -> tuple[tuple[str, str, str, str], ...]:
@@ -558,24 +658,71 @@ def _producer_candidates(
     """Obtain the producer's own file records and candidates through the
     accepted #866 read-only API.
 
-    This is the *sole* candidate accounting for the oracle. It calls the
-    producer's own :func:`discover_context_measurements` over ``declared`` --
-    the artifact's own universe and needle vocabulary -- so a candidate is
-    located, classified and measured by #866 and never by a second scanner
-    written here. It does not call the producer's ``sync``, does not emit or
-    write anything, and does not re-implement discovery, classification or the
-    denominator.
+    This is the *sole* candidate accounting for the oracle. Every location,
+    classification, span and digest below is produced by the #866 producer's own
+    functions over the artifact's own universe and needle vocabulary, never by a
+    second scanner written here, and the producer's ``sync`` is never called.
 
-    A read, masking or classification failure raises a typed
-    :class:`OracleError` rather than escaping as a traceback.
+    The one structural choice this function makes is *isolation*: the producer's
+    :func:`discover_context_measurements` fails closed on the FIRST declared
+    identity it cannot measure, so a single signal that a consumer migration
+    legitimately removed (the estimator site is gone; that is the point of the
+    migration) would abort the whole call and hide every other candidate -- and
+    with them every row-coverage, span-digest, classification and
+    unaccounted-candidate check. That single signal is itself a finding, but it
+    must not be able to suppress the reconciliation of the other 71 rows.
+
+    So the producer's discovery is driven **one declared identity at a time**.
+    Each call is still the producer's own discovery for that identity and can
+    still only return that identity's producer-measured record or raise that
+    identity's producer-typed error; the batch simply collects the outcomes
+    instead of collapsing on the first one. A case that cannot be measured is
+    returned in the ``absent`` list with the producer's own error code and is
+    reported by the caller as a named finding. ``file_records`` is the union of
+    the per-case file records, so a path only an unmeasurable case declared still
+    contributes its digest and the recorded ``source_sha`` stays re-derivable.
+
+    Returns ``(file_records, candidates, absent)``.
     """
-    try:
-        return producer.discover_context_measurements(root, declared)
-    except producer.InventoryError as exc:
-        raise OracleError(
-            "PRODUCER_CHECK_FAILED",
-            f"#{PRODUCER_ISSUE} discovery failed: {exc.code}: {exc.detail}",
-        ) from exc
+    ordered = sorted(declared, key=lambda item: producer._case_sort_key(str(item[0])))
+    files: dict[str, dict[str, Any]] = {}
+    candidates: list[dict[str, Any]] = []
+    absent: list[dict[str, Any]] = []
+    for case_ref, owner, rel, signal in ordered:
+        # Each call is the producer's own discovery for exactly one declared
+        # identity, reusing the producer's own loader, locator, scope and
+        # classifier. Passing a one-case tuple keeps the producer's own
+        # fail-closed, closed-owner-set, closed-classification checks in force.
+        try:
+            case_files, case_candidates = producer.discover_context_measurements(
+                root, ((case_ref, owner, rel, signal),)
+            )
+        except producer.InventoryError as exc:
+            absent.append(
+                {
+                    "case_ref": str(case_ref),
+                    "owner": str(owner),
+                    "path": str(rel),
+                    "signal": str(signal),
+                    "code": exc.code,
+                    "detail": exc.detail,
+                }
+            )
+            continue
+        for record in case_files:
+            files.setdefault(str(record["path"]), record)
+        candidates.extend(case_candidates)
+    # The file records carry the exact producer-measured sha256 per scan root
+    # the run actually loaded. They are reported so the evaluation can name a
+    # declared root that was never measured; a root missing here is one where no
+    # declared identity in it could be loaded, which the caller reports as
+    # SOURCE_UNREADABLE.
+    file_records = [files[rel] for rel in sorted(files)]
+    # Candidates are returned in the producer's own case order so downstream
+    # comparisons and digests never depend on dictionary iteration order.
+    candidates.sort(key=lambda item: producer._case_sort_key(str(item["case_ref"])))
+    absent.sort(key=lambda item: (str(item["path"]), str(item["case_ref"])))
+    return file_records, candidates, absent
 
 
 def _producer_check(
@@ -596,22 +743,20 @@ def _producer_check(
 
     Returns ``(status, detail)``; ``status`` is ``"ok"`` or a typed non-ok
     token (``"stale"``, ``"blocked"``, ``"error"``, ``"digest-mismatch"``).
+
+    The producer's own full validation is reused as the *freshness* authority,
+    not as a gate on reading rows. When it rejects the stored artifact because a
+    measured input moved (a test-path size, a span digest, an aggregate sum), the
+    verdict is ``"stale"``: the artifact is well-formed and no longer current.
+    Only a verdict that means the bytes cannot be *interpreted* at all stays an
+    ``"error"``. This is what lets one stale input be reported as exactly that
+    while the reconciliation continues.
     """
     # The recorded inventory digest must equal a digest computed over the
     # artifact's own content -- recomputing to *validate* the recorded value,
     # never to trust a stored digest blindly.
     try:
         artifact = producer._parse_toml(raw, source=INVENTORY_REL)
-        # Same sequence as the producer's own `check`: measure the declared test
-        # paths, then validate. Re-deriving the measurement here rather than
-        # trusting a recorded size is what keeps a split from being believed on a
-        # stated number.
-        _wsets = artifact.get("consumer_worksets")
-        if not isinstance(_wsets, list):
-            return "error", "consumer_worksets must be a list in the inventory artifact"
-        header, rows, worksets, splits = producer._validate_artifact(
-            artifact, producer._measure_test_paths(root, _wsets)
-        )
     except producer.InventoryError as exc:
         return "error", f"{exc.code}: {exc.detail}"
     recorded_inventory_digest = str(artifact.get("inventory_digest", ""))
@@ -636,10 +781,10 @@ def _producer_check(
         recomputed_inventory_digest = _sha256(
             _canonical_bytes(
                 {
-                    "header": header,
-                    "rows": rows,
-                    "consumer_worksets": worksets,
-                    "proposed_splits": splits,
+                    "header": artifact["header"],
+                    "rows": artifact["rows"],
+                    "consumer_worksets": artifact["consumer_worksets"],
+                    "proposed_splits": artifact["proposed_splits"],
                 }
             )
         )
@@ -653,14 +798,46 @@ def _producer_check(
             f"{recomputed_inventory_digest[:16]}",
         )
 
+    # The producer's own aggregate/workset/split validation, run exactly as its
+    # `check` runs it (measure the declared test paths, then validate). This is
+    # the freshness authority: it re-derives every recorded measurement against
+    # the live tree. A rejection here is staleness, not malformation -- the
+    # structural grammar was already decided (and passed) in
+    # :func:`_read_inventory_artifact`.
+    try:
+        _wsets = artifact.get("consumer_worksets")
+        if not isinstance(_wsets, list):
+            return "error", "consumer_worksets must be a list in the inventory artifact"
+        _header, _rows, _worksets, _splits = producer._validate_artifact(
+            artifact, producer._measure_test_paths(root, _wsets)
+        )
+    except producer.InventoryError as exc:
+        return (
+            "stale",
+            f"the #{PRODUCER_ISSUE} producer's recorded aggregates no longer describe the live "
+            f"tree: {exc.code}: {exc.detail}",
+        )
+
     # Validate the recorded source/rule/owner digests against the live tree,
     # using the producer's own derivation of each over the artifact's OWN
     # declared universe. A recorded value is validated, never trusted.
+    #
+    # The source digest is re-derived from the producer's own file loader over
+    # the declared scan roots. That is deliberately NOT routed through
+    # ``discover_context_measurements``: discovery locates each *signal*, so a
+    # signal that a consumer migration legitimately removed would abort the whole
+    # call and hide the digest verdict. File digests do not depend on any
+    # individual signal still being present, and the vanished signal is reported
+    # separately, by name, as its own finding class.
+    header = artifact["header"]
     try:
         measured_rule_digest = producer._rule_digest()
         measured_owner_digest = producer._owner_digest(declared)
-        file_records, _candidates = producer.discover_context_measurements(root, declared)
-        source_pairs = sorted(f"{r['path']}:{r['sha256']}" for r in file_records)
+        scan_roots = tuple(sorted({str(path) for _ref, _owner, path, _sig in declared}))
+        file_cache = producer._load_files(root, scan_roots)
+        source_pairs = sorted(
+            f"{rel}:{str(file_cache[rel]['sha256'])}" for rel in scan_roots
+        )
         measured_source_sha = _sha256("\n".join(source_pairs).encode("utf-8"))
         owner_map = producer.load_owner_map(root)
         measured_map_digest = owner_map[2]
@@ -674,7 +851,7 @@ def _producer_check(
     ):
         if recorded != measured:
             return (
-                "digest-mismatch",
+                "stale",
                 f"recorded {label} {recorded[:16]} does not match the value derived from the "
                 f"live tree {measured[:16]}; a relevant source/rule/allocation/owner-map "
                 f"input changed since the artifact was generated",
@@ -685,6 +862,10 @@ def _producer_check(
     # producer's own ``check`` performs, and it is what makes an unrelated HEAD
     # move (which changes no scan input) NOT stale the artifact, while any
     # change to a scan root, rule, or owner allocation does.
+    #
+    # A rebuild that cannot complete because a declared signal no longer exists
+    # is staleness with a named cause, not an unreadable error: the artifact
+    # describes a source state the tree has since left behind.
     try:
         mapping, map_status, map_digest = producer.load_owner_map(root)
         fresh = producer.build_inventory(
@@ -694,7 +875,11 @@ def _producer_check(
         )
         fresh_raw = producer._emit_toml(fresh)
     except producer.InventoryError as exc:
-        return "error", f"{exc.code}: {exc.detail}"
+        return (
+            "stale",
+            f"the #{PRODUCER_ISSUE} producer can no longer re-emit the stored artifact from "
+            f"the live tree: {exc.code}: {exc.detail}",
+        )
     if fresh_raw == raw:
         return "ok", "producer re-emission is byte-identical to the stored artifact"
     fresh_header = fresh["header"] if isinstance(fresh, dict) else {}
@@ -1070,8 +1255,8 @@ def evaluate(root: Path) -> OwnershipResult:
     # ``_producer_check`` -- never left unused, and never replaced by a
     # recorded digest value that would have to be taken on trust.
     try:
-        header, rows, worksets, splits, inventory_digest, raw = _read_inventory_artifact(
-            root, producer
+        header, rows, worksets, splits, inventory_digest, raw, _fault = (
+            _read_inventory_artifact(root, producer)
         )
     except OracleError as exc:
         add(exc.code, exc.detail, rule="inventory-lifecycle")
@@ -1114,11 +1299,12 @@ def evaluate(root: Path) -> OwnershipResult:
                 rule="producer-freshness",
             )
         elif check_status == "digest-mismatch":
-            # A recorded digest that disagrees with the measured one is a
-            # malformed artifact, reported against the exact named input.
+            # A recorded digest that disagrees with the measured CONTENT digest
+            # is a malformed artifact: the bytes no longer hash to the digest the
+            # artifact itself declares. Reported against the exact named input.
             add(
                 "INVENTORY_MALFORMED",
-                f"#{PRODUCER_ISSUE} recorded input digests disagree with the measured tree: "
+                f"#{PRODUCER_ISSUE} recorded content digest disagrees with the measured tree: "
                 f"{check_detail}",
                 rule="producer-input-digests",
             )
@@ -1130,11 +1316,23 @@ def evaluate(root: Path) -> OwnershipResult:
             )
 
     # --- Producer's own candidate accounting (the sole producer). ---------
-    try:
-        _file_records, candidates = _producer_candidates(root, producer, declared)
-    except OracleError as exc:
-        add(exc.code, exc.detail, rule="candidate-accounting")
-        candidates = []
+    #
+    # Measured one declared identity at a time (see :func:`_producer_candidates`)
+    # so that a declared identity the producer can no longer locate is reported
+    # as itself -- a named finding -- instead of aborting the whole accounting
+    # and hiding the remaining rows' reconciliation.
+    file_records, candidates, absent = _producer_candidates(root, producer, declared)
+    for item in absent:
+        add(
+            "SOURCE_ROW_MISSING",
+            f"the #{PRODUCER_ISSUE} producer can no longer measure declared identity "
+            f"{item['case_ref']} (owner {item['owner']}): its signal {item['signal']!r} no "
+            f"longer occurs in {item['path']} ({item['code']}: {item['detail']}); the stored "
+            f"row no longer corresponds to live source",
+            case_ref=str(item["case_ref"]),
+            path=str(item["path"]),
+            rule="row-coverage",
+        )
 
     # --- Source row identity: missing, changed digest, changed span, dupes.
     by_case: dict[str, dict[str, Any]] = {}
@@ -1229,13 +1427,90 @@ def evaluate(root: Path) -> OwnershipResult:
             )
 
     # --- Candidate count drift between producer candidates and stored rows.
-    if len(candidates) != len(rows):
+    #
+    # Every declared identity was *asked*; each produced either a measured
+    # candidate or a named absence. The denominator of that accounting is
+    # therefore ``candidates + absent`` -- the number the producer was actually
+    # asked about -- compared against the stored row count. An absent identity
+    # already carries its own ``SOURCE_ROW_MISSING`` finding above, so this
+    # comparison is not double counting: it answers a different question, namely
+    # whether the stored artifact accounts for every identity the oracle put to
+    # the producer.
+    measured_total = len(candidates) + len(absent)
+    if measured_total != len(rows):
         add(
             "CANDIDATE_COUNT_DRIFT",
-            f"the producer discovered {len(candidates)} candidates but the inventory "
+            f"the producer was asked about {measured_total} declared identities "
+            f"({len(candidates)} measured, {len(absent)} unmeasurable) but the inventory "
             f"stores {len(rows)} rows",
             rule="row-coverage",
         )
+
+    # --- Declared scan-root readability, from the producer's own loader verdicts.
+    #
+    # A declared root is reported unreadable ONLY when the producer's own loader
+    # rejected an identity declared in that root for a reason that is not the
+    # signal having migrated away. A root whose identities all report
+    # ``SIGNAL_ABSENT`` is a readable file whose measurement sites were migrated
+    # out of it -- that is a row-coverage fact, already reported once per
+    # identity above, and calling it a read failure would report a readable file
+    # as unreadable.
+    #
+    # ``SIGNAL_ABSENT`` (the declared signal no longer occurs) and
+    # ``CLASSIFICATION_OPEN`` (the signal no longer falls in the closed class
+    # set) are therefore not read failures; every other producer error code
+    # raised while loading or masking a declared root -- ``SCAN_INPUT_MISSING``,
+    # ``MALFORMED_RUST_SOURCE``, ``PACKAGE_UNDECLARED`` -- is.
+    unreadable_identities = [
+        item for item in absent if str(item["code"]) not in ("SIGNAL_ABSENT", "CLASSIFICATION_OPEN")
+    ]
+    for rel in sorted({str(item["path"]) for item in unreadable_identities}):
+        failing = sorted(
+            str(item["case_ref"]) for item in unreadable_identities if str(item["path"]) == rel
+        )
+        codes = sorted({str(item["code"]) for item in unreadable_identities if str(item["path"]) == rel})
+        add(
+            "SOURCE_UNREADABLE",
+            f"declared scan root {rel} could not be loaded or masked by the "
+            f"#{PRODUCER_ISSUE} producer for identity(ies) {failing} ({', '.join(codes)}); "
+            f"the artifact declares rows in a root the producer cannot read",
+            path=rel,
+            rule="row-coverage",
+        )
+
+    # --- Every stored row's recorded source digest, validated against the
+    # producer-measured digest of its OWN file record.
+    #
+    # A row's ``source_sha256`` is a recorded claim about one specific file. It
+    # is validated here against the sha256 the producer's loader measured for
+    # that path in THIS run -- never recomputed from any sibling field of the
+    # same row (``row_digest`` covers the row's own content and says nothing
+    # about the file it points at) and never against the header's aggregate
+    # ``source_sha``, which is a digest *of* those digests and would let every
+    # row in a changed file be excused by one aggregate. This is the per-row
+    # half of A1's "matching exact source digests" clause, and it is independent
+    # of the candidate-by-candidate comparison above: it needs no signal to still
+    # be present, so it also covers rows whose measurement site was migrated.
+    measured_file_sha = {str(rec["path"]): str(rec["sha256"]) for rec in file_records}
+    for row in rows:
+        rel = str(row["path"])
+        measured_sha = measured_file_sha.get(rel)
+        if measured_sha is None:
+            # No measurable identity in this root; whether the root itself is
+            # readable is decided above. Recorded against the header's own
+            # source digest claim instead, which is checked in _producer_check.
+            continue
+        if str(row["source_sha256"]) != measured_sha:
+            add(
+                "SOURCE_DIGEST_CHANGED",
+                f"row {row['id']} ({row['case_ref']}) records source digest "
+                f"{str(row['source_sha256'])[:16]} for {rel} but the live file measures "
+                f"{measured_sha[:16]}; the stored row was measured against different source",
+                row_id=str(row["id"]),
+                case_ref=str(row["case_ref"]),
+                path=rel,
+                rule="row-digest",
+            )
 
     # --- Unaccounted estimator detection, through the producer. -----------
     unaccounted = _unaccounted_candidates(root, producer, rows, candidates, header)
@@ -1318,10 +1593,15 @@ def evaluate(root: Path) -> OwnershipResult:
     # ("#704"/"#783"/"#878"/"#880"), so the lookup and the evidence map -- both
     # keyed by that same string -- agree. A numeric issue id would silently miss
     # every owner and report a false dependency failure.
+    #
+    # The iteration set is EXACTLY ``CONSUMER_DEPENDENCY_MARKERS``'s own keys, in
+    # its own (sorted) order. It is not a hard-coded restatement of the consumer
+    # list and not a superset of it: a closed owner that owns writable seam rows
+    # but has no accepted-adapter entry in that table is a finding in its own
+    # right, reported just below, rather than being quietly skipped here.
     dependency = _dependency_evidence(root, producer, rows)
-    for owner in ("#783", "#878", "#880", CANONICAL_MEASUREMENT_OWNER):
-        if owner not in CONSUMER_DEPENDENCY_MARKERS:
-            continue
+    for owner in sorted(CONSUMER_DEPENDENCY_MARKERS):
+        accepted = CONSUMER_DEPENDENCY_MARKERS[owner]
         hits = dependency.get(owner, [])
         if not hits:
             add(
@@ -1332,6 +1612,41 @@ def evaluate(root: Path) -> OwnershipResult:
                 f"approved adapter, never a local ratio",
                 rule="dependency",
             )
+            continue
+        # Every hit must be one of this owner's exact accepted adapters. The hit
+        # list is built by exact literal search over the owner's declared seam
+        # source (``_dependency_evidence``), so an unexpected hit can only mean
+        # the marker table and the evidence collector disagree -- which is a
+        # deterministic internal defect, reported rather than tolerated.
+        unexpected = sorted({hit.rsplit(":", 1)[-1] for hit in hits} - set(accepted))
+        if unexpected:
+            raise OracleError(
+                "DETERMINISTIC_INTERNAL_DEFECT",
+                f"consumer {owner} dependency evidence names {unexpected}, which is outside its "
+                f"exact accepted adapter set {list(accepted)}",
+            )
+
+    # --- Every closed owner that owns writable seam rows must HAVE an exact
+    # accepted-adapter entry, or its dependency check above could never have
+    # run.
+    #
+    # A consumer present in the inventory's own rows but absent from
+    # ``CONSUMER_DEPENDENCY_MARKERS`` has no declared accepted adapter at all. It
+    # is reported, never skipped: an owner with no accepted adapter set is an
+    # owner whose measurement reach is unconstrained.
+    seam_owners = {
+        str(row["owner"])
+        for row in rows
+        if row["write_scope"] == "writable" and str(row["owner"]) != "unresolved"
+    }
+    for owner in sorted(seam_owners - set(CONSUMER_DEPENDENCY_MARKERS)):
+        add(
+            "MISSING_DEPENDENCY",
+            f"consumer {owner} owns writable seam rows but has no entry in the exact accepted "
+            f"adapter set, so no reference in its source could satisfy or fail the "
+            f"canonical-measurement dependency check",
+            rule="dependency",
+        )
 
     # --- Coverage completeness: unresolved rows and an unsupplied owner map.
     unresolved_rows = [r for r in rows if str(r["status"]) != "owned"]
@@ -1601,7 +1916,33 @@ def _baseline_findings(
     see :func:`_derive_baseline_disposition` for why no recorded row fact can
     establish it.
     """
+    # --- The denominator must itself be complete before it can reconcile
+    # anything.
+    #
+    # ``EXPECTED_BASELINE_ROWS`` is the frozen pre-migration denominator,
+    # written out independently of the producer module. Iterating it reconciles
+    # 31 rows -- but only if it really holds 31 distinct rows with 31 distinct
+    # case identities. A silently truncated or de-duplicated table would shrink
+    # the denominator and make every surviving-row check pass over fewer
+    # requirements than exist, which is exactly "erasing a requirement to get
+    # green". So the table's own cardinality and uniqueness are checked here, and
+    # the reconciled count is compared against that cardinality at the end.
+    if len(EXPECTED_BASELINE_ROWS) != EXPECTED_BASELINE_COUNT:
+        raise OracleError(
+            "DETERMINISTIC_INTERNAL_DEFECT",
+            f"the frozen baseline denominator holds {len(EXPECTED_BASELINE_ROWS)} rows but "
+            f"EXPECTED_BASELINE_COUNT declares {EXPECTED_BASELINE_COUNT}",
+        )
+    frozen_refs = [str(case_ref) for case_ref, _owner in EXPECTED_BASELINE_ROWS]
+    if len(set(frozen_refs)) != len(frozen_refs):
+        duplicates = sorted({ref for ref in frozen_refs if frozen_refs.count(ref) > 1})
+        raise OracleError(
+            "DETERMINISTIC_INTERNAL_DEFECT",
+            f"the frozen baseline denominator repeats case identity(ies) {duplicates}",
+        )
+
     dispositions: dict[str, int] = {d: 0 for d in BASELINE_DISPOSITIONS}
+    lost = 0
     for case_ref, expected_owner in EXPECTED_BASELINE_ROWS:
         row = by_case.get(case_ref)
         if row is None:
@@ -1612,7 +1953,28 @@ def _baseline_findings(
                 case_ref=case_ref,
                 rule="baseline-reconciliation",
             )
+            lost += 1
             continue
+        # The frozen row's expected owner is the oracle's own recorded fact about
+        # the pre-migration allocation. The current row must still carry it: a
+        # baseline requirement that was silently re-allocated to a different owner
+        # has not been reconciled, it has been transferred without evidence, and
+        # the frozen owner is what makes the check independent of the very row
+        # field being judged.
+        actual_owner = str(row["owner"])
+        if actual_owner != expected_owner:
+            add(
+                "BASELINE_DISPOSITION_MISSING",
+                f"frozen baseline row {case_ref} is owned by {actual_owner} but its recorded "
+                f"pre-migration owner is {expected_owner}; a baseline requirement is never "
+                f"re-allocated to obtain green",
+                row_id=str(row["id"]),
+                case_ref=case_ref,
+                path=str(row["path"]),
+                span_start=int(row["span_start"]),
+                span_end=int(row["span_end"]),
+                rule="baseline-reconciliation",
+            )
         # Derive the disposition from the row's own closed fields. The
         # derivation is total over the four closed values, so the membership
         # guard below is a structural invariant of the closed set rather than
@@ -1627,6 +1989,23 @@ def _baseline_findings(
                 f"{disposition!r}",
             )
         dispositions[disposition] += 1
+
+    # --- The reconciliation must cover the whole declared denominator.
+    #
+    # ``reconciled + lost == EXPECTED_BASELINE_COUNT`` is the denominator
+    # arithmetic in its exact form: every frozen row is either reconciled with an
+    # explicit disposition, or reported lost, and nothing else may contribute to
+    # the tally. A shortfall would mean a frozen row was silently skipped rather
+    # than reconciled; an excess would mean the tally counts something outside the
+    # frozen requirement set. ``lost`` is counted here from the same loop that
+    # emitted the ``BASELINE_ROW_LOST`` findings, so the two cannot disagree.
+    reconciled = sum(dispositions.values())
+    if reconciled + lost != EXPECTED_BASELINE_COUNT:
+        raise OracleError(
+            "DETERMINISTIC_INTERNAL_DEFECT",
+            f"baseline reconciliation covers {reconciled} + {lost} rows but the frozen "
+            f"denominator holds {EXPECTED_BASELINE_COUNT}",
+        )
     return dispositions
 
 

@@ -4035,6 +4035,9 @@ impl ProblemOwner {
     }
 
     /// Returns the number of recovered problem revisions.
+    ///
+    /// Live status: no production caller. Whether a projection reads this or the
+    /// accessor is retired is an owner decision.
     #[must_use]
     pub fn revision_count(&self) -> usize {
         self.revisions.len()
@@ -6336,6 +6339,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// receipt while an identity-clear observation withholds pending source
     /// closure instead of allowing. Fails closed when no binding is retained
     /// or the owner read disagrees with the fence.
+    ///
+    /// Live status: no production caller. The live trigger evaluation is
+    /// `check_material_readiness_for_effect`, which inlines the same
+    /// `check_at_trigger` call against its own owner read; this entry is the
+    /// unwired thin variant. Whether it is wired to that path or retired is an
+    /// owner decision.
     pub fn check_work_scope_at_trigger(
         &self,
         observed: &ScopeBinding,
@@ -6360,6 +6369,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// owner-issued resolution receipt through [`admit_at_trigger`]. Authority
     /// comes from the live owner read and the retained descriptor, never from
     /// receipt fields alone. Fails closed when no binding is retained.
+    ///
+    /// Live status: no production caller. Whether it is wired to a dispatch
+    /// ingress or retired is an owner decision.
     pub fn admit_work_scope_at_trigger(
         &self,
         descriptor: &WorkScopeDescriptor,
@@ -6394,6 +6406,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the expected binding for the next owner snapshot; persisting it as the
     /// current owner snapshot belongs to the recovery/bootstrap path that
     /// owns owner writes.
+    ///
+    /// Live status: no production caller. Whether it is wired to a relocation or
+    /// attach ingress or retired is an owner decision.
     pub fn rebind_work_scope_with_receipt(
         receipt: &ScopeRelocationOrAttachReceipt,
         expected_scope_ref: &str,
@@ -6444,6 +6459,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// discovery evidence populates only the host-handles, lineage, and
     /// manifest-boundary tiers, so resolution can distinguish candidates but
     /// never authenticates a scope; owner issuance stays separate.
+    ///
+    /// Live status: no production caller. Whether a scanner ingress builds these
+    /// inputs or the entry is retired is an owner decision.
     pub fn resolve_scope_identity_from_scan(
         inputs: &ScannerResolverInputs,
         candidates: &WorkScopeCandidateSet,
@@ -7280,6 +7298,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// classifies the file without adopting it. A matching filename alone is
     /// not owner provenance, so even well-formed bytes stay quarantined for
     /// the migration owner instead of becoming readable evidence.
+    ///
+    /// Live status: no production caller. No attach/onboarding ingress hands
+    /// over a loose capture today. Whether the migration owner calls this or the
+    /// entry is retired is an owner decision.
     pub fn quarantine_loose_scan_disclosure_capture(
         store: &InstallationScanDisclosureStore,
         file_name: &str,
@@ -7834,6 +7856,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Projects the exact durable cold-start terminal named by a full owner
     /// claim. Reads revalidate the stored lease, terminal revision, current
     /// `StateFence`, and freshly matched `WorkScope` before returning a surface.
+    ///
+    /// Live status: no production caller. Whether a full owner claim reaches
+    /// this projection or the entry is retired is an owner decision.
     pub fn cold_start_surface_for_claim(
         &self,
         claim: &ColdStartReadinessClaim,
@@ -8111,23 +8136,46 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Commits a canonical write after running the discriminating check a
     /// [`NegativeMemoryGateDecision::RequireCheck`] demands.
     ///
-    /// This is the production caller for the read-only probe executor, and it
-    /// exists because a `RequireCheck` is a DEMAND rather than a verdict: the
-    /// plain gated commit refuses such an action and stays refusing it, which
-    /// is correct but leaves the demanded check unrun. Here the gate is
+    /// A `RequireCheck` is a DEMAND rather than a verdict, so this entry runs
+    /// the demanded check itself rather than leaving it unrun: the gate is
     /// evaluated once to learn which check the matched rule declares, the
     /// proposal is built only from that decision and this envelope's own
-    /// owner-observed rule set, the probe is executed through the retained
-    /// read-only route, and the gate is evaluated a SECOND time with the
-    /// resulting admission. The second evaluation is the same pure function
-    /// with one more input, so the probe result cannot grant anything the
-    /// first evaluation would have refused for any other reason.
+    /// owner-observed rule set, the probe is executed through the
+    /// caller-supplied read-only executor, and the gate is evaluated a SECOND
+    /// time with the resulting admission. The second evaluation is the same
+    /// pure function with one more input, so the probe result cannot grant
+    /// anything the first evaluation would have refused for any other reason.
     ///
     /// A probe that fails to execute, that is served at another fence, or whose
     /// verifier is not the record's own leaves the second decision a
     /// `RequireCheck` refusal. There is no path here where an unexecuted check
     /// becomes a pass, and the write is refused in that case exactly as the
     /// plain gated commit refuses it.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller; the function body is
+    /// reachable only by naming it. A source implementation is not evidence of
+    /// a live edge, so the earlier claim that this was "the production caller
+    /// for the read-only probe executor" was false and has been removed.
+    ///
+    /// The probe executor IS live, through a different arrangement:
+    /// `commit_gated_action` in the `eliotd` negative-memory action gate
+    /// (`bins/eliotd/src/negative_memory_action_gate.rs`) runs the same
+    /// two-phase sequence inline — it admits the proposal with
+    /// `admit_negative_memory_probe`, executes it over the retained
+    /// `store_named_async` read-only route through a
+    /// `NamedReadProbeExecutor`, and then commits through
+    /// [`Self::commit_canonical_gated_by_negative_memory`] rather than through
+    /// this entry. The demanded check therefore does run on the live path; this
+    /// governor entry is the unwired duplicate of that sequence, and the two
+    /// can be reconciled only by making one of them the arrangement the daemon
+    /// uses.
+    ///
+    /// Whether this entry is wired to that dispatch or retired is an owner
+    /// decision, not a documentation one. It is retained here unchanged because
+    /// removing a `pub` entry from the governor surface is an API decision for
+    /// the governor owner (#18/#19), not a documentation fix.
     ///
     /// # Errors
     ///
@@ -9615,6 +9663,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// recovered graph fallback: only a validated receipt reports `Active`,
     /// revocation intent reports `Revoked`, and anything unresolved reports
     /// nothing rather than an effective right.
+    ///
+    /// Live status: no production caller. Nothing in the repository reads this
+    /// status; the introduction receipts retained by
+    /// `activate_introduction`/`revoke_introduction` are not projected through
+    /// it. Whether a presentation surface is wired to read it or the accessor is
+    /// retired is an owner decision.
     #[must_use]
     pub fn authority_introduction_status(
         &self,

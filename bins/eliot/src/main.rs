@@ -18,11 +18,12 @@ use eliot_installation::{
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass, ProfileRootAnchors,
     ProfileSelectionInput, RedbInstallationRegistry, RedbInstallationTransactionStore,
-    WindowsInstallationCoordinator, parse_installation_transaction_id,
+    WindowsInstallationCoordinator, compose_profile_launch, parse_installation_transaction_id,
     post_bootstrap_rejection_pending_ref, require_published_source_bundle_journal,
     validate_installation_transaction_json,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
+use eliot_kernel_service::ELIOTD_RESTART_POLICY_SUBJECT_ID;
 use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
@@ -35,7 +36,7 @@ use eliot_platform_windows::{
     is_eliot_governor_running, is_process_elevated, observe_current_user_config,
     windows_path_identity_digest,
 };
-use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
+use eliot_runtime_contracts::{RestartPolicyV1, RuntimeLiveStoreIdentity};
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
 mod backup_entry;
 #[cfg(windows)]
@@ -494,6 +495,18 @@ enum InstallationCommand {
         profile_anchor_root: PathBuf,
         #[arg(long)]
         installation_key: Option<String>,
+        /// Absolute path to the operator's APPROVED config/fault profile JSON
+        /// declaring the one versioned restart policy for the supervised
+        /// `eliotd` child (I14.10, I8.12).
+        ///
+        /// Every restart number, window, backoff, jitter, cooldown and
+        /// quarantine threshold is read from that profile; this command
+        /// declares none of them. Omitting the option means the approved
+        /// profile declares no restart policy, and the child is published with
+        /// no policy at all — the fail-closed disposition that withholds
+        /// automatic restart, never a synthesised default.
+        #[arg(long, value_parser = absolute_path)]
+        eliotd_restart_policy: Option<PathBuf>,
     },
     /// Publish the per-user Notify fallback declaration and register the
     /// signed Task Scheduler fallback. Runs in the interactive session
@@ -2343,6 +2356,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             profile,
             profile_anchor_root,
             installation_key,
+            eliotd_restart_policy,
         } => run_installation_materialize_source_bundle(
             eliot_host,
             eliot_watchdog,
@@ -2374,6 +2388,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             installation_key,
             agent_bridge_exe,
             agent_bridge_account,
+            eliotd_restart_policy,
         ),
         InstallationCommand::SetupNotifyFallback {
             installation,
@@ -2827,6 +2842,53 @@ fn run_installation_setup_notify_fallback(
     Ok(0)
 }
 
+/// Reads the operator's APPROVED restart-policy declaration for the one
+/// supervised `eliotd` child, and hands back an absence as an absence.
+///
+/// I8.12 keeps every restart number, window, backoff, jitter, cooldown and
+/// quarantine threshold in the approved config/fault profile, so this command
+/// declares none of them: it reads the exact `RestartPolicyV1` value the
+/// operator approved and never synthesises, defaults or widens one.
+///
+/// Two refusals live here and neither converts a failure into a pass-through:
+///
+/// - `None` means the approved profile declares no restart policy for this
+///   child. It stays `None` through the materializer onto the descriptor and
+///   into the descriptor digest, where the Kernel reads it as *withhold
+///   automatic restart*, never as an unlimited budget.
+/// - a declaration naming a child other than
+///   `ELIOTD_RESTART_POLICY_SUBJECT_ID` is refused at the operator surface
+///   rather than published, because another child's restart class, intensity
+///   window and quarantine threshold must never become this child's.
+///
+/// The shared contract's own legality check (`RestartPolicyV1::validate`) is
+/// deliberately NOT re-run here; the descriptor owner proves the value once,
+/// at `EliotdLaunchDescriptor::validate`, and this command adds no second
+/// validation site to drift from it.
+fn read_admitted_restart_policy(
+    approved_profile: Option<&Path>,
+) -> Result<Option<RestartPolicyV1>> {
+    let Some(path) = approved_profile else {
+        return Ok(None);
+    };
+    // The existing bounded regular-file read: one read, the same 16 MiB input
+    // limit every other installation input uses, no new store or persistence.
+    let bytes = load_input(path)?;
+    let policy: RestartPolicyV1 = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "approved eliotd restart policy {} is malformed: {error}",
+            path.display()
+        )
+    })?;
+    if policy.subject_id != ELIOTD_RESTART_POLICY_SUBJECT_ID {
+        anyhow::bail!(
+            "approved eliotd restart policy names subject_id {:?}, not the supervised child {ELIOTD_RESTART_POLICY_SUBJECT_ID}",
+            policy.subject_id
+        );
+    }
+    Ok(Some(policy))
+}
+
 #[allow(
     clippy::needless_pass_by_value,
     clippy::too_many_arguments,
@@ -2863,6 +2925,7 @@ fn run_installation_materialize_source_bundle(
     installation_key: Option<String>,
     agent_bridge_exe: Option<PathBuf>,
     agent_bridge_account: Option<String>,
+    eliotd_restart_policy: Option<PathBuf>,
 ) -> Result<i32> {
     let profile_selection = profile_selection_input(ResolveProfileRequest {
         profile,
@@ -2874,6 +2937,7 @@ fn run_installation_materialize_source_bundle(
         source_root: output_bundle.clone(),
         staging_root: staging_root.clone(),
     })?;
+    let eliotd_restart_policy = read_admitted_restart_policy(eliotd_restart_policy.as_deref())?;
     let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
         eliot_host_exe: eliot_host,
         eliot_watchdog_exe: eliot_watchdog,
@@ -2902,6 +2966,7 @@ fn run_installation_materialize_source_bundle(
         // The materializer seam restates the selection's own staging root; it
         // is the same admitted object, not a second independently-proved one.
         staging_root: profile_selection.staging_root.clone(),
+        eliotd_restart_policy,
     };
     let receipt =
         match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {
@@ -4256,6 +4321,12 @@ fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i3
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
+    // Implementation item 4: report the launch adapter this profile actually
+    // composes. Composing it is read-only — it resolves the adapter and, for
+    // `UserMode`, retains the current-user roots through the existing adapter
+    // without touching Task Scheduler — so this command still creates nothing,
+    // reserves no service, and mutates nothing.
+    let launch_composition = compose_profile_launch(&resolution);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -4264,6 +4335,18 @@ fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i3
             "status": "PROFILE_RESOLVED",
             "profile": resolution.governance.profile,
             "supervision": resolution.governance.supervision,
+            "launch_adapter": eliot_installation::launch_adapter_name(
+                resolution.governance.profile
+            ),
+            "launch_composition": match &launch_composition {
+                Ok(composition) => {
+                    serde_json::to_value(composition).unwrap_or(json!(null))
+                }
+                Err(error) => json!({
+                    "state": "REFUSED",
+                    "reason": error.to_string(),
+                }),
+            },
             "root_roles": resolution.governance.roots,
             "enforced_guarantees": resolution.governance.enforced_guarantees,
             "unsupported_guarantees": resolution.governance.unsupported_guarantees,

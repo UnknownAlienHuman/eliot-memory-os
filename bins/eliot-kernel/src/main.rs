@@ -245,6 +245,20 @@ async fn main() {
         kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
     }
     if let Some(daemon_launch) = daemon_launch {
+        // I14.10 / I8.12 (#1682 W1, A7): the admitted versioned restart policy
+        // for the supervised `eliotd` child travels on the Host-approved,
+        // digest-bound launch descriptor that admits this launch, so the Kernel
+        // reads the declaration the operator's approved profile published rather
+        // than choosing one locally. This is the ONLY caller of
+        // `KernelConfig::with_daemon_restart_policy`; without it the composition
+        // admits no restart class and `AdmittedDaemonRestartPolicy` is always
+        // absent, which is precisely the unresolved-policy gap A1 requires to be
+        // named rather than hidden. An absent declaration stays absent and
+        // withholds automatic restart for the child; it is never widened into an
+        // unlimited budget.
+        if let Some(policy) = daemon_launch.restart_policy.clone() {
+            kernel_config = kernel_config.with_daemon_restart_policy(policy);
+        }
         kernel_config = kernel_config.with_daemon_launch(daemon_launch);
     }
     let Some(kernel_artifact_sha256) = options.kernel_artifact_sha256.clone() else {

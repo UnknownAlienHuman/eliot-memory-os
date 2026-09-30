@@ -33,6 +33,17 @@
 //! coordinator never mistakes its stored presented values for loaded owner
 //! evidence.
 //!
+//! Residual STITCH (issue #1108 A5): the loaded legs passed to the pure owner
+//! verifier in [`KernelProviderVerifier::verify`] alias the presented half
+//! (attempt, operation, digests, generation); only the fence leg rides
+//! owner-observed evidence (the live-fence digest) while attempt/operation
+//! mismatch is caught receipt-side from the ORIGINAL bytes. Binding the
+//! digest legs against the durable row per effecting operation demands the
+//! factory-witnessed row retained in this capability (producer:
+//! [`AdmittedProviderFactory::admit`]) plus a daemon row source that no seam
+//! returns today. Until both land, the owner digest/generation gates re-prove
+//! construction-time coherence, not a fresh row read.
+//!
 //! Catalogue, quota, and liveness observations (issue #265) ride only as
 //! [`ProviderSelectionHealth`]: selection/health input, never admission. The
 //! verifier never reads that field; route selection projects its refs into
@@ -44,6 +55,8 @@
 //! authenticated Kernel client, and restore re-queries Kernel through a fresh
 //! [`AdmittedProviderCapability`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use eliot_agent_api::{EpochId, StateFence};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::{
@@ -52,7 +65,12 @@ use eliot_kernel_service::{
 };
 
 use crate::core::{ProviderProofKind, ProviderVerifier};
-use crate::model::{CoordinatorError, ProviderBindingSnapshot, ProviderIdentity, validate_text};
+use crate::model::{
+    CoordinatorError, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
+    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
+    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
+    ResultSubmission, validate_text,
+};
 
 /// Ingress-presented claim material for one provider admission (T9-05
 /// presented half, issue #1108).
@@ -163,7 +181,7 @@ impl OwnerCurrentness {
     ///
     /// # Errors
     ///
-    /// Returns [`CoordinatorError::InvalidField`]     /// [`CoordinatorError::ProviderContract`] for a malformed current
+    /// Returns [`CoordinatorError::ProviderContract`] for a malformed current
     /// expectation shape or an invalid live fence.
     pub fn new(
         expectation: ProviderCapabilityExpectation,
@@ -384,31 +402,57 @@ impl AdmittedProviderCapability {
 /// [`AgentCoordinator::restore_with_admitted_provider`](crate::core::AgentCoordinator::restore_with_admitted_provider);
 /// never public, never caller-implementable.
 ///
-///
-/// Closed until owner-proved: construction alone never reports `Verified`.
-/// The binding stays a typed `PLAN_GAP` until one `verify` call on this
-/// instance succeeds through the owner verifier, and only that success flips
-/// it. A constructed-but-unverified capability therefore cannot mint
-/// `Verified`.
+/// Closed until owner-proved: construction alone (including factory-gated
+/// construction through
+/// [`AdmittedProviderFactory::admit`](crate::admitted_provider::AdmittedProviderFactory::admit))
+/// never reports `Verified`. The binding stays a typed `PLAN_GAP` until one
+/// `verify` call on this instance succeeds through the owner verifier, and
+/// only that success flips it. A constructed-but-unverified capability
+/// therefore cannot mint `Verified`.
 pub(crate) struct KernelProviderVerifier {
     capability: AdmittedProviderCapability,
+    /// Flipped exactly once a `verify` call on this instance returns owner
+    /// `Ok`. `AtomicBool` (not `Cell`/`RefCell`: the sealed
+    /// [`ProviderVerifier`](crate::core::ProviderVerifier) is `Send + Sync`,
+    /// and this file otherwise carries no interior-mutability idiom) because
+    /// `verify` borrows `&self` while the trait signature stays frozen.
+    verified: AtomicBool,
 }
+
+/// Typed `PLAN_GAP` reason reported while this verifier instance has no
+/// successful owner verification yet. A fixed string, so pre-verification
+/// snapshots compare equal across construction and restore.
+const UNVERIFIED_GAP_REASON: &str =
+    "provider admission unverified: no successful owner verification on this verifier instance";
 
 impl KernelProviderVerifier {
     pub(crate) fn new(capability: AdmittedProviderCapability) -> Self {
-        Self { capability }
+        Self {
+            capability,
+            verified: AtomicBool::new(false),
+        }
     }
 }
 
 impl ProviderVerifier for KernelProviderVerifier {
     fn binding(&self) -> ProviderBindingSnapshot {
-        // Conditional by construction: this value exists only because
-        // `AdmittedProviderCapability::new` proved presented-versus-owner
-        // coherence through the pure verifier. A serialized `Verified`
-        // label alone still grants nothing: restore rebuilds this verifier
-        // from freshly supplied capability data and replays every event.
-        ProviderBindingSnapshot::Verified {
-            identity: self.capability.identity.clone(),
+        // Closed by instance state, not by construction: this value reports
+        // `Verified` only after a `verify` call on THIS instance succeeded
+        // through the owner verifier. Before that it is a typed `PLAN_GAP`,
+        // so a merely constructed capability cannot impersonate production
+        // execution readiness, and a serialized `Verified` label alone still
+        // grants nothing: restore rebuilds this verifier from freshly
+        // supplied capability data and replays every event through it.
+        if self.verified.load(Ordering::SeqCst) {
+            ProviderBindingSnapshot::Verified {
+                identity: self.capability.identity.clone(),
+            }
+        } else {
+            ProviderBindingSnapshot::Gap {
+                gap: PlanGap::G11Unavailable {
+                    reason: UNVERIFIED_GAP_REASON.to_owned(),
+                },
+            }
         }
     }
 
@@ -477,12 +521,14 @@ impl ProviderVerifier for KernelProviderVerifier {
         self.capability.check_currentness()?;
         let presented = &self.capability.presented;
         let currentness = &self.capability.currentness;
+        let (receipt_attempt_id, receipt_operation_id) =
+            receipt_proof_identity(kind, canonical_payload, &presented.operation_id)?;
         let fence_digest = presented.fence_digest()?;
         let live_fence_digest = currentness.live_fence_digest()?;
         let request = ProviderCapabilityRequest {
             claim_id: presented.claim_id.clone(),
-            attempt_id: presented.attempt_id.clone(),
-            operation_id: presented.operation_id.clone(),
+            attempt_id: receipt_attempt_id,
+            operation_id: receipt_operation_id,
             proof_kind: map_proof_kind(kind),
             proof_ref: proof_ref.to_owned(),
             canonical_payload_sha256: sha256_hex(canonical_payload.as_bytes()),
@@ -493,6 +539,12 @@ impl ProviderVerifier for KernelProviderVerifier {
             worker_generation: presented.worker_generation,
             fence_digest,
         };
+        // Validates the ORIGINAL assembled request via the existing owner
+        // validator before delegating: shape, revocation, exact
+        // receipt-versus-claim attempt/operation match, epoch currency,
+        // revision agreement, digest equality, generation and fence binding
+        // are all owner-checked below against the loaded claim row.
+        request.validate().map_err(map_capability_error)?;
         verify_provider_capability(
             &request,
             &currentness.expectation,
@@ -504,7 +556,116 @@ impl ProviderVerifier for KernelProviderVerifier {
             &live_fence_digest,
             &currentness.live_epoch(),
         )
-        .map_err(map_capability_error)
+        .map_err(map_capability_error)?;
+        // Only a successful owner verification on this instance flips the
+        // binding: every `Err` above returns before this store, so a failed
+        // or stale proof never mints `Verified`, and the flag is never set
+        // from a recomputed stand-in, only from the owner `Ok` just observed.
+        self.verified.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Reads the receipt-claimed attempt/operation identity for one proof kind
+/// from the receipt's ORIGINAL canonical bytes (issue #1108 A5).
+///
+/// Each kind names its exact identity fields explicitly through the existing
+/// typed receipt schemas (all `deny_unknown_fields`): admission binds every
+/// admitted lane attempt (one admission receipt under a single-attempt claim
+/// names one attempt; a receipt spreading lanes across attempts is an
+/// `IdentityConflict`, never silently narrowed to the first lane); binding,
+/// worker fence, result, and unknown-outcome bind the covered attempt;
+/// cancellation binds the covered attempt plus the requesting operation;
+/// reassignment binds the covered old attempt (the new identity is
+/// core-validated fresh, never claim-bound). Only cancellation receipts carry
+/// an operation identity (`request_operation_id`); no other receipt schema
+/// carries one, so those kinds ride the admitted claim's operation
+/// (`claim_operation_id`) explicitly and there is no receipt-side operation
+/// to drift. The returned pair feeds the owner request while the admitted
+/// claim rides as the loaded durable row, so a receipt naming an attempt or
+/// operation the claim never covered fails closed through the owner as
+/// `ForeignAttempt` / `ForeignOperation`.
+///
+/// # Errors
+///
+/// Returns [`CoordinatorError::InvalidField`] when the canonical bytes are
+/// not a receipt of the claimed kind or admit no lanes, or
+/// [`CoordinatorError::IdentityConflict`] when one admission receipt names
+/// attempts beyond a single identity.
+fn receipt_proof_identity(
+    kind: ProviderProofKind,
+    canonical_payload: &str,
+    claim_operation_id: &str,
+) -> Result<(String, String), CoordinatorError> {
+    match kind {
+        ProviderProofKind::Admission => {
+            let receipt = serde_json::from_str::<ProviderAdmissionReceipt>(canonical_payload)
+                .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            let first = receipt
+                .admitted_lanes
+                .first()
+                .ok_or(CoordinatorError::InvalidField("admitted_lanes"))?;
+            let attempt_id = first.attempt_id.as_str();
+            if receipt
+                .admitted_lanes
+                .iter()
+                .any(|lane| lane.attempt_id.as_str() != attempt_id)
+            {
+                return Err(CoordinatorError::IdentityConflict("admitted_lanes"));
+            }
+            Ok((attempt_id.to_owned(), claim_operation_id.to_owned()))
+        }
+        ProviderProofKind::Binding => {
+            let submission =
+                serde_json::from_str::<ProviderExecutionBindingSubmission>(canonical_payload)
+                    .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                submission.binding.attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
+        ProviderProofKind::Cancellation => {
+            let receipt =
+                serde_json::from_str::<ProviderCancellationReconciliation>(canonical_payload)
+                    .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                receipt.attempt_id.as_str().to_owned(),
+                receipt.request_operation_id.as_str().to_owned(),
+            ))
+        }
+        ProviderProofKind::WorkerFence => {
+            let receipt = serde_json::from_str::<ProviderWorkerFenceReceipt>(canonical_payload)
+                .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                receipt.attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
+        ProviderProofKind::Reassignment => {
+            let receipt = serde_json::from_str::<ProviderReassignmentReceipt>(canonical_payload)
+                .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                receipt.old_attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
+        ProviderProofKind::Result => {
+            let submission = serde_json::from_str::<ResultSubmission>(canonical_payload)
+                .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                submission.result.attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
+        ProviderProofKind::UnknownOutcome => {
+            let receipt =
+                serde_json::from_str::<ProviderUnknownOutcomeReconciliation>(canonical_payload)
+                    .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                receipt.attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
     }
 }
 

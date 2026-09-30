@@ -858,6 +858,15 @@ mod tests {
                 publication_id: ProjectionPublicationId::new("publication-1")
                     .expect("valid publication id"),
                 projection_kind: "cue-index".to_owned(),
+                // I5.8: the durable record names the definition the candidate
+                // data was built with, and `FencedProjectionPublication`
+                // refuses any view that disagrees with its own record about
+                // which definition is current. The fixture's owner is the
+                // single `DEFINITION_DIGEST` the candidate and the fenced view
+                // already carry; `cue-index` is not a store-declared kind, so
+                // the store's own declaration table names no definition for it
+                // and this fixture's digest is the only one in play.
+                projection_definition_digest: DEFINITION_DIGEST.to_owned(),
                 projection_generation: 2,
                 source_generation: 4,
                 source_cursor: 9,

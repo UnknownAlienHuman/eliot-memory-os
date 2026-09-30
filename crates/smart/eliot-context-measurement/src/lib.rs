@@ -32,7 +32,8 @@
 //! The canonical #704 entrypoint is [`measure_serialized_context`], which
 //! measures one exact serialized Context envelope and additionally owns the
 //! normative `STU(bytes) = ceil(UTF-8 byte length / 3)` estimate (computed
-//! once by [`stu::stu_for_bytes`]), immutable observation validation,
+//! once by [`stu::stu_for_bytes`]) plus its covering byte-length inverse
+//! ([`stu::bytes_for_stu`]), immutable observation validation,
 //! unit-compatible capacity/error analysis and deterministic receipt
 //! construction. It returns exact A-15 values plus the package-local
 //! analysis; [`measure_exact_utf8`] remains available as the narrow
@@ -56,7 +57,7 @@ pub use observation::{
     ValidatedObservation, validate_observation,
 };
 pub use receipt::{ReceiptInput, receipt_digest};
-pub use stu::stu_for_bytes;
+pub use stu::{bytes_for_stu, stu_for_bytes};
 
 use eliot_context_contracts::{
     CONTEXT_CONTRACT_VERSION, CapacityLimits, ContextBinding, ContextError, MeasurementStatus,

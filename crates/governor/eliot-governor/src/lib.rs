@@ -128,6 +128,7 @@ mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
 mod problem_owner_transitions;
+mod problem_read_site;
 mod quality_applicability;
 mod reactive_admission;
 mod route_registry;
@@ -265,6 +266,9 @@ pub use problem_owner_transitions::{
     PreparedProblemOwnerTransition, ProblemOwnerAuthorizationRefusal, ProblemOwnerClosure,
     ProblemOwnerTransitionBody, ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest,
     prepare_problem_owner_transition,
+};
+pub use problem_read_site::{
+    ProblemReadback, ProblemReadbackError, ProblemReadbackRevision, read_committed_problem,
 };
 pub use quality_applicability::{
     ACTIVE_DIRECTIVE_OWNER, GOVERNANCE_PROFILE_OWNER, GovernedDecision, IMPACT_OWNER,

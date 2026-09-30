@@ -120,6 +120,37 @@ pub struct NoServiceProfileAuthorityProof {
     /// object. A role whose path merely equals a constructed string is not
     /// counted; a predictable name is not ownership.
     pub verified_root_roles: u32,
+    /// Owner SID the retained current-user roots were proven to belong to.
+    ///
+    /// `user_mode` reports the SID the OS reported about the retained root
+    /// objects, which is how a profile proves at runtime that it is supervised
+    /// in the current user's own security context rather than a service
+    /// account's. It is empty when no current-user root object was retained.
+    pub current_user_owner_sid: String,
+    /// Interactive session the retained current-user roots were proven in.
+    ///
+    /// Zero when no current-user session was retained. A `user_mode` selection
+    /// that cannot name its own current-user session has no proven
+    /// interactive-supervision context.
+    pub current_user_session_id: u32,
+}
+
+/// Returns the launch adapter a selected profile composes (I3.1).
+///
+/// This is the supervision column of the I3.1 table projected onto the
+/// composition boundary that
+/// [`super::compose_profile_launch`](super::compose_profile_launch) owns:
+/// `system_service` reuses the existing SCM primitives, `user_mode` is a
+/// current-user launcher/Task Scheduler, and `portable_dev` is repository-local
+/// disposable supervision. It exists so a status or plan response can report
+/// the adapter a profile actually uses rather than only naming supervision in
+/// prose.
+pub const fn launch_adapter_name(profile: InstallationProfile) -> &'static str {
+    match profile {
+        InstallationProfile::SystemService => "scm_service_registration",
+        InstallationProfile::UserMode => "current_user_launcher_task_scheduler",
+        InstallationProfile::PortableDev => "repository_local_disposable_supervision",
+    }
 }
 
 /// Returns the supervision path I3.1 names for `profile`.
@@ -379,13 +410,36 @@ pub fn prove_no_service_profile_authority_dependency(
         }
     }
 
+    // The current-user owner SID and interactive session turn this from a layout
+    // comparison into a runtime proof of *absence*: a non-service selection
+    // that cannot name the current interactive account it will be supervised
+    // as has not proved it avoids service-account authority. The values come
+    // from the live process token, never from a caller-supplied string.
+    let (current_user_owner_sid, current_user_session_id) = retained_current_user_identity()?;
     Ok(NoServiceProfileAuthorityProof {
         profile: governed.profile,
         selects_scm_supervision: false,
         requires_admin: false,
         requires_program_data_anchor: false,
         verified_root_roles,
+        current_user_owner_sid,
+        current_user_session_id,
     })
+}
+
+/// Returns the current user's SID and interactive session from the live
+/// process token.
+///
+/// This is the same identity the `PortableDev` retained repository root
+/// proves ownership by, so both disposable profiles report the account they
+/// are actually supervised as.
+fn retained_current_user_identity() -> Result<(String, u32), InstallationError> {
+    let identity = eliot_platform_windows::current_process_named_pipe_expectation()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    Ok((
+        identity.expected_sid().to_owned(),
+        identity.expected_session_id(),
+    ))
 }
 
 /// Builds the exact I3.1 root layout a profile names beneath `anchor`.

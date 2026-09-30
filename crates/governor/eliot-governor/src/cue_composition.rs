@@ -744,6 +744,7 @@ mod cue_composition_tests {
             heads_after: heads,
             task_frame: unavailable(),
             attention: unavailable(),
+            problem_readback: None,
             epistemic: unavailable(),
             epistemic_readback: None,
             cue: RoleAcquisition {

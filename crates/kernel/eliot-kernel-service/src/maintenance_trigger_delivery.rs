@@ -234,10 +234,14 @@ impl MaintenanceTriggerDeliveryLedger {
                 .into());
             }
             match (&row.disposition, &row.claim) {
+                // Awaiting-claim rows never carry a live claim: every ledger
+                // transition that parks a row in `Pending` clears its claim,
+                // so a restored `Pending` row with a claim is damage, not a
+                // guessed-complete entry.
                 (MaintenanceTriggerDisposition::Claimed, Some(_))
+                | (MaintenanceTriggerDisposition::Pending, None)
                 | (
-                    MaintenanceTriggerDisposition::Pending
-                    | MaintenanceTriggerDisposition::DecisionRecorded
+                    MaintenanceTriggerDisposition::DecisionRecorded
                     | MaintenanceTriggerDisposition::Acknowledged
                     | MaintenanceTriggerDisposition::Reconciling
                     | MaintenanceTriggerDisposition::Expired
@@ -621,6 +625,14 @@ impl MaintenanceTriggerDeliveryLedger {
     /// records the commitment, never execution. Replaying the identical
     /// receipt reuses it; a different receipt while one is recorded is a
     /// competing decision and is refused.
+    ///
+    /// An identical-receipt replay on a `Reconciling` or `Claimed` row
+    /// restores `DecisionRecorded` through the protocol transition first:
+    /// a claim-timeout release parks the committed receipt on a
+    /// `Reconciling` row, and owner-mediated redelivery re-claims it to
+    /// `Claimed`, but neither disposition can ack. The replay reuses the
+    /// stored receipt bytes without re-evaluation and preserves the live
+    /// claim; only the disposition is repaired.
     pub fn record_decision(
         &mut self,
         trigger_id: &str,
@@ -634,10 +646,22 @@ impl MaintenanceTriggerDeliveryLedger {
         if receipt.revision != row.revision {
             return Err(ProtocolError::ReplayConflict.into());
         }
-        if let Some(stored) = &row.decision_receipt {
-            if *stored == receipt {
-                return Ok(());
+        let identical = matches!(row.decision_receipt.as_ref(), Some(stored) if *stored == receipt);
+        if identical {
+            match row.disposition {
+                MaintenanceTriggerDisposition::Reconciling
+                | MaintenanceTriggerDisposition::Claimed => {
+                    MaintenanceTriggerDisposition::validate_advance(
+                        row.disposition,
+                        MaintenanceTriggerDisposition::DecisionRecorded,
+                    )?;
+                    row.disposition = MaintenanceTriggerDisposition::DecisionRecorded;
+                }
+                _ => {}
             }
+            return Ok(());
+        }
+        if row.decision_receipt.is_some() {
             return Err(ProtocolError::ReplayConflict.into());
         }
         MaintenanceTriggerDisposition::validate_advance(
