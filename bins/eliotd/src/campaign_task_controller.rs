@@ -108,7 +108,7 @@ fn validate_authenticated_context_recipe(
 }
 
 fn validate_invocation_context_recipe(
-    context_campaign_recipe_policy: &serde_json::Value,
+    context_campaign_recipe_catalogue: &serde_json::Value,
     context_campaign_recipe: &serde_json::Value,
     context_input: &serde_json::Value,
     task_id: &str,
@@ -116,7 +116,7 @@ fn validate_invocation_context_recipe(
     state_fence: &StateFence,
 ) -> Result<ContextCampaignRecipeBody, String> {
     let body: ContextCampaignRecipeBody = serde_json::from_value(json!({
-        "policy": context_campaign_recipe_policy.clone(),
+        "catalogue": context_campaign_recipe_catalogue.clone(),
         "recipe": context_campaign_recipe.clone(),
         "compiler_input": context_input.clone(),
     }))
@@ -442,7 +442,7 @@ pub async fn prepare_task_controller_claim(
                 )));
             }
             let Ok(candidate_context_recipe) = validate_invocation_context_recipe(
-                &invocation.context_campaign_recipe_policy,
+                &invocation.context_campaign_recipe_catalogue,
                 &invocation.context_campaign_recipe,
                 &invocation.context_input,
                 invocation.task_id.as_str(),

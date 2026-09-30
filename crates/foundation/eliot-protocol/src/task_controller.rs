@@ -16,11 +16,12 @@ use crate::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES, ProtocolError};
 pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str = "eliot.protocol.task-controller-invocation";
 /// Current Task Controller invocation wire version.
 ///
-/// `2` adds the required `context_campaign_recipe_policy` member: an invocation
-/// that names a Context recipe must also name the approved reusable policy that
-/// recipe was issued under (#1724 W1). A `1` payload cannot decode into this
-/// shape, so the missing member is refused by version and by field rather than
-/// defaulted into an instance that claims no policy.
+/// `2` adds the required `context_campaign_recipe_catalogue` member: an
+/// invocation that names a Context recipe must also name the owner recipe
+/// configuration that recipe is resolved from (#1724 W1/W2). A `1` payload
+/// cannot decode into this shape, so the missing member is refused by version
+/// and by field rather than defaulted into an instance that was compiled under
+/// no approved recipe.
 pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for the Kernel-issued Task Controller attempt.
 pub const TASK_CONTROLLER_ATTEMPT_WIRE_ID: &str = "eliot.protocol.task-controller-attempt";
@@ -125,7 +126,8 @@ pub struct TaskControllerCampaignOwnerMaterials {
 /// foundation protocol into governor, smart-context, or learning contracts.
 /// The daemon decodes `task_input` as the action-specific native Task object,
 /// `learning_state_view_recipe` as the native learning recipe,
-/// `context_campaign_recipe_policy` as the native `ContextRecipePolicy`,
+/// `context_campaign_recipe_catalogue` as the native
+/// `ApprovedRecipeCatalogue` owner configuration,
 /// `context_campaign_recipe` as the rich native `ContextRecipe`, and
 /// `context_input` as the exact `ContextInput`. It joins the latter three into
 /// the typed Context campaign recipe body before owner publication.
@@ -146,9 +148,12 @@ pub struct TaskControllerInvocation {
     pub task_input: Value,
     /// Owner-native `LearningStateViewRecipe` selected for this task route.
     pub learning_state_view_recipe: Value,
-    /// Approved reusable `ContextRecipePolicy` the Context recipe was issued
-    /// under. The Context owner checks the binding; the protocol only carries it.
-    pub context_campaign_recipe_policy: Value,
+    /// Owner recipe configuration the Context recipe is resolved from: the
+    /// approved candidate revisions, this compilation's applicability
+    /// dimensions and compiler-generation profile, and the independent
+    /// governing requirements they are validated against. The Context owner
+    /// resolves exactly one of them; the protocol only carries it.
+    pub context_campaign_recipe_catalogue: Value,
     /// Rich `ContextRecipe` selected for the current Context admission.
     pub context_campaign_recipe: Value,
     /// Exact `ContextInput` admitted for the current Context compilation.
@@ -187,8 +192,8 @@ impl TaskControllerInvocation {
                 "task_controller_invocation.learning_state_view_recipe",
             ),
             (
-                &self.context_campaign_recipe_policy,
-                "task_controller_invocation.context_campaign_recipe_policy",
+                &self.context_campaign_recipe_catalogue,
+                "task_controller_invocation.context_campaign_recipe_catalogue",
             ),
             (
                 &self.context_campaign_recipe,
