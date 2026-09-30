@@ -310,7 +310,7 @@ pub use learning_store::{
 
 pub use write_admission::{
     MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, MAX_WRITE_SUBMISSION_REASON_CODES,
-    NOT_ACCEPTED_RETRY_IDENTITY_RULE, OriginalWriteSubmission,
+    NOT_ACCEPTED_RETRY_IDENTITY_RULE, OriginalWriteSubmission, PreparedWriteOutcome,
     RESOLVED_EXISTING_NEXT_ALLOWED_ACTION, RESOLVED_EXISTING_RETRY_IDENTITY_RULE,
     ReservationEnvelopeState, ReservedScopeBinding, ReservedWriteOutcome,
     ReservedWriteReconciliation, ReservedWriteRequest, ReservedWriteUnsupported,

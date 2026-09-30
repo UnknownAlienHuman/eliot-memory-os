@@ -1531,6 +1531,34 @@ impl WriteSubmission {
         Ok(submission)
     }
 
+    /// Reports a durable ORS stage using its Store-owned reservation projection.
+    ///
+    /// The Kernel producer must call this only after ORS has durably staged and
+    /// read back the reservation, and after checking that the returned token
+    /// matches `admission`. The operation and request identities are copied
+    /// from that exact projection, and `ors_stage_ref` is its owner-mapped
+    /// reservation identity; no operation label or derived digest can stand in
+    /// for an ORS stage identity here.
+    pub fn staged(admission: &WriteAdmissionProjection) -> Result<Self, StoreError> {
+        admission.validate_shape()?;
+        let submission = Self {
+            submission_id: derive_submission_id(
+                &admission.operation_id,
+                &admission.canonical_request_hash,
+            )?,
+            operation_id: admission.operation_id.clone(),
+            request_hash: admission.canonical_request_hash.clone(),
+            state: WriteSubmissionState::Staged,
+            reason_codes: Vec::new(),
+            ors_stage_ref: Some(admission.reservation_id.clone()),
+            canonical_receipt_ref: None,
+            retry_identity_rule: STAGED_RETRY_IDENTITY_RULE.to_owned(),
+            next_allowed_action: STAGED_NEXT_ALLOWED_ACTION.to_owned(),
+        };
+        submission.validate()?;
+        Ok(submission)
+    }
+
     /// Renders the carried reason codes as one bounded comma-separated list.
     ///
     /// An accepted decision has no reason code, so this renders as the empty
@@ -1683,6 +1711,40 @@ impl fmt::Display for WriteSubmission {
             self.reason_codes_text(),
             self.next_allowed_action,
         )
+    }
+}
+
+/// One observed outcome of a prepared canonical write.
+///
+/// `Staged` reports only the durable ORS acceptance result. `Receipt` reports
+/// the terminal canonical store result; neither arm is inferred from the
+/// caller's wait mode or deadline.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparedWriteOutcome {
+    /// ORS durably accepted the exact operation; the caller may poll and must
+    /// not submit a duplicate.
+    Staged(WriteSubmission),
+    /// The canonical store returned the terminal receipt for this operation.
+    Receipt(Box<WriteReceipt>),
+}
+
+impl PreparedWriteOutcome {
+    /// Validates that each arm carries the evidence its outcome claims.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Staged(submission) => {
+                submission.validate()?;
+                if submission.state != WriteSubmissionState::Staged {
+                    return Err(StoreError::InvalidField {
+                        field: "prepared_write_outcome.staged",
+                        reason: "the staged outcome must contain a staged submission",
+                    });
+                }
+            }
+            Self::Receipt(receipt) => receipt.validate()?,
+        }
+        Ok(())
     }
 }
 
