@@ -5,19 +5,20 @@
 //! BORROWED Governor-owned records, so it can only be built by a caller that
 //! already holds the matching proposal, experiment plan, activation evidence,
 //! rollback contract, candidate view, evidence view and admission policy. Until
-//! this module existed, nothing in `eliotd` held any of them, so
-//! `route_improvement_candidate` had no caller at all and the whole
-//! candidate → experiment → evaluation → admission path was unreachable from the
-//! daemon.
+//! this module existed, nothing in `eliotd` held any of them, so neither
+//! `route_improvement_candidate` nor `assess_improvement_repeat` had a caller at
+//! all and the whole candidate → experiment → evaluation → admission → repeat
+//! path was unreachable from the daemon.
 //!
 //! This module is that caller. It takes the ONE observation the daemon already
 //! produced this pass — the advisory improvement artifact
 //! ([`ImprovementArtifact`]), the `G-19` improvement admission policy read from
 //! the live maintenance owner, and the admitted Kernel fence — and assembles the
 //! seven borrowed records out of their OWN fields, then hands them to
-//! [`route_improvement_candidate`]. Each record is built by its own
-//! `route_*` helper so that the reasoning for a field stays attached to the
-//! field, and so a reader auditing one record never has to read the other six.
+//! [`route_improvement_candidate`] and, on the admitted branch, to
+//! [`assess_improvement_repeat`]. Each record is built by its own `route_*`
+//! helper so that the reasoning for a field stays attached to the field, and so
+//! a reader auditing one record never has to read the other six.
 //!
 //! # Every value is a function of what the daemon already observed
 //!
@@ -111,15 +112,16 @@
 //! function for why the original values are the ones compared and why a refusal
 //! is propagated rather than resolved into a substitute.
 //!
-//! # An unresolved external effect is not committed here, and why
+//! # An unresolved external effect is made durable, and how
 //!
 //! `UnknownRequiresReconciliation { obligation }` names a real external debt:
 //! the exact candidate, experiment, commitment, owner and forward-repair /
 //! invalidation bindings whose effect is unsettled. It is read and named by
 //! `daemon_runtime::report_improvement_candidate_route` through the daemon's
-//! existing diagnostics, so the debt is inspectable rather than silently lost —
-//! but it is NOT made durable on this path, and the reason is measured rather
-//! than assumed:
+//! existing diagnostics, and [`commit_unknown_effect_obligation`] then makes the
+//! named debt durable through the same single seam the rest of the improvement
+//! record family uses, so it outlives the pass that observed it. The constraints
+//! that decide WHERE it lands are measured rather than assumed:
 //!
 //! - The closed [`eliot_store_api::LearningRecordKind`] set has no kind for an
 //!   unresolved external effect. `Candidate` is the only kind that describes a
@@ -128,61 +130,77 @@
 //!   receipt and the archive receipt. `ActivationReceipt` would assert that an
 //!   activation receipt exists; nothing here activated anything, and
 //!   `execution_authorized` is false in every handoff the pipeline builds.
-//! - A `Candidate` row, however, is read back EXHAUSTIVELY by
+//! - A `Candidate` row is read back EXHAUSTIVELY by
 //!   `improvement_dedup_read::read_candidate_scope`, whose `classify_row`
-//!   re-proves exactly three document shapes (the candidate artifact, the
-//!   archive receipt, the lineage-merge receipt) and REFUSES any other row of
-//!   that kind. A fourth `Candidate` document shape would therefore make every
-//!   subsequent pass's deduplication read fail closed and stop the whole
-//!   improvement intake. Teaching that reader a fourth shape is a change to
-//!   `improvement_dedup_read`, outside this change, and guessing at it here
-//!   would trade a named debt for a broken pass.
+//!   re-proves every document shape it accepts and REFUSES any other row of that
+//!   kind. The obligation is therefore the FOURTH shape that reader re-proves
+//!   (`classify_reconciliation_obligation`), in the same `DEDUP_SCOPE` the other
+//!   three land in. Writing it as an untaught fourth shape would have traded a
+//!   named debt for a pass whose deduplication read fails closed.
 //! - Inventing a record kind, or opening a second read or write path for the
 //!   obligation, is exactly the second owner this module does not add.
 //!
-//! So the honest state is: the obligation's exact identity is emitted, the
-//! durable owner for it is undecided, and this module says so rather than
-//! pretending the debt is stored.
+//! So the durable record is the named debt plus the owner's DENYING answer: no
+//! effect outcome, no receipt, no permit and no authority, because this daemon
+//! holds none. The effect OWNER is still the absent half, and that — not a
+//! missing call — is what keeps the debt open.
 //!
 //! # No second owner, store, digest or write path
 //!
 //! This module computes no proposal digest: the Governor pipeline computes
 //! exactly one commitment and carries it into its own result, so a digest
-//! computed here could only disagree with the committed one. It opens no store,
-//! reads no record, starts no flight, and writes nothing. It adds no scheduler,
-//! no maintenance owner and no dependency, and it has no blocking `attach_*`
-//! call. Durability of the artifact it reads stays with the existing
+//! computed here could only disagree with the committed one. It reads no record
+//! and starts no flight. It adds no scheduler, no maintenance owner and no
+//! dependency, and it has no blocking `attach_*` call.
+//!
+//! The ONE write it performs is [`commit_unknown_effect_obligation`], and it
+//! writes through the same single Governor-owned seam every other durable
+//! improvement record uses — [`crate::DaemonComposition::commit_learning_record`]
+//! over the closed `RecordLearningRecord` mutation, in the same Governor scope
+//! and the same closed `candidate` record kind as the candidate artifact, the
+//! archive receipts and the lineage-merge receipts
+//! (`improvement_intake_dispatch`). No store client is opened here and no
+//! operation is invented. It exists because an unresolved external effect is
+//! otherwise a debt that lives only in this pass: the record it writes is the
+//! named debt's durable, reviewable form, and it carries no permit, no outcome,
+//! and no authority — nothing about it promotes, activates, installs,
+//! completes, or issues authority.
+//!
+//! Durability of the artifact the route reads stays with the existing
 //! [`crate::DaemonComposition::commit_learning_record`] seam in
 //! `daemon_runtime::run_improvement_intake`.
 //!
-//! # What is still not wired
+//! # The repeat assessment, and what it honestly reports
 //!
-//! [`crate::improvement_candidate_route::assess_improvement_repeat`] still has
-//! no caller, and this change does not give it one. Both of its arguments are
-//! records no public entry point in the Governor crate produces for a daemon:
-//! `ImprovementCurrentProposal` has exactly one producer, the pipeline's
-//! PRIVATE `current_proposal_of`, and neither
-//! `run_improvement_candidate_pipeline` nor `compare_improvement_commitments`
-//! hands one out. The public `assess_improvement_replay` builds one internally
-//! and returns an assessment rather than the record, so reaching it would mean
-//! re-committing the proposal — a second digest over the same bytes, which is
-//! precisely what this issue removed.
+//! [`crate::improvement_candidate_route::assess_improvement_repeat`] is called on
+//! the `CanaryAdmitted` branch only. That branch is the ONLY one that publishes
+//! a checked current record: the pipeline's `ImprovementCanaryHandoff` carries
+//! its own `proposal_commitment`, `proposal_discriminator` and
+//! `proposal_material_equality`, so the comparison runs against the pipeline's
+//! checked content rather than a digest recomputed here. `retained` is the
+//! pipeline's own record from an earlier ADMITTED pass, carried by the caller in
+//! the run loop's single-owner intake flight; it is `None` on the first pass and
+//! after a restart.
 //!
-//! The other half is the retained record. This daemon's durable improvement
-//! records are `ImprovementCandidate` artifacts, archive receipts and
-//! lineage-merge receipts, read back by `improvement_dedup_read`; none of them
-//! is a `RetainedImprovementProposal`, and no owner in this repository retains
-//! one. Manufacturing either argument would mean inventing a record to feed a
-//! comparison, and the retained side of a comparison is caller-supplied, so a
-//! fabricated one would silently decide the question the comparison exists to
-//! answer. That is a different act from the identity read above: the
-//! `ImprovementCurrentProposal` view assembled for
-//! [`check_improvement_handoff_identity`] carries a handoff's OWN recorded
-//! commitment, discriminator and material-equality key and is used only to reach
-//! the existing identity check — it is never compared against anything and
-//! never stored. A record built to be compared would be a second claim. The
-//! forwarder therefore stays honestly unreachable and is named here rather than
-//! faked.
+//! The current record it is compared against is read out of that handoff AFTER
+//! [`check_handoff_consumable`] has refused anything this build cannot read, so
+//! a record under a foreign wire revision or content identity never reaches a
+//! comparison. The two `ImprovementCurrentProposal` views this module assembles —
+//! the one for the identity check and the one for the comparison — are the same
+//! read of the handoff's OWN recorded components: neither is derived, neither is
+//! stored, and the retained side is always a record the pipeline itself committed
+//! on an earlier admitted pass, never a manufactured one.
+//!
+//! On this workspace the branch is not taken: the execution gate refuses first
+//! (see above), so `repeat` is `None` and `retained_next` is `None` on every
+//! live pass today. That is the honest live report, not missing coverage. Two
+//! prerequisites this daemon cannot supply are named rather than faked: the
+//! INDEPENDENT EXECUTED EVALUATION only the Instrument verifier owner family
+//! (`#20`/`#1111`) can produce, and a DURABLE owner for
+//! `RetainedImprovementProposal` (the run-loop flight is process-local, so the
+//! record does not survive a restart). Neither is stubbed here, and an absent
+//! record is passed to the pipeline as no record at all, which it disposes as
+//! `NoRetainedPrior` — never as novelty.
 //!
 //! The identity check added here also stops at this boundary. The Kernel `#11`
 //! owner that independently authorizes and EXECUTES canary activation is a
@@ -191,85 +209,433 @@
 //! [`eliot_maintenance::check_handoff_wire_revision`] against the same constant.
 //! That call site is the Kernel owner's to write, and is named here rather than
 //! faked with a consumer in this crate.
+//!
+//! # The external effect is read from its owner and made durable, never settled
+//!
+//! Every dispatched route reads the disposition's external-effect state through
+//! [`read_improvement_effect_state`], which forwards to the Governor owner's own
+//! retry gate and retained-result accessors, and
+//! [`commit_unknown_effect_obligation`] then makes a named unresolved
+//! obligation durable so the debt outlives the pass.
+//!
+//! What this module deliberately does NOT do is attach an owner outcome. The
+//! only writer of the Governor obligation's outcome is
+//! `ImprovementUnknownEffect::with_settled_owner_outcome`, which re-checks that
+//! the outcome is terminal, that a canonical receipt is present, and that both
+//! the authorized effect and that receipt name the obligation's exact operation
+//! id and idempotency key; its input is an `eliot_authority::EffectReceipt`,
+//! and this repository has no producer of a SETTLED one —
+//! `EffectAuthorizer::compile_effectful_action` is the only production
+//! constructor and it itself has no caller, so it is dead along with the
+//! terminal paths behind it. Calling the seam with a receipt this daemon
+//! assembled would be a fabricated effect outcome, which is precisely the
+//! forgery I12.24 and the audit behind AUD2/AUD3 exist to prevent. So the read
+//! stays a read, and the named gap is the missing effect owner, not a missing
+//! call.
 
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
 use eliot_improvement::ImprovementCandidate;
 use eliot_improvement::candidate_bounds::{canonical_evidence_lineage, evidence_lineage_digest};
+use eliot_maintenance::improvement_pipeline::{
+    ImprovementCurrentProposal, RetainedImprovementProposal,
+};
 use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
     IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT,
     IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementAdmissionPolicy, ImprovementCandidateView,
     ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementProposal,
-    ImprovementPulseOutcome, ImprovementTerminalDisposition, MechanismDeclaration, PipelineError,
-    RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+    ImprovementPulseOutcome, ImprovementReplayAssessment, ImprovementTerminalDisposition,
+    MechanismDeclaration, PipelineError, RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+};
+use eliot_protocol::RequestIdentity;
+use eliot_receipts::RequestBinding;
+use eliot_store_api::{
+    LearningRecordKind, ScopeId, WriteReceipt, canonical_json_bytes, learning_record_commit_params,
+    learning_record_mutation_request,
 };
 
+use super::DaemonComposition;
 use super::improvement_candidate_route::{
-    ImprovementRouteRequest, check_improvement_handoff_identity, route_improvement_candidate,
+    ImprovementEffectState, ImprovementRouteRequest, UnknownEffectObligation,
+    assess_improvement_repeat, check_improvement_handoff_identity, read_improvement_effect_state,
+    route_improvement_candidate,
 };
-use super::improvement_intake_dispatch::ImprovementArtifact;
+use super::improvement_intake_dispatch::{ImprovementArtifact, ImprovementDispatchError};
 
-/// One real dispatch, with the exact records this run committed it over.
+/// Closed store scope for the durable unresolved-effect obligation record.
 ///
-/// The terminal disposition alone would leave a consumer unable to bind a
-/// returned handoff to the experiment that produced it: the handoff carries the
-/// commitment, the discriminator projection and the material-equality key, but
-/// not the full experiment plan those keys were derived from. Carrying the plan
-/// this same call passed to the pipeline — the identical value, never a second
-/// construction — is what lets
+/// The SAME Governor scope the candidate artifact, the archive receipts and the
+/// lineage-merge receipts are committed under, read from the Governor owner's
+/// own published constant rather than spelled here. The obligation is part of
+/// the same improvement record family, so it lands where the exhaustive
+/// candidate-scope read already looks for it — `improvement_dedup_read` names
+/// this scope as its `DEDUP_SCOPE` — and a second scope would be a second
+/// durability owner.
+const RECONCILIATION_SCOPE: &str = eliot_governor::GOVERNOR_SCOPE_ID;
+
+/// Deadline bounding one durable obligation-commit ingress, in Unix
+/// milliseconds.
+///
+/// The same bound `improvement_intake_dispatch` uses for the candidate and
+/// receipt commits it owns, so this commit is bounded identically rather than
+/// inventing a second timeout for the same seam.
+const RECONCILIATION_COMMIT_DEADLINE_MS: u64 = 30_000;
+
+/// The one bounded route step this daemon performs over one real observation.
+///
+/// Every borrowed value is something the caller already holds from the SAME
+/// maintenance pass, so the request is assembled and consumed here with no
+/// exchange, lock or scheduler involved: the route is a pure function of these
+/// values.
+///
+/// `retained` is the pipeline's own checked current record from an earlier
+/// ADMITTED pass, or `None` when this process holds none (the first pass, or any
+/// pass after a restart). Absence is the denying direction and is presented to
+/// the pipeline as no retained record at all, which it disposes as its own
+/// `NoRetainedPrior` case; it is never read as novelty.
+#[derive(Clone, Copy, Debug)]
+pub struct ImprovementRouteDispatch<'a> {
+    /// The advisory candidate/brief/owner-decision artifact this daemon
+    /// assembled and durably committed for the current maintenance observation.
+    pub artifact: &'a ImprovementArtifact,
+    /// The `G-19` improvement admission policy read from the live maintenance
+    /// owner for that same observation.
+    pub policy: &'a ImprovementAdmissionPolicy,
+    /// The Kernel fence the observation was admitted under.
+    pub state_fence: &'a StateFence,
+    /// The pipeline's checked current record from an earlier admitted pass.
+    pub retained: Option<&'a RetainedImprovementProposal>,
+}
+
+/// What one bounded route step actually produced.
+///
+/// The optional fields are absent for the honest reason in each case, never
+/// dropped: `repeat` exists only when a checked current record was compared
+/// against a retained prior record, and `retained_next` exists only when the
+/// disposition carried the canary handoff that publishes that record.
+/// `experiment` is the exact plan this run passed to the pipeline: the terminal
+/// disposition and the repeat assessment alone would leave a consumer unable to
+/// bind a returned handoff to the experiment that produced it, because the
+/// handoff carries the commitment, the discriminator projection and the
+/// material-equality key but not the full plan those keys were derived from.
+/// Carrying the plan this same call passed to the pipeline — the identical
+/// value, never a second construction — is what lets
 /// [`check_improvement_handoff_identity`] reach the Governor-owned
 /// content-identity check on the handoff's OWN recorded components. It is a
 /// read binding, not a second commitment, a second digest, or a stored record.
+/// `effect` is never absent: the Governor owner answers for every disposition,
+/// and on this workspace the answer is always the denying one.
+#[derive(Clone, Debug)]
 pub struct ImprovementRouteOutcome {
     /// The pipeline's own advisory-only terminal disposition.
     pub disposition: ImprovementTerminalDisposition,
     /// The exact experiment plan this run passed to the pipeline, held so a
     /// returned handoff is checked against the record that produced it.
     pub experiment: ExperimentPlan,
+    /// The pipeline-derived repeat assessment, when a checked current record and
+    /// a retained prior record both existed.
+    pub repeat: Option<ImprovementReplayAssessment>,
+    /// The record the NEXT pass must retain for its own repeat assessment.
+    ///
+    /// The same checked record, re-projected into the retained shape. `None`
+    /// whenever the pass was not admitted, so an unadmitted pass never
+    /// accumulates a record to compare against.
+    pub retained_next: Option<RetainedImprovementProposal>,
+    /// What the disposition says about the external effect it names, read
+    /// through the Governor owner's own retry gate and retained-result
+    /// accessors.
+    ///
+    /// This is the reconciliation read the pass makes before anything is
+    /// recorded or retried: nothing here attaches an owner outcome, and nothing
+    /// decides a retry this daemon is not already told about.
+    pub effect: ImprovementEffectState,
 }
 
-/// Builds the Governor improvement-candidate request from one real maintenance
-/// observation and runs the production route over it.
+/// Routes one real maintenance observation through the Governor-owned
+/// improvement pipeline.
 ///
-/// `artifact` is the advisory candidate/brief/owner-decision artifact this
-/// daemon assembled and durably committed for the current maintenance
-/// observation, `policy` is the `G-19` improvement admission policy read from
-/// the live maintenance owner for that same observation, and `state_fence` is
-/// the Kernel fence the observation was admitted under. All three are real
-/// daemon-held values; the seven records this assembles are functions of their
-/// own fields, as the module documentation states field by field.
+/// `dispatch.artifact` is the advisory candidate/brief/owner-decision artifact
+/// this daemon assembled and durably committed for the current maintenance
+/// observation, `dispatch.policy` is the `G-19` improvement admission policy
+/// read from the live maintenance owner for that same observation, and
+/// `dispatch.state_fence` is the Kernel fence the observation was admitted
+/// under. All three are real daemon-held values; the seven records this
+/// assembles are functions of their own fields, as the module documentation
+/// states field by field.
 ///
-/// Returns the pipeline's own advisory-only terminal disposition together with
-/// the exact experiment plan the run committed it over, or the typed
-/// [`PipelineError`] the pipeline refused with. It never promotes, activates,
-/// installs, completes, or issues authority, and it performs no durability of
-/// its own: the caller commits through the existing
-/// [`crate::DaemonComposition::commit_learning_record`] seam.
+/// This module is the only place in the repository that constructs an
+/// [`ImprovementRouteRequest`], and this function is its production caller: it
+/// forwards to [`route_improvement_candidate`], and on the admitted branch to
+/// [`assess_improvement_repeat`]. Both are pure delegations: no proposal digest
+/// is computed here, no fallback, empty or legacy value is substituted, and the
+/// typed [`PipelineError`] the Governor returns — today a refusal, because this
+/// daemon holds no independent executed evaluation — crosses this boundary as
+/// itself.
+///
+/// It returns the pipeline's own advisory-only terminal disposition, the exact
+/// experiment plan the run committed it over, and the repeat assessment the
+/// admitted branch derived — or the typed [`PipelineError`] the pipeline refused
+/// with. It never promotes, activates, installs, completes, or issues authority,
+/// and it performs no durability of its own: the caller commits through the
+/// existing [`crate::DaemonComposition::commit_learning_record`] seam and
+/// retains the next pass's record in the intake flight it already owns.
+///
+/// The route is bounded and non-looping: one call, one decision, per pass. It
+/// never promotes, activates, installs, completes, or issues authority, and a
+/// `CanaryAdmitted` result is only recorded here as a non-authorizing handoff
+/// for the Kernel owner (`#11`) to authorize independently.
 pub fn dispatch_improvement_candidate_route(
-    artifact: &ImprovementArtifact,
-    policy: &ImprovementAdmissionPolicy,
-    state_fence: &StateFence,
+    dispatch: ImprovementRouteDispatch<'_>,
 ) -> Result<ImprovementRouteOutcome, PipelineError> {
-    let candidate = &artifact.candidate;
-    // Bound once, so the plan the request borrows and the plan the consumer
-    // binds the returned handoff to are the same value rather than two
-    // constructions that could drift.
-    let experiment = route_experiment(candidate, policy);
+    let candidate = &dispatch.artifact.candidate;
+    // Bound once, so the plan the request borrows, the plan the returned handoff
+    // is checked against, and the plan the outcome carries are the same value
+    // rather than two constructions that could drift.
+    let experiment = route_experiment(candidate, dispatch.policy);
+    let proposal = route_proposal(candidate, dispatch.policy, dispatch.state_fence);
     let disposition = route_improvement_candidate(ImprovementRouteRequest {
-        proposal: &route_proposal(candidate, policy, state_fence),
+        proposal: &proposal,
         experiment: &experiment,
         evidence: &route_activation_evidence(candidate),
-        rollback: &route_rollback_contract(candidate, policy),
-        candidate: &route_candidate_view(candidate, policy),
-        admission_evidence: &route_admission_evidence(candidate, policy),
-        policy,
+        rollback: &route_rollback_contract(candidate, dispatch.policy),
+        candidate: &route_candidate_view(candidate, dispatch.policy),
+        admission_evidence: &route_admission_evidence(
+            candidate,
+            dispatch.policy,
+            dispatch.retained,
+        ),
+        policy: dispatch.policy,
     })?;
+    // The handoff is consumed under this build's identity BEFORE anything reads
+    // its progress out of it, so the record the repeat assessment compares is
+    // always one this build was able to read. A refusal crosses as the typed
+    // `PipelineError` those checks produce, with no disposition returned at all.
     check_handoff_consumable(&disposition, &experiment)?;
+
+    // The pipeline publishes its own checked current record inside the canary
+    // handoff precisely so a consumer compares progress against the checked
+    // content instead of recomputing it. Every identity below is COPIED from
+    // that handoff; the only other input is the very `ExperimentPlan` this
+    // dispatch submitted and the pipeline joined, held here unchanged. Nothing is
+    // derived, so this cannot disagree with the record the pipeline committed.
+    let current = checked_current_record(&disposition, &experiment);
+    let repeat = match (dispatch.retained, current.as_ref()) {
+        (Some(retained), Some(current)) => Some(assess_improvement_repeat(retained, current)?),
+        _ => None,
+    };
+    let retained_next = current.as_ref().map(retained_record_of);
+    // The external-effect read, taken from the Governor owner over the
+    // disposition this very call produced. It is a read and nothing more: the
+    // obligation's owner outcome is private to the Governor module, and this
+    // module neither writes it nor re-decides the retry answer. On this
+    // workspace the answer is the denying one, because no producer of an
+    // owner-settled receipt exists; recording it is what makes that denial
+    // visible on the live pass instead of an unexamined omission.
+    let effect = read_improvement_effect_state(&disposition);
     Ok(ImprovementRouteOutcome {
         disposition,
         experiment,
+        repeat,
+        retained_next,
+        effect,
+    })
+}
+
+/// Makes one unresolved external-effect obligation durable for its named owner.
+///
+/// # Why the debt needs a durable record
+///
+/// `ImprovementUnknownEffect` is a value. The Governor pipeline builds it from
+/// checked records and hands it back inside
+/// `ImprovementTerminalDisposition::UnknownRequiresReconciliation`, and if this
+/// daemon only logged it the debt would exist for exactly as long as the pass
+/// that observed it. So the obligation is committed through the SAME durable
+/// seam the rest of the improvement record family already uses:
+/// [`DaemonComposition::commit_learning_record`] over the closed
+/// `RecordLearningRecord` mutation, in the same Governor scope and the same
+/// closed `candidate` record kind, under its own record key. `Ok(None)` is the
+/// answer for a disposition that names no unresolved effect — there is nothing
+/// to owe anyone, and inventing a record for a disposition that carries no debt
+/// would be a fabricated obligation.
+///
+/// # What the record contains, and what it does NOT
+///
+/// The document is the obligation's own checked identity — owner, candidate,
+/// experiment, committed operation and idempotency namespace, forward-repair
+/// reference and invalidation set — plus the two answers the Governor owner gave
+/// (`retry_permitted`, `completion_retained`). It contains NO effect outcome, NO
+/// receipt, NO permit and NO authority, because this daemon holds none: the
+/// owner's outcome is private to the Governor module and writable only through
+/// its own re-checked seam, which nothing in this workspace can satisfy. So the
+/// record is a named debt plus the denying answer, never a claim that the effect
+/// was settled, completed, or may be retried.
+///
+/// The commit is idempotent under its own key, so re-committing the same
+/// unresolved obligation on a later pass converges on one durable record instead
+/// of appending duplicates. Proof refs are the candidate's own canonical
+/// evidence lineage — the same refs the candidate artifact commits under, so
+/// this record cites the evidence its own obligation was raised over.
+pub async fn commit_unknown_effect_obligation(
+    composition: &mut DaemonComposition,
+    artifact: &ImprovementArtifact,
+    effect: &ImprovementEffectState,
+    state_fence: &StateFence,
+) -> Result<Option<WriteReceipt>, ImprovementDispatchError> {
+    let Some(obligation) = effect.obligation.as_ref() else {
+        return Ok(None);
+    };
+    let record = serde_json::json!({
+        "unknown_effect_obligation": obligation,
+        "retry_permitted": effect.retry_permitted,
+        "completion_retained": effect.completion_retained,
+    });
+    let record_bytes = canonical_json_bytes(&record)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let record_json = String::from_utf8(record_bytes)
+        .map_err(|_| ImprovementDispatchError::Contract("record is not utf-8".to_owned()))?;
+    let record_digest = eliot_contracts::sha256_hex(record_json.as_bytes());
+    let scope_digest = eliot_contracts::sha256_hex(RECONCILIATION_SCOPE.as_bytes());
+    let fence_digest = eliot_contracts::sha256_hex(format!("{state_fence:?}").as_bytes());
+    // The key names THIS record, so the obligation's commit is an operation
+    // distinct from the candidate's own commit rather than one key reused for
+    // two different documents, and a replay of the same unresolved obligation
+    // converges on it.
+    let record_key = reconciliation_record_key(obligation);
+    let request = learning_record_mutation_request(learning_record_commit_params(
+        LearningRecordKind::Candidate,
+        record_key.clone(),
+        record_json,
+        record_digest,
+        scope_digest,
+        fence_digest,
+        record_key.clone(),
+    ));
+    let identity = reconciliation_commit_identity(&record_key, state_fence)?;
+    let scope = ScopeId::new(RECONCILIATION_SCOPE)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let (receipt, _effective) = composition
+        .commit_learning_record(
+            &identity,
+            request,
+            scope,
+            artifact.candidate.evidence_refs.clone(),
+            None,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| {
+            let candidate_id = &obligation.candidate_id;
+            let owner_id = &obligation.owner_id;
+            ImprovementDispatchError::Commit(format!(
+                "the unresolved external effect on candidate {candidate_id} owed by owner \
+                 {owner_id} could not be made durable: {error}"
+            ))
+        })?;
+    Ok(Some(receipt))
+}
+
+/// The closed store handle and idempotency key of one reconciliation record.
+///
+/// Derived from the obligation's own candidate identity, so a repeat of the same
+/// unresolved debt converges on one record instead of appending a duplicate.
+/// The candidate is the only input: the obligation's owner, experiment and
+/// operation are recorded in the document, and folding them into the key would
+/// make two records for one debt whenever the owner re-observed it under a new
+/// pass.
+fn reconciliation_record_key(obligation: &UnknownEffectObligation) -> String {
+    let candidate_id = obligation.candidate_id.trim();
+    format!("improvement-reconciliation:{candidate_id}")
+}
+
+/// Derives the admitted commit ingress for one reconciliation record.
+///
+/// The request metadata is derived from this daemon's own admitted fence and the
+/// idempotency key is the owner-derived record key, so an identical unresolved
+/// obligation replays convergently under the same key. This mirrors
+/// `improvement_intake_dispatch::improvement_commit_identity` field for field
+/// rather than calling it: that helper is private to the intake module, and this
+/// record is a distinct operation with its own key, so sharing the derivation
+/// would couple two commits whose whole point is that they are separate.
+fn reconciliation_commit_identity(
+    record_key: &str,
+    state_fence: &StateFence,
+) -> Result<RequestIdentity, ImprovementDispatchError> {
+    let now = super::unix_ms_i64();
+    let service = super::SERVICE_NAME;
+    let metadata = eliot_contracts::RequestMetadata {
+        request_id: eliot_contracts::RequestId::new(format!("{service}:{record_key}"))
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+        session_id: None,
+        task_id: None,
+        product_id: eliot_contracts::ProductId::new(service)
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+        source_id: eliot_contracts::SourceId::new(service)
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+        state_fence: state_fence.clone(),
+        clock: eliot_contracts::ClockReading {
+            valid_time_ms: Some(now),
+            known_time_ms: Some(now),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    metadata
+        .validate()
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    Ok(RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: state_fence.clone(),
+        },
+        idempotency_key: record_key.to_owned(),
+        deadline_unix_ms: super::unix_ms().saturating_add(RECONCILIATION_COMMIT_DEADLINE_MS),
+        cancellation_id: format!("{record_key}:cancel"),
+    })
+}
+
+/// Re-projects one pipeline-checked current record into the retained shape the
+/// NEXT pass compares against.
+///
+/// A field-for-field copy of the pipeline's own commitment, discriminator
+/// projection, material-equality key and joined experiment plan. It derives
+/// nothing, so a retained record can never carry an identity the pipeline did not
+/// commit.
+fn retained_record_of(current: &ImprovementCurrentProposal) -> RetainedImprovementProposal {
+    RetainedImprovementProposal {
+        commitment: current.commitment.clone(),
+        discriminator: current.discriminator.clone(),
+        material_equality: current.material_equality.clone(),
+        experiment_plan: current.experiment_plan.clone(),
+    }
+}
+
+/// The pipeline's own checked current record, read out of its canary handoff.
+///
+/// `None` for every disposition that does not publish the record, which is every
+/// outcome except `CanaryAdmitted`. Nothing is recomputed: the commitment,
+/// discriminator projection and material-equality key are the pipeline's own
+/// values, and the experiment plan is the one this dispatch submitted and the
+/// pipeline joined. This is the same read of the handoff's own recorded
+/// components that [`check_improvement_handoff_identity`] makes, and it is only
+/// reached once that check has refused a record this build cannot read.
+fn checked_current_record(
+    disposition: &ImprovementTerminalDisposition,
+    experiment: &ExperimentPlan,
+) -> Option<ImprovementCurrentProposal> {
+    let ImprovementTerminalDisposition::CanaryAdmitted { handoff } = disposition else {
+        return None;
+    };
+    Some(ImprovementCurrentProposal {
+        candidate_id: handoff.candidate_id.clone(),
+        commitment: handoff.proposal_commitment.clone(),
+        discriminator: handoff.proposal_discriminator.clone(),
+        material_equality: handoff.proposal_material_equality.clone(),
+        experiment_plan: experiment.clone(),
     })
 }
 
@@ -632,6 +998,7 @@ fn route_candidate_view(
 fn route_admission_evidence(
     candidate: &ImprovementCandidate,
     policy: &ImprovementAdmissionPolicy,
+    retained: Option<&RetainedImprovementProposal>,
 ) -> ImprovementEvidenceView {
     let candidate_id = candidate.candidate_id.as_str();
     ImprovementEvidenceView {
@@ -666,10 +1033,11 @@ fn route_admission_evidence(
         reopen_ref: None,
         rollback_owner_id: policy.rollback_owner_id.clone(),
         expiry_ref: None,
-        // This daemon retains no prior proposal record, so no retained record is
-        // presented. Absence establishes nothing: the Governor gate derives its
-        // own no-progress outcome from the absent record rather than reading
-        // novelty into it.
-        retained_prior_proposal: None,
+        // The caller's own checked prior record, or the pipeline's own
+        // no-retained-record case. This is a record, never a verdict: the gate
+        // derives its own no-progress outcome from it, so nothing here can assert
+        // a repeat, a new discriminator, or progress. Absence establishes
+        // nothing either — it is never read as novelty.
+        retained_prior_proposal: retained.cloned(),
     }
 }

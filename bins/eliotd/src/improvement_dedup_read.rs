@@ -137,6 +137,28 @@
 //! and the merge advanced the survivor's revision, so the accumulated entry
 //! is the one that survives the restore.
 //!
+//! # An unresolved external effect is the third receipt-shaped row
+//!
+//! `improvement_candidate_dispatch::commit_unknown_effect_obligation` commits a
+//! named unresolved effect under the SAME closed `candidate` kind, as
+//! `{unknown_effect_obligation, retry_permitted, completion_retained}`.
+//!
+//! It is classified here for the same reason the merge receipt is: this read is
+//! exhaustive and fail-closed, so a document shape it does not recognise
+//! refuses the WHOLE enumeration. An effect owner could not settle a debt this
+//! daemon was unable to record, and the debt itself would stop every later pass
+//! from rebuilding its registry — which is the exact "looks empty" failure this
+//! module exists to prevent, reached from the opposite direction.
+//!
+//! What it is NOT given is registry meaning. An obligation names a candidate
+//! whose EXTERNAL effect outcome is unresolved; it carries no candidate, no
+//! brief and no owner decision, so there is nothing in it to re-prove as a
+//! registry entry, and it neither adds an active candidate nor removes one.
+//! Whether that effect may be attempted again is the Governor owner's own
+//! question, answered by the obligation's own retry gate — not by this read
+//! deciding to withhold a candidate. It is recognised, re-proved as a
+//! self-binding record, and dropped; see the `Reconciliation` row of `Row`.
+//!
 //! # What is NOT claimed
 //!
 //! Restoring the registry makes the merge decision real and durable-adjacent.
@@ -285,6 +307,48 @@ struct ArchiveReceiptDocument {
 struct LineageMergeReceiptDocument {
     merged_survivor: TrackedCandidate,
     absorbed_candidate_id: String,
+}
+
+/// A committed unresolved external-effect obligation.
+///
+/// Exactly the shape `commit_unknown_effect_obligation` writes:
+/// `{unknown_effect_obligation, retry_permitted, completion_retained}`.
+///
+/// It is a DEBT record, not a candidate: it names the candidate whose external
+/// effect outcome is unresolved, but it carries no candidate, no brief, and no
+/// owner decision, so there is nothing here to re-prove as a registry entry. It
+/// is still classified rather than refused, because this read is exhaustive and
+/// fail-closed: an unrecognised document under the closed `candidate` kind
+/// refuses the WHOLE read, and a debt the effect owner owes would then stop
+/// every later pass from rebuilding its deduplication registry. The obligation
+/// must therefore be recognised, and recognised as what it is.
+///
+/// Unknown fields are DENIED, as on the other document shapes, so a spliced
+/// document cannot be read as an obligation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconciliationObligationDocument {
+    unknown_effect_obligation: ReconciliationObligation,
+    retry_permitted: bool,
+    completion_retained: bool,
+}
+
+/// The owner-facing identity inside a committed reconciliation record.
+///
+/// Re-proves itself here exactly as the other three shapes do: an obligation
+/// that names no candidate, no owner, no experiment or no committed operation is
+/// a spliced document, and a debt nobody owns is not a debt this registry can
+/// treat as recorded.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconciliationObligation {
+    owner_id: String,
+    candidate_id: String,
+    experiment_id: String,
+    operation_ref: String,
+    idempotency_key: String,
+    forward_repair_ref: String,
+    invalidation_set: Vec<String>,
 }
 
 /// One served page of the bounded candidate read.
@@ -474,6 +538,15 @@ pub fn restored_registry(
             Row::Archived(candidate_id) => {
                 archived.insert(candidate_id);
             }
+            // A reconciliation obligation names a candidate whose EXTERNAL
+            // effect is unresolved, not a candidate that entered or left the
+            // registry. Excluding it here would be wrong for this read's own
+            // question — which is whether the same evidence lineage was already
+            // observed as a candidate — and the debt it records is settled by
+            // the effect owner through the Governor pipeline's own retry gate,
+            // not by the registry refusing to restore a candidate. So it is
+            // recognised and dropped, and the pass continues.
+            Row::Reconciliation => {}
         }
     }
     records.retain(|record| {
@@ -500,6 +573,15 @@ enum Row {
     /// A committed archive receipt naming the candidate id it removed from the
     /// active set.
     Archived(String),
+    /// A committed unresolved external-effect obligation: a recorded debt owed
+    /// by a named external effect owner.
+    ///
+    /// It carries no candidate content, so it is neither a registry entry nor
+    /// an archive or merge receipt: it neither adds an active candidate nor
+    /// removes one. The arm exists so this exhaustive read can classify the
+    /// record instead of refusing the whole enumeration over it, and so the
+    /// shape is stated here rather than defaulted past.
+    Reconciliation,
 }
 
 /// Re-proves one lineage-merge receipt and returns what it merged.
@@ -575,6 +657,95 @@ fn classify_merge_receipt(
     })
 }
 
+/// Re-proves one unresolved external-effect obligation and accepts it as a debt
+/// record.
+///
+/// Split out of [`classify_row`] so this row shape's re-proof reads on its own,
+/// exactly as the merge receipt's does.
+///
+/// Two checks, both content. The first is self-binding: every identity the
+/// Governor pipeline copied into the obligation must be present and non-empty,
+/// because a record naming an effect nobody owns, over no experiment, under no
+/// committed operation, is not a recorded debt. The second is a cross-check on
+/// the two answers the Governor gate gave. They are mutually exclusive BY
+/// CONSTRUCTION there — a settled `Rejected` outcome opens the retry gate and
+/// retains no completion, while a `Committed`/`Compensated` outcome retains its
+/// result and closes the gate — so a record claiming both is a spliced document
+/// and is refused rather than read. A third check re-proves the quarantine
+/// scope the obligation carries.
+///
+/// This read restores a candidate registry; it decides nothing about whether an
+/// effect may be retried, and the cross-check exists only so the recorded
+/// answers stay the owner's distinguishable ones.
+fn classify_reconciliation_obligation(
+    document: Value,
+    refused: &impl Fn(String) -> ImprovementDedupReadError,
+) -> Result<Row, ImprovementDedupReadError> {
+    let receipt: ReconciliationObligationDocument =
+        serde_json::from_value(document).map_err(|error| {
+            refused(format!(
+                "reconciliation obligation does not decode: {error}"
+            ))
+        })?;
+    let obligation = &receipt.unknown_effect_obligation;
+    for (name, value) in [
+        ("candidate_id", obligation.candidate_id.as_str()),
+        ("owner_id", obligation.owner_id.as_str()),
+        ("experiment_id", obligation.experiment_id.as_str()),
+        ("operation_ref", obligation.operation_ref.as_str()),
+        ("idempotency_key", obligation.idempotency_key.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(refused(format!(
+                "reconciliation obligation names no {name}"
+            )));
+        }
+    }
+    if receipt.retry_permitted && receipt.completion_retained {
+        return Err(refused(
+            "reconciliation obligation claims both a permitted retry and a retained completion"
+                .to_owned(),
+        ));
+    }
+    // The quarantine scope the obligation carries is re-proved rather than
+    // trusted, in the direction that can only narrow what a reader believes: a
+    // repeated target names a weaker quarantine than the same set deduped, and
+    // an obligation that names no target at all would carry no repair scope.
+    // A repeated target is refused rather than silently deduped, because the
+    // Governor owner committed this set in its own order and a record that
+    // disagrees with it is a spliced document.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    if obligation.invalidation_set.is_empty() {
+        return Err(refused(
+            "reconciliation obligation names no invalidation target".to_owned(),
+        ));
+    }
+    for target in &obligation.invalidation_set {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err(refused(
+                "reconciliation obligation names an empty invalidation target".to_owned(),
+            ));
+        }
+        if !seen.insert(target) {
+            return Err(refused(format!(
+                "reconciliation obligation repeats invalidation target {target}"
+            )));
+        }
+    }
+    // The forward-repair binding is read for consistency, not strengthened: an
+    // ABSENT forward-repair reference is a real value this daemon's own records
+    // carry, so it is not refused here, but a reference that is present and
+    // blank names no repair path and is a spliced document.
+    if !obligation.forward_repair_ref.is_empty() && obligation.forward_repair_ref.trim().is_empty()
+    {
+        return Err(refused(
+            "reconciliation obligation carries a blank forward-repair reference".to_owned(),
+        ));
+    }
+    Ok(Row::Reconciliation)
+}
+
 /// One projected field of a served row, read verbatim.
 ///
 /// The learning owner projects each row as
@@ -645,10 +816,22 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
         return classify_merge_receipt(document, &refused);
     }
 
+    // An unresolved external-effect obligation is the third legitimate row of the
+    // same closed kind. It is recognised so the enumeration completes, and it
+    // is re-proved rather than trusted: the document must bind itself, naming a
+    // candidate, a distinct external owner, an experiment, and the committed
+    // operation and idempotency namespace the Governor owner re-checks any
+    // receipt against. A debt with an empty identity is a spliced document, and
+    // a spliced document is refused here exactly as everywhere else in this
+    // read.
+    if document.get("unknown_effect_obligation").is_some() {
+        return classify_reconciliation_obligation(document, &refused);
+    }
+
     let artifact: CandidateArtifactDocument =
         serde_json::from_value(document).map_err(|error| {
             refused(format!(
-                "record is neither a committed candidate artifact, nor an archive receipt, nor a lineage merge receipt: {error}"
+                "record is neither a committed candidate artifact, nor an archive receipt, nor a lineage merge receipt, nor a reconciliation obligation: {error}"
             ))
         })?;
     // The document must bind ITSELF. A brief or an owner decision that names a
