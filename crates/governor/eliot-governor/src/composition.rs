@@ -6934,6 +6934,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &mut self,
         input: SourceArtifactAdmissionRequest,
     ) -> Result<SourceArtifactAdmission, SourceArtifactAdmissionError> {
+        if input.operation.effect == eliot_receipts::EffectClass::Read {
+            return Err(SourceArtifactAdmissionError::Binding(
+                "source reads require the original context-request read admission",
+            ));
+        }
         if self.readiness != CompositionReadiness::Ready {
             return Err(SourceArtifactAdmissionError::Owner(
                 "Governor composition is not ready".to_owned(),
