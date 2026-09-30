@@ -366,21 +366,63 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
+        OperatorIntentEnvelope envelope;
+        try
+        {
+            envelope = BuildCommandRegion(SelectedAction.Command, SelectedRecord, task);
+        }
+        catch (Exception error) when (error is InvalidOperationException or JsonException)
+        {
+            // A typed parameter the operator entered is still a locally
+            // refusable request, not a fault. `ParseJsonObject` caps length and
+            // depth and refuses a non-object root, but well-bounded malformed
+            // JSON only fails here, at the parse -- so without this the
+            // `JsonException` left through the `async void` click handler and
+            // killed the process with no banner shown at all.
+            //
+            // The refusal is displayed under the same closed code the
+            // transport paths use, and the framework message is never shown: a
+            // serializer message can carry a JSON path, an offset and a
+            // character lifted from the bytes the operator typed.
+            //
+            // The containment point is BEFORE `SubmitIntentAsync`, which is
+            // where the first send and the first journal write happen. So this
+            // refusal sends nothing, journals nothing and leaves no pending
+            // operation to reconcile -- the same terminal disposition as the
+            // refusals above, and no partially sent write to recover from.
+            SetBanner(
+                "Command not sent",
+                $"{SelectedAction.Command}: the typed command was refused before submission "
+                    + $"({BoundedRefusalReason(error)}); nothing was journaled and nothing was sent.",
+                OperatorBannerSeverity.Warning);
+            return;
+        }
+        await SubmitIntentAsync(envelope, SelectedAction.Command, isReconcile: false);
+    }
+
+    /// Mints the exact typed envelope one user action sends. Split out of the
+    /// caller so the whole build-and-mint region sits inside a single guard:
+    /// the operator's typed buffer reaches JSON parsing here, and this is the
+    /// only place it does before a send.
+    private OperatorIntentEnvelope BuildCommandRegion(
+        string commandName,
+        OperatorRecordView record,
+        OperatorTaskContext task)
+    {
         var command = BuildCommand(
-            SelectedAction.Command,
-            SelectedRecord,
+            commandName,
+            record,
             task,
             ActionInput.Trim(),
             CandidateDisposition);
         // One identity per user action: the typed envelope mints the
         // operation id once and the exact bytes are retained until a terminal
         // receipt. A retry of this action reconciles the same identity.
-        var envelope = OperatorIntentEnvelope.Create(
+        return OperatorIntentEnvelope.Create(
             task.ProjectId,
             task.TaskId,
             task.Revision,
             JsonSerializer.SerializeToElement(command));
-        await SubmitIntentAsync(envelope, SelectedAction.Command, isReconcile: false);
     }
 
     /// Reconciles every pending unknown-outcome operation under its retained
