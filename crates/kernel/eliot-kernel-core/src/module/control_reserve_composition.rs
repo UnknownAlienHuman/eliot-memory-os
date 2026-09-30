@@ -126,17 +126,16 @@ pub fn compose_control_reserve_profile(
 /// guarantee to an explicit `UNKNOWN` row instead of receiving a substituted
 /// default. Two rows claiming one dimension are a contradiction: one owner's
 /// numbers are never picked over another's.
-fn evidence_row_for(
+fn evidence_row_for<'a>(
     bottleneck: CapacityBottleneck,
-    owner_waves: &[&[BottleneckCapacityProfile]],
-) -> KernelResult<Option<&BottleneckCapacityProfile>> {
+    owner_waves: &[&'a [BottleneckCapacityProfile]],
+) -> KernelResult<Option<&'a BottleneckCapacityProfile>> {
     let mut matches = owner_waves
         .iter()
         .flat_map(|wave| wave.iter())
         .filter(|row| row.bottleneck == bottleneck);
-    let row = match matches.next() {
-        Some(row) => row,
-        None => return Ok(None),
+    let Some(row) = matches.next() else {
+        return Ok(None);
     };
     if matches.next().is_some() {
         return Err(contradiction(
