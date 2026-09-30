@@ -5818,6 +5818,70 @@ impl KernelComposition {
             && stored.result_response.as_ref() == Some(&body.response)
             && same_observe_owner_receipt(&stored, body)
         {
+            if stored.executable_input.is_some() {
+                // Protected Observe rows can only replay the exact completion
+                // from the attempt that the durable pair handoff consumed.
+                // This read-only path deliberately does not rely on the
+                // volatile claim map, which may have been retired after the
+                // first completion.
+                let presented = body
+                    .attempt
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                let durable = stored
+                    .attempt
+                    .as_ref()
+                    .filter(|attempt| {
+                        attempt.phase == HostRequestAttemptPhase::Claimed
+                            && attempt.owner_connection_ref.as_str() == session.connection_id
+                            && attempt.owner_launch_nonce.as_str() == session.launch_nonce
+                            && attempt.owner_session_epoch == session.session_epoch
+                            && stored.executable_input.as_ref().is_some_and(|input| {
+                                attempt.input_commitment_sha256.as_deref()
+                                    == Some(input.commitment_sha256.as_str())
+                            })
+                    })
+                    .ok_or(TransportError::SessionFenced)?;
+                let input = stored
+                    .executable_input
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                let host_peer_origin = input
+                    .application_binding
+                    .observation_policy_binding
+                    .get("origin")
+                    .and_then(|origin| origin.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("HOST_PEER");
+                let expected_session = input
+                    .application_binding
+                    .session_ref
+                    .as_ref()
+                    .map(OpaqueLabel::as_str);
+                let provenance = retained_result_provenance(body)?;
+                if presented.operation_id != stored.operation_id.as_str()
+                    || presented.attempt_id != durable.attempt_id.as_str()
+                    || presented.fencing_generation != durable.generation
+                    || presented.expires_at_unix_ms != stored.deadline_unix_ms
+                    || presented.facet_method != stored.capability_ref.as_str()
+                    || presented.scope_id
+                        != stored.scope_ref.as_ref().map(OpaqueLabel::as_str).unwrap_or_default()
+                    || !presented
+                        .authority_epoch
+                        .is_same_authority(&stored.authority_epoch)
+                    || (host_peer_origin
+                        && (presented.wire_version
+                            != LocalReadAttempt::HOST_ORIGIN_CONTRACT_VERSION
+                            || presented.session_id.is_some()))
+                    || (!host_peer_origin
+                        && (presented.wire_version != LocalReadAttempt::CONTRACT_VERSION
+                            || presented.session_id.as_deref() != expected_session))
+                    || provenance.effect_evidence != stored.effect_evidence
+                    || provenance.result_lineage != stored.result_lineage
+                {
+                    return Err(TransportError::IdentityConflict);
+                }
+            }
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
         // Issue #1839: record the adapter-produced native presentation
