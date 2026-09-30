@@ -176,8 +176,7 @@ async fn main() {
     #[cfg(windows)]
     observe_entrypoint(EntrypointStage::HostStartupBinding);
     let authority_path = options.authority_descriptor.clone();
-    let authority_contour =
-        startup_binding::authority_contour(&options.work_root, &authority_path);
+    let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
     #[cfg(windows)]
     let (supervision_profile, portable_dev_repository_root) = startup_binding
         .supervision_profile_binding(profile_root_leases.as_ref())

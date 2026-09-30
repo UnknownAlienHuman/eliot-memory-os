@@ -6,8 +6,8 @@
 //! reports OS acceptance only and keeps source availability unknown. Source
 //! provisioning remains an installer/Host policy.
 
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
 
 use eliot_platform_windows::{
@@ -26,7 +26,7 @@ static EVENT_LOG_QUEUE: OnceLock<Result<SyncSender<QueuedKernelEvent>, ()>> = On
 
 /// Admission result for one fixed Kernel event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EventLogAdmission {
+pub enum EventLogAdmission {
     /// The event is queued and pending worker-side OS reporting.
     Pending,
     /// This runtime did not start the SystemService-only queue.
@@ -56,7 +56,7 @@ impl EventLogAdmission {
 ///
 /// The event means that the Kernel entered startup. It does not mean the
 /// service is ready or that the OS accepted the record.
-pub(crate) fn start_and_enqueue_startup() -> EventLogAdmission {
+pub fn start_and_enqueue_startup() -> EventLogAdmission {
     let Some(sender) = initialize_worker() else {
         return report_admission(
             AdmittedKernelEventLogEvent::Startup,
@@ -207,7 +207,7 @@ fn report_worker_failure(event: AdmittedKernelEventLogEvent, error: EventLogErro
         EventLogError::InvalidInput => "invalid_input",
         EventLogError::Unavailable => "unavailable",
         EventLogError::UnsupportedPlatform => "unsupported_platform",
-        EventLogError::RegistrationFailed { .. } => "source_registration_refused",
+        EventLogError::RegistrationFailed { .. } => "source_handle_unavailable",
         EventLogError::ReportFailed { .. } => "report_refused",
     };
     tracing::warn!(
