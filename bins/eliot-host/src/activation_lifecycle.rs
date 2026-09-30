@@ -78,6 +78,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{ResourceGeneration, StateFence};
+use eliot_host_service::runtime_control::HostActivationAdmission;
 use eliot_host_state::{
     ActivationState, DrainRecord, DrainState, EliotActivationRecord, EpochIdentity,
     EpochTransition, HostState, HostStateRecord, KernelReadinessObservationRecord,
@@ -283,12 +284,22 @@ impl IdleLeaseCensus {
 /// nothing here is inferred from a live process, a pipe or a heartbeat.
 ///
 /// Wire projection: every field already carries the owner's `Serialize`
-/// implementation, so this struct derives `Serialize` and can be placed on
-/// the runtime-control wire without a second spelling. STITCH: the
-/// `HostRuntimeControlResponse` member that carries it lives in
-/// `crates/kernel/eliot-host-service/src/runtime_control.rs`, outside this
-/// Host lifecycle file, and the emission point is the `envelope.respond`
-/// call in the runtime-control service loop; both belong to the owning lane.
+/// implementation, so this struct derives `Serialize` and travels on the
+/// runtime-control wire through the owned member
+/// [`eliot_host_service::runtime_control::HostRuntimeControlResponse::AdmissionProjected`]
+/// (see [`HostComposition::activation_admission_wire`]).
+/// STITCH (dispatch site, second-writer scope — this file must not touch
+/// `main.rs`): the manager/integrator attaches the projection in
+/// `process_runtime_control_requests` (`bins/eliot-host/src/main.rs`), after
+/// `runtime_control_dispatch` produces the operation `response` and before
+/// `envelope.respond(response)` (today `main.rs:1619`):
+/// `let response = match host.activation_admission_wire() { Ok(admission) =>
+/// response.with_activation_admission(admission), Err(_) => response };`
+/// so every authenticated answer carries the generation-bound admission when
+/// an activation record exists, while the bare operation answer still flows
+/// otherwise and the creating trigger is never blocked. Until that lands,
+/// the wire member plus the producer below are constructible but unemitted —
+/// never faked from liveness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActivationAdmission {
     /// Durable activation identity of the joined generation.
@@ -340,6 +351,48 @@ impl HostComposition {
         // F-LOG-HOST-1: projection only, never a readiness or lease claim.
         host_lifecycle_observe_requested(BOUNDARY_ACTIVATION_ADMISSION_REQUESTED);
         activation_admission_from(&self.snapshot()?)
+    }
+
+    /// Projects the durable activation admission onto the runtime-control
+    /// wire type owned by `eliot-host-service`.
+    ///
+    /// Read-only 1:1 projection of [`HostComposition::activation_admission`]:
+    /// the same journal snapshot and the same owner types, so the wire
+    /// result carries the activation state, activation generation,
+    /// governance profile, held lease references and drain disposition the
+    /// journal proved. The runtime-control dispatch loop attaches the result
+    /// to the real response path (STITCH: `process_runtime_control_requests`
+    /// in `bins/eliot-host/src/main.rs`, second-writer scope); the local
+    /// stderr line stays diagnostics-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state cannot be read or the
+    /// activation record is absent.
+    pub fn activation_admission_wire(&self) -> Result<HostActivationAdmission, HostError> {
+        // F-LOG-HOST-1: projection only, never a readiness or lease claim.
+        // Delegation (not a second snapshot/observe): `activation_admission`
+        // already records the boundary observation above.
+        let admission = self.activation_admission()?;
+        Ok(HostActivationAdmission {
+            activation_id: admission.activation_id,
+            activation_generation: admission.activation_generation,
+            state: admission.state,
+            host_epoch: admission.host_epoch,
+            kernel_epoch: admission.kernel_epoch,
+            watchdog_epoch: admission.watchdog_epoch,
+            store_generation: admission.store_generation,
+            governance_profile: admission.governance_profile,
+            control_ready: admission.control_ready,
+            supervision_ready: admission.supervision_ready,
+            requested_capabilities: admission.requested_capabilities,
+            admitted_capabilities: admission.admitted_capabilities,
+            runtime_lease_refs: admission.runtime_lease_refs,
+            supervision_lease_refs: admission.supervision_lease_refs,
+            wake_intent_refs: admission.wake_intent_refs,
+            drain_disposition: admission.drain_disposition,
+            coalesced: admission.coalesced,
+        })
     }
 
     /// Records one authenticated observable-use trigger against the current
