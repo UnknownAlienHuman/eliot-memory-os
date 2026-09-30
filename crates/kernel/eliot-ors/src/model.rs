@@ -10047,7 +10047,7 @@ impl ColdStartReadinessOrsRecord {
     ) -> Result<(), OrsError> {
         let value = self.canonical_terminal_value(terminal)?;
         self.validate_terminal_binding(terminal, &value)?;
-        self.validate_terminal_disposition(terminal, &value)
+        Self::validate_terminal_disposition(terminal, &value)
     }
 
     fn canonical_terminal_value(
@@ -10146,7 +10146,6 @@ impl ColdStartReadinessOrsRecord {
     }
 
     fn validate_terminal_disposition(
-        &self,
         terminal: &ColdStartReadinessTerminalReceipt,
         value: &Value,
     ) -> Result<(), OrsError> {

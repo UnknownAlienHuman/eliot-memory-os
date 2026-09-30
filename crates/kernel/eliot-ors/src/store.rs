@@ -6108,13 +6108,13 @@ impl RedbRecoveryStore {
         };
         validate_cold_start_installation(claim, &store_identity)?;
 
-        if let Some(existing) = Self::load_cold_start_binding(&write, claim, &store_identity)? {
-            if now <= existing.claim.lease_deadline {
-                write.commit().map_err(storage)?;
-                return Ok(crate::ColdStartReadinessStageOutcome::AlreadyBound {
-                    record: Box::new(existing),
-                });
-            }
+        if let Some(existing) = Self::load_cold_start_binding(&write, claim, &store_identity)?
+            .filter(|existing| now <= existing.claim.lease_deadline)
+        {
+            write.commit().map_err(storage)?;
+            return Ok(crate::ColdStartReadinessStageOutcome::AlreadyBound {
+                record: Box::new(existing),
+            });
         }
 
         let revision = Self::next_cold_start_revision(&write, claim)?;
