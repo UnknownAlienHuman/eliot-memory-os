@@ -81,7 +81,7 @@ use std::sync::Arc;
 
 use eliot_backup::{PublicationError, PublicationPort, PublicationReceipt};
 use eliot_blob_api::{
-    BlobError, BlobHash, BlobLocator, BlobPolicyBinding, BlobReceiptContext, BlobReadyReceipt,
+    BlobError, BlobHash, BlobLocator, BlobPolicyBinding, BlobReadyReceipt, BlobReceiptContext,
     BlobRootLease, BlobStageRequest, ObjectResidencyKey, VersionedContentDigest,
 };
 use eliot_platform::WorkScopePath;
@@ -214,10 +214,9 @@ where
                 "an empty archive is not a publication".to_owned(),
             ));
         }
-        let digest =
-            BlobHash::new(blake3::hash(bytes).to_hex().to_string()).map_err(|error| {
-                PublicationError::Refused(format!("archive content identity: {error}"))
-            })?;
+        let digest = BlobHash::new(blake3::hash(bytes).to_hex().to_string()).map_err(|error| {
+            PublicationError::Refused(format!("archive content identity: {error}"))
+        })?;
         let template = &self.binding.residency;
         let residency = ObjectResidencyKey {
             scope_domain_id: template.scope_domain_id.clone(),
@@ -271,8 +270,8 @@ where
         self.core
             .ensure_lease(&self.binding.root_lease)
             .map_err(|error| self.refuse(error))?;
-        let commit_path = Self::operation_path("commit")?;
-        let stage_path = Self::operation_path("stage")?;
+        let commit_path = self.operation_path("commit")?;
+        let stage_path = self.operation_path("stage")?;
         self.core
             .contained(&commit_path)
             .map_err(|error| self.refuse(error))?;
@@ -365,17 +364,20 @@ where
             || commit.idempotency_key != self.binding.idempotency_key
         {
             return Err(PublicationError::Refused(
-                "blob owner commit marker does not name the bound publication operation"
-                    .to_owned(),
+                "blob owner commit marker does not name the bound publication operation".to_owned(),
             ));
         }
-        let scope = ResidencyScope { digest: commit.residency_sha256.clone() };
+        let scope = ResidencyScope {
+            digest: commit.residency_sha256.clone(),
+        };
         let (stored, metadata_bytes) =
-            self.core.load_metadata(&commit.locator, &scope).map_err(|error| {
-                PublicationError::Refused(format!(
-                    "blob owner could not read the committed object: {error}"
-                ))
-            })?;
+            self.core
+                .load_metadata(&commit.locator, &scope)
+                .map_err(|error| {
+                    PublicationError::Refused(format!(
+                        "blob owner could not read the committed object: {error}"
+                    ))
+                })?;
         if sha256_hex(&metadata_bytes) != commit.metadata_sha256 {
             return Err(PublicationError::Refused(
                 "blob owner commit marker does not match the metadata it names".to_owned(),
@@ -402,9 +404,7 @@ where
             &self.binding.idempotency_key,
             suffix,
         )
-        .map_err(|error| {
-            PublicationError::Refused(format!("publication operation path: {error}"))
-        })
+        .map_err(|error| PublicationError::Refused(format!("publication operation path: {error}")))
     }
 
     /// The owner's answer for an operation it holds no record for.
