@@ -356,6 +356,13 @@ fn canonical_operation_payload(operation: &JobOperation) -> serde_json::Value {
             if let Some(bytes) = &submission.semantic_input_bytes {
                 payload.insert("semantic_input_bytes".to_owned(), serde_json::json!(bytes));
             }
+            // The owner record is bound into the canonical mutation digest only
+            // when one was published, so a submission that publishes none keeps
+            // the digest it always had and a submission that publishes one
+            // cannot be replayed under a digest computed without it.
+            if let Some(owner_record) = &submission.owner_record {
+                payload.insert("owner_record".to_owned(), serde_json::json!(owner_record));
+            }
             serde_json::Value::Object(payload)
         }
         JobOperation::LeaseNext { selector } => {
@@ -511,6 +518,22 @@ pub struct JobSubmission {
     pub output_contract: OpaqueContentRef,
     pub admission: AdmissionRef,
     pub cancellation_id: String,
+    /// Content-addressed owner record published beside this submission.
+    ///
+    /// The record travels OPAQUE: this module binds its content identity (the
+    /// owner's own contract, revision, digest, byte length and artifact handle)
+    /// and never interprets its content, never knows which owner's record it
+    /// is, and never substitutes a value for its absence. The producing owner
+    /// computes the digest and the byte length; every reader re-proves them
+    /// against this RECORDED reference through
+    /// [`OpaqueContentRef::validate`] instead of recomputing them, so a
+    /// re-issued or substituted record cannot pass as the original one.
+    ///
+    /// Absence stays explicit. An owner that published no record keeps
+    /// publishing `None`, and no consumer may read `None` as an empty record,
+    /// a zero length, or permission to mint one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_record: Option<OpaqueContentRef>,
 }
 
 impl JobSubmission {
@@ -518,6 +541,9 @@ impl JobSubmission {
         self.semantic_input.validate("semantic_input.sha256")?;
         if let Some(bytes) = &self.semantic_input_bytes {
             self.semantic_input.validate_semantic_input_bytes(bytes)?;
+        }
+        if let Some(owner_record) = &self.owner_record {
+            owner_record.validate("owner_record.sha256")?;
         }
         self.output_contract.validate("output_contract.sha256")?;
         self.admission.validate()?;
@@ -1624,6 +1650,22 @@ pub struct DurableJobResponse {
     /// supplied them. Absence remains explicit for legacy/non-inline jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Content-addressed owner record the durable owner retains for this job.
+    ///
+    /// This is the same opaque, content-addressed reference
+    /// [`JobSubmission::owner_record`] carries, projected by the durable owner
+    /// so a reader that only ever observes the job (the managed worker) can
+    /// still see the record the job was submitted with. It is projected from
+    /// the retained [`DurableJobRecord`], never recomputed on the answering
+    /// side: the digest and the byte length are the ones the producing owner
+    /// recorded, and a reader re-proves them with [`OpaqueContentRef::validate`]
+    /// against this recorded value.
+    ///
+    /// Absence remains an explicit `None` for owners and legacy jobs that
+    /// published no record. It never means an empty record and never licenses
+    /// a consumer to mint one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_record: Option<OpaqueContentRef>,
     /// Exact record revision observed for this response.
     pub revision: u64,
     /// Semantic lifecycle state, separate from the mutation disposition.
@@ -1685,6 +1727,9 @@ impl DurableJobResponse {
                 .as_ref()
                 .ok_or(DurableJobError::SemanticInputUnavailable)?;
             semantic_input.validate_semantic_input_bytes(bytes)?;
+        }
+        if let Some(owner_record) = &self.owner_record {
+            owner_record.validate("owner_record.sha256")?;
         }
         if self.revision == 0 {
             return Err(DurableJobError::InvalidField {
@@ -1850,6 +1895,13 @@ impl DurableJobResponse {
                 if self.semantic_input_bytes != submission.semantic_input_bytes {
                     return Err(DurableJobError::SemanticInputMismatch);
                 }
+                // The owner record answers the submission with the owner's own
+                // recorded reference: the durable owner projects it, it is
+                // never re-derived here, and a substituted or dropped record is
+                // a mismatch rather than an accepted answer.
+                if self.owner_record != submission.owner_record {
+                    return Err(DurableJobError::OwnerRecordMismatch);
+                }
                 // Any positive revision is admitted: an idempotent resubmit
                 // may return the already-advanced record.
                 Ok(())
@@ -2012,6 +2064,8 @@ pub enum DurableJobError {
     SemanticInputUnavailable,
     #[error("semantic input reference or supplied bytes differ from the original owner record")]
     SemanticInputMismatch,
+    #[error("owner record reference differs from the original owner record")]
+    OwnerRecordMismatch,
     #[error("role does not have the requested capability")]
     CapabilityDenied,
     #[error("invalid or expired active lease")]

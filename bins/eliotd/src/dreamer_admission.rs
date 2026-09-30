@@ -392,6 +392,7 @@ mod tests {
             semantic_input: content_ref("input", 8, &"b".repeat(64))?,
             semantic_input_bytes: None,
             output_contract: content_ref("output", 8, &"c".repeat(64))?,
+            owner_record: None,
             admission: AdmissionRef {
                 authority: AuthorityBinding {
                     authority_id: ContractId::new("governor")?,
@@ -610,6 +611,7 @@ mod tests {
             scope: submission.work_scope.clone(),
             semantic_input: Some(submission.semantic_input.clone()),
             semantic_input_bytes: submission.semantic_input_bytes.clone(),
+            owner_record: submission.owner_record.clone(),
             revision: 1,
             state: JobState::Queued,
             disposition: Some(MutationDisposition::Committed),
@@ -645,6 +647,7 @@ mod tests {
             scope: submission.work_scope.clone(),
             semantic_input: Some(submission.semantic_input.clone()),
             semantic_input_bytes: submission.semantic_input_bytes.clone(),
+            owner_record: submission.owner_record.clone(),
             revision: 1,
             state: JobState::Leased,
             disposition: Some(MutationDisposition::Committed),
