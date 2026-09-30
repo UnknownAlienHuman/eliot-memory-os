@@ -1104,7 +1104,9 @@ pub struct AuthenticatedMaintenanceTriggerSession {
 impl AuthenticatedMaintenanceTriggerSession {
     /// Binds one maintenance-trigger session from live Kernel state.
     ///
-    /// Fails closed when the generation is fenced, the service is not
+    /// Fails closed when the generation is fenced, the candidate is in
+    /// `shadow_no_authority` (I14.16 step 4, issue #1953: no trigger claim,
+    /// decision, or revocation issues without authority), the service is not
     /// `Ready`, no candidate lineage or consumed activation receipt exists,
     /// the activation no longer agrees with the live epoch (revoked/stale
     /// activation), or the principal reference is not bounded wire text.
@@ -1113,6 +1115,7 @@ impl AuthenticatedMaintenanceTriggerSession {
         if service.generation_fenced() {
             return Err(KernelServiceError::GenerationFenced);
         }
+        service.admit_shadow_effect()?;
         let state = service.state();
         if state != KernelServiceState::Ready {
             return Err(KernelServiceError::AdmissionClosed(state));

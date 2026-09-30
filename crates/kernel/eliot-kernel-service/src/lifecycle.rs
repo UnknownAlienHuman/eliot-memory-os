@@ -357,6 +357,57 @@ const NORMAL_ADMISSION_OPERATION: &str = "normal-admission";
 /// introduced. Immutable/read-only inspection is not gated here: it is a
 /// separate, admission-free path and the shadow phase is exactly the contour
 /// I14.16 step 3 permits.
+///
+/// Finite shadow-denial map (issue #1953, map item 2 — classified by actual
+/// effects, not method names):
+///
+/// Named [`KernelService::admit_shadow_effect`] gates (refuse first, before
+/// any capacity acquire, ORS touch, or slot fill):
+/// - `advance_authority_epoch` (mints a new epoch sequence);
+/// - `issue_control_receipt` (issues a Session/authority receipt);
+/// - `admit_native_worker_claim` (writes an ORS claim row);
+/// - `mark_native_worker_ready` (advances an ORS claim, publishes readiness);
+/// - `acquire_admission` (issues a normal-work lease);
+/// - `acquire_protected_control` (issues a protected-control lease);
+/// - `admit_host_request` (admits normal work; the `Ready`-only state gate
+///   already refused shadow with the identical value, the named check makes
+///   the map explicit);
+/// - `restore_store_rebind_for_recovery` (fills the rebind slot; startup
+///   housekeeping with a durable effect).
+///
+/// Transition/state-table refusals (no named check; the table or the
+/// `Ready`/`Degraded` gate refuses shadow, each with its existing typed
+/// value):
+/// - `reconcile` (`Cold|Stopped|Failed -> Reconciling` only);
+/// - `activate_permit` (`HandoffPrepared -> Activating` only);
+/// - `rebind_store`, `restore_store_rebind_for_replay`
+///   (`Ready`/`Degraded` only);
+/// - `mark_ready`/`publish_ready` (`Activating|Ready|Degraded` only, so
+///   wrong-generation readiness from a shadow state cannot publish);
+/// - `apply`: `Shadow` entry, `PrepareHandoff` forward step, and `Fail`
+///   failure handling stay legal from `ShadowNoAuthority`; every other arm
+///   is refused by the table.
+///
+/// Intentionally available in shadow (no ORS/store write, no issuance):
+/// - `synchronize_authority_epoch`: in-memory adoption of the Host-approved
+///   epoch tuple, no ORS write and no minted sequence; I1.11 step-3 epoch
+///   recovery runs it in every startup mode, including shadow assembly;
+/// - pure reconciliation queries (`reconcile_activation`,
+///   `reconcile_host_request_admission`, `reconcile_store_rebind`,
+///   `reconcile_native_worker_claim_admission`) and every read-only getter:
+///   no state change, no new authority;
+/// - `fence_generation` and the `Fail` arm: failure handling that stops the
+///   cutover (`ShadowNoAuthority -> Failed`), never an issuance;
+/// - `commit_store_rebind` / `rollback_store_rebind_for_recovery_failure`:
+///   in-memory slot-history moves only, no-ops without a live slot, and the
+///   slot-fill paths above are gated.
+///
+/// The gateway half of the map lives on
+/// `KernelStoreGateway::refuse_shadow_mutation` in `store_gateway.rs`.
+/// Session issuers (`Authenticated*Session::bind` across the front-door
+/// seams) require `Ready` and therefore refuse shadow with the identical
+/// `AdmissionClosed` value; the maintenance-trigger issuer additionally
+/// carries the named check at its single choke point.
 impl KernelService {
     /// Refuses an authority-bearing effect while this candidate is in
     /// `shadow_no_authority`.
@@ -762,6 +813,11 @@ impl KernelService {
         binding: &AgentBridgeProcessBinding,
         resolution: Option<&AgentActivationResolutionResult>,
     ) -> Result<HostRequestAdmissionReceipt, KernelServiceError> {
+        // I14.16 step 4 (issue #1953, map item 2): a `shadow_no_authority`
+        // candidate accepts no normal work. The `Ready`-only state gate below
+        // already refused shadow with this identical value; the named check
+        // makes the denial explicit before any binding work.
+        self.admit_shadow_effect()?;
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
@@ -1082,6 +1138,10 @@ impl KernelService {
         receipt: crate::protocol::StoreRebindReceipt,
         request_digest: String,
     ) -> Result<(), KernelServiceError> {
+        // I14.16 step 4 (issue #1953, map item 2): restoring the rebind slot
+        // is startup housekeeping with a durable effect, so a
+        // `shadow_no_authority` candidate refuses before touching the slot.
+        self.admit_shadow_effect()?;
         receipt.validate()?;
         if request_digest != receipt.request_digest {
             return Err(KernelServiceError::HandshakeMismatch {
@@ -1294,6 +1354,10 @@ impl KernelService {
     /// work; `Degraded` keeps normal closed while protected control stays
     /// open via [`Self::acquire_protected_control`].
     pub fn acquire_admission(&self) -> Result<AdmissionLease, KernelServiceError> {
+        // I14.16 step 4 (issue #1953, map item 2): a `shadow_no_authority`
+        // candidate issues no normal-work lease. Named first for the finite
+        // map; the `Ready`-only gate below refuses shadow identically.
+        self.admit_shadow_effect()?;
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
@@ -1334,6 +1398,11 @@ impl KernelService {
         &self,
         operation_id: &str,
     ) -> Result<ProtectedControlLease, KernelServiceError> {
+        // I14.16 step 4 (issue #1953, map item 2): a `shadow_no_authority`
+        // candidate issues no protected-control lease either — lease issuance
+        // is forbidden regardless of the operation family. Named first; the
+        // `Ready|Degraded` gate below refuses shadow identically.
+        self.admit_shadow_effect()?;
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }

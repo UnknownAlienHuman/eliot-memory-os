@@ -604,6 +604,29 @@ impl KernelComposition {
                 field: "config_hash",
             });
         }
+        // I14.16 step 7 (issue #1953, map item 5): the candidate took the
+        // exclusive owner object for this exact installation/activation
+        // contour at `Reconcile`, still inside the zero-authority shadow
+        // phase. Readiness is authored only while this process still holds
+        // that live object: a receipt from a process that never took
+        // ownership, took a different contour, or lost the object must not
+        // reach Host. The contour comparison uses the retained owner
+        // identities, never caller-supplied name text.
+        {
+            let owner = self.kernel_owner.lock().map_err(|_| {
+                KernelServiceError::Platform("kernel owner lock poisoned".to_owned())
+            })?;
+            let held = owner
+                .as_ref()
+                .ok_or(KernelServiceError::ReadinessNotProven)?;
+            if !held.is_for(&candidate.installation_id, &candidate.activation_id) {
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
+            let capability = held.owner_capability();
+            let _live = capability
+                .live_guard()
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        }
         {
             let service = self
                 .service

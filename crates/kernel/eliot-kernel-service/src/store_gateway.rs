@@ -1172,6 +1172,49 @@ impl KernelStoreGateway {
     /// The refusal is the crate's existing [`KernelServiceError::AdmissionClosed`]
     /// carrying the exact current state, flattened to this module's `String`
     /// error the way every other gateway refusal is.
+    ///
+    /// Finite shadow-denial map, gateway half (issue #1953, map item 2 —
+    /// classified by actual effects, not method names):
+    ///
+    /// Named `refuse_shadow_mutation` gates: [`Self::apply`],
+    /// [`Self::apply_reserved`], [`Self::cancel_reserved`] (ORS-reservation
+    /// cancellation is an ORS mutation), [`Self::reconcile_staged_writes`]
+    /// (startup reconciliation mutates staged envelopes),
+    /// [`Self::reconcile_reserved`] (exact-receipt reconciliation finalizes
+    /// ORS reservation scopes), [`Self::initialize_genesis`] (Store write),
+    /// [`Self::dreamer_job`] (ledger mutations; the permitted `Status` read
+    /// stays available through the operation-effect classification),
+    /// [`Self::backup_restore_batch`] (Store restore write),
+    /// [`Self::execute_user_automation_operation`] and
+    /// [`Self::due_wake_execution_join`] (their Store commits travel through
+    /// the borrowed client, which bypasses [`Self::apply`], so the entries
+    /// carry the named check with their own typed refusal).
+    ///
+    /// Intentionally available in shadow (no Store/ORS write, no issuance):
+    /// `recovery`, `receipt`, `execute_named`/`execute_named_with_error`,
+    /// the `read_user_automation_*` reads, `validate_user_automation_request`
+    /// (pure validation), `project_reserved_submission` (bounded local
+    /// projection only, never ORS or network work),
+    /// `maintenance_trigger_pending_page`,
+    /// `maintenance_trigger_replacement_pending_set`,
+    /// `replay_maintenance_trigger_after_crash`, and
+    /// `recover_maintenance_trigger_commit` (ledger reads whose sessions
+    /// cannot be bound in shadow anyway),
+    /// `restore_maintenance_trigger_ledger` (in-memory restore of already
+    /// persisted rows; inert while shadow because every serving path binds a
+    /// `Ready`-only session), `drain_reserved` (flight fence plus an ORS
+    /// recovery-page read; shutdown handling, no reservation write),
+    /// `validation_snapshot`, `health`, `paused_ordering_scopes`,
+    /// `available_control`, `is_fenced`, `fence`, and `fence_and_drain`
+    /// (observation and lifecycle fences, never authority effects).
+    ///
+    /// The mutating maintenance-trigger entries (`admit`, `claim`,
+    /// `release_expired`, `record_decision`, `acknowledge`,
+    /// `mark_ambiguous`, `revoke_consumer`, `expire`, `supersede`, `gap`)
+    /// all bind their session through the one
+    /// `AuthenticatedMaintenanceTriggerSession::bind` choke point, which
+    /// requires `Ready` and carries the named service-side check, so no
+    /// trigger claim, decision, or revocation can issue from a shadow.
     fn refuse_shadow_mutation(&self) -> Result<(), String> {
         let service = self
             .service
@@ -1665,6 +1708,10 @@ impl KernelStoreGateway {
         request: &ReservedWriteRequest,
         receipt: &WriteReceipt,
     ) -> Result<ReservationRecord, String> {
+        // I14.16 step 4 (issue #1953, map item 2): exact-receipt
+        // reconciliation finalizes ORS reservation scopes, so a
+        // `shadow_no_authority` candidate refuses before the delegate runs.
+        self.refuse_shadow_mutation()?;
         store_receipt_gateway::reconcile_reserved(self, token, request, receipt)
     }
 
@@ -2475,6 +2522,13 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
+        // I14.16 step 4 (issue #1953, map item 2): the Store commits below
+        // travel through the borrowed client, which bypasses `Self::apply`,
+        // so the entry refuses a `shadow_no_authority` candidate itself. The
+        // typed `Rejected` refusal proves nothing was admitted: no UnknownOutcome.
+        self.refuse_shadow_mutation().map_err(|error| {
+            UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::Rejected(error))
+        })?;
         Self::validate_user_automation_request(&request)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         // The sealed request is the one value this frame must keep across every
@@ -4133,6 +4187,12 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + ?Sized,
     {
+        // I14.16 step 4 (issue #1953, map item 2): the occurrence execution
+        // below commits through the borrowed client, which bypasses
+        // `Self::apply`, so the join refuses a `shadow_no_authority`
+        // candidate itself. `Rejected` proves nothing was admitted.
+        self.refuse_shadow_mutation()
+            .map_err(UserAutomationRuntimeError::Rejected)?;
         // The owner read this leg issues under reuses the carrier's admitted
         // parent identity for a `Status` execution projection, so it mints no
         // canonical identity and issues no transition.
@@ -8085,6 +8145,11 @@ impl KernelStoreGateway {
         let _flight = self
             .flight
             .enter()
+            .map_err(StoreApplyRefusal::GatewayRefusal)?;
+        // I14.16 step 4 (issue #1953, map item 2): a restore batch is a Store
+        // write, so a `shadow_no_authority` candidate refuses before the
+        // generation gate and the send.
+        self.refuse_shadow_mutation()
             .map_err(StoreApplyRefusal::GatewayRefusal)?;
         self.require_active_store_generation()
             .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;

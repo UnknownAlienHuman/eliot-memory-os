@@ -172,7 +172,8 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             KernelActivationState::HandoffPrepared,
             "kernel-handoff-prepared",
             |next| {
-                if let Some(evidence) = evidence {
+                if let Some(evidence) = evidence.filter(|e| !next.disposition_evidence.contains(e))
+                {
                     next.disposition_evidence.push(evidence);
                 }
                 Ok(())
@@ -188,9 +189,17 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
     /// Process termination alone is not this proof: `journal_append::
     /// terminated_prior_kernel` proves the Job is empty and the root is
     /// reaped, while [`KernelHandoffReceipt::prove_released`] proves no
-    /// process still owns that contour. Nonce issuance is already gated on
+    /// process still owns that contour. A resumed driver rejoins the handoff
+    /// boundary its own activation record already retained before proving
+    /// release, so an interrupted handoff continues under the original Host
+    /// activation instead of stalling or accepting a replacement receipt;
+    /// the release proof still re-probes the live object, and recovery never
+    /// substitutes for it. Nonce issuance is already gated on
     /// `OldTerminated`, so an unproven release can never reach it.
     pub(super) fn prior_disposition_committed(&mut self) -> Result<(), HostError> {
+        if self.handoff.is_none() {
+            self.handoff = KernelHandoffReceipt::recover_retained(&self.current)?;
+        }
         if let Some(handoff) = self.handoff.as_ref() {
             handoff.prove_released()?;
         } else if !matches!(

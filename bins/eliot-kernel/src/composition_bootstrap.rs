@@ -238,12 +238,80 @@ fn authority_preparation_phase(error: &AuthorityPreparationError) -> &'static st
     }
 }
 
+/// Selects the restricted I14.16 shadow-candidate capability set before the
+/// composition opens any mutable resource (issue #1953, map item 1).
+///
+/// A shadow candidate receives only immutable/read-only snapshot access plus
+/// the Host-injected candidate pipe (`KernelConfig::pipe_name`). Every
+/// authority-bearing input is therefore refused here, before the writable
+/// ORS open, migrations, or durable session state below can observe it:
+/// Store bootstrap (no store route or gateway), daemon launch and restart
+/// policy (no child, no normal work), agent-bridge admission (no second pipe
+/// family), supervision lease authority (no lease issuance), and — at the
+/// `new_with_process_authority` call site — the external process authority
+/// handoff itself. Blob-manifest validation and audit bindings stay admitted:
+/// the manifest is validated read-only without starting a generation and the
+/// audit chain is the Kernel's own diagnostic record, neither grants Store,
+/// ORS, Session, lease, epoch, or work authority.
+///
+/// Active compositions pass through unchanged. The same `KernelService`
+/// lifecycle owner is constructed in both modes and stays `Cold` through
+/// assembly; Host drives it to `ShadowNoAuthority` through the existing
+/// `reconcile` + `Shadow` boundary, so no transition-table edge and no second
+/// service exists.
+///
+/// Residual (ORS owner lane): the writable `RedbRecoveryStore` open path —
+/// `initialize` migrations, `recover_interrupted_execution`, and the
+/// per-open object-generation advance — is owned by `eliot-ors` and has no
+/// read-only open seam in this lane's path scope. The shadow constructor
+/// performs none of the composition-owned durable writes, but a fully
+/// effect-free shadow open needs that ORS-owned seam.
+fn validate_shadow_candidate_capabilities(config: &KernelConfig) -> Result<(), KernelBuildError> {
+    if !config.startup_mode.is_shadow_candidate() {
+        return Ok(());
+    }
+    if config.store_bootstrap.is_some() {
+        return Err(KernelBuildError::Service(
+            "shadow candidate receives no Store bootstrap; snapshot access only".to_owned(),
+        ));
+    }
+    if config.daemon_launch.is_some() {
+        return Err(KernelBuildError::Service(
+            "shadow candidate launches no daemon child and admits no normal work".to_owned(),
+        ));
+    }
+    if config.daemon_restart_policy.is_some() {
+        return Err(KernelBuildError::Service(
+            "shadow candidate admits no child restart policy".to_owned(),
+        ));
+    }
+    if config.agent_bridge_admission.is_some() {
+        return Err(KernelBuildError::Service(
+            "shadow candidate binds the candidate pipe only; no bridge admission".to_owned(),
+        ));
+    }
+    #[cfg(windows)]
+    if config.supervision_lease_authority.is_some() {
+        return Err(KernelBuildError::Service(
+            "shadow candidate issues no supervision leases".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl KernelComposition {
     /// Builds all lower-layer surfaces once and binds them to one runtime.
     ///
     /// The default authority remains fail-closed until Host performs its
     /// authenticated handoff. Test-only adapter construction is available
     /// under the test configuration.
+    ///
+    /// A config carrying `KernelStartupMode::ShadowCandidate` builds the
+    /// restricted I14.16 inspection posture instead (issue #1953): the
+    /// capability set is selected before any mutable resource opens and the
+    /// composition-owned durable writes are skipped. The service stays `Cold`
+    /// until Host reconciles the candidate and drives it to
+    /// `ShadowNoAuthority` through the existing boundary.
     pub fn new(config: KernelConfig) -> Result<Self, KernelBuildError> {
         validate_native_worker_cell_registry().map_err(|_| {
             KernelBuildError::Service(
@@ -256,6 +324,17 @@ impl KernelComposition {
             EntrypointStage::Composition,
             "kernel.composition.build_started",
         );
+        // I14.16 (issue #1953, map item 1): the restricted shadow-candidate
+        // capability set is selected before the platform, the ORS open, and
+        // every durable write below.
+        if let Err(error) = validate_shadow_candidate_capabilities(&config) {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.build_failed",
+            );
+            observe_terminal_error(kernel_build_error_code(&error));
+            return Err(error);
+        }
         let work_root = config.work_root.clone();
         let platform = Arc::new(WindowsPlatform::new(work_root.clone()).map_err(|error| {
             let mapped = KernelBuildError::Platform(error);
@@ -331,6 +410,9 @@ impl KernelComposition {
             observe_terminal_error(kernel_build_error_code(&error));
             error
         };
+        // I14.16 (issue #1953, map item 1): capability selection precedes the
+        // platform, the ORS open, and the descriptor preparation below.
+        validate_shadow_candidate_capabilities(&config).map_err(&terminal)?;
         let work_root = config.work_root.clone();
         let platform = Arc::new(
             WindowsPlatform::new(work_root.clone())
@@ -339,6 +421,17 @@ impl KernelComposition {
         );
         let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
         let ors = Arc::new(Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?);
+        if config.startup_mode.is_shadow_candidate() {
+            // I14.16 steps 3-4: a shadow candidate never begins or consumes
+            // the protected authority handoff (both are durable ORS writes)
+            // and never constructs the process-execution gateway. Assembly
+            // continues with snapshot access and the candidate pipe only.
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.shadow_candidate_descriptor_skipped",
+            );
+            return Self::assemble(config, ors, ors_path, None, platform).map_err(&terminal);
+        }
         let prepared = Self::prepare_authority_descriptor_material(
             &platform,
             &ors,
@@ -355,9 +448,27 @@ impl KernelComposition {
         })
         .map_err(&terminal)?;
         #[cfg(windows)]
+        Self::adopt_descriptor_supervision_authority(&mut config, &prepared.descriptor)
+            .map_err(&terminal)?;
+        Self::assemble_with_prepared_material(config, prepared, ors, ors_path, platform)
+            .map_err(&terminal)
+    }
+
+    /// Adopts the installer-provisioned supervision authority from the
+    /// protected handoff descriptor.
+    ///
+    /// Mechanical split of `new_with_authority_descriptor` (issue #1953):
+    /// the match arms and observations are verbatim, and the mismatch error
+    /// is returned raw so the caller applies the same terminal observation
+    /// exactly once.
+    #[cfg(windows)]
+    fn adopt_descriptor_supervision_authority(
+        config: &mut KernelConfig,
+        descriptor: &ProcessAuthorityHandoffDescriptor,
+    ) -> Result<(), KernelBuildError> {
         if config.require_descriptor_supervision_authority {
             let descriptor_authority = SupervisionLeaseAuthorityConfig {
-                authority: prepared.descriptor.supervision_authority.clone(),
+                authority: descriptor.supervision_authority.clone(),
             };
             match &config.supervision_lease_authority {
                 Some(configured) if configured != &descriptor_authority => {
@@ -365,10 +476,10 @@ impl KernelComposition {
                         EntrypointStage::SupervisionAuthority,
                         "kernel.composition.supervision_authority_mismatch",
                     );
-                    return Err(terminal(KernelBuildError::Service(
+                    return Err(KernelBuildError::Service(
                         "configured supervision authority does not match the protected handoff descriptor"
                             .to_owned(),
-                    )));
+                    ));
                 }
                 Some(_) => {
                     observe_entrypoint_with_detail(
@@ -385,12 +496,28 @@ impl KernelComposition {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Binds the prepared descriptor snapshot, consumes the authority
+    /// handoff, and assembles the process-authority composition.
+    ///
+    /// Mechanical split of `new_with_authority_descriptor` (issue #1953):
+    /// the bindings and owner-typed mappings are verbatim, and errors are
+    /// returned raw so the caller applies the same terminal observation
+    /// exactly once.
+    fn assemble_with_prepared_material(
+        config: KernelConfig,
+        prepared: PreparedAuthorityMaterial,
+        ors: Arc<RedbRecoveryStore>,
+        ors_path: PathBuf,
+        platform: Arc<WindowsPlatform>,
+    ) -> Result<Self, KernelBuildError> {
         let snapshot_binding = AuthoritySnapshotBinding::from_wire(
             prepared.descriptor.snapshot_binding.clone(),
             &prepared.descriptor.authority_id,
         )
-        .map_err(|error| KernelBuildError::Core(error.to_string()))
-        .map_err(&terminal)?;
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         let codec: Arc<dyn DispatchSnapshotCodec> = Arc::new(WindowsDispatchSnapshotCodec::new(
             Arc::clone(&platform),
             prepared.descriptor.dispatch_key.clone(),
@@ -405,11 +532,9 @@ impl KernelComposition {
             &prepared.descriptor,
             &handoff,
         )
-        .map_err(|error| KernelBuildError::Core(error.to_string()))
-        .map_err(&terminal)?;
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         Self::consume_authority_handoff(&ors, &handoff)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))
-            .map_err(&terminal)?;
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         Self::assemble_with_process_controller(
             config,
             controller,
@@ -418,7 +543,6 @@ impl KernelComposition {
             ors_path,
             platform,
         )
-        .map_err(&terminal)
     }
 
     /// Builds a production composition with an externally supplied process
@@ -441,6 +565,15 @@ impl KernelComposition {
             observe_terminal_error(kernel_build_error_code(&error));
             error
         };
+        // I14.16 (issue #1953, map item 1): an externally supplied process
+        // authority is never a shadow-candidate capability, and the remaining
+        // restricted set is selected before the platform and ORS open below.
+        if config.startup_mode.is_shadow_candidate() {
+            return Err(terminal(KernelBuildError::Service(
+                "shadow candidate receives no external process authority".to_owned(),
+            )));
+        }
+        validate_shadow_candidate_capabilities(&config).map_err(&terminal)?;
         let work_root = config.work_root.clone();
         let platform = Arc::new(
             WindowsPlatform::new(work_root.clone())
@@ -453,6 +586,27 @@ impl KernelComposition {
             .map_err(&terminal)
     }
 
+    /// Refuses an owner-authority mutation while this composition is an
+    /// I14.16 shadow candidate (issue #1953, map item 2).
+    ///
+    /// Classified by actual effects: `initialize_p07_owner_revision` advances
+    /// the durable grant-graph revision, and bind/refresh/recover install or
+    /// rotate the retained canonical owner from durable Governor state — all
+    /// ORS writes a zero-authority candidate must never perform. The
+    /// immutable readbacks (`p07_owner_revision`, `p07_owner_readback`) stay
+    /// available: no state change, no new authority. The service/gateway half
+    /// of the map lives on `KernelService::admit_shadow_effect` and
+    /// `KernelStoreGateway::refuse_shadow_mutation`; this covers the
+    /// composition-owned owner entries those cannot see.
+    fn refuse_shadow_owner_mutation(&self) -> Result<(), KernelBuildError> {
+        if self.shadow_candidate {
+            return Err(KernelBuildError::Service(
+                "shadow candidate admits no owner authority mutation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Initializes one owner-lineage graph revision before the first
     /// revocation-history read. The operation is idempotent for the same
     /// revision and refuses a lower presentation; it does not bind an owner
@@ -463,6 +617,7 @@ impl KernelComposition {
         expected_revision: u64,
         state_fence: &StateFence,
     ) -> Result<u64, KernelBuildError> {
+        self.refuse_shadow_owner_mutation()?;
         if expected_revision == 0 || authority_root_ref.trim().is_empty() {
             return Err(KernelBuildError::Core(
                 "owner revision initialization requires a root and nonzero revision".to_owned(),
@@ -492,6 +647,7 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        self.refuse_shadow_owner_mutation()?;
         let _transition = self.p07_owner_transition.write().map_err(|_| {
             KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
         })?;
@@ -557,6 +713,7 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        self.refuse_shadow_owner_mutation()?;
         let _transition = self.p07_owner_transition.write().map_err(|_| {
             KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
         })?;
@@ -627,6 +784,7 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        self.refuse_shadow_owner_mutation()?;
         let _transition = self.p07_owner_transition.write().map_err(|_| {
             KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
         })?;
@@ -1095,6 +1253,9 @@ impl KernelComposition {
         _authority: Arc<dyn DispatchValidationPort>,
         evidence: Arc<dyn CanonicalEvidenceProvider>,
     ) -> Result<Self, KernelBuildError> {
+        // I14.16 (issue #1953, map item 1): capability selection precedes the
+        // writable test ORS open below, exactly as in production construction.
+        validate_shadow_candidate_capabilities(&config)?;
         let work_root = config.work_root.clone();
         let platform =
             Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
@@ -1126,6 +1287,9 @@ impl KernelComposition {
             "kernel.composition.assemble_started",
         );
         let work_root = config.work_root.clone();
+        // I14.16 (issue #1953, map item 1): read once; every durable-write
+        // branch below consults this instead of re-deriving the mode.
+        let shadow_candidate = config.startup_mode.is_shadow_candidate();
         let store_bootstrap = config.store_bootstrap.clone();
         let daemon_launch = config.daemon_launch.clone();
         #[cfg(windows)]
@@ -1315,15 +1479,26 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Service(error.to_string()))?
             .is_none()
         {
-            eliot_kernel_service::establish_canonical_store_route_owner(&ors, generation)
-                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-            observe_entrypoint_with_detail(
-                EntrypointStage::Composition,
-                &format!(
-                    "kernel.composition.canonical_store_owner_established:generation={}",
-                    generation.value()
-                ),
-            );
+            // I14.16 step 4 (issue #1953, map item 1): establishing the route
+            // owner is a durable authority mutation. A shadow candidate
+            // observes the absent owner through the read above and stops; only
+            // an active composition establishes it.
+            if shadow_candidate {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.canonical_store_owner_shadow_skipped",
+                );
+            } else {
+                eliot_kernel_service::establish_canonical_store_route_owner(&ors, generation)
+                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    &format!(
+                        "kernel.composition.canonical_store_owner_established:generation={}",
+                        generation.value()
+                    ),
+                );
+            }
         }
         let mut generations = GenerationRouter::at_epoch(canonical_epoch.clone());
         generations
@@ -1503,28 +1678,44 @@ impl KernelComposition {
         let generation_gateway = OrsGenerationCoordinator::new(ors.clone());
         let mut startup_coordinator = StartupCoordinator::new();
         let mut service = service;
+        // I14.16 / I1.11 step 3: adopting the Host-approved epoch tuple is an
+        // in-memory fence alignment — no ORS write, no issuance — so it runs
+        // in every startup mode, including a shadow candidate. It is the
+        // reason `synchronize_authority_epoch` carries no shadow refusal.
         service
             .synchronize_authority_epoch(canonical_epoch)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let mut policy = front_door_policy;
-        generation_gateway
-            .recover(&mut generations, &mut service, &mut policy)
-            .map_err(|error| {
-                observe_entrypoint_with_detail(
-                    EntrypointStage::Composition,
-                    "kernel.composition.generation_recovery_rejected",
-                );
-                KernelBuildError::Ors(error)
-            })?;
-        generation_gateway
-            .recover_cutover_ownership()
-            .map_err(|error| {
-                observe_entrypoint_with_detail(
-                    EntrypointStage::Composition,
-                    "kernel.composition.cutover_ownership_recovery_rejected",
-                );
-                KernelBuildError::Ors(error)
-            })?;
+        if shadow_candidate {
+            // I14.16 steps 3-4 (issue #1953, map item 1): generation and
+            // cutover recovery reconcile staged ORS rows (durable writes), so
+            // a shadow candidate skips both and adopts no committed cutover.
+            // The router keeps only the assembly routes above and the service
+            // keeps the adopted Host-approved tuple: inspection posture only.
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.generation_recovery_shadow_skipped",
+            );
+        } else {
+            generation_gateway
+                .recover(&mut generations, &mut service, &mut policy)
+                .map_err(|error| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.generation_recovery_rejected",
+                    );
+                    KernelBuildError::Ors(error)
+                })?;
+            generation_gateway
+                .recover_cutover_ownership()
+                .map_err(|error| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.cutover_ownership_recovery_rejected",
+                    );
+                    KernelBuildError::Ors(error)
+                })?;
+        }
         startup_coordinator
             .record_live_evidence(3)
             .map_err(KernelBuildError::Service)?;
@@ -1534,31 +1725,43 @@ impl KernelComposition {
         );
         #[cfg(windows)]
         let store_handoff_init = {
-            let store_bootstrap_for_recovery = store_bootstrap.clone();
-            let recovered = Self::recover_store_rebind_state(
-                &ors,
-                &mut service,
-                store_bootstrap_for_recovery.as_ref(),
-            )
-            .map_err(|error| {
+            // I14.16 step 4 (issue #1953, map item 1): rebind recovery aborts
+            // pending ORS rebind rows (a durable write) and fills the service
+            // rebind slot. A shadow candidate admits no Store bootstrap, so it
+            // skips the recovery entirely and retains no handoff.
+            if shadow_candidate {
                 observe_entrypoint_with_detail(
                     EntrypointStage::StoreBootstrap,
-                    "kernel.composition.store_rebind_recovery_rejected",
+                    "kernel.composition.store_rebind_recovery_shadow_skipped",
                 );
-                KernelBuildError::Ors(error)
-            })?;
-            if recovered.is_some() {
-                observe_entrypoint_with_detail(
-                    EntrypointStage::StoreBootstrap,
-                    "kernel.composition.store_rebind_recovered",
-                );
+                None
             } else {
-                observe_entrypoint_with_detail(
-                    EntrypointStage::StoreBootstrap,
-                    "kernel.composition.store_rebind_absent",
-                );
+                let store_bootstrap_for_recovery = store_bootstrap.clone();
+                let recovered = Self::recover_store_rebind_state(
+                    &ors,
+                    &mut service,
+                    store_bootstrap_for_recovery.as_ref(),
+                )
+                .map_err(|error| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        "kernel.composition.store_rebind_recovery_rejected",
+                    );
+                    KernelBuildError::Ors(error)
+                })?;
+                if recovered.is_some() {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        "kernel.composition.store_rebind_recovered",
+                    );
+                } else {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        "kernel.composition.store_rebind_absent",
+                    );
+                }
+                recovered
             }
-            recovered
         };
         #[cfg(not(windows))]
         let store_handoff_init = None;
@@ -1702,6 +1905,7 @@ impl KernelComposition {
             ipc,
             generation_gateway,
             service: Arc::new(Mutex::new(service)),
+            shadow_candidate,
             generations: Mutex::new(generations),
             generation_poison: Mutex::new(None),
             front_door_policy: Mutex::new(policy),
