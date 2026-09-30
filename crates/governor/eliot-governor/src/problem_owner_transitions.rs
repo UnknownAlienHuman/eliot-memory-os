@@ -404,9 +404,12 @@ fn checked_source_signal<'a>(
 /// moved the commitment on, and a record whose owner was fenced all resolve
 /// correctly here instead of committing a history entry that describes an
 /// authorization the store never saw.
+///
+/// The verdict here has to be the verdict the store reaches: this transition is
+/// prepared as committable, and a prepare the store is bound to refuse hands the
+/// caller an authorization it can never use.
 fn check_retained_authorization(
     candidate: &Problem,
-    prior: Option<&Problem>,
     lease: &AuthenticatedOwnerLease,
 ) -> Result<(), CompositionError> {
     match &candidate.ownership {
@@ -420,29 +423,30 @@ fn check_retained_authorization(
                     "owner transition does not name the presented ownership lease".to_owned(),
                 )),
                 // A record migrated as legacy-without-lease has no lost lease to
-                // name, so there is no lease identity an escalation can present.
-                // Its authority is instead the record's own live predecessor: an
-                // `Escalate` on an already-unassigned record must restate an
-                // obligation the prior committed record already carried, or
-                // refuse. Without this, `Escalate` on a legacy-unassigned record
-                // is refused with "does not name the presented ownership lease"
-                // for every possible presented lease, which is the same
-                // undischargeable-obligation defect `Ownership::retained_epoch`
-                // was added to fix on the reassignment half.
-                None => match prior {
-                    Some(prior)
-                        if matches!(
-                            prior.ownership,
-                            eliot_problem::Ownership::Unassigned(_)
-                        ) =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(owner_refused(
-                        "an unassigned record with no lost lease is not the product of an owner transition"
-                            .to_owned(),
-                    )),
-                },
+                // name, so there is no lease identity an escalation can present
+                // — and there is nothing for the presented authorization to be
+                // *over*. The store holds the same shape to the same invariant:
+                // the authorization digest it compares is re-derived from the
+                // candidate record's own retained lease identity
+                // (`ASSIGNED.lease`, or `UNASSIGNED.lost_lease`), so a record
+                // retaining neither yields no digest for the presented
+                // authorization to equal, and the commit is refused. Refusing
+                // here is what keeps the two boundaries in agreement; admitting
+                // here would build an envelope the store is bound to reject, and
+                // the caller would hold an authorization it cannot commit.
+                //
+                // The obligation such a record carries is still dischargeable,
+                // but by reassignment rather than by escalating itself. `Assign`
+                // admits a successor under a strictly greater
+                // `Ownership::retained_epoch`, which is defined to read the
+                // unassigned epoch of exactly this legacy shape — that is what
+                // stops the migration's obligation from being undischargeable.
+                // That repair lives on the `Assigned` half of this match and in
+                // the state machine that produces the successor; this arm governs
+                // only the unassigned half's escalations and does not touch it.
+                None => Err(owner_refused(
+                    "an unassigned record that retained no lost lease carries no ownership-lease identity for an escalation to be authorized by".to_owned(),
+                )),
             }
         }
         eliot_problem::Ownership::Assigned(assigned) => {
@@ -877,7 +881,7 @@ pub fn prepare_problem_owner_transition(
             "candidate record is not bound to the admitted source Signal".to_owned(),
         ));
     }
-    check_retained_authorization(&candidate, current, lease)?;
+    check_retained_authorization(&candidate, lease)?;
     let bindings = problem_owner_parameters(
         &candidate,
         expected_revision,
