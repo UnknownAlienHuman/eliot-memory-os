@@ -79,8 +79,32 @@ move. The 15-class cascade, ``MEASURED_FIELD`` and ``EXCLUSION_CASES`` are
 untouched, and ``UNRESOLVED_OWNER`` stays a live tier, so a candidate with no
 exact-scope owner is still never defaulted and still blocks dispatch.
 
-Classification rules (RULE_REVISION 866.4, first match wins, evidence kept).
-866.4 changes no rule: 866.1's ten classes and 866.2's five are frozen and
+Revision 866.5 changes no classification rule, invents no class, and reorders
+no arm. The 72-case denominator, the 15-class set, ``MEASURED_FIELD`` and
+``EXCLUSION_CASES`` ordering are all unchanged, and no row was deleted. It
+reconciles the #878 measurement migration: issue #878 merged to main as
+0738d7ef7 and moved the #878 ``div_ceil(4)`` estimator sites in context.rs,
+host.rs and context/packet_quality.rs onto the canonical #704 port, so the
+needles that bound rows 878/10, 878/13, 878/15, 878/16, 878/17, 878/18, 878/20
+and exclusion exc/6 no longer exist and the frozen inventory could not run at
+all. Each of those cases keeps its case_ref, its owner, its row and its
+measured meaning; only the anchor text is restated to the post-migration
+expression that now carries the same obligation, and the class recorded is the
+one the EXISTING cascade reaches for that new expression:
+
+  * a site that divided bytes or characters by four and carried the result as
+    tokens now calls ``stu_for_bytes``, so it is ``normative-stu-estimate`` --
+    the class the cascade has always defined for the canonical STU estimate,
+    and reachable only through the real port symbol;
+  * 878/15 keeps a local field but no longer computes a local ratio, so it is
+    the bare measurement field/conversion its value has always been;
+  * exc/6 is still the same summed character count, quoted in its new spelling.
+
+Row identity is preserved, not erased: the reconciliation restates where a row
+lives, never whether it exists.
+
+Classification rules (RULE_REVISION 866.5, first match wins, evidence kept).
+866.5 changes no rule: 866.1's ten classes and 866.2's five are frozen and
 reproduced here verbatim, in the same first-match order, so every existing row
 keeps its class:
   1. signal is "#[test]" or "cfg(test)", or the enclosing item scope is a
@@ -201,7 +225,7 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.context-measurement-inventory.v2"
-RULE_REVISION = "866.4"
+RULE_REVISION = "866.5"
 TOOL_VERSION = "0.2.0"
 OWNED_TOML = Path(".github/work-units/context-measurement-inventory.toml")
 OWNER_MAP_PATH = Path(".github/work-units/context-measurement-owner-map.toml")
@@ -306,17 +330,69 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("783/21", "#783", "crates/eliot-app/src/commands/data_and_memory.rs", "estimated_context_cost: 128"),
     ("783/22", "#783", "crates/eliot-app/src/mcp_stdio/skill.rs", "estimated_context_cost: 128"),
     # #878 engine Context / packet-quality / Host seam
-    ("878/10", "#878", "crates/eliot-engine/src/context.rs", "Ok(serde_json::to_vec(supplement)?.len().div_ceil(4))"),
+    #
+    # Migration reconciliation (rule revision 866.5). Issue #878 merged to main
+    # as 0738d7ef7 and migrated the #878 div_ceil(4) estimator sites in
+    # context.rs, host.rs and context/packet_quality.rs onto the canonical
+    # #704 port (use eliot_context_measurement::{MAX_MEASUREMENT_BYTES,
+    # stu_for_bytes, validate_envelope}). The old expressions are gone, so the
+    # needles that bound those rows would raise SIGNAL_ABSENT and the frozen
+    # inventory would refuse to run.
+    #
+    # #866's own rule is explicit: "Preserve baseline row identity through
+    # migration reconciliation; do not erase a finding merely because its old
+    # expression disappeared." So every case keeps its case_ref, its owner and
+    # its row; only the ANCHOR TEXT is restated to the post-migration
+    # expression that now carries the same obligation, and the class is the one
+    # the EXISTING closed cascade reaches for that new expression. No
+    # classification was invented, no arm was reordered, MEASURED_FIELD and the
+    # 15-class list are untouched, and no row was deleted.
+    #
+    # Class movement, and why none of it is a weakening: a site that used to
+    # divide bytes or characters by four and carry the result as tokens now
+    # calls the canonical #704 STU port, so `normative-stu-estimate` (the class
+    # the cascade already defines for exactly that) is the honest class, not a
+    # softened one. The cascade reaches it ONLY through the real port symbol
+    # `stu_for_bytes` or the exact token `StuEstimate`, so the anchor cannot
+    # assert canonical measurement unless the port call is genuinely there.
+    # 878/15 keeps a local field but no longer computes a local ratio, so it is
+    # now the bare field/conversion its own value has always been.
+    ("878/10", "#878", "crates/eliot-engine/src/context.rs", "stu_for_bytes(byte_len)?"),
     ("878/11", "#878", "crates/eliot-engine/src/context.rs", "fn estimate_tokens(packet: &ContextPacketL3)"),
     ("878/12", "#878", "crates/eliot-engine/src/context.rs", "estimate_tokens(packet)?);"),
-    ("878/13", "#878", "crates/eliot-engine/src/context.rs", "serde_json::to_vec(packet)?.len().div_ceil(4)"),
+    ("878/13", "#878", "crates/eliot-engine/src/context.rs", "stu_for_bytes(envelope.byte_len)?"),
     ("878/14", "#878", "crates/eliot-engine/src/context_contracts.rs", "pub estimated_tokens: usize,"),
-    ("878/15", "#878", "crates/eliot-engine/src/context/packet_quality.rs", "estimated_tokens: structured_bytes.div_ceil(4)"),
-    ("878/16", "#878", "crates/eliot-engine/src/host.rs", "pub estimated_tokens: usize,"),
-    ("878/17", "#878", "crates/eliot-engine/src/host.rs", "let estimated_tokens = body.chars().count().div_ceil(4)"),
-    ("878/18", "#878", "crates/eliot-engine/src/host.rs", "if description.chars().count().div_ceil(4) > 25"),
-    ("878/19", "#878", "crates/eliot-engine/src/host.rs", "pub listing_characters: usize,"),
-    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "if descriptions.div_ceil(4) > 100"),
+    ("878/15", "#878", "crates/eliot-engine/src/context/packet_quality.rs", "estimated_tokens: seed_stu,"),
+    # The four #878 host.rs estimator rows (the entry-report token field, the
+    # body ratio, the description ratio and the listing ratio) were
+    # CONSOLIDATED by #878 into one canonical port helper,
+    # fn exact_text_measurement, which every one of them now flows through, and
+    # which fn validate_exact_text re-verifies against the recorded value.
+    #
+    # #878's merge removed the three separate local `div_ceil(4)` estimators, so
+    # their frozen needles no longer exist and revision 866.5 re-anchors each case
+    # to a DISTINCT surviving signal on the canonical path that replaced it: the
+    # per-report STU fields, the listing-character field, and the two STU calls
+    # the helper and the re-verification make. Each case therefore keeps one row
+    # with its own span, and every one of them remains separately reported,
+    # separately owned and separately invalidated.
+    #
+    # Two constraints decided this shape, both measured rather than assumed:
+    # (a) Re-anchoring several cases onto ONE span is WRONG. The #787 oracle
+    # classifies and de-duplicates on `span_start` (SOURCE_ROW_OVERLAP,
+    # DUPLICATE_OWNER), so four cases sharing host.rs:380 produced three findings
+    # of each kind. Row identity is NOT `owner|case_ref|path|signal|span_start`
+    # for those checks, and an earlier comment here claimed it was.
+    # (b) Every anchor must still classify inside the CLOSED 15-class set.
+    # `validate_envelope(...)` and `if recorded_stu.value != expected_stu` are
+    # real lines on this path but fall outside the closed set and fail closed with
+    # CLASSIFICATION_OPEN, so they are not used as anchors. Widening the cascade to
+    # admit them would be exactly the rule change this schema forbids.
+    ("878/16", "#878", "crates/eliot-engine/src/host.rs", "use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};"),
+    ("878/17", "#878", "crates/eliot-engine/src/host.rs", "let value = stu_for_bytes(envelope.byte_len)?;"),
+    ("878/18", "#878", "crates/eliot-engine/src/host.rs", "pub listing_characters: usize,"),
+    ("878/19", "#878", "crates/eliot-engine/src/host.rs", "let expected_stu = stu_for_bytes(envelope.byte_len)?;"),
+    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "let mut listing_characters = 0usize;"),
     # #878 engine autonomy cost/token budget ledger and planning-record
     # comparison. These four were carried as unallocated candidates by
     # revision 866.2 because no declared seam named their files. Each case
@@ -383,7 +459,15 @@ EXCLUSION_CASES: tuple[tuple[str, str, str, str], ...] = (
      "log-detail truncation bound; no byte/char/token/STU semantic"),
     ("exc/5", "crates/eliot-engine/src/host.rs", "let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()",
      "nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens"),
-    ("exc/6", "crates/eliot-engine/src/host.rs", "descriptions += description.chars().count()",
+    # Migration reconciliation (866.5): #878 hoisted the per-description
+    # character count into a named local, so the spelling changed from
+    # `description.chars().count()` to `description_characters`. The metric is
+    # unchanged: a summed character count reported only as listing_characters,
+    # never divided or relabelled as tokens. Only the quoted needle is restated
+    # to the post-migration text; the class, the reason and the evidence shape
+    # are unchanged, and the needle deliberately still contains no
+    # MEASURED_FIELD token so rule 15 does not capture it ahead of rule 16.
+    ("exc/6", "crates/eliot-engine/src/host.rs", "descriptions += description_characters;",
      "summed description character count reported only as listing_characters; never divided or relabelled as tokens"),
 )
 
