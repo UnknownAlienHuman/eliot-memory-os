@@ -1496,6 +1496,18 @@ fn is_daemon_operation(operation: &str) -> bool {
             // re-hash, same-fence record read-back, then the binder's own
             // ready/epoch/fence checks); this entry only lets the frame reach it.
             | "bind_notify_launch_grant"
+            // Issue #1777 (I11.8): the Operator session token, the fresh
+            // short-lived Kernel challenge/session token the WinUI client
+            // presents when it redeems its broker binding. The marker is the
+            // one string the admitted dispatch at `daemon_request_dispatch.rs`
+            // already serves; without this entry the frame fell through every
+            // predicate, failed the `ProcessExecutionRequest` decode, and
+            // fenced the session before the arm was ever entered. This entry
+            // only lets the frame reach it: the arm still proves the live
+            // session fence and Material authority, and the token, its lease
+            // and its bound authority epoch/fence/generation are produced by
+            // the Kernel-side binder, never by the payload or this predicate.
+            | "bind_operator_session_token"
             // Issue #1780: the canonical persistent notification route. Both
             // markers are the store contract's own closed operation names
             // (`ApplyNotificationState` / `GetNotificationState`), which are
