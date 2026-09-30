@@ -6,9 +6,13 @@ namespace Eliot.Operator.Services;
 public interface IGovernorClient
 {
     /// The broker-granted role and exact capability set of the live binding,
-    /// or null when no binding is established. Views and mutations gate on
-    /// this grant: a binding that withholds a capability withholds its views
-    /// and refuses its mutations instead of executing them.
+    /// or null when no grant is PROVABLE at this instant. Null is not "none
+    /// was ever established": a binding whose transport dropped, was aborted
+    /// or became unreadable also reports null rather than a stale grant, so
+    /// null is the absence of a proof, never a fact about the past, and it
+    /// never authorizes. Views and mutations gate on this grant: a binding
+    /// that withholds a capability withholds its views and refuses its
+    /// mutations instead of executing them.
     OperatorRoleBinding? GrantedBinding { get; }
 
     Task<OperatorSnapshot> SnapshotAsync(
@@ -33,8 +37,11 @@ public interface IGovernorClient
     /// Reconciles the SAME operation after a lost response: resends the exact
     /// retained envelope bytes (same operation identity) and returns the owner
     /// receipt. Minting a second identity for the same logical mutation is
-    /// forbidden; pipe loss without a fresh owner handoff surfaces the typed
-    /// restart-required disposition instead of a silent retry.
+    /// forbidden, and neither pipe-loss branch is a silent retry: a loss
+    /// BEFORE this request's write could have reached the owner surfaces the
+    /// typed restart-required disposition, and a loss at or after the write
+    /// surfaces the typed unknown-outcome fault under the SAME identity, so a
+    /// possibly-executed mutation is never reported as a proven non-effect.
     Task<JsonElement> ReconcileAsync(
         JsonElement commandEnvelope,
         CancellationToken cancellationToken = default);
