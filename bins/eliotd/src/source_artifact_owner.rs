@@ -161,6 +161,9 @@ impl SourceArtifactOwner {
                 return Err(SourceArtifactOwnerError::WrongEffect);
             }
             reference.validate()?;
+            if admission.resource_ref() != reference.expected_ready_receipt_id.as_str() {
+                return Err(BlobError::MetadataPayloadMismatch.into());
+            }
             profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
             let policy = blob_policy_binding(profile)?;
             let residency = blob_residency_domains(profile)?;
@@ -200,6 +203,9 @@ impl SourceArtifactOwner {
             return Err(SourceArtifactOwnerError::WrongEffect);
         }
         payload.validate()?;
+        if admission.resource_ref() != payload.ready_receipt_id.as_str() {
+            return Err(BlobError::MetadataPayloadMismatch.into());
+        }
         if payload.receipt_kind != eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND {
             return Err(SourceArtifactOwnerError::WrongCapturedPayloadKind);
         }

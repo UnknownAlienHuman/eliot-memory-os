@@ -473,6 +473,17 @@ impl BlobRootOwner {
         self.process_id
     }
 
+    /// Returns the resource generation from this owner's admitted lifecycle
+    /// fence. Production physical providers use this exact owner-issued value
+    /// to fence their backend view; an owner claimed without a lifecycle fence
+    /// cannot issue that production binding.
+    #[must_use]
+    pub fn lifecycle_resource_generation(&self) -> Option<u64> {
+        self.lifecycle_fence
+            .as_ref()
+            .map(|fence| fence.resource_generation.value())
+    }
+
     #[must_use]
     pub fn claim_id(&self) -> &str {
         &self.claim_id

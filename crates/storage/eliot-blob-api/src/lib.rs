@@ -2217,9 +2217,11 @@ pub struct BlobCasRequest {
     pub expected: BlobCasState,
     pub replacement_sha256: String,
     pub replacement_length: u64,
-    /// Provider generation pinned before the mutation is attempted. This is
-    /// distinct from the root lease generation and prevents a stale provider
-    /// view from being used as the compare-and-replace authority.
+    /// Provider-view generation pinned before the mutation is attempted. This
+    /// is a separate binding from the root lease even when an owner supplies
+    /// the same lifecycle resource generation for both. The Windows physical
+    /// provider uses its retained `BlobRootOwner` lifecycle generation so a
+    /// recreated provider view stays bound to the original owner.
     pub expected_backend_generation: u64,
     pub requested_durability: BlobCasDurability,
 }
