@@ -256,6 +256,14 @@ impl KernelComposition {
             None,
             epoch.as_ref().map(|value| value.as_str()),
         );
+        if validated {
+            let request_id = super::kernel_diagnostics::bound_field(request.message_id.as_str());
+            context.record("request_id", request_id.text());
+            context.record(
+                "request_id_redaction",
+                request_id.redaction_status().unwrap_or("none"),
+            );
+        }
         observe_control_in_context("kernel.control.request_received", "attempt", &context);
         match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence, &context))
             .instrument(context.clone())

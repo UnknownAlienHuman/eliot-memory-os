@@ -2947,6 +2947,12 @@ impl KernelComposition {
             None,
             None,
         );
+        let bounded_request_id = super::kernel_diagnostics::bound_field(request_id.as_str());
+        context.record("request_id", bounded_request_id.text());
+        context.record(
+            "request_id_redaction",
+            bounded_request_id.redaction_status().unwrap_or("none"),
+        );
         context.in_scope(|| observe_daemon_request("kernel.daemon_request_received", "attempt"));
         context
             .in_scope(|| observe_daemon_operation(trusted_daemon_operation(operation), "received"));

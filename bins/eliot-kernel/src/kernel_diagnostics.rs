@@ -487,6 +487,8 @@ pub fn operation_context(
     tracing::info_span!(
         target: KERNEL_DIAGNOSTICS_TARGET,
         "kernel.operation",
+        request_id = "unavailable",
+        request_id_redaction = "none",
         operation = operation.text(),
         operation_redaction = operation.redaction_status().unwrap_or("none"),
         generation = generation.text(),

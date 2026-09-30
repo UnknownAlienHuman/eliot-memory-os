@@ -172,10 +172,7 @@ fn record_process_start_request_context(
 
 /// Projects the physical identity already validated into a successful start
 /// receipt onto the same bounded operation span.
-fn record_process_start_receipt_identity(
-    context: &tracing::Span,
-    receipt: &ProcessStartReceipt,
-) {
+fn record_process_start_receipt_identity(context: &tracing::Span, receipt: &ProcessStartReceipt) {
     let identity = receipt.identity();
     let physical = identity.physical();
     let process_id = physical.process_id().to_string();
@@ -186,11 +183,7 @@ fn record_process_start_receipt_identity(
         "process_start_100ns",
         Some(start_time_100ns.as_str()),
     );
-    record_process_context_field(
-        context,
-        "image_sha256",
-        Some(identity.executable_sha256()),
-    );
+    record_process_context_field(context, "image_sha256", Some(identity.executable_sha256()));
     observe_process_in_context(
         context,
         "kernel.process.start_identity_observed",
