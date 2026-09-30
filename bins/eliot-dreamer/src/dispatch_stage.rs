@@ -6,9 +6,11 @@
 //! resolves the exact native owner for one closed [`JobClass`] and invokes it
 //! with no fallthrough: Curation names the A-31 curation fan-in
 //! ([`route_validated_curation`](eliot_dreamer_curation::route_validated_curation)),
-//! Orientation names the Orientation pulse composer
-//! ([`project_validated_orientation`], which reaches
-//! `eliot-dreamer-orientation` `build_projection`), and every
+//! Orientation names the production Orientation composer
+//! ([`dispatch_orientation`], which reaches
+//! `eliot-dreamer-orientation` `build_projection` through the versioned
+//! [`ProductionOrientationInputs`](crate::production_orientation::ProductionOrientationInputs)
+//! carrier), and every
 //! other class names its native owner. Exhaustive with no wildcard arm:
 //! extending the closed taxonomy breaks compilation here until the new class
 //! is assigned an owning slice.
@@ -30,11 +32,10 @@
 //! entry, then resolves the production carrier prerequisites and returns the
 //! typed [`DreamResult::Orientation`] complete/partial/blocked result (issue
 //! #2901): with no CC-002 outcome, CC-004 set, or stage-owner records
-//! in-binary, production returns blocked, never a packet. The packet-only
-//! compatibility seam ([`dispatch_orientation_with`],
-//! [`project_validated_orientation`]) stays byte-stable for its tests but is
-//! not the production pulse and cannot satisfy the #41 Product Pulse
-//! acceptance; Curation genuinely resolves descriptors, validates
+//! in-binary, production returns blocked, never a packet. Orientation has
+//! exactly one composition path: the packet-only compatibility seam is
+//! deleted, so no alternative route can produce a candidate packet outside
+//! the versioned carrier. Curation genuinely resolves descriptors, validates
 //! registry/policy/screen, and routes the injected batch through the real
 //! A-31 fan-in; `ResearchSynthesis` and `Maintenance` fail closed naming
 //! their missing Governor-resolved inputs; the remaining five classes refuse
@@ -58,10 +59,8 @@ use eliot_dreamer_candidate_validation::{
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
 use eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate;
 use eliot_dreamer_contracts::{
-    BudgetUsage, ContractViolation, DreamInputBundle, DreamJobAdmission,
-    GroundedDreamDraft as TextGroundedDraft, JobClass, ModelDraft as TextModelDraft,
-    PreservationReport, ScreenBinding, ScreenState, SourceDisposition, ValidatedCandidate,
-    ValidationPolicy,
+    ContractViolation, DreamInputBundle, DreamJobAdmission, JobClass, ScreenBinding, ScreenState,
+    SourceDisposition,
 };
 use eliot_dreamer_curation::{
     CurationCandidateSet, CurationMemberOutcome, CurationRoutingError, MAX_BATCH_ITEMS,
@@ -344,39 +343,6 @@ pub(crate) fn require_validated_binding(
     Ok(())
 }
 
-/// Projects one v1-validated candidate through the compatibility composer.
-///
-/// This is the packet-only compatibility seam (the `project_once` body
-/// exercised by the validation-stage integration tests): it takes only
-/// `&ValidatedCandidate` — the receipt-bound v1 aggregate — plus the
-/// admitted job/bundle/policy it was validated against, never a raw draft.
-/// The pulse runs with packet inputs only; every other stage records an
-/// explicit pending disposition, and the packet projection is byte-identical
-/// to the direct owner call. Raw unvalidated input cannot reach the native
-/// projector through this seam: construction requires the v1 validator
-/// receipt, and dispatch proves the structured receipt binding first.
-/// Governor-resolved evidence and epistemic-position handles travel empty
-/// here (G5: locally built envelopes would be self-issued authority). This
-/// seam is not the production pulse and its output cannot satisfy the #41
-/// Product Pulse acceptance.
-#[allow(
-    dead_code,
-    reason = "packet-only compatibility seam retained for validation-stage tests; production dispatches through dispatch_orientation"
-)]
-pub(crate) fn project_validated_orientation(
-    admitted_job: &AdmittedOrientationJob,
-    candidate: &ValidatedCandidate,
-    bundle: &DreamInputBundle,
-    policy: &OrientationPolicy,
-) -> Result<OrientationPacketCandidate, OrientationError> {
-    crate::pulse::run_compat_orientation_pulse(admitted_job, candidate, bundle, policy)
-        .map(|pulse| {
-            pulse.verify_compat();
-            pulse.packet
-        })
-        .map_err(crate::pulse::PulseError::into_orientation_error)
-}
-
 /// Dispatches one admitted Orientation job through the production composer.
 ///
 /// Takes the structured A-05 validated candidate alongside the admitted pair:
@@ -482,83 +448,6 @@ fn orientation_dispatch_policy() -> Result<OrientationPolicy, DreamerError> {
     Ok(policy)
 }
 
-/// Dispatches one admitted Orientation job with injectable owner calls.
-///
-/// This is the packet-only compatibility seam: `validate_once` wraps the real
-/// v1 A-05 entry and `project_once` wraps the compatibility projector; both
-/// are `FnOnce`, so neither owner can run twice for one admission through
-/// this seam. Deterministic tests pass counting wrappers around the real
-/// functions to prove validator-once/handler-once-or-never. The structured
-/// receipt binding ([`require_validated_binding`]) runs before either owner
-/// call; a v1 semantic rejection maps to the static refusal and never reaches
-/// the projector, so rejection invokes zero handlers with no fallback
-/// dispatch. Production dispatches through [`dispatch_orientation`] instead;
-/// this seam is not the production pulse and its output cannot satisfy the
-/// #41 Product Pulse acceptance.
-#[allow(
-    dead_code,
-    reason = "packet-only compatibility seam retained for validation-stage tests; production dispatches through dispatch_orientation"
-)]
-pub(crate) fn dispatch_orientation_with(
-    admission: &KernelJobAdmission,
-    job: &DreamJobInput,
-    validated: &ValidatedGroundingCandidate,
-    validate_once: impl FnOnce(
-        &DreamJobAdmission,
-        &DreamInputBundle,
-        &TextModelDraft,
-        &TextGroundedDraft,
-        &ValidationPolicy,
-        &BudgetUsage,
-        &PreservationReport,
-    ) -> Result<CandidateValidationOutcome, DreamDraftValidationError>,
-    project_once: impl FnOnce(
-        &AdmittedOrientationJob,
-        &ValidatedCandidate,
-        &DreamInputBundle,
-        &OrientationPolicy,
-    ) -> Result<OrientationPacketCandidate, OrientationError>,
-) -> Result<DreamResult, DreamerError> {
-    require_validated_binding(admission, job, validated)?;
-    let admitted = admission_of(admission, job)?;
-    let bundle = bundle_of(admission, job)?;
-    // The frame binds admitted bundle material; see
-    // `orientation_frame_source`.
-    let frame_source = orientation_frame_source(&bundle)?;
-    let model = v1_model_of(admission, job)?;
-    let grounded = v1_grounded_of(&model)?;
-    let usage = usage_of(&admitted.budget);
-    let validation_policy = validation_policy_of(admitted.policy_ref.as_str())?;
-    let preservation = preservation_of()?;
-    let candidate = match validate_once(
-        &admitted,
-        &bundle,
-        &model,
-        &grounded,
-        &validation_policy,
-        &usage,
-        &preservation,
-    ) {
-        Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,
-        Ok(CandidateValidationOutcome::Rejected(_)) => {
-            return Err(DreamerError::InvalidAdmission(
-                "validation semantic rejection",
-            ));
-        }
-        Err(error) => return Err(v1_denied(&error)),
-    };
-    let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
-    let admitted_job = orientation_admitted_job(admitted, frame);
-    let policy = orientation_dispatch_policy()?;
-    // Orientation adaptations (G1-G5) as owned by the orientation crate and
-    // composed here: G1 scope/state-fence split via the admitted frame, G2/G3
-    // native shapes, G4 marker preservation in `map_orientation_packet`, G5
-    // empty Governor-sourced handles inside `project_validated_orientation`.
-    let packet = project_once(&admitted_job, &candidate, &bundle, &policy)
-        .map_err(|error| orientation_denied(&error))?;
-    Ok(DreamResult::Packet(map_orientation_packet(&packet, job)))
-}
-
 /// Maps a v1 A-05 validation refusal to a typed fail-closed refusal.
 ///
 /// Every mapping is [`DreamerError::InvalidAdmission`] (request-rejected
@@ -590,8 +479,8 @@ fn v1_denied(error: &DreamDraftValidationError) -> DreamerError {
 /// probes never execute), invalidation conditions, and projection-input
 /// provenance (proof of inputs, never of truth) travel likewise.
 ///
-/// Shared by the compatibility seam and the production composer so the
-/// packet projection stays byte-identical on both paths.
+/// The single packet mapping the production composer applies; the deleted
+/// compatibility seam no longer has a second path to stay identical to.
 pub(crate) fn map_orientation_packet(
     packet: &OrientationPacketCandidate,
     job: &DreamJobInput,

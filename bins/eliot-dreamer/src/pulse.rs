@@ -30,15 +30,15 @@
 //! carrier, whose CC-002 outcome and CC-004 projection set are mandatory and
 //! validated first (schema, bundle-digest binding, job binding, mutual fence
 //! compatibility, one coherent identity closure). Missing prerequisites yield
-//! a typed blocked result, never a packet. [`run_orientation_pulse`] remains a
-//! generic partial composer only behind an explicit [`PulseDenominator`]: a
-//! stage whose caller-supplied inputs are absent records an explicit pending
-//! disposition and never blocks the packet; a stage whose inputs are present
-//! but whose owner refuses fails that composition, so a partial pulse is never
-//! thinned into a packet silently. The packet-only compatibility wrapper
-//! ([`run_compat_orientation_pulse`]) is not the production pulse and cannot
-//! satisfy the #41 Product Pulse acceptance. Error payloads are bounded static
-//! fields; nothing secret flows.
+//! a typed blocked result, never a packet. The per-stage owner entries answer
+//! to the explicit mandatory [`PulseDenominator`]: a stage whose caller-supplied
+//! inputs are absent records an explicit pending disposition, and a stage whose
+//! inputs are present but whose owner refuses fails that stage, so a partial
+//! pulse is never thinned into a packet silently. There is no packet-only
+//! compatibility composition: the mandatory denominator is the only denominator
+//! this crate names, so no alternative path can produce a candidate packet
+//! outside the production carrier. Error payloads are bounded static fields;
+//! nothing secret flows.
 //!
 //! Binding notes: the resolved epistemic position is resolver policy output,
 //! never a Governor-issued handle, so it is reported as its own stage and the
@@ -70,14 +70,10 @@ use eliot_dreamer_conflict_analysis::{
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as GroundedClaimDraft;
 use eliot_dreamer_contracts::{
     ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft,
-    ModelRouteDisposition, ModelRouteOutcome, ValidatedCandidate, ValidatedCurationItem,
-    ValidatedDreamDraft, ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes,
-    digest_hex,
+    ModelRouteDisposition, ModelRouteOutcome, ValidatedCurationItem, ValidatedDreamDraft,
+    ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
 };
-use eliot_dreamer_orientation::{
-    AdmittedOrientationJob, CurrentEpistemicPositionHandle, OrientationError, OrientationPolicy,
-    projection::{OrientationPacketCandidate, build_projection},
-};
+use eliot_dreamer_orientation::OrientationError;
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
 use eliot_dreamer_rival_model::{
     RivalModelSet as StructuredRivalModelSet, RivalPolicy, structure_rival_models,
@@ -316,32 +312,23 @@ impl PulseStageId {
 /// Canonical identity of the mandatory ten-member denominator.
 pub(crate) const PULSE_DENOMINATOR_IDENTITY: &str = "orientation-pulse-denominator:v1:classification,cue_activation,epistemic_position,understanding,grounding,rivals,conflict,probes,candidates,packet";
 
-/// Explicit composition denominator: the expected member set plus the
-/// boundary policy the composition answers to.
+/// Explicit composition denominator: the canonical member set this crate
+/// composes against. Whether CC-002/CC-004 are mandatory is no longer a flag
+/// on the denominator: production carries them as non-optional
+/// [`ProductionOrientationInputs`](crate::production_orientation::ProductionOrientationInputs)
+/// members, so the carrier itself is the admission proof and no optional
+/// alternative denominator exists to weaken it.
 pub(crate) struct PulseDenominator {
     /// Canonical denominator identity carried by the result.
     pub identity: &'static str,
     /// Expected members in composition order.
     pub members: &'static [PulseStageId],
-    /// Whether CC-002/CC-004 boundaries are mandatory prerequisites.
-    pub boundaries_required: bool,
 }
 
-/// Mandatory production denominator: all ten members plus both boundaries.
+/// Mandatory production denominator: all ten members.
 pub(crate) const MANDATORY_DENOMINATOR: PulseDenominator = PulseDenominator {
     identity: PULSE_DENOMINATOR_IDENTITY,
     members: &PulseStageId::ORDER,
-    boundaries_required: true,
-};
-
-/// Compatibility denominator: same ten members, boundaries optional, absent
-/// stage inputs record pending instead of blocking. Packet-only compositions
-/// under this denominator are candidate-only compatibility output and cannot
-/// satisfy the #41 Product Pulse acceptance.
-pub(crate) const COMPAT_DENOMINATOR: PulseDenominator = PulseDenominator {
-    identity: PULSE_DENOMINATOR_IDENTITY,
-    members: &PulseStageId::ORDER,
-    boundaries_required: false,
 };
 
 /// Proof ceiling for an executed member: candidate-only, never promoted.
@@ -411,14 +398,6 @@ impl<T> PulseStage<T> {
             output: None,
         }
     }
-
-    /// Whether this member holds the compatibility contract: pending with a
-    /// reason and no output.
-    fn is_pending_compat(&self) -> bool {
-        self.disposition == OrientationStageDisposition::Pending
-            && self.reason.is_some()
-            && self.output.is_none()
-    }
 }
 
 /// Canonical content digest over one owner output value.
@@ -427,97 +406,6 @@ impl<T> PulseStage<T> {
 /// treats as an owner defect.
 pub(crate) fn output_digest<T: serde::Serialize>(value: &T) -> Option<String> {
     canonical_bytes(value).ok().map(|bytes| digest_hex(&bytes))
-}
-
-/// Complete Orientation pulse request: CC-002/CC-004 boundary values, the
-/// always-required packet inputs, and optional per-stage owner inputs.
-///
-/// The explicit denominator names the member set this composition answers
-/// to; production never builds this request directly (it composes from the
-/// versioned carrier with mandatory boundaries instead).
-pub(crate) struct OrientationPulseRequest<'a, F> {
-    /// Explicit composition denominator carried by the result.
-    pub denominator: &'static PulseDenominator,
-    /// CC-002 routed model outcome the pulse accounts for.
-    pub model_outcome: Option<&'a ModelRouteOutcome>,
-    /// CC-004 canonical projection set the pulse consumes.
-    pub projections: Option<&'a CanonicalProjectionSet>,
-    /// Admitted Orientation job.
-    pub admitted_job: &'a AdmittedOrientationJob,
-    /// Receipt-bound v1 validated candidate.
-    pub validated_candidate: &'a ValidatedCandidate,
-    /// Bounded bundle the packet projects.
-    pub bundle: &'a DreamInputBundle,
-    /// Governor-resolved epistemic-position handles for the packet.
-    pub cep_handles: &'a [CurrentEpistemicPositionHandle],
-    /// Sealed orientation policy.
-    pub policy: &'a OrientationPolicy,
-    /// Classification stage inputs.
-    pub classification: Option<ClassificationStage<'a>>,
-    /// Cue-activation stage inputs.
-    pub cue_activation: Option<CueActivationStage<'a>>,
-    /// Epistemic resolution request over admitted records.
-    pub epistemic: Option<&'a PositionRequest>,
-    /// Understanding stage inputs with the route measurement.
-    pub understanding: Option<UnderstandingStage<'a, F>>,
-    /// Claim-grounding request (cloned; the owner takes owned input).
-    pub grounding: Option<&'a GroundingRequest>,
-    /// Rival-structuring stage inputs.
-    pub rivals: Option<RivalStage<'a>>,
-    /// Conflict-analysis stage inputs.
-    pub conflict: Option<ConflictStage<'a>>,
-    /// Discriminative probe-plan parameters.
-    pub probes: Option<ProbePlanParams<'a>>,
-    /// Context-candidate stage inputs.
-    pub candidates: Option<CandidateStage<'a>>,
-}
-
-/// Complete Orientation pulse: the expected denominator, one disposition
-/// per stage, plus the packet.
-pub(crate) struct OrientationPulse {
-    /// Explicit denominator this composition answered to.
-    pub denominator: &'static PulseDenominator,
-    /// Classification stage outcome.
-    pub classification: PulseStage<ClassificationResult>,
-    /// Cue-activation stage outcome.
-    pub cue_activation: PulseStage<CueActivationEvaluation>,
-    /// Current Epistemic Position stage outcome.
-    pub epistemic_position: PulseStage<ResolvedEpistemicPosition>,
-    /// Active Understanding View stage outcome.
-    pub understanding: PulseStage<ActiveUnderstandingViewResult>,
-    /// Claim-grounding stage outcome.
-    pub grounding: PulseStage<GroundedClaimDraft>,
-    /// Rival-structuring stage outcome.
-    pub rivals: PulseStage<StructuredRivalModelSet>,
-    /// Conflict-analysis stage outcome.
-    pub conflict: PulseStage<ConflictAnalysisCandidate>,
-    /// Probe-plan stage outcome.
-    pub probes: PulseStage<ProbePlan>,
-    /// Context-candidate stage outcome.
-    pub candidates: PulseStage<ContextCandidateSetResult>,
-    /// Candidate-only Orientation packet.
-    pub packet: OrientationPacketCandidate,
-}
-
-impl OrientationPulse {
-    /// Verifies the compatibility contract: a boundaries-optional
-    /// denominator with every non-packet member pending.
-    ///
-    /// This is a compatibility-seam self-check, not a production invariant:
-    /// production answers to the mandatory denominator with typed
-    /// complete/partial/blocked results instead.
-    pub(crate) fn verify_compat(&self) {
-        debug_assert!(!self.denominator.boundaries_required);
-        debug_assert!(self.classification.is_pending_compat());
-        debug_assert!(self.cue_activation.is_pending_compat());
-        debug_assert!(self.epistemic_position.is_pending_compat());
-        debug_assert!(self.understanding.is_pending_compat());
-        debug_assert!(self.grounding.is_pending_compat());
-        debug_assert!(self.rivals.is_pending_compat());
-        debug_assert!(self.conflict.is_pending_compat());
-        debug_assert!(self.probes.is_pending_compat());
-        debug_assert!(self.candidates.is_pending_compat());
-    }
 }
 
 /// Fail-closed pulse error with bounded static refusal fields.
@@ -593,16 +481,6 @@ impl PulseError {
             Self::DeadlineExceeded => OrientationError::RevalidationRequired,
         }
     }
-}
-
-/// Measurement closure used when the understanding stage is absent.
-///
-/// The concrete `fn` type pins the request generic parameter; it is never
-/// invoked because the stage is `None`.
-type NoMeasurement = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
-
-fn no_understanding<'a>() -> Option<UnderstandingStage<'a, NoMeasurement>> {
-    None
 }
 
 pub(crate) fn fences_compatible(left: &StateFence, right: &StateFence) -> bool {
@@ -856,98 +734,4 @@ pub(crate) fn run_candidate_stage(
         )),
         (_, None) => Ok(PulseStage::pending(PulseStageId::Candidates)),
     }
-}
-
-/// Runs the generic partial Orientation pulse through the named owner entries.
-///
-/// This composer stays behind the explicit request denominator: supplied
-/// boundary values validate first; each present stage executes in pulse order
-/// and any owner refusal fails the composition before the packet; absent stage
-/// inputs record explicit pending dispositions. The packet always projects
-/// from the caller-supplied validated candidate, bundle, handles, and policy.
-/// Production never calls this directly; it composes from the versioned
-/// carrier with mandatory boundaries instead.
-pub(crate) fn run_orientation_pulse<F>(
-    request: OrientationPulseRequest<'_, F>,
-) -> Result<OrientationPulse, PulseError>
-where
-    F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
-{
-    if request.denominator.boundaries_required
-        && (request.model_outcome.is_none() || request.projections.is_none())
-    {
-        return Err(PulseError::Boundary("production boundaries required"));
-    }
-    if let Some(outcome) = request.model_outcome {
-        check_model_boundary(outcome, request.bundle)?;
-    }
-    if let Some(projections) = request.projections {
-        check_projection_boundary(projections, request.bundle)?;
-    }
-
-    let classification = run_classification_stage(request.classification.as_ref())?;
-    let cue_activation = run_cue_stage(request.cue_activation.as_ref())?;
-    let epistemic_position = run_epistemic_stage(request.epistemic)?;
-    let understanding = run_understanding_stage(request.understanding)?;
-    let grounding = run_grounding_stage(request.grounding)?;
-    let rivals = run_rival_stage(request.rivals.as_ref())?;
-    let conflict = run_conflict_stage(request.conflict.as_ref())?;
-    let probes = run_probe_stage(request.probes)?;
-    let candidates = run_candidate_stage(request.projections, request.candidates.as_ref())?;
-
-    let packet = build_projection(
-        request.admitted_job,
-        request.validated_candidate,
-        request.bundle,
-        request.cep_handles,
-        request.policy,
-    )?;
-
-    Ok(OrientationPulse {
-        denominator: request.denominator,
-        classification,
-        cue_activation,
-        epistemic_position,
-        understanding,
-        grounding,
-        rivals,
-        conflict,
-        probes,
-        candidates,
-        packet,
-    })
-}
-
-/// Runs the packet-only compatibility pulse: packet inputs only, every other
-/// stage explicitly pending.
-///
-/// This is the compatibility call site for the pulse composer, retained so the
-/// packet path stays byte-stable while production moves to typed
-/// complete/partial/blocked results. It is not the production pulse and its
-/// output cannot satisfy the #41 Product Pulse acceptance.
-pub(crate) fn run_compat_orientation_pulse(
-    admitted_job: &AdmittedOrientationJob,
-    validated_candidate: &ValidatedCandidate,
-    bundle: &DreamInputBundle,
-    policy: &OrientationPolicy,
-) -> Result<OrientationPulse, PulseError> {
-    run_orientation_pulse(OrientationPulseRequest {
-        denominator: &COMPAT_DENOMINATOR,
-        model_outcome: None,
-        projections: None,
-        admitted_job,
-        validated_candidate,
-        bundle,
-        cep_handles: &[],
-        policy,
-        classification: None,
-        cue_activation: None,
-        epistemic: None,
-        understanding: no_understanding(),
-        grounding: None,
-        rivals: None,
-        conflict: None,
-        probes: None,
-        candidates: None,
-    })
 }
