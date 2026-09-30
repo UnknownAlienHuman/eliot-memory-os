@@ -43,10 +43,10 @@ enum ScopedCanonicalEvidence {
         readbacks: BTreeMap<String, OrderingHeadReadback>,
     },
     Receipt {
-        token: WriterReservationToken,
-        reconciliation: CanonicalReconciliation,
+        token: Box<WriterReservationToken>,
+        reconciliation: Box<CanonicalReconciliation>,
         store_receipt: Box<WriteReceipt>,
-        envelope: ReceiptEnvelope,
+        envelope: Box<ReceiptEnvelope>,
     },
 }
 
@@ -188,10 +188,10 @@ impl CanonicalStoreEvidence {
 
         self.with_scope(
             ScopedCanonicalEvidence::Receipt {
-                token: token.clone(),
-                reconciliation: reconciliation.clone(),
+                token: Box::new(token.clone()),
+                reconciliation: Box::new(reconciliation.clone()),
                 store_receipt: Box::new(store_receipt.clone()),
-                envelope,
+                envelope: Box::new(envelope),
             },
             action,
         )
@@ -305,10 +305,10 @@ impl CanonicalEvidenceProvider for CanonicalStoreEvidence {
                 "reconciliation requires a live Store receipt".to_owned(),
             ));
         };
-        if token != &observed_token
-            || reconciliation != &observed_reconciliation
-            || reconciliation.receipt != envelope
-            || store_receipt.require_reconciliation_envelope().ok() != Some(&envelope)
+        if token != observed_token.as_ref()
+            || reconciliation != observed_reconciliation.as_ref()
+            || &reconciliation.receipt != envelope.as_ref()
+            || store_receipt.require_reconciliation_envelope().ok() != Some(envelope.as_ref())
         {
             return Err(OrsError::CanonicalEvidence(
                 "ORS reconciliation differs from the scoped Store receipt and token".to_owned(),
@@ -319,7 +319,11 @@ impl CanonicalEvidenceProvider for CanonicalStoreEvidence {
 
     fn verify_receipt(&self, receipt: &ReceiptEnvelope) -> Result<(), OrsError> {
         match self.active()? {
-            ScopedCanonicalEvidence::Receipt { envelope, .. } if &envelope == receipt => Ok(()),
+            ScopedCanonicalEvidence::Receipt { envelope, .. }
+                if envelope.as_ref() == receipt =>
+            {
+                Ok(())
+            }
             _ => Err(OrsError::CanonicalEvidence(
                 "receipt verification requires the exact live Store owner receipt".to_owned(),
             )),

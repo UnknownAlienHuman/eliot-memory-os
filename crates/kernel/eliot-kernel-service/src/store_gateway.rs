@@ -902,14 +902,22 @@ impl AcceptedReservedWrite {
 pub enum StagedReservedWriteError {
     /// The exact staged token is still durable, but an earlier scope owner
     /// blocks execution. Retry or restore this same operation; never restage.
-    RetryablePredecessorPending { operation_id: String },
+    RetryablePredecessorPending {
+        /// Operation whose exact durable reservation remains pending.
+        operation_id: String,
+    },
     /// A pre-send gate refused execution. If staging already succeeded, the
     /// accepted token remains durable and can be polled or restored.
-    Refused { detail: String },
+    Refused {
+        /// Reason the pre-send gate refused the staged write.
+        detail: String,
+    },
     /// Acceptance, claim, send, or receipt evidence is ambiguous. Query only
     /// the exact Store receipt; never retransmit from this result.
     OutcomeUnknown {
+        /// Operation whose retained Store receipt must be queried.
         operation_id: String,
+        /// Evidence that made the write outcome ambiguous.
         detail: String,
     },
 }
@@ -941,9 +949,100 @@ impl From<String> for StagedReservedWriteError {
     }
 }
 
+fn validate_staged_request_binding(
+    request: &ReservedWriteRequest,
+    token: &WriterReservationToken,
+    created_at_ms: i64,
+    binding: &eliot_ors::RecoveryWriteBinding,
+    source: &OriginalWriteSubmission,
+) -> Result<(), StagedReservedWriteError> {
+    if request.admission.operation_id.as_str() != token.operation_id.as_str()
+        || request.admission.reservation_id != token.reservation_id.as_str()
+        || request.admission.reservation_order != token.reservation_order
+        || request.admission.prepared_transition_digest != token.prepared_transition_sha256
+        || binding.operation_id != token.operation_id
+        || binding.idempotency_key.as_str() != request.transition.identity.idempotency_key.as_str()
+        || binding.canonical_request_sha256.as_str()
+            != request.transition.identity.canonical_request_hash.as_str()
+        || binding.prepared_transition_sha256.as_str()
+            != token.prepared_transition_sha256.as_str()
+        || binding.admission_contract_set_digest.as_str()
+            != request.transition.admission_contract_set_digest.as_str()
+        || binding.operation_manifest_digest.as_str()
+            != request.transition.operation_manifest_digest.as_str()
+        || binding.authority_epoch != token.writer_epoch
+        || binding.state_fence != token.state_fence
+        || binding.payload_created_at_ms != created_at_ms
+        || request.admission.created_at_ms != created_at_ms
+        || binding.write_intent_id.as_str() != source.write_intent_id.as_str()
+        || binding.write_envelope_protocol_version != source.protocol_version
+        || binding.write_response_mode.as_deref() != Some(source.response_mode.as_str())
+    {
+        return Err("restored Store request does not exactly join its ORS token"
+            .to_owned()
+            .into());
+    }
+    let mut expected_scopes = request
+        .transition
+        .ordering_scopes
+        .iter()
+        .map(|scope| scope.as_str().to_owned())
+        .collect::<Vec<_>>();
+    expected_scopes.sort();
+    let bound_scopes = binding
+        .ordering_scopes
+        .iter()
+        .map(|scope| scope.as_str().to_owned())
+        .collect::<Vec<_>>();
+    if expected_scopes != bound_scopes {
+        return Err("durable write binding scopes differ from the exact transition scopes"
+            .to_owned()
+            .into());
+    }
+    Ok(())
+}
+
+fn validate_staged_protected_envelope(
+    owner: &CompositionReservation,
+    token: &WriterReservationToken,
+    binding: &eliot_ors::RecoveryWriteBinding,
+) -> Result<(), StagedReservedWriteError> {
+    let envelope = owner
+        .verify_staged_envelope(&token.operation_id)
+        .map_err(|error| error.to_string())?;
+    if envelope.write_binding.as_ref() != Some(binding)
+        || envelope.contract_version != binding.recovery_envelope_contract_version
+        || envelope.operation_or_checkpoint_id != token.operation_id
+        || envelope.authority_epoch != token.writer_epoch
+        || envelope.state_fence != token.state_fence
+        || envelope.created_at_ms != binding.payload_created_at_ms
+        || envelope.known_at_ms != binding.payload_known_at_ms
+        || envelope.expires_at_ms != Some(token.expires_at_ms)
+        || envelope.privacy_and_visibility_class != binding.recovery_access_class
+    {
+        return Err(
+            "protected ORS envelope differs from the original durable write binding"
+                .to_owned()
+                .into(),
+        );
+    }
+    match &envelope.payload {
+        eliot_ors::RecoveryPayload::Encrypted { key, ciphertext }
+            if key == &binding.payload_key_reference
+                && u64::try_from(ciphertext.len()).ok() == Some(binding.protected_payload_length)
+                && sha256_hex(ciphertext) == binding.protected_payload_sha256 =>
+        {
+            Ok(())
+        }
+        _ => Err("protected ORS payload does not match the original write binding"
+            .to_owned()
+            .into()),
+    }
+}
+
 fn bind_accepted_staged_write(
     sealed: SealedReservation,
-    accepted_pending: AcceptedPending,
+    accepted_pending: &AcceptedPending,
     context: &RequestMetadata,
     transition: &PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
@@ -1775,7 +1874,7 @@ impl KernelStoreGateway {
             })?;
         bind_accepted_staged_write(
             sealed,
-            accepted_pending,
+            &accepted_pending,
             context,
             &transition,
             expected_revision_heads,
@@ -1951,52 +2050,7 @@ impl KernelStoreGateway {
         let source = request.original_write_submission.as_ref().ok_or_else(|| {
             "staged CaptureObservation request omitted its original source".to_owned()
         })?;
-        if request.admission.operation_id.as_str() != token.operation_id.as_str()
-            || request.admission.reservation_id != token.reservation_id.as_str()
-            || request.admission.reservation_order != token.reservation_order
-            || request.admission.prepared_transition_digest != token.prepared_transition_sha256
-            || binding.operation_id != token.operation_id
-            || binding.idempotency_key.as_str()
-                != request.transition.identity.idempotency_key.as_str()
-            || binding.canonical_request_sha256.as_str()
-                != request.transition.identity.canonical_request_hash.as_str()
-            || binding.prepared_transition_sha256.as_str()
-                != token.prepared_transition_sha256.as_str()
-            || binding.admission_contract_set_digest.as_str()
-                != request.transition.admission_contract_set_digest.as_str()
-            || binding.operation_manifest_digest.as_str()
-                != request.transition.operation_manifest_digest.as_str()
-            || binding.authority_epoch != token.writer_epoch
-            || binding.state_fence != token.state_fence
-            || binding.payload_created_at_ms != created_at_ms
-            || request.admission.created_at_ms != created_at_ms
-            || binding.write_intent_id.as_str() != source.write_intent_id.as_str()
-            || binding.write_envelope_protocol_version != source.protocol_version
-            || binding.write_response_mode.as_deref() != Some(source.response_mode.as_str())
-        {
-            return Err("restored Store request does not exactly join its ORS token"
-                .to_owned()
-                .into());
-        }
-        let mut expected_scopes = request
-            .transition
-            .ordering_scopes
-            .iter()
-            .map(|scope| scope.as_str().to_owned())
-            .collect::<Vec<_>>();
-        expected_scopes.sort();
-        let bound_scopes = binding
-            .ordering_scopes
-            .iter()
-            .map(|scope| scope.as_str().to_owned())
-            .collect::<Vec<_>>();
-        if expected_scopes != bound_scopes {
-            return Err(
-                "durable write binding scopes differ from the exact transition scopes"
-                    .to_owned()
-                    .into(),
-            );
-        }
+        validate_staged_request_binding(request, token, created_at_ms, binding, source)?;
         let record = reservation_record_by_operation(&owner, &token.operation_id)
             .map_err(|error| error.to_string())?;
         if record.token != *token {
@@ -2006,39 +2060,7 @@ impl KernelStoreGateway {
                     .into(),
             );
         }
-        let envelope = owner
-            .verify_staged_envelope(&token.operation_id)
-            .map_err(|error| error.to_string())?;
-        if envelope.write_binding.as_ref() != Some(binding)
-            || envelope.contract_version != binding.recovery_envelope_contract_version
-            || envelope.operation_or_checkpoint_id != token.operation_id
-            || envelope.authority_epoch != token.writer_epoch
-            || envelope.state_fence != token.state_fence
-            || envelope.created_at_ms != binding.payload_created_at_ms
-            || envelope.known_at_ms != binding.payload_known_at_ms
-            || envelope.expires_at_ms != Some(token.expires_at_ms)
-            || envelope.privacy_and_visibility_class != binding.recovery_access_class
-        {
-            return Err(
-                "protected ORS envelope differs from the original durable write binding"
-                    .to_owned()
-                    .into(),
-            );
-        }
-        match &envelope.payload {
-            eliot_ors::RecoveryPayload::Encrypted { key, ciphertext }
-                if key == &binding.payload_key_reference
-                    && u64::try_from(ciphertext.len()).ok()
-                        == Some(binding.protected_payload_length)
-                    && sha256_hex(ciphertext) == binding.protected_payload_sha256 => {}
-            _ => {
-                return Err(
-                    "protected ORS payload does not match the original write binding"
-                        .to_owned()
-                        .into(),
-                );
-            }
-        }
+        validate_staged_protected_envelope(&owner, token, binding)?;
         Ok((owner, evidence, record))
     }
 
@@ -2195,47 +2217,15 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
-        let (owner, evidence, ordering_readbacks, transition_digest) =
-            Box::pin(self.prepare_reserved_reservation(
-                context,
-                &transition,
-                &expected_revision_heads,
-                &expected_ordering_heads,
-            ))
-            .await?;
-        // Reservation and eligibility run without any admission lease: queued
-        // normal work holds no provider permit, Kernel lock, or
-        // protected-control resource while awaiting a predecessor (I14.3).
-        let reserve = || match original_submission {
-            Some(source) => reserve_for_transition_with_original_submission(
-                &owner,
-                &seed,
-                context,
-                &transition,
-                &expected_revision_heads,
-                &expected_ordering_heads,
-                source,
-            ),
-            None => reserve_for_transition(
-                &owner,
-                &seed,
-                context,
-                &transition,
-                &expected_revision_heads,
-                &expected_ordering_heads,
-            ),
-        };
-        let sealed = evidence
-            .with_ordering_readbacks(
-                transition.identity.operation_id.as_str(),
-                &transition_digest,
-                &context.state_fence,
-                &ordering_readbacks,
-                reserve,
-            )
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
-        ensure_eligible(&owner, &sealed.token).map_err(|error| error.to_string())?;
+        let (owner, evidence, sealed) = Box::pin(self.stage_reserved_operation(
+            context,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+            &seed,
+            original_submission,
+        ))
+        .await?;
         let operation_id = transition.identity.operation_id.as_str().to_owned();
         if let Err(error) = validate_current_proof_approval_support(&transition) {
             let refusal =
@@ -2322,6 +2312,65 @@ impl KernelStoreGateway {
                 Err(refusal)
             }
         }
+    }
+
+    async fn stage_reserved_operation(
+        &self,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+        seed: &ReservationSeed,
+        original_submission: Option<&OriginalWriteSubmission>,
+    ) -> Result<
+        (
+            CompositionReservation,
+            Arc<CanonicalStoreEvidence>,
+            SealedReservation,
+        ),
+        String,
+    > {
+        let (owner, evidence, ordering_readbacks, transition_digest) =
+            Box::pin(self.prepare_reserved_reservation(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            ))
+            .await?;
+        // No admission lease, provider permit, Kernel lock, or protected-control
+        // resource is held while the staged reservation awaits a predecessor.
+        let reserve = || match original_submission {
+            Some(source) => reserve_for_transition_with_original_submission(
+                &owner,
+                seed,
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+                source,
+            ),
+            None => reserve_for_transition(
+                &owner,
+                seed,
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            ),
+        };
+        let sealed = evidence
+            .with_ordering_readbacks(
+                transition.identity.operation_id.as_str(),
+                &transition_digest,
+                &context.state_fence,
+                &ordering_readbacks,
+                reserve,
+            )
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        ensure_eligible(&owner, &sealed.token).map_err(|error| error.to_string())?;
+        Ok((owner, evidence, sealed))
     }
 
     async fn prepare_reserved_reservation(

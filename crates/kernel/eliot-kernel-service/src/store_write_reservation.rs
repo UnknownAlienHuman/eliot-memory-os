@@ -822,36 +822,7 @@ fn reserve_for_transition_inner(
 ) -> Result<(SealedReservation, Option<AcceptedPending>), ReservationWriteError> {
     let (expected_revision_heads, expected_ordering_heads) = head_expectations;
     let operation_id = transition.identity.operation_id.as_str().to_owned();
-    let has_capture = transition
-        .named_operations
-        .iter()
-        .any(|operation| operation.operation == NamedMutationOperation::CaptureObservation);
-    match (has_capture, original_submission) {
-        (true, None) => {
-            return Err(ReservationWriteError::Admission {
-                operation_id,
-                detail:
-                    "CaptureObservation reservation requires its original public Observe submission"
-                        .to_owned(),
-            });
-        }
-        (false, Some(_)) => {
-            return Err(ReservationWriteError::Admission {
-                operation_id,
-                detail: "original Observe submission is only valid for CaptureObservation"
-                    .to_owned(),
-            });
-        }
-        (_, Some(source)) => {
-            source
-                .validate()
-                .map_err(|error| ReservationWriteError::Admission {
-                    operation_id: operation_id.clone(),
-                    detail: format!("original Observe submission is invalid: {error}"),
-                })?;
-        }
-        (false, None) => {}
-    }
+    validate_original_submission(transition, original_submission, &operation_id)?;
     validate_admitted(
         context,
         transition,
@@ -861,25 +832,7 @@ fn reserve_for_transition_inner(
     seed.validate(&operation_id)?;
     refuse_plaintext_payload(seed, transition, &operation_id)?;
     let observed_sequence = check_epoch_against_fence(&owner.writer_epoch, context, &operation_id)?;
-    let mut observed: Vec<(&str, u64)> = seed
-        .heads
-        .iter()
-        .map(|head| (head.scope.as_str(), head.expected_sequence))
-        .collect();
-    observed.sort_unstable();
-    let mut declared: Vec<(&str, u64)> = expected_ordering_heads
-        .iter()
-        .map(|head| (head.scope.as_str(), head.expected_sequence))
-        .collect();
-    declared.sort_unstable();
-    if observed != declared {
-        return Err(ReservationWriteError::Binding {
-            operation_id: operation_id.clone(),
-            detail:
-                "observed head set must exactly cover the admitted scopes with matching sequences"
-                    .to_owned(),
-        });
-    }
+    validate_observed_heads(seed, expected_ordering_heads, &operation_id)?;
     let (request, transition_digest) = build_reservation_request(
         owner,
         seed,
@@ -931,6 +884,65 @@ fn reserve_for_transition_inner(
         },
         accepted,
     ))
+}
+
+fn validate_original_submission(
+    transition: &PreparedTransition,
+    original_submission: Option<&OriginalWriteSubmission>,
+    operation_id: &str,
+) -> Result<(), ReservationWriteError> {
+    let has_capture = transition
+        .named_operations
+        .iter()
+        .any(|operation| operation.operation == NamedMutationOperation::CaptureObservation);
+    match (has_capture, original_submission) {
+        (true, None) => Err(ReservationWriteError::Admission {
+            operation_id: operation_id.to_owned(),
+            detail:
+                "CaptureObservation reservation requires its original public Observe submission"
+                    .to_owned(),
+        }),
+        (false, Some(_)) => Err(ReservationWriteError::Admission {
+            operation_id: operation_id.to_owned(),
+            detail: "original Observe submission is only valid for CaptureObservation".to_owned(),
+        }),
+        (_, Some(source)) => {
+            source
+                .validate()
+                .map_err(|error| ReservationWriteError::Admission {
+                    operation_id: operation_id.to_owned(),
+                    detail: format!("original Observe submission is invalid: {error}"),
+                })
+        }
+        (false, None) => Ok(()),
+    }
+}
+
+fn validate_observed_heads(
+    seed: &ReservationSeed,
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    operation_id: &str,
+) -> Result<(), ReservationWriteError> {
+    let mut observed: Vec<(&str, u64)> = seed
+        .heads
+        .iter()
+        .map(|head| (head.scope.as_str(), head.expected_sequence))
+        .collect();
+    observed.sort_unstable();
+    let mut declared: Vec<(&str, u64)> = expected_ordering_heads
+        .iter()
+        .map(|head| (head.scope.as_str(), head.expected_sequence))
+        .collect();
+    declared.sort_unstable();
+    if observed != declared {
+        return Err(ReservationWriteError::Binding {
+            operation_id: operation_id.to_owned(),
+            detail:
+                "observed head set must exactly cover the admitted scopes with matching sequences"
+                    .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn build_reservation_request(
