@@ -396,6 +396,22 @@ struct OperatorSessionBinding {
     challenge_peer: Option<ProcessIdentity>,
     redeemed_peer: Option<ProcessIdentity>,
     redeemed: bool,
+    /// The broker-local registration epoch the *core* held its handoff ledger
+    /// under when this row was inserted. It is recorded from the live
+    /// registration receipt, not from the launch declaration, because it is
+    /// one of the three axes the core itself compares
+    /// (`UserBroker::operator_handoff_authority`).
+    core_ledger_broker_epoch: u64,
+    /// The logon Session the *core* held its handoff ledger under when this
+    /// row was inserted. Distinct from `interactive_session_id` above, which
+    /// is the SID/Session tuple this broker was admitted for: the core
+    /// compares the registration's own Session, and the two are the same value
+    /// only because admission refuses a foreign tuple.
+    core_ledger_interactive_session_id: String,
+    /// The installation-approved Operator artifact the *core* built this row's
+    /// ledger for. A different approved image is a different core ledger, and
+    /// the core treats it as one.
+    core_ledger_artifact: OperatorArtifact,
 }
 
 fn is_bounded_text(value: &str) -> bool {
@@ -1903,6 +1919,14 @@ impl BrokerComposition {
         let live_token = live.registration_digest.clone();
         self.operator_session_bindings
             .retain(|_, row| !row.redeemed || row.kernel_session_token == live_token);
+        // Retirement on the core's own ledger key, after the issue above has
+        // already rebuilt that ledger to this key. This is the second, and
+        // only sound, way a row leaves this map.
+        Self::retire_rows_outside_core_ledger(
+            &mut self.operator_session_bindings,
+            &live,
+            &artifact,
+        );
         self.operator_session_bindings.insert(
             endpoint.handoff_nonce.clone(),
             OperatorSessionBinding {
@@ -1915,9 +1939,64 @@ impl BrokerComposition {
                 challenge_peer: None,
                 redeemed_peer: None,
                 redeemed: false,
+                core_ledger_broker_epoch: live.user_broker_epoch,
+                core_ledger_interactive_session_id: live.interactive_session_id.clone(),
+                core_ledger_artifact: artifact,
             },
         );
         Ok(endpoint)
+    }
+
+    /// Retires every row whose handoff the core can no longer see, at the one
+    /// insert site. Mirrors `OperatorHandoffAuthority::retire_terminal_rows` in
+    /// `eliot-user-broker-core`.
+    ///
+    /// The predicate is *structural*, not inferred from row state. The core
+    /// retains its handoff ledger under exactly three axes — in
+    /// `UserBroker::operator_handoff_authority`, the retained
+    /// `OperatorHandoffBinding` survives only while
+    /// `binding.broker_epoch == registration.user_broker_epoch &&
+    /// binding.interactive_session_id == registration.interactive_session_id &&
+    /// binding.artifact == artifact`; any mismatch constructs a *fresh*
+    /// `OperatorHandoffAuthority`, and its `handoffs` map starts empty. So for
+    /// a row recorded under a different key, the nonce this map still holds
+    /// is absent from the core's live ledger, and
+    /// `OperatorHandoffAuthority::consume` reads that absence as
+    /// `BrokerError::ReplayConflict`. Removing the row therefore changes no
+    /// refusal into an acceptance: the absent-row branch of
+    /// [`Self::redeem_operator_handoff`] delegates to exactly that core call
+    /// and gets exactly that refusal. The refusal *code* narrows for these
+    /// rows, exactly as it does for the core's own retired rows: a challenge or
+    /// redemption that used to report `STALE_AUTHORITY_EPOCH` from the
+    /// registration check reports `RESOURCE_LEASE_REPLAYED` /
+    /// `CAPABILITY_INTRODUCTION_REQUIRED` from the unknown nonce instead. Both
+    /// are errors and neither grants anything.
+    ///
+    /// The direction does not reverse either. A rebuilt ledger is empty and
+    /// nonces are freshly minted per issue, so a retired row's nonce can
+    /// never reappear under a later key — the key moving *back* would rebuild
+    /// an empty map again, not restore the old one. This is what distinguishes
+    /// this retirement from retiring a row merely because it looks spent: a
+    /// spent row is only safe to drop because its nonce happens to be consumed
+    /// in the core, whereas here the core cannot hold the nonce at all.
+    ///
+    /// What this bounds: the map holds the handoffs issued under the core
+    /// ledger key that is still current, plus redeemed rows the previous
+    /// `retain` still needs. What it does not bound: handoffs issued under
+    /// the *current* key that are never redeemed. Those stay until the key
+    /// moves, because bounding them would need a capacity or age limit this
+    /// boundary does not carry — and an age limit is exactly the coincidence
+    /// this predicate refuses to depend on.
+    fn retire_rows_outside_core_ledger(
+        rows: &mut BTreeMap<String, OperatorSessionBinding>,
+        live: &RegistrationReceipt,
+        artifact: &OperatorArtifact,
+    ) {
+        rows.retain(|_, row| {
+            row.core_ledger_broker_epoch == live.user_broker_epoch
+                && row.core_ledger_interactive_session_id == live.interactive_session_id
+                && &row.core_ledger_artifact == artifact
+        });
     }
 
     /// Returns the existing live Kernel registration token for one exact,
