@@ -41,8 +41,9 @@ use eliot_context_assembly::{
     assemble_active_view_with_learning,
 };
 use eliot_context_contracts::{
-    AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
-    SerializedContextMeasurement,
+    AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe,
+    QualityApplicabilityInput, QualityDimensionResult, QualityOperation, QualityOutputBinding,
+    QualityRefusal, QualityScorecard, SerializedContextMeasurement,
 };
 use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
 use eliot_improvement::candidate_bounds::{
@@ -61,6 +62,69 @@ pub struct HostGovernedCompilation {
     pub retrieval: RetrievalDecision,
     pub admission: AdmissionResult,
     pub view: Option<ActiveUnderstandingViewResult>,
+    /// Typed quality diagnostics when the view could not be projected.
+    ///
+    /// `None` exactly when `view` is `Some`. This is the W6 host-facing half of
+    /// the issue: an incomplete compilation keeps the attempted recipe, the exact
+    /// output handles the card claimed to grade, and the complete failed and
+    /// unknown dimension accounting, instead of the Display string
+    /// `"quality evidence cannot support a complete projection"` that this path
+    /// used to return. A blocked packet is still never handed on as a successful
+    /// Active View — `view` stays `None` — so this is a diagnosis, never a
+    /// fabricated success.
+    pub quality_diagnostic: Option<QualityDiagnostics>,
+}
+
+/// Why a host compilation produced no view, with the evidence that was retained.
+///
+/// The values are the owners' own records, carried rather than re-derived. The
+/// attempted recipe digest and the card's own output binding are the exact
+/// handles a reader needs to reproduce or to see which output the twelve grades
+/// were about, and the dimension results are the complete failed and unknown
+/// accounting in canonical order, so no failing dimension is dropped to fit an
+/// output limit and a caller never has to re-derive which anchor, active
+/// directive or required verifier was missing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QualityDiagnostics {
+    /// The operation whose readiness was requested; always named.
+    pub operation: QualityOperation,
+    /// The recipe this compilation actually attempted, by its own digest.
+    pub attempted_recipe_digest: String,
+    /// The exact output the scorecard claimed to grade.
+    pub attempted_output: QualityOutputBinding,
+    /// Every dimension result that was not a current pass, in canonical
+    /// dimension order, with its state and the exact evidence it lacks.
+    pub dimension_results: Vec<QualityDimensionResult>,
+    /// Applicability inputs that were never resolved for this packet.
+    pub unresolved_applicability: Vec<QualityApplicabilityInput>,
+}
+
+impl QualityDiagnostics {
+    /// Build the host-facing diagnostics for one refused quality readiness check.
+    ///
+    /// The card is the owner's complete twelve-dimension accounting and the
+    /// refusal is its operation-scoped answer; both are carried whole. The
+    /// failed and unknown set is the complement of the card's own current passes
+    /// over its declared twelve results, so it is never a partial copy of the
+    /// refusal's blocking subset.
+    fn refused(
+        refusal: &QualityRefusal,
+        quality: &QualityScorecard,
+        attempted_recipe_digest: &str,
+    ) -> Self {
+        Self {
+            operation: refusal.operation,
+            attempted_recipe_digest: attempted_recipe_digest.to_owned(),
+            attempted_output: quality.output.clone(),
+            dimension_results: quality
+                .results
+                .iter()
+                .filter(|result| !result.is_current_pass())
+                .cloned()
+                .collect(),
+            unresolved_applicability: refusal.unresolved_applicability.clone(),
+        }
+    }
 }
 
 /// Fail-closed host admission errors with stable codes.
@@ -169,6 +233,19 @@ fn same_cross_task_carryover(
 /// is for a task other than the local admission's target — the same distinct
 /// owner-issued cross-task carryover on both the producer and the screens. Any
 /// failure refuses the whole compilation.
+///
+/// # A quality refusal is returned as diagnostics, not as a generic error
+///
+/// When the scorecard cannot support the requested operation this returns `Ok`
+/// with `view: None` and `quality_diagnostic` populated. A blocked packet
+/// therefore never reaches a caller as a successful Active View, and the caller
+/// keeps the attempted recipe digest, the exact output handles the card claimed
+/// to grade, and the complete failed and unknown dimension results with the
+/// evidence each still lacks. Before this, the same condition returned
+/// `HostAdmitError::Assembly("quality evidence cannot support a complete
+/// projection")` — the owner's `Display` string — which named neither the
+/// operation, nor any dimension, nor any missing evidence. Every other
+/// assembly failure is unchanged and still returns `Err`.
 #[allow(clippy::too_many_arguments)]
 pub fn admit_governed_host<F>(
     governor: &Governor,
@@ -231,17 +308,51 @@ where
     input.learning_tickets.push(presented.ticket.clone());
     let admission = admit_context_with_learning(&input, presented)
         .map_err(|error| HostAdmitError::Admission(error.to_string()))?;
+    // Read before assembly consumes the recipe: this is the exact handle the
+    // retained diagnostics name, so a refusal identifies the compilation that
+    // was attempted rather than a generic quality failure.
+    let attempted_recipe_digest = recipe.recipe_sha256.clone();
     let view = match &admission.outcome {
-        ContextOutcome::Complete(set) => Some(
-            assemble_active_view_with_learning(set, recipe, quality, policy, measure, presented)
-                .map_err(|error: AssemblyError| HostAdmitError::Assembly(error.to_string()))?,
-        ),
+        ContextOutcome::Complete(set) => {
+            // A quality refusal is a diagnosable outcome, not a transport
+            // failure, and it must not be flattened into one. The assembly owner
+            // already returns the whole card and the operation-scoped refusal in
+            // `AssemblyError::QualityIncomplete`; this arm carries both into the
+            // host-facing response so the attempted recipe, the exact output
+            // handles and the complete failed/unknown dimension accounting
+            // survive the boundary. Every other assembly failure is unchanged
+            // and still refuses the whole compilation.
+            match assemble_active_view_with_learning(
+                set,
+                recipe,
+                quality,
+                policy,
+                measure,
+                presented,
+            ) {
+                Ok(result) => Some(result),
+                Err(AssemblyError::QualityIncomplete(card, refusal)) => {
+                    return Ok(HostGovernedCompilation {
+                        retrieval,
+                        admission,
+                        view: None,
+                        quality_diagnostic: Some(QualityDiagnostics::refused(
+                            &refusal,
+                            &card,
+                            &attempted_recipe_digest,
+                        )),
+                    });
+                }
+                Err(error) => return Err(HostAdmitError::Assembly(error.to_string())),
+            }
+        }
         ContextOutcome::Incomplete(_) => None,
     };
     Ok(HostGovernedCompilation {
         retrieval,
         admission,
         view,
+        quality_diagnostic: None,
     })
 }
 

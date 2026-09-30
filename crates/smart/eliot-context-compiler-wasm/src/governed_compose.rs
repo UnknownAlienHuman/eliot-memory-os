@@ -38,8 +38,9 @@ use eliot_context_assembly::{
     assemble_active_view_with_learning,
 };
 use eliot_context_contracts::{
-    AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
-    SerializedContextMeasurement,
+    AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe,
+    QualityApplicabilityInput, QualityDimensionResult, QualityOperation, QualityOutputBinding,
+    QualityRefusal, QualityScorecard, SerializedContextMeasurement,
 };
 use eliot_improvement::candidate_bounds::{
     BoundsError, CrossTaskCarryover, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef,
@@ -59,6 +60,77 @@ pub struct GovernedCompilation {
     pub retrieval: RetrievalDecision,
     pub admission: AdmissionResult,
     pub view: Option<ActiveUnderstandingViewResult>,
+    /// Typed quality diagnostics when the view could not be projected.
+    ///
+    /// `None` exactly when `view` is `Some`. This is the W6 half of the issue
+    /// that the plain `Err` return could not express: an incomplete compilation
+    /// retains the attempted recipe, the exact output the card claimed to grade,
+    /// the complete set of failed and unknown dimension results, and the
+    /// operation-scoped refusal — instead of collapsing to a single Display
+    /// string and discarding every dimension that did not block. It is a
+    /// diagnosis, not a view: `view` stays `None`, so a blocked packet is never
+    /// handed to a consumer as a successful Active View.
+    pub quality_diagnostic: Option<QualityDiagnostics>,
+}
+
+/// Why a compiled packet was not projected, with the evidence that was retained.
+///
+/// Every field is the owner's own value, carried rather than re-derived. The
+/// attempted recipe digest and the card's own output binding are the two exact
+/// handles a reader needs to re-run the compilation or to see which output the
+/// twelve grades were about; the dimension results are the complete failed and
+/// unknown accounting, in canonical dimension order, so a caller never has to
+/// guess which anchor, directive or verifier was missing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QualityDiagnostics {
+    /// The operation whose readiness was requested; always named.
+    pub operation: QualityOperation,
+    /// The recipe this compilation actually attempted, by its own digest. The
+    /// attempt is retained even though it produced no view, so a refusal is
+    /// reproducible and a retry names the same input.
+    pub attempted_recipe_digest: String,
+    /// The exact output the scorecard claimed to grade: recipe, fence, admitted
+    /// and rendered digests, serializer identity and route, evidence revisions
+    /// and omission handles. Retained so the refused grades stay bound to a
+    /// named output rather than floating free.
+    pub attempted_output: QualityOutputBinding,
+    /// Every dimension result that was not a current pass, in canonical
+    /// dimension order, with its state and the exact evidence it lacks. This is
+    /// the complete failed/unknown accounting, not only the subset that blocked
+    /// the requested operation, so nothing is dropped to fit an output limit.
+    pub dimension_results: Vec<QualityDimensionResult>,
+    /// Applicability inputs that were never resolved for this packet.
+    pub unresolved_applicability: Vec<QualityApplicabilityInput>,
+}
+
+impl QualityDiagnostics {
+    /// Build the diagnostics for one refused quality readiness check.
+    ///
+    /// The card is the owner's complete twelve-dimension accounting and the
+    /// refusal is its operation-scoped answer; both are carried whole. The
+    /// failed and unknown set is recomputed here as the *complement* of the
+    /// current passes, read off the card's own twelve results against the
+    /// declared dimension denominator, so it cannot be a partial copy of the
+    /// refusal's blocking subset and cannot omit a dimension that failed for a
+    /// reason unrelated to this operation.
+    fn refused(
+        refusal: &QualityRefusal,
+        quality: &QualityScorecard,
+        attempted_recipe_digest: &str,
+    ) -> Self {
+        Self {
+            operation: refusal.operation,
+            attempted_recipe_digest: attempted_recipe_digest.to_owned(),
+            attempted_output: quality.output.clone(),
+            dimension_results: quality
+                .results
+                .iter()
+                .filter(|result| !result.is_current_pass())
+                .cloned()
+                .collect(),
+            unresolved_applicability: refusal.unresolved_applicability.clone(),
+        }
+    }
 }
 
 /// Composed-path refusal. Every variant fails the whole compilation closed.
@@ -121,6 +193,17 @@ fn same_cross_task_carryover(
 /// envelopes can never backdate mark/overlay expiry. Direct screen callers
 /// (outside this composition) MUST likewise pass owner-sourced time, never
 /// requester values.
+///
+/// # A quality refusal is a result, not a transport failure
+///
+/// When the scorecard cannot support the requested operation the composition
+/// still returns `Ok`, with `view: None` and `quality_diagnostic` populated.
+/// A blocked packet therefore never reaches a consumer as a successful Active
+/// View, and the caller keeps the attempted recipe digest, the exact output
+/// handles the card claimed to grade, and the complete failed and unknown
+/// dimension results with the evidence each still lacks — instead of the
+/// single Display string that [`ComposeError::Assembly`] would render. Every
+/// other assembly failure is unchanged and still returns `Err`.
 pub fn compose_governed_compilation<F>(
     production: LearningProduction<'_>,
     presented: PresentedLearning<'_>,
@@ -181,17 +264,51 @@ where
     input.learning_tickets.push(presented.ticket.clone());
     let admission =
         admit_context_with_learning(&input, presented).map_err(ComposeError::Admission)?;
+    // The attempted recipe digest is read from the recipe this call was given,
+    // before it is consumed by assembly. It is the exact handle the retained
+    // diagnostics name, so a refusal names the compilation that was attempted
+    // rather than a generic quality failure.
+    let attempted_recipe_digest = recipe.recipe_sha256.clone();
     let view = match &admission.outcome {
-        ContextOutcome::Complete(set) => Some(
-            assemble_active_view_with_learning(set, recipe, quality, policy, measure, presented)
-                .map_err(ComposeError::Assembly)?,
-        ),
+        ContextOutcome::Complete(set) => {
+            // A quality refusal is not a transport failure and must not be
+            // collapsed into one. `AssemblyError::QualityIncomplete` already
+            // carries the whole card and the operation-scoped refusal; this arm
+            // converts that into the host-facing diagnostic, so the caller keeps
+            // the attempted recipe, the exact output handles and the complete
+            // failed/unknown dimension accounting. Every other assembly failure
+            // still propagates as a `ComposeError`, unchanged.
+            match assemble_active_view_with_learning(
+                set,
+                recipe,
+                quality.clone(),
+                policy,
+                measure,
+                presented,
+            ) {
+                Ok(result) => Some(result),
+                Err(AssemblyError::QualityIncomplete(card, refusal)) => {
+                    return Ok(GovernedCompilation {
+                        retrieval,
+                        admission,
+                        view: None,
+                        quality_diagnostic: Some(QualityDiagnostics::refused(
+                            &refusal,
+                            &card,
+                            &attempted_recipe_digest,
+                        )),
+                    });
+                }
+                Err(error) => return Err(ComposeError::Assembly(error)),
+            }
+        }
         ContextOutcome::Incomplete(_) => None,
     };
     Ok(GovernedCompilation {
         retrieval,
         admission,
         view,
+        quality_diagnostic: None,
     })
 }
 
