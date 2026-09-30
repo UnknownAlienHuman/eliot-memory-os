@@ -110,9 +110,10 @@ impl ProfileGovernedRoots {
     /// inside the profile's versioned immutable binaries root is therefore
     /// refused for `system_service` and `user_mode`. `portable_dev` admits it
     /// only within its selected repository, including the disposable binary
-    /// and state contours. The comparison is lexical on
-    /// [`WindowsPathIdentity`], the same bounded identity this crate already uses
-    /// for root separation, so a traversal or alias cannot slip past it.
+    /// and state contours. This comparison uses lexical
+    /// [`WindowsPathIdentity`] to reject traversal and paths outside the selected
+    /// roots. Callers that write to disk must also retain the full parent contour
+    /// to reject reparse aliases and path replacement.
     ///
     /// # Errors
     ///
