@@ -834,6 +834,27 @@ pub fn requirement_for_named_mutation(
     }
 }
 
+/// Whether one canonical write envelope is task-relative (issue #1746, W4).
+///
+/// Single definition of the capture/task-relative split predicate behind
+/// [`admit_canonical_write`]: a write that names a task, or that carries a
+/// task-relative/effectful named mutation
+/// ([`requirement_for_named_mutation`]), needs the live activation recheck
+/// ([`bind_current_task_selection`] over the Governor-owned snapshot);
+/// anything else stays on the receipt-only cold/non-task-relative legs, so
+/// permitted raw capture remains cold without a retained terminal. Consulted
+/// by [`admit_canonical_write`]; the dispatch effect gate in
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
+/// consults the same split so gating cannot drift from it.
+#[must_use]
+pub fn envelope_is_task_relative(envelope: &CanonicalWriteEnvelope) -> bool {
+    envelope.task_id.is_some()
+        || envelope.semantic_commands.iter().any(|command| {
+            requirement_for_named_mutation(command.operation)
+                == CanonicalOperationRequirement::TaskRelativeEffectful
+        })
+}
+
 /// Daemon dispatch entrypoint presenting one admission attempt
 /// (issue #1746, A6).
 ///
@@ -1812,10 +1833,15 @@ pub enum BootstrapAdmission {
     /// authority by itself.
     Material(MaterialBootstrap),
     /// Diagnostic bootstrap: selection/intake data, never Material-ready.
-    /// A bootstrap without a task always lands here.
+    /// A bootstrap without a task always lands here. It carries the exact
+    /// non-material task-or-selection-state (bounded eligible handles,
+    /// exploratory/stale identity, or the current evidence withheld on
+    /// readiness/profiles) so the caller answers from owner evidence instead
+    /// of inventing a choice.
     Diagnostic {
         reason: &'static str,
         next_safe_action: String,
+        selection: TaskSelectionResponse,
     },
     /// No task is selected: answer with this scope's bounded intake shape.
     IntakeRequired(Box<eliot_workscope::TaskSelectionRequired>),
@@ -1866,8 +1892,9 @@ pub struct MaterialBootstrap {
 /// [`ReadinessLifecycle`] and the surface's typed [`ScopeResolutionState`]
 /// decide. `Material` additionally requires an authenticated scope, material
 /// readiness, exact current selection evidence, and fingerprint-matched
-/// verified profiles; anything else is `Diagnostic` (without a task, always)
-/// or `IntakeRequired` (no task selected). Budget previews and expansion
+/// verified profiles; anything else is `Diagnostic` (without a task, always,
+/// carrying the exact non-material task-or-selection-state) or
+/// `IntakeRequired` (no task selected). Budget previews and expansion
 /// handles travel on the owners' surfaces; required selection, authority, and
 /// recovery information is never dropped by this join.
 ///
@@ -2021,17 +2048,34 @@ pub fn admit_bootstrap_context(
     };
     match selection_response_for_receipt(receipt)? {
         TaskSelectionResponse::Absent(intake) => Ok(BootstrapAdmission::IntakeRequired(intake)),
-        TaskSelectionResponse::Ambiguous(_) => Ok(BootstrapAdmission::Diagnostic {
+        TaskSelectionResponse::Ambiguous(candidate_handles) => Ok(BootstrapAdmission::Diagnostic {
             reason: "task selection is ambiguous; answer with the bounded eligible handles",
             next_safe_action: receipt.next_safe_action.clone(),
+            selection: TaskSelectionResponse::Ambiguous(candidate_handles),
         }),
-        TaskSelectionResponse::Exploratory { .. } => Ok(BootstrapAdmission::Diagnostic {
+        TaskSelectionResponse::Exploratory {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        } => Ok(BootstrapAdmission::Diagnostic {
             reason: "exploratory binding is read-only orientation, not material work",
             next_safe_action: receipt.next_safe_action.clone(),
+            selection: TaskSelectionResponse::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            },
         }),
-        TaskSelectionResponse::Stale { .. } => Ok(BootstrapAdmission::Diagnostic {
+        TaskSelectionResponse::Stale {
+            task_ref,
+            task_revision,
+        } => Ok(BootstrapAdmission::Diagnostic {
             reason: "task selection is stale; refresh or rebind before material work",
             next_safe_action: receipt.next_safe_action.clone(),
+            selection: TaskSelectionResponse::Stale {
+                task_ref,
+                task_revision,
+            },
         }),
         TaskSelectionResponse::Current(task) => {
             // `resolve_task_selection` refuses `CurrentTaskContract` until the
@@ -2044,18 +2088,21 @@ pub fn admit_bootstrap_context(
                 return Ok(BootstrapAdmission::Diagnostic {
                     reason: "bootstrap is not authenticated material readiness",
                     next_safe_action: receipt.next_safe_action.clone(),
+                    selection: TaskSelectionResponse::Current(task),
                 });
             }
             if !verified_profiles {
                 return Ok(BootstrapAdmission::Diagnostic {
                     reason: "coverage or governance profile evidence is unknown or unverified",
                     next_safe_action: receipt.next_safe_action.clone(),
+                    selection: TaskSelectionResponse::Current(task),
                 });
             }
             let (Some(coverage), Some(governance)) = (coverage, governance) else {
                 return Ok(BootstrapAdmission::Diagnostic {
                     reason: "coverage or governance profile evidence is unknown or unverified",
                     next_safe_action: receipt.next_safe_action.clone(),
+                    selection: TaskSelectionResponse::Current(task),
                 });
             };
             Ok(BootstrapAdmission::Material(MaterialBootstrap {
@@ -2159,8 +2206,9 @@ pub fn admit_canonical_write(
             .any(|command| requirement_for_named_mutation(command.operation) == requirement)
     };
     let captures = carries_requirement(CanonicalOperationRequirement::SafeRawCapture);
-    let task_relative = envelope.task_id.is_some()
-        || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful);
+    // Issue #1746, W4: the same frozen split the dispatch effect gate consults
+    // through `envelope_is_task_relative`, so gating cannot drift from it.
+    let task_relative = envelope_is_task_relative(envelope);
     // Issue #1746, W4: Absent stays absent and Ambiguous keeps its bounded
     // eligible handles through the single typed response constructor.
     // A task-free capture remains cold and unrelated non-task writes need
