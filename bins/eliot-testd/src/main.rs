@@ -221,6 +221,7 @@ fn drive_admitted<E: ProcessExecutor + 'static>(
     composition: &TestdComposition,
     presented: PresentedAdmission,
     executor: &E,
+    git: Option<&dyn eliot_testd_core::SourceObservationGitPort>,
 ) -> i32 {
     // Closed-profile gate: the admitted drive derives its executable
     // binding from the registry; an unregistered profile, fixed-argv
@@ -245,6 +246,7 @@ fn drive_admitted<E: ProcessExecutor + 'static>(
         composition,
         presented,
         executor,
+        git,
         SERVICE_NAME,
         ADMITTED_WORKER_LEASE_MS,
         now_ms(),

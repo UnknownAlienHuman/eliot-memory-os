@@ -20,16 +20,16 @@ use eliot_platform::ClockObservation;
 use eliot_platform_windows::WindowsPlatform;
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
-    EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
-    KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidenceSink, ProcessExecutionError,
-    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessTreeId, SessionId,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    EnvironmentInheritance, EnvironmentProjection, ExitDisposition, FencingToken, Generation,
+    ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidenceSink,
+    ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt,
+    ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision, TargetRoots, TestJob,
-    TestdError, TestdSourceObservation, TestdStore, is_admitted_testd_profile,
+    Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision, SourceObservationGitPort,
+    TargetRoots, TestJob, TestdError, TestdSourceObservation, TestdStore, is_admitted_testd_profile,
     issue_process_admission, testd_profile_resource_limits, validate_running_lease,
     verify_layout_binding,
 };
@@ -542,6 +542,356 @@ pub fn compose_process_executor(
     WindowsProcessExecutor::new(authority)
 }
 
+// ---- Governed Git source observation (issue #1140, AC3) ----
+//
+// `TestdSourceObservation::capture` used to launch `git` with a bare
+// `std::process::Command` from inside `eliot-testd-core`, which bypassed
+// the `#100` ProcessExecutor/Job Object contour entirely. This module is
+// the composition-root binding of that capture's physical side: the one
+// admitted `ProcessExecutor` instance above launches each closed Git
+// subcommand under an exact `ProcessIntent` plus a one-shot dispatch
+// permit, so every Git child runs inside a Job Object with the documented
+// wall/CPU/memory, stdout/stderr, and descendant limits, and every child
+// is owned and cleaned up by the executor.
+//
+// Nothing here is generic shell authority: the executable is the single
+// closed relative program [`TESTD_SOURCE_OBSERVATION_GIT_PROGRAM`], the
+// argv comes only from
+// [`SourceObservationGitCommand::argv`][eliot_testd_core::SourceObservationGitCommand::argv],
+// the working directory is the admitted canonical source root, the
+// environment is the closed non-inheriting projection below, and no
+// caller-supplied text, path, or environment can reach the launch.
+
+/// Closed relative program for the Git source observation. Absolute paths
+/// and parent traversal are refused by [`resolve_tool_file`], so no caller
+/// can redirect the observation to another executable.
+pub const TESTD_SOURCE_OBSERVATION_GIT_PROGRAM: &str = "git";
+
+/// Stable registry identity for the Git observation image bound into every
+/// sealed `ProcessIntent`.
+const TESTD_SOURCE_OBSERVATION_GIT_IMAGE: &str = "testd-source-observation-git";
+
+/// Bounded wall timeout for one Git source-observation child, in
+/// milliseconds. `git status` and `git diff` over a large working tree are
+/// the slow cases, so this is deliberately wider than the nextest probe's
+/// wall timeout while staying a fixed, source-visible bound.
+pub const TESTD_SOURCE_OBSERVATION_GIT_WALL_TIMEOUT_MS: u64 = 120_000;
+/// Bounded CPU ceiling for one Git source-observation child, in
+/// milliseconds.
+pub const TESTD_SOURCE_OBSERVATION_GIT_CPU_TIME_MS: u64 = 60_000;
+/// Bounded memory ceiling for one Git source-observation child, in bytes.
+pub const TESTD_SOURCE_OBSERVATION_GIT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+/// Bounded stdout capture for one Git source-observation child, in bytes.
+/// `git diff --binary` on a large working tree is the widest expected
+/// stream; a larger one is a fail-closed truncation, not a silent success.
+pub const TESTD_SOURCE_OBSERVATION_GIT_STDOUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Bounded stderr capture for one Git source-observation child, in bytes.
+pub const TESTD_SOURCE_OBSERVATION_GIT_STDERR_BYTES: u64 = 1024 * 1024;
+/// Bounded descendant ceiling for one Git source-observation child. The
+/// sealed argv is read-only plumbing; no child may spawn a tree.
+pub const TESTD_SOURCE_OBSERVATION_GIT_MAX_DESCENDANTS: u32 = 4;
+
+/// Environment variables that redirect Git away from the admitted
+/// repository, config the child could be steered by, or otherwise widen
+/// its authority. They are refused rather than blanked: the observation
+/// must see the same repository identity the operator configured, and a
+/// hostile value must not silently change what "dirty state" means.
+const TESTD_SOURCE_OBSERVATION_GIT_REFUSED_ENVIRONMENT: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+];
+
+/// Bounded poll interval while one admitted Git child runs inside the
+/// executor's own wall/CPU watcher.
+const TESTD_SOURCE_OBSERVATION_GIT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Bound duration of the per-call admission lease for one Git child. It is
+/// wider than the child's wall timeout so the permit never expires while
+/// the child is still legitimately running.
+const TESTD_SOURCE_OBSERVATION_GIT_LEASE_MS: u64 =
+    TESTD_SOURCE_OBSERVATION_GIT_WALL_TIMEOUT_MS.saturating_mul(2);
+
+/// Maps a closed Git command to its stable dispatch identity.
+fn source_observation_git_command_name(command: eliot_testd_core::SourceObservationGitCommand) -> &'static str {
+    use eliot_testd_core::SourceObservationGitCommand;
+    match command {
+        SourceObservationGitCommand::ShowTopLevel => "show-toplevel",
+        SourceObservationGitCommand::AbbreviatedBranch => "abbrev-ref-head",
+        SourceObservationGitCommand::VerifiedCommit => "verify-head-commit",
+        SourceObservationGitCommand::PorcelainV2Status => "status-porcelain-v2",
+        SourceObservationGitCommand::BinaryWorktreeDiff => "diff-binary",
+        SourceObservationGitCommand::UntrackedListing => "ls-files-others",
+    }
+}
+
+/// Physical Git execution for source observation, bound to the one
+/// admitted `ProcessExecutor` and its Job Object contour.
+///
+/// The port holds the same executor instance the productive tool run
+/// uses, so Git children are owned, bounded, and cleaned up by exactly the
+/// same physical mechanism as the tool child. It mints nothing: the
+/// executable digest comes from the installed `git` file bytes, and the
+/// permit comes from the caller's already-activated
+/// [`TestdDispatchAuthority`], which is the same authority the tool permit
+/// is minted by.
+pub struct GovernedGitSourceObservation {
+    executor: Arc<WindowsProcessExecutor>,
+    authority: Arc<TestdDispatchAuthority>,
+    git_executable_absolute: String,
+    git_executable_sha256: String,
+    /// Admitted authority epoch and generation for every issued Git permit.
+    epoch: EpochId,
+    generation: u64,
+    /// Deterministic fence nonce and per-observation lease identity. These
+    /// are derived once from admitted material, never from caller text.
+    fence_nonce: String,
+    action_lease_ref: String,
+    /// Monotonic per-command counter producing the one-shot permit nonce,
+    /// so each of the six sealed Git children gets a distinct, single-use
+    /// permit that can never be replayed.
+    issued: std::sync::atomic::AtomicU64,
+}
+
+impl GovernedGitSourceObservation {
+    /// Resolves the installed `git` executable once and binds the observer
+    /// to the already-composed executor and authority.
+    ///
+    /// Resolution reuses the same `PATH` tool locator as the admitted test
+    /// profiles, so the observed Git is the same installed file the
+    /// operator's `PATH` names, canonicalized (no reparse point) and
+    /// hashed once; the executor re-hashes it again before every start.
+    pub fn new(
+        executor: Arc<WindowsProcessExecutor>,
+        authority: Arc<TestdDispatchAuthority>,
+        material: &crate::testd_material::ValidatedTestdMaterial,
+    ) -> Result<Self, TestdError> {
+        let resolved = resolve_source_observation_git()?;
+        Ok(Self {
+            executor,
+            authority,
+            git_executable_absolute: resolved.path,
+            git_executable_sha256: resolved.sha256,
+            epoch: material.epoch.clone(),
+            generation: material.generation,
+            fence_nonce: material.nonce.clone(),
+            action_lease_ref: format!("testd-source-observation-{}", material.grant.idempotency_key),
+            issued: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Seals one admitted Git `ProcessIntent` for a closed subcommand.
+    fn derive_git_intent(
+        &self,
+        command: eliot_testd_core::SourceObservationGitCommand,
+        operation: &OperationId,
+        source_root: &Path,
+    ) -> Result<ProcessIntent, TestdError> {
+        let invalid = |error: eliot_process::ContractError| {
+            TestdError::Contract(truncate_dispatch_detail(&error.to_string()))
+        };
+        if source_root
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(TestdError::Invalid {
+                field: "source_observation.repository_root",
+                reason: "Git source observation refuses a source root with parent traversal",
+            });
+        }
+        for variable in TESTD_SOURCE_OBSERVATION_GIT_REFUSED_ENVIRONMENT {
+            if std::env::var_os(variable).is_some() {
+                return Err(TestdError::Invalid {
+                    field: "source_observation.git_environment",
+                    reason: "Git repository-redirecting environment is not admitted for source observation",
+                });
+            }
+        }
+        let limits = ResourceLimits::new(
+            TESTD_SOURCE_OBSERVATION_GIT_WALL_TIMEOUT_MS,
+            Some(TESTD_SOURCE_OBSERVATION_GIT_CPU_TIME_MS),
+            Some(TESTD_SOURCE_OBSERVATION_GIT_MEMORY_BYTES),
+            TESTD_SOURCE_OBSERVATION_GIT_STDOUT_BYTES,
+            TESTD_SOURCE_OBSERVATION_GIT_STDERR_BYTES,
+            TESTD_SOURCE_OBSERVATION_GIT_MAX_DESCENDANTS,
+        )
+        .map_err(invalid)?;
+        // No ambient environment is inherited: the closed read-only Git
+        // argv needs none, and an inherited environment would let a
+        // caller's value reach the child.
+        let environment = EnvironmentProjection::new(
+            BTreeMap::new(),
+            Vec::new(),
+            EnvironmentInheritance::None,
+        )
+        .map_err(invalid)?;
+        let name = source_observation_git_command_name(command);
+        ProcessIntent::new(
+            operation.clone(),
+            ProcessTreeId::new(format!("testd-source-observation-{name}"))
+                .map_err(invalid)?,
+            JobId::new(format!("testd-source-observation-{name}")).map_err(invalid)?,
+            ImageId::new(TESTD_SOURCE_OBSERVATION_GIT_IMAGE).map_err(invalid)?,
+            SessionId::new(self.fence_nonce.clone()).map_err(invalid)?,
+            Generation::new(self.generation).map_err(invalid)?,
+            self.git_executable_absolute.clone(),
+            self.git_executable_sha256.clone(),
+            command
+                .argv()
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            source_root.to_string_lossy().into_owned(),
+            environment,
+            limits,
+        )
+        .map_err(invalid)
+    }
+}
+
+impl eliot_testd_core::SourceObservationGitPort for GovernedGitSourceObservation {
+    fn run_git(
+        &self,
+        repository_root: &Path,
+        command: eliot_testd_core::SourceObservationGitCommand,
+    ) -> Result<Vec<u8>, TestdError> {
+        use std::sync::atomic::Ordering;
+
+        let refused = |reason: &'static str| TestdError::Invalid {
+            field: "source_observation.git",
+            reason,
+        };
+        let sequence = self.issued.fetch_add(1, Ordering::Relaxed);
+        let operation = OperationId::new(format!(
+            "testd-source-observation-{}-{sequence}",
+            source_observation_git_command_name(command)
+        ))
+        .map_err(|error| TestdError::Contract(truncate_dispatch_detail(&error.to_string())))?;
+        let intent = self.derive_git_intent(command, &operation, repository_root)?;
+        // The permit is minted by the same `TestdDispatchAuthority` that
+        // seals the productive tool request, with a distinct one-shot
+        // nonce per Git child, so each child consumes exactly one permit
+        // and no permit can be replayed.
+        let now_unix_ms = unix_ms();
+        let lease = ActionLeaseRef::new(self.action_lease_ref.clone()).map_err(|error| {
+            TestdError::Contract(truncate_dispatch_detail(&error.to_string()))
+        })?;
+        let fence = FencingToken::new(
+            self.epoch.clone(),
+            Generation::new(self.generation).map_err(|error| {
+                TestdError::Contract(truncate_dispatch_detail(&error.to_string()))
+            })?,
+            self.fence_nonce.clone(),
+        )
+        .map_err(|error| TestdError::Contract(truncate_dispatch_detail(&error.to_string())))?;
+        let heads = BTreeMap::from([(
+            "source-observation".to_owned(),
+            intent.effect_digest().to_owned(),
+        )]);
+        let issuance = PermitIssuance::new(
+            lease,
+            fence,
+            heads,
+            now_unix_ms.saturating_sub(1).max(1),
+            now_unix_ms.saturating_add(TESTD_SOURCE_OBSERVATION_GIT_LEASE_MS),
+            format!(
+                "testd-source-observation-{}-{sequence}",
+                source_observation_git_command_name(command)
+            ),
+        )
+        .map_err(|error| TestdError::Contract(truncate_dispatch_detail(&error.to_string())))?;
+        let request = self.authority.issue_observation(&intent, issuance)?;
+        // The observation's own evidence collector absorbs the Git child's
+        // typed evidence; it is not the productive tool's collector, so a
+        // Git observation can never be promoted into tool evidence.
+        let sink: Arc<dyn ProcessEvidenceSink> =
+            Arc::new(eliot_testd_core::EvidenceCollector::default());
+        let receipt = crate::worker::block_on_one_shot(self.executor.start(request, sink))
+            .map_err(|_error| refused("governed Git source observation could not be started"))?;
+        if receipt.operation_id() != &operation {
+            return Err(refused("governed Git start receipt does not preserve the admitted operation"));
+        }
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(TESTD_SOURCE_OBSERVATION_GIT_WALL_TIMEOUT_MS.saturating_mul(2));
+        let view = loop {
+            let view = crate::worker::block_on_one_shot(self.executor.inspect(operation.clone()))
+                .map_err(|_error| refused("governed Git source observation could not be observed"))?;
+            if view.lifecycle().is_terminal() {
+                break view;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Cancellation is requested through the same contour, and
+                // the child is owned by the executor's Job Object, so the
+                // tree is torn down rather than left running.
+                let _ = crate::worker::block_on_one_shot(
+                    self.executor.cancel(operation.clone()),
+                );
+                return Err(refused("governed Git source observation exceeded its wall bound"));
+            }
+            std::thread::sleep(TESTD_SOURCE_OBSERVATION_GIT_POLL);
+        };
+        let exit = view
+            .exit()
+            .ok_or_else(|| refused("governed Git source observation reached a terminal lifecycle without an exit observation"))?;
+        if !matches!(exit.disposition(), ExitDisposition::Completed) {
+            return Err(refused("governed Git source observation did not complete"));
+        }
+        let code = governed_git_exit_code(exit)?;
+        if code != 0 {
+            return Err(refused("Git source observation failed or exceeded its bound"));
+        }
+        let (stdout, stderr) = self
+            .executor
+            .captured_output(&operation)
+            .map_err(|_error| refused("governed Git stream readback failed"))?;
+        if !stderr.captured || !stderr.complete || stderr.truncated {
+            return Err(refused("governed Git stderr capture is incomplete"));
+        }
+        if !stdout.captured || !stdout.complete || stdout.truncated {
+            return Err(refused("governed Git stdout capture is incomplete"));
+        }
+        Ok(stdout.bytes)
+    }
+}
+
+/// Recovers the exact numeric exit code of one governed child's completed
+/// exit, following the established serialized-exit precedent used by the
+/// governed Git bridge: the typed contract exposes only the coarse
+/// disposition, and the numeric code is read from the sealed observation.
+fn governed_git_exit_code(exit: &eliot_process::ExitStatus) -> Result<i32, TestdError> {
+    serde_json::to_value(exit)
+        .ok()
+        .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
+        .and_then(|code| i32::try_from(code).ok())
+        .ok_or(TestdError::Invalid {
+            field: "source_observation.git",
+            reason: "governed Git exit carries no numeric code",
+        })
+}
+
+/// Resolves the installed `git` executable through the same closed `PATH`
+/// tool locator used by the admitted test profiles.
+fn resolve_source_observation_git() -> Result<ResolvedToolFile, TestdError> {
+    let path_var = std::env::var_os("PATH").ok_or(TestdError::Invalid {
+        field: "program_path",
+        reason: "the platform tool locator carries no PATH",
+    })?;
+    resolve_tool_file(TESTD_SOURCE_OBSERVATION_GIT_PROGRAM, &path_var)
+}
+
 /// Ephemeral testd-owned dispatch authority (issue #20, DISPATCH-FINISH).
 ///
 /// Local testd half of the merged User Broker pattern
@@ -637,6 +987,58 @@ impl TestdDispatchAuthority {
             },
             fence,
             grant.authority_epoch.clone(),
+            heads,
+            1,
+        )
+        .map_err(invalid)?;
+        *self
+            .context
+            .lock()
+            .map_err(|_| TestdError::Contract("testd context lock poisoned".to_owned()))? =
+            Some(context);
+        ProcessRequest::new(intent.clone(), permit).map_err(invalid)
+    }
+
+    /// Issues one permit-bound request for an already-sealed observation
+    /// intent (issue #1140, AC3).
+    ///
+    /// This is the same Kernel-side authority and the same one-shot replay
+    /// fence as [`Self::issue`]; only the admission input differs. The
+    /// caller supplies the fully sealed `ProcessIntent` and the matching
+    /// `PermitIssuance`, and this method stores the validation context that
+    /// is exactly in lockstep with that issuance's fence, epoch, and
+    /// revision heads, so `validate_and_consume` can never see a context
+    /// that disagrees with the permit. It grants no authority of its own:
+    /// an intent whose fence, epoch, or effect digest is not the admitted
+    /// one still fails closed inside `DispatchPermitAuthority::issue` and
+    /// `ProcessRequest::new`.
+    pub fn issue_observation(
+        &self,
+        intent: &ProcessIntent,
+        issuance: PermitIssuance,
+    ) -> Result<ProcessRequest, TestdError> {
+        let invalid = |error: eliot_process::ContractError| {
+            TestdError::Contract(truncate_dispatch_detail(&error.to_string()))
+        };
+        let fence = issuance.state_fence().clone();
+        let epoch = fence.authority_epoch().clone();
+        let heads = issuance.expected_revision_heads().clone();
+        let now_unix_ms = unix_ms();
+        let permit = self
+            .authority
+            .lock()
+            .map_err(|_| TestdError::Contract("testd authority lock poisoned".to_owned()))?
+            .issue(intent, issuance)
+            .map_err(invalid)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(i64::try_from(now_unix_ms).unwrap_or(i64::MAX)),
+                known_time_ms: Some(i64::try_from(now_unix_ms).unwrap_or(i64::MAX)),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            epoch,
             heads,
             1,
         )
@@ -1567,6 +1969,7 @@ fn ensure_dispatch_source_observation(
     store: &TestdStore,
     mut job: TestJob,
     canonical_job_source: &Path,
+    git: &impl SourceObservationGitPort,
     now_unix_ms: u64,
 ) -> Result<TestJob, TestdError> {
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
@@ -1576,7 +1979,7 @@ fn ensure_dispatch_source_observation(
                 return Err(TestdError::InvalidBinding);
             }
         } else {
-            let observation = TestdSourceObservation::capture(canonical_job_source)?;
+            let observation = TestdSourceObservation::capture(canonical_job_source, git)?;
             job = store.bind_source_observation_before_dispatch(
                 &job.job_id,
                 observation,
@@ -1629,16 +2032,10 @@ fn present_dispatch_admission(
     job: &TestJob,
     material: &crate::testd_material::ValidatedTestdMaterial,
     intent: &ProcessIntent,
+    authority: &TestdDispatchAuthority,
     now_unix_ms: u64,
-) -> Result<
-    (
-        crate::kernel_client::PresentedAdmission,
-        TestdDispatchAuthority,
-    ),
-    TestdError,
-> {
+) -> Result<crate::kernel_client::PresentedAdmission, TestdError> {
     let authority_epoch = material.epoch.clone();
-    let authority = TestdDispatchAuthority::new()?;
     let request = authority.issue(intent, &material.grant, now_unix_ms)?;
     if request.invocation_digest() != job.process.invocation_digest {
         return Err(TestdError::InvalidBinding);
@@ -1665,7 +2062,7 @@ fn present_dispatch_admission(
         evidence_ref: material.operation_id.clone(),
         cancelled: material.cancelled,
     };
-    Ok((presented, authority))
+    Ok(presented)
 }
 
 fn project_dispatch_receipt_state(
@@ -1703,14 +2100,35 @@ pub async fn drive_validated_dispatch_material(
     let source_root = Path::new(source_root);
     let (store, job) = load_dispatch_job(material)?;
     let canonical_job_source = canonicalize_dispatch_roots(source_root, &job, material)?;
-    let job = ensure_dispatch_source_observation(&store, job, &canonical_job_source, now_unix_ms)?;
+    // The governed contour is composed before any physical execution on
+    // this path. The Git source observation runs through the very same
+    // `WindowsProcessExecutor` instance and the very same
+    // `TestdDispatchAuthority` that later seals the productive tool
+    // request, so both launches share one Job Object contour, one permit
+    // authority, and one one-shot replay fence (issue #1140, AC3).
+    let authority = Arc::new(TestdDispatchAuthority::new()?);
+    let executor = Arc::new(compose_process_executor(authority.clone()));
+    let git = GovernedGitSourceObservation::new(executor.clone(), authority, material)?;
+    let job = ensure_dispatch_source_observation(
+        &store,
+        job,
+        &canonical_job_source,
+        &git,
+        now_unix_ms,
+    )?;
     let intent = derive_dispatch_process_intent(&job, material, &canonical_job_source)?;
-    let (presented, authority) = present_dispatch_admission(&job, material, &intent, now_unix_ms)?;
-    let executor = compose_process_executor(Arc::new(authority));
+    // The productive tool permit is sealed by the same authority instance
+    // that sealed the observation permits, and the tool child is launched
+    // by the same `WindowsProcessExecutor`. Both permits carry distinct
+    // one-shot nonces, so neither can be replayed, and both children are
+    // owned by one Job Object contour.
+    let presented =
+        present_dispatch_admission(&job, material, &intent, &authority, now_unix_ms)?;
     let receipt = worker::drive_admitted_one_shot_from_store(
         &store,
         presented,
-        &executor,
+        executor.as_ref(),
+        Some(&git as &dyn SourceObservationGitPort),
         SERVICE_NAME,
         ADMITTED_WORKER_LEASE_MS,
         now_unix_ms,
@@ -1810,12 +2228,15 @@ pub fn run_admitted_one_shot<E: ProcessExecutor + 'static>(
     composition: &TestdComposition,
     presented: kernel_client::PresentedAdmission,
     executor: &E,
+    git: Option<&dyn SourceObservationGitPort>,
     owner: &str,
     lease_ms: u64,
     now: u64,
 ) -> Result<TestReceipt, TestdError> {
     let store = composition.store();
-    worker::drive_admitted_one_shot_from_store(store, presented, executor, owner, lease_ms, now)
+    worker::drive_admitted_one_shot_from_store(
+        store, presented, executor, git, owner, lease_ms, now,
+    )
 }
 
 pub(crate) fn receipt(job: &TestJob) -> TestReceipt {
