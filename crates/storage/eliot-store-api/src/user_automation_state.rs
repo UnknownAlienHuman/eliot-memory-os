@@ -13,6 +13,16 @@
 //! owner. Wire shapes stay serialization-only and never become a second
 //! semantic model.
 //!
+//! The owner-issued schedule normalization envelope is the one document here
+//! that this module neither mints nor interprets: it travels as an opaque JSON
+//! object, exactly as `ApplyNotificationState` carries its `source_receipt`,
+//! and the backends check it only through the shared `ReceiptEnvelope`
+//! validator. It exists because I05.19:96 gives a domain `*Receipt` exactly
+//! ONE issuing subsystem — the automation subsystem that compiled the
+//! occurrence set — and the Store's own `WriteReceipt` history provably
+//! cannot stand in for it, so the envelope rides the immutable revision row
+//! its issuer already writes rather than a second receipt store.
+//!
 //! Wire identity: [`USER_AUTOMATION_STATE_SCHEMA_V1`]
 //! (`eliot.automation.state.v1`). Mutation operation:
 //! `ApplyUserAutomationState`. Read operation: `GetUserAutomationState`.
@@ -122,6 +132,27 @@ pub const AUTOMATION_PARAM_REVISION_JSON: &str = "revision_json";
 pub const AUTOMATION_PARAM_PREVIOUS_REVISION: &str = "previous_revision";
 /// Closed admission state (revision legs; stored on the current pointer).
 pub const AUTOMATION_PARAM_CONFIGURATION_STATE: &str = "configuration_state";
+/// Owner-issued schedule normalization envelope (create/edit legs).
+///
+/// I05.19:96 gives a domain `*Receipt` name exactly ONE versioned envelope,
+/// issued by the ONE subsystem that performed the transition. The subsystem
+/// that compiled an automation's occurrence set is the automation subsystem,
+/// so the envelope over that set is its own and no Store-issued envelope can
+/// stand in for it: `WriteReceipt`'s `receipt_artifacts` emits only
+/// `store-transition:{op}` and `store-plan:{commit_id}`, and its identity is
+/// content-derived from the committed transition — whose digest already
+/// covers the very `revision_json` naming the envelope id, so binding an
+/// occurrence digest there would be circular.
+///
+/// The envelope therefore rides the immutable revision row its issuer already
+/// writes, through the same mechanism and the same shared
+/// `ReceiptEnvelope::validate()` edge `ApplyNotificationState` uses for
+/// `source_receipt_json`: the owning leg issues it, hands the Store the
+/// canonical bytes, and the backend persists those ORIGINAL bytes rather than
+/// a re-derivation, a re-issue, or a digest. Absence stays absence — a
+/// revision that retained no envelope leaves its compiled occurrence set
+/// unadmitted by name downstream, never a synthesized receipt.
+pub const AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON: &str = "normalization_receipt_json";
 /// Stable occurrence identity (run-now leg; row key).
 pub const AUTOMATION_PARAM_OCCURRENCE_ID: &str = "occurrence_id";
 /// Opaque canonical invocation document (run-now leg).
@@ -256,6 +287,10 @@ pub enum DecodedAutomationMutation {
         revision_json: String,
         /// Closed admission state for the current pointer.
         configuration_state: String,
+        /// Owner-issued schedule normalization envelope to retain beside the
+        /// revision, absent when the leg carried none (see
+        /// [`AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON`]).
+        normalization_receipt_json: Option<Value>,
     },
     /// Add a superseding immutable revision + move the current pointer.
     Edit {
@@ -269,6 +304,10 @@ pub enum DecodedAutomationMutation {
         revision_json: String,
         /// Closed admission state for the current pointer.
         configuration_state: String,
+        /// Owner-issued schedule normalization envelope to retain beside the
+        /// new revision, absent when the leg carried none (see
+        /// [`AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON`]).
+        normalization_receipt_json: Option<Value>,
     },
     /// Move admission state without touching the immutable revision.
     StateTransition {
@@ -780,6 +819,31 @@ pub fn automation_edit_params(
     params
 }
 
+/// Attaches the owner-issued schedule normalization envelope to one
+/// revision-leg parameter map.
+///
+/// The envelope is a separate call rather than a fifth argument to
+/// [`automation_create_params`]/[`automation_edit_params`] because it is
+/// OPTIONAL per leg, and those two builders are the closed minimum every
+/// revision leg must carry. An edit takes its own envelope, never the
+/// superseded revision's, because each immutable revision publishes its own
+/// compiled occurrence set and therefore needs its own owner envelope.
+///
+/// The value is carried by value and is already validated by the leg that
+/// issued it; nothing here mints, re-derives or defaults one. A leg that
+/// carries no envelope simply does not call this, and absence stays absence.
+#[must_use]
+pub fn with_automation_normalization_receipt(
+    mut parameters: BTreeMap<String, Value>,
+    envelope: Value,
+) -> BTreeMap<String, Value> {
+    parameters.insert(
+        AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON.to_owned(),
+        envelope,
+    );
+    parameters
+}
+
 /// Builds a pause/resume/remove-leg parameter map (no revision document:
 /// the immutable revision is untouched, only the pointer moves).
 pub fn automation_state_transition_params(
@@ -974,6 +1038,21 @@ pub fn validate_automation_mutation_params(
     }
     let leg = text_param(parameters, AUTOMATION_PARAM_OPERATION)?;
     validate_automation_id(text_param(parameters, AUTOMATION_PARAM_AUTOMATION_ID)?)?;
+    // The retained owner envelope is optional per leg but never untyped: when a
+    // revision leg carries one it must be the canonical envelope JSON object, so
+    // the backend can decode it through the shared `ReceiptEnvelope::validate()`
+    // and persist the ORIGINAL bytes rather than anything it re-derives. Only the
+    // shape is decided here — envelope validity belongs to the validator every
+    // backend already shares with `source_receipt_json`.
+    match parameters.get(AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON) {
+        None | Some(Value::Object(_)) => {}
+        Some(_) => {
+            return Err(StoreError::InvalidField {
+                field: AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON,
+                reason: "owner normalization envelope must be a JSON object",
+            });
+        }
+    }
     match leg {
         AUTOMATION_OPERATION_CREATE => {
             validate_revision_id(text_param(parameters, AUTOMATION_PARAM_REVISION)?)?;
@@ -1047,12 +1126,21 @@ pub fn decode_automation_mutation(
             })
     };
     let leg = text_of(AUTOMATION_PARAM_OPERATION)?;
+    // `validate_automation_mutation_params` already proved the shape, so this
+    // only projects the object; an absent envelope is absence, never an empty
+    // or synthesized one.
+    let envelope_of = || {
+        parameters
+            .get(AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+            .cloned()
+    };
     match leg.as_str() {
         AUTOMATION_OPERATION_CREATE => Ok(DecodedAutomationMutation::Create {
             automation_id: text_of(AUTOMATION_PARAM_AUTOMATION_ID)?,
             revision: text_of(AUTOMATION_PARAM_REVISION)?,
             revision_json: text_of(AUTOMATION_PARAM_REVISION_JSON)?,
             configuration_state: text_of(AUTOMATION_PARAM_CONFIGURATION_STATE)?,
+            normalization_receipt_json: envelope_of(),
         }),
         AUTOMATION_OPERATION_EDIT => Ok(DecodedAutomationMutation::Edit {
             automation_id: text_of(AUTOMATION_PARAM_AUTOMATION_ID)?,
@@ -1060,6 +1148,7 @@ pub fn decode_automation_mutation(
             revision: text_of(AUTOMATION_PARAM_REVISION)?,
             revision_json: text_of(AUTOMATION_PARAM_REVISION_JSON)?,
             configuration_state: text_of(AUTOMATION_PARAM_CONFIGURATION_STATE)?,
+            normalization_receipt_json: envelope_of(),
         }),
         AUTOMATION_OPERATION_PAUSE | AUTOMATION_OPERATION_RESUME | AUTOMATION_OPERATION_REMOVE => {
             Ok(DecodedAutomationMutation::StateTransition {
