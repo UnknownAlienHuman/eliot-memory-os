@@ -3024,7 +3024,7 @@ mod honest_tests {
         fixture_handle(root.join(name).to_string_lossy().into_owned())
     }
 
-    fn fixture_profile_roots(
+    pub fn fixture_profile_roots(
         portable_root: &Path,
         generation: &str,
         runtime_state_roots: &eliot_installation::RuntimeStateRoots,
@@ -3800,7 +3800,11 @@ mod store_currentness_production_tests {
             profile_component: h("eliot"),
             profile_version: h("test-version"),
             profile_installation_key: None,
-            profile_governed_roots: fixture_profile_roots(Path::new(portable), "gen-1", roots),
+            profile_governed_roots: super::honest_tests::fixture_profile_roots(
+                Path::new(portable),
+                "gen-1",
+                roots,
+            ),
             portable_root: Some(PlatformHandle::new(portable.to_owned()).expect("handle")),
             installation_epoch: eliot_installation::InstallationEpoch {
                 installation: h("install-1"),
@@ -4139,6 +4143,19 @@ mod live_production_observer_tests {
             activation_generation: genesis("act-lineage-1"),
         }
     }
+    /// The empty `HostState` for one fresh Host epoch, built the way the owner
+    /// builds one: open the journal on the epoch and read back its snapshot.
+    ///
+    /// `HostState` is the Host journal's rebuildable read model, not a value a
+    /// caller assembles, so a struct literal would bypass the single-writer
+    /// reducer. A freshly opened journal has admitted no record, which is
+    /// exactly the no-evidence contour these observer tests inspect.
+    fn empty_host_state(host: HostInstallationEpoch) -> HostState {
+        eliot_host_state::HostStateJournal::open(eliot_host_state::MemoryBackend::default(), host)
+            .expect("open host journal")
+            .snapshot()
+            .expect("snapshot empty host journal")
+    }
     fn ready_process() -> ServiceProcessRecord {
         serde_json::from_value(serde_json::json!({
             "process_id": "pid:1001:start:10",
@@ -4383,10 +4400,10 @@ mod live_production_observer_tests {
                     profile_component: h("eliot"),
                     profile_version: h("test-version"),
                     profile_installation_key: None,
-                    profile_governed_roots: fixture_profile_roots(
+                    profile_governed_roots: super::honest_tests::fixture_profile_roots(
                         Path::new(portable),
                         "gen-1",
-                        roots,
+                        &roots,
                     ),
                     portable_root: Some(PlatformHandle::new(portable.to_owned()).expect("handle")),
                     installation_epoch: eliot_installation::InstallationEpoch {
@@ -4680,30 +4697,7 @@ mod live_production_observer_tests {
             lease_verified: true,
         };
         let observer = FakeWatchdogObserver { snap: Some(snap) };
-        let host = HostState {
-            host: make_host(),
-            sequence: 1,
-            last_checksum: None,
-            activation: None,
-            kernel: None,
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: Vec::new(),
-            store_rebinds: Vec::new(),
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: Vec::new(),
-            epoch_retirements: Vec::new(),
-        };
+        let host = empty_host_state(make_host());
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
             state: ComponentState::Healthy,
@@ -4743,30 +4737,7 @@ mod live_production_observer_tests {
             lease_verified: true,
         };
         let observer = FakeWatchdogObserver { snap: Some(snap) };
-        let host = HostState {
-            host: make_host(),
-            sequence: 1,
-            last_checksum: None,
-            activation: None,
-            kernel: None,
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: Vec::new(),
-            store_rebinds: Vec::new(),
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: Vec::new(),
-            epoch_retirements: Vec::new(),
-        };
+        let host = empty_host_state(make_host());
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
             state: ComponentState::Healthy,

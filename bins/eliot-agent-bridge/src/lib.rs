@@ -6859,7 +6859,7 @@ mod tests {
         let decoded = decode_activation_response(&resp_frame, &req, &receipt).expect("decode");
         assert!(matches!(
             decoded.disposition,
-            eliot_protocol::AgentBridgeActivationDisposition::Denied { .. }
+            eliot_protocol::OpenAgentBridgeActivationDisposition::Denied { .. }
         ));
         let mut bad_req = req.clone();
         bad_req.request_sha256 = "0".repeat(64);
@@ -7104,6 +7104,11 @@ mod tests {
                     task_revision: "task-revision-1".to_owned(),
                     plan_id: "plan-1".to_owned(),
                     plan_revision: "plan-revision-1".to_owned(),
+                    // No bounded workspace observation ran for this
+                    // synthetic resolver binding, so the scanner issued no
+                    // non-ready question: the field carries absence of an
+                    // observation, not an empty one.
+                    cold_start_question: None,
                 }),
             },
             response_sha256: String::new(),
