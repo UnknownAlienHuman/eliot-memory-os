@@ -251,8 +251,7 @@ pub fn gate_apply(
                         NamedMutationOperation::CaptureObservation
                             | NamedMutationOperation::AppendAuditEvent
                     )
-                })
-                    || transition.transition_class != TransitionClass::CaptureCandidate
+                }) || transition.transition_class != TransitionClass::CaptureCandidate
                     || transition.requested_effect_ceiling != EffectClass::Candidate
                 {
                     return Err(TaskBindingRejection::selection_required(
