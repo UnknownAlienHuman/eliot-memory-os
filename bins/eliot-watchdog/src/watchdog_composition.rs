@@ -6,8 +6,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use eliot_contracts::sha256_hex;
 use eliot_runtime::{
     ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
+};
+use eliot_watchdog_core::{
+    CoverageGapExplanation, CoverageManifestMismatch, CoverageManifestProjection, EvidenceRef,
+    ObservationCoverageInput, validate_observation_coverage_against_manifest,
 };
 
 use crate::AdmittedIsolatedDestination;
@@ -29,8 +34,8 @@ use crate::health_projection::{HealthProjectionCell, evaluate_interval_health};
 use crate::heartbeat_transport::{HeartbeatTransport, HeartbeatTransportError};
 use crate::kernel_gap_reason;
 use crate::observation_coverage::{
-    IntervalCoverageCell, IntervalCoveragePublication, ObservationChannel, ObservationClass,
-    RecordOutcome,
+    CoverageDisposition, IntervalCoverageCell, IntervalCoveragePublication, IntervalCoverageReport,
+    ObservationChannel, ObservationClass, RecordOutcome, channel_capability,
 };
 use crate::report_gap_nonfatal;
 use crate::watchdog_spool::WatchdogSpool;
@@ -155,6 +160,130 @@ fn publish_interval_coverage(publication: &IntervalCoveragePublication, interval
         channels = ?channels,
         "one supervision tick's per-channel I8.2 observation coverage published"
     );
+}
+
+/// Projects the actual #1755 interval manifest on one closed interval.
+///
+/// This is the A4 adapter's read of the owner's own record: the interval
+/// identity, the manifest evidence handle, and the gap verdict are all derived
+/// from the closed [`IntervalCoverageReport`] through its public claims only.
+/// A supplied [`ObservationCoverageInput`] built anywhere else — a restated
+/// label, a stale interval, or a verdict the manifest does not carry — cannot
+/// match this projection, so [`validate_supplied_coverage_against_manifest`]
+/// refuses it instead of letting two coverage claims disagree about one
+/// interval.
+///
+/// The verdict categories are the rule's own: an internally inconsistent
+/// manifest, or one no tick closed, establishes no verdict; a manifest whose
+/// every short channel is a measured missing adapter is explained; any other
+/// short wired channel is a gap this owner cannot account for. The evidence
+/// handle is this adapter's digest over the manifest's public record data —
+/// the manifest's own handle, not the detector's internal publication digest
+/// — so supplied values are judged against the actual manifest, never against
+/// a restatement of the detector's input.
+#[must_use]
+pub fn project_actual_coverage_manifest(
+    manifest: &IntervalCoverageReport,
+) -> CoverageManifestProjection {
+    CoverageManifestProjection {
+        interval_id: manifest_interval_identity(manifest),
+        evidence: EvidenceRef {
+            evidence_id: sha256_hex(manifest_evidence_fields(manifest).as_bytes()),
+        },
+        explanation: manifest_gap_verdict(manifest),
+    }
+}
+
+/// Validates supplied coverage values against the actual #1755 manifest on the
+/// interval.
+///
+/// A4: an `ObservationCoverageGap` that names a different interval, cites
+/// different evidence, or claims a different explanation than the actual
+/// manifest on that interval is a contradictory coverage claim and must not
+/// stand. Each mismatch class is typed by the existing
+/// [`CoverageManifestMismatch`] so the supplying caller can project the exact
+/// correction. This adapter reads no store and authorizes no effect: it
+/// compares a supplied input against the owner's own manifest record.
+///
+/// # Errors
+///
+/// Returns the exact mismatch when the supplied interval, evidence, or
+/// explanation disagrees with the actual manifest on that interval.
+#[must_use]
+pub fn validate_supplied_coverage_against_manifest(
+    manifest: &IntervalCoverageReport,
+    input: &ObservationCoverageInput,
+) -> Result<(), CoverageManifestMismatch> {
+    let actual = project_actual_coverage_manifest(manifest);
+    validate_observation_coverage_against_manifest(input, &actual)
+}
+
+/// The actual manifest's own interval identity: the declared owner-clock
+/// bounds under the sensor map revision they were derived under.
+///
+/// Length-prefixed with the manifest's own tag, so it can never collide with
+/// the detector's internal source-event identity: the two name different
+/// things — the owner's published record versus one rule's comparison event.
+fn manifest_interval_identity(manifest: &IntervalCoverageReport) -> String {
+    let interval = manifest.interval();
+    crate::health_projection::encode_identity(&[
+        "watchdog_coverage_manifest".to_owned(),
+        interval.start_ms.to_string(),
+        interval.end_ms.to_string(),
+        manifest.sensor_map_revision().to_string(),
+    ])
+}
+
+/// The manifest's own evidence fields: every public record claim bound into
+/// one digest.
+///
+/// Map revision, declared bounds, and per record the channel, disposition,
+/// observed-class count, dropped samples, and every named gap reason. A
+/// supplied evidence handle matches only when it was built from this same
+/// record, so a stale or foreign manifest can never validate.
+fn manifest_evidence_fields(manifest: &IntervalCoverageReport) -> String {
+    let interval = manifest.interval();
+    let mut fields = vec![
+        "watchdog_coverage_manifest".to_owned(),
+        manifest.sensor_map_revision().to_string(),
+        interval.start_ms.to_string(),
+        interval.end_ms.to_string(),
+    ];
+    for record in manifest.records() {
+        fields.push(record.channel().as_str().to_owned());
+        fields.push(record.disposition().as_str().to_owned());
+        fields.push(record.observed_classes().len().to_string());
+        fields.push(record.dropped_samples().to_string());
+        for gap in record.gaps() {
+            fields.push(gap.reason.to_owned());
+        }
+    }
+    crate::health_projection::encode_identity(&fields)
+}
+
+/// The actual manifest's own gap verdict in the rule's vocabulary.
+///
+/// An inconsistent manifest, or one no tick closed, establishes no verdict. A
+/// channel the map says has no competent source is a measured structural
+/// limitation, not a gap that appeared between two intervals, so only a short
+/// wired channel is unexplained. These are the same categories the runtime
+/// projection derives, read here through the manifest's public claims, so the
+/// adapter can never contradict the projection about one interval.
+fn manifest_gap_verdict(manifest: &IntervalCoverageReport) -> CoverageGapExplanation {
+    if !manifest.valid() || manifest.records().iter().any(|record| !record.interval_closed()) {
+        return CoverageGapExplanation::Unknown;
+    }
+    let unexplained = manifest.records().iter().any(|record| {
+        matches!(
+            record.disposition(),
+            CoverageDisposition::Partial | CoverageDisposition::Unknown
+        ) && channel_capability(record.channel()).wiring.is_wired()
+    });
+    if unexplained {
+        CoverageGapExplanation::Unexplained
+    } else {
+        CoverageGapExplanation::Explained
+    }
 }
 
 /// Ends one supervision tick's coverage interval when the tick body is left.
