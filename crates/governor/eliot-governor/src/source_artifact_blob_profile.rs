@@ -9,7 +9,9 @@
 use eliot_authority::PrincipalRef;
 use eliot_contracts::StateFence;
 use eliot_protocol::RequestIdentity;
-use eliot_receipts::{OperationBinding, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding};
+use eliot_receipts::{
+    EffectClass, OperationBinding, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding,
+};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -168,7 +170,7 @@ pub struct SourceArtifactBlobProfile {
     request: RequestBinding,
     request_identity: RequestIdentity,
     operation: OperationBinding,
-    reservation_id: eliot_ors::OperationIdentity,
+    reservation_id: Option<eliot_ors::OperationIdentity>,
 }
 
 impl SourceArtifactBlobProfile {
@@ -277,7 +279,7 @@ impl SourceArtifactBlobProfile {
             request: admission.request().clone(),
             request_identity: admission.request_identity().clone(),
             operation: admission.operation().clone(),
-            reservation_id: admission.reservation_id().clone(),
+            reservation_id: admission.reservation_id().cloned(),
         };
         profile.validate_admission_binding(admission)?;
         Ok(profile)
@@ -365,9 +367,14 @@ impl SourceArtifactBlobProfile {
             && self.request == *admission.request()
             && self.request_identity == *admission.request_identity()
             && self.operation == *admission.operation()
-            && self.reservation_id == *admission.reservation_id()
+            && self.reservation_id.as_ref() == admission.reservation_id()
             && self.state_fence == admission.work_scope().state_fence;
-        if !binding_matches {
+        let reservation_matches_effect = match admission.operation().effect {
+            EffectClass::Read => self.reservation_id.is_none(),
+            EffectClass::ReversibleMutation => self.reservation_id.is_some(),
+            _ => false,
+        };
+        if !binding_matches || !reservation_matches_effect {
             return Err(SourceArtifactBlobProfileError::AdmissionMismatch);
         }
         if self.residency_domains.scope != admission.work_scope().scope_id.as_str() {
