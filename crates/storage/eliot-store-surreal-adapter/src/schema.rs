@@ -816,6 +816,21 @@ pub(crate) const TX_MODULE_REGISTRY_OWNER: &str = "LET $module_registry_existing
 /// evidence by, so a delayed writer holding a stale predecessor is refused
 /// inside the canonical transaction, before it can reach the registry. The
 /// record document stays opaque bytes.
+/// Fenced compare-and-set of the existing Governor-owned coordination owner
+/// image. The payload remains opaque to the adapter; only the fixed
+/// `owner/coordination` address, fence, and outer revision are
+/// provider-arbitrated.
+///
+/// Same shape as [`TX_MODULE_REGISTRY_OWNER`], with the coordination row's own
+/// address: the genesis owner record must already exist (a `RecoverySchema`
+/// owner image is never created outside genesis), and a present row is advanced
+/// only from exactly the asserted namespace, key, schema, state fence and
+/// revision. The issued `revision` is always `expected + 1`. A delayed writer
+/// holding a stale predecessor throws `coordination_owner_cas_conflict` inside
+/// the canonical transaction, before the receipt commits, so it can never
+/// overwrite a newer coordination image.
+pub(crate) const TX_COORDINATION_OWNER: &str = "LET $coordination_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema } FROM ONLY type::record($coordination_owner_table, $coordination_owner_id)); IF type::is_object($coordination_existing) { LET $coordination_owner_cas = (UPDATE type::record($coordination_owner_table, $coordination_owner_id) CONTENT $coordination_owner_record WHERE namespace = 'owner' AND key = 'coordination' AND schema = 'eliot.governor.owner.snapshot.v1' AND state_fence = $coordination_expected_state_fence AND revision = $coordination_expected_revision RETURN AFTER); IF array::len($coordination_owner_cas ?? []) != 1 { THROW 'coordination_owner_cas_conflict'; }; } ELSE { THROW 'coordination_owner_cas_conflict'; };";
+
 pub(crate) const TX_CAPABILITY_EVIDENCE_OWNER: &str = "LET $capability_evidence_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($capability_evidence_table, $capability_evidence_id)); IF type::is_object($capability_evidence_existing) { LET $capability_evidence_cas = (UPDATE type::record($capability_evidence_table, $capability_evidence_id) CONTENT $capability_evidence_record WHERE state_fence = $capability_evidence_expected_state_fence AND revision = $capability_evidence_expected_revision RETURN AFTER); IF array::len($capability_evidence_cas ?? []) != 1 { THROW 'capability_evidence_cas_conflict'; }; } ELSE { IF $capability_evidence_expected_revision != 0 { THROW 'capability_evidence_create_conflict'; }; LET $capability_evidence_create = (CREATE type::record($capability_evidence_table, $capability_evidence_id) CONTENT $capability_evidence_record RETURN AFTER); IF array::len($capability_evidence_create ?? []) != 1 { THROW 'capability_evidence_create_conflict'; }; };";
 
 /// Renders an indexed transaction template for the given binding index.

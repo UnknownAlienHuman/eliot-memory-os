@@ -967,6 +967,10 @@ fn build_apply_statements(
     // rows under the same fenced compare-and-set contract.
     append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
     append_module_registry_owner_statement(&mut sql, &mut bindings, transition)?;
+    // The coordination owner image is the coordination owner's post-genesis
+    // write route; without this leg every coordination mutation would be
+    // erased by the next owner rehydration.
+    append_coordination_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 
@@ -1142,6 +1146,109 @@ fn append_module_registry_owner_statement(
     );
     bindings.insert(
         "module_registry_owner_record".to_owned(),
+        Value::Object(record),
+    );
+    Ok(())
+}
+
+/// Appends the Governor-produced coordination owner image.
+///
+/// The adapter keeps the snapshot opaque and only performs the fixed
+/// `owner/coordination` fenced revision CAS. Governor has already validated
+/// every session, work item, lease, and result admission inside the image
+/// before this statement is assembled, and it reads the exact committed image
+/// back through the same named recovery read `refresh_from_kernel` uses, so a
+/// committed coordination mutation survives rehydration.
+fn append_coordination_owner_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordCoordinationOwner
+    }) else {
+        return Ok(());
+    };
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let expected_revision = text_param("expected_coordination_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "expected_coordination_revision must be a decimal revision",
+            })
+        })?;
+    if expected_revision == 0 {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "coordination.owner_revision",
+            reason: "the genesis owner record must already exist",
+        }));
+    }
+    let snapshot_json = text_param("snapshot_json")?;
+    if snapshot_json.is_empty() {
+        return Err(AdapterError::Store(StoreError::Empty {
+            field: "coordination.snapshot_json",
+        }));
+    }
+    if snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+
+    let key = eliot_store_api::RecoveryRecordKey::new("owner", "coordination")
+        .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&key)?;
+    let payload = snapshot_json.as_bytes();
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(key.namespace));
+    record.insert("key".to_owned(), json!(key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert(
+        "revision".to_owned(),
+        json!(expected_revision.checked_add(1).ok_or({
+            AdapterError::Store(StoreError::InvalidField {
+                field: "coordination.owner_revision",
+                reason: "revision overflow",
+            })
+        })?),
+    );
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::OWNER_SNAPSHOT_SCHEMA),
+    );
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert(
+        "value_digest".to_owned(),
+        json!(eliot_store_api::sha256_hex(payload)),
+    );
+
+    sql.push_str(schema::TX_COORDINATION_OWNER);
+    bindings.insert(
+        "coordination_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("coordination_owner_id".to_owned(), json!(owner_id));
+    bindings.insert(
+        "coordination_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert(
+        "coordination_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
+    bindings.insert(
+        "coordination_owner_record".to_owned(),
         Value::Object(record),
     );
     Ok(())

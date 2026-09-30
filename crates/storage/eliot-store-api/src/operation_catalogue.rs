@@ -448,8 +448,9 @@ struct ActivatedMutationDescriptor {
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
-/// `ReconcileRecovery`, `RecordFinishEvidence`, `RecordFinishDecision`, and
-/// `RecordModuleCatalogSnapshot` persist `ReversibleMutation` through the
+/// `ReconcileRecovery`, `RecordFinishEvidence`, `RecordFinishDecision`,
+/// `RecordModuleCatalogSnapshot`, and `RecordCoordinationOwner` persist
+/// `ReversibleMutation` through the
 /// `RecoverySchema` family;
 /// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
@@ -545,6 +546,17 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
         // Owner snapshots are bounded at 512 KiB. The existing 2 MiB bulk
         // parameter bound covers canonical JSON string escaping and the
         // remaining fixed parameters without broadening the payload bound.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordCoordinationOwner,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        // The coordination image is bounded exactly like the other owner
+        // snapshots: `MAX_RECOVERY_RECORD_BYTES` (512 KiB) inside the adapter
+        // handler, and the 2 MiB bulk parameter bound covers canonical JSON
+        // string escaping plus the enclosing structure without broadening the
+        // payload bound itself.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
@@ -888,7 +900,7 @@ pub fn validate_read_against_catalogue(
 /// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
 /// `CommitExperienceBank`, `CommitAgentFeedback`,
 /// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`,
-/// `ApplyProblemOwnerState`, and
+/// `ApplyProblemOwnerState`, `RecordCoordinationOwner`, and
 /// `RecordModuleCatalogSnapshot` have activated
 /// mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
@@ -950,6 +962,7 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::RecordFinishDecision
             | NamedMutationOperation::RecordFinishEvidence
             | NamedMutationOperation::RecordModuleCatalogSnapshot
+            | NamedMutationOperation::RecordCoordinationOwner
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure
