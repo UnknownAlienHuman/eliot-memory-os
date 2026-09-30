@@ -734,14 +734,28 @@ pub(super) fn run() -> Result<(), String> {
     // (diagnostics only), keeping the owner identity observable without adding
     // policy semantics to the composition root.
     //
-    // Measured at #2703: this is a DIAGNOSTIC REFERENCE ONLY. It is not a
-    // dispatch site. No live request reaches `govern_improvement_candidate`,
-    // because `ImprovementRouteRequest` is never constructed anywhere in
-    // `bins/` or `crates/`, and the candidate → experiment → evaluation →
-    // admission path is therefore not yet served by this daemon. The typed
-    // result mapping behind it is exhaustive and correct; what is missing is a
-    // request source, which is owner scope for #1145, not for this diagnostic.
-    // Do not read this line as evidence that the route is wired.
+    // Measured at #2703 and re-measured at 28e544329: this is a DIAGNOSTIC
+    // REFERENCE ONLY. It is not a dispatch site. `eliotd::govern_improvement_candidate`
+    // is still called from nowhere in `bins/`, `crates/` or `apps/` — the only
+    // references to that name are its own `lib.rs` definition and one
+    // `shipped_serde_boundaries.toml` data row — so this line does not reach
+    // it.
+    //
+    // The reason the old comment gave for that is no longer true, though:
+    // `ImprovementRouteRequest` IS now constructed, at exactly one site
+    // (`improvement_candidate_dispatch.rs`, inside
+    // `dispatch_improvement_candidate_route`). And that sibling IS
+    // production-reached: one call site, at `route_and_reconcile_improvement_candidate`
+    // below, reached from `run_improvement_intake`, whose flight
+    // `maybe_start_improvement_intake` starts from the live run loop. So the
+    // candidate -> experiment -> evaluation -> admission path is served by this
+    // daemon today — through the sibling, not through this crate-root
+    // forwarder, which remains an uncalled duplicate of it.
+    //
+    // What remains true of the forwarder is only its own shape: the typed
+    // result mapping behind it is exhaustive and correct. Do not read this line
+    // as evidence that the route is wired, and do not read the forwarder's
+    // absence as evidence that it is not.
     tracing::info!(
         target: "eliotd::diagnostics",
         event = "eliotd.improvement_pipeline_owner",
@@ -5097,21 +5111,26 @@ struct FairPullRecoveryFlightState {
 /// Sole owner of the always-armed bounded fair-pull recovery poll in
 /// `run_loop` (issue #1683 W5, I14.8).
 ///
-/// This is the thirteenth single-owner polled flight, and it is the one that
-/// makes the I14.8 progress loop correct rather than merely fast. The event arm
-/// (`solo_ingest_result`) advances released capacity in the same operation that
-/// released it; that arm is an optimisation. This one exists because an
-/// event-only loop is a lost-wakeup deadlock: a dropped, coalesced or
-/// pre-registered notification would leave the loop waiting forever for work
-/// that is already eligible.
+/// This is the thirteenth single-owner polled flight. I14.8 closes with two
+/// sentences, and this flight is the one that discharges the second: "Mechanical
+/// queue progress never depends on an LLM remembering to start another agent."
+/// The first sentence is an ordering requirement — "terminal/deferred/blocked
+/// attempt releases its slot, then the next currently admissible Ready Work
+/// Item is selected" — and the event arm (`solo_ingest_result`) is the
+/// *synchronous* implementation of it. That arm has no caller in this tree, so
+/// this poll is what preserves the ordering today, at up to one tick of latency
+/// rather than synchronously. It exists in its own right because an event-only
+/// loop is a lost-wakeup deadlock: a dropped, coalesced or pre-registered
+/// notification would leave the loop waiting forever for work that is already
+/// eligible.
 ///
 /// So `maybe_start_fair_pull_recovery` starts the poll on **every** tick of the
 /// shared `ACTIVATION_POLL_INTERVAL` cadence. It is not gated on a pending
 /// wake, on a prior failure, on a "did anything change" flag, or on any
-/// degraded state: the bounded poll is the authoritative arm and the event is
-/// the optimisation, so a fallback that only ran after a failure would invert
-/// that and reintroduce the deadlock. `Idle` means no poll is outstanding;
-/// `InFlight` holds the one pending bounded poll, so ticks never overlap it.
+/// degraded state: no external prompt may be what makes the queue progress, so
+/// a fallback that only ran after a failure would reintroduce the deadlock.
+/// `Idle` means no poll is outstanding; `InFlight` holds the one pending bounded
+/// poll, so ticks never overlap it.
 /// The future remains a select branch, so a pending restore keeps the cadence
 /// and shutdown pollable.
 enum FairPullRecoveryFlight {

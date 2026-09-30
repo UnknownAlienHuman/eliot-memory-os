@@ -2,7 +2,7 @@
 //!
 //! Owner-neutral public adapter boundary for constructing a verified
 //! Coordinator without exposing an "always true" verifier. The sealed
-//! [`ProviderAdmission`] handle is the only production path this crate offers
+//! [`ProviderAdmission`] handle is the only *non-test* path this crate offers
 //! from daemon-resolved claim material to the coordinator's closed admission:
 //! its constructor itself requires exact owner evidence — the live
 //! [`OwnerSessionFacts`](crate::daemon_kernel_client::OwnerSessionFacts) from
@@ -36,15 +36,39 @@
 //! revision/generation coherence stays with the owner
 //! (`AdmittedProviderCapability::new`); this port enforces the session-half
 //! overwrite, original shape, and expectation-epoch currency.
+//!
+//! Reachability, stated rather than implied: this module and
+//! [`ProviderAdmission`] are not `cfg(test)`-gated, so they are compiled in a
+//! production build, and [`ProviderAdmission::new`] has exactly one call site —
+//! `DaemonComposition::build_production_provider_capability` in
+//! `bins/eliotd/src/lib.rs`, which is itself private to that impl block. That
+//! function's only two callers are
+//! `DaemonComposition::agent_fabric_new_verified_async` and
+//! `DaemonComposition::agent_fabric_restore_verified_async`, and both of those
+//! now have non-test callers — the runtime solo queue poll
+//! (`solo_poll_queue_async` -> `drive_solo_delegate_verified_async` ->
+//! `drive_admitted_material_async`) and the bounded fair-pull recovery poll
+//! (`solo_fair_pull_recovery` -> the `#[cfg(not(test))]`
+//! `restore_solo_fabric_async`) respectively.
+//!
+//! What no production run does is *supply the input* those paths need: the
+//! queue-poll path returns `SoloPollOutcome::Idle` while `solo_state.queue` is
+//! empty and nothing enqueues an intake ([`DaemonComposition::solo_enqueue`]
+//! has no caller), and the recovery-poll path returns
+//! `FairPullRecovery::NoLiveProjection` while `solo_state.live_operation` is
+//! `None` and nothing sets it. So a production build compiles this port on a
+//! live call path, and no production run yet constructs a `ProviderAdmission`:
+//! the closed admission is reachable only once the per-operation executor that
+//! owns the seam is bound. The residual is the Kernel native-worker
+//! executable-binding owner plus the G-11 admission owner (issue #1678), and
+//! nothing here works around it.
 
 use eliot_contracts::StateFence;
 
 use crate::agent_fabric::{FabricError, VerifiedProviderMaterial};
 use crate::daemon_kernel_client::OwnerSessionFacts;
 
-/// Sealed production provider admission for one provider claim (issue #1108,
-///
-/// A4).
+/// Sealed provider admission for one provider claim (issue #1108, A4).
 ///
 /// Closed port, not a trait: there is no caller-implementable verifier hook.
 /// The value exists only because the constructor proved a live authenticated
@@ -53,6 +77,11 @@ use crate::daemon_kernel_client::OwnerSessionFacts;
 /// expectation epoch under the live fence epoch. Currency is never cached:
 /// the caller re-queries the live fence per construction, per restore, and per
 /// daemon operation resolution, and every coordinator `verify` re-checks it.
+///
+/// These are the real invariants this type enforces, and they are enforced
+/// whenever a value exists — no `cfg(test)` boundary weakens them. What is
+/// *not* yet true is that a production run produces one: see this module's
+/// reachability paragraph above.
 pub struct ProviderAdmission {
     material: VerifiedProviderMaterial,
 }

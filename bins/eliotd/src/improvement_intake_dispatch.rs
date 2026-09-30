@@ -5,7 +5,10 @@
 //! daemon run loop reaches it through [`crate::daemon_runtime`]'s retained
 //! `ImprovementIntakeFlight`, starting from a live Governor maintenance
 //! observation. This intake remains distinct from the full
-//! `ImprovementRouteRequest` pipeline, which has no production request source.
+//! `ImprovementRouteRequest` pipeline, which is served elsewhere: the request
+//! is constructed and routed by
+//! [`crate::improvement_candidate_dispatch::dispatch_improvement_candidate_route`]
+//! on the same intake pass.
 //!
 //! # The evidence is real observations this daemon already made
 //!
@@ -1688,10 +1691,9 @@ fn enforce_improvement_class_gate(
 ///   `Concilium` member at all, so a Concilium verdict could not be carried on
 ///   the decision even if the field were consulted. A vocabulary claim with no
 ///   producer behind it is the mirror of the misattribution this function
-///   exists to remove, so none is added. The funnel's request source is also
-///   absent (see this module's header on `ImprovementRouteRequest` having no
-///   production request source), so a verdict has no path into
-///   `assemble_improvement_artifact` at all.
+///   exists to remove, so none is added. `assemble_improvement_artifact`
+///   reads no suggestion source from the observation either, so a verdict has
+///   no path into it at all; see the three sources with no producer below.
 ///
 /// # The three sources with no producer AT ALL
 ///

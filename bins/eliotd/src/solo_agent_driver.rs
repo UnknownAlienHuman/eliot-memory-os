@@ -1171,6 +1171,13 @@ pub fn drive_solo_delegate(
 /// the direct entry stays a probe until its `lib.rs` wrapper threads the
 /// composition through (one-line follow-up outside this module).
 ///
+/// The direct entry is not merely a probe but an *uncalled* one:
+/// `DaemonComposition::solo_drive_once_async` has no caller in this crate or
+/// workspace, and `eliotd` has no reverse dependency in the workspace, so
+/// nothing can reach it from outside either. The same is true of
+/// `DaemonComposition::solo_enqueue`, which is what leaves the runtime queue
+/// poll's intake queue empty.
+///
 /// Kernel currently has no independently owner-backed executable-binding
 /// digest on its durable provider claim row. Its accepted verifier therefore
 /// cannot yet authorize construction of an `AdmittedProviderCapability` for
@@ -1812,37 +1819,63 @@ fn load_scheduling_profile(
 /// Drives the coordinator's fair pull over the capacity a settled attempt just
 /// released (issue #1683 W1, I14.8 "Scheduler is pull-based").
 ///
-/// This is the **event arm** of the I14.8 progress loop: the daemon's
-/// production call of `AgentFabric::drive_fair_pull`, on the I14.8 release
-/// path. `submit_attempt_result` has just settled an attempt, so the
-/// coordinator is asked for the next currently admissible item instead of
-/// waiting for another agent command. It runs after
+/// I14.8's closing paragraph is two sentences, and this join exists to satisfy
+/// the first one: "Scheduler is pull-based: terminal/deferred/blocked attempt
+/// releases its slot, then the next currently admissible Ready Work Item is
+/// selected." That is an **ordering requirement**, not only the second
+/// sentence's guarantee that progress needs no external prompt — and this join
+/// is the *synchronous* form of it.
+///
+/// This is the **event arm** of the I14.8 progress loop: the daemon's call of
+/// `AgentFabric::drive_fair_pull`, on the I14.8 release path.
+/// `submit_attempt_result` has just settled an attempt, so the coordinator is
+/// asked for the next currently admissible item immediately, in the same
+/// operation that released the slot, rather than waiting for another agent
+/// command or for a later tick. It runs after
 /// [`repersist_after_control`], so the candidate result and settlement state are
 /// already durable and a refused queue profile cannot lose an observation.
 ///
-/// A release that arrives while nobody is listening to a wake still cannot
-/// strand work, because the same drive is also reached by the always-armed
-/// bounded recovery poll in [`solo_fair_pull_recovery`]. This arm is the
-/// low-latency path; it is not the correctness mechanism.
+/// The always-armed bounded recovery poll in [`solo_fair_pull_recovery`] reaches
+/// the same drive over the same projection one cadence later. It still preserves
+/// the ordering, because the release it follows has already happened; it is the
+/// *no external prompt* half of I14.8 that only that poll can discharge, because
+/// an event-only loop is a lost-wakeup deadlock. But the two are not
+/// interchangeable answers to one requirement, and this arm is not a mere
+/// optimisation of it: while it is unwired, the ordering is met only with
+/// bounded latency.
 ///
-/// Reachable in a non-test build: [`solo_ingest_result`] and
+/// **Not currently wired.** This join is not `cfg(test)`-gated, so it is
+/// compiled and callable in a production build, but it has exactly two callers —
+/// [`solo_ingest_result`] and [`solo_ingest_tool_result`] — and neither is
+/// reached by a production run: the first is called only from the public
 /// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
-/// are not `cfg(test)`-gated, so this join is compiled and callable in
-/// production. The fabric it drives is restored through the verified seam
-/// (issue #1108): [`restore_solo_fabric`] binds the frozen plan digest,
-/// re-resolves live owner evidence over the closed production ports, and
-/// reconciles an emitted-but-unresulted dispatch to unknown instead of
-/// relaunching; missing, stale, or revoked evidence refuses typed before any
-/// effect. New production work now constructs through the async seam on the
-/// runtime queue-poll path
-/// ([`drive_solo_delegate_verified_async`] over
+/// wrapper, which nothing calls either, and the second has no reference outside
+/// its own definition. So no released capacity is advanced by the operation
+/// that released it today. Wiring it is a caller decision, not a defect in the
+/// mechanism, and no caller is invented here.
+///
+/// The arm is blocked one hop earlier as well. Both of its callers obtain their
+/// fabric from the synchronous [`restore_solo_fabric`], and in a non-test build
+/// that function returns `Err` unconditionally ("solo restore is blocked until
+/// Kernel retains an independently owner-verified executable-binding digest"),
+/// so it never yields a fabric for this join to drive. The `#[cfg(test)]` arm
+/// of `restore_solo_fabric` is a different function and does bind the frozen
+/// plan digest, re-resolve live owner evidence over the *solo* ports (not the
+/// closed production ports), and reconcile an emitted-but-unresulted dispatch to
+/// unknown instead of relaunching; the closed production ports
+/// ([`DaemonComposition::production_fabric_ports`]) are used by the *async*
+/// restore, [`restore_solo_fabric_async`], which this arm does not call.
+///
+/// Separately, new production work constructs through the async seam on the
+/// runtime queue-poll path ([`drive_solo_delegate_verified_async`] over
 /// [`DaemonComposition::agent_fabric_new_verified_async`] with the driver's
-/// claimed halves) and fails closed one hop later: the admitted-route gate
-/// refuses with the typed missing-prerequisite residual until B-MOD #694
-/// binds an accepted registry revision, and execution still waits on the
-/// native-worker executable-binding owner (issue #1678). The join is placed
-/// on the release path because that is where I14.8 says the wake happens,
-/// not on a site that would be reachable only by pulling over an empty
+/// claimed halves) and fails closed there: the admitted-route gate refuses with
+/// the typed missing-prerequisite residual until B-MOD #694 binds an accepted
+/// registry revision, because the production `ModelRegistryPort` reports
+/// `PortBindingState::Missing`. Both residuals are the Kernel native-worker
+/// owner and the G-11 admission owner (issue #1678), not this issue's. The join
+/// is placed on the release path because that is where I14.8 says the wake
+/// happens, not on a site that would be reachable only by pulling over an empty
 /// plan-only coordinator.
 fn drive_fair_pull_after_release(
     composition: &DaemonComposition,
@@ -1890,8 +1923,8 @@ pub enum FairPullRecovery {
 /// The always-armed bounded recovery poll of the I14.8 progress loop (issue
 /// #1683 W5).
 ///
-/// **This is the arm that makes the loop correct under a lost notification, and
-/// the event arm in [`drive_fair_pull_after_release`] is only the optimisation.**
+/// **This is the arm that discharges I14.8's *no external prompt* guarantee,
+/// and it preserves the release-then-select ordering rather than replacing it.**
 /// An event-only loop deadlocks: if a wake is dropped, coalesced away, or
 /// delivered before anything is waiting, the loop waits forever for work that
 /// is already eligible. So this poll is *armed unconditionally* — the caller
@@ -1900,6 +1933,17 @@ pub enum FairPullRecovery {
 /// performs runs its bounded selector loop whether or not a wake was pending.
 /// That is why a lost wake costs one cadence of latency rather than stranding
 /// work.
+///
+/// I14.8 requires two things, and this poll is load-bearing for both. The
+/// release it follows has already happened by the time it selects, so the
+/// ordering "release its slot, then the next currently admissible Ready Work
+/// Item is selected" still holds — with up to one tick of latency, rather than
+/// synchronously. And the guarantee "Mechanical queue progress never depends
+/// on an LLM remembering to start another agent" is the half this poll alone
+/// can satisfy, because the event arm in [`drive_fair_pull_after_release`] has
+/// no caller in this tree. Describing the event arm as "only the optimisation"
+/// would under-read the fragment: the ordering is specified, so while the event
+/// arm is unwired the ordering is met only with this poll's bounded latency.
 ///
 /// It is the same drive over the same projection as the release path, with the
 /// same `SchedulingProfile` resolved from the same Kernel-owned `runtime.toml`
@@ -1916,13 +1960,33 @@ pub enum FairPullRecovery {
 /// Reachable in a non-test build: this is not `cfg(test)`-gated, and its
 /// production caller is `daemon_runtime::maybe_start_fair_pull_recovery`, which
 /// runs it on the daemon's existing `ACTIVATION_POLL_INTERVAL` cadence. The
-/// poll restores through the verified seam (issue #1108): missing, stale, or
-/// revoked evidence reports its typed refusal and stays blocked, and an
-/// emitted-but-unresulted dispatch reconciles to unknown instead of
+/// production restore it drives is the async verified seam (issue #1108),
+/// [`restore_solo_fabric_async`] — not the synchronous
+/// [`restore_solo_fabric`], whose `#[cfg(not(test))]` arm returns `Err`
+/// unconditionally. Through that seam missing, stale, or revoked evidence
+/// reports its typed refusal and stays blocked, the session halves are
+/// re-resolved over the live authenticated session and the binding is verified
+/// by the Kernel provider-admission verifier before the coordinator is rebuilt,
+/// and an emitted-but-unresulted dispatch reconciles to unknown instead of
 /// relaunching. New projections construct through the async seam on the
 /// queue-poll path ([`drive_solo_delegate_verified_async`]) but refuse at
 /// the admitted-route gate until B-MOD #694 binds — so the poll only ever
 /// drives a previously admitted projection, never a fresh one.
+///
+/// What is *not* yet true is that any production tick reaches that restore.
+/// This poll reads `solo_state.live_operation` first and returns
+/// [`FairPullRecovery::NoLiveProjection`] when it is `None`, and in a non-test
+/// build no run *sets* it. There are three `Some(..)` assignments to that slot
+/// in this module and none of them is reachable in a non-test build:
+/// `#[cfg(test)] drive_solo_delegate` is test-only;
+/// `drive_admitted_material_async` sets it at the very end, after the
+/// admitted-route gate that refuses while B-MOD #694 is unbound; and
+/// `solo_restore` sets it only after the synchronous `restore_solo_fabric`
+/// that refuses unconditionally above it. So today every tick reports
+/// `NoLiveProjection` without performing a drive. That is the honest idle
+/// observation rather than a failure, and it is a consequence of two upstream
+/// owners (the Kernel native-worker owner and the G-11 admission owner, issue
+/// #1678), not of this function; no caller or admission is invented here.
 ///
 /// The Kernel handle is used only for the restore's live owner-evidence
 /// re-resolution that the restore seam already performs (the async verified
@@ -2105,7 +2169,9 @@ pub fn solo_ingest_result(
     repersist_after_control(composition, &fabric, &mut projection)?;
     // Issue #1683 W1 / I14.8: the settled attempt released its slot, so the
     // coordinator's bounded fair pull runs now instead of on the next agent
-    // command. The candidate result is already durable above.
+    // command. The candidate result is already durable above. This whole
+    // function currently has no caller in the tree, so this synchronous join
+    // does not run in production yet; see `drive_fair_pull_after_release`.
     drive_fair_pull_after_release(composition, &mut fabric, &mut projection)?;
     solo_status(composition, operation_id)
 }

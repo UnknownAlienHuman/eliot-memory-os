@@ -525,12 +525,20 @@ pub fn governed_improvement_pipeline_owner() -> &'static str {
 /// #2703: this function IS a caller of
 /// [`improvement_candidate_route::route_improvement_candidate`] (and
 /// transitively of `eliot_maintenance::run_improvement_candidate_pipeline` and
-/// `admit_improvement_candidate`), but it is NOT itself called from any live
-/// request path: `ImprovementRouteRequest` is never constructed in `bins/` or
-/// `crates/`. The typed result mapping behind this call is exhaustive and
-/// correct; the missing link is a production request source, which is #1145's
-/// owner scope. Do not cite this function as evidence that the improvement
-/// pipeline is wired into the daemon.
+/// `admit_improvement_candidate`), but it is NOT itself called from anywhere in
+/// `bins/`, `crates/` or `apps/`: the only references to the name are its own
+/// definition and the `shipped_serde_boundaries.toml` data row. It is a thin
+/// forwarder, and the daemon reaches `route_improvement_candidate` through the
+/// *other* call site instead — `improvement_candidate_dispatch::
+/// dispatch_improvement_candidate_route`, which constructs the single
+/// `ImprovementRouteRequest` in this tree and is itself reached from the live
+/// run loop (`daemon_runtime::maybe_start_improvement_intake` ->
+/// `run_improvement_intake` -> `route_and_reconcile_improvement_candidate`).
+/// So the candidate -> experiment -> evaluation -> admission path IS served by
+/// this daemon; this particular wrapper is a redundant sibling of that path,
+/// not the path itself. Do not cite this function as the evidence that the
+/// pipeline is wired, and do not cite its absence as evidence that it is not:
+/// the sibling implementation is the one to read.
 ///
 /// It remains a pure thin forwarder for the candidate → experiment → independent
 /// evaluation → rejected-or-canary-admitted path (#1100/#18/#20); Kernel
@@ -967,11 +975,17 @@ pub async fn solo_poll_queue_async(
 /// The always-armed bounded recovery poll of the I14.8 progress loop (issue
 /// #1683 W5).
 ///
-/// This is the arm that makes progress correct under a lost notification, and
-/// the event-driven release path is only the optimisation. The daemon runtime
-/// calls it on its existing bounded activation cadence without consulting any
-/// wake state, so a dropped, coalesced or pre-registered wake costs one cadence
-/// of latency instead of stranding work that is already eligible.
+/// This is the arm that discharges I14.8's guarantee that mechanical queue
+/// progress never depends on an LLM remembering to start another agent, and it
+/// preserves that fragment's release-then-select *ordering* rather than
+/// replacing it: the release it follows has already happened by the time it
+/// selects. The daemon runtime calls it on its existing bounded activation
+/// cadence without consulting any wake state, so a dropped, coalesced or
+/// pre-registered wake costs one cadence of latency instead of stranding work
+/// that is already eligible. It is not the whole of I14.8 — the event-driven
+/// release path is the synchronous form of the ordering, and it currently has
+/// no caller in this tree, so the ordering is met only with this poll's
+/// bounded latency.
 ///
 /// Thin wrapper over
 /// [`solo_agent_driver::solo_fair_pull_recovery`](crate::solo_agent_driver::solo_fair_pull_recovery):
@@ -3293,17 +3307,29 @@ impl DaemonComposition {
     /// Readiness gates the construction exactly like
     /// [`Self::agent_fabric_descriptor`].
     ///
-    /// The ports returned here feed only the verifier-gated production path:
-    /// the construct path through
-    /// [`Self::agent_fabric_new_verified_async`] (production caller
-    /// `solo_agent_driver::drive_solo_delegate_verified_async`) and the
-    /// restore path through
-    /// [`Self::agent_fabric_restore_verified_async`] (production caller
-    /// `solo_agent_driver::restore_solo_fabric_async`). Both consumers
+    /// The ports returned here feed only the verifier-gated paths: the
+    /// construct path through
+    /// [`Self::agent_fabric_new_verified_async`] (called from
+    /// `solo_agent_driver::drive_admitted_material_async`, which the runtime
+    /// queue poll reaches as
+    /// `run_loop` -> `solo_poll_queue_async` ->
+    /// `drive_solo_delegate_verified_async`) and the restore path through
+    /// [`Self::agent_fabric_restore_verified_async`] (called from the
+    /// `#[cfg(not(test))]` `solo_agent_driver::restore_solo_fabric_async`,
+    /// which the bounded fair-pull recovery poll reaches). Both consumers
     /// resolve the session halves over the live authenticated session and
     /// verify the binding through the Kernel provider-admission verifier
-    /// before any admitted capability is built, so production ports never
-    /// reach an effect without owner verification (issue #1108 W1/W2).
+    /// before any admitted capability is built, so ports that reach an effect
+    /// through either do so only after owner verification (issue #1108 W1/W2).
+    ///
+    /// Both consumers sit on a live call path in a production build, but no
+    /// production run reaches either one today, and the reason is upstream of
+    /// them rather than in this method: nothing enqueues a solo intake
+    /// ([`Self::solo_enqueue`] has no caller in this crate or workspace, and
+    /// `eliotd` has no reverse dependency in the workspace), and nothing sets
+    /// a live solo slot. So the guarantee above is real for the code and latent
+    /// for the daemon. The residual is the Kernel native-worker owner plus the
+    /// G-11 admission owner (issue #1678).
     ///
     /// # Errors
     ///
@@ -3333,10 +3359,11 @@ impl DaemonComposition {
     /// `AgentFabric::new_with_admitted_provider`. The per-operation driver
     /// (executor) binds this seam per admitted operation without changing
     /// executor semantics here; without a validated handshake the
-    /// resolution fails closed and the daemon stays plan-only. This is the
-    /// non-test production caller the verified seam requires: the
-    /// composition invents no port implementation beyond the closed ports
-    /// above and reimplements no owner.
+    /// resolution fails closed and the daemon stays plan-only. This is a
+    /// `#[cfg(test)]`-only caller of the verified seam, not the non-test one:
+    /// the composition invents no port implementation beyond the closed ports
+    /// above and reimplements no owner, and the non-test construct path is
+    /// [`Self::agent_fabric_new_verified_async`].
     ///
     /// #1957 (I3.4): the constructed fabric is not returned until the required
     /// model route passes [`Self::require_admitted_model_route`] — the observed
@@ -3373,7 +3400,7 @@ impl DaemonComposition {
     /// (session-half overwrite + owner validation) and
     /// [`crate::provider_capability::admit_provider_capability`]
     /// (per-operation content comparison against the driven `claimed`
-    /// halves): the only production path from resolved material to the
+    /// halves): the only compiled non-test path from resolved material to the
     /// coordinator's closed admission. The `health` half rides input-only
     /// into the capability and never mints admission (issue #265, W6).
     ///
@@ -3383,6 +3410,20 @@ impl DaemonComposition {
     /// and the per-operation content comparison binds the projection to the
     /// exact operation at hand. Any disagreement is the typed
     /// `IdentityConflict` residual — never a substituted route or provider.
+    ///
+    /// Not itself production-reached. This private function is not
+    /// `cfg(test)`-gated, and its only two call sites are
+    /// [`Self::agent_fabric_new_verified_async`] and
+    /// [`Self::agent_fabric_restore_verified_async`] — both of which now have
+    /// non-test callers on the runtime poll and recovery-poll paths. What those
+    /// callers cannot do today is supply an intake: the queue-poll path returns
+    /// early when `solo_state.queue` is empty and nothing enqueues one, and the
+    /// recovery-poll path returns `FairPullRecovery::NoLiveProjection` when
+    /// `solo_state.live_operation` is `None` and nothing sets one. So the
+    /// closed admission this builds is reachable in a non-test build as
+    /// compiled code, but reached by no production run today. The refusal that
+    /// keeps it that way is the Kernel native-worker executable-binding owner
+    /// plus the G-11 admission owner (issue #1678); no caller is invented here.
     ///
     /// # Errors
     ///
@@ -3401,13 +3442,21 @@ impl DaemonComposition {
 
     /// Constructs the production fabric on a sealed admitted provider
     /// capability verified through the Kernel admission verifier (issue #1108
-    /// W5/W2, production caller for A1).
+    /// W5/W2; written as the production caller for A1).
     ///
-    /// Production caller is
+    /// Its non-test caller is
     /// `solo_agent_driver::drive_solo_delegate_verified_async`, reached from
-    /// the runtime queue poll via `solo_poll_queue_async`.
+    /// the runtime queue poll via `solo_poll_queue_async` ->
+    /// `daemon_runtime::maybe_start_solo_poll`. That is a real production call
+    /// path, not a `cfg(test)` wrapper — but no production run supplies the
+    /// intake it needs: `solo_poll_queue_async` returns `SoloPollOutcome::Idle`
+    /// whenever `solo_state.queue` is empty, and the only enqueue entry point,
+    /// [`Self::solo_enqueue`], has no caller. So read "production caller for
+    /// A1" as the shape this takes in production, not as evidence that A1 is
+    /// closed for the daemon: the seam is compiled and called, and the intake
+    /// that would make the call do anything is owner scope (issue #1678).
     ///
-    /// Sole production counterpart of the test-only
+    /// Non-test counterpart of the `#[cfg(test)]`-only
     /// `agent_fabric_new_verified`: readiness plus the exact live
     /// fence and the validated session binding gate the resolution, and
     /// caller-supplied session halves are overwritten with the live
@@ -3501,11 +3550,21 @@ impl DaemonComposition {
     /// Restores the production fabric on freshly verified owner material in
     /// one call (issue #1108 A6/W2, verified restore for A8).
     ///
-    /// Production caller is `solo_agent_driver::restore_solo_fabric_async`,
-    /// reached from the async fair-pull recovery poll
-    /// (`solo_fair_pull_recovery`).
+    /// Its non-test caller is `solo_agent_driver::restore_solo_fabric_async`
+    /// (`#[cfg(not(test))]`), reached from the bounded fair-pull recovery poll
+    /// (`solo_fair_pull_recovery` -> `daemon_runtime::maybe_start_fair_pull_recovery`).
+    /// That poll returns `FairPullRecovery::NoLiveProjection` before the
+    /// restore when `solo_state.live_operation` is `None`, and nothing sets
+    /// that slot in a non-test build today, so no production tick reaches this
+    /// method. How the sibling restore in `solo_agent_driver.rs` should be read
+    /// follows from that: the *synchronous* `restore_solo_fabric` used by
+    /// `solo_ingest_result`, `solo_ingest_result`'s bridge sibling, the cancel
+    /// legs and `solo_restore` does **not** route here — its `#[cfg(not(test))]`
+    /// arm refuses with `Err` unconditionally — and its `#[cfg(test)]` arm calls
+    /// the `#[cfg(test)]` `agent_fabric_restore_verified` instead. Only
+    /// `restore_solo_fabric_async` reaches this method.
     ///
-    /// Sole production counterpart of the test-only
+    /// Non-test counterpart of the `#[cfg(test)]`-only
     /// `agent_fabric_restore_verified`: the session halves are
     /// re-resolved over the live authenticated session and the binding is
     /// verified through the authenticated Kernel provider-admission verifier
@@ -3691,6 +3750,11 @@ impl DaemonComposition {
     /// acknowledgement first (never success), then the candidate result
     /// (never Finish).
     ///
+    /// This wrapper currently has no caller in this tree, which is why the
+    /// synchronous I14.8 release-event join it fronts does not run in
+    /// production. That join is private, so it is described at its own
+    /// definition rather than linked from here.
+    ///
     /// # Errors
     ///
     /// Returns the readiness or ingestion rejection unchanged.
@@ -3733,11 +3797,17 @@ impl DaemonComposition {
     /// Resolves the session-observed owner half of one verified provider
     /// material over the live authenticated session.
     ///
-    /// Shared by the test-only verified seam and the production async
-    /// verified constructors below: readiness plus the exact live fence and
-    /// the validated session binding gate the resolution, so both paths
-    /// overwrite caller-supplied halves with the live authenticated session
-    /// values and fail closed without them.
+    /// Shared by the `#[cfg(test)]`-only verified seam and the two non-test
+    /// async verified constructors below: readiness plus the exact live fence
+    /// and the validated session binding gate the resolution, so all three
+    /// paths overwrite caller-supplied halves with the live authenticated
+    /// session values and fail closed without them. This function itself is
+    /// *not* `cfg(test)`-gated — issue #1108 removed that gate from it — so it
+    /// is compiled in a production build. Its two production-side call sites are
+    /// the two async constructors named above, and both of those now have
+    /// non-test callers on the runtime poll and recovery-poll paths; what those
+    /// callers cannot do today is supply an intake or a retained live slot, so
+    /// no production run reaches this function either.
     ///
     /// Readiness plus the exact live fence and the validated session binding
     /// gate the resolution: the threaded expectation must be current under

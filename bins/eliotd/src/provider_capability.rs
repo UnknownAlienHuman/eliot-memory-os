@@ -1,11 +1,26 @@
-//! Production provider-capability adapter (issue #1108, item A5).
+//! Provider-capability adapter (issue #1108, item A5).
 //!
-//! One production admission adapter over the accepted Kernel / native-worker /
+//! One non-test admission adapter over the accepted Kernel / native-worker /
 //! G-11 receipt owner. [`admit_provider_capability`] builds the sealed
 //! coordinator capability
 //! ([`AdmittedProviderCapability`](eliot_agent_coordinator::AdmittedProviderCapability))
 //! from a session-bound [`ProviderAdmission`](crate::provider_admission::ProviderAdmission),
 //! never from caller strings.
+//!
+//! Reachability: this module is not `cfg(test)`-gated, so it is compiled in a
+//! production build, and [`admit_provider_capability`] has exactly one call
+//! site — `DaemonComposition::build_production_provider_capability` in
+//! `bins/eliotd/src/lib.rs`. That function's only two callers are
+//! `DaemonComposition::agent_fabric_new_verified_async` and
+//! `DaemonComposition::agent_fabric_restore_verified_async`, and both now have
+//! non-test callers — the runtime solo queue poll and the bounded fair-pull
+//! recovery poll respectively (see
+//! [`crate::provider_admission`]'s reachability paragraph for the chain). What
+//! no production run does is supply the intake or the retained live slot those
+//! two paths need, so the per-operation content comparison below is compiled
+//! non-test code that no production run performs yet. The residual is the
+//! Kernel native-worker executable-binding owner plus the G-11 admission owner
+//! (issue #1678).
 //!
 //! I10.15: "admission is a fail-closed saga rather than a fictitious
 //! cross-store transaction" — "1. `AgentCoordinator` revalidates dependencies,
