@@ -328,6 +328,17 @@ fn validate_response(
     }
 }
 
+/// Whether one operator operation is served as a read projection.
+///
+/// This is a closed allowlist of read shapes, not an exclusion list: only the
+/// operations that project stored automation state without changing it are
+/// named, and every other variant takes the mutation side of the split by
+/// default. I12.24:65's decision-owner selection is deliberately not named
+/// here — it reads no automation revision, invocation, wake or failure and
+/// mutates none, and I12.24:82 makes the advisory class "default; changes
+/// nothing until owner acts" — so it is excluded from the read side rather
+/// than added to it, and is refused by the Store adapter instead of being
+/// handed a read projection.
 fn is_read_operation(operation: &UserAutomationOperation) -> bool {
     matches!(
         operation,

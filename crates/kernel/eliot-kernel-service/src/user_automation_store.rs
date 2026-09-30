@@ -985,6 +985,24 @@ impl<C: CanonicalStoreClient> UserAutomationStorePort for CanonicalUserAutomatio
             | UserAutomationOperation::Resume { .. }
             | UserAutomationOperation::Remove { .. }
             | UserAutomationOperation::RunNow { .. } => self.execute_mutation(&request).await,
+            // I12.24:65's decision-owner selection records one disposition
+            // against one improvement brief. It is not a read, and it is not a
+            // mutation of an automation row either: the automation Store owns
+            // revisions, invocations, wakes and failures, and a brief lives in
+            // the improvement owner's own canonical record, not in this
+            // schema. I12.24:3 states that ELIOT "never silently rewrites code,
+            // policy or memory authority", and I12.24:82 makes the advisory
+            // class "default; changes nothing until owner acts", so admitting
+            // this as an automation mutation here would mint a second write
+            // path for improvement state. The closed refusal this file already
+            // models for an operation it does not own
+            // (`StoreError::UnknownOperation`, the same answer
+            // `mutation_parameters` and `project_mutation_result` give) is
+            // the honest classification, and it fails closed before any Store
+            // I/O.
+            UserAutomationOperation::DecideImprovementBrief { .. } => {
+                Err(StoreError::UnknownOperation)
+            }
         }
     }
 
@@ -1756,7 +1774,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             &canonical_json_bytes(&admission_view)
                 .map_err(|error| StoreError::Serialization(error.to_string()))?,
         );
-        let automation_id = automation_scope(&request.intent.operation);
+        let automation_id = automation_scope(&request.intent.operation)?;
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: request.identity.clone(),
@@ -2368,18 +2386,43 @@ fn retained_normalization_envelope(envelope: &ReceiptEnvelope) -> Result<Value, 
 }
 
 /// Returns the automation identity scoping one intent's ordering stream.
-fn automation_scope(operation: &UserAutomationOperation) -> String {
+///
+/// The scope is the `automation:` ordering namespace, so every arm must name
+/// a real automation identity: the stream exists to serialize canonical
+/// transitions that touch one automation's rows, and a scope identity that
+/// names no automation would place a transition in a stream it does not
+/// belong to.
+///
+/// I12.24:65's decision-owner selection therefore has no honest arm. It
+/// carries `brief_id` and no `automation_id`, and it mutates no automation
+/// revision, invocation, wake or failure, so there is no automation whose
+/// ordering it could join. `brief_id` is not a substitute: reusing it as the
+/// scope would silently map one improvement brief onto the automation
+/// ordering namespace, colliding with an unrelated automation that happens to
+/// share the string and fabricating an ordering relationship I12.24:3 does not
+/// permit ("never silently rewrites code, policy or memory authority"). This
+/// is the same closed refusal `execute_user_automation` returns for the
+/// operation, carried by [`StoreError::UnknownOperation`], so the transition
+/// is never admitted with a fabricated scope.
+fn automation_scope(operation: &UserAutomationOperation) -> Result<String, StoreError> {
     match operation {
         UserAutomationOperation::Create { revision }
-        | UserAutomationOperation::Edit { revision, .. } => revision.automation_id.clone(),
-        UserAutomationOperation::List { .. } => "list".to_owned(),
+        | UserAutomationOperation::Edit { revision, .. } => {
+            Ok(revision.automation_id.clone())
+        }
+        UserAutomationOperation::List { .. } => Ok("list".to_owned()),
         UserAutomationOperation::Status { automation_id }
         | UserAutomationOperation::History { automation_id }
         | UserAutomationOperation::Pause { automation_id, .. }
         | UserAutomationOperation::Resume { automation_id, .. }
         | UserAutomationOperation::Remove { automation_id, .. }
         | UserAutomationOperation::RunNow { automation_id, .. }
-        | UserAutomationOperation::InspectLastFailure { automation_id } => automation_id.clone(),
+        | UserAutomationOperation::InspectLastFailure { automation_id } => {
+            Ok(automation_id.clone())
+        }
+        UserAutomationOperation::DecideImprovementBrief { .. } => {
+            Err(StoreError::UnknownOperation)
+        }
     }
 }
 
