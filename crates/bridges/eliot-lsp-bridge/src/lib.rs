@@ -32,11 +32,14 @@ pub use scip_cache::{
     CachedProjection, CachedScipItems, ScipIndexerProvenance, ScipProjectionCache,
 };
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use eliot_artifact::{
-    ArtifactKind, ArtifactOwner, ArtifactReadReceipt, ArtifactReference, VerifiedArtifact,
+    ArtifactError, ArtifactKind, ArtifactOwner, ArtifactReadReceipt, ArtifactReference,
+    VerifiedArtifact,
 };
 use eliot_build_test_graph::{BuildFingerprint, CandidateIdentity};
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion};
@@ -51,12 +54,14 @@ use eliot_instrument_runner::{
     InstrumentSpec, InstrumentSpecParams, RegistryEntry, ResolvedExecutableIdentity,
 };
 use eliot_instrument_scip::ScipIndex;
-use eliot_git_bridge::SourceTreeSnapshot;
+use eliot_git_bridge::{
+    AsyncProcessRunner as GitProcessRunner, GitSnapshotError, RepoRoot, SourceTreeSnapshot,
+};
 use eliot_process::{
     CancellationReceipt, ContractError as ProcessContractError, ExitDisposition, OperationId,
-    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView,
-    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessStreamKind,
-    StreamPreviewRepresentation,
+    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest,
+    ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessIntent, ProcessRequest,
+    ProcessStartReceipt, ProcessStreamKind, StreamPreviewRepresentation,
 };
 use eliot_types::memory::GovernedGitScope;
 use serde::{Deserialize, Serialize};
@@ -942,7 +947,7 @@ impl LspSourceArtifactProof {
         source_candidate.validate()?;
         let workspace_matches = snapshot
             .validates_workspace_root(Path::new(&source_candidate.workspace_root))
-            .map_err(|error| BridgeError::InconsistentBinding(error.to_string()))?;
+            .map_err(BridgeError::SourceSnapshot)?;
         validate_source_artifact_identity(&snapshot, &reference)?;
         if snapshot.max_archive_bytes() != artifact_owner.max_read_bytes() {
             return Err(BridgeError::InconsistentBinding(
@@ -952,7 +957,7 @@ impl LspSourceArtifactProof {
         }
         artifact_owner
             .validate_source_readback(&reference, &artifact, &read_receipt, snapshot.archive_bytes())
-            .map_err(|error| BridgeError::InconsistentBinding(error.to_string()))?;
+            .map_err(BridgeError::SourceArtifact)?;
         if !workspace_matches || snapshot.archive_bytes() != artifact.bytes() {
             return Err(BridgeError::InconsistentBinding(
                 "Git source snapshot does not match the original immutable artifact readback"
@@ -988,6 +993,32 @@ impl LspSourceArtifactProof {
             && self.reference == other.reference
             && self.artifact == other.artifact
             && self.read_receipt == other.read_receipt
+    }
+
+    async fn revalidate_current(
+        &self,
+        source_root: &RepoRoot,
+        runner: &dyn GitProcessRunner,
+        source_candidate: &SourceCandidate,
+    ) -> Result<(), BridgeError> {
+        let root_matches = self
+            .snapshot
+            .validates_workspace_root(source_root.path())
+            .map_err(BridgeError::SourceSnapshot)?;
+        let candidate_matches = self
+            .snapshot
+            .validates_workspace_root(Path::new(&source_candidate.workspace_root))
+            .map_err(BridgeError::SourceSnapshot)?;
+        if !root_matches || !candidate_matches {
+            return Err(BridgeError::InconsistentBinding(
+                "source owner root differs from the captured analyzer workspace".to_owned(),
+            ));
+        }
+        self.snapshot
+            .revalidate_current_async(source_root, runner)
+            .await
+            .map_err(BridgeError::SourceSnapshot)?;
+        Ok(())
     }
 }
 
@@ -1327,6 +1358,32 @@ pub struct CurrentLspAdoptionContext<'a> {
     pub registry_entry: &'a RegistryEntry,
     /// Current complete admitted instrument spec/parser identity.
     pub instrument_spec: &'a InstrumentSpec,
+}
+
+/// Non-authoritative currentness projection over an immutable retained
+/// observation. The observation keeps its original Stale receipt; a live
+/// adoption never rewrites that historical receipt to claim Current.
+#[derive(Debug, Eq, PartialEq)]
+pub struct LspAdoptionProjection {
+    /// Original normalized semantic result with its original receipt intact.
+    observation: NormalizedResult,
+    /// Freshness established at this adoption boundary, separate from the
+    /// historical receipt carried by `observation`.
+    currentness: Freshness,
+}
+
+impl LspAdoptionProjection {
+    /// Returns the unchanged retained semantic result and its original receipt.
+    #[must_use]
+    pub const fn observation(&self) -> &NormalizedResult {
+        &self.observation
+    }
+
+    /// Returns currentness assessed at this non-persistent adoption boundary.
+    #[must_use]
+    pub const fn currentness(&self) -> &Freshness {
+        &self.currentness
+    }
 }
 
 /// Lookup outcome classified from an observation receipt (I10.8.6).
@@ -2129,6 +2186,73 @@ pub struct LspBridge<E> {
     executor: Arc<E>,
 }
 
+/// Typed failure returned by the original admitted Kernel process owner.
+#[derive(Debug)]
+pub enum LspProcessOwnerError {
+    /// The Kernel rejected the original admission.
+    Rejected { code: String, detail: String },
+    /// The admitted process operation failed at its owner boundary.
+    Process(ProcessExecutionError),
+}
+
+impl std::fmt::Display for LspProcessOwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { code, detail } => {
+                write!(f, "Kernel rejected LSP process admission ({code}): {detail}")
+            }
+            Self::Process(error) => write!(f, "LSP process owner failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LspProcessOwnerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rejected { .. } => None,
+            Self::Process(error) => Some(error),
+        }
+    }
+}
+
+/// Sendable future returned by the original process owner.
+pub type LspProcessOwnerFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, LspProcessOwnerError>> + Send + 'a>>;
+
+/// Capability over the original session-bound Kernel process owner.
+///
+/// Start accepts only an already owner-created admission. Reconciliation is
+/// always keyed from the original non-Clone bridge launch handle.
+pub trait LspProcessOwnerPort: Send + Sync {
+    /// Starts one exact admitted process request through the original Kernel.
+    fn start(
+        &self,
+        admission: ProcessExecutionAdmissionRequest,
+    ) -> LspProcessOwnerFuture<'_, ProcessStartReceipt>;
+
+    /// Reconciles one operation through the same session-bound owner.
+    fn reconcile(
+        &self,
+        operation_id: OperationId,
+    ) -> LspProcessOwnerFuture<'_, ProcessEvidence>;
+}
+
+/// Proof-bound Current path over original Kernel process and Git owners.
+pub struct LspCurrentBridge<P, G> {
+    process_owner: Arc<P>,
+    git_owner: Arc<G>,
+}
+
+impl<P, G> LspCurrentBridge<P, G> {
+    /// Creates a Current path over the admitted process owner and Git runner.
+    pub fn new(process_owner: Arc<P>, git_owner: Arc<G>) -> Self {
+        Self {
+            process_owner,
+            git_owner,
+        }
+    }
+}
+
 impl<E> LspBridge<E> {
     /// Creates a bridge over the supplied process implementation.
     pub fn new(executor: Arc<E>) -> Self {
@@ -2172,64 +2296,6 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
             resolved_executable,
             registry_entry,
             instrument_spec,
-            None,
-        )
-        .await
-    }
-
-    /// Starts an analyzer only when the original source snapshot is backed by
-    /// its exact I-01/S-04 immutable artifact readback.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn launch_retained_with_source_artifact_proof(
-        &self,
-        command: &LspCommand,
-        request: ProcessRequest,
-        sink: Arc<dyn ProcessEvidenceSink>,
-        instrument_invocation: &InstrumentInvocation,
-        source_candidate: &SourceCandidate,
-        source_scope: Option<&GovernedGitScope>,
-        candidate_identity: Option<&CandidateIdentity>,
-        build_fingerprint: Option<&BuildFingerprint>,
-        config: &AnalyzerConfig,
-        operation: &SemanticOperation,
-        resolved_executable: &ResolvedExecutableIdentity,
-        registry_entry: &RegistryEntry,
-        instrument_spec: &InstrumentSpec,
-        source_artifact_proof: LspSourceArtifactProof,
-    ) -> Result<LspStartedInvocation, BridgeError> {
-        let source_artifact_id = &source_artifact_proof.reference.identity.artifact_id;
-        if candidate_identity.is_none()
-            || build_fingerprint.is_none()
-            || !source_artifact_binds_invocation(
-                &source_artifact_proof,
-                instrument_invocation,
-            )
-            || instrument_invocation
-            .input_artifacts
-            .iter()
-            .filter(|artifact| *artifact == source_artifact_id)
-            .count()
-            != 1
-        {
-            return Err(BridgeError::InconsistentBinding(
-                "immutable source artifact or admitted candidate identity is missing".to_owned(),
-            ));
-        }
-        self.launch_retained_inner(
-            command,
-            request,
-            sink,
-            instrument_invocation,
-            source_candidate,
-            source_scope,
-            candidate_identity,
-            build_fingerprint,
-            config,
-            operation,
-            resolved_executable,
-            registry_entry,
-            instrument_spec,
-            Some(source_artifact_proof),
         )
         .await
     }
@@ -2250,7 +2316,6 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         resolved_executable: &ResolvedExecutableIdentity,
         registry_entry: &RegistryEntry,
         instrument_spec: &InstrumentSpec,
-        source_artifact_proof: Option<LspSourceArtifactProof>,
     ) -> Result<LspStartedInvocation, BridgeError> {
         config.validate()?;
         source_candidate.validate()?;
@@ -2260,27 +2325,6 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         instrument_invocation
             .validate()
             .map_err(BridgeError::InstrumentContract)?;
-        if let Some(source_proof) = source_artifact_proof.as_ref() {
-            let artifact_id = &source_proof.reference.identity.artifact_id;
-            if !source_proof
-                .snapshot
-                .validates_workspace_root(Path::new(&source_candidate.workspace_root))
-                .map_err(|error| BridgeError::InconsistentBinding(error.to_string()))?
-                || !source_artifact_binds_invocation(source_proof, instrument_invocation)
-                || instrument_invocation
-                    .input_artifacts
-                    .iter()
-                    .filter(|artifact| *artifact == artifact_id)
-                    .count()
-                    != 1
-                || validate_candidate_identity(candidate_identity, build_fingerprint).is_err()
-            {
-                return Err(BridgeError::InconsistentBinding(
-                    "source artifact, selected workspace, and admitted invocation do not join"
-                        .to_owned(),
-                ));
-            }
-        }
         request.validate().map_err(BridgeError::ProcessEvidence)?;
         validate_instrument_process_request(&request, instrument_invocation)?;
         validate_candidate_identity(candidate_identity, build_fingerprint)?;
@@ -2290,7 +2334,7 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
             .map_err(|error| BridgeError::ExecutableIdentity(error.to_string()))?;
         validate_instrument_binding(
             command,
-            &request,
+            request.intent(),
             source_candidate,
             config,
             operation,
@@ -2333,7 +2377,7 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
             resolved_executable: ResolvedExecutableIdentityRecord::from(resolved_executable),
             instrument_spec: instrument_spec.clone(),
             registry_identity: LspRegistryIdentity::from(registry_entry),
-            source_artifact_proof,
+            source_artifact_proof: None,
         })
     }
 
@@ -2363,62 +2407,6 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
             build_fingerprint_after_run,
             invoked_at_unix_ms,
         )
-    }
-
-    /// Retains a reconciled process result and attaches an after-run source
-    /// readback only when it exactly matches the private dispatch proof.
-    /// A moved source keeps the dispatch receipt and remains Stale.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn retain_reconciled_result_with_source_artifact_proof(
-        &self,
-        started: &LspStartedInvocation,
-        raw_outputs: Vec<LspRawOutput>,
-        source_scope_after_run: Option<&GovernedGitScope>,
-        candidate_identity_after_run: Option<&CandidateIdentity>,
-        build_fingerprint_after_run: Option<&BuildFingerprint>,
-        invoked_at_unix_ms: u64,
-        after_run_source_proof: LspSourceArtifactProof,
-    ) -> Result<RetainedLspObservationV1, BridgeError> {
-        let mut retained = self
-            .retain_reconciled_result(
-                started,
-                raw_outputs,
-                source_scope_after_run,
-                candidate_identity_after_run,
-                build_fingerprint_after_run,
-                invoked_at_unix_ms,
-            )
-            .await?;
-        let Some(dispatch_proof) = started.source_artifact_proof.as_ref() else {
-            return Ok(retained);
-        };
-        if !dispatch_proof.matches_current_source(&after_run_source_proof)
-            || !started
-                .instrument_invocation
-                .input_artifacts
-                .contains(&after_run_source_proof.reference.identity.artifact_id)
-        {
-            return Ok(retained);
-        }
-        let after_run_projection = after_run_source_proof.projection();
-        let source_binding = retained
-            .result
-            .receipt_mut()
-            .source_binding
-            .as_mut()
-            .ok_or_else(|| BridgeError::InconsistentBinding(
-                "retained result omitted its source binding".to_owned(),
-            ))?;
-        source_binding.source_artifact_after_run = Some(after_run_projection);
-        validate_source_binding(source_binding)?;
-        let candidate = retained
-            .source_candidate
-            .reference_with_source_binding(source_binding)?;
-        retained.result.receipt_mut().candidate = candidate;
-        retained.result.receipt_mut().freshness = Freshness::Stale {
-            reason: "source owner readback is retained; current adoption must revalidate it".to_owned(),
-        };
-        Ok(retained)
     }
 
     /// Captures one reconciled analyzer invocation into its immutable
@@ -2501,9 +2489,11 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
             .source_candidate
             .reference_with_source_binding(&source_binding)?;
         result.receipt_mut().source_binding = Some(source_binding);
-        result.receipt_mut().freshness = Freshness::Stale {
-            reason: "current source-artifact owner readback is required for adoption".to_owned(),
-        };
+        if matches!(&result.receipt().freshness, Freshness::Current) {
+            result.receipt_mut().freshness = Freshness::Stale {
+                reason: "current source-artifact owner readback is required for adoption".to_owned(),
+            };
+        }
         Ok(RetainedLspObservationV1 {
             schema_version: LSP_RETAINED_OBSERVATION_SCHEMA_VERSION,
             receipt_kind: LSP_TOOL_OBSERVATION_RECEIPT_KIND.to_owned(),
@@ -2557,88 +2547,6 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
             instrument_spec: current.instrument_spec,
         };
         adopt_received_result(record, &owner_checked_current)
-    }
-
-    /// Adopts a received result as Current only when original process-owner
-    /// reconciliation, the retained dispatch/after-run binding, and a fresh
-    /// I-01/S-04 readback of the exact source snapshot all agree.
-    pub async fn adopt_received_result_with_source_artifact_proof(
-        &self,
-        record: RetainedLspObservationV1,
-        started: &LspStartedInvocation,
-        current: &CurrentLspAdoptionContext<'_>,
-        current_source_proof: LspSourceArtifactProof,
-    ) -> Result<NormalizedResult, BridgeError> {
-        let retained = record.clone();
-        let mut adopted = self
-            .adopt_received_result_from_owner(record, started, current)
-            .await?;
-        let Some(dispatch_proof) = started.source_artifact_proof.as_ref() else {
-            return Ok(adopted);
-        };
-        let Some(binding) = retained.result.receipt().source_binding.as_ref() else {
-            return Ok(adopted);
-        };
-        let current_registry = LspRegistryIdentity::from(current.registry_entry);
-        let executable_matches = ResolvedExecutableIdentityRecord::from(current.resolved_executable)
-            == retained.resolved_executable;
-        let profile_matches = current_registry == retained.registry_identity
-            && current.instrument_spec == &retained.instrument_spec
-            && current.registry_entry.instrument == retained.instrument_invocation.instrument
-            && current.registry_entry.parser == current.instrument_spec.parser
-            && current
-                .registry_entry
-                .supports(retained.instrument_invocation.kind)
-            && current.registry_entry.verify_profile_identities().is_ok()
-            && current
-                .registry_entry
-                .check_resolved_executable(Some(current.resolved_executable))
-                .is_ok();
-        let workspace_matches = current_source_proof
-            .snapshot
-            .validates_workspace_root(Path::new(&current.source_candidate.workspace_root))
-            .map_err(|error| BridgeError::InconsistentBinding(error.to_string()))?;
-        let current_projection = current_source_proof.projection();
-        let owner_matches = dispatch_proof.matches_current_source(&current_source_proof)
-            && source_artifact_binds_invocation(
-                &current_source_proof,
-                current.instrument_invocation,
-            )
-            && binding.source_artifact_at_dispatch.as_ref() == Some(&dispatch_proof.projection())
-            && binding.source_artifact_after_run.as_ref() == Some(&current_projection)
-            && workspace_matches
-            && current_source_proof
-                .snapshot
-                .same_source(&dispatch_proof.snapshot)
-            && current_source_proof
-                .artifact
-                .identity()
-                .artifact_id
-                == current_source_proof.reference.identity.artifact_id
-            && current
-                .instrument_invocation
-                .input_artifacts
-                .iter()
-                .filter(|artifact| {
-                    *artifact == &current_source_proof.reference.identity.artifact_id
-                })
-                .count()
-                == 1
-            && current.build_fingerprint.is_some()
-            && current.candidate_identity.is_some()
-            && current.build_fingerprint == started.build_fingerprint.as_ref()
-            && current.candidate_identity == started.candidate_identity.as_ref();
-        let process_complete = LspBridge::<E>::completed(&retained.process_evidence)
-            && !process_outputs_incomplete(&retained.process_evidence, &retained.raw_outputs);
-        if executable_matches
-            && profile_matches
-            && owner_matches
-            && process_complete
-            && source_binding_matches_current(binding, current)
-        {
-            adopted.receipt_mut().freshness = Freshness::Current;
-        }
-        Ok(adopted)
     }
 
     /// Validates and starts one exact analyzer invocation.
@@ -2734,6 +2642,421 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
     }
 }
 
+impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
+    /// Starts only through the original Kernel admission and only when the
+    /// exact source snapshot is still current immediately before start.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn launch_retained_with_source_artifact_proof(
+        &self,
+        command: &LspCommand,
+        admission: ProcessExecutionAdmissionRequest,
+        instrument_invocation: &InstrumentInvocation,
+        source_candidate: &SourceCandidate,
+        source_root: &RepoRoot,
+        source_scope: Option<&GovernedGitScope>,
+        candidate_identity: Option<&CandidateIdentity>,
+        build_fingerprint: Option<&BuildFingerprint>,
+        config: &AnalyzerConfig,
+        operation: &SemanticOperation,
+        resolved_executable: &ResolvedExecutableIdentity,
+        registry_entry: &RegistryEntry,
+        instrument_spec: &InstrumentSpec,
+        source_artifact_proof: LspSourceArtifactProof,
+    ) -> Result<LspStartedInvocation, BridgeError> {
+        config.validate()?;
+        source_candidate.validate()?;
+        if let Some(source_scope) = source_scope {
+            validate_git_scope(source_scope)?;
+        }
+        instrument_invocation
+            .validate()
+            .map_err(BridgeError::InstrumentContract)?;
+        validate_instrument_process_admission(&admission, instrument_invocation)?;
+        validate_candidate_identity(candidate_identity, build_fingerprint)?;
+        registry_entry
+            .verify_profile_identities()
+            .and_then(|()| registry_entry.check_resolved_executable(Some(resolved_executable)))
+            .map_err(|error| BridgeError::ExecutableIdentity(error.to_string()))?;
+        validate_instrument_binding(
+            command,
+            admission.intent(),
+            source_candidate,
+            config,
+            operation,
+            &LspInstrumentBindingOwner {
+                invocation: instrument_invocation,
+                resolved: resolved_executable,
+                registry: registry_entry,
+                spec: instrument_spec,
+            },
+        )?;
+        validate_invocation_sidecar(
+            command,
+            config,
+            operation,
+            admission.intent().operation_id().as_str(),
+        )?;
+        let source_artifact_id = &source_artifact_proof.reference.identity.artifact_id;
+        if !source_artifact_proof
+            .snapshot
+            .validates_workspace_root(Path::new(&source_candidate.workspace_root))
+            .map_err(BridgeError::SourceSnapshot)?
+            || !source_artifact_binds_invocation(&source_artifact_proof, instrument_invocation)
+            || instrument_invocation
+                .input_artifacts
+                .iter()
+                .filter(|artifact| *artifact == source_artifact_id)
+                .count()
+                != 1
+        {
+            return Err(BridgeError::InconsistentBinding(
+                "source artifact, selected workspace, and admitted invocation do not join"
+                    .to_owned(),
+            ));
+        }
+
+        // This is the final live Git readback before the original Kernel owner
+        // receives the already-created admission.
+        source_artifact_proof
+            .revalidate_current(source_root, self.git_owner.as_ref(), source_candidate)
+            .await?;
+        let expected_intent = admission.intent().clone();
+        let expected_fence = admission.state_fence().clone();
+        let expected_operation = expected_intent.operation_id().clone();
+        let expected_generation = expected_intent.generation().get();
+        let process_start = self
+            .process_owner
+            .start(admission)
+            .await
+            .map_err(BridgeError::ProcessOwner)?;
+        process_start
+            .validate()
+            .map_err(BridgeError::ProcessEvidence)?;
+        if process_start.operation_id() != &expected_operation
+            || process_start.accepted_generation().get() != expected_generation
+            || process_start.binding().state_fence() != &expected_fence
+            || process_start.binding().authority_epoch()
+                != expected_fence.authority_epoch()
+            || process_start.binding().process_tree_id() != expected_intent.process_tree_id()
+            || process_start.binding().job_id() != expected_intent.job_id()
+            || process_start.binding().image_id() != expected_intent.image_id()
+            || process_start.binding().session_id() != expected_intent.session_id()
+        {
+            return Err(BridgeError::ReceiptMismatch);
+        }
+        let invocation_digest = process_start.request_digest().to_owned();
+        Ok(LspStartedInvocation {
+            process_start,
+            instrument_invocation: instrument_invocation.clone(),
+            source_candidate: source_candidate.clone(),
+            source_scope_at_dispatch: source_scope.cloned(),
+            candidate_identity: candidate_identity.cloned(),
+            build_fingerprint: build_fingerprint.cloned(),
+            config: config.clone(),
+            operation: operation.clone(),
+            process_intent: expected_intent,
+            invocation_digest,
+            resolved_executable: ResolvedExecutableIdentityRecord::from(resolved_executable),
+            instrument_spec: instrument_spec.clone(),
+            registry_identity: LspRegistryIdentity::from(registry_entry),
+            source_artifact_proof: Some(source_artifact_proof),
+        })
+    }
+
+    /// Reconciles the original operation through its session-bound owner,
+    /// revalidates source after the run, and keeps the retained observation
+    /// Stale until adoption repeats live source validation. When post-run
+    /// source readback is unavailable, `None` still retains the original
+    /// observation as Stale.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retain_reconciled_result_with_source_artifact_proof(
+        &self,
+        started: &LspStartedInvocation,
+        raw_outputs: Vec<LspRawOutput>,
+        source_scope_after_run: Option<&GovernedGitScope>,
+        candidate_identity_after_run: Option<&CandidateIdentity>,
+        build_fingerprint_after_run: Option<&BuildFingerprint>,
+        invoked_at_unix_ms: u64,
+        source_root: &RepoRoot,
+        after_run_source_proof: Option<LspSourceArtifactProof>,
+    ) -> Result<RetainedLspObservationV1, BridgeError> {
+        let operation_id = started.process_start.operation_id().clone();
+        let process_evidence = self
+            .process_owner
+            .reconcile(operation_id)
+            .await
+            .map_err(BridgeError::ProcessOwner)?;
+        validate_process_owner_readback(started, &process_evidence)?;
+        let mut retained = self.retain_result(
+            started,
+            process_evidence,
+            raw_outputs,
+            source_scope_after_run,
+            candidate_identity_after_run,
+            build_fingerprint_after_run,
+            invoked_at_unix_ms,
+        )?;
+        let Some(dispatch_proof) = started.source_artifact_proof.as_ref() else {
+            return Ok(retained);
+        };
+        if dispatch_proof
+            .revalidate_current(source_root, self.git_owner.as_ref(), &started.source_candidate)
+            .await
+            .is_err()
+        {
+            return Ok(retained);
+        }
+        let Some(after_run_source_proof) = after_run_source_proof else {
+            return Ok(retained);
+        };
+        if !dispatch_proof.matches_current_source(&after_run_source_proof)
+            || !started
+                .instrument_invocation
+                .input_artifacts
+                .contains(&after_run_source_proof.reference.identity.artifact_id)
+        {
+            return Ok(retained);
+        }
+        let source_binding = retained
+            .result
+            .receipt_mut()
+            .source_binding
+            .as_mut()
+            .ok_or_else(|| BridgeError::InconsistentBinding(
+                "retained result omitted its source binding".to_owned(),
+            ))?;
+        source_binding.source_artifact_after_run = Some(after_run_source_proof.projection());
+        validate_source_binding(source_binding)?;
+        let candidate = retained
+            .source_candidate
+            .reference_with_source_binding(source_binding)?;
+        retained.result.receipt_mut().candidate = candidate;
+        Ok(retained)
+    }
+
+    /// Adopts only after same-owner reconciliation and fresh source
+    /// revalidation at the adoption boundary. When current source readback is
+    /// unavailable, `None` returns a Stale observation.
+    pub async fn adopt_received_result_with_source_artifact_proof(
+        &self,
+        record: RetainedLspObservationV1,
+        started: &LspStartedInvocation,
+        current: &CurrentLspAdoptionContext<'_>,
+        source_root: &RepoRoot,
+        current_source_proof: Option<LspSourceArtifactProof>,
+    ) -> Result<LspAdoptionProjection, BridgeError> {
+        validate_retained_record_matches_started(&record, started)?;
+        let operation_id = started.process_start.operation_id().clone();
+        let process_evidence = self
+            .process_owner
+            .reconcile(operation_id)
+            .await
+            .map_err(BridgeError::ProcessOwner)?;
+        validate_process_owner_readback(started, &process_evidence)?;
+        if record.process_evidence != process_evidence {
+            return Err(BridgeError::InconsistentBinding(
+                "received process evidence differs from original process-owner readback".to_owned(),
+            ));
+        }
+        let currentness = received_result_currentness(&record, current);
+        let mut projection = LspAdoptionProjection {
+            observation: adopt_received_result(record.clone(), current)?,
+            currentness,
+        };
+        let Some(dispatch_proof) = started.source_artifact_proof.as_ref() else {
+            return Ok(projection);
+        };
+        if let Err(error) = dispatch_proof
+            .revalidate_current(source_root, self.git_owner.as_ref(), current.source_candidate)
+            .await
+        {
+            projection.currentness = Freshness::Stale {
+                reason: format!("source changed or became unavailable at adoption: {error}"),
+            };
+            return Ok(projection);
+        }
+        let Some(current_source_proof) = current_source_proof else {
+            return Ok(projection);
+        };
+        let Some(binding) = projection.observation.receipt().source_binding.as_ref() else {
+            return Ok(projection);
+        };
+        let current_registry = LspRegistryIdentity::from(current.registry_entry);
+        let executable_matches = ResolvedExecutableIdentityRecord::from(current.resolved_executable)
+            == started.resolved_executable;
+        let profile_matches = current_registry == record.registry_identity
+            && current.instrument_spec == &started.instrument_spec
+            && current.registry_entry.instrument == started.instrument_invocation.instrument
+            && current.registry_entry.parser == current.instrument_spec.parser
+            && current.registry_entry.supports(started.instrument_invocation.kind)
+            && current.registry_entry.verify_profile_identities().is_ok()
+            && current
+                .registry_entry
+                .check_resolved_executable(Some(current.resolved_executable))
+                .is_ok();
+        let workspace_matches = match current_source_proof
+            .snapshot
+            .validates_workspace_root(Path::new(&current.source_candidate.workspace_root))
+        {
+            Ok(matches) => matches,
+            Err(error) => {
+                projection.currentness = Freshness::Stale {
+                    reason: format!("current source workspace is unavailable: {error}"),
+                };
+                return Ok(projection);
+            }
+        };
+        if !workspace_matches {
+            projection.currentness = Freshness::Stale {
+                reason: "current source artifact belongs to another workspace root".to_owned(),
+            };
+            return Ok(projection);
+        }
+        let current_projection = current_source_proof.projection();
+        let owner_matches = dispatch_proof.matches_current_source(&current_source_proof)
+            && source_artifact_binds_invocation(&current_source_proof, current.instrument_invocation)
+            && binding.source_artifact_at_dispatch.as_ref() == Some(&dispatch_proof.projection())
+            && binding.source_artifact_after_run.as_ref() == Some(&current_projection)
+            && workspace_matches
+            && current_source_proof.snapshot.same_source(&dispatch_proof.snapshot)
+            && current_source_proof.artifact.identity().artifact_id
+                == current_source_proof.reference.identity.artifact_id
+            && current
+                .instrument_invocation
+                .input_artifacts
+                .iter()
+                .filter(|artifact| *artifact == &current_source_proof.reference.identity.artifact_id)
+                .count()
+                == 1
+            && current.build_fingerprint == started.build_fingerprint.as_ref()
+            && current.candidate_identity == started.candidate_identity.as_ref();
+        let process_complete = process_succeeded(
+            process_evidence_completed(&record.process_evidence),
+            process_evidence_exit_code(&record.process_evidence),
+        ) && !process_outputs_incomplete(&process_evidence, &record.raw_outputs);
+        if executable_matches
+            && profile_matches
+            && owner_matches
+            && process_complete
+            && source_binding_matches_current(binding, current)
+        {
+            projection.currentness = Freshness::Current;
+        }
+        Ok(projection)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retain_result(
+        &self,
+        started: &LspStartedInvocation,
+        process_evidence: ProcessEvidence,
+        raw_outputs: Vec<LspRawOutput>,
+        source_scope_after_run: Option<&GovernedGitScope>,
+        candidate_identity_after_run: Option<&CandidateIdentity>,
+        build_fingerprint_after_run: Option<&BuildFingerprint>,
+        invoked_at_unix_ms: u64,
+    ) -> Result<RetainedLspObservationV1, BridgeError> {
+        process_evidence
+            .validate()
+            .map_err(BridgeError::ProcessEvidence)?;
+        let process_start = process_start_binding(&started.process_start)?;
+        if process_evidence.request_digest() != started.invocation_digest
+            || process_evidence.operation_id() != started.process_intent.operation_id()
+            || started.process_start.request_digest() != started.invocation_digest
+            || started.process_start.operation_id() != started.process_intent.operation_id()
+            || process_start.accepted_generation != started.process_intent.generation().get()
+        {
+            return Err(BridgeError::ReceiptMismatch);
+        }
+        validate_candidate_identity(candidate_identity_after_run, build_fingerprint_after_run)?;
+        validate_raw_outputs(
+            &started.instrument_invocation,
+            &process_evidence,
+            &started.operation,
+            &started.config,
+            &raw_outputs,
+            true,
+        )?;
+        let process_completed = process_evidence_completed(&process_evidence);
+        let process_truncated = process_outputs_incomplete(&process_evidence, &raw_outputs);
+        let exit_code = process_evidence_exit_code(&process_evidence);
+        let mut result = normalize_retained_operation(
+            &started.config,
+            &started.source_candidate,
+            &started.operation,
+            &started.resolved_executable,
+            &raw_outputs,
+            &process_evidence,
+            invoked_at_unix_ms,
+        )?;
+        apply_process_completion(&mut result, process_completed, process_truncated, exit_code);
+        let source_binding = LspSourceBindingV1 {
+            schema_version: 1,
+            source_scope_at_dispatch: started.source_scope_at_dispatch.clone(),
+            source_scope_after_run: source_scope_after_run.cloned(),
+            candidate_identity_at_dispatch: started.candidate_identity.clone(),
+            build_fingerprint_at_dispatch: started.build_fingerprint.clone(),
+            candidate_identity_after_run: candidate_identity_after_run.cloned(),
+            build_fingerprint_after_run: build_fingerprint_after_run.cloned(),
+            process_start,
+            instrument_request_id: started.instrument_invocation.request.request_id.as_str().to_owned(),
+            instrument_target: started.instrument_invocation.target.clone(),
+            instrument_declared_scope: started.instrument_invocation.declared_scope.clone(),
+            instrument_input_artifacts: started.instrument_invocation.input_artifacts.clone(),
+            source_artifact_at_dispatch: started
+                .source_artifact_proof
+                .as_ref()
+                .map(LspSourceArtifactProof::projection),
+            source_artifact_after_run: None,
+            process_operation_id: started.process_intent.operation_id().as_str().to_owned(),
+            process_generation: started.process_intent.generation().get(),
+            process_working_directory: started.process_intent.working_directory().to_owned(),
+        };
+        validate_source_binding(&source_binding)?;
+        result.receipt_mut().candidate = started
+            .source_candidate
+            .reference_with_source_binding(&source_binding)?;
+        result.receipt_mut().source_binding = Some(source_binding);
+        if matches!(&result.receipt().freshness, Freshness::Current) {
+            result.receipt_mut().freshness = Freshness::Stale {
+                reason: "current source-artifact owner readback is required for adoption".to_owned(),
+            };
+        }
+        Ok(RetainedLspObservationV1 {
+            schema_version: LSP_RETAINED_OBSERVATION_SCHEMA_VERSION,
+            receipt_kind: LSP_TOOL_OBSERVATION_RECEIPT_KIND.to_owned(),
+            operation: started.operation.clone(),
+            config: started.config.clone(),
+            source_candidate: started.source_candidate.clone(),
+            instrument_invocation: started.instrument_invocation.clone(),
+            process_intent: started.process_intent.clone(),
+            invocation_digest: started.invocation_digest.clone(),
+            resolved_executable: started.resolved_executable.clone(),
+            instrument_spec: started.instrument_spec.clone(),
+            registry_identity: started.registry_identity.clone(),
+            process_evidence,
+            raw_outputs,
+            result,
+        })
+    }
+}
+
+fn process_evidence_completed(evidence: &ProcessEvidence) -> bool {
+    evidence
+        .view()
+        .exit()
+        .is_some_and(|exit| exit.disposition() == ExitDisposition::Completed)
+}
+
+fn process_evidence_exit_code(evidence: &ProcessEvidence) -> Option<i32> {
+    let exit = evidence.view().exit()?;
+    let value = serde_json::to_value(exit).ok()?;
+    value
+        .get("code")?
+        .as_i64()
+        .and_then(|code| i32::try_from(code).ok())
+}
+
 /// Validates a retained observation against its original process request and
 /// raw bytes, then returns a historical result that is always stale. The
 /// envelope cannot provide the independent current source, executable, or
@@ -2742,11 +3065,7 @@ pub fn adopt_retained_observation(
     record: RetainedLspObservationV1,
 ) -> Result<NormalizedResult, BridgeError> {
     validate_retained_observation(&record)?;
-    let mut result = record.result;
-    result.receipt_mut().freshness = Freshness::Stale {
-        reason: "historical observation lacks independent current source, executable, and profile verification".to_owned(),
-    };
-    Ok(result)
+    Ok(record.result)
 }
 
 /// Compares one retained result with current task, source, executable,
@@ -2758,6 +3077,14 @@ pub fn adopt_received_result(
     current: &CurrentLspAdoptionContext<'_>,
 ) -> Result<NormalizedResult, BridgeError> {
     validate_retained_observation(&record)?;
+    validate_received_result_request(&record, current)?;
+    Ok(record.result)
+}
+
+fn validate_received_result_request(
+    record: &RetainedLspObservationV1,
+    current: &CurrentLspAdoptionContext<'_>,
+) -> Result<(), BridgeError> {
     current.source_candidate.validate()?;
     current.config.validate()?;
     current
@@ -2777,7 +3104,13 @@ pub fn adopt_received_result(
             "retained invocation does not match the current task request".to_owned(),
         ));
     }
+    Ok(())
+}
 
+fn received_result_currentness(
+    record: &RetainedLspObservationV1,
+    current: &CurrentLspAdoptionContext<'_>,
+) -> Freshness {
     let current_registry = LspRegistryIdentity::from(current.registry_entry);
     let executable_matches = ResolvedExecutableIdentityRecord::from(current.resolved_executable)
         == record.resolved_executable;
@@ -2799,9 +3132,14 @@ pub fn adopt_received_result(
         .source_binding
         .as_ref()
         .is_some_and(|binding| source_binding_matches_current(binding, current));
-    let mut result = record.result;
-    result.receipt_mut().freshness = Freshness::Stale {
-        reason: if !executable_matches || !profile_matches {
+    let process_matches = process_succeeded(
+        process_evidence_completed(&record.process_evidence),
+        process_evidence_exit_code(&record.process_evidence),
+    ) && !process_outputs_incomplete(&record.process_evidence, &record.raw_outputs);
+    Freshness::Stale {
+        reason: if !process_matches {
+            "original tool process did not complete successfully with complete output".to_owned()
+        } else if !executable_matches || !profile_matches {
             "current executable or admitted profile differs from the captured invocation".to_owned()
         } else if !source_matches {
             "current source or admitted candidate identity differs from the captured invocation"
@@ -2809,8 +3147,7 @@ pub fn adopt_received_result(
         } else {
             "current source has no owner-read immutable source-artifact join".to_owned()
         },
-    };
-    Ok(result)
+    }
 }
 
 fn validate_retained_observation(record: &RetainedLspObservationV1) -> Result<(), BridgeError> {
@@ -3253,13 +3590,8 @@ fn validate_source_artifact_projection(
 ) -> Result<(), BridgeError> {
     let reference = &source.artifact_reference;
     let receipt = &source.read_receipt;
-    reference
-        .validate()
-        .map_err(|error| BridgeError::InconsistentBinding(error.to_string()))?;
-    let identity_digest = reference
-        .identity
-        .identity_digest()
-        .map_err(|error| BridgeError::InconsistentBinding(error.to_string()))?;
+    reference.validate()?;
+    let identity_digest = reference.identity.identity_digest()?;
     let identity_source = reference.identity.source.as_ref();
     if source.schema_version != 1
         || !is_git_object_id(&source.git_tree_id)
@@ -3726,9 +4058,31 @@ fn validate_instrument_process_request(
     Ok(())
 }
 
+fn validate_instrument_process_admission(
+    admission: &ProcessExecutionAdmissionRequest,
+    invocation: &InstrumentInvocation,
+) -> Result<(), BridgeError> {
+    admission.validate().map_err(BridgeError::ProcessEvidence)?;
+    let intent = admission.intent();
+    if intent.operation_id().as_str() != invocation.request.request_id.as_str()
+        || intent.generation().get() != invocation.request.state_fence.resource_generation.value()
+        || admission.state_fence().authority_epoch() != &invocation.request.state_fence.authority_epoch
+        || invocation
+            .request
+            .session_id
+            .as_ref()
+            .is_some_and(|session| session.as_str() != intent.session_id().as_str())
+    {
+        return Err(BridgeError::InconsistentBinding(
+            "original Kernel admission does not match the Instrument request id, session, generation, or authority epoch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_instrument_binding(
     command: &LspCommand,
-    request: &ProcessRequest,
+    intent: &ProcessIntent,
     candidate: &SourceCandidate,
     config: &AnalyzerConfig,
     operation: &SemanticOperation,
@@ -3740,7 +4094,9 @@ fn validate_instrument_binding(
     let registry = owner.registry;
     let spec = owner.spec;
     if command != &projected
-        || !command.matches_request(request)
+        || !intent.executable().eq_ignore_ascii_case(&command.executable)
+        || intent.argv() != command.arguments.as_slice()
+        || intent.working_directory() != command.working_directory
         || !registry.supports(invocation.kind)
         || registry.instrument != invocation.instrument
         || spec.kind.as_str() != registry.instrument.as_str()
@@ -3751,14 +4107,15 @@ fn validate_instrument_binding(
             .as_deref()
             .is_some_and(|version| resolved.tool_version.as_deref() != Some(version))
         || spec.environment_profile != registry.environment_class
-        || request.intent().executable() != resolved.canonical_path.as_str()
-        || request.intent().executable_sha256() != resolved.content_digest.as_str()
-        || request.intent().argv() != command.arguments.as_slice()
-        || request.intent().working_directory() != command.working_directory.as_str()
-        || resolved.arguments.as_slice() != request.intent().argv()
+        || intent.executable() != resolved.canonical_path.as_str()
+        || intent.executable_sha256() != resolved.content_digest.as_str()
+        || intent.argv() != command.arguments.as_slice()
+        || intent.working_directory() != command.working_directory.as_str()
+        || intent.resource_limits() != &spec.limits
+        || resolved.arguments.as_slice() != intent.argv()
         || invocation.arguments.as_slice() != spec.argument_template.as_slice()
         || path_file_name(&spec.executable) != resolved.executable_file_name()
-        || !resolved.binds_argv(request.intent().argv())
+        || !resolved.binds_argv(intent.argv())
     {
         return Err(BridgeError::InconsistentBinding(
             "analyzer command does not match the admitted Instrument, #1814 executable, registry, or parser".to_owned(),
@@ -3950,30 +4307,13 @@ fn source_binding_matches_current(
     binding: &LspSourceBindingV1,
     current: &CurrentLspAdoptionContext<'_>,
 ) -> bool {
-    let scopes_match = binding
-        .source_scope_at_dispatch
-        .as_ref()
-        .zip(binding.source_scope_after_run.as_ref())
-        .zip(current.source_scope)
-        .is_some_and(|((dispatch, after), now)| dispatch == after && after == now);
-    let identities_match = match (
-        binding.candidate_identity_at_dispatch.as_ref(),
-        binding.build_fingerprint_at_dispatch.as_ref(),
-        binding.candidate_identity_after_run.as_ref(),
-        binding.build_fingerprint_after_run.as_ref(),
-        current.candidate_identity,
-        current.build_fingerprint,
-    ) {
-        (
-            Some(dispatch),
-            Some(dispatch_fp),
-            Some(after),
-            Some(after_fp),
-            Some(now),
-            Some(now_fp),
-        ) => dispatch == after && after == now && dispatch_fp == after_fp && after_fp == now_fp,
-        _ => false,
-    };
+    let scopes_match = binding.source_scope_at_dispatch == binding.source_scope_after_run
+        && binding.source_scope_after_run.as_ref() == current.source_scope;
+    let identities_match = binding.candidate_identity_at_dispatch
+        == binding.candidate_identity_after_run
+        && binding.build_fingerprint_at_dispatch == binding.build_fingerprint_after_run
+        && binding.candidate_identity_after_run.as_ref() == current.candidate_identity
+        && binding.build_fingerprint_after_run.as_ref() == current.build_fingerprint;
     let request_matches = binding.process_start.schema_version == 1
         && binding.instrument_request_id
             == current.instrument_invocation.request.request_id.as_str()
@@ -4164,6 +4504,15 @@ pub enum BridgeError {
     /// The existing #1814 executable identity is inconsistent or invalid.
     #[error("resolved executable identity is invalid: {0}")]
     ExecutableIdentity(String),
+    /// Current source could not be revalidated by the original Git owner.
+    #[error("source snapshot revalidation failed: {0}")]
+    SourceSnapshot(#[source] GitSnapshotError),
+    /// The existing Artifact owner rejected the immutable source readback.
+    #[error("source artifact readback failed validation: {0}")]
+    SourceArtifact(#[from] ArtifactError),
+    /// The original session-bound Kernel process owner rejected or failed the operation.
+    #[error("original Kernel process owner failed: {0}")]
+    ProcessOwner(#[source] LspProcessOwnerError),
     /// The retained instrument/spec/parser identity is invalid.
     #[error("instrument identity is invalid: {0}")]
     InstrumentIdentity(String),

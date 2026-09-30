@@ -50,6 +50,7 @@ use std::fmt;
 use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -299,6 +300,44 @@ pub trait ProcessRunner: Send + Sync {
         }
         self.run(exe, args, cwd, stdin)
     }
+}
+
+/// Typed failure returned by an asynchronous original-owner Git runner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitProcessRunError {
+    /// Stable owner rejection or execution failure code.
+    pub code: String,
+    /// Bounded owner or execution detail.
+    pub detail: String,
+}
+
+impl fmt::Display for GitProcessRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.detail)
+    }
+}
+
+/// Sendable future returned by an asynchronous original-owner Git runner.
+pub type GitProcessRunFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProcessOutcome, GitProcessRunError>> + Send + 'a>>;
+
+/// Asynchronous Git process port backed by the original admitted Kernel owner.
+///
+/// Implementations validate each exact command and profile against an
+/// owner-created admission and route it through that owner. The Git bridge
+/// never creates dispatch authority or starts a private child. A successful
+/// outcome must contain complete stdout and stderr; adapters fail closed when
+/// original process evidence contains only a truncated preview.
+pub trait AsyncProcessRunner: Send + Sync {
+    /// Runs one exact Git invocation under its typed isolated-index profile.
+    fn run_profiled<'a>(
+        &'a self,
+        exe: &'a str,
+        args: &'a [&'a str],
+        cwd: &'a Path,
+        stdin: &'a [u8],
+        profile: &'a GitProcessProfile,
+    ) -> GitProcessRunFuture<'a>;
 }
 
 /// The only process-profile override currently used by Git source capture.

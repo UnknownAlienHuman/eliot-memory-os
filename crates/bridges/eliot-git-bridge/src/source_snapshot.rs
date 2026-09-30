@@ -1,6 +1,8 @@
 //! Immutable readback of the selected Git workspace and its worktree overlay.
 
-use crate::{BridgeError, GitProcessProfile, ProcessOutcome, ProcessRunner, RepoRoot};
+use crate::{
+    AsyncProcessRunner, BridgeError, GitProcessProfile, ProcessOutcome, ProcessRunner, RepoRoot,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -18,6 +20,18 @@ pub enum GitSnapshotError {
     WorkspaceRootMismatch { selected: PathBuf, resolved: PathBuf },
     /// A process port rejected an invocation or could not return complete data.
     Process { operation: &'static str, detail: String },
+    /// Git completed with a nonzero exit status while reading the source tree.
+    ProcessExit {
+        operation: &'static str,
+        exit_code: i32,
+        stderr: Vec<u8>,
+    },
+    /// The original Kernel owner rejected a source readback invocation.
+    OwnerRejected {
+        operation: &'static str,
+        code: String,
+        detail: String,
+    },
     /// Git returned output outside the admitted source snapshot shape.
     InvalidGitOutput { operation: &'static str, detail: String },
     /// A complete tree could not be archived with every referenced blob.
@@ -45,6 +59,19 @@ impl fmt::Display for GitSnapshotError {
             Self::Process { operation, detail } => {
                 write!(f, "Git source {operation} failed: {detail}")
             }
+            Self::ProcessExit {
+                operation,
+                exit_code,
+                stderr,
+            } => write!(
+                f,
+                "Git source {operation} exited with {exit_code}: {}",
+                String::from_utf8_lossy(stderr)
+            ),
+            Self::OwnerRejected { operation, code, detail } => write!(
+                f,
+                "Git source {operation} was rejected by its original owner ({code}): {detail}"
+            ),
             Self::InvalidGitOutput { operation, detail } => {
                 write!(f, "Git source {operation} returned invalid output: {detail}")
             }
@@ -79,7 +106,8 @@ impl From<BridgeError> for GitSnapshotError {
 }
 
 /// Captured source bytes for one exact selected workspace, including tracked
-/// edits, tracked deletions, and non-ignored untracked files.
+/// edits, tracked deletions, and untracked files, including ignored files that
+/// remain readable inputs to tools operating on the selected workspace.
 ///
 /// This value is deliberately neither serializable nor caller-constructible.
 /// The Git tree ID is supplemental correlation; the archive bytes and their
@@ -114,6 +142,27 @@ impl SourceTreeSnapshot {
         Ok(after)
     }
 
+    /// Captures and double-checks the complete selected workspace through the
+    /// asynchronous original-owner process port.
+    pub async fn capture_current_async(
+        root: &RepoRoot,
+        runner: &dyn AsyncProcessRunner,
+        max_archive_bytes: u64,
+    ) -> Result<Self, GitSnapshotError> {
+        if max_archive_bytes == 0 {
+            return Err(GitSnapshotError::InvalidGitOutput {
+                operation: "archive bound",
+                detail: "admitted source archive ceiling must be nonzero".to_owned(),
+            });
+        }
+        let before = capture_once_async(root, runner, max_archive_bytes).await?;
+        let after = capture_once_async(root, runner, max_archive_bytes).await?;
+        if !before.same_source(&after) {
+            return Err(GitSnapshotError::WorkspaceChanged);
+        }
+        Ok(after)
+    }
+
     /// Re-captures the selected workspace under the same admitted byte ceiling
     /// and returns that new owner readback only when it matches this capture.
     /// A changed source invalidates currentness.
@@ -123,6 +172,21 @@ impl SourceTreeSnapshot {
         runner: &dyn ProcessRunner,
     ) -> Result<Self, GitSnapshotError> {
         let current = Self::capture_current(root, runner, self.max_archive_bytes)?;
+        if self.same_source(&current) {
+            Ok(current)
+        } else {
+            Err(GitSnapshotError::WorkspaceChanged)
+        }
+    }
+
+    /// Re-captures through the same asynchronous original owner and returns
+    /// the new owner readback only when every source byte still matches.
+    pub async fn revalidate_current_async(
+        &self,
+        root: &RepoRoot,
+        runner: &dyn AsyncProcessRunner,
+    ) -> Result<Self, GitSnapshotError> {
+        let current = Self::capture_current_async(root, runner, self.max_archive_bytes).await?;
         if self.same_source(&current) {
             Ok(current)
         } else {
@@ -207,7 +271,14 @@ fn capture_once(
     }
 
     run_git(runner, &workspace_root, &profile, "index initialization", &["read-tree", "HEAD"], &[])?;
-    run_git(runner, &workspace_root, &profile, "overlay capture", &["add", "--all"], &[])?;
+    run_git(
+        runner,
+        &workspace_root,
+        &profile,
+        "overlay capture",
+        &["add", "--all", "--force"],
+        &[],
+    )?;
     let tree = run_git(runner, &workspace_root, &profile, "tree write", &["write-tree"], &[])?;
     let tree_id = parse_line(&tree.stdout, "tree write")?.to_owned();
     if !matches!(tree_id.len(), 40 | 64) || !tree_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -245,6 +316,134 @@ fn capture_once(
         &["archive", "--format=tar", &tree_id],
         &[],
     )?;
+    if archive.stdout.len() as u64 > max_archive_bytes {
+        return Err(GitSnapshotError::ArchiveTooLarge {
+            max_bytes: max_archive_bytes,
+        });
+    }
+    verify_archive(&archive.stdout, &blobs)?;
+    let workspace_after = fs::canonicalize(requested)
+        .map_err(|_| GitSnapshotError::WorkspaceUnavailable(requested.to_path_buf()))?;
+    if workspace_after != workspace_root {
+        return Err(GitSnapshotError::WorkspaceChanged);
+    }
+    drop(index);
+
+    Ok(SourceTreeSnapshot {
+        workspace_root,
+        tree_id,
+        archive_bytes: archive.stdout,
+        max_archive_bytes,
+    })
+}
+
+async fn capture_once_async(
+    root: &RepoRoot,
+    runner: &dyn AsyncProcessRunner,
+    max_archive_bytes: u64,
+) -> Result<SourceTreeSnapshot, GitSnapshotError> {
+    let requested = root.path();
+    let workspace_root = fs::canonicalize(requested)
+        .map_err(|_| GitSnapshotError::WorkspaceUnavailable(requested.to_path_buf()))?;
+    if !workspace_root.is_dir() {
+        return Err(GitSnapshotError::WorkspaceUnavailable(workspace_root));
+    }
+    let index = OwnedGitIndex::create()?;
+    let profile = GitProcessProfile::isolated_index(index.index_path())
+        .map_err(|detail| GitSnapshotError::IndexDirectory {
+            path: index.directory.clone(),
+            detail,
+        })?;
+
+    let resolved = run_git_async(
+        runner,
+        &workspace_root,
+        &profile,
+        "workspace root",
+        &["rev-parse", "--show-toplevel"],
+        &[],
+    )
+    .await?;
+    let git_root = parse_line(&resolved.stdout, "workspace root")?;
+    let git_root = fs::canonicalize(PathBuf::from(git_root)).map_err(|error| {
+        GitSnapshotError::InvalidGitOutput {
+            operation: "workspace root",
+            detail: format!("Git root could not be resolved: {error}"),
+        }
+    })?;
+    if git_root != workspace_root {
+        return Err(GitSnapshotError::WorkspaceRootMismatch {
+            selected: workspace_root,
+            resolved: git_root,
+        });
+    }
+
+    run_git_async(
+        runner,
+        &workspace_root,
+        &profile,
+        "index initialization",
+        &["read-tree", "HEAD"],
+        &[],
+    )
+    .await?;
+    run_git_async(
+        runner,
+        &workspace_root,
+        &profile,
+        "overlay capture",
+        &["add", "--all", "--force"],
+        &[],
+    )
+    .await?;
+    let tree = run_git_async(
+        runner,
+        &workspace_root,
+        &profile,
+        "tree write",
+        &["write-tree"],
+        &[],
+    )
+    .await?;
+    let tree_id = parse_line(&tree.stdout, "tree write")?.to_owned();
+    if !matches!(tree_id.len(), 40 | 64) || !tree_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(GitSnapshotError::InvalidGitOutput {
+            operation: "tree write",
+            detail: "Git did not return a full object ID".to_owned(),
+        });
+    }
+
+    let listing = run_git_async(
+        runner,
+        &workspace_root,
+        &profile,
+        "tree enumeration",
+        &["ls-tree", "-r", "-z", &tree_id],
+        &[],
+    )
+    .await?;
+    if listing.stdout.len() as u64 > max_archive_bytes {
+        return Err(GitSnapshotError::ArchiveTooLarge {
+            max_bytes: max_archive_bytes,
+        });
+    }
+    let blobs = read_all_blobs_async(
+        runner,
+        &workspace_root,
+        &profile,
+        &listing.stdout,
+        max_archive_bytes,
+    )
+    .await?;
+    let archive = run_git_async(
+        runner,
+        &workspace_root,
+        &profile,
+        "tree archive",
+        &["archive", "--format=tar", &tree_id],
+        &[],
+    )
+    .await?;
     if archive.stdout.len() as u64 > max_archive_bytes {
         return Err(GitSnapshotError::ArchiveTooLarge {
             max_bytes: max_archive_bytes,
@@ -375,6 +574,93 @@ fn read_all_blobs(
             &["cat-file", "blob", object_id],
             &[],
         )?;
+        total_bytes = total_bytes
+            .checked_add(outcome.stdout.len() as u64)
+            .ok_or(GitSnapshotError::ArchiveTooLarge {
+                max_bytes: max_archive_bytes,
+            })?;
+        if total_bytes > max_archive_bytes {
+            return Err(GitSnapshotError::ArchiveTooLarge {
+                max_bytes: max_archive_bytes,
+            });
+        }
+        let blob = SourceBlob {
+            path: path.to_vec(),
+            mode,
+            bytes: outcome.stdout,
+        };
+        if blobs.insert(path.to_vec(), blob).is_some() {
+            return Err(GitSnapshotError::InvalidGitOutput {
+                operation: "tree enumeration",
+                detail: "tree repeated a source path".to_owned(),
+            });
+        }
+    }
+    Ok(blobs)
+}
+
+async fn read_all_blobs_async(
+    runner: &dyn AsyncProcessRunner,
+    cwd: &Path,
+    profile: &GitProcessProfile,
+    listing: &[u8],
+    max_archive_bytes: u64,
+) -> Result<BTreeMap<Vec<u8>, SourceBlob>, GitSnapshotError> {
+    let mut blobs = BTreeMap::new();
+    let mut total_bytes = 0u64;
+    if listing.is_empty() {
+        return Ok(blobs);
+    }
+    for row in listing.split(|byte| *byte == 0).filter(|row| !row.is_empty()) {
+        let (metadata, path) = row.split_once(|byte| *byte == b'\t').ok_or_else(|| {
+            GitSnapshotError::InvalidGitOutput {
+                operation: "tree enumeration",
+                detail: "tree row omitted its path separator".to_owned(),
+            }
+        })?;
+        let fields: Vec<&[u8]> = metadata
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty())
+            .collect();
+        if fields.len() != 3 {
+            return Err(GitSnapshotError::InvalidGitOutput {
+                operation: "tree enumeration",
+                detail: "tree row did not contain mode, type and object ID".to_owned(),
+            });
+        }
+        if fields[1] != b"blob" || fields[0] == b"160000" {
+            return Err(GitSnapshotError::InvalidGitOutput {
+                operation: "tree enumeration",
+                detail: "source tree contains an entry without captured blob bytes".to_owned(),
+            });
+        }
+        let mode = std::str::from_utf8(fields[0])
+            .map_err(|_| GitSnapshotError::InvalidGitOutput {
+                operation: "tree enumeration",
+                detail: "tree mode is not ASCII".to_owned(),
+            })?
+            .to_owned();
+        if !matches!(mode.as_str(), "100644" | "100755" | "120000") {
+            return Err(GitSnapshotError::InvalidGitOutput {
+                operation: "tree enumeration",
+                detail: format!("unsupported Git blob mode {mode}"),
+            });
+        }
+        let object_id = std::str::from_utf8(fields[2]).map_err(|_| {
+            GitSnapshotError::InvalidGitOutput {
+                operation: "tree enumeration",
+                detail: "blob object ID is not ASCII".to_owned(),
+            }
+        })?;
+        let outcome = run_git_async(
+            runner,
+            cwd,
+            profile,
+            "blob readback",
+            &["cat-file", "blob", object_id],
+            &[],
+        )
+        .await?;
         total_bytes = total_bytes
             .checked_add(outcome.stdout.len() as u64)
             .ok_or(GitSnapshotError::ArchiveTooLarge {
@@ -600,9 +886,36 @@ fn run_git(
         .run_profiled("git", args, cwd, stdin, profile)
         .map_err(|detail| GitSnapshotError::Process { operation, detail })?;
     if outcome.code != 0 {
-        return Err(GitSnapshotError::Process {
+        return Err(GitSnapshotError::ProcessExit {
             operation,
-            detail: String::from_utf8_lossy(&outcome.stderr).into_owned(),
+            exit_code: outcome.code,
+            stderr: outcome.stderr,
+        });
+    }
+    Ok(outcome)
+}
+
+async fn run_git_async(
+    runner: &dyn AsyncProcessRunner,
+    cwd: &Path,
+    profile: &GitProcessProfile,
+    operation: &'static str,
+    args: &[&str],
+    stdin: &[u8],
+) -> Result<ProcessOutcome, GitSnapshotError> {
+    let outcome = runner
+        .run_profiled("git", args, cwd, stdin, profile)
+        .await
+        .map_err(|error| GitSnapshotError::OwnerRejected {
+            operation,
+            code: error.code,
+            detail: error.detail,
+        })?;
+    if outcome.code != 0 {
+        return Err(GitSnapshotError::ProcessExit {
+            operation,
+            exit_code: outcome.code,
+            stderr: outcome.stderr,
         });
     }
     Ok(outcome)
