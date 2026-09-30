@@ -5253,6 +5253,11 @@ where
         policy: BlobPolicyBinding,
         domains: BlobResidencyDomains,
     ) -> Result<BlobReadyReceipt, BlobError> {
+        if bytes.len() as u64 > MAX_BLOB_PLAINTEXT_BYTES {
+            return Err(BlobError::InvalidContract(
+                "blob plaintext exceeds canonical hard ceiling".to_owned(),
+            ));
+        }
         let residency = domains.bind_exact_bytes(bytes)?;
         self.stage_source(BlobStageRequest {
             context,
