@@ -9,12 +9,14 @@
 //!   I07.20 agent-facing error contract (typed codes stay with their owners).
 //!
 //! This module owns exactly one process-global `tracing` subscriber
-//! installation plus the bounded, nonsecret field helpers used by Host
-//! process-entry observations. It owns no lifecycle, admission, transport,
-//! supervision, Store, generation, provider, credential, or repair authority:
-//! a diagnostic record is evidence only and can never reconcile an
-//! observation, authorize an effect, or promote liveness into
-//! readiness/completion.
+//! installation attempt plus the bounded, nonsecret field helpers used by
+//! Host process-entry observations. It reports the real outcome of that one
+//! attempt — Host-owned, still in progress, or unavailable behind a foreign
+//! subscriber — and never replaces or claims a subscriber it did not install.
+//! It owns no lifecycle, admission, transport, supervision, Store,
+//! generation, provider, credential, or repair authority: a diagnostic record
+//! is evidence only and can never reconcile an observation, authorize an
+//! effect, or promote liveness into readiness/completion.
 //!
 //! Delivery is workspace `tracing` only, written to stderr so the
 //! newline-delimited console protocol on stdout
@@ -27,7 +29,7 @@
 //! another sink.
 
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use eliot_host_state::HostState;
 use tracing_subscriber::EnvFilter;
@@ -52,8 +54,72 @@ pub const HOST_TERMINAL_CODE_DISPATCHER_FAILED: &str = "dispatcher_failed";
 /// failure; later leaves (#891) own the remaining sites.
 pub const HOST_TERMINAL_CODE_CONSOLE_FAILED: &str = "console_failed";
 
-/// Process ownership claim for the facade's one global subscriber install.
-static SUBSCRIBER_INSTALLED: OnceLock<()> = OnceLock::new();
+/// Observed outcome of the facade's one process-global subscriber install.
+///
+/// A claim, a successful Host-owned install, and a failed or foreign install
+/// are three distinct states, so `OnceLock<()>` — which cannot tell a
+/// completed install from the mere right to attempt one — is replaced by this
+/// value under a private lock. The state records one observed attempt only:
+/// it never authorizes a second install, a retry, or a replacement of an
+/// existing global subscriber.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriberSetup {
+    /// A caller holds the claim and the single install attempt is still in
+    /// progress: no outcome is observed yet, and a caller arriving now is
+    /// not the owner of an installed subscriber.
+    InProgress,
+    /// This facade's stderr subscriber is the installed global subscriber.
+    Installed,
+    /// The one attempt failed, so an unknown pre-existing global subscriber
+    /// (or an otherwise unusable initialization) owns the global slot. The
+    /// outcome is degraded but truthful; it is never upgraded to success.
+    Unavailable,
+}
+
+impl SubscriberSetup {
+    /// The caller-facing answer for this observed state: a Host-owned
+    /// subscriber, the claim of a still-running attempt, a failed/foreign
+    /// subscriber, or the honest "no attempt observed yet".
+    const fn as_result(self) -> Result<(), HostDiagnosticsError> {
+        match self {
+            Self::Installed => Ok(()),
+            Self::InProgress => Err(HostDiagnosticsError::SetupInProgress),
+            Self::Unavailable => Err(HostDiagnosticsError::SetupUnavailable),
+        }
+    }
+}
+
+/// Process state for the facade's one global subscriber install.
+///
+/// The `OnceLock` still names this one attempt: a caller that loses the
+/// `get_or_init` race learns the first observed outcome instead of winning a
+/// second claim, and only the initializing caller ever runs `try_init`. The
+/// mutex then serializes the transition from claimed to settled, so a
+/// concurrent claimant is never answered `Ok` before the install finished.
+static SUBSCRIBER_SETUP: OnceLock<Mutex<SubscriberSetup>> = OnceLock::new();
+
+/// One-process state for the facade's single subscriber install attempt.
+///
+/// Bounded by construction: one process-global cell, a claim, one
+/// `try_init`, and one settled outcome. No queue, thread, worker, or retry.
+fn subscriber_setup_cell() -> &'static Mutex<SubscriberSetup> {
+    SUBSCRIBER_SETUP.get_or_init(|| Mutex::new(SubscriberSetup::InProgress))
+}
+
+/// Reads the first observed outcome without touching the install claim.
+///
+/// A poisoned lock is not a startup gate: the value it still holds is the
+/// one observed attempt, so it is read rather than fabricated, and this
+/// function never panics.
+fn subscriber_setup_observed() -> SubscriberSetup {
+    let Some(cell) = SUBSCRIBER_SETUP.get() else {
+        return SubscriberSetup::InProgress;
+    };
+    match cell.lock() {
+        Ok(observed) => *observed,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
 
 /// Typed facade failures.
 ///
@@ -63,14 +129,24 @@ static SUBSCRIBER_INSTALLED: OnceLock<()> = OnceLock::new();
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostDiagnosticsError {
     /// The facade already owns the process-global subscriber installation.
-    /// Repeat installation is bounded and non-panicking: the first install
-    /// stands and no second owner is created.
+    /// Repeat installation is bounded and non-panicking: the first observed
+    /// install stands and no second owner is created.
     AlreadyOwned,
     /// Windows Event Log delivery was requested from the facade, which
     /// routes to `tracing` only: this arm has no Event Log sink and must
     /// not fake one (real delivery lives in the `windows_event_log`
     /// wrapper over #984's landed safe port).
     EventLogUnavailable,
+    /// The single install attempt is still running in another caller. Its
+    /// outcome is not observed yet, so this answer asserts no ownership and
+    /// makes no second attempt.
+    SetupInProgress,
+    /// The facade's stderr subscriber is not the installed global
+    /// subscriber: the one attempt failed, typically because another
+    /// subscriber already owns the global slot. That pre-existing
+    /// subscriber is left untouched and unclaimed, and the stderr sink
+    /// cannot be certified. Degraded, never a startup rejection.
+    SetupUnavailable,
 }
 
 impl fmt::Display for HostDiagnosticsError {
@@ -79,6 +155,10 @@ impl fmt::Display for HostDiagnosticsError {
             Self::AlreadyOwned => write!(f, "host diagnostics subscriber already owned"),
             Self::EventLogUnavailable => {
                 write!(f, "windows event log sink unavailable (see issue #984)")
+            }
+            Self::SetupInProgress => write!(f, "host diagnostics subscriber setup in progress"),
+            Self::SetupUnavailable => {
+                write!(f, "host diagnostics subscriber setup unavailable")
             }
         }
     }
@@ -89,7 +169,9 @@ impl std::error::Error for HostDiagnosticsError {}
 /// Diagnostic delivery sinks visible to the Host entrypoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticSink {
-    /// Workspace `tracing` subscriber writing to stderr. Available.
+    /// Workspace `tracing` subscriber writing to stderr. Compiled in, and
+    /// certified only once [`install_host_diagnostics`] has observed a
+    /// successful Host-owned install.
     TracingStderr,
     /// Windows Event Log. Explicitly unavailable from the facade, which
     /// routes to `tracing` only: requesting it is a typed error, never
@@ -100,11 +182,20 @@ pub enum DiagnosticSink {
 
 /// Reports whether a sink can carry Host diagnostics.
 ///
+/// The `tracing` arm answers from this facade's *observed* installation
+/// state, not from compiled-in support: before any install attempt, while
+/// the one attempt is still running, or after it failed, this sink cannot be
+/// certified and the answer is a typed error. Even a successful install
+/// certifies only that the Host stderr subscriber owns the global slot: the
+/// `EnvFilter` may still suppress a given event, and the `tracing` library
+/// proves neither emission nor delivery, so no arm of this function claims
+/// that a record was written or received.
+///
 /// The Event Log arm always answers [`HostDiagnosticsError::EventLogUnavailable`];
 /// absence of evidence remains missing, never a faked delivery.
 pub fn sink_status(sink: DiagnosticSink) -> Result<(), HostDiagnosticsError> {
     match sink {
-        DiagnosticSink::TracingStderr => Ok(()),
+        DiagnosticSink::TracingStderr => subscriber_setup_observed().as_result(),
         DiagnosticSink::WindowsEventLog => Err(HostDiagnosticsError::EventLogUnavailable),
     }
 }
@@ -113,22 +204,82 @@ pub fn sink_status(sink: DiagnosticSink) -> Result<(), HostDiagnosticsError> {
 ///
 /// The subscriber is `tracing_subscriber::fmt` with an `env-filter` default
 /// of `info` and the stderr writer, so the console-protocol stdout framing is
-/// preserved. The first caller becomes the single owner; every later caller
-/// receives [`HostDiagnosticsError::AlreadyOwned`] without panic,
-/// replacement, or a second global install. Delivery setup is best-effort: a
-/// foreign pre-existing global install (or any init failure) is kept as-is
-/// and the owner claim still stands, because diagnostics must never gate
-/// startup, retry, recurse, or change Host results.
+/// preserved. The reported answer is the real setup outcome, never an
+/// unconditional success:
+///
+/// * `Ok(())` only when `try_init` installed *this* facade's stderr
+///   subscriber as the global subscriber;
+/// * [`HostDiagnosticsError::SetupUnavailable`] when the one attempt failed,
+///   typically because a foreign subscriber already holds the global slot —
+///   that subscriber is never replaced and never claimed, and the degraded
+///   outcome is retained;
+/// * [`HostDiagnosticsError::SetupInProgress`] for a caller that arrives
+///   while the claimed attempt is still running: no ownership is asserted
+///   and no second attempt is started;
+/// * [`HostDiagnosticsError::AlreadyOwned`] for every later call after an
+///   install this facade performed, bounded and non-panicking, with no
+///   second subscriber created.
+///
+/// Repeated calls report the *first observed* outcome; they are one
+/// observation, not a re-attempt. Setup stays best-effort and never becomes
+/// fatal: no result here gates startup, retries, recurses into the
+/// unavailable sink, or changes a Host result, because diagnostics must
+/// never gate startup.
 pub fn install_host_diagnostics() -> Result<(), HostDiagnosticsError> {
-    if SUBSCRIBER_INSTALLED.set(()).is_err() {
+    let Some(cell) = SUBSCRIBER_SETUP.get() else {
+        // This caller wins the one install claim: the cell starts claimed
+        // and in progress, so a concurrent caller sees `SetupInProgress`
+        // until the outcome below is recorded.
+        return install_claimed_subscriber();
+    };
+    // The single attempt is already claimed. Report the first observed
+    // outcome and make no second attempt.
+    let observed = *subscriber_setup_lock(cell);
+    if observed == SubscriberSetup::Installed {
         return Err(HostDiagnosticsError::AlreadyOwned);
     }
+    observed.as_result()
+}
+
+/// Runs the one install attempt for the caller that holds the claim, then
+/// records whether this facade's stderr subscriber actually owns the global
+/// slot.
+///
+/// `try_init` is observed, never discarded: a failure (a pre-existing global
+/// subscriber, or any other initialization failure) settles the state as
+/// [`SubscriberSetup::Unavailable`] and returns the typed degraded answer.
+/// The library's own error text is neither returned, logged, nor stringified
+/// into a `Host` result (I07.20).
+fn install_claimed_subscriber() -> Result<(), HostDiagnosticsError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
+    let installed = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .try_init();
-    Ok(())
+        .try_init()
+        .is_ok();
+    settle_subscriber_setup(if installed {
+        SubscriberSetup::Installed
+    } else {
+        SubscriberSetup::Unavailable
+    })
+}
+
+/// Records the settled install outcome exactly once and answers the caller
+/// with it.
+fn settle_subscriber_setup(outcome: SubscriberSetup) -> Result<(), HostDiagnosticsError> {
+    let cell = subscriber_setup_cell();
+    let mut recorded = subscriber_setup_lock(cell);
+    *recorded = outcome;
+    outcome.as_result()
+}
+
+/// Locks the setup cell, tolerating poisoning because diagnostics must never
+/// turn a lock into a startup panic.
+fn subscriber_setup_lock(cell: &Mutex<SubscriberSetup>) -> MutexGuard<'_, SubscriberSetup> {
+    match cell.lock() {
+        Ok(locked) => locked,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Starts the single bounded Event Log worker before the first Host request
@@ -786,8 +937,9 @@ fn publish_projected_event_log_record(projection: &HostRequestProjection) {
 /// Every leaf module reaches the tracing macros through this re-export
 /// instead of naming `tracing::` itself, so this facade remains the one
 /// place that owns the emission spelling for a process whose subscriber is
-/// installed exactly once by [`install_host_diagnostics`]. The macros are
-/// re-exported unchanged: this facade owns *where* an observation is emitted
-/// from, never the field vocabulary or the lifecycle meaning of a call site,
-/// which stay with the owning module.
+/// installed at most once by [`install_host_diagnostics`], whose outcome
+/// that call reports truthfully. The macros are re-exported unchanged: this
+/// facade owns *where* an observation is emitted from, never the field
+/// vocabulary or the lifecycle meaning of a call site, which stay with the
+/// owning module.
 pub use tracing::{info, warn};
