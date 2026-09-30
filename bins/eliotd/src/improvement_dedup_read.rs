@@ -81,11 +81,10 @@
 //!    identity the store keys rows by;
 //! 3. its document decodes to the committed artifact shape AND binds itself:
 //!    the brief and the owner decision must name the very candidate the
-//!    document carries, the owner decision must name the very brief the
-//!    document carries, and the recorded decision owner must be a non-empty
-//!    principal — the principal that RECORDED the disposition, which is a
-//!    different fact from the candidate's ADMISSION authority and is therefore
-//!    not required to equal it;
+//!    document carries, and the recorded decision owner must be a real
+//!    non-empty principal — the principal that SELECTED the disposition
+//!    (I12.24:65), which is deliberately not required to be the authority the
+//!    candidate NOMINATES (I12.24:31); see the note at `classify_row`;
 //! 4. the candidate itself passes [`ImprovementCandidate::validate`];
 //! 5. the owner-decided bound committed beside it must pass
 //!    [`CandidateBoundPolicy::validate`].
@@ -651,10 +650,11 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
                 "record is neither a committed candidate artifact, nor an archive receipt, nor a lineage merge receipt: {error}"
             ))
         })?;
-    // The document must bind ITSELF. A brief or an owner decision that names a
-    // different candidate, or a decision that names a different brief, is a
-    // spliced document: reading its owner or its evidence refs as this
-    // candidate's would be trusting a string.
+    // The document must bind ITSELF. A brief or an owner decision that names
+    // a different candidate is a spliced document: reading its owner or its
+    // evidence refs as this candidate's would be trusting a string. This is
+    // where the anti-splice work actually happens, and it holds regardless of
+    // WHICH principal decided.
     let candidate_id = artifact.candidate.candidate_id.trim();
     if artifact.brief.candidate_id.trim() != candidate_id
         || artifact.owner_decision.candidate_id.trim() != candidate_id
@@ -663,40 +663,42 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
             "the committed brief or owner decision names a different candidate".to_owned(),
         ));
     }
-    if artifact.owner_decision.brief_id.trim() != artifact.brief.brief_id.trim() {
+    // The recorded decision owner is the principal that SELECTED the
+    // disposition (I12.24:65: "decision owner selects reject / investigate /
+    // work item / experiment"). The candidate's `owner_and_decision_authority`
+    // is a different role (I12.24:31): the authority the candidate NOMINATES,
+    // read back below as the restored entry's owner. Demanding the two be
+    // the same string was not an anti-splice property at all — it asserts an
+    // identity, and it can only ever hold while the machine decides about
+    // itself, because the one moment a real principal selects a disposition is
+    // the one moment the two names differ. It passed only for that reason, and
+    // it is what made this read refuse the owner's own decision as a splice.
+    //
+    // What actually binds the decision to this document is the check above:
+    // `owner_decision.candidate_id` is the candidate the decision was taken
+    // over, and `brief.candidate_id` is the candidate the brief was written
+    // for, so a decision lifted off another candidate cannot be read as this
+    // one's. String equality against a nominated authority adds no binding to
+    // that and no binding the digest does not already cover.
+    //
+    // So the surviving requirement on the owner is what A12.02:3 makes
+    // load-bearing: "Unknown identity means minimum privilege and no Material
+    // authority." A decision attributed to nobody is not a decision, and this
+    // read will not present it as one. Nothing stronger is defensible HERE:
+    // this module reads a stored document, and the principal that wrote it was
+    // bound to a Session and an Authority Epoch at the harness boundary, not at
+    // the moment of the read. The closed set of principals that may decide is
+    // not a fact this document carries, and spelling one out here would be a
+    // second identity scheme invented at a read site — the thing A12.02:3
+    // warns against ("Identity is not a model's self-declared string"). The
+    // admission of the decision stays where the principal is real: the governed
+    // path that recorded it, under the recorded
+    // `governed_admission_digest` checked below.
+    if artifact.owner_decision.owner.trim().is_empty() {
         return Err(refused(
-            "the committed owner decision names a different brief".to_owned(),
+            "the recorded decision names no principal".to_owned(),
         ));
     }
-    // The recorded decision owner is the principal that RECORDED this
-    // disposition, which is a different fact from the candidate's
-    // `owner_and_decision_authority` — the authority that ADMITTED the
-    // candidate, which `brief.rs` itself calls a separate owner decision and
-    // the thing that admits the candidate to the backlog. Requiring
-    // the two strings to be EQUAL therefore tested an accident, not an
-    // invariant: it held only because both were the same constant, and the
-    // first record written by a principal that actually selected a disposition
-    // would have been refused as spliced — and refused on every later pass too,
-    // because the registry re-reads the same durable rows each time. That is
-    // why the equality is not kept and only its property is.
-    //
-    // What this read still proves is that the owner is a real principal, and
-    // it proves it with the authority owner's own `PrincipalRef` constructor
-    // rather than a predicate written here: that constructor refuses a blank,
-    // whitespace-only or control-character value, and it is applied to the
-    // ORIGINAL recorded string, not to a trimmed copy of it. A caller-declared
-    // string is still not authority — admission is proved by `enforced_bound`
-    // against a Governor-minted permit, the restored entry's owner is the
-    // CANDIDATE's own authority and never this field, and the record's own
-    // digest already covers this string, so it cannot be altered inside the
-    // record without changing the revision identity the store keys the row by.
-    eliot_authority::PrincipalRef::new(artifact.owner_decision.owner.as_str()).map_err(
-        |error| {
-            refused(format!(
-                "recorded decision owner is not a principal: {error}"
-            ))
-        },
-    )?;
     if artifact.governed_admission_digest.trim().is_empty() {
         return Err(refused(
             "record carries no owner-issued governed admission digest".to_owned(),
