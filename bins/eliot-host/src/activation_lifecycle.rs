@@ -1380,7 +1380,7 @@ impl HostComposition {
         let mut claimed = 0_usize;
         for wake in pending {
             match next_generation_wake_schedule_state(&wake, now_ms) {
-                NextGenerationWakeSchedule::NoOwnerPolicy => {}
+                NextGenerationWakeSchedule::NoOwnerPolicy | NextGenerationWakeSchedule::Due => {}
                 NextGenerationWakeSchedule::NotDue => {
                     // Eligible only once the committed generation's authority
                     // is fenced. A `Pending -> Pending` edge does not exist,
@@ -1401,7 +1401,6 @@ impl HostComposition {
                     self.append_record(HostStateRecord::Wake(next))?;
                     continue;
                 }
-                NextGenerationWakeSchedule::Due => {}
             }
             let same_generation =
                 wake.fence.activation_generation == activation.fence.activation_generation;
