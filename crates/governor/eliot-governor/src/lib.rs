@@ -811,4 +811,7 @@ pub const fn degraded_health() -> HealthVector {
 
 pub use orientation_stage_sources::{
     OrientationClassificationSourceError, OrientationClassificationSourceReadback,
+    OrientationCueAdmissionError, OrientationCueAdmissionInput, OrientationCueAdmissionValuesV1,
+    OrientationCueBindingsSourceError, OrientationCueBindingsSourceReadback,
+    admit_orientation_cue_bindings, admit_orientation_cue_bindings_from_values,
 };

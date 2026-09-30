@@ -330,6 +330,7 @@ pub use operation_catalogue::{
 };
 
 pub use operation_parameters::{
+    decode_orientation_owner_sources,
     ParameterDeclaration, ParameterSchemaField, ParameterShape, declared_read_parameters,
     named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
     named_read_operation_name, parameter_schema_digest, project_parameter_schema,
@@ -3981,6 +3982,9 @@ pub enum NamedMutationOperation {
     /// Governor registry re-evaluates through its own exact-fingerprint,
     /// freshness, invalidation, and requalification predicates.
     RecordCapabilityEvidenceRecord,
+    /// Persist the exact independently admitted Orientation owner sources
+    /// under the original task, scope, fence and predecessor heads.
+    RecordOrientationOwnerSources,
     /// Canonical problem owner-state transaction (issue #1759 I2, I13.9/I13.7).
     ///
     /// Durable Problem-registry ownership and lifecycle only: the prepared
@@ -4006,7 +4010,8 @@ impl NamedMutationOperation {
             | Self::CommitExperienceBank
             | Self::CommitAgentFeedback
             | Self::ApplyBlackboardItem
-            | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
+            | Self::RecordCapabilityEvidenceRecord
+            | Self::RecordOrientationOwnerSources => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState | Self::ApplySwarmOwnerRevisions => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,

@@ -417,22 +417,22 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
 
     let mut artifacts = Vec::with_capacity(a12_result.candidates.len() + 2);
     artifacts.push(ArtifactBinding {
-        artifact_id: ArtifactId::new("orientation-a12-result")
+        artifact_id: ArtifactId::new(a12_result.result_digest.as_str())
             .map_err(|_| OrientationCueAdmissionError::A12("result artifact id".to_owned()))?,
         sha256: a12_result.result_digest.as_str().to_owned(),
         role: ReceiptKind::Artifact,
         source_revision: None,
     });
     artifacts.push(ArtifactBinding {
-        artifact_id: ArtifactId::new("orientation-policy-snapshot")
+        artifact_id: ArtifactId::new(policy_snapshot_id.as_str())
             .map_err(|_| OrientationCueAdmissionError::Authorization("policy_artifact_id"))?,
         sha256: policy_snapshot_digest.as_str().to_owned(),
         role: ReceiptKind::Artifact,
         source_revision: Some(policy_snapshot_id.clone()),
     });
     let mut artifact_ids = std::collections::BTreeSet::from([
-        "orientation-a12-result".to_owned(),
-        "orientation-policy-snapshot".to_owned(),
+        a12_result.result_digest.as_str().to_owned(),
+        policy_snapshot_id.clone(),
     ]);
     for candidate in &a12_result.candidates {
         candidate

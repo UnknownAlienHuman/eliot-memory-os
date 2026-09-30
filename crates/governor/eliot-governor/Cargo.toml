@@ -8,6 +8,7 @@ description = "Production Governor orchestration and readiness owner"
 
 [dependencies]
 eliot-dreamer-contracts = { path = "../../smart/eliot-dreamer-contracts", version = "0.1.0" }
+eliot-dreamer-orientation = { path = "../../smart/eliot-dreamer-orientation", version = "0.1.0" }
 eliot-agent-api.workspace = true
 eliot-authority.workspace = true
 eliot-budget.workspace = true

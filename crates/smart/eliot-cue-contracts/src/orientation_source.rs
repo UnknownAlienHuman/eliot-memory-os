@@ -140,12 +140,12 @@ fn validate_decision_receipt(
             && state_fence.task_revision.as_ref() == Some(&task.task_revision)
     });
     let result_artifact_matches = core.artifacts.iter().any(|artifact| {
-        artifact.artifact_id.as_str() == "orientation-a12-result"
+        artifact.artifact_id.as_str() == a12_result_digest
             && artifact.sha256 == a12_result_digest
             && artifact.role == ReceiptKind::Artifact
     });
     let policy_artifact_matches = core.artifacts.iter().any(|artifact| {
-        artifact.artifact_id.as_str() == "orientation-policy-snapshot"
+        artifact.artifact_id.as_str() == policy_snapshot_id
             && artifact.sha256 == policy_snapshot_digest
             && artifact.source_revision.as_deref() == Some(policy_snapshot_id)
             && artifact.role == ReceiptKind::Artifact
