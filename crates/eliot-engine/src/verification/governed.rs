@@ -503,7 +503,7 @@ impl GovernedProfileService {
         runs: Vec<InstrumentRun>,
         blob_store: Option<&BlobStore>,
     ) -> Result<GovernedProfileReport, EngineError> {
-        let (resolved, admitted, plan) = Self::resolve_once(name, bindings)?;
+        let (resolved, admitted, plan, _) = Self::resolve_once(name, bindings)?;
         render_resolved_report(&resolved, &admitted, &plan, runs, blob_store)
     }
 
@@ -526,7 +526,10 @@ impl GovernedProfileService {
     /// The bindings revalidate at dispatch: a changed layout, scope fence, or
     /// environment refuses instead of rebinding silently. The exact revision
     /// pins before launch, so a registry update cannot silently change later
-    /// stages of the same run. A malformed or replaced candidate identity
+    /// stages of the same run. New stage admission is checked against the
+    /// live registry the plan compiled against, so a replaced spec, parser,
+    /// receipt, or route becomes a missing run instead of a launch.
+    /// A malformed or replaced candidate identity
     /// refuses through
     /// [`StagePlan::bind_candidate_identity`](eliot_instrument_runner::StagePlan::bind_candidate_identity).
     /// Each launched run retains its durable stage identity with the bound
@@ -555,7 +558,7 @@ impl GovernedProfileService {
         launcher: &dyn StageLauncher,
         blob_store: Option<&BlobStore>,
     ) -> Result<GovernedProfileReport, EngineError> {
-        let (resolved, admitted, mut plan) = Self::resolve_once(name, bindings)?;
+        let (resolved, admitted, mut plan, registry) = Self::resolve_once(name, bindings)?;
         if let Some(candidate) = candidate_identity {
             plan.bind_candidate_identity(candidate).map_err(|error| {
                 rejected(
@@ -564,7 +567,8 @@ impl GovernedProfileService {
                 )
             })?;
         }
-        let runs = StageOrchestrator::launch_plan(runner, &plan, launcher).await;
+        let runs =
+            StageOrchestrator::launch_plan_live(runner, &registry, &plan, launcher).await;
         render_resolved_report(&resolved, &admitted, &plan, runs, blob_store)
     }
 
@@ -577,6 +581,8 @@ impl GovernedProfileService {
     /// expand the resolved stage DAG exactly. A changed fence, layout,
     /// environment, or registry revision refuses here instead of rebinding
     /// silently, so planning and execution share one resolution identity.
+    /// The compiled-against registry travels with the plan so the executable
+    /// path admits new stages against that live registry.
     ///
     /// # Errors
     ///
@@ -586,7 +592,15 @@ impl GovernedProfileService {
     fn resolve_once(
         name: &str,
         bindings: &ProfileResolutionBindings,
-    ) -> Result<(ResolvedProfile, AdmittedProfile, StagePlan), EngineError> {
+    ) -> Result<
+        (
+            ResolvedProfile,
+            AdmittedProfile,
+            StagePlan,
+            InstrumentRegistry,
+        ),
+        EngineError,
+    > {
         let bindings = ProfileResolutionBindings::admitted(
             bindings.layout.clone(),
             bindings.scope.clone(),
@@ -619,7 +633,7 @@ impl GovernedProfileService {
                 &format!("resolved profile '{name}' did not plan: {reason}"),
             )
         })?;
-        Ok((resolved, admitted, plan))
+        Ok((resolved, admitted, plan, registry))
     }
 
     /// Refuses a non-successful governed aggregate as an error.
