@@ -501,6 +501,12 @@ fn canonical_templates() -> [SurqlTemplate; 20] {
             1024 * 1024,
         ),
         template(
+            NamedSurqlOp::CanonicalSourceOwnerReadbackBySubjectRef,
+            "CanonicalSourceOwnerReadbackBySubjectRefRequest",
+            "CanonicalSourceOwnerReadbackBySubjectRefResponse",
+            1024 * 1024,
+        ),
+        template(
             NamedSurqlOp::LoadCanonicalMemoryAdmissionChildren,
             "LoadCanonicalMemoryAdmissionChildrenRequest",
             "LoadCanonicalMemoryAdmissionChildrenResponse",

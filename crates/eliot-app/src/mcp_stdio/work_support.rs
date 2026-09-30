@@ -736,6 +736,27 @@ async fn load_canonical_terminal_entities(
     })
 }
 
+/// Reads the CandidateDiff and WorktreeLease through the canonical owner,
+/// validates their original write receipts and contents, then revalidates the
+/// exact Git source tree. A legacy CandidateDiff without the source-artifact
+/// binding remains unavailable for current-source joins.
+pub(super) async fn read_candidate_source_owner_record(
+    state: &McpState,
+    project_id: ProjectId,
+    task_id: TaskId,
+    candidate_diff_id: CandidateDiffId,
+) -> Result<eliot_engine::CandidateSourceOwnerReadbackV1> {
+    Ok(eliot_engine::CandidateDiffService
+        .readback_source_owner(
+            &state.store,
+            project_id,
+            task_id,
+            candidate_diff_id,
+            &state.root.join("candidate-diffs"),
+        )
+        .await?)
+}
+
 async fn load_canonical_broker_entities(
     state: &McpState,
     project_id: ProjectId,

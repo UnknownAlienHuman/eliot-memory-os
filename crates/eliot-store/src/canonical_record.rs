@@ -29,7 +29,7 @@ use std::marker::PhantomData;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use eliot_types::{
-    MemoryRevision, ProjectId, ProjectSequence, TaskId, WriteReceiptRef,
+    MemoryRevision, ProjectId, ProjectSequence, TaskId, WriteReceipt, WriteReceiptRef,
     strict_json_has_no_duplicate_members,
 };
 use serde::de::{DeserializeOwned, Error as DeError, MapAccess, SeqAccess, Visitor};
@@ -47,6 +47,35 @@ pub struct CanonicalRecord<T> {
     pub canonical_receipt: WriteReceiptRef,
     pub memory_revision: Option<MemoryRevision>,
     pub project_sequence: Option<ProjectSequence>,
+}
+
+/// Owner-validated readback of one canonical projection and its original
+/// committed write receipt. This value is deliberately non-deserializable;
+/// callers must obtain it through `CanonicalStore` so serialized projections
+/// cannot stand in for receipt validation.
+#[derive(Clone, Debug)]
+pub struct CanonicalRecordReadback<T> {
+    record: CanonicalRecord<T>,
+    receipt: WriteReceipt,
+}
+
+impl<T> CanonicalRecordReadback<T> {
+    pub(crate) fn from_owner_readback(record: CanonicalRecord<T>, receipt: WriteReceipt) -> Self {
+        Self { record, receipt }
+    }
+
+    /// Returns the canonical projection validated against its original write.
+    #[must_use]
+    pub fn record(&self) -> &CanonicalRecord<T> {
+        &self.record
+    }
+
+    /// Returns the original committed receipt read back from the canonical
+    /// owner and matched to the projection.
+    #[must_use]
+    pub fn receipt(&self) -> &WriteReceipt {
+        &self.receipt
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for CanonicalRecord<T> {

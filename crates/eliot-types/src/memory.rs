@@ -9,7 +9,7 @@ use crate::skill::{ProceduralSkillPacketView, SkillActivationRecord};
 use crate::ul::artifact::UlArtifact;
 use crate::{
     ActionLeaseId, ActionRequestId, AgentId, AgentRunId, AgentSessionId, BlackboardItemId,
-    CandidateDiffId, ClaimId, EvidenceId, MailboxMessageId, MemoryRevision, OperationId,
+    ArtifactId, CandidateDiffId, ClaimId, EvidenceId, MailboxMessageId, MemoryRevision, OperationId,
     PatchRequestId, PatchRunId, ProjectId, ProjectSequence, ReceiptId, SessionId, SkillId, TaskId,
     VerificationId, VerifierRunId, WorkItemId, WorkLeaseId, WorktreeLeaseId,
     WorktreeLeaseRequestId, WriteId,
@@ -3276,28 +3276,67 @@ pub const CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub struct CandidateSourceSnapshotV1 {
     /// Source snapshot schema revision.
     pub schema_version: u16,
+    /// Artifact handle derived by the Git source owner from this immutable
+    /// tree object's algorithm and object ID.
+    pub artifact_id: ArtifactId,
     /// Git tree object id from the exact `git write-tree` invocation.
     pub tree_oid: String,
 }
 
 impl CandidateSourceSnapshotV1 {
+    /// Derives the stable artifact handle used to join an immutable Git tree
+    /// object to an Instrument invocation's admitted input artifacts.
+    #[must_use]
+    pub fn artifact_id_for_tree_oid(tree_oid: &str) -> Option<ArtifactId> {
+        let algorithm = match tree_oid.len() {
+            40 => "sha1",
+            64 => "sha256",
+            _ => return None,
+        };
+        if !tree_oid
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return None;
+        }
+        ArtifactId::new(format!("git-tree-{algorithm}:{tree_oid}")).ok()
+    }
+
+    /// Returns the canonical source-closure digest bound to this exact Git
+    /// tree artifact, or `None` when the schema or object identity is invalid.
+    #[must_use]
+    pub fn source_closure_digest(&self) -> Option<String> {
+        if !self.is_well_formed() {
+            return None;
+        }
+        #[derive(Serialize)]
+        struct SourceClosureV1<'a> {
+            schema_version: u16,
+            artifact_id: &'a ArtifactId,
+            tree_oid: &'a str,
+        }
+        let bytes = eliot_contracts::canonical_json_bytes(&SourceClosureV1 {
+            schema_version: CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+            artifact_id: &self.artifact_id,
+            tree_oid: &self.tree_oid,
+        })
+        .ok()?;
+        Some(eliot_contracts::sha256_hex(&bytes))
+    }
+
     /// Returns whether this versioned tree identity has a supported schema and
     /// canonical Git object id shape.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         self.schema_version == CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION
-            && matches!(self.tree_oid.len(), 40 | 64)
-            && self
-                .tree_oid
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            && Self::artifact_id_for_tree_oid(&self.tree_oid).as_ref() == Some(&self.artifact_id)
     }
 }
 
 impl CandidateDiff {
     /// Returns the recorded tree OID only for the supported owner snapshot
     /// revision. An absent legacy field or unsupported/malformed revision is
-    /// unknown and must not be reconstructed from other CandidateDiff fields.
+    /// unknown and must not be reconstructed from other `CandidateDiff` fields.
     /// This accessor does not validate the canonical write receipt or join an
     /// immutable source artifact; those checks belong to the record reader.
     #[must_use]
@@ -3306,6 +3345,17 @@ impl CandidateDiff {
             .as_ref()
             .filter(|snapshot| snapshot.is_well_formed())
             .map(|snapshot| snapshot.tree_oid.as_str())
+    }
+
+    /// Returns the Git source owner's versioned immutable tree artifact
+    /// handle. Missing historical fields and unsupported snapshots stay
+    /// unknown.
+    #[must_use]
+    pub fn recorded_source_artifact_id(&self) -> Option<&ArtifactId> {
+        self.source_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.is_well_formed())
+            .map(|snapshot| &snapshot.artifact_id)
     }
 }
 

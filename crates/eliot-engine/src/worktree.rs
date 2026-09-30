@@ -2,6 +2,10 @@ use crate::{
     EngineError, WriteAdmissionService, WriterHandle, path_in_scope, work::WorkState,
     work_lease_is_active,
 };
+use eliot_build_test_graph::{BuildFingerprint, CandidateIdentity, GovernedWorkEnvelope};
+use eliot_contracts::ArtifactId;
+use eliot_instrument_api::InstrumentInvocation;
+use eliot_store::{CanonicalRecordReadback, CanonicalStore};
 use eliot_types::{
     ActionLease, AgentId, AgentSessionId, CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION, CandidateDiff,
     CandidateDiffId, CandidateDiffStatus, CandidateReview, CandidateReviewDecision,
@@ -55,6 +59,113 @@ pub struct CandidateReviewInput {
     pub reviewer_session_id: AgentSessionId,
     pub decision: CandidateReviewDecision,
     pub reasons: Vec<String>,
+}
+
+/// Owner-issued source binding for one canonical `CandidateDiff` and its live
+/// Git tree. The private fields prevent callers from rebuilding authority
+/// from a serialized projection or digest.
+#[derive(Debug)]
+pub struct CandidateSourceOwnerReadbackV1 {
+    candidate_diff: CanonicalRecordReadback<CandidateDiff>,
+    worktree_lease: CanonicalRecordReadback<WorktreeLease>,
+    revalidated_snapshot: CandidateSourceSnapshotV1,
+}
+
+impl CandidateSourceOwnerReadbackV1 {
+    /// Canonical `CandidateDiff` body and original committed write receipt.
+    #[must_use]
+    pub fn candidate_diff(&self) -> &CanonicalRecordReadback<CandidateDiff> {
+        &self.candidate_diff
+    }
+
+    /// Canonical `WorktreeLease` body and original committed write receipt.
+    #[must_use]
+    pub fn worktree_lease(&self) -> &CanonicalRecordReadback<WorktreeLease> {
+        &self.worktree_lease
+    }
+
+    /// Live Git tree identity remeasured by the Git source owner.
+    #[must_use]
+    pub fn revalidated_snapshot(&self) -> &CandidateSourceSnapshotV1 {
+        &self.revalidated_snapshot
+    }
+
+    /// Joins this canonical/Git source owner readback to the exact input
+    /// artifact and source closure of an admitted `Instrument` work envelope.
+    pub fn join_admitted_invocation(
+        self,
+        envelope: &GovernedWorkEnvelope,
+        invocation: &InstrumentInvocation,
+    ) -> Result<CandidateSourceArtifactJoinV1, EngineError> {
+        let candidate_identity = envelope
+            .admit()
+            .map_err(|error| rejected(error.to_string()))?;
+        invocation
+            .validate()
+            .map_err(|error| rejected(error.to_string()))?;
+        let diff = &self.candidate_diff.record().receipt_body;
+        let fingerprint = &envelope.fingerprint;
+        let source_artifact = &self.revalidated_snapshot.artifact_id;
+        let source_closure = self
+            .revalidated_snapshot
+            .source_closure_digest()
+            .ok_or_else(|| rejected("candidate_source_closure_invalid"))?;
+        if diff.work_item_id.to_string() != envelope.work_item_id
+            || candidate_identity.build_fingerprint != fingerprint.digest().map_err(|e| rejected(e.to_string()))?
+            || fingerprint.source_closure_digest != source_closure
+            || invocation.input_artifacts.iter().filter(|id| *id == source_artifact).count() != 1
+        {
+            return Err(rejected("instrument_candidate_source_artifact_join_mismatch"));
+        }
+        Ok(CandidateSourceArtifactJoinV1 {
+            owner: self,
+            instrument_invocation: invocation.clone(),
+            build_fingerprint: fingerprint.clone(),
+            candidate_identity,
+        })
+    }
+}
+
+/// Exact join of source-owner readback, admitted `Instrument` inputs, and the
+/// validated build fingerprint. This is an in-process value only.
+#[derive(Debug)]
+pub struct CandidateSourceArtifactJoinV1 {
+    owner: CandidateSourceOwnerReadbackV1,
+    instrument_invocation: InstrumentInvocation,
+    build_fingerprint: BuildFingerprint,
+    candidate_identity: CandidateIdentity,
+}
+
+impl CandidateSourceArtifactJoinV1 {
+    /// Returns the canonical/source-owner evidence used by this join.
+    #[must_use]
+    pub fn owner(&self) -> &CandidateSourceOwnerReadbackV1 {
+        &self.owner
+    }
+
+    /// The exact admitted `Instrument` invocation bound to the source artifact.
+    #[must_use]
+    pub fn instrument_invocation(&self) -> &InstrumentInvocation {
+        &self.instrument_invocation
+    }
+
+    /// The validated build fingerprint whose source closure names the tree.
+    #[must_use]
+    pub fn build_fingerprint(&self) -> &BuildFingerprint {
+        &self.build_fingerprint
+    }
+
+    /// Candidate identity issued by the admitted governed work envelope.
+    #[must_use]
+    pub fn candidate_identity(&self) -> &CandidateIdentity {
+        &self.candidate_identity
+    }
+
+    /// Returns the exact immutable Git tree `ArtifactId` joined to the invocation.
+    #[must_use]
+    pub fn artifact_id(&self) -> &ArtifactId {
+        &self.owner.revalidated_snapshot.artifact_id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -281,6 +392,80 @@ impl WorktreeLeaseService {
 }
 
 impl CandidateDiffService {
+    /// Reads canonical `CandidateDiff`/`WorktreeLease` records through their
+    /// original committed `WriteReceipt`s, then remeasures the same live Git
+    /// source tree before issuing an in-process owner value.
+    pub async fn readback_source_owner(
+        &self,
+        store: &CanonicalStore,
+        project_id: eliot_types::ProjectId,
+        task_id: eliot_types::TaskId,
+        candidate_diff_id: CandidateDiffId,
+        diff_root: &Path,
+    ) -> Result<CandidateSourceOwnerReadbackV1, EngineError> {
+        let candidate_diff = store
+            .canonical_record_readback_by_subject_ref::<CandidateDiff>(
+                project_id,
+                Some(task_id),
+                &["candidate_diff"],
+                &candidate_diff_id.to_string(),
+            )
+            .await?
+            .ok_or_else(|| rejected("candidate_diff_source_owner_readback_absent"))?;
+        let worktree_lease_id = candidate_diff.record().receipt_body.worktree_lease_id;
+        let worktree_lease = store
+            .canonical_record_readback_by_subject_ref::<WorktreeLease>(
+                project_id,
+                Some(task_id),
+                &["worktree_lease"],
+                &worktree_lease_id.to_string(),
+            )
+            .await?
+            .ok_or_else(|| rejected("worktree_lease_source_owner_readback_absent"))?;
+        let diff = &candidate_diff.record().receipt_body;
+        let lease = &worktree_lease.record().receipt_body;
+        let recorded_snapshot = diff
+            .source_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.is_well_formed())
+            .ok_or_else(|| rejected("candidate_diff_source_snapshot_unknown"))?;
+        if candidate_diff.record().receipt_kind != "candidate_diff"
+            || candidate_diff.record().subject_ref != candidate_diff_id.to_string()
+            || diff.candidate_diff_id != candidate_diff_id
+            || diff.project_id != project_id
+            || diff.task_id != task_id
+            || diff.worktree_lease_id != lease.worktree_lease_id
+            || diff.work_item_id != lease.work_item_id
+            || diff.base_commit != lease.base_commit
+            || diff.worktree_head.is_none()
+            || worktree_lease.record().receipt_kind != "worktree_lease"
+            || worktree_lease.record().subject_ref != worktree_lease_id.to_string()
+            || lease.project_id != project_id
+            || lease.task_id != task_id
+        {
+            return Err(rejected("candidate_source_owner_identity_mismatch"));
+        }
+        let head = git_stdout(
+            &canonical_existing_path(&lease.worktree_path)?,
+            &["rev-parse", "HEAD"],
+        )
+        .await?;
+        if diff.worktree_head.as_deref() != Some(head.as_str()) {
+            return Err(rejected("candidate_source_head_moved"));
+        }
+        let revalidated_snapshot = self
+            .revalidate_source_snapshot(lease, diff_root)
+            .await?;
+        if &revalidated_snapshot != recorded_snapshot {
+            return Err(rejected("candidate_source_tree_moved"));
+        }
+        Ok(CandidateSourceOwnerReadbackV1 {
+            candidate_diff,
+            worktree_lease,
+            revalidated_snapshot,
+        })
+    }
+
     pub async fn capture(
         &self,
         state: &mut WorkState,
@@ -362,6 +547,8 @@ impl CandidateDiffService {
             worktree_head: Some(snapshot.worktree_head),
             source_snapshot: Some(CandidateSourceSnapshotV1 {
                 schema_version: CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+                artifact_id: CandidateSourceSnapshotV1::artifact_id_for_tree_oid(&source_tree_oid)
+                    .ok_or_else(|| rejected("candidate_snapshot_tree_oid_invalid"))?,
                 tree_oid: source_tree_oid,
             }),
             diff_hash: blake3::hash(diff_text.as_bytes()).to_hex().to_string(),
@@ -378,6 +565,40 @@ impl CandidateDiffService {
         };
         state.candidate_diffs.push(diff.clone());
         Ok(diff)
+    }
+
+    /// Re-observes a live worktree through its isolated temporary Git index
+    /// and returns the exact immutable source-tree artifact identity. This is
+    /// source-owner revalidation for an existing CandidateDiff; it does not
+    /// replace or rewrite that historical record.
+    pub async fn revalidate_source_snapshot(
+        &self,
+        lease: &WorktreeLease,
+        diff_root: &Path,
+    ) -> Result<CandidateSourceSnapshotV1, EngineError> {
+        if !matches!(lease.state, WorktreeLeaseState::Active | WorktreeLeaseState::Captured)
+            || lease.expires_at < OffsetDateTime::now_utc()
+        {
+            return Err(rejected("worktree_lease_not_active"));
+        }
+        let worktree_path = canonical_existing_path(&lease.worktree_path)?;
+        let diff_root = prepare_diff_root(diff_root)?;
+        let candidate_diff_id = CandidateDiffId::new_v7();
+        let head = git_stdout(&worktree_path, &["rev-parse", "HEAD"]).await?;
+        let tree_oid = snapshot_candidate_tree(
+            &worktree_path,
+            &diff_root,
+            candidate_diff_id,
+            &head,
+        )
+        .await?;
+        let artifact_id = CandidateSourceSnapshotV1::artifact_id_for_tree_oid(&tree_oid)
+            .ok_or_else(|| rejected("candidate_snapshot_tree_oid_invalid"))?;
+        Ok(CandidateSourceSnapshotV1 {
+            schema_version: CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+            artifact_id,
+            tree_oid,
+        })
     }
 
     pub fn default_max_diff_bytes() -> usize {

@@ -82,6 +82,7 @@ pub enum NamedSurqlOp {
     CurationRecordPage,
     CanonicalRecordByWriteId,
     CanonicalRecordsBySubjectRef,
+    CanonicalSourceOwnerReadbackBySubjectRef,
     LoadCanonicalMemoryAdmissionChildren,
     LoadCanonicalMemoryL2,
     LoadCanonicalMemoryProjectionSegments,
@@ -171,6 +172,7 @@ impl NamedSurqlOp {
             | Self::CurationRecordPage
             | Self::CanonicalRecordByWriteId
             | Self::CanonicalRecordsBySubjectRef
+            | Self::CanonicalSourceOwnerReadbackBySubjectRef
             | Self::LoadCanonicalMemoryAdmissionChildren
             | Self::LoadCanonicalMemoryL2
             | Self::LoadCanonicalMemoryProjectionSegments
@@ -262,6 +264,9 @@ impl NamedSurqlOp {
             Self::CurationRecordPage => "curation_record_page",
             Self::CanonicalRecordByWriteId => "canonical_record_by_write_id",
             Self::CanonicalRecordsBySubjectRef => "canonical_records_by_subject_ref",
+            Self::CanonicalSourceOwnerReadbackBySubjectRef => {
+                "canonical_source_owner_readback_by_subject_ref"
+            }
             Self::LoadCanonicalMemoryAdmissionChildren => {
                 "load_canonical_memory_admission_children"
             }
@@ -426,6 +431,9 @@ impl NamedSurqlOp {
             }
             Self::CanonicalRecordsBySubjectRef => {
                 include_str!("canonical_records_by_subject_ref.surql")
+            }
+            Self::CanonicalSourceOwnerReadbackBySubjectRef => {
+                include_str!("canonical_source_owner_readback_by_subject_ref.surql")
             }
             Self::LoadCanonicalMemoryAdmissionChildren => {
                 include_str!("load_canonical_memory_admission_children.surql")

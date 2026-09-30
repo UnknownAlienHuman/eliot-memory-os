@@ -2,6 +2,7 @@ use crate::blob_store::verify_canonical_memory_child_set;
 use crate::surreal_server::SurrealServerSupervisor;
 use crate::{
     BlobStore, CanonicalAutonomyRunView, CanonicalLifecycleView, CanonicalRecord,
+    CanonicalRecordReadback,
     CanonicalSleepView, DbClientSet, MAX_CANONICAL_RECORDS, NamedSurqlOp, SleepCandidatesResponse,
     StoreError, SurqlTemplateRegistry,
 };
@@ -3510,6 +3511,166 @@ impl CanonicalStore {
             )
             .await?;
         decode_value(NamedSurqlOp::CanonicalRecordsBySubjectRef, value)
+    }
+
+    /// Reads the latest canonical projection for an exact subject and matches
+    /// it to the original committed WriteReceipt before issuing a
+    /// non-deserializable readback value.
+    pub async fn canonical_record_readback_by_subject_ref<T>(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        receipt_kinds: &[&str],
+        subject_ref: &str,
+    ) -> Result<Option<CanonicalRecordReadback<T>>, StoreError>
+    where
+        T: DeserializeOwned + serde::Serialize,
+    {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::CanonicalSourceOwnerReadbackBySubjectRef,
+                json!({
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "receipt_kinds": receipt_kinds,
+                    "subject_ref_fragments": string_fragments(subject_ref),
+                    "limit": 2,
+                }),
+            )
+            .await?;
+        let mut rows: Vec<Value> = decode_value(
+            NamedSurqlOp::CanonicalSourceOwnerReadbackBySubjectRef,
+            value,
+        )?;
+        let Some(latest_row) = rows.first() else {
+            return Ok(None);
+        };
+        let latest_revision = latest_row.get("memory_revision").cloned();
+        let latest_sequence = latest_row.get("project_sequence").cloned();
+        if rows.get(1).is_some_and(|previous| {
+            previous.get("memory_revision") == latest_revision.as_ref()
+                && previous.get("project_sequence") == latest_sequence.as_ref()
+        }) {
+            return Err(StoreError::Decode(
+                "canonical subject readback is ambiguous at one revision".to_owned(),
+            ));
+        }
+        let mut row = rows.remove(0);
+        let Some(object) = row.as_object_mut() else {
+            return Err(StoreError::Decode(
+                "canonical subject readback row is not an object".to_owned(),
+            ));
+        };
+        let Some(stored_write_id) = object
+            .get("write_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Err(StoreError::Decode(
+                "canonical source-owner row has no write_id".to_owned(),
+            ));
+        };
+        let Some(stored_input_hash) = object
+            .get("input_hash")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Err(StoreError::Decode(
+                "canonical source-owner row has no input_hash".to_owned(),
+            ));
+        };
+        let Some(stored_body_b64) = object
+            .get("receipt_body_json_b64")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Err(StoreError::Decode(
+                "canonical source-owner row has no original body bytes".to_owned(),
+            ));
+        };
+        object.remove("write_id");
+        object.remove("input_hash");
+        let record: CanonicalRecord<T> = serde_json::from_value(row)
+            .map_err(|error| StoreError::Decode(error.to_string()))?;
+        if record.canonical_receipt.write_id.to_string() != stored_write_id {
+            return Err(StoreError::Decode(
+                "canonical subject write_id differs from its stored receipt reference".to_owned(),
+            ));
+        }
+        if record.project_id != project_id
+            || record.task_id != task_id
+            || !receipt_kinds.contains(&record.receipt_kind.as_str())
+            || record.subject_ref != subject_ref
+        {
+            return Err(StoreError::Decode(
+                "canonical subject readback does not match its requested scope".to_owned(),
+            ));
+        }
+        let receipt = self
+            .write_receipt_by_id(&record.canonical_receipt.write_id)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Decode("canonical subject WriteReceipt is absent".to_owned())
+            })?;
+        if receipt.write_id != record.canonical_receipt.write_id
+            || receipt.receipt_id != record.canonical_receipt.receipt_id
+            || receipt.input_hash != stored_input_hash
+            || receipt.project_id != project_id
+            || receipt.task_id != task_id
+            || receipt.command_kind != eliot_types::SemanticCommandKind::ToolObservationRecord
+            || !matches!(
+                receipt.status,
+                WriteStatus::Committed | WriteStatus::IdempotentReplay
+            )
+            || receipt.rejected_reason.is_some()
+            || receipt.memory_revision != record.memory_revision
+            || receipt.project_sequence != record.project_sequence
+            || !receipt.created_records.iter().any(|created| {
+                created == &format!("canonical_record:{}", record.record_id)
+            })
+        {
+            return Err(StoreError::Decode(
+                "canonical subject WriteReceipt does not validate the readback".to_owned(),
+            ));
+        }
+        let original_observations = self
+            .tool_observations_by_write_id(&record.canonical_receipt.write_id)
+            .await?;
+        let original_body = serde_json::to_value(&record.receipt_body)
+            .map_err(|error| StoreError::Decode(error.to_string()))?;
+        let original_body_bytes = serde_json::to_vec(&original_body)
+            .map_err(|error| StoreError::Decode(error.to_string()))?;
+        if STANDARD_NO_PAD.encode(original_body_bytes) != stored_body_b64 {
+            return Err(StoreError::Decode(
+                "canonical source-owner bytes differ from the original typed content".to_owned(),
+            ));
+        }
+        let matching_observations = original_observations
+            .iter()
+            .filter(|observation| {
+                observation.project_id == project_id
+                    && observation.task_id == task_id
+                    && observation.write_id == receipt.write_id
+                    && receipt.memory_revision == Some(observation.memory_revision)
+                    && receipt.project_sequence == Some(observation.project_sequence)
+                    && receipt
+                        .created_records
+                        .iter()
+                        .any(|created| created == &observation.observation_id)
+                    && observation.payload.get("receipt_kind").and_then(Value::as_str)
+                        == Some(record.receipt_kind.as_str())
+                    && observation.payload.get("receipt_body") == Some(&original_body)
+            })
+            .count();
+        if matching_observations != 1 {
+            return Err(StoreError::Decode(
+                "canonical subject content does not match its original write observation"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(CanonicalRecordReadback::from_owner_readback(
+            record, receipt,
+        )))
     }
 
     pub async fn ul_artifact_by_id<T>(

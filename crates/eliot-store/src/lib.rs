@@ -9,6 +9,7 @@ mod canonical_observation_models;
 pub mod canonical_projection;
 mod canonical_projection_views;
 mod canonical_record;
+pub use canonical_record::CanonicalRecordReadback;
 pub mod canonical_store;
 mod control_reserve;
 pub mod control_wal;

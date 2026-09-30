@@ -404,6 +404,21 @@ pub(super) async fn dispatch_worktree_capture_diff(
     write_canonical_work_lease(state, context, &mut work_lease, &work_lease_key).await?;
     work_state.leases[work_lease_index] = work_lease;
     replace_worktree_lease(&mut work_state, lease);
+    let source_owner = read_candidate_source_owner_record(
+        state,
+        diff.project_id,
+        diff.task_id,
+        diff.candidate_diff_id,
+    )
+    .await?;
+    let canonical_diff = &source_owner.candidate_diff().record().receipt_body;
+    if canonical_diff.source_snapshot != diff.source_snapshot
+        || source_owner.revalidated_snapshot() != diff.source_snapshot.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("captured candidate source snapshot is unavailable")
+        })?
+    {
+        anyhow::bail!("candidate source owner readback differs from captured source tree");
+    }
     save_worktree_state_and_reports(&state.root, &work_state)?;
     let operation_status = if diff.capture_status == CandidateDiffStatus::Captured {
         OperationStatus::OperationCompleted
@@ -426,6 +441,29 @@ pub(super) async fn dispatch_worktree_review(
     let mut work_state = load_work_state(&state.root)?;
     let candidate_diff_id =
         CandidateDiffId::from_str(&input.candidate_diff).context("parse candidate diff id")?;
+    let local_diff = work_state
+        .candidate_diffs
+        .iter()
+        .find(|diff| diff.candidate_diff_id == candidate_diff_id)
+        .context("candidate diff not found")?;
+    let source_owner = read_candidate_source_owner_record(
+        state,
+        local_diff.project_id,
+        local_diff.task_id,
+        candidate_diff_id,
+    )
+    .await?;
+    let source_diff = &source_owner.candidate_diff().record().receipt_body;
+    if source_diff.project_id != local_diff.project_id
+        || source_diff.task_id != local_diff.task_id
+        || source_diff.worktree_lease_id != local_diff.worktree_lease_id
+        || source_diff.work_item_id != local_diff.work_item_id
+        || source_diff.base_commit != local_diff.base_commit
+        || source_diff.worktree_head != local_diff.worktree_head
+        || source_diff.source_snapshot != local_diff.source_snapshot
+    {
+        anyhow::bail!("local candidate diff differs from canonical source owner readback");
+    }
     let reviewer_session_id =
         require_current_candidate_reviewer(state, context, &work_state, candidate_diff_id).await?;
     let decision = parse_candidate_review_decision(&input.decision)?;

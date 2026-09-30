@@ -281,6 +281,7 @@ pub use work::{
 };
 pub use worktree::{
     CandidateCompletionContext, CandidateDiffCaptureInput, CandidateDiffService,
+    CandidateSourceArtifactJoinV1, CandidateSourceOwnerReadbackV1,
     CandidatePatchRequestInput, CandidateReviewInput, CandidateReviewService, WorktreeAdoptInput,
     WorktreeCleanupService, WorktreeCreateInput, WorktreeLeaseService, WorktreeMemoryWriter,
 };
