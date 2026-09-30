@@ -1435,6 +1435,187 @@ impl Problem {
     }
 }
 
+/// The I13.11 Diagnostic Brief: a problem model, not a raw log dump.
+///
+/// The compiler combines exactly the ten I13.11 inputs, each named below with
+/// its document number: symptom/severity (1), affected module/scope/tasks (2),
+/// timeline and correlation (3), exact evidence/log handles (4), recent
+/// config/module changes (5), graph dependencies (6), prior failures/repairs
+/// (7), current hypotheses and unknowns (8), next discriminative probe (9),
+/// and allowed repairs/escalation (10). `problem_id` and `source_revision`
+/// are the record coordinates the brief was compiled from, not further
+/// inputs: they are what let a Controller/operator read resolve the brief to
+/// the same canonical Problem after restart.
+///
+/// Evidence is always the record's own retained [`ArtifactId`] handles, never
+/// caller-supplied text: [`Self::compile`] takes only `&Problem`, so a brief
+/// cannot smuggle in a log dump or a model summary as verified explanation.
+/// An unknown is an explicit [`None`], never a silently empty vector that
+/// reads as "none": `hypotheses` is [`None`] when the record holds no
+/// hypothesis and `recent_config_changes` is [`None`] because the record
+/// retains no config-change history at all, while `Some` always means the
+/// input is known (possibly known-empty).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticBrief {
+    /// The canonical Problem this brief was compiled from.
+    pub problem_id: ProblemId,
+    /// The record revision the brief was compiled from.
+    pub source_revision: u64,
+    /// I13.11 (1): what is wrong, in the record's own words.
+    pub symptom: String,
+    /// I13.11 (1): how serious the admitting Signal said it is.
+    pub severity: SignalSeverity,
+    /// I13.11 (2): the affected module/scope/tasks.
+    pub scope_id: String,
+    /// I13.11 (3): the ordered source-Signal refs behind this Problem.
+    ///
+    /// Admission order is the timeline the record retains: the refs are the
+    /// correlation, and the record carries no clock of its own.
+    pub timeline: Vec<SignalId>,
+    /// I13.11 (4): the exact evidence/log handles the record observed.
+    pub evidence: Vec<ArtifactId>,
+    /// I13.11 (5): recent config/module changes, or explicit unknown.
+    ///
+    /// The record retains no config-change history, so compilation always
+    /// yields [`None`]: unknown, not "no changes". `Some` would mean a known
+    /// set, possibly a known-empty one.
+    pub recent_config_changes: Option<Vec<ArtifactId>>,
+    /// I13.11 (6): the exact graph dependencies hit.
+    pub affected_dependencies: Vec<String>,
+    /// I13.11 (7): one retained entry per committed repair.
+    pub repair_history: Vec<RepairRecord>,
+    /// I13.11 (7): one retained entry per evidenced reopen.
+    pub reopen_history: Vec<ReopenRecord>,
+    /// I13.11 (8): candidate explanations, or an explicit unknown.
+    ///
+    /// [`None`] means the record holds no hypothesis and the cause is
+    /// unknown; it is distinct from `Some(vec![])`, which would mean the
+    /// unknown was positively ruled out. A guess is never counted as an
+    /// observation either way.
+    pub hypotheses: Option<Vec<ProblemHypothesis>>,
+    /// I13.11 (9): the next discriminative action.
+    pub next_probe: String,
+    /// I13.11 (10): what the record itself says would close it.
+    pub resolution_condition: String,
+    /// I13.11 (10): the independently expected observables a repair must cover.
+    pub expected_resolution: Vec<ArtifactId>,
+    /// I13.11 (10): the I13.8 default-owner route accountable for escalation.
+    ///
+    /// Derived from the record's own class, never chosen by the compiler
+    /// caller, so the escalation half of this input names a role rather than
+    /// a hardcoded name.
+    pub escalation_route: OwnerRoute,
+}
+
+impl DiagnosticBrief {
+    /// Validates brief shape, retained-handle identity and explicit unknowns.
+    ///
+    /// Mirrors the [`Problem`] admission it was compiled from: text inputs
+    /// are non-blank, retained-handle sets are nonempty and duplicate-free,
+    /// and each retained history entry is re-validated. The two explicit
+    /// unknowns need no content check when [`None`]; a `Some` set is held to
+    /// the same duplicate-free rule as every other retained-handle set.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        text(&self.symptom, "brief.symptom")?;
+        text(&self.scope_id, "brief.scope_id")?;
+        text(&self.next_probe, "brief.next_probe")?;
+        text(&self.resolution_condition, "brief.resolution_condition")?;
+        if self.source_revision == 0 {
+            return Err(ProblemError::InvalidField {
+                field: "brief.source_revision",
+                reason: "must be non-zero",
+            });
+        }
+        nonempty(&self.timeline, "brief.timeline")?;
+        nonempty(&self.evidence, "brief.evidence")?;
+        nonempty(&self.affected_dependencies, "brief.affected_dependencies")?;
+        nonempty(&self.expected_resolution, "brief.expected_resolution")?;
+        let timeline = self
+            .timeline
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&timeline, "brief.timeline")?;
+        unique_text(&self.affected_dependencies, "brief.affected_dependencies")?;
+        let evidence = self
+            .evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&evidence, "brief.evidence")?;
+        let expected = self
+            .expected_resolution
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&expected, "brief.expected_resolution")?;
+        for repair in &self.repair_history {
+            repair.validate()?;
+        }
+        for reopen in &self.reopen_history {
+            reopen.validate()?;
+        }
+        if let Some(hypotheses) = &self.hypotheses {
+            for hypothesis in hypotheses {
+                hypothesis.validate()?;
+            }
+        }
+        if let Some(changes) = &self.recent_config_changes {
+            let changes = changes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            unique_text(&changes, "brief.recent_config_changes")?;
+        }
+        Ok(())
+    }
+
+    /// Compiles the brief from the record's own retained state.
+    ///
+    /// The only input is `&Problem`, so every handle in the brief is one the
+    /// record already retained: symptom, severity, scope, source-Signal refs,
+    /// observed evidence, dependencies, repair/reopen history, hypotheses,
+    /// next probe, resolution condition, expected closure set and the
+    /// class-derived escalation route. Inputs the record does not retain are
+    /// stated unknowns rather than invented: an empty hypothesis list becomes
+    /// [`None`], and `recent_config_changes` is always [`None`] because no
+    /// config-change history exists on the record to copy.
+    ///
+    /// Serving this model over the bounded read/Context path is a separate
+    /// composition step owned by the read-path holder: no production
+    /// read/projection site of a canonical `Problem` exists yet (the Governor
+    /// preparation path takes `&Problem` only to prepare mutations, and the
+    /// `GetAttentionAndProblems` named read plus the ControlBoard surface live
+    /// outside this crate), so this entry compiles the model and leaves the
+    /// serving composition to that holder.
+    pub fn compile(problem: &Problem) -> Result<Self, ProblemError> {
+        problem.validate()?;
+        Ok(Self {
+            problem_id: problem.problem_id.clone(),
+            source_revision: problem.revision,
+            symptom: problem.symptom.clone(),
+            severity: problem.severity,
+            scope_id: problem.scope_id.clone(),
+            timeline: problem.signal_refs.clone(),
+            evidence: problem.observed_evidence.clone(),
+            recent_config_changes: None,
+            affected_dependencies: problem.affected_dependencies.clone(),
+            repair_history: problem.repair_history.clone(),
+            reopen_history: problem.reopen_history.clone(),
+            hypotheses: if problem.hypotheses.is_empty() {
+                None
+            } else {
+                Some(problem.hypotheses.clone())
+            },
+            next_probe: problem.next_probe.clone(),
+            resolution_condition: problem.resolution_condition.clone(),
+            expected_resolution: problem.expected_resolution.clone(),
+            escalation_route: problem.default_owner_route(),
+        })
+    }
+}
+
 /// Incident lifecycle for integrity, authority, security or dangerous effects.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
