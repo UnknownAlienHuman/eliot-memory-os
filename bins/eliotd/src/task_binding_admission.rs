@@ -47,7 +47,7 @@
 //!   writes; that rule belongs to
 //!   `eliot-store-surreal::task_binding_gate`, which re-derives it from the
 //!   opaque proof handles before provider I/O. Neither replaces the other.
-//! - [`admit_task_controller_prepared_transition`] — the live Task Controller
+//! - [`admit_prepared_transition_with_owner_selection`] — the live task-bound
 //!   prepared-transition edge. It receives the issuer's exact
 //!   `TaskSelectionAdmissionBinding`, independently observed Host scope
 //!   resources, and the current live fence. Task-free capture retains the cold
@@ -2350,7 +2350,7 @@ fn compatibility_for(
 ///
 /// This is the composition-root named-mutation intake for canonical envelopes.
 /// Prepared transitions use
-/// [`admit_task_controller_prepared_transition`]. The write is split by
+/// [`admit_prepared_transition_with_owner_selection`]. The write is split by
 /// what it actually is:
 ///
 /// - a capture naming no task — the capture-first case — goes through
@@ -3011,9 +3011,9 @@ pub fn revalidate_task_bound_for_effect(
 /// the store. It decides the capture leg and reports task-relative work it
 /// cannot admit:
 ///
-/// - a `CaptureObservation` naming no task on either the admitted context or
-///   the transition, and with no task-relative/effectful operation in the
-///   typed catalogue, has no unique task selection, so it is admitted through
+/// - a task-free `CaptureObservation` whose only named operations are
+///   `CaptureObservation` and the optional `AppendAuditEvent`, and which has
+///   no task-relative/effectful operation, is admitted through
 ///   [`admit_capture`] as [`TaskBindingAdmission::ColdUnbound`] with no task
 ///   activation, support/influence promotion, or finish relevance;
 /// - a `CaptureObservation` that names a task is task-relative, and this edge
@@ -3041,7 +3041,7 @@ pub fn revalidate_task_bound_for_effect(
 ///
 /// `DaemonKernelClient::apply_prepared` may use this narrow entry when it owns
 /// only a `PreparedTransition` and `RequestIdentity`. Task-relative prepared
-/// work uses [`admit_task_controller_prepared_transition`] instead, with the
+/// work uses [`admit_prepared_transition_with_owner_selection`] instead, with the
 /// owner-issued selection binding, retained `ScopeBinding`, live observed
 /// scope, and current fence supplied explicitly. This entry never accepts fabricated
 /// evidence or treats an absent selection as compatible; a task-free raw
@@ -3061,6 +3061,7 @@ pub fn admit_named_mutation_capture(
             .iter()
             .any(|named| requirement_for_named_mutation(named.operation) == requirement)
     };
+    let has_capture = carries_requirement(CanonicalOperationRequirement::SafeRawCapture);
     let names_a_task = transition.task_id.is_some() || context.task_id.is_some();
     if names_a_task || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful) {
         // Issue #1746, A6: the bridge transport edge enforces the same binding
@@ -3081,8 +3082,18 @@ pub fn admit_named_mutation_capture(
             "bridge transport edge cannot admit a task-relative effect without owner evidence",
         ));
     }
-    if !carries_requirement(CanonicalOperationRequirement::SafeRawCapture) {
+    if !has_capture {
         return Ok(TaskBindingAdmission::NotTaskRelative);
+    }
+    if transition.named_operations.iter().any(|named| {
+        !matches!(
+            named.operation,
+            NamedMutationOperation::CaptureObservation | NamedMutationOperation::AppendAuditEvent
+        )
+    }) {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-free cold capture may contain only CaptureObservation and AppendAuditEvent",
+        ));
     }
     match admit_capture(
         transition.identity.operation_id.as_str().to_owned(),
@@ -3103,18 +3114,20 @@ pub fn admit_named_mutation_capture(
     }
 }
 
-/// Admits one live Task Controller prepared transition with the original
-/// owner-issued selection, an independently retained WorkScope binding, the
-/// observed Host scope, and the current fence (issue #1929, W3/W4).
+/// Admits one task-bound prepared transition with the original owner-issued
+/// selection, an independently retained WorkScope binding, the observed Host
+/// scope, and the current fence (issue #1929, W2/W3/W4).
 ///
 /// The caller performs [`admit_named_mutation_capture`] first and invokes this
 /// only for its `TaskRelative` result, so cold unbound capture remains
-/// unchanged. The owner binding is returned by the live task-selection issuer;
-/// none of its task, principal, session, revision, digest, scope, or fence
-/// terms are derived from the evidence being checked. Compatibility is
+/// unchanged. Every task-relative effect operation and every task-bearing
+/// `CaptureObservation` must carry the exact owner selection in its immutable
+/// parameters. The owner binding is returned by the live task-selection
+/// issuer; none of its task, principal, session, revision, digest, scope, or
+/// fence terms are derived from the evidence being checked. Compatibility is
 /// admitted only after those independent terms match exactly and the Host
 /// observation passes the WorkScope identity guard.
-pub fn admit_task_controller_prepared_transition(
+pub fn admit_prepared_transition_with_owner_selection(
     context: &RequestMetadata,
     transition: &PreparedTransition,
     request_identity: (&str, &str, &str, &str),
@@ -3124,7 +3137,7 @@ pub fn admit_task_controller_prepared_transition(
 ) -> Result<(), TaskBindingError> {
     let (request_principal_ref, request_session_id, request_task_ref, request_scope_ref) =
         request_identity;
-    let evidence = &owner.evidence;
+    let evidence = owner.evidence();
     evidence.validate().map_err(|error| {
         TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
     })?;
@@ -3137,7 +3150,7 @@ pub fn admit_task_controller_prepared_transition(
     let context_task_ref = context.task_id.as_ref().map(TaskId::as_str);
     let admitted_task_ref = refuse_task_identity_conflict(context_task_ref, Some(request_task_ref))?;
     if transition.task_id.as_deref() != Some(request_task_ref)
-        || owner.task_ref != request_task_ref
+        || owner.task_ref() != request_task_ref
         || evidence.task_ref != request_task_ref
     {
         return Err(TaskBindingError::scope_incompatible(
@@ -3146,7 +3159,7 @@ pub fn admit_task_controller_prepared_transition(
     }
 
     let context_session_ref = context.session_id.as_ref().map(SessionId::as_str);
-    if request_session_id != owner.session_ref
+    if request_session_id != owner.session_ref()
         || context_session_ref != Some(request_session_id)
     {
         return Err(TaskBindingError::scope_incompatible(
@@ -3155,38 +3168,41 @@ pub fn admit_task_controller_prepared_transition(
     }
     if request_principal_ref.trim().is_empty()
         || request_principal_ref.chars().any(char::is_control)
-        || owner.principal_ref != request_principal_ref
+        || owner.principal_ref() != request_principal_ref
     {
         return Err(TaskBindingError::scope_incompatible(
             "task selection owner binding belongs to another authenticated principal",
         ));
     }
 
-    if evidence.task_revision != owner.task_revision
+    if evidence.task_revision != owner.task_revision()
         || evidence.acceptance_digest != owner.acceptance_digest()
-        || evidence.selection_source_ref != owner.selection_source_ref
-        || evidence.evidence_ref != owner.evidence_ref
+        || evidence.selection_source_ref != owner.selection_source_ref()
+        || evidence.evidence_ref != owner.evidence_ref()
     {
         return Err(TaskBindingError::scope_incompatible(
             "task selection differs from the current owner task and evidence binding",
         ));
     }
 
-    let expected_scope = &owner.work_scope;
+    let expected_scope = owner.work_scope();
     expected_scope.validate().map_err(|error| {
         TaskBindingError::scope_incompatible(format!(
             "owner-retained WorkScope binding is invalid: {error}"
         ))
     })?;
 
-    let mut found_task_relative_operation = false;
+    let task_bound_capture = transition.task_id.is_some();
+    let mut found_bound_operation = false;
     for named in &transition.named_operations {
-        if requirement_for_named_mutation(named.operation)
-            != CanonicalOperationRequirement::TaskRelativeEffectful
-        {
+        let task_relative_effect = requirement_for_named_mutation(named.operation)
+            == CanonicalOperationRequirement::TaskRelativeEffectful;
+        let operation_capture_is_task_bound =
+            task_bound_capture && named.operation == NamedMutationOperation::CaptureObservation;
+        if !task_relative_effect && !operation_capture_is_task_bound {
             continue;
         }
-        found_task_relative_operation = true;
+        found_bound_operation = true;
         let required_text = |key: &str| {
             named
                 .parameters
@@ -3206,14 +3222,14 @@ pub fn admit_task_controller_prepared_transition(
                 "task-relative operation selection evidence is invalid: {error}"
             ))
         })?;
-        let owner_task_revision = owner.task_revision.to_string();
+        let owner_task_revision = owner.task_revision().to_string();
         if &operation_evidence != evidence
             || required_text("task_selection_revision")? != owner_task_revision.as_str()
             || required_text("task_selection_acceptance_digest")? != owner.acceptance_digest()
             || required_text("task_selection_scope_ref")?
-                != owner.work_scope.binding.scope.scope_ref.as_str()
-            || required_text("task_selection_source_ref")? != owner.selection_source_ref.as_str()
-            || required_text("task_selection_evidence_ref")? != owner.evidence_ref.as_str()
+                != owner.work_scope().binding.scope.scope_ref.as_str()
+            || required_text("task_selection_source_ref")? != owner.selection_source_ref()
+            || required_text("task_selection_evidence_ref")? != owner.evidence_ref()
         {
             return Err(TaskBindingError::scope_incompatible(
                 "task-relative operation selection payload differs from the original owner evidence",
@@ -3222,32 +3238,32 @@ pub fn admit_task_controller_prepared_transition(
         if !transition
             .required_proof_and_approval_refs
             .iter()
-            .any(|reference| reference == &owner.selection_source_ref)
+            .any(|reference| reference == owner.selection_source_ref())
             || !transition
                 .required_proof_and_approval_refs
                 .iter()
-                .any(|reference| reference == &owner.evidence_ref)
+                .any(|reference| reference == owner.evidence_ref())
         {
             return Err(TaskBindingError::selection_required(
                 "task-relative operation omits the original task selection proof references",
             ));
         }
     }
-    if !found_task_relative_operation {
+    if !found_bound_operation {
         return Err(TaskBindingError::selection_required(
-            "prepared task-relative transition has no typed task-relative operation",
+            "prepared task-relative transition has no typed task-relative or task-bound capture operation",
         ));
     }
 
     if request_scope_ref != transition.scope_id.as_str()
-        || owner.work_scope.binding.scope.scope_ref != request_scope_ref
+        || owner.work_scope().binding.scope.scope_ref != request_scope_ref
         || evidence.work_scope_ref != request_scope_ref
     {
         return Err(TaskBindingError::scope_incompatible(
             "prepared transition, owner selection, and current WorkScope differ",
         ));
     }
-    if !eliot_contracts::fences_match_exact(&owner.state_fence, live_fence)
+    if !eliot_contracts::fences_match_exact(owner.state_fence(), live_fence)
         || !eliot_contracts::fences_match_exact(&expected_scope.state_fence, live_fence)
         || !eliot_contracts::fences_match_exact(&context.state_fence, live_fence)
         || !eliot_contracts::fences_match_exact(&transition.state_fence, live_fence)
