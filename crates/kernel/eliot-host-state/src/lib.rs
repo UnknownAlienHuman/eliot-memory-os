@@ -37,6 +37,8 @@ pub use journal::{
     readonly_project_host_state, record_checksum,
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
+#[cfg(any(test, feature = "test-support"))]
+pub use model::HostStateReadVerificationParts;
 pub use model::{
     ActivationState, AppliedOperation, BackupPreparationRecord, BackupPreparationState,
     CanonicalStoreWriteRefusal, CleanMarker, CutoverIntentRecord, CutoverIntentState,
@@ -53,8 +55,6 @@ pub use model::{
     WakeCancellationBatchEntry, WakeCancellationBatchRecord, WakeDisposition, WakeRecord,
     host_owner_epoch_digest,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use model::HostStateReadVerificationParts;
 pub use reactive_context::{
     DEFAULT_REACTIVE_CONTEXT_MAX_ATTEMPT_ITEMS, DEFAULT_REACTIVE_CONTEXT_MAX_BYTES,
     DEFAULT_REACTIVE_CONTEXT_MAX_ITEMS, DEFAULT_REACTIVE_CONTEXT_MAX_PAGE_ITEMS,

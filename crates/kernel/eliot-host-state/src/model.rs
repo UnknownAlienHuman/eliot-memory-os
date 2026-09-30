@@ -3195,9 +3195,7 @@ impl HostState {
     /// [`crate::HostStateJournal::snapshot`]: HostStateJournal::snapshot
     /// [`crate::readonly_project_host_state`]: crate::readonly_project_host_state
     #[cfg(any(test, feature = "test-support"))]
-    pub fn reconstruct_for_read_verification(
-        parts: HostStateReadVerificationParts,
-    ) -> Self {
+    pub fn reconstruct_for_read_verification(parts: HostStateReadVerificationParts) -> Self {
         Self {
             host: parts.host,
             sequence: parts.sequence,
