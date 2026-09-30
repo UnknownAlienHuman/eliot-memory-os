@@ -50,6 +50,7 @@ use std::{
 use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
+mod canary_removal_entry;
 mod controlboard_status;
 mod dashboard;
 mod dev_crate_check;
@@ -303,6 +304,70 @@ enum InstallationCommand {
         /// Optional transaction identity, accepted only to make the refusal scope explicit.
         #[arg(long)]
         transaction_id: Option<String>,
+    },
+    /// Resolve one exact installed canary into a frozen read-only removal plan.
+    ///
+    /// Only a plan the installation owner admits proceeds past the refusal
+    /// boundary; foreign, ambiguous, replaced, production and last-known-good
+    /// targets fail with typed errors before any destructive path exists.
+    PlanCanaryRemoval {
+        /// Absolute path to an existing transaction redb file. Never created.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Absolute path to the retained per-installation Host state root
+        /// locating the accepted registry.
+        #[arg(long, value_parser = absolute_path)]
+        host_state_root: PathBuf,
+        /// Exact generation to remove; must equal the request's exact candidate.
+        #[arg(long)]
+        generation: String,
+        /// Absolute path to the explicit Remove authorization JSON
+        /// (`ManagedEnvironmentChangeRequest`).
+        #[arg(long, value_parser = absolute_path)]
+        request: PathBuf,
+    },
+    /// Admit and drive the durable removal operation for one frozen plan.
+    ///
+    /// The plan JSON is untrusted import: the owner revalidates the exact plan
+    /// digest and current revisions before the first destructive call.
+    ApplyCanaryRemoval {
+        /// Absolute path to an existing transaction redb file. Never created.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Absolute path to the retained per-installation Host state root
+        /// locating the accepted registry.
+        #[arg(long, value_parser = absolute_path)]
+        host_state_root: PathBuf,
+        /// Absolute path to the frozen `CanaryRemovalPlan` JSON.
+        #[arg(long, value_parser = absolute_path)]
+        plan: PathBuf,
+    },
+    /// Project the stable secret-free disposition of one removal operation.
+    ///
+    /// Read-only: only the durable store is opened, never an external owner.
+    CanaryRemovalStatus {
+        /// Absolute path to an existing transaction redb file. Never created.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Durable removal operation identity.
+        #[arg(long)]
+        removal_transaction_id: String,
+    },
+    /// Reconcile one already admitted removal operation.
+    ///
+    /// Recovery reuses the same operation identity and reconciles before any
+    /// further attempt; it never admits a fresh removal identity.
+    RecoverCanaryRemoval {
+        /// Absolute path to an existing transaction redb file. Never created.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Absolute path to the retained per-installation Host state root
+        /// locating the accepted registry.
+        #[arg(long, value_parser = absolute_path)]
+        host_state_root: PathBuf,
+        /// Durable removal operation identity.
+        #[arg(long)]
+        removal_transaction_id: String,
     },
     /// Materialize an exact fifteen-role Phase-A source bundle and feed it through
     /// the publication-bound generation planner. `--store` is required because
@@ -2110,6 +2175,35 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             );
             Ok(INVALID_REQUEST_EXIT)
         }
+        InstallationCommand::PlanCanaryRemoval {
+            store,
+            host_state_root,
+            generation,
+            request,
+        } => canary_removal_entry::run_plan_canary_removal(
+            &store,
+            &host_state_root,
+            &generation,
+            &request,
+        ),
+        InstallationCommand::ApplyCanaryRemoval {
+            store,
+            host_state_root,
+            plan,
+        } => canary_removal_entry::run_apply_canary_removal(&store, &host_state_root, &plan),
+        InstallationCommand::CanaryRemovalStatus {
+            store,
+            removal_transaction_id,
+        } => canary_removal_entry::run_canary_removal_status(&store, &removal_transaction_id),
+        InstallationCommand::RecoverCanaryRemoval {
+            store,
+            host_state_root,
+            removal_transaction_id,
+        } => canary_removal_entry::run_recover_canary_removal(
+            &store,
+            &host_state_root,
+            &removal_transaction_id,
+        ),
         InstallationCommand::MaterializeSourceBundle {
             eliot_host,
             eliot_watchdog,
