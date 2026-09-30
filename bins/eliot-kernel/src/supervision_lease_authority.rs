@@ -48,19 +48,74 @@ use crate::daemon_supervision::DaemonSupervisionProgressState;
 /// F-LOG-KERNEL-3 (#901): supervision-lease boundary observations.
 ///
 /// Observation only, via #895's facade: fixed `kernel.supervision.*` event
-/// names plus a bounded stable outcome. Never carries lease identities,
-/// digests, signed material, tickets, or owner error strings (I15.4).
+/// names plus a bounded stable outcome, explicitly parented by the owning
+/// operation. Identity references are screened and recorded on the span,
+/// never repeated as event fields (I15.4).
 #[cfg(windows)]
-fn observe_supervision_lease(event: &'static str, outcome: &'static str) {
+fn observe_supervision_lease(
+    context: &tracing::Span,
+    event: &'static str,
+    outcome: &'static str,
+) {
     use crate::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "supervision lease observation"
     );
+}
+
+/// Builds the bounded diagnostic projection from the identity material the
+/// lease-ticket owner already holds. `state_fence` contains only the
+/// lineage-aware epoch digest and that fence's original resource generation;
+/// it is a scope projection, not the full fence or nonce identity.
+#[cfg(windows)]
+fn supervision_lease_operation_context(
+    ticket: &SupervisionLeaseCommitTicket,
+) -> tracing::Span {
+    use crate::kernel_diagnostics::operation_context;
+
+    let binding = &ticket.binding;
+    let epoch_digest = StateFence::canonical_epoch_digest(&binding.state_fence.authority_epoch).ok();
+    let generation = binding
+        .generation_binding
+        .process_generation
+        .value()
+        .to_string();
+    let state_fence = epoch_digest.as_ref().map(|epoch| {
+        format!(
+            "epoch={};resource_generation={}",
+            epoch.as_str(),
+            binding.state_fence.resource_generation.value()
+        )
+    });
+    let context = operation_context(
+        Some(ticket.operation_id.as_str()),
+        Some(&generation),
+        state_fence.as_deref(),
+        epoch_digest.as_ref().map(|epoch| epoch.as_str()),
+    );
+    record_supervision_ticket_context(&context, ticket);
+    context
+}
+
+#[cfg(windows)]
+fn record_supervision_ticket_context(
+    context: &tracing::Span,
+    ticket: &SupervisionLeaseCommitTicket,
+) {
+    use crate::kernel_diagnostics::bound_field;
+
+    let lease = bound_field(ticket.lease_id.as_str());
+    context.record("lease", lease.text());
+    if let Some(receipt_sha256) = ticket.previous_receipt_sha256.as_deref() {
+        let receipt = bound_field(receipt_sha256);
+        context.record("receipt", receipt.text());
+    }
 }
 
 /// Maps one supervision-lease authority failure to its stable code.
@@ -623,19 +678,42 @@ impl KernelSupervisionLeaseAuthority {
         &self,
         ticket: &SupervisionLeaseCommitTicket,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
+        let context = supervision_lease_operation_context(ticket);
+        self.commit_active_in_context(ticket, &context)
+    }
+
+    pub(crate) fn commit_active_in_context(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+        context: &tracing::Span,
+    ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         // F-LOG-KERNEL-3 (#901): lease acquire/renew boundary. Exact replay
         // is read back inside, not recommitted; exactly one terminal is
         // emitted per failed commit and no lease material is logged.
-        observe_supervision_lease("kernel.supervision.commit_requested", "attempt");
+        record_supervision_ticket_context(context, ticket);
+        observe_supervision_lease(
+            context,
+            "kernel.supervision.commit_requested",
+            "attempt",
+        );
         match self.commit_active_inner(ticket) {
             Ok(snapshot) => {
-                observe_supervision_lease("kernel.supervision.commit_committed", "success");
+                observe_supervision_lease(
+                    context,
+                    "kernel.supervision.commit_committed",
+                    "success",
+                );
                 Ok(snapshot)
             }
             Err(error) => {
-                observe_supervision_lease("kernel.supervision.commit_failed", "rejected");
-                crate::kernel_diagnostics::observe_terminal_error(
+                observe_supervision_lease(
+                    context,
+                    "kernel.supervision.commit_failed",
+                    "rejected",
+                );
+                crate::kernel_diagnostics::observe_terminal_error_in_context(
                     supervision_authority_terminal_code(&error),
+                    context,
                 );
                 Err(error)
             }
@@ -682,19 +760,42 @@ impl KernelSupervisionLeaseAuthority {
         &self,
         ticket: &SupervisionLeaseCommitTicket,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
+        let context = supervision_lease_operation_context(ticket);
+        self.commit_terminal_in_context(ticket, &context)
+    }
+
+    pub(crate) fn commit_terminal_in_context(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+        context: &tracing::Span,
+    ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         // F-LOG-KERNEL-3 (#901): lease revoke/expire/supersede/close
         // boundary. A terminal disposition stays terminal; exactly one
         // terminal diagnostic is emitted per failed commit.
-        observe_supervision_lease("kernel.supervision.terminal_requested", "attempt");
+        record_supervision_ticket_context(context, ticket);
+        observe_supervision_lease(
+            context,
+            "kernel.supervision.terminal_requested",
+            "attempt",
+        );
         match self.commit_terminal_inner(ticket) {
             Ok(snapshot) => {
-                observe_supervision_lease("kernel.supervision.terminal_committed", "success");
+                observe_supervision_lease(
+                    context,
+                    "kernel.supervision.terminal_committed",
+                    "success",
+                );
                 Ok(snapshot)
             }
             Err(error) => {
-                observe_supervision_lease("kernel.supervision.terminal_failed", "rejected");
-                crate::kernel_diagnostics::observe_terminal_error(
+                observe_supervision_lease(
+                    context,
+                    "kernel.supervision.terminal_failed",
+                    "rejected",
+                );
+                crate::kernel_diagnostics::observe_terminal_error_in_context(
                     supervision_authority_terminal_code(&error),
+                    context,
                 );
                 Err(error)
             }
@@ -803,6 +904,31 @@ impl KernelSupervisionLeaseAuthority {
         expected_fence: &StateFence,
         now_ms: u64,
     ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
+        self.expire_past_due_lease_with_context(supervision_lease_id, expected_fence, now_ms, None)
+    }
+
+    pub(crate) fn expire_past_due_lease_in_context(
+        &self,
+        supervision_lease_id: &str,
+        expected_fence: &StateFence,
+        now_ms: u64,
+        context: &tracing::Span,
+    ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
+        self.expire_past_due_lease_with_context(
+            supervision_lease_id,
+            expected_fence,
+            now_ms,
+            Some(context),
+        )
+    }
+
+    fn expire_past_due_lease_with_context(
+        &self,
+        supervision_lease_id: &str,
+        expected_fence: &StateFence,
+        now_ms: u64,
+        supplied_context: Option<&tracing::Span>,
+    ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
         let Some(current) = self.current_snapshot(supervision_lease_id)? else {
             return Ok(None);
         };
@@ -854,24 +980,52 @@ impl KernelSupervisionLeaseAuthority {
         // expiry is observed; routine not-due ticks stay unlogged. Exactly one
         // terminal is emitted per failed commit and no lease material is
         // logged.
-        observe_supervision_lease("kernel.supervision.expire_requested", "attempt");
-        match self.commit_terminal(&stage.ticket) {
+        let owned_context;
+        let context = if let Some(context) = supplied_context {
+            record_supervision_ticket_context(context, &stage.ticket);
+            context
+        } else {
+            owned_context = supervision_lease_operation_context(&stage.ticket);
+            &owned_context
+        };
+        observe_supervision_lease(
+            context,
+            "kernel.supervision.expire_requested",
+            "attempt",
+        );
+        match self.commit_terminal_in_context(&stage.ticket, context) {
             Ok(snapshot) => {
                 if snapshot.record.state != LeaseState::Expired
                     || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Terminal
                 {
-                    observe_supervision_lease("kernel.supervision.expire_failed", "rejected");
-                    return Err(SupervisionLeaseAuthorityError::Ors(
+                    let error = SupervisionLeaseAuthorityError::Ors(
                         OrsError::SupervisionLeaseBindingMismatch,
-                    ));
+                    );
+                    observe_supervision_lease(
+                        context,
+                        "kernel.supervision.expire_failed",
+                        "rejected",
+                    );
+                    crate::kernel_diagnostics::observe_terminal_error_in_context(
+                        supervision_authority_terminal_code(&error),
+                        context,
+                    );
+                    return Err(error);
                 }
-                observe_supervision_lease("kernel.supervision.expire_committed", "success");
+                observe_supervision_lease(
+                    context,
+                    "kernel.supervision.expire_committed",
+                    "success",
+                );
                 Ok(Some(snapshot))
             }
             Err(error) => {
-                observe_supervision_lease("kernel.supervision.expire_failed", "rejected");
-                crate::kernel_diagnostics::observe_terminal_error(
-                    supervision_authority_terminal_code(&error),
+                // `commit_terminal_in_context` owns the one terminal. Expiry
+                // only observes this propagated failure at its own level.
+                observe_supervision_lease(
+                    context,
+                    "kernel.supervision.expire_failed",
+                    "rejected",
                 );
                 Err(error)
             }
