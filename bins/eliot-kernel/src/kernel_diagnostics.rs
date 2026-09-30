@@ -467,19 +467,64 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
     );
 }
 
+/// Builds an operation span from the safe identities already held by its owner.
+///
+/// Missing or not-yet-validated identities remain unavailable. This projection
+/// never reads an owner, manufactures authority, or logs signed fence material.
+/// Callers may record validated tree, lease and receipt references in the
+/// declared fields after screening them through [`bound_field`].
+#[must_use]
+pub fn operation_context(
+    operation: Option<&str>,
+    generation: Option<&str>,
+    state_fence: Option<&str>,
+    authority_epoch: Option<&str>,
+) -> tracing::Span {
+    let operation = bound_field(operation.unwrap_or("unavailable"));
+    let generation = bound_field(generation.unwrap_or("unavailable"));
+    let state_fence = bound_field(state_fence.unwrap_or("unavailable"));
+    let authority_epoch = bound_field(authority_epoch.unwrap_or("unavailable"));
+    tracing::info_span!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        "kernel.operation",
+        operation = operation.text(),
+        operation_redaction = operation.redaction_status().unwrap_or("none"),
+        generation = generation.text(),
+        generation_redaction = generation.redaction_status().unwrap_or("none"),
+        state_fence = state_fence.text(),
+        state_fence_redaction = state_fence.redaction_status().unwrap_or("none"),
+        authority_epoch = authority_epoch.text(),
+        authority_epoch_redaction = authority_epoch.redaction_status().unwrap_or("none"),
+        process_tree = "unavailable",
+        lease = "unavailable",
+        receipt = "unavailable",
+    )
+}
+
 /// Records the single terminal error boundary (the `exit_error` funnel)
 /// with its exact typed code.
 ///
 /// One underlying failed operation yields exactly one terminal record here;
-/// lower-phase entrypoint observations correlate by stage order, not by a
-/// dedup cache. The code is screened against the shared telemetry field policy
+/// the current span is preserved for existing callers. Operation owners pass
+/// their explicit span to [`observe_terminal_error_in_context`] so concurrent
+/// operations never rely on stage order for correlation. No dedup cache is used.
+/// The code is screened against the shared telemetry field policy
 /// and bounded defensively; every current call site passes a `&'static str`
 /// typed code owned by its failure path (I07.20). Terminal receipt framing
 /// (`write_error`) is untouched and still owns the process exit.
 pub fn observe_terminal_error(code: &str) {
+    observe_terminal_error_in_context(code, &tracing::Span::current());
+}
+
+/// Emits the terminal assigned to this owner under its operation's exact span.
+///
+/// Subordinate owner reads must propagate their error without emitting another
+/// terminal; choosing that boundary remains the caller's responsibility.
+pub fn observe_terminal_error_in_context(code: &str, context: &tracing::Span) {
     let bounded = bound_field(code);
     tracing::error!(
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = "kernel.terminal_error",
         code = bounded.text(),
         code_bytes = bounded.original_bytes(),
