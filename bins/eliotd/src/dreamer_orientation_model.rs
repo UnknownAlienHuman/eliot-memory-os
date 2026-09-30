@@ -23,10 +23,10 @@ use eliot_agent_opencode::{
 use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::grounding::{RouteIdentity, route_fingerprint};
 use eliot_dreamer_contracts::{
-    CostUsageReceipt, DreamInputBundle, DreamJobAdmission, DreamJobInput, MODEL_ROUTE_SCHEMA_VERSION,
-    ModelDraft, ModelRouteDisposition, ModelRouteExecutionIdentity, ModelRouteOutcome,
-    ModelRoutePrivacy, ModelRouteProviderUsage, ModelRouteRequest, ModelRouteUsageState,
-    ProviderOutputV2, bundle_digest_of,
+    CostUsageReceipt, DreamInputBundle, DreamJobAdmission, DreamJobInput,
+    MODEL_ROUTE_SCHEMA_VERSION, ModelDraft, ModelRouteDisposition, ModelRouteExecutionIdentity,
+    ModelRouteOutcome, ModelRoutePrivacy, ModelRouteProviderUsage, ModelRouteRequest,
+    ModelRouteUsageState, ProviderOutputV2, bundle_digest_of,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -115,7 +115,10 @@ impl DreamerOrientationModelAttempt {
         }
         let provider_output = outcome.provider_output.as_ref()?;
         provider_output.validate().ok()?;
-        if serde_json::to_value(provider_output).ok()?.ne(parsed_output) {
+        if serde_json::to_value(provider_output)
+            .ok()?
+            .ne(parsed_output)
+        {
             return None;
         }
         let draft = &provider_output.draft;
@@ -340,18 +343,18 @@ pub async fn run_admitted_model_route(
                     Err(error) => (Err(error), None),
                 },
                 Err(error) => (
-                    Err(ModelRouteProjectionError::OwnerCandidateRejected(Box::new(error))),
+                    Err(ModelRouteProjectionError::OwnerCandidateRejected(Box::new(
+                        error,
+                    ))),
                     None,
                 ),
             };
-            DreamerOrientationModelOwnerResult::Outcome(Box::new(
-                DreamerOrientationModelOutcome {
-                    original,
-                    agent_result,
-                    model_route,
-                    provider_output,
-                },
-            ))
+            DreamerOrientationModelOwnerResult::Outcome(Box::new(DreamerOrientationModelOutcome {
+                original,
+                agent_result,
+                model_route,
+                provider_output,
+            }))
         }
         Err(error) => {
             let malformed = project_malformed_refusal(

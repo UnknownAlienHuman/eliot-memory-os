@@ -26,6 +26,7 @@ pub mod grounding;
 pub mod job;
 pub mod model_route;
 pub mod probe;
+pub mod provider_output;
 pub mod registry;
 pub mod rejection;
 pub mod relation;
@@ -137,6 +138,10 @@ pub use probe::{
     ProbeRepeatRef, ProbeSourceRef, ResourceDimension, ResultBranch, ResultBranchAcceptance,
     ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
     RivalUpdateMeaning, update_sets_equal,
+};
+pub use provider_output::{
+    PROVIDER_OUTPUT_SCHEMA_VERSION, ProviderGroundingOutputV2, ProviderOutputV2,
+    provider_output_schema_v2,
 };
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
