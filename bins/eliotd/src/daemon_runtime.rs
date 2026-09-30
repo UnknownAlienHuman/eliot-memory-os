@@ -5244,6 +5244,14 @@ fn trigger_cold_start_controller(
         &ticket.connection_id,
         &ticket.ticket_id,
     );
+    let contour_status = contour_result
+        .as_ref()
+        .err()
+        .map_or("available", String::as_str);
+    let binding_status = binding_result
+        .as_ref()
+        .err()
+        .map_or("available", String::as_str);
 
     if let Err(controller) = controller_result {
         let missing_reads = trigger
@@ -5256,13 +5264,7 @@ fn trigger_cold_start_controller(
             .map(|read| format!("{read:?}"))
             .collect::<Vec<_>>();
         return Err(format!(
-            "I4.4.1 AttachOrLaunch refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {}; Kernel binding owner: {}",
-            contour_result
-                .err()
-                .unwrap_or_else(|| "available".to_owned()),
-            binding_result
-                .err()
-                .unwrap_or_else(|| "available".to_owned()),
+            "I4.4.1 AttachOrLaunch refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}",
         ));
     }
 
@@ -5288,13 +5290,7 @@ fn trigger_cold_start_controller(
             }
         };
         return Err(format!(
-            "I4.4.1 AttachOrLaunch reached privacy-bounded scanner question path: {question}; Kernel contour owner: {}; Kernel binding owner: {}; privacy class, admitted boundary and policy remain absent",
-            contour_result
-                .err()
-                .unwrap_or_else(|| "available".to_owned()),
-            binding_result
-                .err()
-                .unwrap_or_else(|| "available".to_owned()),
+            "I4.4.1 AttachOrLaunch reached privacy-bounded scanner question path: {question}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}; privacy class, admitted boundary and policy remain absent",
         ));
     };
 
