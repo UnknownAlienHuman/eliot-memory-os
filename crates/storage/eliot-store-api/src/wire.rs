@@ -21,13 +21,13 @@ use crate::{
     CanonicalValidationSnapshot, ErasureIntentRecord, ErasureSurfaceKind, ExactJsonBytes,
     IsolatedDestination, IsolatedDestinationReceipt, MAX_STORE_FAILURE_DETAIL_LEN,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
-    OrderingHeadReadback,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes, dreamer_job::map_durable_error,
-    json_shape_name, reconcile_same_operation, sha256_hex, verify_canonical_request_hash,
+    OrderingHeadExpectation, OrderingHeadReadback, OrderingScopeId, PreparedTransition,
+    RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor,
+    SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError, StoreGenesisRequest,
+    StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes,
+    dreamer_job::map_durable_error, json_shape_name, reconcile_same_operation, sha256_hex,
+    verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 

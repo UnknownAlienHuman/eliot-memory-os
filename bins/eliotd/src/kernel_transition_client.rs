@@ -20,11 +20,11 @@ use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     CampaignSourceHead, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
     CampaignSourceRevisionRead, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHeadExpectation, ScopeId,
-    OriginalWriteSubmission, StoreHealth, TaskContractAcceptanceSet, WriteReceipt,
-    decode_task_contract_acceptance_set,
-    generated_operation_manifests, task_contract_acceptance_read_request,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    OrderingHeadExpectation, OriginalWriteSubmission, PreparedTransition, ReadConsistency,
+    RevisionHeadExpectation, ScopeId, StoreHealth, TaskContractAcceptanceSet, WriteReceipt,
+    decode_task_contract_acceptance_set, generated_operation_manifests,
+    task_contract_acceptance_read_request, validate_store_receipt_envelope,
+    verify_canonical_request_hash,
 };
 use tracing::Instrument as _;
 
@@ -99,7 +99,8 @@ fn check_identity_binding_with_selection(
             )
             .map_err(|error| task_binding_kernel_error(&error))?;
         }
-        (super::task_binding_admission::TaskBindingAdmission::TaskRelative, None) | (_, Some(_)) => {
+        (super::task_binding_admission::TaskBindingAdmission::TaskRelative, None)
+        | (_, Some(_)) => {
             return Err(KernelPortError::TaskSelectionRequired);
         }
         (_, None) => {}
@@ -308,11 +309,7 @@ impl DaemonKernelClient {
                         .map_err(|error| KernelPortError::Contract(error.to_string()))?;
                 }
                 let value = self
-                    .transact_async_with_identity(
-                        "apply_prepared",
-                        request,
-                        identity.clone(),
-                    )
+                    .transact_async_with_identity("apply_prepared", request, identity.clone())
                     .await
                     .map_err(kernel_port_error)?;
                 let value = kind_value(&value, "write_receipt")?;

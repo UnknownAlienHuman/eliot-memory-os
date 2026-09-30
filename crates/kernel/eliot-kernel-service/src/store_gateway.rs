@@ -108,6 +108,7 @@ use eliot_store_api::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::canonical_store_evidence::CanonicalStoreEvidence;
 use crate::commit_recovery::{
     CheckedPauseObservation, CommitRecoveryClass, CommitRecoveryError, PauseReleaseOutcome,
     PauseScopeView, PausedScopeMirror, RetainedCommitState, classify_commit_receipt,
@@ -115,14 +116,13 @@ use crate::commit_recovery::{
     resolve_open_record, verify_dreamer_canonical_request_hash, verify_receipt_binding,
     verify_retained_binding, verify_terminal_evidence,
 };
-use crate::canonical_store_evidence::CanonicalStoreEvidence;
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
     finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
-    reserve_for_transition_with_original_submission,
-    retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
+    reserve_for_transition_with_original_submission, retain_unsupported_prepared_plan,
+    writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
     UserAutomationDueWakeResolution, UserAutomationDurableJobMaterial,

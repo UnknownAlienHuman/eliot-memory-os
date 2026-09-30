@@ -2046,9 +2046,11 @@ impl RecoveryWriteBinding {
             ));
         }
         self.recovery_access_class.validate()?;
-        if self.write_response_mode.as_deref().is_some_and(|mode| {
-            !matches!(mode, "wait_for_commit" | "accept_after_stage")
-        }) {
+        if self
+            .write_response_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "wait_for_commit" | "accept_after_stage"))
+        {
             return Err(OrsError::InvalidField {
                 field: "write_response_mode",
                 reason: "must be wait_for_commit or accept_after_stage when present",

@@ -202,17 +202,14 @@ impl CanonicalStoreEvidence {
         evidence: ScopedCanonicalEvidence,
         action: impl FnOnce() -> T,
     ) -> Result<T, OrsError> {
-        let _transaction = self
-            .inner
-            .transaction
-            .lock()
-            .map_err(|_| OrsError::CanonicalEvidence("evidence scope lock poisoned".to_owned()))?;
+        let _transaction =
+            self.inner.transaction.lock().map_err(|_| {
+                OrsError::CanonicalEvidence("evidence scope lock poisoned".to_owned())
+            })?;
         {
-            let mut active = self
-                .inner
-                .active
-                .lock()
-                .map_err(|_| OrsError::CanonicalEvidence("evidence state lock poisoned".to_owned()))?;
+            let mut active = self.inner.active.lock().map_err(|_| {
+                OrsError::CanonicalEvidence("evidence state lock poisoned".to_owned())
+            })?;
             if active.is_some() {
                 return Err(OrsError::CanonicalEvidence(
                     "another canonical Store proof scope is active".to_owned(),
@@ -220,9 +217,7 @@ impl CanonicalStoreEvidence {
             }
             *active = Some(evidence);
         }
-        let reset = ActiveEvidenceReset {
-            inner: &self.inner,
-        };
+        let reset = ActiveEvidenceReset { inner: &self.inner };
         let result = action();
         drop(reset);
         Ok(result)
@@ -277,10 +272,7 @@ impl CanonicalEvidenceProvider for CanonicalStoreEvidence {
         verify_store_ordering_heads(&state_fence, &readbacks, &request.scopes)
     }
 
-    fn verify_ordering_heads(
-        &self,
-        scopes: &[ScopeReservationRequest],
-    ) -> Result<(), OrsError> {
+    fn verify_ordering_heads(&self, scopes: &[ScopeReservationRequest]) -> Result<(), OrsError> {
         let ScopedCanonicalEvidence::Ordering {
             operation_id,
             transition_sha256,
@@ -355,16 +347,19 @@ fn verify_store_ordering_heads(
         .iter()
         .map(|scope| scope.scope.as_str())
         .collect::<BTreeSet<_>>();
-    let observed_scopes = readbacks.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let observed_scopes = readbacks
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     if requested_scopes.len() != scopes.len() || requested_scopes != observed_scopes {
         return Err(OrsError::CanonicalEvidence(
             "ORS reservation scope set is not the exact Store readback scope set".to_owned(),
         ));
     }
     for scope in scopes {
-        let observed = readbacks
-            .get(scope.scope.as_str())
-            .ok_or_else(|| OrsError::CanonicalEvidence("Store readback scope missing".to_owned()))?;
+        let observed = readbacks.get(scope.scope.as_str()).ok_or_else(|| {
+            OrsError::CanonicalEvidence("Store readback scope missing".to_owned())
+        })?;
         if observed.head.state_fence != *state_fence
             || observed.head.sequence != scope.expected_head.sequence
             || observed.canonical_sha256 != scope.expected_head.head_sha256

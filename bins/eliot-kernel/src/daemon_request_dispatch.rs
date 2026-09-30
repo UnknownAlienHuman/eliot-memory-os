@@ -9416,10 +9416,13 @@ impl KernelComposition {
         }
         let created_at_ms = i64::try_from(current_time_ms)
             .map_err(|_| "Kernel clock is outside the reservation time range".to_owned())?;
-        let expires_at_ms = i64::try_from(record.deadline_unix_ms)
-            .map_err(|_| "host request deadline is outside the reservation time range".to_owned())?;
+        let expires_at_ms = i64::try_from(record.deadline_unix_ms).map_err(|_| {
+            "host request deadline is outside the reservation time range".to_owned()
+        })?;
 
-        let observed_heads = self.read_observe_reservation_heads(gateway, operation).await?;
+        let observed_heads = self
+            .read_observe_reservation_heads(gateway, operation)
+            .await?;
         let access = input
             .protected_envelope
             .privacy_and_visibility_class
@@ -9595,7 +9598,6 @@ impl KernelComposition {
 
         Ok(observed_heads)
     }
-
 
     /// Resolves an already-committed `Apply` receipt for this exact operation
     /// identity.
