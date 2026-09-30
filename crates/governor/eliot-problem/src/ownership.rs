@@ -35,6 +35,19 @@
 //! [`Ownership::retained_epoch`] is what lets that successor clear the fenced
 //! epoch instead of being refused because the record currently has no owner.
 //!
+//! The loss direction is fenced by the same trust boundary as the assignment
+//! direction, which is the property that makes both halves of an owner-loss
+//! event real at once. [`OwnerLeaseLoss`] has private fields and no
+//! `Deserialize`, so an event cannot be spelled by a caller or decoded from
+//! transport bytes; its only construction path, [`OwnerLeaseLoss::observed`],
+//! asks the issuing owner itself — through
+//! [`OwnerLeaseIssuer::revoked_lease`] — what it durably records about a grant
+//! it no longer holds, and **re-derives** the observed identity from that grant
+//! rather than accepting one. A caller holding only a principal string, or a
+//! hand-written [`LeaseIdentity`], therefore has no way to reach this type at
+//! all, and a caller that does hold the exact grant still cannot claim a loss
+//! the issuer does not report.
+//!
 //! The one obligation with no lease identity behind it is the legacy migration:
 //! a record that never carried a lease has no [`LeaseIdentity`] to lose, so its
 //! [`Ownership::Unassigned`] variant carries `lost_lease: None` and an empty
@@ -349,10 +362,29 @@ impl AuthenticatedOwnerLease {
 /// The implementation lives with the lease owner, not here: this crate never
 /// mints, renews, or stores a lease. Returning `None` for a grant the issuer
 /// does not hold is the refusal that keeps a self-named owner out.
+///
+/// It answers two questions about the same durable state. [`Self::commitment_for`]
+/// is the assignment direction: what commitment does the issuer hold for a
+/// grant it is still willing to have held. [`Self::revoked_lease`] is the loss
+/// direction: what does the issuer itself record about a grant it issued and no
+/// longer holds. The two are deliberately on one trait because the issuer, not
+/// this crate, is what makes a lease real and what makes it stop being real —
+/// splitting them would let one direction be answered by something other than
+/// the party that owns the lease.
 pub trait OwnerLeaseIssuer {
     /// The durable commitment this issuer holds for `grant`, or `None` when it
     /// holds no such lease.
     fn commitment_for(&self, grant: &OwnerLeaseGrant) -> Option<String>;
+
+    /// The revocation this issuer durably records for `grant`, or `None` when it
+    /// records no loss of it.
+    ///
+    /// The event's reason and evidence come from here rather than from whoever
+    /// asks, so an expiry is the expiry the issuer observed, not one a caller
+    /// declared. `None` is the refusal in both directions of the lifecycle: an
+    /// issuer that has no record of losing this lease will not authenticate a
+    /// loss of it.
+    fn revoked_lease(&self, grant: &OwnerLeaseGrant) -> Option<OwnerLeaseRevocation>;
 }
 
 /// The visible obligation an owner loss leaves outstanding.
@@ -541,6 +573,20 @@ impl UnassignedOwnership {
             };
             identity.validate()?;
             crate::nonempty(&self.loss_evidence, "loss_evidence")?;
+            // The retained epoch is bound to the retained lease identity, exactly
+            // as [`AssignedOwnership::validate`] binds them on the assigned
+            // variant. This is not a shape nicety: [`Ownership::retained_epoch`]
+            // reads the successor's epoch floor from *this* field when the record
+            // is unassigned, so an epoch that disagreed with the fenced lease
+            // would let a successor be admitted below the lease it must
+            // supersede — the same reuse of a fenced epoch that a renewal is
+            // refused for, arriving through the loss path instead.
+            if identity.ownership_epoch != self.ownership_epoch {
+                return Err(ProblemError::InvalidField {
+                    field: "ownership_epoch",
+                    reason: "must equal the epoch of the retained lost ownership lease",
+                });
+            }
         }
         let evidence = self
             .loss_evidence
@@ -561,20 +607,28 @@ impl UnassignedOwnership {
     }
 }
 
-/// One observed owner-loss event from the lease owner.
+/// What the lease owner itself durably records about a grant it issued and no
+/// longer holds.
+///
+/// This is the *issuer's* record, not the caller's claim about one. It is
+/// deliberately the only place a reason and evidence for a loss are written
+/// down: an [`OwnerLeaseLoss`] copies them out of a value the issuer returned,
+/// so a caller cannot name its own expiry and attach its own artifacts to it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OwnerLeaseLoss {
-    /// Why the lease stopped being current.
+pub struct OwnerLeaseRevocation {
+    /// Why the issuing owner stopped holding this grant.
     pub reason: OwnerLossReason,
-    /// The exact lease identity the lease owner observed dead.
-    pub observed_lease: LeaseIdentity,
-    /// Evidence for the loss event.
+    /// The issuing owner's own evidence for the revocation.
     pub evidence: Vec<ArtifactId>,
 }
 
-impl OwnerLeaseLoss {
-    /// Validates the loss reason, observed identity and evidence.
+impl OwnerLeaseRevocation {
+    /// Validates the reason and the issuer's evidence.
+    ///
+    /// A legacy migration is refused here for the same reason it is refused on
+    /// the event: it names the absence of a lease rather than the loss of one,
+    /// so it is never something an issuer reports observing.
     pub fn validate(&self) -> Result<(), ProblemError> {
         if self.reason == OwnerLossReason::LegacyRecordWithoutLease {
             return Err(ProblemError::InvalidField {
@@ -582,7 +636,6 @@ impl OwnerLeaseLoss {
                 reason: "a legacy-without-lease migration is not an observed loss",
             });
         }
-        self.observed_lease.validate()?;
         crate::nonempty(&self.evidence, "loss.evidence")?;
         let evidence = self
             .evidence
@@ -590,6 +643,86 @@ impl OwnerLeaseLoss {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         crate::unique_text(&evidence, "loss.evidence")
+    }
+}
+
+/// One observed owner-loss event, authenticated against the issuing owner.
+///
+/// The fields are private and the type does not implement `Deserialize`, so an
+/// event cannot be spelled as a struct literal by a caller and cannot be
+/// decoded from transport bytes: both were ways to reach "this lease is dead"
+/// with nothing but a principal string and an invented identity. The only
+/// construction path is [`Self::observed`], which asks the issuer that granted
+/// the lease and re-derives the observed identity from the grant itself. That
+/// is what makes the first half of the owner-loss fence real evidence rather
+/// than an assertion: the reason and the evidence are the issuer's own, and the
+/// identity is derived, never restated.
+///
+/// The second half — that the identity still matches what the record holds when
+/// the event is applied — belongs to the record's `record_owner_loss`, which
+/// compares this identity against its *current* retained identity. Both are
+/// needed: an issuer-authenticated event for a lease the record has since
+/// moved on from is exactly the delayed expiry that must not unassign the
+/// successor.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq)]
+pub struct OwnerLeaseLoss {
+    observed_lease: LeaseIdentity,
+    revocation: OwnerLeaseRevocation,
+}
+
+impl OwnerLeaseLoss {
+    /// The exact lease identity the issuing owner observed dead.
+    ///
+    /// Re-derived from the grant by [`Self::observed`], so it always names the
+    /// lease the issuer was actually asked about.
+    #[must_use]
+    pub const fn observed_lease(&self) -> &LeaseIdentity {
+        &self.observed_lease
+    }
+
+    /// Why the issuing owner stopped holding this lease.
+    #[must_use]
+    pub const fn reason(&self) -> OwnerLossReason {
+        self.revocation.reason
+    }
+
+    /// The issuing owner's own evidence for the loss.
+    #[must_use]
+    pub fn evidence(&self) -> &[ArtifactId] {
+        &self.revocation.evidence
+    }
+
+    /// Observes the loss of `grant` against the issuer that granted it.
+    ///
+    /// The issuer is asked first: it returns the revocation it durably records
+    /// for this exact grant, or nothing at all when it holds no such record. A
+    /// `None` is the refusal — a caller cannot assert that a lease the issuer
+    /// still considers held has stopped being current. The observed identity is
+    /// then re-derived here from the grant's own domain-separated commitment,
+    /// never taken from the caller, so the event names precisely the lease the
+    /// issuer was asked about rather than one the caller preferred.
+    pub fn observed(
+        grant: &OwnerLeaseGrant,
+        issuer: &dyn OwnerLeaseIssuer,
+    ) -> Result<Self, ProblemError> {
+        let revocation = issuer
+            .revoked_lease(grant)
+            .ok_or(ProblemError::OwnerLossNotObserved)?;
+        revocation.validate()?;
+        Ok(Self {
+            observed_lease: grant.identity(grant.expected_commitment()?)?,
+            revocation,
+        })
+    }
+
+    /// Validates the retained reason, observed identity and issuer evidence.
+    ///
+    /// `observed` already holds every one of these, so this exists for a
+    /// reloaded value and for the record-side check that runs before the event
+    /// is applied.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        self.revocation.validate()?;
+        self.observed_lease.validate()
     }
 }
 
