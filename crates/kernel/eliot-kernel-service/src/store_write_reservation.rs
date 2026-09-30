@@ -144,19 +144,21 @@ use eliot_ors::{
     CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation, EpochIdentity,
     EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
     OperationalRecoveryStore, RecoveryAccessClass, RecoveryCursor, RecoveryEnvelopeContext,
-    RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope, RedbRecoveryStore, ReservationRecord,
-    ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
-    WriterReservationToken,
+    RecoveryOwner, RecoveryPage, RecoveryPayload, RecoveryPayloadEnvelope, RecoveryWriteBinding,
+    RedbRecoveryStore, ReservationRecord, ReservationRequest, ReservationState,
+    ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OperationId, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, ReceiptEnvelope, ReservedScopeBinding,
-    ReservedWriteRequest, RevisionHeadExpectation, WriteAdmissionParams, WriteAdmissionProjection,
-    WriteReceipt, WriteReceiptStatus, WriterEpochBinding, prepared_transition_digest, sha256_hex,
-    verify_canonical_request_hash,
+    NamedMutationOperation, OrderingScopeId, OriginalWriteSubmission, PreparedTransition,
+    ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation,
+    WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
+    WriterEpochBinding, prepared_transition_digest, sha256_hex, verify_canonical_request_hash,
 };
+
+use crate::canonical_store_evidence::CanonicalStoreEvidence;
 
 /// Key-provider label carried on reservation envelopes.
 ///
@@ -299,13 +301,13 @@ pub enum ReservationWriteError {
 /// Composition-bound reservation owner: the one owned ORS handle plus the
 /// active writer epoch from trusted Kernel composition.
 ///
-/// There is deliberately no constructor accepting an evidence provider, a
-/// second ORS handle, or a claimed epoch: the evidence provider stays bound
-/// inside the ORS handle, and the writer epoch must be the composition-active
-/// one or every lifecycle call fails with the owner error.
+/// The evidence provider must be the same instance bound inside the ORS handle;
+/// the writer epoch must be the composition-active one or every lifecycle
+/// call fails with the owner error.
 pub struct CompositionReservation {
     ors: Arc<RedbRecoveryStore>,
     writer_epoch: EpochLineage,
+    evidence: Option<Arc<CanonicalStoreEvidence>>,
 }
 
 impl CompositionReservation {
@@ -321,7 +323,28 @@ impl CompositionReservation {
         writer_epoch
             .validate()
             .map_err(ReservationWriteError::Ors)?;
-        Ok(Self { ors, writer_epoch })
+        Ok(Self {
+            ors,
+            writer_epoch,
+            evidence: None,
+        })
+    }
+
+    /// Binds the composition ORS handle, current writer epoch, and the same
+    /// canonical Store evidence provider installed in that ORS handle.
+    ///
+    /// Production reservation and recovery routes use this constructor so an
+    /// actual authenticated Store observation can be scoped around each local
+    /// ORS transaction. The legacy constructor remains evidence-unbound and
+    /// fails closed when the ORS provider requires owner evidence.
+    pub fn bind_with_evidence(
+        ors: Arc<RedbRecoveryStore>,
+        writer_epoch: EpochLineage,
+        evidence: Arc<CanonicalStoreEvidence>,
+    ) -> Result<Self, ReservationWriteError> {
+        let mut owner = Self::bind(ors, writer_epoch)?;
+        owner.evidence = Some(evidence);
+        Ok(owner)
     }
 
     /// Returns the bound active writer epoch.
@@ -714,7 +737,78 @@ pub fn reserve_for_transition(
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<SealedReservation, ReservationWriteError> {
+    reserve_for_transition_inner(
+        owner,
+        seed,
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        None,
+    )
+}
+
+/// Reserves a CaptureObservation transition while binding the exact original
+/// public Observe submission that produced it. Other transition kinds cannot
+/// claim this capture identity, and CaptureObservation cannot enter ORS through
+/// the source-less wrapper above.
+pub fn reserve_for_transition_with_original_submission(
+    owner: &CompositionReservation,
+    seed: &ReservationSeed,
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    original_submission: &OriginalWriteSubmission,
+) -> Result<SealedReservation, ReservationWriteError> {
+    reserve_for_transition_inner(
+        owner,
+        seed,
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        Some(original_submission),
+    )
+}
+
+fn reserve_for_transition_inner(
+    owner: &CompositionReservation,
+    seed: &ReservationSeed,
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    original_submission: Option<&OriginalWriteSubmission>,
+) -> Result<SealedReservation, ReservationWriteError> {
     let operation_id = transition.identity.operation_id.as_str().to_owned();
+    let has_capture = transition
+        .named_operations
+        .iter()
+        .any(|operation| operation.operation == NamedMutationOperation::CaptureObservation);
+    match (has_capture, original_submission) {
+        (true, None) => {
+            return Err(ReservationWriteError::Admission {
+                operation_id,
+                detail: "CaptureObservation reservation requires its original public Observe submission"
+                    .to_owned(),
+            });
+        }
+        (false, Some(_)) => {
+            return Err(ReservationWriteError::Admission {
+                operation_id,
+                detail: "original Observe submission is only valid for CaptureObservation"
+                    .to_owned(),
+            });
+        }
+        (_, Some(source)) => source.validate().map_err(|error| {
+            ReservationWriteError::Admission {
+                operation_id: operation_id.clone(),
+                detail: format!("original Observe submission is invalid: {error}"),
+            }
+        })?,
+        (false, None) => {}
+    }
     validate_admitted(
         context,
         transition,
@@ -766,6 +860,16 @@ pub fn reserve_for_transition(
     )
     .map_err(ReservationWriteError::Ors)?;
     let transition_digest = prepared_transition_digest(transition)?;
+    let envelope = match original_submission {
+        Some(source) => bind_original_write_submission(
+            envelope,
+            source,
+            owner,
+            transition,
+            &transition_digest,
+        )?,
+        None => envelope,
+    };
     let mut scopes: Vec<ScopeReservationRequest> = seed
         .heads
         .iter()
@@ -805,6 +909,60 @@ pub fn reserve_for_transition(
         token,
         created_at_ms: seed.created_at_ms,
     })
+}
+
+fn bind_original_write_submission(
+    envelope: RecoveryPayloadEnvelope,
+    source: &OriginalWriteSubmission,
+    owner: &CompositionReservation,
+    transition: &PreparedTransition,
+    transition_digest: &str,
+) -> Result<RecoveryPayloadEnvelope, ReservationWriteError> {
+    let RecoveryPayload::Encrypted { key, .. } = &envelope.payload else {
+        return Err(ReservationWriteError::Admission {
+            operation_id: transition.identity.operation_id.as_str().to_owned(),
+            detail: "CaptureObservation reservation requires the exact protected encrypted payload"
+                .to_owned(),
+        });
+    };
+    let ordering_scopes = transition
+        .ordering_scopes
+        .iter()
+        .map(|scope| {
+            OpaqueLabel::new(scope.as_str().to_owned()).map_err(ReservationWriteError::Ors)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let write_binding = RecoveryWriteBinding {
+        write_envelope_protocol_version: source.protocol_version,
+        recovery_envelope_contract_version: envelope.contract_version,
+        recovery_access_class: envelope.privacy_and_visibility_class.clone(),
+        payload_created_at_ms: envelope.created_at_ms,
+        payload_known_at_ms: envelope.known_at_ms,
+        payload_expires_at_ms: envelope.expires_at_ms,
+        operation_id: envelope.operation_or_checkpoint_id.clone(),
+        write_intent_id: OpaqueLabel::new(source.write_intent_id.clone())
+            .map_err(ReservationWriteError::Ors)?,
+        idempotency_key: OpaqueLabel::new(transition.identity.idempotency_key.clone())
+            .map_err(ReservationWriteError::Ors)?,
+        canonical_request_sha256: transition.identity.canonical_request_hash.clone(),
+        prepared_transition_sha256: transition_digest.to_owned(),
+        ordering_scopes,
+        admission_contract_set_digest: transition.admission_contract_set_digest.clone(),
+        operation_manifest_digest: OpaqueLabel::new(
+            transition.operation_manifest_digest.as_str().to_owned(),
+        )
+        .map_err(ReservationWriteError::Ors)?,
+        authority_epoch: owner.writer_epoch.clone(),
+        state_fence: envelope.state_fence.clone(),
+        protected_payload_sha256: envelope.payload_sha256.clone(),
+        protected_payload_length: envelope.payload_length,
+        payload_key_reference: key.clone(),
+        write_response_mode: Some(source.response_mode.clone()),
+    };
+    write_binding.validate().map_err(ReservationWriteError::Ors)?;
+    envelope
+        .with_write_binding(write_binding)
+        .map_err(ReservationWriteError::Ors)
 }
 
 /// Projects exactly one eligible token to the #990 sealed request sent through #991.
@@ -1446,6 +1604,45 @@ impl ReservedSubmission {
         )?)
     }
 
+    /// Projects one CaptureObservation reservation and carries its exact
+    /// original public Observe submission through the authenticated Store
+    /// boundary unchanged.
+    pub fn from_sealed_with_original_submission(
+        sealed: &SealedReservation,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        original_submission: &OriginalWriteSubmission,
+    ) -> Result<Self, ReservationWriteError> {
+        original_submission
+            .validate()
+            .map_err(|error| ReservationWriteError::Admission {
+                operation_id: transition.identity.operation_id.as_str().to_owned(),
+                detail: format!("original Observe submission is invalid: {error}"),
+            })?;
+        if !transition
+            .named_operations
+            .iter()
+            .any(|operation| operation.operation == NamedMutationOperation::CaptureObservation)
+        {
+            return Err(ReservationWriteError::Admission {
+                operation_id: transition.identity.operation_id.as_str().to_owned(),
+                detail: "original Observe submission is only valid for CaptureObservation"
+                    .to_owned(),
+            });
+        }
+        let mut request = project_reserved_write(
+            sealed,
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )?;
+        request.original_write_submission = Some(original_submission.clone());
+        Self::new(request)
+    }
+
     /// Exact Store capability this submission selects.
     pub fn capability(&self) -> &'static str {
         CAPABILITY_RESERVED_WRITE
@@ -1676,9 +1873,18 @@ async fn reconcile_one_record(
             reason: "awaiting store receipt".to_owned(),
         });
     };
-    match reconcile_receipt(token, &receipt)
-        .and_then(|reconciliation| finalize_reservation(owner, &reconciliation))
-    {
+    let finalized = reconcile_receipt(token, &receipt).and_then(|reconciliation| {
+        let evidence = owner.evidence.as_ref().ok_or_else(|| {
+            ReservationWriteError::Ors(eliot_ors::OrsError::CanonicalEvidence(
+                "startup receipt has no shared canonical Store evidence provider".to_owned(),
+            ))
+        })?;
+        evidence
+            .with_store_receipt(token, &reconciliation, &receipt, || {
+                finalize_reservation(owner, &reconciliation)
+            })?
+    });
+    match finalized {
         Ok(_) => Ok(StartupRecordOutcome::Resolved),
         Err(_) => {
             if record.state == ReservationState::Reconciling {
