@@ -3007,8 +3007,8 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
             serde_json::to_vec(&rendered_packet).map_err(EngineError::from)?;
         let (rendered_utf8_bytes, stu_estimate, content_digest) =
             canonical_measurement_for_payload(&final_serialized_packet)?;
-        budget.estimated_tokens =
-            usize::try_from(stu_estimate.value).map_err(|_| ContextError::Overflow)?;
+        budget.estimated_tokens = usize::try_from(stu_estimate.value)
+            .map_err(|_| EngineError::from(ContextError::Overflow))?;
         budget.rendered_utf8_bytes = rendered_utf8_bytes;
         budget.stu_estimate = stu_estimate;
         let (
@@ -3123,8 +3123,8 @@ fn render_packet_with_budget_policy(
     let packet_bytes = serde_json::to_vec(&packet).map_err(EngineError::from)?;
     let (rendered_utf8_bytes, stu_estimate, content_digest) =
         canonical_measurement_for_payload(&packet_bytes)?;
-    let estimated_tokens =
-        usize::try_from(stu_estimate.value).map_err(|_| ContextError::Overflow)?;
+    let estimated_tokens = usize::try_from(stu_estimate.value)
+        .map_err(|_| EngineError::from(ContextError::Overflow))?;
     let (serializer_id, serializer_version, serializer_options_digest, serializer_profile_digest) =
         packet_serializer_binding();
     let mut section_tokens = packet_section_accounting(&packet)?;
