@@ -17,6 +17,7 @@ use eliot_governor::{
     CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
     GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
     KernelGenerationSnapshotProvider, PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
+    RehydratedContractAcceptanceSet,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -1605,7 +1606,11 @@ impl DaemonComposition {
     // re-checks the pre-commit fence before the receipt is admitted.
 
     /// Rehydrates the contract owner's acceptance-item enumeration for one finish
-    /// candidate at the exact task id and task revision (issue #1741, I7.9).
+    /// candidate at the exact task id (issue #1741, I7.9).
+    ///
+    /// The task revision is resolved by the Governor finish owner from its live
+    /// task-lifecycle owner record; this binary supplies only the task, so it
+    /// cannot hand the denominator read a revision of its own choosing.
     ///
     /// This is the single bounded read the finish path performs before it
     /// prepares anything, and it is the only route to the denominator. It holds
@@ -1618,21 +1623,50 @@ impl DaemonComposition {
     pub async fn rehydrate_task_contract_acceptance(
         &self,
         task_id: &eliot_contracts::TaskId,
-        task_revision: u64,
-    ) -> Result<eliot_store_api::TaskContractAcceptanceSet, FinishAttemptError> {
+    ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.governor
-            .rehydrate_task_contract_acceptance(task_id, task_revision)
+            .rehydrate_task_contract_acceptance(task_id)
             .await
+    }
+
+    /// Prepares the canonical owner leg that admits the Task Controller's
+    /// current plan revision for one task (issue #1741, I7.9).
+    ///
+    /// This is the production producer for the canonical owner's `current_plan`
+    /// dimension, which the all-absent genesis image leaves empty and which
+    /// every finish-path reader therefore refused. The plan identity is derived
+    /// by the Governor from its own Task-selection and task-lifecycle owners;
+    /// this binary supplies only the admitted identity, operation and task, so it
+    /// cannot assemble a plan of its own.
+    ///
+    /// `None` means the owner already holds exactly this plan, so no owner
+    /// revision is minted and no exchange is owed.
+    ///
+    /// This phase transports nothing: the caller holds the composition lock for
+    /// the call alone and releases it before the exchange.
+    pub fn prepare_current_plan_admission(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        task_id: &eliot_contracts::TaskId,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .prepare_current_plan_admission(identity, operation_id, task_id)
     }
 
     /// Prepares the Governor-owned finish-evidence exchange without transporting it.
     ///
     /// `contract_acceptance` is the contract owner's rehydrated enumeration from
     /// [`Self::rehydrate_task_contract_acceptance`], passed in so this phase
-    /// stays synchronous and pure.
+    /// stays synchronous and pure. It is a `RehydratedContractAcceptanceSet`, so
+    /// this binary cannot assemble a denominator of its own to pass here even if
+    /// it wanted to.
     ///
     /// Runtime callers hold the composition lock only for this synchronous phase,
     /// then exchange the immutable plan through Kernel after releasing the lock.
@@ -1641,7 +1675,7 @@ impl DaemonComposition {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
-        contract_acceptance: &eliot_store_api::TaskContractAcceptanceSet,
+        contract_acceptance: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));

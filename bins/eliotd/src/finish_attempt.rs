@@ -246,20 +246,93 @@ pub async fn serve_finish_claim(
         .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
 
     // Issue #1741, I7.9: rehydrate the contract owner's acceptance-item
-    // enumeration for this exact task id and task revision BEFORE any evidence
-    // is prepared. This is one bounded read on the existing authenticated
-    // Kernel named-read route, so the composition borrow is held across it; the
-    // two write legs below still run with no lock held across their exchange, as
-    // before. A refusal here is a typed rejection body: the plan's own
+    // enumeration for this exact task id BEFORE any evidence is prepared. The
+    // task revision is read by the Governor finish owner from its live
+    // task-lifecycle record; this lane supplies only the task id, so the
+    // denominator read can never be aimed at a revision the caller chose. This
+    // is one bounded read on the existing authenticated Kernel named-read
+    // route, so the composition borrow is held across it; the two write legs
+    // below still run with no lock held across their exchange, as before. A
+    // refusal here is a typed rejection body: the plan's own
     // `required_acceptance_item_ids` are never used as the denominator, so a
     // candidate whose plan narrows the contract's obligations cannot proceed.
     let task_id = eliot_contracts::TaskId::new(draft.task_id.clone())
         .map_err(|error| format!("admitted finish draft names an invalid task: {error}"))?;
+
+    // Issue #1741, I7.9: the Finish service rehydrates the Task Controller's
+    // current plan revision for this exact task before it reads any acceptance
+    // denominator, because the denominator is joined against that plan and the
+    // canonical owner carried no plan at all until this leg existed. The plan
+    // identity is derived inside the Governor from the Task-selection owner's
+    // own same-fence, task-bound accepted receipt and the live task record; this
+    // lane supplies only the task id, so no caller can hand the canonical owner a
+    // plan of its own choosing.
+    //
+    // It is prepared under the composition lock and exchanged with the lock
+    // released, exactly like every other canonical owner leg here. When the owner
+    // already holds this plan the Governor returns `None` and nothing is
+    // exchanged, so a replayed candidate never mints a second owner revision.
+    let plan_operation_id = eliot_contracts::OperationId::new(format!(
+        "{}/current-plan",
+        claimed.operation_id.as_str()
+    ))
+    .map_err(|error| format!("current-plan operation identity is invalid: {error}"))?;
+    let current_plan = {
+        let guard = composition.lock().await;
+        guard.prepare_current_plan_admission(
+            &claimed.request_identity,
+            &plan_operation_id,
+            &task_id,
+        )
+    };
+    let current_plan = match current_plan {
+        Ok(prepared) => prepared,
+        Err(error) => return rejected_finish_result(&claimed, &error),
+    };
+    if let Some(prepared) = current_plan.as_ref() {
+        if let Err(error) = prepared.exchange(kernel).await {
+            return rejected_finish_result(&claimed, &error);
+        }
+        let accepted = {
+            let guard = composition.lock().await;
+            guard.accept_prepared_finish_exchange(prepared)
+        };
+        if let Err(error) = accepted {
+            return rejected_finish_result(&claimed, &error);
+        }
+        // Issue #1741, I7.9: the committed plan has to reach the owner image
+        // before the evidence leg is derived. `accept_prepared_finish_exchange`
+        // re-checks only the pre-commit fence, so without this publication the
+        // image still carries the all-absent `current_plan` and
+        // `prepare_finish_evidence` refuses at `read_current_plan` — which would
+        // leave exact artifacts, executed verifier runs and effect outcomes
+        // unrehydrated on every live candidate. This is the one existing owner
+        // publication entry point, the same
+        // `DaemonComposition::refresh_testd_terminal_owner` the TestD terminal
+        // ceremony already uses between its fact leg and its evidence leg, over
+        // the same `refresh_from_kernel` recovery read. A second named entry
+        // point for one action would be a second scheme, so there is none. A
+        // refusal here is a typed rejected result body, never a locally derived
+        // plan.
+        let published = {
+            let mut guard = composition.lock().await;
+            guard.refresh_testd_terminal_owner()
+        };
+        if let Err(error) = published {
+            return rejected_finish_result_with_detail(
+                &claimed,
+                &error.to_string(),
+                (
+                    AgentResponseDisposition::RecoveryRequired,
+                    "RECOVERY_REQUIRED",
+                ),
+            );
+        }
+    }
+
     let contract_acceptance = {
         let guard = composition.lock().await;
-        guard
-            .rehydrate_task_contract_acceptance(&task_id, draft.expected_task_revision)
-            .await
+        guard.rehydrate_task_contract_acceptance(&task_id).await
     };
     let contract_acceptance = match contract_acceptance {
         Ok(acceptance) => acceptance,

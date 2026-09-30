@@ -21,7 +21,9 @@ use crate::canonical_projections::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
-use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
+use crate::finish_attempt::{
+    PreparedFinishDecision, PreparedKernelExchange, current_plan_envelope,
+};
 use crate::migration_inventory::PRODUCT_PROOF_PLAN;
 use crate::negative_memory_gate::{
     self, NegativeMemoryGateDecision, NegativeMemoryGateInput, evaluate_negative_memory_gate,
@@ -74,7 +76,7 @@ use eliot_diagnostic::{
 };
 use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
 use eliot_finish::{
-    DescendantClosure, FinishDecisionReceipt, FinishLifecycleAction, FinishService,
+    DescendantClosure, FinishDecisionReceipt, FinishError, FinishLifecycleAction, FinishService,
 };
 use eliot_influence::RevocationBounds;
 use eliot_instrument_api::{
@@ -1357,6 +1359,103 @@ pub enum CompositionError {
     Kernel(#[from] KernelPortError),
 }
 
+/// The Task Controller's verifier decision for one current plan revision.
+///
+/// The previous representation was `Option<CanonicalVerifierPlanBinding>`, which
+/// cannot say *which* of two different situations it is reporting: a Task
+/// Controller that has not yet decided a verifier request contract for this plan
+/// revision, or a plan whose recorded decision has been lost. Issue #1741 made
+/// that distinction load-bearing — with a bare `None` the finish path could not
+/// tell a pending decision from a dead task, and the idempotence check in
+/// `prepare_current_plan_admission` would absorb a later owner decision and leave
+/// the task permanently unable to produce verifier-bound evidence.
+///
+/// A closed, two-member state makes the distinction explicit and keeps both
+/// refusals:
+///
+/// * `Undecided` is the honest owner state before any decision. It carries an
+///   explicit reason reference, so a consumer's refusal names the missing owner
+///   decision instead of reporting a corrupt or absent binding.
+/// * `Decided` is the exact owner-issued request contract, validated by its own
+///   existing `validate`.
+///
+/// `Decided` boxes that contract. The two variants differ in size by more than an
+/// order of magnitude — a `String` against a `PlannedVerifierRef` plus a dozen
+/// contract ids, sets and maps — and inlining the large one into every
+/// `CanonicalPlanBinding` inflates the whole owner image, which is retained and
+/// re-read on every finish candidate. The box changes only where the bytes live:
+/// `serde` and `schemars` treat `Box<T>` exactly as `T`, so the persisted and
+/// generated shapes are byte-identical, and the `Decided` payload is still the
+/// identical `CanonicalVerifierPlanBinding` content.
+///
+/// No consumer may read a verifier out of `Undecided`: every one that needs a
+/// verifier goes through [`CanonicalPlanBinding::verifier_binding`], which
+/// refuses with a typed `CompositionError` naming the state it found. The
+/// requirement itself is unchanged; only the reason it is refused is now
+/// nameable.
+///
+/// Nothing in this crate authors a `Decided` value. The state is reachable from
+/// persisted owner bytes, exactly as `CanonicalVerifierPlanBinding` itself is, and
+/// `GovernorFinishAttempt::admit_task_controller_plan` carries a retained
+/// decision forward verbatim rather than authoring or discarding one.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "verifier_state")]
+pub enum CanonicalVerifierPlanState {
+    /// The Task Controller has published no verifier request contract for this
+    /// plan revision. `reason_ref` is the owner-side reference explaining that,
+    /// not a synthesized label.
+    Undecided { reason_ref: String },
+    /// The Task Controller published this exact verifier request contract.
+    Decided {
+        binding: Box<CanonicalVerifierPlanBinding>,
+    },
+}
+
+impl CanonicalVerifierPlanState {
+    /// The owner-side reference recorded when no verifier decision exists.
+    ///
+    /// This is the only value [`Self::default`] produces, and it names the
+    /// absent owner decision rather than standing in for one.
+    pub const NO_VERIFIER_DECISION_REF: &'static str =
+        "task-controller-published-no-verifier-request-contract";
+
+    /// Validates the state and, when decided, the exact owner-issued contract.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        match self {
+            Self::Undecided { reason_ref } => {
+                if reason_ref.trim().is_empty() || reason_ref.chars().any(char::is_control) {
+                    return Err(CompositionError::Recovery(
+                        "canonical plan verifier state has an empty or malformed decision reference"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::Decided { binding } => binding.validate(),
+        }
+    }
+
+    /// The exact owner-issued request contract, or a typed refusal that names the
+    /// state it found.
+    pub fn binding(&self) -> Result<&CanonicalVerifierPlanBinding, CompositionError> {
+        match self {
+            Self::Decided { binding } => Ok(binding.as_ref()),
+            Self::Undecided { reason_ref } => Err(CompositionError::Recovery(format!(
+                "canonical plan carries no verifier request contract because the Task Controller \
+                 has published none for this plan revision ({reason_ref})"
+            ))),
+        }
+    }
+}
+
+impl Default for CanonicalVerifierPlanState {
+    fn default() -> Self {
+        Self::Undecided {
+            reason_ref: Self::NO_VERIFIER_DECISION_REF.to_owned(),
+        }
+    }
+}
+
 /// Exact current Canonical plan identity retained by the Governor owner.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1365,15 +1464,23 @@ pub struct CanonicalPlanBinding {
     pub plan_revision: String,
     pub task_id: TaskId,
     pub work_scope_id: String,
-    /// Verifier request contract selected by this canonical plan. Older
-    /// plans may omit it, but the verifier fact producer refuses such a plan
-    /// because profile/config/scope/artifact currentness cannot be proved.
+    /// The Task Controller's verifier decision for this plan revision.
+    ///
+    /// Explicitly typed so an absent decision is distinguishable from a lost one;
+    /// see [`CanonicalVerifierPlanState`]. A plan that has not been given a
+    /// verifier request contract still validates, and every consumer that needs
+    /// one refuses through [`Self::verifier_binding`].
     #[serde(default)]
-    pub verifier: Option<CanonicalVerifierPlanBinding>,
+    pub verifier: CanonicalVerifierPlanState,
 }
 
 impl CanonicalPlanBinding {
     /// Constructs a bounded current-plan identity.
+    ///
+    /// The verifier dimension starts as [`CanonicalVerifierPlanState::Undecided`]:
+    /// a plan identity is not an authority to pick a verifier, so this admits
+    /// none. An owner decision binds one by changing this dimension, which is a
+    /// different owner revision.
     pub fn new(
         plan_id: impl Into<String>,
         plan_revision: impl Into<String>,
@@ -1385,10 +1492,16 @@ impl CanonicalPlanBinding {
             plan_revision: plan_revision.into(),
             task_id,
             work_scope_id: work_scope_id.into(),
-            verifier: None,
+            verifier: CanonicalVerifierPlanState::default(),
         };
         binding.validate()?;
         Ok(binding)
+    }
+
+    /// The exact owner-issued verifier request contract for this plan, or a typed
+    /// refusal that names whether the owner has simply not decided one yet.
+    pub fn verifier_binding(&self) -> Result<&CanonicalVerifierPlanBinding, CompositionError> {
+        self.verifier.binding()
     }
 
     /// Validates the bounded plan identity without consulting evidence.
@@ -1410,9 +1523,11 @@ impl CanonicalPlanBinding {
                 "canonical work scope id is blank or contains control characters".to_owned(),
             ));
         }
-        if let Some(verifier) = &self.verifier {
-            verifier.validate()?;
-        }
+        // The verifier dimension is validated as the closed state it now is, not
+        // skipped when absent: an `Undecided` must still carry a well-formed
+        // owner-side reason reference, so "no decision yet" is always a stated
+        // fact and never an unexplained hole.
+        self.verifier.validate()?;
         Ok(())
     }
 }
@@ -2290,8 +2405,10 @@ fn admitted_testd_verifier_plan<'a>(
         ));
     }
     plan.validate()?;
-    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-        verifier_fact_error("canonical plan has no verifier profile/config/scope/artifact binding")
+    let verifier_plan = plan.verifier_binding().map_err(|error| {
+        verifier_fact_error(format!(
+            "canonical plan has no verifier profile/config/scope/artifact binding: {error}"
+        ))
     })?;
     if job.invocation.request.task_id.as_ref() != Some(task_id) {
         return Err(verifier_fact_error(
@@ -2486,8 +2603,10 @@ fn checked_fact_identity_and_plan<'a>(
             "canonical verifier fact plan is task-mismatched",
         ));
     }
-    let verifier_plan = fact.plan.verifier.as_ref().ok_or_else(|| {
-        verifier_fact_error("persisted verifier fact has no canonical verifier plan binding")
+    let verifier_plan = fact.plan.verifier_binding().map_err(|error| {
+        verifier_fact_error(format!(
+            "persisted verifier fact has no canonical verifier plan binding: {error}"
+        ))
     })?;
     fact.invocation.validate()?;
     Ok(verifier_plan)
@@ -2708,7 +2827,14 @@ const TASK_ACCEPTANCE_SET_DOMAIN: &str = "eliot/task-acceptance-set/v1";
 /// # Errors
 ///
 /// Returns [`CompositionError::Recovery`] when the set cannot be canonicalized.
-fn task_acceptance_set_commitment(item_ids: &BTreeSet<String>) -> Result<String, CompositionError> {
+///
+/// Crate-private rather than private to this module so the finish owner can
+/// re-derive the same commitment over its own rehydrated enumeration. It is a
+/// pure hash of the set it is handed: it admits nothing, mints no identity, and
+/// cannot by itself satisfy any check that compares its result.
+pub(crate) fn task_acceptance_set_commitment(
+    item_ids: &BTreeSet<String>,
+) -> Result<String, CompositionError> {
     #[derive(Serialize)]
     struct Commitment<'a> {
         domain: &'a str,
@@ -2793,6 +2919,59 @@ impl ContractAcceptanceDenominator {
     }
 }
 
+/// One contract-owner acceptance-item set, admitted only by the owner's own
+/// neutral read.
+///
+/// This type exists to carry *provenance* rather than data. The neutral
+/// [`TaskContractAcceptanceSet`] is a store-neutral wire payload with public
+/// fields and a self-satisfiable `validate()`, and any store adapter has to be
+/// able to decode one — so it can never be the thing the finish path trusts.
+/// Handing that payload to [`AcceptanceDenominatorError::bind`] as a plain
+/// reference let a caller mint a set whose `items` equal the canonical plan's
+/// declared list and whose `acceptance_digest` equals the plan's own
+/// `task_acceptance_digest`, which is already forced to equal
+/// `task_acceptance_set_commitment(plan_ids)`. That is a self-satisfiable
+/// input: the comparison in `bind` was correct and the value being compared
+/// was caller-authored, so the owner was never actually consulted.
+///
+/// The field is private, there is no `Default`, no `From`, no `Deserialize` and
+/// no public constructor, so the only way to obtain one of these values is to
+/// await [`KernelTransitionPort::task_contract_acceptance_set`] and admit the
+/// result. I7.9 requires the Finish service to *rehydrate* the current
+/// `TaskContract` and its acceptance items; a type whose construction is
+/// unreachable except through the owner read is what makes "rehydrated" an
+/// enforced property instead of a convention.
+#[derive(Clone, Debug)]
+pub struct RehydratedContractAcceptanceSet {
+    /// Private on purpose: an accessible field would restore the very bypass
+    /// this type exists to close, because a caller could then write into it.
+    owner_set: TaskContractAcceptanceSet,
+}
+
+impl RehydratedContractAcceptanceSet {
+    /// The only constructor, and it is crate-private on purpose.
+    ///
+    /// Its single production caller is
+    /// `GovernorFinishAttempt::rehydrate_task_contract_acceptance`, which is the
+    /// one place the finish path performs the owner's named read. Nothing in
+    /// this crate can build this value from a literal, and nothing outside this
+    /// crate can build it at all.
+    pub(crate) const fn admit_owner_read(owner_set: TaskContractAcceptanceSet) -> Self {
+        Self { owner_set }
+    }
+
+    /// The owner's own payload, exactly as the read returned it.
+    ///
+    /// This is the only way to read the admitted set, and it is crate-private:
+    /// a consumer outside `eliot-governor` can pass one of these values on but
+    /// cannot take one apart and reassemble a self-satisfiable payload for
+    /// [`AcceptanceDenominatorError::bind`], because `bind` accepts only this
+    /// type.
+    pub(crate) const fn owner_set(&self) -> &TaskContractAcceptanceSet {
+        &self.owner_set
+    }
+}
+
 /// Closed failure set of the contract-owner acceptance denominator join.
 ///
 /// Every arm is a refusal: no arm has a success meaning, and no arm names a
@@ -2816,6 +2995,21 @@ pub enum AcceptanceDenominatorError {
     /// The owner set does not validate against the closed owner contract.
     #[error("the rehydrated contract acceptance set is malformed: {0}")]
     Malformed(String),
+    /// The task-selection owner evidence does not commit to the enumerated set.
+    ///
+    /// This is the additional conjunct the design enforced before the
+    /// owner-enumeration rehydration landed, and which that change dropped: the
+    /// accepted task-and-plan-bound observation receipts' recorded
+    /// `acceptance_digest` had to reproduce `task_acceptance_set_commitment`
+    /// over the enumerated obligation set. The receipt digest is still
+    /// cross-checked between receipts for mutual agreement, but on its own that
+    /// only proves the receipts agree with each other, not that either commits
+    /// to the denominator. Restoring the commitment keeps a receipt whose digest
+    /// was issued for a different set from riding under an owner enumeration.
+    #[error(
+        "task-bound observation evidence does not commit to the enumerated acceptance item set"
+    )]
+    SelectionEvidenceDisagrees,
     /// The plan's declared enumeration is not the contract owner's enumeration.
     ///
     /// Reported item by item, never as a count alone, so the mismatch names
@@ -2852,12 +3046,22 @@ impl AcceptanceDenominatorError {
     /// value commits to the owner enumeration retained beside it, so a
     /// caller-stated digest issued for a different (larger) set cannot ride
     /// under an owner enumeration.
+    ///
+    /// `owner_set` is a [`RehydratedContractAcceptanceSet`], not the neutral
+    /// payload. That is the whole enforcement: this signature has no arm that
+    /// accepts a caller-assembled set, so a caller that narrows the
+    /// denominator cannot reach this comparison at all — it cannot produce the
+    /// argument. Before the parameter carried the neutral payload, a caller
+    /// could build `items` equal to the plan's list and `acceptance_digest`
+    /// equal to the plan's own `task_acceptance_digest` and pass here with
+    /// zero owner involvement.
     pub(crate) fn bind(
         task_id: &str,
         task_revision: u64,
-        owner_set: &TaskContractAcceptanceSet,
+        owner_set: &RehydratedContractAcceptanceSet,
         verifier_plan: &CanonicalVerifierPlanBinding,
     ) -> Result<CanonicalContractAcceptance, Self> {
+        let owner_set = owner_set.owner_set();
         owner_set
             .validate()
             .map_err(|error| Self::Malformed(error.to_string()))?;
@@ -2931,8 +3135,10 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
             "canonical verifier fact plan drifted from the current canonical owner plan",
         ));
     }
-    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-        verifier_fact_error("canonical finish plan has no verifier item bindings")
+    let verifier_plan = plan.verifier_binding().map_err(|error| {
+        verifier_fact_error(format!(
+            "canonical finish plan has no verifier item bindings: {error}"
+        ))
     })?;
     if !contract.admits(verifier_plan) {
         return Err(verifier_fact_error(
@@ -2948,98 +3154,129 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
     );
     let mut acceptance = Vec::with_capacity(contract.item_ids.len());
     for item_id in &contract.item_ids {
-        // Explicit acceptance-to-test join owned by the canonical plan. A
-        // missing entry is an unmapped obligation; an empty test set declares
-        // a non-test obligation that executed verifier runs alone cannot
-        // satisfy. Neither form shrinks the denominator to the test list.
-        let mapped = verifier_plan
-            .acceptance_verifier_map
-            .get(item_id)
-            .cloned()
-            .unwrap_or_default();
-        let mut evidence_refs = BTreeSet::new();
-        let mut mapped_events = 0_usize;
-        let mut all_mapped_observed = true;
-        let mut all_pass = true;
-        for test_id in &mapped {
-            let test_events = fact
-                .verification_run
-                .evidence
-                .iter()
-                .filter(|event| {
-                    event
-                        .value
-                        .get("nextest_test_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(test_id.as_str())
-                })
-                .collect::<Vec<_>>();
-            if test_events.is_empty() {
-                all_mapped_observed = false;
-            }
-            for event in test_events {
-                mapped_events += 1;
-                evidence_refs.insert(event.evidence_id.to_string());
-                evidence_refs.insert(event.raw_artifact_id.to_string());
-                if let Some(handles) = event
-                    .value
-                    .get("raw_artifact_handles")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    evidence_refs.extend(
-                        handles
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned),
-                    );
-                }
-                if event
-                    .value
-                    .get("nextest_status")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("PASS")
-                {
-                    all_pass = false;
-                }
-            }
-        }
-        if mapped_events == 0 {
-            // Keep the negative item disposition tied to the actual raw run
-            // artifacts inspected; never mint a placeholder item receipt.
-            evidence_refs.extend(
-                fact.verification_run
-                    .raw_evidence
-                    .iter()
-                    .map(ToString::to_string),
-            );
-        }
-        // An item is satisfied only for a current run where every bound test
-        // executed and every bound execution passed. Failed, stale,
-        // not-executed, simulated (non-productive, hence non-certifying and
-        // stale-marked upstream), unmapped, and non-test obligations stay
-        // uncovered here and fail closed in `derive_finish_decision`.
-        let satisfied = run_is_current && !mapped.is_empty() && all_mapped_observed && all_pass;
-        let verifier_run_refs = if mapped_events == 0 {
-            Vec::new()
-        } else {
-            vec![run_ref.clone()]
-        };
-        // Only an explicit empty mapping declares a non-test obligation that
-        // does not require a verifier run. A missing mapping stays a
-        // verifier gap so absent coverage fails closed downstream.
-        let requires_verifier = !matches!(
-            verifier_plan.acceptance_verifier_map.get(item_id),
-            Some(tests) if tests.is_empty()
-        );
-        acceptance.push(AcceptanceCoverage {
-            item_id: item_id.clone(),
-            satisfied,
-            evidence_refs: evidence_refs.into_iter().collect(),
-            verifier_run_refs,
-            requires_verifier,
-        });
+        acceptance.push(acceptance_coverage_for_item(
+            item_id,
+            verifier_plan,
+            fact,
+            &run_ref,
+            run_is_current,
+        ));
     }
     Ok(acceptance)
+}
+
+/// Projects one acceptance item's coverage from the executed verifier run.
+///
+/// This is the per-item half of [`acceptance_coverage_from_verifier_fact`], which
+/// keeps the plan/fact/denominator refusals and delegates the projection here, so
+/// neither half can grow into the other. It is a pure move of that loop body: it
+/// raises no refusal of its own, so the only thing a caller can observe is the
+/// `AcceptanceCoverage` it returns, and every check, comparison, order and effect
+/// in it is the one the loop already performed.
+///
+/// The denominator decision is unchanged. `requires_verifier` is false only for an
+/// explicitly empty mapping, so a *missing* mapping stays a verifier gap;
+/// `satisfied` is true only for a current run whose every mapped test was observed
+/// and every one of them passed; and a `mapped_events == 0` item keeps its
+/// disposition tied to the raw run artifacts actually inspected rather than a
+/// minted placeholder. A persisted `satisfied` flag is never an input here.
+fn acceptance_coverage_for_item(
+    item_id: &str,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+    fact: &CanonicalVerifierExecutionFact,
+    run_ref: &str,
+    run_is_current: bool,
+) -> AcceptanceCoverage {
+    // Explicit acceptance-to-test join owned by the canonical plan. A
+    // missing entry is an unmapped obligation; an empty test set declares
+    // a non-test obligation that executed verifier runs alone cannot
+    // satisfy. Neither form shrinks the denominator to the test list.
+    let mapped = verifier_plan
+        .acceptance_verifier_map
+        .get(item_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut evidence_refs = BTreeSet::new();
+    let mut mapped_events = 0_usize;
+    let mut all_mapped_observed = true;
+    let mut all_pass = true;
+    for test_id in &mapped {
+        let test_events = fact
+            .verification_run
+            .evidence
+            .iter()
+            .filter(|event| {
+                event
+                    .value
+                    .get("nextest_test_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(test_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if test_events.is_empty() {
+            all_mapped_observed = false;
+        }
+        for event in test_events {
+            mapped_events += 1;
+            evidence_refs.insert(event.evidence_id.to_string());
+            evidence_refs.insert(event.raw_artifact_id.to_string());
+            if let Some(handles) = event
+                .value
+                .get("raw_artifact_handles")
+                .and_then(serde_json::Value::as_array)
+            {
+                evidence_refs.extend(
+                    handles
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+            if event
+                .value
+                .get("nextest_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("PASS")
+            {
+                all_pass = false;
+            }
+        }
+    }
+    if mapped_events == 0 {
+        // Keep the negative item disposition tied to the actual raw run
+        // artifacts inspected; never mint a placeholder item receipt.
+        evidence_refs.extend(
+            fact.verification_run
+                .raw_evidence
+                .iter()
+                .map(ToString::to_string),
+        );
+    }
+    // An item is satisfied only for a current run where every bound test
+    // executed and every bound execution passed. Failed, stale,
+    // not-executed, simulated (non-productive, hence non-certifying and
+    // stale-marked upstream), unmapped, and non-test obligations stay
+    // uncovered here and fail closed in `derive_finish_decision`.
+    let satisfied = run_is_current && !mapped.is_empty() && all_mapped_observed && all_pass;
+    let verifier_run_refs = if mapped_events == 0 {
+        Vec::new()
+    } else {
+        vec![run_ref.to_owned()]
+    };
+    // Only an explicit empty mapping declares a non-test obligation that
+    // does not require a verifier run. A missing mapping stays a
+    // verifier gap so absent coverage fails closed downstream.
+    let requires_verifier = !matches!(
+        verifier_plan.acceptance_verifier_map.get(item_id),
+        Some(tests) if tests.is_empty()
+    );
+    AcceptanceCoverage {
+        item_id: item_id.to_owned(),
+        satisfied,
+        evidence_refs: evidence_refs.into_iter().collect(),
+        verifier_run_refs,
+        requires_verifier,
+    }
 }
 
 fn verifier_fact_error(reason: impl Into<String>) -> CompositionError {
@@ -3689,6 +3926,63 @@ impl CanonicalAdmissionOwner {
             })?;
         fact.validate(state_fence)?;
         Ok(fact)
+    }
+
+    /// Builds the next canonical admission owner image that carries one
+    /// Task Controller's current plan revision (issue #1741, I7.9).
+    ///
+    /// # Why this producer exists
+    ///
+    /// `current_plan` is `None` in the all-absent genesis payload, and until this
+    /// method nothing could ever make it `Some`. The genesis packet is by
+    /// construction the canonical all-absent image — its `validate` pins every
+    /// owner payload to exactly that form, so a plan installed there would be a
+    /// fabricated second plan authority rather than an owner-issued one — and
+    /// both pre-existing producers ([`Self::prepare_verifier_execution_fact`]
+    /// and [`Self::prepare_finish_evidence`]) only ever *carry forward*
+    /// `self.snapshot.current_plan`. The plan dimension was therefore
+    /// write-once-absent, so [`Self::read_current_plan`] and
+    /// `read_current_activation_plan` refused on every live daemon, which
+    /// dead-ended `prepare_finish_evidence` at its `read_current_plan` call
+    /// before it could ever reach the contract owner's acceptance denominator.
+    ///
+    /// # Ownership (A00-07:50, A02-02:22, A10-04:22, I06-10:70, I07-21:9)
+    ///
+    /// Architecture names the Task Controller as the role that owns "the current
+    /// plan revision" of one task under the active Authority Epoch, holding a
+    /// `TaskControllerLease`, and withholds that authority from the Main Agent
+    /// and from workers (`I10-15:194`: "workers cannot mutate the current plan
+    /// in place"). This is that owner boundary on the existing
+    /// [`CanonicalAdmissionOwner`]: it extends the existing scheme and invents no
+    /// new plan identity type, vocabulary, or admission path.
+    ///
+    /// The plan is admitted only for a task it names, only under this exact
+    /// fence, and only when the resulting image validates. Re-admitting the plan
+    /// the owner already holds is idempotent: the caller compares the derived
+    /// binding against [`Self::read_current_plan`] and skips the write, so this
+    /// never mints a second owner revision for the same plan. A verifier
+    /// execution fact or finish evidence already retained under a *different*
+    /// plan cannot survive the transition, because
+    /// [`CanonicalAdmissionSnapshot::validate`] refuses a fact or evidence image
+    /// that does not match `current_plan` — the old plan's derived state is
+    /// dropped with it rather than carried across a plan change.
+    pub fn prepare_current_plan(
+        &self,
+        plan: CanonicalPlanBinding,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        plan.validate()?;
+        let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: Some(plan),
+            verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
+            finish_evidence: self.snapshot.finish_evidence.clone(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     /// Builds the next canonical admission owner image after a Governor-owned
@@ -5571,13 +5865,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Rehydrates one verifier execution fact from the current Governor task,
     /// plan, and the current durable TestD owner row. The caller supplies only
     /// the durable job identity; it cannot pass a held `TestJob` image or a
-    /// verifier verdict. The store read, task/plan join, persisted receipt,
-    /// execution run, artifact lineage, and canonical fence are checked by
-    /// the one fact constructor.
+    /// verifier verdict, and it cannot pass a task revision either — the current
+    /// revision is the task-lifecycle owner record's own value, because
+    /// `StateFence::task_revision` is structurally `None` on every production
+    /// Kernel-generation fence. The store read, task/plan join, persisted
+    /// receipt, execution run, artifact lineage, and canonical fence are checked
+    /// by the one fact constructor.
     pub fn rehydrate_testd_verifier_execution_fact(
         &self,
         task_id: &TaskId,
-        task_revision: u64,
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<CanonicalVerifierExecutionFact, CompositionError> {
@@ -5588,11 +5884,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let task = self.owners.task.task(task_id).ok_or_else(|| {
             CompositionError::Recovery(format!("canonical task {} is absent", task_id.as_str()))
         })?;
-        if task.task_id != *task_id || task.revision != task_revision || task.state_fence != fence {
+        if task.task_id != *task_id || task.revision == 0 || task.state_fence != fence {
             return Err(CompositionError::Recovery(
                 "canonical task owner is stale for verifier rehydration".to_owned(),
             ));
         }
+        // The task revision the fact is bound to is the owner record's own
+        // current value, proved non-zero and fence-bound above.
+        let task_revision = task.revision;
         let plan = self.owners.canonical.read_current_plan(&fence)?;
         if plan.task_id != *task_id {
             return Err(CompositionError::Recovery(
@@ -5607,10 +5906,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .ok_or_else(|| {
                 CompositionError::Recovery(format!("durable TestD job {job_id} is absent"))
             })?;
-        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-            CompositionError::Recovery(
-                "canonical plan has no verifier profile/config/scope/artifact binding".to_owned(),
-            )
+        let verifier_plan = plan.verifier_binding().map_err(|error| {
+            CompositionError::Recovery(format!(
+                "canonical plan has no verifier profile/config/scope/artifact binding: {error}"
+            ))
         })?;
         let receipt = job.verification_receipt.as_ref().ok_or_else(|| {
             CompositionError::Recovery(
@@ -5635,12 +5934,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     pub fn prepare_testd_verifier_execution_fact(
         &self,
         task_id: &TaskId,
-        task_revision: u64,
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
-        let fact =
-            self.rehydrate_testd_verifier_execution_fact(task_id, task_revision, job_id, testd)?;
+        let fact = self.rehydrate_testd_verifier_execution_fact(task_id, job_id, testd)?;
         self.owners.canonical.prepare_verifier_execution_fact(fact)
     }
 
@@ -5654,6 +5951,116 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         self.owners.canonical.read_current_plan(state_fence)
+    }
+
+    /// Admits the Task Controller's current plan revision for one task from
+    /// owner state alone, and returns the exact exchange that leg still owes
+    /// (issue #1741, I7.9).
+    ///
+    /// This is the production producer for `CanonicalAdmissionSnapshot::current_plan`.
+    /// It performs no transport and mutates nothing, so the caller holds its
+    /// composition borrow for this call alone and releases it before
+    /// [`PreparedKernelExchange::exchange`].
+    ///
+    /// # Where the plan identity comes from
+    ///
+    /// Every field is read from an owner, never taken from a caller:
+    ///
+    /// * `plan_id` / `plan_revision` — the plan identity the Task-selection
+    ///   owner's accepted, same-fence, task-bound observation receipt already
+    ///   records (`ObservationPlanBinding`). That receipt is the durable owner
+    ///   record of the admitted plan revision, and it is the same record the
+    ///   finish path's `matches_plan` join compares the owner plan against, so
+    ///   the plan admitted here cannot disagree with the evidence it is later
+    ///   joined to.
+    /// * `task_id` / `task_revision` — the live task-lifecycle owner record, so
+    ///   the admitted plan is current by construction rather than by a
+    ///   caller-asserted revision. A task is the documented unit of plan
+    ///   ownership (A10-04:22: "exactly one Task Controller owns the current
+    ///   plan revision for the Authority Epoch"), so the plan is bound to the
+    ///   owner record that holds that authority.
+    /// * `work_scope_id` — the same selection receipt's `work_scope_ref`.
+    ///
+    /// The verifier request contract is deliberately *not* supplied here. The
+    /// governing fragments assign plan-revision ownership to the Task Controller
+    /// (A00-07:50, A02-02:22, A10-04:22, I07-21:9) and keep the verifier under an
+    /// Evaluation Contract (A05-05, I07-27), but name no owner that publishes a
+    /// `CanonicalVerifierPlanBinding` — and none exists: the type has no struct
+    /// literal anywhere in the tree, so it is reachable only by deserialization.
+    /// It is therefore left absent, which [`CanonicalPlanBinding::validate`]
+    /// admits, so the plan *identity* is admitted on the evidence that actually
+    /// exists and every consumer that requires a verifier keeps refusing on its
+    /// own pre-existing typed check rather than reading a synthesized contract.
+    ///
+    /// # Idempotence
+    ///
+    /// When the owner already holds exactly this plan, `None` is returned and no
+    /// owner revision is minted: a re-admission of an already-current plan must
+    /// not look like a new canonical fact. `Some` is returned only when the
+    /// owner image would actually change.
+    ///
+    /// # Publication
+    ///
+    /// Preparing does not publish. The derived image becomes the owner image only
+    /// through a later [`Self::refresh_from_kernel`], because
+    /// [`Self::accept_prepared_exchange`] re-checks the pre-commit fence and
+    /// nothing else. A caller that derives any later leg from
+    /// [`Self::read_current_plan`] — [`Self::prepare_finish_evidence`] is the
+    /// one that does — must therefore publish this leg first, or it reads the
+    /// pre-publish image and refuses on the all-absent `current_plan`. That is a
+    /// publication obligation on the caller, not a second plan authority here.
+    ///
+    /// # Fail-closed
+    ///
+    /// Refuses, without mutating anything, when the composition is not ready;
+    /// when the task is absent, stale for the fence, at a zero revision, or not
+    /// in a plan-bearing state; when the Task-selection owner has no accepted,
+    /// same-fence, task-bound, plan-bearing, uncontaminated receipt for this
+    /// exact task revision; when those receipts disagree about the plan identity;
+    /// or when the resulting owner image does not validate. There is no
+    /// synthesized plan and no fallback to the genesis image.
+    pub fn prepare_current_plan_admission(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        task_id: &TaskId,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        identity
+            .validate()
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        if identity.request.state_fence != identity.request.metadata.state_fence {
+            return Err(FinishError::FenceMismatch.into());
+        }
+        let fence = identity.request.metadata.state_fence.clone();
+        if self.owners.canonical.state_fence() != &fence {
+            return Err(FinishError::FenceMismatch.into());
+        }
+        if identity.request.metadata.task_id.as_ref() != Some(task_id) {
+            return Err(FinishError::Canonical(
+                eliot_canonical::CanonicalError::TaskBindingMismatch,
+            )
+            .into());
+        }
+        let service = self.finish_attempt_service();
+        let plan = service.admit_task_controller_plan(task_id)?;
+        // Already current: the owner holds exactly this plan, so there is no
+        // owner image to publish and no revision to advance.
+        if self
+            .owners
+            .canonical
+            .read_current_plan(&fence)
+            .is_ok_and(|current| current == plan)
+        {
+            return Ok(None);
+        }
+        let snapshot = self.owners.canonical.prepare_current_plan(plan)?;
+        let envelope = current_plan_envelope(identity, operation_id, &snapshot, task_id)?;
+        Ok(Some(
+            service.prepare_current_plan_exchange(identity, envelope)?,
+        ))
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
@@ -6109,7 +6516,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         task_id: &TaskId,
-        task_revision: u64,
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
@@ -6117,14 +6523,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.finish_attempt_service()
-            .publish_testd_verifier_execution_fact(
-                identity,
-                operation_id,
-                task_id,
-                task_revision,
-                job_id,
-                testd,
-            )
+            .publish_testd_verifier_execution_fact(identity, operation_id, task_id, job_id, testd)
             .await
     }
 
@@ -6148,8 +6547,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     }
 
     /// Rehydrates the contract owner's acceptance-item enumeration for one
-    /// finish candidate, at the exact task id and task revision the admitted
-    /// request carries (issue #1741, I7.9).
+    /// finish candidate, at the exact task id the admitted request carries
+    /// (issue #1741, I7.9).
     ///
     /// This is the async half of the denominator join and the only place the
     /// finish path may obtain it. It is deliberately separate from
@@ -6158,19 +6557,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// prepare with the owner's set in hand instead of holding a composition
     /// borrow across a Kernel round trip for the write legs.
     ///
+    /// The task revision is resolved inside the finish owner from the live
+    /// task-lifecycle owner record, so this boundary names only the task and
+    /// never a caller-held revision.
+    ///
     /// A read that is absent, refused, unadmitted, or bound to another task,
     /// revision or fence is a typed
     /// [`AcceptanceDenominatorError`], never a substituted plan list.
     pub async fn rehydrate_task_contract_acceptance(
         &self,
         task_id: &TaskId,
-        task_revision: u64,
-    ) -> Result<TaskContractAcceptanceSet, FinishAttemptError> {
+    ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.finish_attempt_service()
-            .rehydrate_task_contract_acceptance(task_id, task_revision)
+            .rehydrate_task_contract_acceptance(task_id)
             .await
     }
 
@@ -6179,9 +6581,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the derived image is already current, so nothing is owed.
     ///
     /// `contract_acceptance` is the contract owner's rehydrated enumeration
-    /// from [`Self::rehydrate_task_contract_acceptance`]. The caller supplies
-    /// it rather than this method reading it, so the whole preparation stays
-    /// pure and no composition borrow crosses the read.
+    /// from [`Self::rehydrate_task_contract_acceptance`], carried as a
+    /// [`RehydratedContractAcceptanceSet`]. The caller supplies that value
+    /// rather than this method reading it, so the whole preparation stays pure
+    /// and no composition borrow crosses the read — and it can only supply one
+    /// that the owner read produced, because the type has no public
+    /// constructor.
     ///
     /// This method transports nothing, so the caller may hold its composition
     /// borrow for this call alone. The refresh that publishes the evidence leg's
@@ -6191,7 +6596,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
-        contract_acceptance: &TaskContractAcceptanceSet,
+        contract_acceptance: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
@@ -6269,9 +6674,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // enumeration rather than the plan's declared list.
         let task_id = TaskId::new(draft.task_id.clone())
             .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
-        let contract_acceptance = self
-            .rehydrate_task_contract_acceptance(&task_id, draft.expected_task_revision)
-            .await?;
+        let contract_acceptance = self.rehydrate_task_contract_acceptance(&task_id).await?;
         let evidence =
             self.prepare_finish_evidence(identity, &operation_id, &draft, &contract_acceptance)?;
         if let Some(prepared) = evidence.as_ref() {
@@ -11164,7 +11567,7 @@ mod tests {
                 plan_revision: "1".to_owned(),
                 task_id: TaskId::new("task-1").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
-                verifier: None,
+                verifier: CanonicalVerifierPlanState::default(),
             }),
             verifier_execution_fact: None,
             finish_evidence: None,
@@ -12062,7 +12465,7 @@ mod tests {
                 plan_revision: "1".to_owned(),
                 task_id: TaskId::new("task-other").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
-                verifier: None,
+                verifier: CanonicalVerifierPlanState::default(),
             }),
             verifier_execution_fact: None,
             finish_evidence: None,
