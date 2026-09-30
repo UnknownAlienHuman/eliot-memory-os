@@ -6451,15 +6451,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     "authenticated Observe request has no session binding".to_owned(),
                 )
             })?;
-        let session = self
-            .owners
-            .session
-            .session(session_id)
-            .ok_or_else(|| CompositionError::Recovery("Session owner has no admitted Observe session".to_owned()))?;
+        let session = self.owners.session.session(session_id).ok_or_else(|| {
+            CompositionError::Recovery("Session owner has no admitted Observe session".to_owned())
+        })?;
         if session.session_id != *session_id
             || session.status != SessionState::Active
             || session.state_fence != *request_fence
-            || !session.authority_epoch.is_same_authority(&request_fence.authority_epoch)
+            || !session
+                .authority_epoch
+                .is_same_authority(&request_fence.authority_epoch)
         {
             return Err(CompositionError::Provider(
                 "Observe session owner binding is not current at the request fence".to_owned(),
@@ -6517,7 +6517,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || !is_sha256(&work_scope_read.value_digest)
         {
             return Err(CompositionError::Recovery(
-                "WorkScope named-read source does not match its current owner projection".to_owned(),
+                "WorkScope named-read source does not match its current owner projection"
+                    .to_owned(),
             ));
         }
         let policy_value = serde_json::to_value(policy.policy)
