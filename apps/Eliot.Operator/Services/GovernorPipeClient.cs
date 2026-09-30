@@ -459,12 +459,16 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// The handoff is validated against the exact current process identity and
     /// consumed before the pipe is opened, so a failed connect can never
     /// present the same nonce twice, even when no application payload was
-    /// sent. Connection and the required initial authentication steps are
-    /// bounded by ONE establishment window: the smallest of the handoff's own
-    /// remaining owner-allowed lifetime, the declared connect ceiling, and the
-    /// caller's whole-operation budget. That window ends with establishment:
-    /// afterwards the request budget and the serving owner's session and
-    /// revocation rules apply, never the spent nonce's old TTL.
+    /// sent. The broker vouches for this process FIRST: challenge and
+    /// redemption complete before any Governor transport is constructed,
+    /// published on the client's connection slot or opened, so this client
+    /// never holds a live Governor connection to a broker instance it has
+    /// proven nothing to. Connection and the required initial authentication
+    /// steps are bounded by ONE establishment window: the smallest of the
+    /// handoff's own remaining owner-allowed lifetime, the declared connect
+    /// ceiling, and the caller's whole-operation budget. That window ends with
+    /// establishment: afterwards the request budget and the serving owner's
+    /// session and revocation rules apply, never the spent nonce's old TTL.
     private async Task<GovernorConnection> EnsureConnectedAsync(OperationBudget budget, string operationScope, string tool)
     {
         var live = Volatile.Read(ref _connection);
@@ -528,25 +532,35 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         var pipeName = handoff.Endpoint.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase);
         // Single use: the nonce is spent now, not after a successful connect.
         handoff.Consume(DateTimeOffset.UtcNow);
-        var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-        var connection = new GovernorConnection(pipe, handoff);
-        Interlocked.Exchange(ref _connection, connection);
 
         using var establishment = budget.OpenWindow(establishmentAllowance, OperatorExchangeStages.Establishment);
+        // Exactly one Governor connection is ever built here, and it is built
+        // only after the broker has vouched for this process. A refusal or a
+        // fault during redemption therefore leaves nothing constructed, nothing
+        // published on `_connection` and nothing for the failure paths to
+        // abort. `attempt` is that one connection once it exists; before
+        // redemption completes it is null because there is nothing to name.
+        GovernorConnection? attempt = null;
         try
         {
+            // The inherited handoff is consumed before any broker request.
+            // Broker challenge and redemption share this establishment window
+            // and finish before the Governor pipe is connected, so this client
+            // never opens, publishes or holds a Governor transport it has not
+            // yet been vouched for.
+            await BrokerPipeClient.RedeemOperatorHandoffAsync(
+                handoff.Endpoint,
+                clientIdentity,
+                establishment.Token).ConfigureAwait(false);
+            var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+            var connection = new GovernorConnection(pipe, handoff);
+            attempt = connection;
+            Interlocked.Exchange(ref _connection, connection);
             // The cancellation registration references THIS connection only, so
             // a late establishment cancellation can never close a replacement
             // connection, and it never waits for the request gate the cancelled
             // operation itself may hold.
             using var abortOnEstablishment = connection.BindAbort(establishment.Token);
-            // The inherited handoff is consumed before any broker request.
-            // Broker challenge and redemption share this establishment window
-            // and finish before the Governor pipe is connected.
-            await BrokerPipeClient.RedeemOperatorHandoffAsync(
-                handoff.Endpoint,
-                clientIdentity,
-                establishment.Token).ConfigureAwait(false);
             try
             {
                 await pipe.ConnectAsync(establishment.Token).ConfigureAwait(false);
@@ -629,34 +643,49 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             {
                 throw new UnauthorizedAccessException(OperatorFaultReason.HandshakeRefused);
             }
+            return connection;
         }
         catch (OperatorRestartRequiredException)
         {
-            await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            if (attempt is not null)
+            {
+                await AbortConnectionAsync(attempt, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            }
             throw;
         }
         catch (OperatorNotAttemptedException)
         {
-            await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            if (attempt is not null)
+            {
+                await AbortConnectionAsync(attempt, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            }
             throw;
         }
         catch (OperationCanceledException)
         {
-            await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            if (attempt is not null)
+            {
+                await AbortConnectionAsync(attempt, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            }
             throw EstablishmentRefusal(budget, establishment, operationScope, tool, OperatorExchangeStages.Establishment);
         }
         catch (UnauthorizedAccessException)
         {
-            await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            if (attempt is not null)
+            {
+                await AbortConnectionAsync(attempt, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            }
             throw;
         }
         catch (Exception error) when (error is IOException or OperatorProtocolException or InvalidOperationException or JsonException)
         {
-            await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            if (attempt is not null)
+            {
+                await AbortConnectionAsync(attempt, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
+            }
             throw BindingLost(
                 $"{OperatorFaultReason.HandshakeShapeRefused} at broker registration generation {handoff.BrokerRegistrationEpoch}");
         }
-        return connection;
     }
 
     /// Writes one framed request and reads one framed answer on the captured
