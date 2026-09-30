@@ -858,7 +858,7 @@ impl AdmittedSourceQuarantine {
         expected_state_revision: u64,
         owner: &str,
     ) -> Result<Self, SecurityContractError> {
-        Self::bind(QuarantineBindings {
+        Self::bind(&QuarantineBindings {
             assessed_source: &restriction.assessed_source,
             permitted_uses: restriction.permitted_uses,
             permitted_effects: restriction.permitted_effects,
@@ -885,7 +885,7 @@ impl AdmittedSourceQuarantine {
     pub fn admit_from_decision(
         decision_ref: &str,
         decision_revision: &str,
-        bindings: QuarantineBindings<'_>,
+        bindings: &QuarantineBindings<'_>,
     ) -> Result<Self, SecurityContractError> {
         assessment_text(decision_ref, "admission.decision_ref")?;
         assessment_text(decision_revision, "admission.decision_revision")?;
@@ -897,7 +897,7 @@ impl AdmittedSourceQuarantine {
     /// Every check is a comparison against a value the closure or the authority
     /// supplied, so an admission cannot be assembled from restated strings that
     /// disagree with the scope it claims to cover.
-    fn bind(bindings: QuarantineBindings<'_>) -> Result<Self, SecurityContractError> {
+    fn bind(bindings: &QuarantineBindings<'_>) -> Result<Self, SecurityContractError> {
         let QuarantineBindings {
             assessed_source,
             permitted_uses,
@@ -920,12 +920,12 @@ impl AdmittedSourceQuarantine {
                 field: "admission.dependency_closure.root_ref",
             });
         }
-        if dependency_closure.state_fence != *state_fence {
+        if dependency_closure.state_fence != **state_fence {
             return Err(SecurityContractError::FenceMismatch);
         }
         // An admission that expects revision zero names no committed
         // predecessor, so there is nothing for the store to compare against.
-        if expected_state_revision == 0 {
+        if *expected_state_revision == 0 {
             return Err(SecurityContractError::QuarantineRevisionUnbound {
                 field: "admission.expected_state_revision",
             });
@@ -943,14 +943,14 @@ impl AdmittedSourceQuarantine {
             });
         }
         Ok(Self {
-            affected_source: assessed_source.clone(),
-            dependency_closure: dependency_closure.clone(),
+            affected_source: (*assessed_source).clone(),
+            dependency_closure: (*dependency_closure).clone(),
             permitted_uses: permitted_uses.to_vec(),
             permitted_effects: permitted_effects.to_vec(),
-            expected_state_revision,
+            expected_state_revision: *expected_state_revision,
             owner: owner.trim().to_owned(),
             release_condition: release_condition.trim().to_owned(),
-            state_fence: state_fence.clone(),
+            state_fence: (*state_fence).clone(),
         })
     }
 
