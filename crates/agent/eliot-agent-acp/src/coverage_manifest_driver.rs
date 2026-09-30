@@ -1,7 +1,8 @@
 //! Coverage-manifest driver for durable host-event ingest (issue #1936, I7.23).
 //!
-//! [`run_coverage_manifest`] is the per-fingerprint production caller: for one
-//! product/session/attempt/route fingerprint it resolves the host-observed
+//! [`run_coverage_manifest`] runs the per-fingerprint flow once the run owner
+//! that knows the fingerprint invokes it: for one product/session/attempt/route
+//! fingerprint it resolves the host-observed
 //! compliance facts for every named stream against the caller-supplied allowed
 //! Tool/Facet manifest revision, verifies the denominator plan binds that same
 //! revision, records the joined coverage denominator through
