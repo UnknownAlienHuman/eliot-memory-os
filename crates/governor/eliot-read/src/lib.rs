@@ -37,12 +37,17 @@
 //! implementation, in [`ReadService`], and the three families
 //! (`state`/`query`/`resource` and their `bound_*` forms) are the only entry
 //! points, all reaching the one engine [`ReadService::execute`]. There is no
-//! second read path, no cache, and no second consistency algorithm.
-//! `provider_memory_feed` is a candidate-only import surface with **no importer
-//! in this repository** (see `reverse_consumers` in the machine-checkable copy);
-//! it declares no read wire shape and grants no promotion authority, so its
-//! items are inventoried as [`owner_inventory::PublicApiKind::OffWire`] rather
-//! than as read-contract members.
+//! second read path, no cache, and no second consistency algorithm. The two
+//! `LocalReadPort` methods declare no intent of their own: each resolves its one
+//! declared row through
+//! [`owner_inventory::local_read_port_binding`], so the port surface and the
+//! owner inventory cannot state different operations, intents or consistency
+//! modes. `provider_memory_feed` is a candidate-only import surface with **no
+//! importer in this repository** (see `reverse_consumers` in the
+//! machine-checkable copy); it declares no read wire shape and grants no
+//! promotion authority, so its items are inventoried as
+//! [`owner_inventory::PublicApiKind::OffWire`] rather than as read-contract
+//! members.
 //!
 //! ```text
 //! public API:        ReadApi, LocalReadPort, ReadService,
@@ -90,6 +95,37 @@
 //! ([`ReadService::execute`]) now resolves all four through the one comparison,
 //! so the coverage a read publishes is the coverage that comparison admitted
 //! rather than a second resolution of it.
+//!
+//! The port surface had the same shape of duplication and it was live. The
+//! [`LocalReadPort`] methods each restated their operation, intent and
+//! consistency mode as a literal at the call site, while the owner's declared
+//! port table stated the same rows and checked them against the Store catalogue —
+//! the table's own documentation claimed the read path consulted it, and the
+//! read path did not. Two places stated one decision and only one of them was
+//! checked. Both methods now resolve their row through
+//! [`owner_inventory::local_read_port_binding`] and build the request from it,
+//! so the declared row is the only statement of the operation, intent,
+//! consistency mode and the two Store-declared selector names. The selector
+//! names in particular are no longer hardcoded strings: they are the names the
+//! Store declaration table resolves, so a port can no longer send a selector the
+//! Store does not declare.
+//!
+//! The other three semantics were measured and each already had exactly one
+//! owner, so nothing was moved:
+//!
+//! * cache: this package holds no cache and no mutable state at all. There is no
+//!   second cache to collapse; [`ReadInvalidationSet`] states the exact
+//!   conditions that void a retained read, and no read in this package is ever
+//!   served from a stored one.
+//! * freshness: [`FreshnessPolicy`] is declared once and carried as a
+//!   [`QueryIntent`] field. Before this change the two port methods each wrote
+//!   their own `QueryIntent` literal, which was a second statement of the same
+//!   freshness choice; they now take it from the declared row.
+//! * revision/order heads: [`ReadOrderingBinding`] is the only order-head
+//!   vocabulary and [`ReadService::execute`] is the only place that reads
+//!   `RevisionHead` sets (before, and again after, the named read). The
+//!   `RevisionHead`/`OrderingHead` types are consumed from `eliot_store_api` and
+//!   never re-declared.
 //!
 //! # Comparison with the current read owner, Store read model and runtime
 //! # status consumers (W2)
@@ -202,6 +238,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::owner_inventory::LocalReadPortMethod;
 
 /// Stable wire name for the Governor read contract.
 pub const CONTRACT_NAME: &str = "eliot.governor.read";
@@ -1609,6 +1647,9 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         subject: String,
         max_records: u32,
     ) -> Result<QueryResult, ReadError> {
+        // Caller-supplied input is validated first, so a malformed subject or
+        // bound is refused as caller error rather than as an owner-resolution
+        // error, exactly as before the port delegated.
         text(&subject, "subject")?;
         if max_records == 0 {
             return Err(ReadError::InvalidField {
@@ -1616,25 +1657,35 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
                 reason: "must be a positive decimal bound".to_owned(),
             });
         }
-        let intent = QueryIntent {
-            mode: QueryMode::Verification,
-            time_scope: TimeScope::EvidenceWindow,
-            branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
-            freshness_policy: FreshnessPolicy::ExactCapturedRecords,
-            required_assurance: RequiredAssurance::VerifierEvidence,
-        };
+        // The operation, the intent, the consistency mode and both selector
+        // names come from the one declared port row, resolved against the Store
+        // declaration table. They are not restated here: a literal written at
+        // this call site would be a second answer to a decision the declared
+        // table already states and checks, and the two could disagree.
+        let binding = owner_inventory::local_read_port_binding(LocalReadPortMethod::EvidenceQuery)?;
+        let subject_selector =
+            binding
+                .subject_selector
+                .ok_or_else(|| ReadError::InvalidField {
+                    field: "local_read_port.EvidenceQuery.subject".to_owned(),
+                    reason: "the store declares no required subject selector".to_owned(),
+                })?;
+        let bound_selector =
+            binding
+                .result_set_bound_selector
+                .ok_or_else(|| ReadError::InvalidField {
+                    field: "local_read_port.EvidenceQuery.result_set_bound".to_owned(),
+                    reason: "the store declares no required bound selector".to_owned(),
+                })?;
         let parameters = NamedParameters::from_map(BTreeMap::from([
-            ("subject".to_owned(), Value::String(subject)),
-            (
-                "max_records".to_owned(),
-                Value::String(max_records.to_string()),
-            ),
+            (subject_selector, Value::String(subject)),
+            (bound_selector, Value::String(max_records.to_string())),
         ]))?;
         let request = QueryRequest {
-            intent,
-            operation: NamedReadOperation::GetEvidencePack,
+            intent: binding.intent,
+            operation: binding.operation,
             scope_id: Some(scope),
-            consistency: ReadConsistency::Eventual,
+            consistency: binding.consistency,
             dependency_revisions: BTreeMap::new(),
             // This port declares no conflict-serialization head dependency: its
             // coherence is proven by the scope-bound evidence projection under
@@ -1670,23 +1721,20 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
                 }
             }
         }
-        let intent = QueryIntent {
-            mode: QueryMode::ContextReconstruction,
-            time_scope: TimeScope::ProjectionWindow,
-            branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
-            freshness_policy: FreshnessPolicy::ProjectionInputsOnly,
-            required_assurance: RequiredAssurance::ReconstructionInputs,
-        };
+        // Same declared row as above: the operation, intent and consistency mode
+        // are resolved once and reused, never restated per method.
+        let binding =
+            owner_inventory::local_read_port_binding(LocalReadPortMethod::ProjectionInputs)?;
         // Facade-valid shape today (scope-bound, admitted intent/operation).
         // `packet_ref` / `material_refs` are validated above but map to no
         // selector yet: no `packet_ref` / `material_refs` parameter mapping
         // exists until MGR04 (#19) declares the storage schema, so no
         // selectors cross and no free text enters the request.
         let request = QueryRequest {
-            intent,
-            operation: NamedReadOperation::GetUnderstandingProjectionInputs,
+            intent: binding.intent,
+            operation: binding.operation,
             scope_id: Some(scope),
-            consistency: ReadConsistency::Eventual,
+            consistency: binding.consistency,
             dependency_revisions: BTreeMap::new(),
             // Explicit no-order-dependency declaration, for the same reason as
             // `evidence_query`: the resolved identity states it rather than
