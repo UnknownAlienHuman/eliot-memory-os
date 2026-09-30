@@ -40,11 +40,11 @@ use eliot_agent_bridge_core::host_event::ToolOutcomeClass;
 use eliot_agent_bridge_core::{
     AgentBridgeCore, Assessment, AssessmentLog, BridgeError, CanonicalDisposition, CommitEvidence,
     CorrelationAssessmentState, CorrelationIdentity, CorrelationIdentityParts, CorrelationStage,
-    DeadlineSweepRequest, EliotEmissionObservation, EmissionCause, FaultEdgeSubmission,
-    HandlerOutcome, HostEventEnvelope, HostEventJoinKeys, NormalizedHostEventPayload,
-    OperationIdentity, OwnerValidatedOperationBinding, StdioEmissionReceipt,
-    TerminalReconcileRequest, reconcile_deadline_sweep, reconcile_terminal_event,
-    submit_derived_fault,
+    CoverageIndeterminacy, CoverageProof, DeadlineSweepRequest, EliotEmissionObservation,
+    EmissionCause, FaultEdgeSubmission, HandlerOutcome, HostEventEnvelope, HostEventJoinKeys,
+    NormalizedHostEventPayload, OperationIdentity, OwnerValidatedOperationBinding,
+    StdioEmissionReceipt, TerminalReconcileRequest, reconcile_deadline_sweep,
+    reconcile_terminal_event, submit_derived_fault,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_protocol::{DeliveryClass, EventEnvelope, EventPayload, ProtocolPayload};
@@ -107,6 +107,14 @@ pub enum HostEventReconciliation {
         state: CorrelationAssessmentState,
         /// Whether the owner filed a transport edge for the revision.
         edge_filed: bool,
+        /// The owner's OWN coverage proof this assessment relied on, carried
+        /// verbatim out of the assessment evidence.
+        ///
+        /// A3 requires the assessment to state whether coverage was complete or
+        /// partial. That is a property of the owner's journal, so it is read
+        /// back from the evidence the owner itself derived rather than
+        /// recomputed or guessed here.
+        coverage: CoverageProof,
     },
     /// The event is not terminal, so it closes no correlation.
     NotTerminal,
@@ -583,19 +591,35 @@ impl BridgeRunner {
         // live `&mut` into `self.correlations` across `&mut self.core` is a
         // borrow error, not a race.
         let latest = record.assessments.latest().cloned();
-        let edge_filed = match latest {
+        let (edge_filed, coverage) = match latest {
             Some(revision) => {
-                matches!(
+                let filed = matches!(
                     submit_derived_fault(&mut self.core, &revision, sequence),
                     FaultEdgeSubmission::Submitted
-                )
+                );
+                // The coverage the assessment actually relied on is read back
+                // out of its OWN retained evidence, never recomputed from the
+                // caller's inputs and never restated from the raw journal. An
+                // assessment that recorded no denominator is reported as the
+                // owner's own absent-denominator indeterminacy, never as a
+                // clean interval.
+                let coverage = revision
+                    .assessment
+                    .evidence
+                    .coverage
+                    .clone()
+                    .unwrap_or(CoverageProof::Indeterminate {
+                        cause: CoverageIndeterminacy::OwnerUnattached,
+                    });
+                (filed, coverage)
             }
-            None => false,
+            None => (false, CoverageProof::NoEventYet),
         };
         Ok(HostEventReconciliation::Resolved {
             correlation_digest: digest,
             state,
             edge_filed,
+            coverage,
         })
     }
 

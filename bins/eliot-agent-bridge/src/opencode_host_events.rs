@@ -488,11 +488,18 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                     // the original decision instead of evaluating a second one.
                     replayed_decision: self.committed_decisions.get(&submission.event_id).cloned(),
                 };
-                // #2899: the event is now in the owner's live journal, so a
-                // terminal invocation can be joined against the correlation it
-                // names. This is the competent host evidence the correlation was
-                // waiting for; nothing before this point could have resolved it.
-                Self::reconcile_admitted_event(self, submission, &admitted);
+                // #2899: this admission deliberately does NOT reconcile a
+                // correlation. The `EventEnvelope` admitted above rides the
+                // bridge-event/ORS route, and that route does not journal a
+                // `HostEventEnvelope`; it is `forward_hook`
+                // (`AgentBridgeCore::observe_host_event`) that files the owner's
+                // terminal host journal, and `reconcile_terminal_host_event`
+                // verifies a candidate against exactly that journal. Looking a
+                // durable event identity up in a journal that by construction
+                // never receives it could only ever miss, so a reconciliation
+                // here would report a permanent "no tracked correlation" and
+                // prove nothing. The join is driven from the ingress that does
+                // populate the journal: `main.rs::handle_forward_hook`.
                 Ok(admitted)
             }
             EventForwardStatus::BestEffortForwarded
@@ -630,71 +637,6 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
             .forward_gap(&coverage)
             .map_err(|error| HostEventAdmissionError::of(bridge_failure(&error)))?;
         Ok(())
-    }
-}
-
-impl BridgeHostEventAdmission<'_> {
-    /// Joins a just-admitted terminal host event onto the correlation it names.
-    ///
-    /// #2899: the host event is now in the OWNER's live journal, so this is
-    /// the first point at which a competent host terminal state exists. The
-    /// join verifies the candidate against that journal, the owner's attach
-    /// binding and the owner's observed route before deriving anything, so a
-    /// stale, foreign, duplicated or reordered event closes nothing current.
-    ///
-    /// A reconciliation failure never fails the admission: the host event is
-    /// already durable, and refusing to admit it because a correlation could
-    /// not be closed would discard a competent observation. The failure is
-    /// reported on stderr instead.
-    fn reconcile_admitted_event(
-        &mut self,
-        submission: &HostEventSubmission,
-        receipt: &HostEventAdmissionReceipt,
-    ) {
-        let Some(inputs) = self.runner.terminal_reduction_inputs() else {
-            return;
-        };
-        let Some(journaled) = inputs
-            .history()
-            .iter()
-            .find(|event| event.event_id.as_str() == receipt.event_id.as_str())
-        else {
-            return;
-        };
-        let now = crate::mcp_correlation::owner_now_unix_ms().unwrap_or(0);
-        let outcome =
-            self.runner
-                .reconcile_terminal_host_event(journaled, &submission.producer_id, now);
-        let (correlation_digest, state, edge_filed, failure) = match outcome {
-            Ok(crate::mcp_correlation::HostEventReconciliation::Resolved {
-                correlation_digest,
-                state,
-                edge_filed,
-            }) => (
-                correlation_digest,
-                state.as_str(),
-                edge_filed,
-                String::new(),
-            ),
-            Ok(crate::mcp_correlation::HostEventReconciliation::NotTerminal) => {
-                (String::new(), "not_terminal", false, String::new())
-            }
-            Ok(crate::mcp_correlation::HostEventReconciliation::NoTrackedCorrelation) => (
-                String::new(),
-                "no_tracked_correlation",
-                false,
-                String::new(),
-            ),
-            Err(error) => (String::new(), "unreconciled", false, error.to_string()),
-        };
-        tracing::info!(
-            host_event_id = %receipt.event_id,
-            correlation_digest = %correlation_digest,
-            assessment_state = state,
-            transport_edge_filed = edge_filed,
-            reconcile_failure = %failure,
-            "mcp host-event correlation reconciliation"
-        );
     }
 }
 

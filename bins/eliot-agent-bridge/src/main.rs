@@ -1576,20 +1576,121 @@ fn forward_receipt_error(error: &BridgeError) -> Response {
 /// cursor, and sequence. The host's own untyped identifier therefore never
 /// names a delivery point on its own: a wire with no typed normalization is
 /// refused before any pending injection moves.
+///
+/// #2899 W4/A2/A3/A8/A10: this is the live stdio → host-event → Agent
+/// Bridge/Kernel correlation producer. `BridgeRunner::forward_hook` is the one
+/// ingress that calls the owner's `observe_host_event`, so it is the only place
+/// the owner's terminal host journal actually receives a `HostEventEnvelope` —
+/// and that journal is precisely what `reconcile_terminal_host_event` verifies a
+/// candidate against before deriving any assessment. The join therefore runs
+/// here, on the ingress that populates the journal, rather than on a durable
+/// `EventEnvelope` admission that could only ever look up an identity the
+/// journal never holds.
+///
+/// The join reads back its own inputs from the owner and the correlation's own
+/// immutable identity, so a stale, foreign, unattributable, duplicated or
+/// reordered event closes nothing current and an exact replay stays idempotent.
+/// A join failure never fails the forward: the host event is already admitted
+/// and durable, and discarding a competent observation because a correlation
+/// could not be closed would lose evidence.
 fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> (Response, bool) {
     match runner.forward_hook(event) {
-        Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
-            Ok(receipts) => (
-                Response::Forwarded {
-                    bootstrap: None,
-                    reactive_receipts: receipts,
-                    event_forwarding: None,
-                },
-                false,
-            ),
-            Err(error) => (forward_receipt_error(&error), false),
-        },
+        Ok(()) => {
+            reconcile_hook_correlation(runner, event);
+            match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
+                Ok(receipts) => (
+                    Response::Forwarded {
+                        bootstrap: None,
+                        reactive_receipts: receipts,
+                        event_forwarding: None,
+                    },
+                    false,
+                ),
+                Err(error) => (forward_receipt_error(&error), false),
+            }
+        }
         Err(error) => forward_dispatch_error(&error),
+    }
+}
+
+/// Joins one admitted hook host event onto the live MCP correlation it names.
+///
+/// The host integration identity is the envelope's OWN validated route
+/// `host_family`, not caller text: that is the identity the host integration
+/// itself stamped on the observation, and a value minted anywhere else would
+/// attribute one integration's completion to another. It is read from the
+/// envelope after the owner admitted and normalized it, so it is an
+/// owner-validated value rather than an untrusted wire string.
+///
+/// The clock is the owner's own reading; an unavailable clock never advances a
+/// deadline on its own, so a missing reading leaves the correlation pending
+/// rather than fabricating a timeout.
+///
+/// Every outcome is reported as a bounded, secret-free line: the correlation
+/// digest, the closed reason code, and whether the revision filed a transport
+/// edge. A refused join is a normal outcome for a host event that is not about
+/// an MCP invocation, so it is not escalated into a fault.
+fn reconcile_hook_correlation(runner: &mut BridgeRunner, event: &HostEventEnvelope) {
+    let now = eliot_agent_bridge::mcp_correlation::owner_now_unix_ms().unwrap_or(0);
+    let integration_id = event.route.host_family.as_str();
+    let outcome = runner.reconcile_terminal_host_event(event, integration_id, now);
+    let (correlation_digest, state, edge_filed, coverage, failure) = match outcome {
+        Ok(eliot_agent_bridge::mcp_correlation::HostEventReconciliation::Resolved {
+            correlation_digest,
+            state,
+            edge_filed,
+            coverage,
+        }) => (
+            correlation_digest,
+            state.as_str(),
+            edge_filed,
+            coverage.as_str(),
+            String::new(),
+        ),
+        Ok(eliot_agent_bridge::mcp_correlation::HostEventReconciliation::NotTerminal) => (
+            String::new(),
+            "not_terminal",
+            false,
+            "not_applicable",
+            String::new(),
+        ),
+        Ok(eliot_agent_bridge::mcp_correlation::HostEventReconciliation::NoTrackedCorrelation) => (
+            String::new(),
+            "no_tracked_correlation",
+            false,
+            "unknown",
+            String::new(),
+        ),
+        Err(error) => (
+            String::new(),
+            "unreconciled",
+            false,
+            "unknown",
+            error.to_string(),
+        ),
+    };
+    tracing::info!(
+        host_event_id = %event.event_id,
+        host_integration = integration_id,
+        correlation_digest = %correlation_digest,
+        assessment_state = state,
+        owner_coverage = coverage,
+        transport_edge_filed = edge_filed,
+        reconcile_failure = %failure,
+        "mcp host-event correlation reconciliation"
+    );
+    // #2899 A3: the no-terminal-event boundary is assessed from the SAME owner
+    // journal, on the SAME owner clock, immediately after the journal advanced.
+    // A host timeout/stuck conclusion therefore requires an owner-proven
+    // complete interval past the admitted deadline; a gap, a rotated journal or
+    // an unattributed correlation stays unknown and is never reported as a
+    // host fault.
+    for (digest, state) in runner.sweep_correlation_deadlines(now) {
+        tracing::info!(
+            correlation_digest = %digest,
+            assessment_state = state.as_str(),
+            "mcp correlation deadline sweep"
+        );
     }
 }
 
