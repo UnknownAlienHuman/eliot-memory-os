@@ -271,6 +271,7 @@ eliot-store-api = { path = "crates/storage/eliot-store-api", version = "0.1.0" }
 eliot-store-surreal-adapter = { path = "crates/storage/eliot-store-surreal-adapter", version = "0.1.0" }
 eliot-blob-api = { path = "crates/storage/eliot-blob-api", version = "0.1.0" }
 eliot-blob = { path = "crates/storage/eliot-blob", version = "0.1.0" }
+eliot-artifact = { path = "crates/instrument/eliot-artifact", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
 eliot-instrument-scip = { path = "crates/instrument/eliot-instrument-scip", version = "0.1.0" }
