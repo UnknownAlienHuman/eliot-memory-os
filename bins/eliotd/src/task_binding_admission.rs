@@ -1751,15 +1751,13 @@ pub fn resolve_task_selection(
 ///
 /// Owner seam, stated exactly: the `TaskContract` revision, `WorkScope`,
 /// principal/session, and fence are rechecked against the live
-/// [`eliot_governor::GovernorActivationSnapshot`], which carries all four;
-/// the acceptance digest and owner-proven selection source/evidence refs rest
-/// on the Governor-compiled receipt (`ColdStartController::compile` through
-/// the retained cold-start terminal) plus structural validation. That snapshot
-/// carries no acceptance digest and no selection source/evidence refs —
-/// verified on this base and on `origin/main` — so a digest/source liveness
-/// recheck against a second live owner value needs that owner extension in
-/// `crates/governor` first; it is named here, never synthesized, never read
-/// from the request.
+/// [`eliot_governor::GovernorActivationSnapshot`]; the acceptance digest is
+/// rechecked against the owner-compiled receipt original
+/// (`TaskBindingState::CurrentTaskContract`), which the activation snapshot
+/// does not carry. The owner-proven selection source/evidence refs rest on the
+/// Governor-compiled receipt (`ColdStartController::compile` through the
+/// retained cold-start terminal) plus structural validation here — never
+/// synthesized, never read from the request.
 pub fn bind_current_task_selection(
     activation: Option<&eliot_governor::GovernorActivationSnapshot>,
     receipt: &OnboardingReadinessReceipt,
@@ -2144,13 +2142,14 @@ pub fn admit_bootstrap_context(
 /// toward the #1742 Material gate
 /// (`GovernorComposition::commit_canonical_with_readiness`) only when the
 /// bootstrap is `Material` and names the same admitted task, `WorkScope`,
-/// presented fence, receipt revision, and governance profile reference as the
-/// sealed binding. Anything else fails closed with a typed error and admits
-/// nothing: `Diagnostic` (including a bootstrap without a task, which always
-/// lands there) withholds with `TASK_SCOPE_INCOMPATIBLE` — a diagnostic
-/// bootstrap is never Material authority — and `IntakeRequired` withholds
-/// with `TASK_SELECTION_REQUIRED`. A moved task, scope, fence, or
-/// bootstrap/profile revision conflicts for rebind; it is never rewritten
+/// presented fence, receipt revision, governance profile reference, and
+/// projection generation as the sealed binding. Anything else fails closed
+/// with a typed error and admits nothing: `Diagnostic` (including a bootstrap
+/// without a task, which always lands there) withholds with
+/// `TASK_SCOPE_INCOMPATIBLE` — a diagnostic bootstrap is never Material
+/// authority — and `IntakeRequired` withholds with `TASK_SELECTION_REQUIRED`.
+/// A moved task, scope, fence, bootstrap/profile revision, or re-projected
+/// bootstrap conflicts for rebind; it is never rewritten
 /// under the old operation identity.
 ///
 /// Cold/unbound and non-task-relative admissions carry no sealed identity and
@@ -2198,6 +2197,14 @@ pub fn require_material_bootstrap_for_task_bound(
     {
         return Err(TaskBindingError::scope_incompatible(
             "task-bound dispatch bootstrap/profile revision moved before effect; rebind at the live revision, no silent rebind",
+        ));
+    }
+    // A re-projected bootstrap under the same receipt revision still conflicts
+    // for rebind: the admitted projection is never silently adopted under the
+    // old operation identity.
+    if material.projection_generation != binding.projection_generation {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap was re-projected before effect; rebind at the live projection, no silent adoption",
         ));
     }
     Ok(())
@@ -2427,14 +2434,16 @@ pub fn admit_canonical_write(
 /// applicability recheck joined in (issue #1746, W4/A2).
 ///
 /// This is [`admit_canonical_write`] preceded by
-/// [`bind_current_task_selection`]: the owner-compiled receipt's acceptance
-/// digest, `TaskContract` revision, `WorkScope`, and owner-proven selection
-/// source/evidence must name exactly what the activation route proved at the
-/// write fence — principal, session, task, non-zero revision, and `WorkScope`.
-/// A receipt that structurally validates but names another task, a moved
-/// revision, another scope, or another fence than the live activation fails
-/// closed here with `TASK_SCOPE_INCOMPATIBLE` before any admission runs, so a
-/// wrong workspace/task or stale selection can never receive a task-bound
+/// [`bind_current_task_selection`]: the owner-compiled receipt's `TaskContract`
+/// revision, `WorkScope`, and owner-proven selection source/evidence must name
+/// exactly what the activation route proved at the write fence — principal,
+/// session, task, non-zero revision, and `WorkScope` — while the acceptance
+/// digest is rechecked against the owner-compiled receipt original, which the
+/// activation snapshot does not carry. A receipt that structurally validates
+/// but names another task, a moved revision, a moved digest, another scope, or
+/// another fence than the live activation fails closed here with
+/// `TASK_SCOPE_INCOMPATIBLE` before any admission runs, so a wrong
+/// workspace/task or stale selection can never receive a task-bound
 /// write. Absent/ambiguous/exploratory/stale dispositions fall through to
 /// [`admit_canonical_write`], which maps them to the cold candidate, the
 /// bounded intake answer, or the typed error without ever promoting.
