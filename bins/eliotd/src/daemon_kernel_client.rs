@@ -1644,26 +1644,39 @@ impl DaemonKernelClient {
     /// correlated by [`Self::send_startup_evidence`]; the producer never
     /// mints identities.
     ///
-    /// The publish's own canonical bytes cannot be the digest input here:
-    /// `EliotdStartupEvidence` carries this very binding inside its
-    /// `transport_binding` field, so
-    /// digesting it here would be self-referential. The retained Kernel
-    /// generation snapshot is the admitted publish scope instead — service,
-    /// protocol, generation, authority epoch, artifact digest, protected
-    /// snapshot digest and principal — and it is exactly what the Kernel
-    /// re-checks against this publish in
-    /// `validate_server_hello`/`daemon_startup_evidence_operation`. The
-    /// resulting binding is therefore a deterministic function of retained
-    /// content, so a byte-identical republish presents the same identity
-    /// rather than a fresh one, and a publish under a different admitted
-    /// snapshot binds to a different identity.
-    pub fn mint_startup_evidence_identity(&self) -> Result<RequestIdentity, super::DaemonError> {
-        let scope = serde_json::to_value(&self.snapshot)
+    /// I5.27: "fields affecting authority, scope, ordering, privacy or
+    /// effect cannot be omitted/defaulted silently". The digest input is
+    /// therefore `content` — the evaluated
+    /// [`StartupEvidenceContent`](super::startup_evidence_producer::StartupEvidenceContent),
+    /// which is the published payload minus exactly one field. Two
+    /// publishes under the same generation that differ in any
+    /// `config_mirror_digest`, `policy_mirror_digest`, capability
+    /// evaluation, evidence ref or bound fence now derive different
+    /// `request_id`, `idempotency_key` and `cancellation_id` values, so the
+    /// Kernel can no longer resolve a second, different publish to the first
+    /// one's receipt.
+    ///
+    /// `content` deliberately excludes `transport_binding`: the payload
+    /// carries this very identity, so a digest over the full payload would
+    /// be a fixed point nobody can compute. That is the one field the
+    /// digest cannot cover, and it is covered by construction instead — the
+    /// caller binds the identity to the same `content` value it was
+    /// derived from (`bind_startup_evidence`), so the identity determines
+    /// every other byte of the payload and a different payload cannot be
+    /// presented under it. The bound `state_fence` is inside `content`, so
+    /// a different generation or authority epoch is still a different
+    /// publish, and `principal_and_scope` still carries this connection.
+    /// No counter, nonce, salt, clock or hidden state participates.
+    pub fn mint_startup_evidence_identity(
+        &self,
+        content: &super::startup_evidence_producer::StartupEvidenceContent,
+    ) -> Result<RequestIdentity, super::DaemonError> {
+        let canonical_content = serde_json::to_value(content)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         self.next_identity(&CanonicalKernelRequest {
             operation: super::startup_evidence_producer::DAEMON_STARTUP_EVIDENCE_OPERATION,
             scope: &self.connection_id,
-            request: &scope,
+            request: &canonical_content,
         })
         .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }

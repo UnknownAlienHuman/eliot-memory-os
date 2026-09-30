@@ -56,9 +56,12 @@
 //! - the transport operation binding is minted by the authenticated channel
 //!   owner (`DaemonKernelClient::mint_startup_evidence_identity`) for this
 //!   exact publish and correlated by `send_startup_evidence`; the producer
-//!   never mints identities. A store-domain `OperationIdentity` has no
-//!   source at daemon startup, so the evidence binds the transport identity
-//!   the Kernel already authenticates instead of synthesizing one.
+//!   never mints identities. It is minted FROM the evaluated
+//!   [`StartupEvidenceContent`], so the identity commits the published
+//!   content rather than the generation snapshot the publish runs under.
+//!   A store-domain `OperationIdentity` has no source at daemon startup, so
+//!   the evidence binds the transport identity the Kernel already
+//!   authenticates instead of synthesizing one.
 //! - policy content comes only from the recovered Governor `PolicyOwner`
 //!   (actual canonical snapshot, fence/revision/digest correlated at
 //!   recovery). In particular the unaccepted 1966 precedence helper is not
@@ -76,6 +79,9 @@
 //!   composition fence, the Kernel-observed protected digest, and the
 //!   recovered Config projection digest; values not yet observable stay
 //!   missing and yield explicit diagnostics instead of a ready claim.
+//!   That site evaluates the content first and mints the transport identity
+//!   from it, because the identity commits the published content and cannot
+//!   be an input to its own digest.
 //!   Publish transport failure never fails the daemon: the existing step-7
 //!   live-receipt path is unchanged and the Kernel keeps steps 8/9 fenced
 //!   until its consumer lands.
@@ -331,6 +337,40 @@ impl EliotdStartupEvidence {
     }
 }
 
+/// The content half of one startup evidence publish: every
+/// [`EliotdStartupEvidence`] field except `transport_binding`, under the
+/// exact field names the wire payload uses.
+///
+/// I5.27 defines idempotency over the canonical bytes an operation commits,
+/// and this publish commits its own `transport_binding`, so that one field
+/// cannot be inside its own digest input (a fixed point nobody can compute).
+/// The content is therefore exactly the committed payload minus that single
+/// self-referential field, and BOTH the digest input and the published
+/// payload are built from this one evaluated value. Every field that affects
+/// effect — the bound fence, the mirror digests, the capability evaluation
+/// and the evidence refs — therefore selects the transport identity, and no
+/// content can be published under an identity that does not commit it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StartupEvidenceContent {
+    /// State fence the evidence is bound to. It equals the transport
+    /// binding fence, so a different generation or authority epoch is a
+    /// different publish and derives a different identity.
+    pub state_fence: StateFence,
+    /// Validated Config mirror digest.
+    pub config_mirror_digest: PlatformHandle,
+    /// Validated Policy mirror digest, or explicit absence.
+    pub policy_mirror_digest: Option<PlatformHandle>,
+    /// Capability registry digest bound to the evaluated outcomes, or
+    /// explicit absence.
+    pub capability_registry_digest: Option<PlatformHandle>,
+    /// Required capability names evaluated, or explicit absence.
+    pub required_capabilities: Option<Vec<String>>,
+    /// Validated outcomes covering the required set, or explicit absence.
+    pub capability_outcomes: Option<Vec<CapabilityOutcome>>,
+    /// Auxiliary evidence references.
+    pub evidence_refs: Vec<PlatformHandle>,
+}
+
 /// Evaluates one mirror rebuild output: present, well-formed, and byte-equal
 /// between the canonical source and the rebuilt mirror.
 ///
@@ -476,37 +516,34 @@ fn evaluate_required_capabilities(
     Ok(bound)
 }
 
-/// Builds the authenticated startup evidence payload from one threaded
-/// observation (I1.11 steps 8 and 9).
+/// Evaluates the content half of one threaded observation: every owned
+/// evaluation that does not need the transport binding, yielding exactly
+/// the fields the wire payload carries besides `transport_binding`.
+///
+/// The binding is deliberately not an input here. It is the field the
+/// publish commits and the field the transport identity is derived FROM, so
+/// the content must be evaluable before the identity exists; that ordering
+/// is what lets the identity be a function of the committed content instead
+/// of of the generation snapshot the publish merely runs under.
 ///
 /// Fail-closed order: the observed Kernel fence validates first; the
-/// transport binding and operation fence must be present, valid, exactly
-/// equal, and compatible with the Kernel observation; the Config mirror
-/// must reproduce its canonical source. Policy and capability inputs whose
-/// owners do not exist yet build as explicit absence markers (never
-/// satisfied, never blocking the acquirable evidence); a partially observed
-/// capability evaluation blocks. The first blocker wins and names its
-/// prerequisite.
+/// operation fence must be present, valid and compatible with the Kernel
+/// observation; the Config mirror must reproduce its canonical source.
+/// Policy and capability inputs whose owners do not exist yet evaluate as
+/// explicit absence markers (never satisfied, never blocking the acquirable
+/// evidence); a partially observed capability evaluation blocks.
 ///
 /// # Errors
 ///
 /// Returns [`StartupEvidenceError`] naming the blocking prerequisite. A
 /// missing acquirable source is explicit not-ready evidence, never a ready
 /// claim.
-pub fn build_startup_evidence(
+pub fn evaluate_startup_evidence_content(
     request: &StartupEvidenceRequest,
-) -> Result<EliotdStartupEvidence, StartupEvidenceError> {
+) -> Result<StartupEvidenceContent, StartupEvidenceError> {
     request.observed_kernel_fence.validate().map_err(|error| {
         StartupEvidenceError::Contract(format!("observed kernel fence: {error}"))
     })?;
-    let Some(binding) = &request.transport_binding else {
-        return Err(StartupEvidenceError::Missing(
-            "no transport operation binding was observed".to_owned(),
-        ));
-    };
-    binding
-        .validate()
-        .map_err(|error| StartupEvidenceError::Contract(format!("transport binding: {error}")))?;
     let Some(operation_fence) = &request.operation_fence else {
         return Err(StartupEvidenceError::Missing(
             "no operation fence was observed".to_owned(),
@@ -515,11 +552,6 @@ pub fn build_startup_evidence(
     operation_fence
         .validate()
         .map_err(|error| StartupEvidenceError::Contract(format!("operation fence: {error}")))?;
-    if *operation_fence != binding.request.state_fence {
-        return Err(StartupEvidenceError::Mismatch(
-            "operation fence must equal the transport binding fence".to_owned(),
-        ));
-    }
     if !operation_fence.is_compatible_with(&request.observed_kernel_fence) {
         return Err(StartupEvidenceError::Mismatch(
             "operation fence is not compatible with the observed kernel fence (wrong generation or epoch)"
@@ -556,8 +588,7 @@ pub fn build_startup_evidence(
                 ));
             }
         };
-    let evidence = EliotdStartupEvidence {
-        transport_binding: binding.clone(),
+    Ok(StartupEvidenceContent {
         state_fence: operation_fence.clone(),
         config_mirror_digest: config_digest,
         policy_mirror_digest: policy_digest,
@@ -565,9 +596,78 @@ pub fn build_startup_evidence(
         required_capabilities: required,
         capability_outcomes: outcomes,
         evidence_refs: request.evidence_refs.clone(),
+    })
+}
+
+/// Attaches the transport identity minted for one evaluated content to that
+/// exact content, producing the wire payload.
+///
+/// The binding must be a validated identity whose fence equals the content's
+/// bound fence, so evidence can never ride a binding minted for another
+/// publish. The resulting payload is byte-for-byte the evaluated content
+/// plus that one binding — the same two halves the channel owner digested to
+/// derive the binding.
+///
+/// # Errors
+///
+/// Returns [`StartupEvidenceError::Contract`] when the binding fails its own
+/// validator or the assembled payload is malformed, and
+/// [`StartupEvidenceError::Mismatch`] when the binding fence is not the
+/// content's fence.
+pub fn bind_startup_evidence(
+    content: StartupEvidenceContent,
+    binding: &RequestIdentity,
+) -> Result<EliotdStartupEvidence, StartupEvidenceError> {
+    binding
+        .validate()
+        .map_err(|error| StartupEvidenceError::Contract(format!("transport binding: {error}")))?;
+    if content.state_fence != binding.request.state_fence {
+        return Err(StartupEvidenceError::Mismatch(
+            "operation fence must equal the transport binding fence".to_owned(),
+        ));
+    }
+    let evidence = EliotdStartupEvidence {
+        transport_binding: binding.clone(),
+        state_fence: content.state_fence,
+        config_mirror_digest: content.config_mirror_digest,
+        policy_mirror_digest: content.policy_mirror_digest,
+        capability_registry_digest: content.capability_registry_digest,
+        required_capabilities: content.required_capabilities,
+        capability_outcomes: content.capability_outcomes,
+        evidence_refs: content.evidence_refs,
     };
     evidence.validate()?;
     Ok(evidence)
+}
+
+/// Builds the authenticated startup evidence payload from one threaded
+/// observation that already carries its transport binding (I1.11 steps 8
+/// and 9).
+///
+/// This is the single-call form for a caller that already holds the
+/// binding. The publish site cannot use it, because the binding must be
+/// minted from the evaluated content (see
+/// [`evaluate_startup_evidence_content`]); it calls those two steps in
+/// order instead. Fail-closed order: the transport binding must be present;
+/// the content evaluation validates the observed Kernel fence, the
+/// operation fence and the mirrors; the binding fence must equal the content
+/// fence exactly. The first blocker wins and names its prerequisite.
+///
+/// # Errors
+///
+/// Returns [`StartupEvidenceError`] naming the blocking prerequisite. A
+/// missing acquirable source is explicit not-ready evidence, never a ready
+/// claim.
+pub fn build_startup_evidence(
+    request: &StartupEvidenceRequest,
+) -> Result<EliotdStartupEvidence, StartupEvidenceError> {
+    let Some(binding) = &request.transport_binding else {
+        return Err(StartupEvidenceError::Missing(
+            "no transport operation binding was observed".to_owned(),
+        ));
+    };
+    let content = evaluate_startup_evidence_content(request)?;
+    bind_startup_evidence(content, binding)
 }
 
 /// Retained capability-model evaluation at the startup boundary (I1.11 step 9).
@@ -674,9 +774,6 @@ pub fn publish_daemon_startup_evidence(
     }
     let observed = kernel.kernel_fence();
     let outcome = (|| -> Result<EliotdStartupEvidence, StartupEvidenceError> {
-        let binding = kernel.mint_startup_evidence_identity().map_err(|error| {
-            StartupEvidenceError::Contract(format!("transport binding mint: {error}"))
-        })?;
         let canonical = PlatformHandle::new(
             composition
                 .kernel_snapshot()
@@ -715,7 +812,11 @@ pub fn publish_daemon_startup_evidence(
             None => None,
         };
         let request = StartupEvidenceRequest {
-            transport_binding: Some(binding.clone()),
+            // Minted below from the evaluated content, so it cannot be an
+            // input here: the binding is the field the publish commits, and
+            // an identity cannot digest itself. `bind_startup_evidence`
+            // completes the payload once the identity exists.
+            transport_binding: None,
             operation_fence: Some(composition.kernel_snapshot().state_fence()),
             observed_kernel_fence: observed,
             config_mirror: Some(MirrorObservation {
@@ -741,7 +842,16 @@ pub fn publish_daemon_startup_evidence(
             evidence_refs: Vec::new(),
             now_unix_ms,
         };
-        let evidence = build_startup_evidence(&request)?;
+        let content = evaluate_startup_evidence_content(&request)?;
+        // Mint AFTER the content exists: the identity is derived from the
+        // exact fields this publish commits, so two different publishes
+        // under one generation can no longer share an identity.
+        let binding = kernel
+            .mint_startup_evidence_identity(&content)
+            .map_err(|error| {
+                StartupEvidenceError::Contract(format!("transport binding mint: {error}"))
+            })?;
+        let evidence = bind_startup_evidence(content, &binding)?;
         kernel
             .send_startup_evidence(&evidence, binding)
             .map_err(|error| {
