@@ -3828,9 +3828,10 @@ pub struct EvidenceFreeze {
 /// [`crate::source_admissibility::FreezeCommitment`] draws, and the bytes
 /// themselves live on the record that retains them
 /// ([`InquiryGovernance::retained_revisions`]), which re-runs each revision's own
-/// `verify_integrity` on readback. What this adds over that sibling is the
-/// direction: the freeze names the receipt that authorised its own member, so the
-/// freeze can be checked on its own bytes rather than only by correlation.
+/// `verify_integrity`. What this adds over that sibling is the **direction**: the
+/// freeze names the receipt that authorised its own member, so the freeze states
+/// what admitted and persisted it on its own bytes, instead of leaving a reader
+/// to correlate a sibling record to discover it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FreezeMemberReceipt {
     /// The admitted source handle. Equal to this receipt's position in
@@ -4205,14 +4206,14 @@ impl EvidenceFreeze {
             });
         }
         self.validate_successor()?;
-        // The readback half of the receipt relation `freeze` establishes at
-        // construction. The constructor's check runs on the arguments; this one
-        // runs on the record's own stored fields, which is what a reader of a
-        // **reloaded** record has and what the constructor's check cannot reach —
-        // the two are the same relation asked of two different carriers, and a
-        // record that lost a receipt between construction and publication, or
-        // carried one under a handle it does not include, is refused here rather
-        // than presented as a freeze whose members are all receipted.
+        // The receipt relation asked of the STORED fields, not of the
+        // constructor's arguments. The constructor already ran the same rule over
+        // the values it was handed, so re-running it here over those same values
+        // would be a restatement; running it over `self` is what covers a value
+        // that was persisted and re-read, or otherwise edited between construction
+        // and publication. A record that lost a receipt, or carries one under a
+        // handle it does not include, is refused here rather than presented as a
+        // freeze whose members are all receipted.
         self.validate_member_receipts()?;
         if self.compute_digest() != self.digest {
             return Err(InquiryError::IntegrityMismatch {
@@ -4225,10 +4226,16 @@ impl EvidenceFreeze {
     /// Re-proves that every included member carries its own admission and
     /// persistence receipt, filed under its own handle.
     ///
-    /// Stated once and called from the constructor and from
-    /// [`Self::validate_integrity`] so a record that is built and a record that is
-    /// read back are held to the identical relation rather than to a construction
-    /// rule that readback only inherits by accident.
+    /// Stated once and asked of two different carriers, which is the whole point
+    /// of it being a method rather than inline constructor code. The constructor
+    /// asks it of the arguments it was handed; `validate_integrity` asks the
+    /// identical relation of the **record's own stored fields**. A validator that
+    /// only ever saw the constructor's arguments would be a live-path check: it
+    /// would hold for a value that was just built and say nothing about the same
+    /// value after it has crossed a storage round trip and lost a field. Asking it
+    /// of the stored fields is what makes the check survive that round trip, so
+    /// the moment any owner persists and re-reads this record the reloaded value
+    /// is held to the same relation as the live one.
     ///
     /// The receipt's own fields are shape-checked, not just counted: a receipt
     /// whose `content_digest` is not a digest names no revision, and a receipt
@@ -9615,16 +9622,23 @@ fn evidence_freeze(
     //   owner's own `RetainedSourceRevision` values, which its `retain` already
     //   re-proved against that same content digest.
     //
-    // A member with no retained original therefore produces no receipt, and since
-    // the receipt list must stand in one-to-one relation with the included set,
-    // the freeze is refused rather than published with a member it cannot name a
-    // persistence receipt for. That is not a new refusal: this is the same
-    // eligible-and-retained filter `commit_freeze_through_source_admission` and
-    // `CommittedFreeze::commit` already build their members from, applied one
-    // step earlier. A run that never persisted anything now produces no freeze at
-    // all instead of a freeze that claims members it retained nothing for — and
-    // `commit_freeze_through_source_admission` would have refused the same run one
-    // step later with no request to commit.
+    // A member with no retained original produces no receipt, and since the
+    // receipt list must stand in one-to-one relation with the included set, the
+    // freeze is refused rather than published with a member it cannot name a
+    // persistence receipt for.
+    //
+    // This is a **generalisation of an existing refusal, not a new one**. Before
+    // this field, `validate_source_admission_requests` already required every
+    // included handle that was eligible AND retained to carry a request, and
+    // `CommittedFreeze::commit` already refused an empty request set, so a run
+    // admitting a member it retained nothing for was already refused — one step
+    // later, with a less specific field. The receipt requirement only makes the
+    // same condition decidable at the freeze itself, which is what lets the
+    // record name its own authorising receipt instead of requiring a reader to
+    // correlate a sibling record to learn it. `included` is deliberately NOT
+    // narrowed to retained members: narrowing it here would publish a freeze
+    // whose denominator is silently smaller than the admitted one, and the
+    // denominator is what the release gate reasons over.
     let retained = &observation.retained_revisions;
     let mut member_receipts: Vec<FreezeMemberReceipt> = Vec::with_capacity(included.len());
     for handle in &included {
