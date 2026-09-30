@@ -1,5 +1,7 @@
 //! Public assembly operation and its explicit phases.
 
+use std::collections::BTreeMap;
+
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe, MeasurementStatus,
     QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
@@ -273,6 +275,7 @@ fn require_graded_output(
                 operation: QualityOperation::Compile,
                 blocking: Vec::new(),
                 unresolved_applicability: Vec::new(),
+                missing_evidence: BTreeMap::new(),
             }),
         ));
     }

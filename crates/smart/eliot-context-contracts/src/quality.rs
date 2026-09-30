@@ -761,7 +761,7 @@ impl QualityEvidenceExpectation {
 /// `Unsupported`, `Stale`, `Transformed` and `Unknown` are all `false`: none of
 /// them is a current observation, and an unknown count is never zero and never
 /// a proven error. See `STITCH`.
-pub trait ObservationOwnerRecheck {
+pub trait ObservationOwnerRecheck: std::fmt::Debug {
     /// Revalidate the owner's own observation for this reference and return
     /// whether it is a current exact observation.
     fn revalidate(&self, reference: &MeasurementRef) -> Result<bool, ContextError>;

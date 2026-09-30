@@ -1,6 +1,6 @@
 //! Assembled view and intrinsic selection-integrity proof.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, ContractVersion, SourceId, canonical_json_bytes, sha256_hex};
 use eliot_evidence::{Assertability, EpistemicStatus};
@@ -382,6 +382,7 @@ impl ActiveUnderstandingView {
             operation,
             blocking: Vec::new(),
             unresolved_applicability: Vec::new(),
+            missing_evidence: BTreeMap::new(),
         })?;
         self.quality.suitability(operation, additional_required)
     }
