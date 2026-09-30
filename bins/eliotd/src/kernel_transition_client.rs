@@ -566,7 +566,7 @@ impl KernelTransitionPort for DaemonKernelClient {
 /// owner-issued task selection evidence and an independent Host observation.
 /// The wrapped transport remains the same authenticated daemon client; only
 /// the pre-transport gate receives the retained selection bundle.
-pub(crate) struct OwnerSelectionKernelPort<'a> {
+pub struct OwnerSelectionKernelPort<'a> {
     kernel: &'a DaemonKernelClient,
     request_identity: (&'a str, &'a str, &'a str, &'a str),
     owner: &'a eliot_governor::TaskSelectionAdmissionBinding,
@@ -575,7 +575,7 @@ pub(crate) struct OwnerSelectionKernelPort<'a> {
 }
 
 impl<'a> OwnerSelectionKernelPort<'a> {
-    pub(crate) fn new(
+    pub fn new(
         kernel: &'a DaemonKernelClient,
         request_identity: (&'a str, &'a str, &'a str, &'a str),
         owner: &'a eliot_governor::TaskSelectionAdmissionBinding,
