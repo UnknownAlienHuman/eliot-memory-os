@@ -1137,8 +1137,7 @@ impl DaemonComposition {
             eliot_workscope::RequestedEffect::CanonicalWrite,
         )
         .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
-        let admission = if crate::task_binding_admission::envelope_is_task_relative(&envelope)
-        {
+        let admission = if crate::task_binding_admission::envelope_is_task_relative(&envelope) {
             // Issue #1746 (W4/A2): a task-relative write is admitted only
             // against the live Governor-resolved activation, never on the
             // caller-presented receipt alone. The lease key terms come from

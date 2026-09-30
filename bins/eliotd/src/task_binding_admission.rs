@@ -888,13 +888,10 @@ pub fn requirement_for_named_mutation(
 #[must_use]
 pub fn envelope_is_task_relative(envelope: &CanonicalWriteEnvelope) -> bool {
     envelope.task_id.is_some()
-        || envelope
-            .semantic_commands
-            .iter()
-            .any(|command| {
-                requirement_for_named_mutation(command.operation)
-                    == CanonicalOperationRequirement::TaskRelativeEffectful
-            })
+        || envelope.semantic_commands.iter().any(|command| {
+            requirement_for_named_mutation(command.operation)
+                == CanonicalOperationRequirement::TaskRelativeEffectful
+        })
 }
 
 /// Daemon dispatch entrypoint presenting one admission attempt
@@ -1946,7 +1943,8 @@ pub struct MaterialBootstrap {
 /// compiled [`OnboardingReadinessReceipt`], the [`IntegrationCoverageProfile`],
 /// and the derived [`GovernanceProfile`], all bound to the same
 /// session/scope/task-or-selection-state and source revisions: receipt/lease,
-/// principal/session, scope/instance/lineage, task binding, state fence,
+/// principal/session, scope/descriptor-revision/instance/lineage,
+/// scope-resolution state, task binding, state fence,
 /// governing-source set/generation, governance/route profile refs, receipt
 /// revision, and projection source/generation must name the same values on
 /// both sides, or the join fails closed with `TASK_SCOPE_INCOMPATIBLE`.
@@ -2033,6 +2031,15 @@ pub fn admit_bootstrap_context(
     bound("principal", &receipt.principal_ref, &surface.principal_ref)?;
     bound("session", &receipt.session_ref, &surface.session_ref)?;
     bound("scope", &receipt.scope.scope_ref, &surface.scope.scope_ref)?;
+    // Issue #1746, W3: the scope descriptor revision is part of the bound
+    // scope identity (I4.2.1 `session_task_and_expected_scope_revision`). A
+    // surface projected for another descriptor revision is another scope
+    // binding, never silently adopted under this receipt.
+    if receipt.scope_descriptor_revision != surface.scope_descriptor_revision {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another scope descriptor revision",
+        ));
+    }
     bound(
         "instance",
         &receipt.instance.instance_ref,
@@ -2057,6 +2064,14 @@ pub fn admit_bootstrap_context(
     if !eliot_contracts::fences_match_exact(&receipt.state_fence, &surface.state_fence) {
         return Err(TaskBindingError::scope_incompatible(
             "bootstrap surface was projected at another fence",
+        ));
+    }
+    // Issue #1746, W5: the scope resolution state is owner-issued on both
+    // sides for this same receipt/projection. A surface disagreeing on whether
+    // the scope is authenticated withholds instead of admitting.
+    if receipt.scope_resolution != surface.scope_resolution {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another scope resolution state",
         ));
     }
     bound(
