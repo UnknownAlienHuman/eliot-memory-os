@@ -23,7 +23,8 @@ use super::super::{
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallerServiceRegistrationApproval, PendingActivation, PendingActivationAbortReceipt,
-    PendingActivationState, PlatformHandle, ResourceGeneration, StateFence,
+    PendingActivationState, PlatformHandle, PreparedDestinationAdmission, ResourceGeneration,
+    StateFence,
 };
 
 use super::{PendingActivationTerminal, PendingActivationTerminalDisposition};
@@ -208,6 +209,15 @@ pub(super) struct RegistryWireV11 {
     /// migration.
     #[serde(default)]
     committed_cutover_activation: Option<CommittedCutoverActivation>,
+    /// Destination installations allocated and admitted as PREPARED but never
+    /// activated (#958, A2).  A registry written before #958 has no such member
+    /// and decodes as empty; it is `Vec` rather than a `RequiredOption` for the
+    /// same reason `committed_cutover_activation` is optional — an absent
+    /// optional collection is a valid earlier state, not a schema migration, and
+    /// `skip_serializing_if` keeps the projection identity of every registry
+    /// written before this member byte-identical.
+    #[serde(default)]
+    prepared_isolated_destinations: Vec<PreparedDestinationAdmission>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -254,6 +264,7 @@ impl RegistryWireV11 {
                 .0
                 .map(ActivePhaseBRebindWireV11::into_rebind),
             committed_cutover_activation: self.committed_cutover_activation,
+            prepared_isolated_destinations: self.prepared_isolated_destinations,
         }
     }
 }
