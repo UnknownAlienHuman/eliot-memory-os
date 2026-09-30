@@ -199,7 +199,7 @@ pub fn issue_source_artifact_admission(
         .map_err(|_| SourceArtifactAdmissionError::FenceEncoding)?;
     if active.state_fence.canonical_json.as_bytes() != fence_json.as_slice()
         || active.state_fence.observed_authority_epoch
-            != input.work_scope.state_fence.authority_epoch.value()
+            != input.work_scope.state_fence.authority_epoch.sequence.get()
     {
         return Err(SourceArtifactAdmissionError::Binding(
             "active reservation fence or epoch differs from the current WorkScope",
@@ -246,7 +246,7 @@ pub fn issue_source_artifact_admission(
     let authority_binding = action_lease.authority_binding.clone();
     Ok(SourceArtifactAdmission {
         action_lease,
-        authorized_effect: compiled.authorized,
+        authorized_effect: compiled.authorized().clone(),
         holder: input.holder,
         work_scope: input.work_scope,
         task: input.task,

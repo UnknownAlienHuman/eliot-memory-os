@@ -181,8 +181,8 @@ impl SourceArtifactBlobProfile {
         let snapshot = policy_owner.snapshot();
         snapshot
             .validate()
-            .map_err(|_| SourceArtifactBlobProfileError::InvalidPolicySnapshot)?;
-        if policy_owner.state_fence() != admission.work_scope().state_fence
+            .map_err(SourceArtifactBlobProfileError::InvalidPolicySnapshot)?;
+        if policy_owner.state_fence() != &admission.work_scope().state_fence
             || snapshot.state_fence != admission.work_scope().state_fence
             || snapshot.scope_id != admission.work_scope().scope_id.as_str()
             || snapshot.revision.value() != policy_owner.revision()
@@ -393,8 +393,8 @@ pub enum SourceArtifactBlobProfileError {
     #[error("source-artifact setting is invalid: {setting_key}")]
     InvalidSetting { setting_key: &'static str },
     /// The retained Policy snapshot failed its own owner validation.
-    #[error("retained source-artifact Policy snapshot is invalid")]
-    InvalidPolicySnapshot,
+    #[error("retained source-artifact Policy snapshot is invalid: {0}")]
+    InvalidPolicySnapshot(#[source] eliot_config::ConfigError),
     /// Policy owner snapshot does not match this exact admitted WorkScope/fence/revision.
     #[error("source-artifact Policy snapshot does not bind the admitted WorkScope and fence")]
     PolicyBindingMismatch,
