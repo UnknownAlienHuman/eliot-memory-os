@@ -120,8 +120,9 @@ use crate::user_automation_orchestration::{
 };
 #[cfg(windows)]
 use crate::{
-    AuthenticatedMaintenanceTriggerSession, KernelServiceError, MaintenanceTriggerDeliveryError,
-    MaintenanceTriggerDeliveryLedger, MaintenanceTriggerDeliveryRow,
+    AuthenticatedMaintenanceTriggerSession, KernelServiceError, MaintenanceTriggerClaimRequest,
+    MaintenanceTriggerDeliveryError, MaintenanceTriggerDeliveryLedger, MaintenanceTriggerDeliveryRow,
+    handle_maintenance_trigger_claim,
 };
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
@@ -3082,6 +3083,87 @@ impl KernelStoreGateway {
         })?;
         let receipt = ledger.admit_intake(record)?;
         Ok((receipt, ledger.durable_rows()))
+    }
+
+    /// Issues one finite fenced claim over the owned delivery ledger (issue
+    /// #1694 W3).
+    ///
+    /// I14.22 keeps the trigger durable while the evaluator is unavailable;
+    /// the claim is how a compatible, authenticated replacement generation
+    /// takes bounded custody of it. The request binds the trigger identity,
+    /// the claiming daemon fence/session, a stable delivery identity, and a
+    /// finite deadline. The [`handle_maintenance_trigger_claim`] seam
+    /// re-proves the presenting fence against live Kernel authority before
+    /// the owned [`MaintenanceTriggerDeliveryLedger`] issues the claim, so an
+    /// old-generation request fails before any ledger transition and a
+    /// revoked consumer stays refused. An exact retry (same revision,
+    /// delivery identity, fence, session) returns the live claim; a
+    /// concurrent claim under another identity conflicts; a claim against a
+    /// settled identity conflicts and reconciles through the recorded receipt
+    /// or terminal disposition instead. Claim timeout never renames the
+    /// trigger: the owner releases the expired claim back to `Pending` under
+    /// the same identity. The returned rows are the ledger's durable snapshot
+    /// for the store owner to persist. The daemon transport caller that
+    /// presents the request stays STITCH (front-door/daemon composition).
+    #[cfg(windows)]
+    pub fn issue_maintenance_trigger_claim(
+        &self,
+        principal_ref: &str,
+        request: MaintenanceTriggerClaimRequest,
+    ) -> Result<
+        (
+            MaintenanceTriggerClaim,
+            Vec<MaintenanceTriggerDeliveryRow>,
+        ),
+        MaintenanceTriggerDeliveryError,
+    > {
+        let _flight = self.flight.enter().map_err(|message| {
+            if self.is_fenced() {
+                MaintenanceTriggerDeliveryError::Service(KernelServiceError::GenerationFenced)
+            } else {
+                MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(message))
+            }
+        })?;
+        // Every mutating entry refuses `shadow_no_authority` first. The exact
+        // service error is preserved (not flattened) so the caller sees the
+        // closed admission refusal.
+        {
+            let service = self.service.lock().map_err(|_| {
+                MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(
+                    "Kernel service lock poisoned".to_owned(),
+                ))
+            })?;
+            service
+                .admit_shadow_effect()
+                .map_err(MaintenanceTriggerDeliveryError::Service)?;
+        }
+        // Bind the session from live authority; the guard is released before
+        // any ledger work below.
+        let session = {
+            let service = self.service.lock().map_err(|_| {
+                MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(
+                    "Kernel service lock poisoned".to_owned(),
+                ))
+            })?;
+            AuthenticatedMaintenanceTriggerSession::bind(&service, principal_ref)
+                .map_err(MaintenanceTriggerDeliveryError::Service)?
+        };
+        // Re-prove liveness under a fresh guard, then issue under both
+        // guards, service-first and ledger-second. The seam re-validates the
+        // session and the request's current fence against the live
+        // epoch/generation before the ledger transition.
+        let service = self.service.lock().map_err(|_| {
+            MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(
+                "Kernel service lock poisoned".to_owned(),
+            ))
+        })?;
+        let mut ledger = self.maintenance_triggers.lock().map_err(|_| {
+            MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(
+                "maintenance trigger ledger lock poisoned".to_owned(),
+            ))
+        })?;
+        let claim = handle_maintenance_trigger_claim(&service, &session, &mut ledger, request)?;
+        Ok((claim, ledger.durable_rows()))
     }
 
     /// Returns one bounded, restart-stable page of retained trigger lifecycle
