@@ -5413,6 +5413,43 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             })
     }
 
+    /// Appends one delayed utility evaluation to a retained maintenance job.
+    ///
+    /// The maintenance owner reads its own retained obligation chain, runs the
+    /// delayed comparison over it, and appends the resulting evaluation revision
+    /// through the same Kernel durable-job ledger the lifecycle transitions and
+    /// receipt admissions already write through. Nothing here concludes utility:
+    /// the verdict is the observation contract's own predicate over the evidence
+    /// the caller supplied, and every metric that comparison did not observe
+    /// stays explicitly unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not
+    /// ready, and [`CompositionError::Recovery`] when the maintenance owner
+    /// refuses the evaluation. The owner's own [`MaintenanceError`] is
+    /// preserved in the detail so a malformed comparison stays distinguishable
+    /// from a transport failure.
+    pub fn evaluate_maintenance_utility(
+        &mut self,
+        job_id: &str,
+        evaluation_window: eliot_observation_contracts::CoverageInterval,
+        evidence: &eliot_maintenance::UtilityEvaluationEvidence,
+    ) -> Result<MaintenanceJob, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        self.owners
+            .maintenance
+            .evaluate_utility(job_id, &fence, evaluation_window, evidence)
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "maintenance utility evaluation was not appended: {error}"
+                ))
+            })
+    }
+
     /// Returns the retained durable maintenance job for one exact job identity.
     ///
     /// The read goes through the same authenticated Kernel durable-job route the

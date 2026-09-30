@@ -29,6 +29,7 @@ pub mod improvement_pipeline;
 mod outcome_observation;
 pub mod result_obligation;
 mod trigger_intake;
+pub mod utility_evaluation;
 
 pub use outcome_observation::{
     AdmittedObservationReceipt, ExpectedOutcomeObservation, MaintenanceOutcomeDisposition,
@@ -43,6 +44,12 @@ pub use result_obligation::{
     FOLLOW_UP_PENDING_REASON, MAINTENANCE_OBLIGATION_CONTRACT_VERSION, MAX_RESULT_OBLIGATIONS,
     MaintenanceResultObligation, NOT_APPLICABLE_REASON, SOURCE_EVALUATION_METHOD,
     SOURCE_EVALUATION_METHOD_REVISION, maintenance_observation_record,
+};
+
+pub use utility_evaluation::{
+    MEASUREMENT_UNOBSERVED_REASON, MaintenanceUtilityEvaluation, RequiredUtilityMetric,
+    UtilityEvaluationEvidence, UtilityMetricMeasurement, append_utility_evaluation,
+    evaluate_maintenance_utility, result_is_evaluable,
 };
 
 pub use end_of_activity::{
@@ -1173,6 +1180,53 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         if next == job {
             return Ok(job);
         }
+        self.store.save(&next)?;
+        Ok(next)
+    }
+
+    /// Appends one delayed utility evaluation to a job's retained obligation
+    /// chain and persists it.
+    ///
+    /// This is the durable half of the delayed evaluation path. The evaluation
+    /// is appended onto the same revision — through the same
+    /// [`MaintenanceStateStore::save`] every lifecycle transition and receipt
+    /// admission already uses — so the evaluation and the job state it
+    /// describes become durable together or in neither. Re-presenting an
+    /// identical evaluation appends nothing new: the appended revision already
+    /// carries an evaluation, so the owner refuses a second one and the same
+    /// evidence republishes the same record under the same identity.
+    ///
+    /// It reaches no trigger, admits no job and appends no lifecycle
+    /// transition, so repeated evaluation of an unchanged result produces one
+    /// appended revision and never a chain of new maintenance results.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] when an identity is empty,
+    /// when the job is not retained, or when the evaluation does not append
+    /// onto the job's latest obligation; [`MaintenanceError::FenceMismatch`]
+    /// for a stale or mismatched fence; [`MaintenanceError::Store`] when the
+    /// port refuses the write; and every [`MaintenanceError`] from
+    /// [`append_utility_evaluation`].
+    pub fn evaluate_utility(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+        evaluation_window: eliot_observation_contracts::CoverageInterval,
+        evidence: &UtilityEvaluationEvidence,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
+        let job = self.load_checked(job_id, fence)?;
+        let source = job
+            .result_obligations
+            .last()
+            .ok_or(MaintenanceError::InvalidField("job.result_obligations"))?;
+        let evaluation = evaluate_maintenance_utility(
+            source,
+            &job.result_obligations,
+            evaluation_window,
+            evidence,
+        )?;
+        let next = append_utility_evaluation(&job, &evaluation)?;
         self.store.save(&next)?;
         Ok(next)
     }
