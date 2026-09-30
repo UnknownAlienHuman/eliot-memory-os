@@ -7,7 +7,6 @@
 //! request bindings. Durable Blob availability alone is never projected as
 //! source admissibility.
 
-use std::future::Future;
 use std::path::Path;
 
 use eliot_artifact::{
@@ -25,6 +24,9 @@ use eliot_blob_api::{
 use eliot_governor::{
     SourceArtifactAdmission, SourceArtifactBlobProfile, SourceArtifactBlobProfileError,
     SourceArtifactRetentionClass,
+};
+use eliot_lsp_bridge::{
+    LSP_TOOL_OBSERVATION_RECEIPT_KIND, LspAdoptionProjection, RetainedLspObservationV1,
 };
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::WindowsPlatform;
@@ -75,6 +77,14 @@ pub enum SourceArtifactOwnerError {
     CapturedPayload(#[from] eliot_store_api::StoreError),
     #[error("captured payload does not identify an LSP observation envelope")]
     WrongCapturedPayloadKind,
+    #[error("generic source staging cannot use the reserved LSP observation operation kind")]
+    ReservedLspObservationOperationKind,
+    #[error("LSP observation publication requires the exact admitted request and live bridge projection")]
+    LspObservationBindingMismatch,
+    #[error("LSP observation publication requires its reserved operation kind")]
+    WrongLspObservationOperationKind,
+    #[error("captured LSP observation payload could not be decoded: {0}")]
+    LspObservationPayload(#[source] serde_json::Error),
     #[error("source artifact effect is not admitted for this operation")]
     WrongEffect,
 }
@@ -108,7 +118,7 @@ impl SourceArtifactOwner {
         })
     }
 
-    /// Stages exact archive bytes after the original PolicyOwner profile has
+    /// Stages exact archive bytes after the original `PolicyOwner` profile has
     /// been validated against this live source admission and the active Blob
     /// key lineage. Blob derives the versioned content digest from these exact
     /// bytes; neither Governor nor this composition invents residency facts.
@@ -121,6 +131,9 @@ impl SourceArtifactOwner {
     ) -> Result<ArtifactReference, SourceArtifactOwnerError> {
         if admission.operation().effect != EffectClass::ReversibleMutation {
             return Err(SourceArtifactOwnerError::WrongEffect);
+        }
+        if admission.operation().operation_kind == LSP_TOOL_OBSERVATION_RECEIPT_KIND {
+            return Err(SourceArtifactOwnerError::ReservedLspObservationOperationKind);
         }
         identity.verify_content(bytes)?;
         identity.validate()?;
@@ -143,50 +156,105 @@ impl SourceArtifactOwner {
         .map_err(SourceArtifactOwnerError::Artifact)
     }
 
+    /// Stages one bridge-owned LSP observation under its reserved operation
+    /// kind. The payload is decoded only to prove that these exact original
+    /// bytes join the non-Serde bridge projection and admitted request; Blob
+    /// receives the original byte slice unchanged.
+    pub fn stage_lsp_observation_payload(
+        &self,
+        admission: &SourceArtifactAdmission,
+        profile: &SourceArtifactBlobProfile,
+        projection: &LspAdoptionProjection,
+        record: &RetainedLspObservationV1,
+        original_payload: &[u8],
+    ) -> Result<eliot_store_api::CapturedBlobPayloadRefV1, SourceArtifactOwnerError> {
+        let operation = admission.operation();
+        if operation.effect != EffectClass::ReversibleMutation {
+            return Err(SourceArtifactOwnerError::WrongEffect);
+        }
+        if operation.operation_kind != LSP_TOOL_OBSERVATION_RECEIPT_KIND {
+            return Err(SourceArtifactOwnerError::WrongLspObservationOperationKind);
+        }
+
+        let decoded: RetainedLspObservationV1 = serde_json::from_slice(original_payload)
+            .map_err(SourceArtifactOwnerError::LspObservationPayload)?;
+        let invocation_request = &record.instrument_invocation.request;
+        if decoded != *record
+            || invocation_request != &admission.request().metadata
+            || invocation_request.task_id.as_ref() != Some(&admission.task().task_id)
+            || invocation_request.session_id.as_ref() != Some(&admission.session().session_id)
+            || invocation_request.state_fence != operation.state_fence
+            || operation.request_id != invocation_request.request_id
+            || !projection.matches_retained_observation(record)
+            || projection.observation() != &record.result
+        {
+            return Err(SourceArtifactOwnerError::LspObservationBindingMismatch);
+        }
+
+        profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
+        let policy = blob_policy_binding(profile)?;
+        let residency = blob_residency_domains(profile)?;
+        let context = receipt_context(admission);
+        let blob = self.blob_for_context(&context)?;
+        let root_lease = self.root_owner.lease_for_request(&context.request)?;
+        let ready = blob.stage_source_with_domains(
+            context,
+            root_lease,
+            original_payload,
+            policy,
+            residency,
+        )?;
+        ready.validate()?;
+        if ready.receipt().core.operation.operation_kind != LSP_TOOL_OBSERVATION_RECEIPT_KIND {
+            return Err(BlobError::MetadataPayloadMismatch.into());
+        }
+        eliot_store_api::CapturedBlobPayloadRefV1::from_ready_receipt(
+            LSP_TOOL_OBSERVATION_RECEIPT_KIND,
+            &ready,
+        )
+        .map_err(SourceArtifactOwnerError::CapturedPayload)
+    }
+
     /// Reopens one exact persisted Artifact reference through the original
-    /// Blob owner. The current PolicyOwner profile must match the authenticated
+    /// Blob owner. The current `PolicyOwner` profile must match the authenticated
     /// policy and six residency domains on that reference; the returned proof
     /// preserves the S-04 read receipt lineage and verifies the artifact
     /// identity against the bytes a second time.
-    pub fn read_source_reference<'a>(
-        &'a self,
-        admission: &'a SourceArtifactAdmission,
-        profile: &'a SourceArtifactBlobProfile,
+    pub async fn read_source_reference(
+        &self,
+        admission: &SourceArtifactAdmission,
+        profile: &SourceArtifactBlobProfile,
         reference: ArtifactReference,
-    ) -> impl Future<
-        Output = Result<(VerifiedArtifact, ArtifactReadReceipt), SourceArtifactOwnerError>,
-    > + 'a {
-        async move {
-            if admission.operation().effect != EffectClass::Read {
-                return Err(SourceArtifactOwnerError::WrongEffect);
-            }
-            reference.validate()?;
-            if admission.resource_ref() != reference.expected_ready_receipt_id.as_str() {
-                return Err(BlobError::MetadataPayloadMismatch.into());
-            }
-            profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
-            let policy = blob_policy_binding(profile)?;
-            let residency = blob_residency_domains(profile)?;
-            if !matches_residency_domains(&reference.locator.residency, &residency) {
-                return Err(BlobError::MetadataPayloadMismatch.into());
-            }
-            let context = receipt_context(admission);
-            let blob = self.blob_for_context(&context)?;
-            let reader = AdmissionBlobReader {
-                blob: &blob,
-                root_owner: &self.root_owner,
-                context,
-                policy,
-                residency,
-            };
-            // The persisted identity supplies this read's exact byte ceiling;
-            // BlobStoreCore enforces its own canonical plaintext ceiling.
-            let artifact = ArtifactOwner::new(reference.identity.content.size_bytes.max(1))?;
-            artifact
-                .read(reference, &reader)
-                .await
-                .map_err(SourceArtifactOwnerError::Artifact)
+    ) -> Result<(VerifiedArtifact, ArtifactReadReceipt), SourceArtifactOwnerError> {
+        if admission.operation().effect != EffectClass::Read {
+            return Err(SourceArtifactOwnerError::WrongEffect);
         }
+        reference.validate()?;
+        if admission.resource_ref() != reference.expected_ready_receipt_id.as_str() {
+            return Err(BlobError::MetadataPayloadMismatch.into());
+        }
+        profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
+        let policy = blob_policy_binding(profile)?;
+        let residency = blob_residency_domains(profile)?;
+        if !matches_residency_domains(&reference.locator.residency, &residency) {
+            return Err(BlobError::MetadataPayloadMismatch.into());
+        }
+        let context = receipt_context(admission);
+        let blob = self.blob_for_context(&context)?;
+        let reader = AdmissionBlobReader {
+            blob: &blob,
+            root_owner: &self.root_owner,
+            context,
+            policy,
+            residency,
+        };
+        // The persisted identity supplies this read's exact byte ceiling;
+        // BlobStoreCore enforces its own canonical plaintext ceiling.
+        let artifact = ArtifactOwner::new(reference.identity.content.size_bytes.max(1))?;
+        artifact
+            .read(reference, &reader)
+            .await
+            .map_err(SourceArtifactOwnerError::Artifact)
     }
 
     /// Reads the exact retained LSP observation payload named by its original
@@ -230,7 +298,8 @@ impl SourceArtifactOwner {
         chunk.validate()?;
 
         let ready = chunk.ready_receipt();
-        if ready.locator() != &payload.locator
+        if ready.receipt().core.operation.operation_kind != LSP_TOOL_OBSERVATION_RECEIPT_KIND
+            || ready.locator() != &payload.locator
             || ready.metadata_sha256() != payload.metadata_sha256.as_str()
             || ready.receipt().identity.receipt_id.as_str() != payload.ready_receipt_id.as_str()
             || ready.policy() != &policy
